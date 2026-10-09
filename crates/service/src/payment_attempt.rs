@@ -55,15 +55,13 @@ pub enum PaymentOption {
     PaykitBtcBitcoin,
     PaykitUsdtArbitrumOne,
     PaypalFiat,
-    StripeFiat,
 }
 
 impl PaymentOption {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 3] = [
         Self::PaykitBtcBitcoin,
         Self::PaykitUsdtArbitrumOne,
         Self::PaypalFiat,
-        Self::StripeFiat,
     ];
 
     /// The canonical option id, as stored in
@@ -73,7 +71,6 @@ impl PaymentOption {
             Self::PaykitBtcBitcoin => "paykit.btc.bitcoin",
             Self::PaykitUsdtArbitrumOne => "paykit.usdt.arbitrum-one",
             Self::PaypalFiat => "paypal.fiat",
-            Self::StripeFiat => "stripe.fiat",
         }
     }
 
@@ -87,7 +84,6 @@ impl PaymentOption {
             Self::PaykitBtcBitcoin => "bitcoin",
             Self::PaykitUsdtArbitrumOne => "usdt",
             Self::PaypalFiat => "paypal",
-            Self::StripeFiat => "stripe",
         }
     }
 
@@ -102,7 +98,7 @@ impl PaymentOption {
         match self {
             Self::PaykitBtcBitcoin => Some(PaymentNetwork::Bitcoin),
             Self::PaykitUsdtArbitrumOne => Some(PaymentNetwork::ArbitrumOne),
-            Self::PaypalFiat | Self::StripeFiat => None,
+            Self::PaypalFiat => None,
         }
     }
 
@@ -130,7 +126,8 @@ impl PaymentNetwork {
 }
 
 /// What the buyer sends (`orders.payment_asset`). Only USDT carries these
-/// columns today; Bitcoin, PayPal and Stripe orders leave them NULL.
+/// columns today; Bitcoin and PayPal orders (and historical Stripe orders)
+/// leave them NULL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettlementAsset {
     Usdt,
@@ -317,15 +314,14 @@ mod tests {
             [
                 "paykit.btc.bitcoin",
                 "paykit.usdt.arbitrum-one",
-                "paypal.fiat",
-                "stripe.fiat"
+                "paypal.fiat"
             ]
         );
         let methods: Vec<&str> = PaymentOption::ALL
             .into_iter()
             .map(PaymentOption::method)
             .collect();
-        assert_eq!(methods, ["bitcoin", "usdt", "paypal", "stripe"]);
+        assert_eq!(methods, ["bitcoin", "usdt", "paypal"]);
         for option in PaymentOption::ALL {
             assert_eq!(PaymentOption::from_id(option.id()), Some(option));
             assert_eq!(PaymentOption::from_method(option.method()), Some(option));
@@ -360,7 +356,6 @@ mod tests {
             Some(PaymentNetwork::ArbitrumOne)
         );
         assert_eq!(PaymentOption::PaypalFiat.network(), None);
-        assert_eq!(PaymentOption::StripeFiat.network(), None);
         assert_eq!(PaymentNetwork::Bitcoin.as_str(), "bitcoin");
         assert_eq!(PaymentNetwork::ArbitrumOne.as_str(), "arbitrum-one");
     }
