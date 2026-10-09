@@ -100,6 +100,17 @@ primary key. It builds no index on an existing table and sets
 `lock_timeout` like 0050. No index serves the follower's revival read (live
 listings with `revived_from_cursor` set); it filters the live listings.
 
+0053 (payment assets) widens `orders.payment_method` to `usdt`, adds five
+nullable `orders` columns for what the buyer sends (`payment_asset`,
+`payment_network`, `payment_amount_minor`, `payment_exponent`,
+`payment_quote_basis`), and creates `seller_accepted_payment_options` with its
+primary key. The two `orders` CHECKs (the method list; the five columns all
+set or all NULL with a positive amount) are `NOT VALID`: new and updated rows
+are checked, no table scan runs under the lock. No default, no rewrite, no
+index on an existing table; it sets `lock_timeout` like 0050. A binary from
+before it lists its `orders` columns and ignores them. The asset, network and
+quote basis have no CHECK on purpose: a later value is not a migration.
+
 0058 (purge retired Stripe values) is one `UPDATE` that sets
 `seller_payment_configs.stripe_payment_link` and
 `stripe_restricted_key_ciphertext` to `NULL` for the rows that hold a value.
@@ -109,22 +120,17 @@ additive. Orders and payments bound to Stripe are not touched.
 
 ## Numbers claimed by open pull requests
 
-`main` ends at 0051. Pull requests that are open when this was written claim
-the next numbers, so a new migration must check the open list (`gh pr list`)
-and take the next free number rather than assume 0052:
+`main` has 0001 to 0052, then 0056 and 0058. Pull requests that are open when
+this was written claim the missing numbers, so a new migration must check the
+open list (`gh pr list`) and take the next free number rather than assume
+0053:
 
 | Number | File | Pull request |
 | --- | --- | --- |
-| 0052 | `0052_paykit_upstream_lifecycle.sql` | #95 (upstream Paykit lifecycle) |
-| 0052 | `0052_paykit_prepared_attempts.sql` | #89, which collides with #95 and must be reconciled before either merges |
-| 0053 | `0053_payment_assets.sql` | #91, and #99 (the same change stacked on #95) |
-| 0054 | `0054_refund_destinations.sql` | #94, and #101 (stacked on #95) |
+| 0053 | `0053_payment_assets.sql` | #99 (USDT asset model, S1) |
+| 0054 | `0054_refund_destinations.sql` | #101 (USDT refund destination, S6, stacked on #99) |
 | 0055 | `0055_user_priv_key_custody_releases.sql` | #92 (`/priv` Phase 4) |
-| 0056 | `0056_order_delivery_terms.sql` | #106 (seller-set delivery periods, optional `guarantee_policy_version`) |
-| 0057 | none yet | reserved for other work |
-| 0058 | `0058_purge_retired_stripe_values.sql` | #104 (remove the Stripe rail) |
+| 0057 | `0057_encrypted_delivery_address.sql` | #110 (sealed delivery address envelopes) |
 
-The stacked pairs (#91/#99, #94/#101) are alternative bases for the same file,
-not two migrations. Only one of each pair will merge. #93 and #100 carry no
-migration. This table describes unmerged work and goes stale as pull requests
-land; trust `crates/service/migrations/` on `main` over it.
+#100 carries no migration. This table describes unmerged work and goes stale as
+pull requests land; trust `crates/service/migrations/` on `main` over it.
