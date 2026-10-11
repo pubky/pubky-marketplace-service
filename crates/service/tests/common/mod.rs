@@ -5,6 +5,7 @@
 
 pub mod fx_feed;
 pub mod paykit_review;
+pub mod paykit_server_67_75;
 
 use std::sync::Arc;
 

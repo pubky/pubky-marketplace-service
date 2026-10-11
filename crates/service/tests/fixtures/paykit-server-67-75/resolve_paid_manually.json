@@ -1,0 +1,16 @@
+{
+  "name": "resolve_paid_manually",
+  "server_revision": "80352cebb011d2f57318170068ae4ec24af6a417",
+  "request": {
+    "method": "POST",
+    "path": "/marketplace/payment-requests/resolve",
+    "content_type": null,
+    "signature": "LVB8wmwa67GgTVP-a-1K5NqD1Twfayv1-s-0kOHTw9C31bxA2RUsfT5xN6feIrmwL-7-77K0jjXC8usK2LeTBw",
+    "body": "{\"creator\":\"pubkybuuk6nr1caaumhms4tph5oa656z9f5k9q867h4u8ze441mpfuhyo\",\"invoice_id\":\"22e960e0-0a8a-43b3-b901-c6bc7ea9072c\",\"outcome\":\"paid_manually\"}"
+  },
+  "response": {
+    "status": 200,
+    "content_type": "application/json",
+    "body": "{\"invoice_id\":\"22e960e0-0a8a-43b3-b901-c6bc7ea9072c\",\"outcome\":\"paid_manually\",\"resolved_at\":\"2026-10-11T13:24:44.507485Z\"}"
+  }
+}
