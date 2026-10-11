@@ -632,8 +632,9 @@ fn every_manual_review_writer_stamps_the_entry_time() {
     }
     // The enumerated set: Locks apply_manual_review (1 in bitcoin_review),
     // apply_late_money still-held (1 in bitcoin_review), the paykit worker
-    // (4: amount mismatch, observed-amount-vs-quote mismatch, confirm-failure,
-    // seller-window reaper — late settlement now goes through apply_late_money),
+    // (5: amount mismatch, observed-amount-vs-quote mismatch, confirm-failure,
+    // upstream lifecycle inconsistency, seller-window reaper — late settlement
+    // now goes through apply_late_money),
     // the fiat apply_fiat_paid confirm-failure (1; expired uses apply_late_money),
     // the sandbox transition (1), and a released Paykit attempt settling with a
     // different amount (1 in paykit_attempts). Any NEW writer fails here until it is
@@ -649,7 +650,7 @@ fn every_manual_review_writer_stamps_the_entry_time() {
             ("payment.rs".to_string(), 1),
             ("paykit_attempts.rs".to_string(), 1),
             ("payment_methods.rs".to_string(), 1),
-            ("workers.rs".to_string(), 4),
+            ("workers.rs".to_string(), 5),
         ]),
         "the manual_review writer set drifted; stamp and enumerate the new writer"
     );
