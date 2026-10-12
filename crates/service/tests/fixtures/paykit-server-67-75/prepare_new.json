@@ -1,0 +1,16 @@
+{
+  "name": "prepare_new",
+  "server_revision": "80352cebb011d2f57318170068ae4ec24af6a417",
+  "request": {
+    "method": "POST",
+    "path": "/marketplace/payment-requests/prepare",
+    "content_type": null,
+    "signature": "xienZUQarxZ_nMpMHJ5xAr9PnlZl5PT0mdcWDDWNFhf9L71wRIprn_v-6JNUwIW4Xj5NytdxzgAEz5SJfjW5Cg",
+    "body": "{\"amount_sats\":50000,\"creator\":\"pubkybuuk6nr1caaumhms4tph5oa656z9f5k9q867h4u8ze441mpfuhyo\",\"operation_id\":\"marketplace-payment:2ca0f173-2505-45aa-acae-5315c79cdd51:1\",\"payment_window_seconds\":3600,\"reader\":\"pubky7ahm9mquyezn4ny85baxqo43r8epijtwo6h8149yxsm7eiu155uy\",\"reference\":\"2ca0f173-2505-45aa-acae-5315c79cdd51\"}"
+  },
+  "response": {
+    "status": 200,
+    "content_type": "application/json",
+    "body": "{\"invoice_id\":\"22e960e0-0a8a-43b3-b901-c6bc7ea9072c\",\"state\":\"prepared\",\"total_sats\":50000,\"prepare_expires_at\":\"2026-10-11T13:39:44.325855Z\"}"
+  }
+}

@@ -42,6 +42,7 @@ const sharedEnv = {
   LOCKS_SERVER_URL: preserve(),
   NEXUS_URL: preserve(),
   PAYKIT_REQUEST_SIGNING_KEY: preserve(),
+  PAYKIT_MAX_PREPARE_TTL_SECONDS: preserve(),
   PAYKIT_SERVER_URL: preserve(),
   PICKUP_DETAILS_ENCRYPTION_KEY: preserve(),
   PICKUP_DETAILS_ENCRYPTION_KEY_PREVIOUS: preserve(),
