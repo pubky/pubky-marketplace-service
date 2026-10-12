@@ -168,7 +168,7 @@ Railway IaC `preserve()`):
 | `PAYKIT_SERVER_API` | `fork` | which paykit-server the service speaks to: `fork` (today's production server) or `upstream` (`pubky/paykit-server` with the signed-services allowlist, first shipped in v0.1.0-rc9, #55; the latest tagged release is v0.1.0-rc11). Set only together with `PAYKIT_SERVER_URL`. See [Paykit server API](#paykit-server-api) |
 | `PAYKIT_POLL_SECONDS` | `15` | minimum interval between paykit status polls per pending bitcoin order |
 | `PAYKIT_RAIL_STALE_SECONDS` | `60` | stale-out window for cached Paykit rail and seller claim availability; must be at least `PAYKIT_POLL_SECONDS` |
-| `DELIVERY_ASSUME_DAYS` | `14` | default for the days after shipment when the worker marks a `shipped` order `delivered` on server time (no carrier tracking feed), flagging the projection `delivery_assumed` (≥ 1). Applies only to an order whose seller left `deliveryAssumeDays` unset on their shop record; see [Seller-set periods](#seller-set-periods) |
+| `DELIVERY_ASSUME_DAYS` | `14` | default for the days after shipment when the worker marks a `shipped` order `delivered` on server time (no carrier tracking feed), flagging the projection `delivery_assumed` (≥ 1). The same period counts from payment for a paid manual digital order the seller never marks delivered. Applies only to an order whose seller left `deliveryAssumeDays` unset on their shop record; see [Seller-set periods](#seller-set-periods) |
 | `AUTO_COMPLETE_DAYS` | `14` | default for the days after delivery when the worker completes a `delivered` order on server time, unless a return/cancel request is open (≥ 1). Applies only to an order whose seller left `autoCompleteDays` unset on their shop record; see [Seller-set periods](#seller-set-periods) |
 | `DELIVERY_SWEEP_BATCH_SIZE` | `100` | rows claimed per inner delivery/auto-complete sweep pass (≥ 1); the worker loops until a short batch or the per-lease cap |
 | `PUBLIC_APP_ORIGIN` | unset | the web app's public origin (e.g. `https://shop.pubky.app`); when set, hosted checkouts that support a return destination (PayPal `_xclick`) send the buyer back to `{origin}/marketplace/orders` after commit/cancel |
@@ -874,7 +874,11 @@ and refund branches):
   `auto_complete_days`). Capture happens once: a later change to the shop
   record never moves an open order's clock, and a second lock point on the
   same order does not read the record again. The sweeps (`delivery_assume`,
-  `order_auto_complete`) then use each order's own period. A period the
+  `order_auto_complete`) then use each order's own period, and the same two
+  periods govern a paid manual digital order ("I'll email it" / "I'll send
+  it in messages") the seller never marks delivered: the delivered
+  assumption counts from payment rather than shipment (see
+  [Digital delivery](#digital-delivery)). A period the
   seller left unset (absent, not an integer, or outside 1 to 60) stays NULL on
   the order and the sweeps apply `DELIVERY_ASSUME_DAYS` /
   `AUTO_COMPLETE_DAYS`; a seller with no shop record, a deployment without a
@@ -1023,7 +1027,17 @@ downloading while the order stands, including `completed`. For `email` and
 `message` lines the seller reads the address at
 `GET /v1/orders/{id}/delivery-email` and records the delivery with
 `fulfillment.deliver_digital` (`channel`: `email` or `message`); when every
-manual line is marked the order moves `paid` to `delivered`. A background
+manual line is marked the order moves `paid` to `delivered`. A seller who
+never marks it does not strand the order: the `delivery_assume` sweep moves a
+paid manual digital order `paid` to `delivered` once the order's frozen
+delivered-assumption period (the seller's `deliveryAssumeDays`, else
+`DELIVERY_ASSUME_DAYS`) has elapsed since the receipt was issued, flagging it
+`delivery_assumed` and notifying both parties exactly as for a shipped order.
+The `order_auto_complete` sweep then completes it after the frozen
+auto-complete period (`autoCompleteDays`, else `AUTO_COMPLETE_DAYS`), which
+starts the sealed address's retention clock. An open cancellation request or
+a PayPal reversal outstanding on the order holds the assumption; instant-only
+orders are delivered at payment and never wait for it. A background
 worker deletes the sealed address after its retention (see
 `BUYER_EMAIL_RETENTION_DAYS`), and `/ready` reports `unavailable` if the purge
 falls behind.
