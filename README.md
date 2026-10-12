@@ -155,15 +155,14 @@ Railway IaC `preserve()`):
 | `LOCKS_LOOKUP_HMAC_KEY` | unset | 32-byte hex key for the HMAC-SHA256 correlation lookup token; must differ from the encryption key |
 | `LOCKS_PAYMENT_WINDOW_SECONDS` | `3600` | hold window armed by the `payment.register_locks` lock point (≥ 60); the correlation window IS the hold window |
 | `CHECKOUT_HOLD_WINDOW_SECONDS` | `900` | unbound leftover cancel for ordinary `pending_payment` rows with `stock_held=false` and no payment method (≥ 60). Ordinary `checkout.create` does not hold stock |
-| `FIAT_PAYMENT_WINDOW_SECONDS` | `600` | hold window armed by a PayPal/Stripe payment-method bind (`POST /v0/orders/{id}/payment-method`) (≥ 60). Default 10 minutes; live Railway may still preserve a longer override |
+| `FIAT_PAYMENT_WINDOW_SECONDS` | `600` | hold window armed by a PayPal payment-method bind (`POST /v0/orders/{id}/payment-method`) (≥ 60). Default 10 minutes; live Railway may still preserve a longer override |
 | `BITCOIN_PAYMENT_WINDOW_SECONDS` | `1800` | hold window armed by a bitcoin payment-method bind; the same instant is Paykit `expires_at` — never longer than the invoice the buyer is shown (≥ 60). Honor a deployment value ≥ 60; do not cap below a live Railway override |
 | `SANDBOX_PAYMENT_WINDOW_SECONDS` | `900` | hold window armed by the sandbox lock point (`payment.sandbox_advance`'s first transition out of `awaiting_entitlement`) (≥ 60) |
 | `DROP_CLAIM_WINDOW_SECONDS` | `600` | hold window armed at checkout for drop-bound orders (lock-at-claim) (≥ 60) |
 | `LOCKS_POLL_SECONDS` | `30` | minimum interval between lifecycle lookups per pending correlation |
 | `ATTESTOR_SECRET_KEY` | unset | 32-byte hex Ed25519 secret of the attestor identity (ADR 0024); its z-base-32 public key is the attestor pubky |
 | `ATTESTOR_ORDER_SALT` | unset | 32-byte hex salt for `order_ref` hashing; must stay stable for the attestor identity's lifetime |
-| `STRIPE_KEY_ENCRYPTION_KEY` | unset | 32-byte hex key sealing seller Stripe restricted keys at rest; setting it enables the `/v0` payment-methods surface |
-| `STRIPE_API_BASE` | `https://api.stripe.com` | Stripe API base URL (overridden only by tests) |
+| `STRIPE_KEY_ENCRYPTION_KEY` | unset | 32-byte hex key sealing seller secrets (Shippo API tokens) at rest; setting it enables the `/v0` payment-methods surface. The name is a legacy of the removed Stripe rail and is kept so deployments need no change |
 | `PAYKIT_SERVER_URL` | unset | paykit-server base URL; setting it enables the bitcoin method |
 | `PAYKIT_REQUEST_SIGNING_KEY` | unset | 32-byte hex ed25519 seed signing paykit-server requests. Its pubky-formatted public key goes into paykit-server's `[signed_services] trusted_public_keys`, beside the Locks key, when `PAYKIT_SERVER_API=upstream`; on the fork (`fork`, the default) it is `marketplace.trusted_public_key`. See [Paykit server API](#paykit-server-api) |
 | `PAYKIT_SERVER_API` | `fork` | which paykit-server the service speaks to: `fork` (today's production server) or `upstream` (`pubky/paykit-server` with the signed-services allowlist, first shipped in v0.1.0-rc9, #55; the latest tagged release is v0.1.0-rc11). Set only together with `PAYKIT_SERVER_URL`. See [Paykit server API](#paykit-server-api) |
@@ -236,13 +235,26 @@ A seller's new Paykit claim becomes visible to buyers within
 `PAYKIT_POLL_SECONDS`.
 
 The endpoint is unauthenticated, so it returns booleans only:
-`paypal_available` (a merchant email is stored) and `stripe_available` (a
-payment link and restricted key are stored). It never returns the seller's
-PayPal email, Stripe payment link, or any other payout or contact identifier.
+`paypal_available` (a merchant email is stored). It never returns the seller's
+PayPal email or any other payout or contact identifier.
 The PayPal email reaches a buyer only inside the `fiat_checkout_url` of an
 order they bound to PayPal (`POST /v0/orders/{id}/payment-method`), which only
 that order's buyer and seller can read. The seller reads their own stored
 values from the authenticated `GET /v0/sellers/me/payment-config`.
+
+Stripe is not a payment method: the service has no Stripe client, binding
+`stripe` answers `invalid_method`, and `PUT /v0/sellers/me/payment-config`
+answers `stripe_removed` to a non-empty `stripe_payment_link` or
+`stripe_restricted_key`. Two retired fields remain in the seller's own view
+only because a Shop that predates the removal requires them:
+`stripe_payment_link` is always `null` and `stripe_restricted_key_set` is
+always `false`; they go once the Shop stops reading them. The columns
+`seller_payment_configs.stripe_payment_link` and
+`stripe_restricted_key_ciphertext` are unused and always `NULL`: migration
+0058 clears every stored value, and nothing writes them after that. Orders
+bound to Stripe before the removal keep `payment_method = 'stripe'` and read
+`fiat_verification: 'processor'`, and the `payments.adapter` and
+`orders.payment_method` check constraints still admit `stripe` for them.
 
 During deployment ordering, an older paykit-server response without
 `bitcoin_offer_available` is compatible: `electrum: "ready"` or
@@ -280,8 +292,8 @@ in the upstream allowlist first, then set `PAYKIT_SERVER_API=upstream` and
 repoint `PAYKIT_SERVER_URL`; setting it back to `fork` (or unsetting it) and
 repointing is the rollback. Upstream does not serve the payment-request
 lifecycle routes (prepare, activate, void, resolve) yet, so with `upstream`
-a Bitcoin bind answers `paykit_unavailable` until those land. PayPal and
-Stripe are not affected.
+a Bitcoin bind answers `paykit_unavailable` until those land. PayPal is
+not affected.
 
 ### Address autocomplete proxy
 
@@ -732,7 +744,7 @@ and arms a bounded server-time hold window on the order
 | Lock point | Window |
 | --- | --- |
 | `payment.register_locks` | `LOCKS_PAYMENT_WINDOW_SECONDS` (default 3600) — the existing correlation window IS the hold window; one window concept, not two |
-| `POST /v0/orders/{id}/payment-method` (PayPal / Stripe) | `FIAT_PAYMENT_WINDOW_SECONDS` (default 600, min 60) |
+| `POST /v0/orders/{id}/payment-method` (PayPal) | `FIAT_PAYMENT_WINDOW_SECONDS` (default 600, min 60) |
 | `POST /v0/orders/{id}/payment-method` (bitcoin) | `BITCOIN_PAYMENT_WINDOW_SECONDS` (default 1800, min 60) — equals Paykit `expires_at` |
 | `payment.sandbox_advance` transitioning OUT of `awaiting_entitlement` (the first transition; gated by `SANDBOX_PAYMENTS_ENABLED` as always) | `SANDBOX_PAYMENT_WINDOW_SECONDS` (default 900, min 60) |
 

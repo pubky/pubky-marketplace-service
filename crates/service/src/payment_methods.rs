@@ -7,15 +7,13 @@
 //!   idempotent no-op; a different method is refused once one is bound
 //!   (switching rails after a payment request or checkout URL exists could
 //!   double-collect).
-//! - The Stripe leg is processor-verified: the service lists the seller's
-//!   recent Checkout Sessions with their stored restricted key and matches
-//!   `client_reference_id == order id` plus exact amount and currency.
 //! - The PayPal leg is gateway-notified when it can be: PayPal's IPN
 //!   callback (postback-verified, matched against the seller's configured
 //!   email and the exact order total) pays the order automatically. The
 //!   buyer-reports/seller-confirms pair remains as the fallback when no IPN
 //!   arrives. The projection exposes the provenance as `fiat_verification:
-//!   'processor' | 'gateway-notified' | 'seller-attested'`.
+//!   'gateway-notified' | 'seller-attested'` (historical Stripe-bound orders
+//!   keep reading `'processor'`).
 //! - PayPal `Refunded`/`Reversed`/`Canceled_Reversal` IPNs are recorded on
 //!   the order whose gateway-verified payment id is their `parent_txn_id`,
 //!   or held in `gateway_refund_inbox` (`paypal_refund`,
@@ -48,24 +46,21 @@ use crate::handlers::{
 };
 use crate::model::{OrderRow, PaymentRow};
 use crate::payments::{
-    attempt_reference, validate_paypal_email, validate_stripe_payment_link,
-    validate_stripe_restricted_key, PaykitRequestError, PaymentsRuntime, StripeError,
+    attempt_reference, validate_paypal_email, PaykitRequestError, PaymentsRuntime,
 };
 use crate::queries::PAYMENT_COLUMNS;
 use crate::AppState;
 
 mod paypal_refund;
 
-const CONFIG_COLUMNS: &str = "seller_pubky, bitcoin_enabled, stripe_payment_link, \
-     stripe_restricted_key_ciphertext, paypal_merchant_email, created_at, updated_at";
+const CONFIG_COLUMNS: &str =
+    "seller_pubky, bitcoin_enabled, paypal_merchant_email, created_at, updated_at";
 
 #[derive(Debug, sqlx::FromRow)]
 struct SellerPaymentConfigRow {
     #[allow(dead_code)]
     seller_pubky: String,
     bitcoin_enabled: bool,
-    stripe_payment_link: Option<String>,
-    stripe_restricted_key_ciphertext: Option<Vec<u8>>,
     paypal_merchant_email: Option<String>,
     #[allow(dead_code)]
     created_at: DateTime<Utc>,
@@ -73,7 +68,7 @@ struct SellerPaymentConfigRow {
 }
 
 /// Machine-readable failure: the standard command error envelope plus a
-/// `reason` sub-code the client can branch on (e.g. `stripe_key_invalid`).
+/// `reason` sub-code the client can branch on (e.g. `invalid_paypal_email`).
 fn method_error(code: ErrorCode, reason: &str, message: &str) -> Response {
     (
         StatusCode::from_u16(code.http_status()).expect("error codes map to valid statuses"),
@@ -98,7 +93,8 @@ fn internal(context: &str, error: &dyn std::fmt::Display) -> Response {
 }
 
 /// The payment-methods surface is enabled only when the deployment carries
-/// the payments runtime (`STRIPE_KEY_ENCRYPTION_KEY`); fail closed otherwise.
+/// the payments runtime (`STRIPE_KEY_ENCRYPTION_KEY`, the seller-secret key);
+/// fail closed otherwise.
 fn payments_runtime(state: &AppState) -> Result<std::sync::Arc<PaymentsRuntime>, Box<Response>> {
     state.payments.clone().ok_or_else(|| {
         Box::new(method_error(
@@ -128,11 +124,12 @@ where
 #[serde(deny_unknown_fields)]
 pub struct PutPaymentConfigBody {
     bitcoin_enabled: bool,
-    /// Absent or null clears the stored link.
+    /// Retired Stripe field, still parsed so a client that has not dropped it
+    /// keeps saving: only absent or null is accepted.
     #[serde(default)]
     stripe_payment_link: Option<String>,
-    /// Write-only. Absent or null PRESERVES the stored key (the client can
-    /// never read it back to re-send it); an empty string clears it.
+    /// Retired Stripe field: only absent, null or the empty string (the old
+    /// "clear it" value) is accepted.
     #[serde(default)]
     stripe_restricted_key: Option<String>,
     /// Absent or null clears the stored email.
@@ -140,102 +137,70 @@ pub struct PutPaymentConfigBody {
     paypal_merchant_email: Option<String>,
 }
 
+/// The seller's own view. `stripe_payment_link` (always null) and
+/// `stripe_restricted_key_set` (always false) are retired Stripe fields kept
+/// only because a Shop that has not yet dropped them requires both keys.
 fn config_view(
     bitcoin_enabled: bool,
-    stripe_payment_link: &Option<String>,
     paypal_merchant_email: &Option<String>,
-    stripe_restricted_key_set: bool,
     updated_at: DateTime<Utc>,
 ) -> Value {
     json!({
         "bitcoin_enabled": bitcoin_enabled,
-        "stripe_payment_link": stripe_payment_link,
+        "stripe_payment_link": Value::Null,
         "paypal_merchant_email": paypal_merchant_email,
-        "stripe_restricted_key_set": stripe_restricted_key_set,
+        "stripe_restricted_key_set": false,
         "updated_at": format_timestamp(updated_at),
     })
 }
 
 /// `PUT /v0/sellers/me/payment-config` (seller session): full replace of the
-/// seller's rail configuration, except the write-only restricted key, which
-/// only an explicit value changes. The restricted key is never returned.
+/// seller's rail configuration. Any Stripe values stored before the rail was
+/// removed are cleared by the save.
 pub async fn put_payment_config(
     State(state): State<AppState>,
     Extension(actor): Extension<Actor>,
     Json(body): Json<PutPaymentConfigBody>,
 ) -> Response {
-    let payments = match payments_runtime(&state) {
-        Ok(payments) => payments,
-        Err(response) => return *response,
-    };
-    if let Some(link) = &body.stripe_payment_link {
-        if let Err(message) = validate_stripe_payment_link(link) {
-            return method_error(ErrorCode::InvalidCommand, "invalid_payment_link", message);
-        }
+    if let Err(response) = payments_runtime(&state) {
+        return *response;
+    }
+    if body.stripe_payment_link.is_some()
+        || body
+            .stripe_restricted_key
+            .as_deref()
+            .is_some_and(|key| !key.is_empty())
+    {
+        return method_error(
+            ErrorCode::InvalidCommand,
+            "stripe_removed",
+            "Stripe payments are no longer supported.",
+        );
     }
     if let Some(email) = &body.paypal_merchant_email {
         if let Err(message) = validate_paypal_email(email) {
             return method_error(ErrorCode::InvalidCommand, "invalid_paypal_email", message);
         }
     }
-    // None = preserve; Some(None) = clear; Some(Some(ciphertext)) = replace.
-    let restricted_key_update: Option<Option<Vec<u8>>> = match body.stripe_restricted_key.as_deref()
-    {
-        None => None,
-        Some("") => Some(None),
-        Some(key) => {
-            if let Err(message) = validate_stripe_restricted_key(key) {
-                return method_error(ErrorCode::InvalidCommand, "invalid_restricted_key", message);
-            }
-            Some(Some(payments.stripe_key_cipher.encrypt(&actor.0, key)))
-        }
-    };
     let now = state.clock.now();
-    let stored: Result<SellerPaymentConfigRow, sqlx::Error> = match restricted_key_update {
-        None => {
-            sqlx::query_as(&format!(
-                "INSERT INTO seller_payment_configs \
-                 (seller_pubky, bitcoin_enabled, stripe_payment_link, paypal_merchant_email, \
-                  created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $5) \
-                 ON CONFLICT (seller_pubky) DO UPDATE SET \
-                 bitcoin_enabled = EXCLUDED.bitcoin_enabled, \
-                 stripe_payment_link = EXCLUDED.stripe_payment_link, \
-                 paypal_merchant_email = EXCLUDED.paypal_merchant_email, \
-                 updated_at = EXCLUDED.updated_at \
-                 RETURNING {CONFIG_COLUMNS}"
-            ))
-            .bind(&actor.0)
-            .bind(body.bitcoin_enabled)
-            .bind(&body.stripe_payment_link)
-            .bind(&body.paypal_merchant_email)
-            .bind(now)
-            .fetch_one(&state.pool)
-            .await
-        }
-        Some(ciphertext) => {
-            sqlx::query_as(&format!(
-                "INSERT INTO seller_payment_configs \
-                 (seller_pubky, bitcoin_enabled, stripe_payment_link, \
-                  stripe_restricted_key_ciphertext, paypal_merchant_email, created_at, \
-                  updated_at) VALUES ($1, $2, $3, $4, $5, $6, $6) \
-                 ON CONFLICT (seller_pubky) DO UPDATE SET \
-                 bitcoin_enabled = EXCLUDED.bitcoin_enabled, \
-                 stripe_payment_link = EXCLUDED.stripe_payment_link, \
-                 stripe_restricted_key_ciphertext = EXCLUDED.stripe_restricted_key_ciphertext, \
-                 paypal_merchant_email = EXCLUDED.paypal_merchant_email, \
-                 updated_at = EXCLUDED.updated_at \
-                 RETURNING {CONFIG_COLUMNS}"
-            ))
-            .bind(&actor.0)
-            .bind(body.bitcoin_enabled)
-            .bind(&body.stripe_payment_link)
-            .bind(&ciphertext)
-            .bind(&body.paypal_merchant_email)
-            .bind(now)
-            .fetch_one(&state.pool)
-            .await
-        }
-    };
+    let stored: Result<SellerPaymentConfigRow, sqlx::Error> = sqlx::query_as(&format!(
+        "INSERT INTO seller_payment_configs \
+         (seller_pubky, bitcoin_enabled, paypal_merchant_email, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $4) \
+         ON CONFLICT (seller_pubky) DO UPDATE SET \
+         bitcoin_enabled = EXCLUDED.bitcoin_enabled, \
+         stripe_payment_link = NULL, \
+         stripe_restricted_key_ciphertext = NULL, \
+         paypal_merchant_email = EXCLUDED.paypal_merchant_email, \
+         updated_at = EXCLUDED.updated_at \
+         RETURNING {CONFIG_COLUMNS}"
+    ))
+    .bind(&actor.0)
+    .bind(body.bitcoin_enabled)
+    .bind(&body.paypal_merchant_email)
+    .bind(now)
+    .fetch_one(&state.pool)
+    .await;
     match stored {
         Ok(row) => (
             StatusCode::OK,
@@ -243,9 +208,7 @@ pub async fn put_payment_config(
                 "ok": true,
                 "payment_config": config_view(
                     row.bitcoin_enabled,
-                    &row.stripe_payment_link,
                     &row.paypal_merchant_email,
-                    row.stripe_restricted_key_ciphertext.is_some(),
                     row.updated_at,
                 ),
             })),
@@ -258,8 +221,7 @@ pub async fn put_payment_config(
 /// `GET /v0/sellers/me/payment-config` (seller session): the seller's own
 /// stored configuration, exactly as the PUT returns it. This is the raw row
 /// (`bitcoin_enabled` as stored, no paykit availability lookup) so the
-/// settings page can load state on mount. The restricted key is never
-/// returned, only `stripe_restricted_key_set`.
+/// settings page can load state on mount.
 pub async fn get_own_payment_config(
     State(state): State<AppState>,
     Extension(actor): Extension<Actor>,
@@ -270,9 +232,7 @@ pub async fn get_own_payment_config(
             Json(json!({
                 "payment_config": config_view(
                     row.bitcoin_enabled,
-                    &row.stripe_payment_link,
                     &row.paypal_merchant_email,
-                    row.stripe_restricted_key_ciphertext.is_some(),
                     row.updated_at,
                 ),
             })),
@@ -288,15 +248,13 @@ pub async fn get_own_payment_config(
 }
 
 /// The unauthenticated rail projection. Booleans only: a seller's PayPal
-/// email, Stripe payment link, and any other payout or contact identifier
-/// never leave the service here. The PayPal email reaches a buyer only inside
+/// email and any other payout or contact identifier never leave the service here. The PayPal email reaches a buyer only inside
 /// the `fiat_checkout_url` of an order they bound to PayPal, which only the
 /// order's participants can read.
 fn public_config_view(
     bitcoin_available: bool,
     bitcoin_offer_available: bool,
     paypal_available: bool,
-    stripe_available: bool,
 ) -> Response {
     (
         StatusCode::OK,
@@ -304,7 +262,6 @@ fn public_config_view(
             "bitcoin_available": bitcoin_available,
             "bitcoin_offer_available": bitcoin_offer_available,
             "paypal_available": paypal_available,
-            "stripe_available": stripe_available,
         })),
     )
         .into_response()
@@ -318,9 +275,7 @@ fn public_config_view(
 /// be read, is not offered Bitcoin.
 /// `bitcoin_offer_available` is the cached rail-wide Paykit gate. Older
 /// paykit-server responses without that field derive it from `status`.
-/// `paypal_available` is a stored merchant email; `stripe_available` is a
-/// stored payment link plus restricted key (the same rule as
-/// `seller_has_rail`), since Stripe payments are verified with that key.
+/// `paypal_available` is a stored merchant email.
 pub async fn get_payment_config(
     State(state): State<AppState>,
     Path(seller_pubky): Path<String>,
@@ -355,7 +310,7 @@ pub async fn get_payment_config(
         None => false,
     };
     let Some(config) = config else {
-        return public_config_view(false, rail_health, false, false);
+        return public_config_view(false, rail_health, false);
     };
     let bitcoin_available = if config.bitcoin_enabled {
         let paykit = state
@@ -384,7 +339,6 @@ pub async fn get_payment_config(
         bitcoin_available,
         rail_health,
         config.paypal_merchant_email.is_some(),
-        config.stripe_payment_link.is_some() && config.stripe_restricted_key_ciphertext.is_some(),
     )
 }
 
@@ -546,11 +500,11 @@ pub async fn bind_payment_method(
         Err(response) => return *response,
     };
     let method = body.method.as_str();
-    if !matches!(method, "bitcoin" | "stripe" | "paypal") {
+    if !matches!(method, "bitcoin" | "paypal") {
         return method_error(
             ErrorCode::InvalidCommand,
             "invalid_method",
-            "The payment method must be bitcoin, stripe, or paypal.",
+            "The payment method must be bitcoin or paypal.",
         );
     }
     let now = state.clock.now();
@@ -748,31 +702,6 @@ pub async fn bind_payment_method(
                     return internal("paykit bind attempt", &"no attempt was reserved");
                 };
                 (None, Some(attempt_reference(order.id, attempt)), "paykit")
-            }
-            "stripe" => {
-                let Some(link) = config
-                    .as_ref()
-                    .and_then(|config| config.stripe_payment_link.clone())
-                else {
-                    return method_error(
-                        ErrorCode::InvalidState,
-                        "method_unavailable",
-                        "The seller has no Stripe payment link configured.",
-                    );
-                };
-                if !is_fiat_currency(&order) {
-                    return method_error(
-                        ErrorCode::InvalidState,
-                        "currency_unsupported",
-                        "Stripe payment requires a fiat-denominated order.",
-                    );
-                }
-                let separator = if link.contains('?') { '&' } else { '?' };
-                (
-                    Some(format!("{link}{separator}client_reference_id={}", order.id)),
-                    None,
-                    "stripe",
-                )
             }
             "paypal" => {
                 let Some(email) = config
@@ -1648,125 +1577,6 @@ async fn read_order_and_payment(
     Ok(payment.map(|payment| (order, payment)))
 }
 
-/// `POST /v0/orders/{id}/fiat/verify` (either participant): server-side
-/// Stripe verification with the SELLER's stored restricted key. On a match
-/// the order is paid; `verified: false` means no matching paid session was
-/// found yet (the buyer may not have completed checkout).
-pub async fn verify_fiat_payment(
-    State(state): State<AppState>,
-    Extension(actor): Extension<Actor>,
-    Path(order_id): Path<Uuid>,
-) -> Response {
-    let payments = match payments_runtime(&state) {
-        Ok(payments) => payments,
-        Err(response) => return *response,
-    };
-    let (order, payment) = match read_order_and_payment(&state, order_id).await {
-        Ok(Some(pair)) => pair,
-        Ok(None) => {
-            return method_error(
-                ErrorCode::NotFound,
-                "order_not_found",
-                "The order was not found.",
-            )
-        }
-        Err(error) => return internal("order lookup", &error),
-    };
-    if actor.0 != order.buyer_pubky && actor.0 != order.seller_pubky {
-        return method_error(
-            ErrorCode::Unauthorized,
-            "not_participant",
-            "Only order participants may verify the payment.",
-        );
-    }
-    if order.payment_method.as_deref() != Some("stripe") {
-        return method_error(
-            ErrorCode::InvalidState,
-            "method_mismatch",
-            "Processor verification applies only to Stripe-bound orders.",
-        );
-    }
-    // `awaiting_entitlement` and `expired` are the only states this call can
-    // advance to paid (`expired` through the late-money fork), so both need a
-    // paid Stripe session below. `confirmed`, `manual_review` and `detected`
-    // have already recorded their outcome and `apply_fiat_paid` changes
-    // nothing for them: an idempotent success.
-    if !matches!(payment.state.as_str(), "awaiting_entitlement" | "expired") {
-        return match apply_fiat_paid(
-            &state,
-            &actor.0,
-            order_id,
-            None,
-            "processor",
-            None,
-            state.clock.now(),
-        )
-        .await
-        {
-            Ok(response) | Err(response) => response,
-        };
-    }
-    let config = match load_config(&state.pool, &order.seller_pubky).await {
-        Ok(config) => config,
-        Err(error) => return internal("payment config read", &error),
-    };
-    let Some(sealed) = config.and_then(|config| config.stripe_restricted_key_ciphertext) else {
-        return method_error(
-            ErrorCode::InvalidState,
-            "stripe_key_missing",
-            "The seller has no Stripe restricted key configured, so this order cannot be verified.",
-        );
-    };
-    let restricted_key = match payments
-        .stripe_key_cipher
-        .decrypt(&order.seller_pubky, &sealed)
-    {
-        Ok(key) => key,
-        Err(error) => return internal("restricted key decryption", &error),
-    };
-    let matched = payments
-        .stripe
-        .find_paid_session(
-            &restricted_key,
-            &order.id.to_string(),
-            order.total_minor,
-            &order.currency,
-        )
-        .await;
-    match matched {
-        Ok(Some(matched)) => {
-            match apply_fiat_paid(
-                &state,
-                &actor.0,
-                order_id,
-                Some(&matched.session_id),
-                "processor",
-                None,
-                state.clock.now(),
-            )
-            .await
-            {
-                Ok(response) | Err(response) => response,
-            }
-        }
-        Ok(None) => (
-            StatusCode::OK,
-            Json(json!({ "ok": true, "verified": false, "status": "not_found" })),
-        )
-            .into_response(),
-        Err(StripeError::KeyInvalid) => method_error(
-            ErrorCode::InvalidState,
-            "stripe_key_invalid",
-            "Stripe rejected the seller's restricted key; the seller must update their payment configuration.",
-        ),
-        Err(StripeError::Unavailable) => method_error(
-            ErrorCode::UpstreamUnavailable,
-            "stripe_unavailable",
-            "Stripe could not be reached; try again.",
-        ),
-    }
-}
-
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MarkPaidBody {
@@ -1895,8 +1705,7 @@ pub async fn mark_fiat_paid(
 
 /// `POST /v0/orders/{id}/fiat/confirm-received` (seller session): the seller
 /// attests the PayPal payment arrived, which pays the order. This is the
-/// deliberate `seller-attested` counterpart to Stripe's processor
-/// verification.
+/// deliberate `seller-attested` leg of PayPal verification.
 pub async fn confirm_fiat_received(
     State(state): State<AppState>,
     Extension(actor): Extension<Actor>,

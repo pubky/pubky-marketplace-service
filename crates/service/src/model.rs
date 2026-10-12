@@ -606,19 +606,20 @@ pub struct OrderRow {
     pub delivery_assumed: bool,
     pub return_request: Option<Value>,
     pub external_refund: Option<Value>,
-    /// The buyer-bound payment method (`bitcoin` | `stripe` | `paypal`),
-    /// NULL until bound.
+    /// The buyer-bound payment method (`bitcoin` | `paypal`; historical rows may
+    /// still read `stripe`), NULL until bound.
     pub payment_method: Option<String>,
     /// Snapshot of the fiat checkout URL taken at binding time.
     pub fiat_checkout_url: Option<String>,
     /// When the buyer reported an out-of-band fiat payment (PayPal leg).
     pub payment_reported_at: Option<DateTime<Utc>>,
     /// Optional processor/transaction reference: the buyer-supplied PayPal
-    /// transaction id, or the matched Stripe Checkout Session id.
+    /// transaction id (historical Stripe rows hold the matched Checkout
+    /// Session id).
     pub fiat_transaction_ref: Option<String>,
-    /// Who verified the fiat payment that paid the order: `processor`
-    /// (Stripe key lookup), `gateway` (verified PayPal IPN), or `seller`
-    /// (manual confirm-received). NULL until verified.
+    /// Who verified the fiat payment that paid the order: `gateway`
+    /// (verified PayPal IPN) or `seller` (manual confirm-received); historical
+    /// Stripe rows read `processor`. NULL until verified.
     pub fiat_verified_by: Option<String>,
     /// Set while a verified PayPal reversal (a buyer chargeback or dispute)
     /// is outstanding on the order; cleared when `Canceled_Reversal`
@@ -1018,12 +1019,12 @@ impl OrderRow {
         }
     }
 
-    /// How the bound fiat method is verified: `processor` (Stripe, via the
-    /// seller's restricted key against the Stripe API), `gateway-notified`
+    /// How the bound fiat method is verified: `gateway-notified`
     /// (PayPal, a postback-verified IPN from PayPal's servers paid the
     /// order), or `seller-attested` (PayPal fallback: buyer reports + seller
-    /// confirms). The provenance asymmetry is deliberate and must stay
-    /// visible to both parties.
+    /// confirms). Historical Stripe-bound orders keep reading `processor`.
+    /// The provenance asymmetry is deliberate and must stay visible to both
+    /// parties.
     pub fn fiat_verification(&self) -> Value {
         match self.payment_method.as_deref() {
             Some("stripe") => json!("processor"),

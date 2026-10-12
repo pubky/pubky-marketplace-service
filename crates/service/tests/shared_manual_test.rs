@@ -165,7 +165,7 @@ async fn assert_late_manual_review(pool: &PgPool, order_id: &str, entered_at: Da
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn captured_late_exclusive_status_enters_manual_review_without_paid_effects(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, _payment_id, reference) =
@@ -200,7 +200,7 @@ async fn captured_late_exclusive_status_enters_manual_review_without_paid_effect
 async fn captured_late_shared_manual_status_enters_manual_review_without_seller_confirmation(
     pool: PgPool,
 ) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, _payment_id, reference) =
@@ -234,7 +234,7 @@ async fn captured_late_shared_manual_status_enters_manual_review_without_seller_
 /// and the worker, never `PaykitStatusOutcome` directly.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_missing_or_malformed_late_settlement_fails_closed(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
 
     for (label, malformed) in [
         ("absent", None),
@@ -276,7 +276,7 @@ async fn a_missing_or_malformed_late_settlement_fails_closed(pool: PgPool) {
 /// display state reflects the on-chain fact.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn late_detected_and_undetected_never_take_authority(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
 
     // shared_manual: a late detection must NOT arm the seller window.
     let seller = new_actor(&app).await;
@@ -333,7 +333,7 @@ async fn late_detected_and_undetected_never_take_authority(pool: PgPool) {
 /// purchase on the order — it stays paid with its one receipt.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_late_report_never_unpays_a_terminal_paid_order(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, _payment_id, reference) =
@@ -390,7 +390,7 @@ async fn order_facts(pool: &PgPool, order_id: &str) -> (String, String, bool, Op
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_matching_observation_enters_awaiting_seller_confirmation(pool: PgPool) {
     install_log_capture();
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, _payment_id, reference) =
@@ -523,7 +523,7 @@ async fn a_matching_observation_enters_awaiting_seller_confirmation(pool: PgPool
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_late_observation_goes_straight_to_manual_review(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, _payment_id, reference) =
@@ -582,7 +582,7 @@ async fn a_late_observation_goes_straight_to_manual_review(pool: PgPool) {
 /// confirmation refreshes the facts and keeps the window open.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_late_confirmation_keeps_an_active_seller_window(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, _payment_id, reference) =
@@ -683,7 +683,7 @@ async fn assert_still_waiting(pool: &PgPool, order_id: &str, state: &str, confir
 /// Only the seller's attestation may pay it.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn an_exclusive_confirmation_keeps_an_active_seller_window(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, _payment_id, reference) =
@@ -706,7 +706,7 @@ async fn an_exclusive_confirmation_keeps_an_active_seller_window(pool: PgPool) {
 /// The same mode change with no seller answer: the reaper is the other exit.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn an_exclusive_confirmation_leaves_the_window_to_the_reaper(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, _payment_id, reference) =
@@ -736,7 +736,7 @@ async fn an_exclusive_confirmation_leaves_the_window_to_the_reaper(pool: PgPool)
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn an_amount_mismatch_keeps_an_active_seller_window(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, _payment_id, reference) =
@@ -767,7 +767,7 @@ async fn an_amount_mismatch_keeps_an_active_seller_window(pool: PgPool) {
 /// exit; the reaper routes it to review.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_confirmation_the_order_cannot_take_keeps_the_seller_window(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, _payment_id, reference) =
@@ -807,7 +807,7 @@ async fn a_confirmation_the_order_cannot_take_keeps_the_seller_window(pool: PgPo
 /// None pays it, reviews it, or disarms the window.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn no_paykit_report_moves_an_order_out_of_the_seller_window(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, _payment_id, reference) =
@@ -886,7 +886,7 @@ async fn no_paykit_report_moves_an_order_out_of_the_seller_window(pool: PgPool) 
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn an_unpinned_legacy_exact_confirmation_auto_confirms(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, _payment_id, reference) =
@@ -918,7 +918,7 @@ async fn an_unpinned_legacy_exact_confirmation_auto_confirms(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn an_unpinned_legacy_amount_mismatch_enters_manual_review(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, _payment_id, reference) =
@@ -946,7 +946,7 @@ async fn an_unpinned_legacy_amount_mismatch_enters_manual_review(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn an_exclusive_poll_racing_the_seller_confirm_pays_once_by_attestation(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, _payment_id, reference) =
@@ -995,7 +995,7 @@ async fn an_exclusive_poll_racing_the_seller_confirm_pays_once_by_attestation(po
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn seller_confirm_pays_with_observation_derived_audit(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, _payment_id, reference) =
@@ -1092,7 +1092,7 @@ async fn seller_confirm_pays_with_observation_derived_audit(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn confirm_authorises_before_idempotency_and_is_idempotent(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let other = new_actor(&app).await;
@@ -1151,7 +1151,7 @@ async fn confirm_authorises_before_idempotency_and_is_idempotent(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn confirm_wrong_state_and_observation_mismatch(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, _payment_id, reference) =
@@ -1201,7 +1201,7 @@ async fn confirm_wrong_state_and_observation_mismatch(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn the_seller_window_reaper_routes_to_manual_review_preserving_the_hold(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, _payment_id, reference) =
@@ -1259,7 +1259,7 @@ async fn the_seller_window_reaper_routes_to_manual_review_preserving_the_hold(po
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn confirm_and_reaper_race_has_exactly_one_winner(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
 
     // Deterministic orderings first: reaper-before-confirm and
     // confirm-before-reaper, each against a fresh order at its deadline.
@@ -1419,7 +1419,7 @@ async fn confirm_and_reaper_race_has_exactly_one_winner(pool: PgPool) {
 /// two overlapping real Postgres transactions.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn read_then_write_calibration_produces_the_double_state(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, payment_id, reference) =
@@ -1514,7 +1514,7 @@ async fn read_then_write_calibration_produces_the_double_state(pool: PgPool) {
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn seller_response_sla_alerts_once_at_two_business_days(pool: PgPool) {
     install_log_capture();
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, _payment_id, reference) =
@@ -1584,7 +1584,7 @@ async fn seller_response_sla_alerts_once_at_two_business_days(pool: PgPool) {
 /// governs even against the bind-time record (§B.11.4 A3).
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn the_status_contract_fails_closed(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
 
     // Every malformed contract shape leaves the order untouched.
     let mut malformed = vec![

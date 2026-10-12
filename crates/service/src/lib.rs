@@ -98,10 +98,11 @@ pub struct AppState {
     /// Single flight for commands that read the homeserver before their
     /// executor transaction (`listing.register` with a public record).
     pub command_flights: command_flight::CommandFlights,
-    /// Seller payment-method rails: Stripe key sealing/verification and the
-    /// signed Paykit client. `None` when `STRIPE_KEY_ENCRYPTION_KEY` is
-    /// unset: the whole `/v0` payment-methods surface is refused (fail
-    /// closed; see [`payments::payments_runtime_from_env`]).
+    /// Seller payment-method rails: seller-secret sealing, PayPal IPN
+    /// verification, Shippo and the signed Paykit client. `None` when
+    /// `STRIPE_KEY_ENCRYPTION_KEY` (the seller-secret key) is unset: the
+    /// whole `/v0` payment-methods surface is refused (fail closed; see
+    /// [`payments::payments_runtime_from_env`]).
     pub payments: Option<Arc<PaymentsRuntime>>,
     /// Cached Paykit rail and seller claim availability.
     pub payment_availability: PaymentAvailabilityCache,

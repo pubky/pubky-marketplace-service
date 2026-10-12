@@ -35,8 +35,8 @@ const CONFIG_COLUMNS: &str =
     "seller_pubky, shippo_api_key_ciphertext, ship_from, created_at, updated_at";
 
 /// Associated-data domain for sealing the Shippo token: distinct from the
-/// Stripe key's plain-pubky AAD so ciphertexts are never interchangeable
-/// across purposes.
+/// plain-pubky AAD so ciphertexts are never interchangeable across
+/// purposes.
 fn seal_domain(seller_pubky: &str) -> String {
     format!("{seller_pubky}#shippo")
 }
@@ -247,9 +247,7 @@ pub async fn put_shipping_config(
                 return shipping_error(ErrorCode::InvalidCommand, "invalid_shippo_key", message);
             }
             Some(Some(
-                payments
-                    .stripe_key_cipher
-                    .encrypt(&seal_domain(&actor.0), key),
+                payments.secret_cipher.encrypt(&seal_domain(&actor.0), key),
             ))
         }
     };
@@ -457,7 +455,7 @@ async fn shipping_credentials(
         )));
     };
     let api_key = payments
-        .stripe_key_cipher
+        .secret_cipher
         .decrypt(&seal_domain(seller_pubky), &sealed)
         .map_err(|error| Box::new(internal("shippo token decryption", &error)))?;
     Ok((api_key, ship_from))

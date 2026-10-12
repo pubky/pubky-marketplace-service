@@ -98,8 +98,7 @@ async fn pickup_offer_app(
     fulfillment: &'static [&'static str],
     shipping: bool,
 ) -> (TestApp, FakePaypalIpn) {
-    let (app, _stripe, _paykit, ipn, _shippo) =
-        test_app_with_payments_config(pool, config_durable()).await;
+    let (app, _paykit, ipn, _shippo) = test_app_with_payments_config(pool, config_durable()).await;
     let state = app
         .state
         .clone()

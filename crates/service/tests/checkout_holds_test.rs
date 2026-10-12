@@ -9,7 +9,7 @@ use common::paykit_review::{
     bound_order, enable_bitcoin, poll_now, resolve_call, status_confirmed,
 };
 use common::*;
-use common::{FakePaykit, FakeStripeSession, TestActor};
+use common::{FakePaykit, TestActor};
 use marketplace_service::clock::Clock;
 use marketplace_service::payments::attempt_reference;
 use marketplace_service::workers::{drain_outbox, expire_due_payment_windows};
@@ -19,7 +19,6 @@ use uuid::Uuid;
 
 const HOLDING_COPY: &str =
     "Another buyer's payment is holding this item. If it isn't completed in time, the item restocks.";
-const RESTRICTED_KEY: &str = "rk_test_51NxyzMarketplace";
 const REFUND_REQUIRED_PAID: &str =
     "This payment cannot complete the order. Return the funds, then record the refund.";
 
@@ -53,8 +52,6 @@ async fn bind_method(
 fn full_config_body() -> Value {
     json!({
         "bitcoin_enabled": true,
-        "stripe_payment_link": "https://buy.stripe.com/test_abc123",
-        "stripe_restricted_key": RESTRICTED_KEY,
         "paypal_merchant_email": "merchant@example.com",
     })
 }
@@ -292,7 +289,7 @@ async fn qty_two_second_checkout_succeeds(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn bind_rearms_fiat_and_bitcoin_windows(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool).await;
+    let (app, paykit) = test_app_with_payments(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     put_config(&app, &seller.token, &full_config_body()).await;
@@ -302,7 +299,7 @@ async fn bind_rearms_fiat_and_bitcoin_windows(pool: PgPool) {
         (false, None, None)
     );
 
-    let (status, body) = bind_method(&app, &buyer.token, &order.order_id, "stripe").await;
+    let (status, body) = bind_method(&app, &buyer.token, &order.order_id, "paypal").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         hold_row(&app.pool, &order.order_id).await,
@@ -380,7 +377,7 @@ async fn operator_sql_selects_only_unbound_pending(pool: PgPool) {
     let auction = Uuid::new_v4();
     for (id, method, auction_id) in [
         (unbound, None, None),
-        (bound, Some("stripe"), None),
+        (bound, Some("paypal"), None),
         (auction, None, Some("listing:seller_boots")),
     ] {
         sqlx::query(
@@ -432,49 +429,8 @@ async fn operator_sql_selects_only_unbound_pending(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn same_ms_stripe_pipelines_one_winner(pool: PgPool) {
-    let (app, stripe, _paykit) = test_app_with_payments(pool.clone()).await;
-    stripe.accept_key(RESTRICTED_KEY);
-    let seller = new_actor(&app).await;
-    put_config(&app, &seller.token, &full_config_body()).await;
-    execute(&app, &seller.token, &register_command(&seller.pubky, 1)).await;
-    let first = new_actor(&app).await;
-    let second = new_actor(&app).await;
-    let (token, order_id, _payment_id) =
-        race_qty_one_binds(&app, &seller.pubky, &first, &second, 0xb100, "stripe").await;
-
-    let total: i64 = sqlx::query_scalar("SELECT total_minor FROM orders WHERE id = $1::uuid")
-        .bind(&order_id)
-        .fetch_one(&app.pool)
-        .await
-        .expect("total");
-    stripe.add_session(FakeStripeSession {
-        id: "cs_paid_match".into(),
-        client_reference_id: order_id.clone(),
-        payment_status: "paid".into(),
-        amount_total: total,
-        currency: "usd".into(),
-    });
-    let (status, body) = send(
-        app.router.clone(),
-        "POST",
-        &format!("/v0/orders/{order_id}/fiat/verify"),
-        Some(&token),
-        &Value::Null,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let paid: String = sqlx::query_scalar("SELECT state FROM orders WHERE id = $1::uuid")
-        .bind(&order_id)
-        .fetch_one(&app.pool)
-        .await
-        .expect("order");
-    assert_eq!(paid, "paid");
-}
-
-#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn same_ms_paypal_pipelines_one_winner(pool: PgPool) {
-    let (app, _stripe, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
+    let (app, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
     let seller = new_actor(&app).await;
     put_config(&app, &seller.token, &full_config_body()).await;
     execute(&app, &seller.token, &register_command(&seller.pubky, 1)).await;
@@ -500,7 +456,7 @@ async fn same_ms_paypal_pipelines_one_winner(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn same_ms_bitcoin_exclusive_pipelines_one_winner(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     enable_bitcoin(&app, &paykit, &seller).await;
     execute(&app, &seller.token, &register_sat_command(&seller.pubky, 1)).await;
@@ -530,7 +486,7 @@ async fn same_ms_bitcoin_exclusive_pipelines_one_winner(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn same_ms_bitcoin_ln_pipelines_one_winner(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     enable_bitcoin(&app, &paykit, &seller).await;
     execute(&app, &seller.token, &register_sat_command(&seller.pubky, 1)).await;
@@ -587,7 +543,7 @@ async fn same_ms_sandbox_pipelines_one_winner(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn bitcoin_late_completion_when_stock_is_free(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, _payment_id, reference) =
@@ -625,7 +581,7 @@ async fn bitcoin_late_completion_when_stock_is_free(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn bitcoin_refund_required_when_second_buyer_holds(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let first = new_actor(&app).await;
     let (order_id, reference) =
@@ -694,7 +650,7 @@ async fn bitcoin_refund_required_when_second_buyer_holds(pool: PgPool) {
 /// on `events_one_per_aggregate_revision`.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn late_cancel_then_record_external_keeps_revision_monotonic(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, reference) =
@@ -799,7 +755,7 @@ async fn assert_order_event_revisions_match(pool: &PgPool, order_id: &str, order
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn paypal_ipn_after_expire_with_stock_gone_is_refund_required(pool: PgPool) {
-    let (app, _stripe, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
+    let (app, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     put_config(&app, &seller.token, &full_config_body()).await;
@@ -839,230 +795,6 @@ async fn paypal_ipn_after_expire_with_stock_gone_is_refund_required(pool: PgPool
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn stripe_verify_after_expire_with_stock_gone_is_refund_required(pool: PgPool) {
-    let (app, stripe, _paykit) = test_app_with_payments(pool.clone()).await;
-    stripe.accept_key(RESTRICTED_KEY);
-    let seller = new_actor(&app).await;
-    let buyer = new_actor(&app).await;
-    put_config(&app, &seller.token, &full_config_body()).await;
-    let order = create_pending_order(&app, &seller, &buyer).await;
-    let (status, body) = bind_method(&app, &buyer.token, &order.order_id, "stripe").await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let total = body["order"]["total"]["amount_minor"]
-        .as_i64()
-        .expect("total");
-    let after = app.clock.now() + chrono::Duration::seconds(3700);
-    assert!(
-        expire_due_payment_windows(&app.state, after)
-            .await
-            .expect("expire")
-            >= 1
-    );
-    sqlx::query(
-        "UPDATE listings SET available_quantity = 0, reserved_quantity = 0, \
-         sold_quantity = total_quantity, state = 'sold' WHERE aggregate_id = $1",
-    )
-    .bind(listing_aggregate(&seller.pubky))
-    .execute(&pool)
-    .await
-    .expect("sold out");
-    stripe.add_session(FakeStripeSession {
-        id: "cs_late_gone".into(),
-        client_reference_id: order.order_id.clone(),
-        payment_status: "paid".into(),
-        amount_total: total,
-        currency: "usd".into(),
-    });
-    let (status, body) = send(
-        app.router.clone(),
-        "POST",
-        &format!("/v0/orders/{}/fiat/verify", order.order_id),
-        Some(&buyer.token),
-        &Value::Null,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let reason: Option<String> =
-        sqlx::query_scalar("SELECT review_reason FROM payments WHERE order_id = $1::uuid")
-            .bind(&order.order_id)
-            .fetch_one(&pool)
-            .await
-            .expect("reason");
-    assert_eq!(reason.as_deref(), Some("refund_required"));
-}
-
-async fn expired_stripe_order(
-    app: &TestApp,
-    seller: &TestActor,
-    buyer: &TestActor,
-) -> (String, i64) {
-    put_config(app, &seller.token, &full_config_body()).await;
-    let order = create_pending_order(app, seller, buyer).await;
-    let (status, body) = bind_method(app, &buyer.token, &order.order_id, "stripe").await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let total = body["order"]["total"]["amount_minor"]
-        .as_i64()
-        .expect("total");
-    let after = app.clock.now() + chrono::Duration::seconds(3700);
-    assert!(
-        expire_due_payment_windows(&app.state, after)
-            .await
-            .expect("expire")
-            >= 1
-    );
-    (order.order_id, total)
-}
-
-async fn verify_stripe(app: &TestApp, token: &str, order_id: &str) -> (StatusCode, Value) {
-    send(
-        app.router.clone(),
-        "POST",
-        &format!("/v0/orders/{order_id}/fiat/verify"),
-        Some(token),
-        &Value::Null,
-    )
-    .await
-}
-
-async fn order_and_payment_state(pool: &PgPool, order_id: &str) -> (String, String) {
-    sqlx::query_as(
-        "SELECT o.state, p.state FROM orders o JOIN payments p ON p.order_id = o.id \
-         WHERE o.id = $1::uuid",
-    )
-    .bind(order_id)
-    .fetch_one(pool)
-    .await
-    .expect("order and payment state")
-}
-
-#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn stripe_verify_after_expire_without_a_paid_session_never_pays(pool: PgPool) {
-    let (app, stripe, _paykit) = test_app_with_payments(pool.clone()).await;
-    stripe.accept_key(RESTRICTED_KEY);
-    let seller = new_actor(&app).await;
-    let buyer = new_actor(&app).await;
-    let (order_id, total) = expired_stripe_order(&app, &seller, &buyer).await;
-    assert_eq!(
-        order_and_payment_state(&pool, &order_id).await,
-        ("cancelled".to_string(), "expired".to_string())
-    );
-
-    let requests_before = stripe.request_count();
-    let (status, body) = verify_stripe(&app, &buyer.token, &order_id).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["verified"], json!(false), "{body}");
-    assert_eq!(body["status"], json!("not_found"), "{body}");
-    assert!(
-        stripe.request_count() > requests_before,
-        "an expired payment is verified against Stripe, never taken on the buyer's word"
-    );
-
-    // Sessions that are unpaid or that do not match the order never verify it.
-    stripe.add_session(FakeStripeSession {
-        id: "cs_expired_unpaid".into(),
-        client_reference_id: order_id.clone(),
-        payment_status: "unpaid".into(),
-        amount_total: total,
-        currency: "usd".into(),
-    });
-    stripe.add_session(FakeStripeSession {
-        id: "cs_expired_wrong_amount".into(),
-        client_reference_id: order_id.clone(),
-        payment_status: "paid".into(),
-        amount_total: total - 1,
-        currency: "usd".into(),
-    });
-    for token in [&buyer.token, &seller.token] {
-        let (status, body) = verify_stripe(&app, token, &order_id).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["verified"], json!(false), "{body}");
-    }
-
-    assert_eq!(
-        order_and_payment_state(&pool, &order_id).await,
-        ("cancelled".to_string(), "expired".to_string())
-    );
-    assert_eq!(count(&pool, "SELECT COUNT(*) FROM receipts").await, 0);
-    let (stock_held, _, _) = hold_row(&pool, &order_id).await;
-    assert!(!stock_held, "an unverified payment never takes stock back");
-}
-
-#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn stripe_verify_after_expire_needs_a_usable_seller_key(pool: PgPool) {
-    let (app, stripe, _paykit) = test_app_with_payments(pool.clone()).await;
-    let seller = new_actor(&app).await;
-    let buyer = new_actor(&app).await;
-    let (order_id, _total) = expired_stripe_order(&app, &seller, &buyer).await;
-
-    // The fake accepts no keys, so Stripe rejects the stored key: an expired
-    // payment is not paid, and the rejection is reported instead of hidden.
-    let (status, body) = verify_stripe(&app, &buyer.token, &order_id).await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(
-        body["error"]["reason"],
-        json!("stripe_key_invalid"),
-        "{body}"
-    );
-
-    let (status, _) = put_config(
-        &app,
-        &seller.token,
-        &json!({
-            "bitcoin_enabled": false,
-            "stripe_payment_link": "https://buy.stripe.com/test_abc123",
-            "stripe_restricted_key": "",
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let (status, body) = verify_stripe(&app, &buyer.token, &order_id).await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(
-        body["error"]["reason"],
-        json!("stripe_key_missing"),
-        "{body}"
-    );
-
-    assert_eq!(
-        order_and_payment_state(&pool, &order_id).await,
-        ("cancelled".to_string(), "expired".to_string())
-    );
-    assert_eq!(stripe.request_count(), 1);
-}
-
-#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn stripe_verify_after_expire_with_a_paid_session_and_free_stock_completes(pool: PgPool) {
-    let (app, stripe, _paykit) = test_app_with_payments(pool.clone()).await;
-    stripe.accept_key(RESTRICTED_KEY);
-    let seller = new_actor(&app).await;
-    let buyer = new_actor(&app).await;
-    let (order_id, total) = expired_stripe_order(&app, &seller, &buyer).await;
-    stripe.add_session(FakeStripeSession {
-        id: "cs_late_paid".into(),
-        client_reference_id: order_id.clone(),
-        payment_status: "paid".into(),
-        amount_total: total,
-        currency: "usd".into(),
-    });
-
-    let (status, body) = verify_stripe(&app, &buyer.token, &order_id).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["verified"], json!(true), "{body}");
-    assert_eq!(body["order"]["state"], json!("paid"), "{body}");
-    assert_eq!(
-        order_and_payment_state(&pool, &order_id).await,
-        ("paid".to_string(), "confirmed".to_string())
-    );
-    assert_eq!(count(&pool, "SELECT COUNT(*) FROM receipts").await, 1);
-
-    // Re-verification of the now-confirmed payment stays an idempotent success.
-    let (status, body) = verify_stripe(&app, &seller.token, &order_id).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["verified"], json!(true), "{body}");
-    assert_eq!(count(&pool, "SELECT COUNT(*) FROM receipts").await, 1);
-}
-
-#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn sandbox_confirm_inside_window_pays_held_checkout(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
@@ -1080,7 +812,7 @@ async fn sandbox_confirm_inside_window_pays_held_checkout(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn bitcoin_exclusive_confirm_inside_window_pays(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, _payment_id, reference) =

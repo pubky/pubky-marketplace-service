@@ -90,9 +90,8 @@ pub struct Config {
     pub checkout_hold_window_seconds: i64,
     /// Hold window armed by a fiat payment-method bind
     /// (`FIAT_PAYMENT_WINDOW_SECONDS`, default 600, minimum 60). PayPal
-    /// `_xclick` and Stripe Payment Link have no matching inventory TTL;
-    /// this is the listing restock clock while those hosted checkouts are
-    /// open.
+    /// `_xclick` has no matching inventory TTL; this is the listing restock
+    /// clock while the hosted checkout is open.
     pub fiat_payment_window_seconds: i64,
     /// Hold window armed by a bitcoin payment-method bind
     /// (`BITCOIN_PAYMENT_WINDOW_SECONDS`, default 1800, minimum 60). The

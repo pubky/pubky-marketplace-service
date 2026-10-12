@@ -21,7 +21,7 @@ A released invoice can still receive money, for example when an activation commi
 `review_reason` values:
 
 - `payment_settled`: money confirmed on a released attempt after the order's payment was already confirmed, resolved, or under review. The buyer paid twice.
-- `other_rail`: money confirmed on a released Bitcoin attempt while another rail owns the payment: the order is bound to Stripe or PayPal, or the payment is managed by Locks (or any adapter other than `paykit` or `sandbox`). The order and payment are left untouched.
+- `other_rail`: money confirmed on a released Bitcoin attempt while another rail owns the payment: the order is bound to PayPal (or, for an order that predates the Stripe removal, Stripe), or the payment is managed by Locks (or any adapter other than `paykit` or `sandbox`). The order and payment are left untouched.
 - `detected_unconfirmed`: money was detected on the released attempt but did not confirm within 7 days.
 
 ## Polling cadence

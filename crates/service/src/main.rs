@@ -48,9 +48,9 @@ async fn main() -> anyhow::Result<()> {
     // without salt, or salt without key) refuses to start rather than
     // issuing attestations with unlinkable order refs.
     let attestor = marketplace_service::attestor::Attestor::from_env()?;
-    // Fail closed for payment methods: STRIPE_KEY_ENCRYPTION_KEY enables the
-    // surface, and the Paykit pair (server URL + signing key) is
-    // all-or-nothing within it.
+    // Fail closed for payment methods: STRIPE_KEY_ENCRYPTION_KEY (the
+    // seller-secret key, a legacy name) enables the surface, and the Paykit
+    // pair (server URL + signing key) is all-or-nothing within it.
     let payments = marketplace_service::payments::payments_runtime_from_env()?;
     match &payments {
         Some(payments) => tracing::info!(
@@ -61,7 +61,7 @@ async fn main() -> anyhow::Result<()> {
             },
             "payment methods enabled"
         ),
-        None => tracing::info!("payment methods disabled (no Stripe key encryption key)"),
+        None => tracing::info!("payment methods disabled (no seller-secret encryption key)"),
     }
     // All-or-none for local pickup (§A8): PICKUP_DETAILS_ENCRYPTION_KEY
     // enables the sealed pickup-details store; absent, pickup is OFF and
