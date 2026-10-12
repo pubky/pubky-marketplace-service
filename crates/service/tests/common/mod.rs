@@ -1789,6 +1789,41 @@ pub async fn count(pool: &PgPool, sql: &str) -> i64 {
     value
 }
 
+/// Every `table.column` of the public schema holding `needle` as text, JSON
+/// or bytes: the scan behind "this value is stored nowhere".
+pub async fn db_columns_containing(pool: &PgPool, needle: &str) -> Vec<String> {
+    let columns: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT c.table_name, c.column_name, c.data_type FROM information_schema.columns c \
+         JOIN information_schema.tables t \
+           ON t.table_schema = c.table_schema AND t.table_name = c.table_name \
+         WHERE c.table_schema = 'public' AND t.table_type = 'BASE TABLE' \
+           AND c.data_type IN ('text', 'character varying', 'jsonb', 'json', 'bytea', 'ARRAY')",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("column catalog");
+    let mut hits = Vec::new();
+    for (table, column, data_type) in columns {
+        let predicate = if data_type == "bytea" {
+            format!("position($1::bytea IN \"{column}\") > 0")
+        } else {
+            format!("strpos(\"{column}\"::text, $2) > 0")
+        };
+        let (found,): (bool,) = sqlx::query_as(&format!(
+            "SELECT EXISTS (SELECT 1 FROM \"{table}\" WHERE {predicate})"
+        ))
+        .bind(needle.as_bytes())
+        .bind(needle)
+        .fetch_one(pool)
+        .await
+        .unwrap_or_else(|error| panic!("scan {table}.{column}: {error}"));
+        if found {
+            hits.push(format!("{table}.{column}"));
+        }
+    }
+    hits
+}
+
 /// Deterministic key sealing seller secrets in tests (production:
 /// `STRIPE_KEY_ENCRYPTION_KEY`, a legacy name).
 pub const TEST_SELLER_SECRET_KEY: &str =

@@ -2023,3 +2023,54 @@ async fn a_canceled_reversal_before_its_reversal_leaves_nothing_outstanding(pool
     assert!(view["gateway_refund_review_at"].is_string());
     assert_eq!(ledger_rows(&pool, &order.id).await.len(), 2);
 }
+
+/// Payer values the real IPN fixtures carry; none may be stored or logged.
+const PAYER_VALUES: [&str; 8] = [
+    "buyer@example.com",
+    "LPLWNMTBWMFAY",
+    "Test Buyer",
+    "1 Main St",
+    "San Jose",
+    "95131",
+    "AtkOfCXbDm2hu0ZELryHFjY",
+    "5f3e8a1c9b2d4",
+];
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn paypal_ipn_stores_nothing_about_the_payer(pool: PgPool) {
+    install_log_capture();
+    let (app, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
+    let order = paid_paypal_order(&app, PAYMENT_TXN).await;
+
+    // A refund applied to the order, and one held in the inbox.
+    assert_eq!(
+        post_ipn(
+            &app,
+            &refund("refund-partial-1.ipn", &order.id, PAYMENT_TXN)
+        )
+        .await,
+        StatusCode::OK
+    );
+    let unknown = refund("refund-full.ipn", &order.id, "9ZZ99999ZZ9999999");
+    assert_eq!(post_ipn(&app, &unknown).await, StatusCode::OK);
+    assert_eq!(inbox_rows(&pool).await.len(), 1);
+
+    for value in PAYER_VALUES {
+        let hits = db_columns_containing(&pool, value).await;
+        assert!(hits.is_empty(), "{value} stored at {hits:?}");
+        assert!(!captured_logs().contains(value), "{value} reached the logs");
+    }
+
+    // What is kept is the payment id and the seller's account.
+    let (txn, receiver_email, receiver_id): (String, String, Option<String>) = sqlx::query_as(
+        "SELECT paypal_txn_id, paypal_receiver_email, paypal_receiver_id FROM orders \
+         WHERE id = $1::uuid",
+    )
+    .bind(&order.id)
+    .fetch_one(&pool)
+    .await
+    .expect("order row");
+    assert_eq!(txn, PAYMENT_TXN);
+    assert_eq!(receiver_email, "merchant@example.com");
+    assert_eq!(receiver_id.as_deref(), Some("S8XGHLYDW9T3S"));
+}
