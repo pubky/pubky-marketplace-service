@@ -439,7 +439,7 @@ async fn bind_replay_conflict_and_race_yield_exactly_one_quote(pool: PgPool) {
         "POST",
         &format!("/v0/orders/{}/payment-method", order.order_id),
         Some(&fixture.buyer.token),
-        &json!({ "method": "stripe" }),
+        &json!({ "method": "paypal" }),
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");

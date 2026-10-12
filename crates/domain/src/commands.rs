@@ -473,7 +473,11 @@ pub struct CreateCheckoutPayload {
     /// email-kind; the handler refuses it otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery_email: Option<DeliveryEmail>,
-    pub guarantee_policy_version: u32,
+    /// Legacy field. Clients that still send it must send `1`; it is no
+    /// longer required, and the service attaches no policy to an order whose
+    /// command omits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guarantee_policy_version: Option<u32>,
 }
 
 /// Longest accepted delivery email address.
@@ -589,7 +593,9 @@ pub struct OfferCheckoutPayload {
     /// listing publishes and never silently rewrites it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fulfillment: Option<FulfillmentMethod>,
-    pub guarantee_policy_version: u32,
+    /// Legacy field; see [`CreateCheckoutPayload::guarantee_policy_version`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guarantee_policy_version: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1675,10 +1681,13 @@ fn validate_offer_checkout(
             "Offer checkout supports shipping or pickup",
         )),
     }
-    if payload.guarantee_policy_version != 1 {
+    if payload
+        .guarantee_policy_version
+        .is_some_and(|version| version != 1)
+    {
         issues.push(issue(
             "payload.guarantee_policy_version",
-            "Expected guarantee policy version 1",
+            "Expected guarantee policy version 1 when present",
         ));
     }
     if issues.is_empty() {
@@ -2289,10 +2298,13 @@ fn validate_create_checkout(
         }
         (None, false) => {}
     }
-    if payload.guarantee_policy_version != 1 {
+    if payload
+        .guarantee_policy_version
+        .is_some_and(|version| version != 1)
+    {
         issues.push(issue(
             "payload.guarantee_policy_version",
-            "Expected guarantee policy version 1",
+            "Expected guarantee policy version 1 when present",
         ));
     }
 
@@ -2786,6 +2798,43 @@ mod tests {
             serde_json::to_string(&command.canonical_json()).expect("canonical JSON serializes");
         assert!(!serialized.contains("variant_id"));
         assert!(!serialized.contains("variant_options"));
+    }
+
+    #[test]
+    fn checkout_accepts_a_legacy_guarantee_policy_version_but_does_not_require_it() {
+        let present = parse_command(&checkout_command_json()).expect("legacy checkout parses");
+        let CommandPayload::CreateCheckout(payload) = &present.payload else {
+            panic!("expected checkout payload");
+        };
+        assert_eq!(payload.guarantee_policy_version, Some(1));
+
+        let mut absent_raw = checkout_command_json();
+        absent_raw["payload"]
+            .as_object_mut()
+            .expect("payload object")
+            .remove("guarantee_policy_version");
+        let absent = parse_command(&absent_raw).expect("checkout without the field parses");
+        let CommandPayload::CreateCheckout(payload) = &absent.payload else {
+            panic!("expected checkout payload");
+        };
+        assert_eq!(payload.guarantee_policy_version, None);
+        let serialized =
+            serde_json::to_string(&absent.canonical_json()).expect("canonical JSON serializes");
+        assert!(!serialized.contains("guarantee_policy_version"));
+
+        let present_serialized =
+            serde_json::to_string(&present.canonical_json()).expect("canonical JSON serializes");
+        assert!(present_serialized.contains("\"guarantee_policy_version\":1"));
+    }
+
+    #[test]
+    fn checkout_rejects_an_unknown_guarantee_policy_version() {
+        let mut raw = checkout_command_json();
+        raw["payload"]["guarantee_policy_version"] = json!(2);
+        let issues = parse_command(&raw).expect_err("version 2 is not a defined policy");
+        assert!(issues
+            .iter()
+            .any(|issue| issue.path == "payload.guarantee_policy_version"));
     }
 
     #[test]

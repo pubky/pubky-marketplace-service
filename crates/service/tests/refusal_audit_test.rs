@@ -1994,7 +1994,7 @@ async fn refusal_audit_forbidden_plaintext_inverse_scan(pool: PgPool) {
 async fn refusal_audit_manual_resolve_missing_pin_is_recorded_after_domain_release(pool: PgPool) {
     use common::paykit_review::{into_manual_review_held, resolve_call};
 
-    let (mut app, _stripe, paykit) = common::test_app_with_payments(pool.clone()).await;
+    let (mut app, paykit) = common::test_app_with_payments(pool.clone()).await;
     let seller = common::new_actor(&app).await;
     let buyer = common::new_actor(&app).await;
     let (order_id, _) = into_manual_review_held(&app, &paykit, &seller, &buyer).await;
@@ -2530,7 +2530,7 @@ async fn refusal_audit_real_fixture_is_invariant_across_writer_states(pool: PgPo
         common::prepare_locks_command(locks_payment, 122),
     ));
 
-    let (manual_app, _stripe, paykit) = common::test_app_with_payments(pool.clone()).await;
+    let (manual_app, paykit) = common::test_app_with_payments(pool.clone()).await;
     let manual_seller = common::new_actor(&manual_app).await;
     let manual_buyer = common::new_actor(&manual_app).await;
     let manual_other = common::new_actor(&manual_app).await;

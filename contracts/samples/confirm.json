@@ -184,6 +184,7 @@
         },
         "ok": true,
         "order": {
+          "auto_complete_days": null,
           "bitcoin_payable": {
             "amount_minor": 51637,
             "currency": "SAT",
@@ -202,6 +203,7 @@
           "buyer_pubky": "<pubky:buyer>",
           "cancellation_reason": null,
           "created_at": "<timestamp:1>",
+          "delivery_assume_days": null,
           "delivery_assumed": false,
           "drop_aggregate_id": null,
           "edition": null,

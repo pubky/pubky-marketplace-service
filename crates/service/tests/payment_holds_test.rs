@@ -50,7 +50,7 @@ async fn order_hold(app: &TestApp, order_id: &str) -> (bool, Option<String>) {
 // second bind is 409 INVALID_STATE with the holding copy.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn both_buyers_check_out_the_last_unit_and_the_first_bind_wins(pool: PgPool) {
-    let (app, _stripe, _paykit) = test_app_with_payments(pool).await;
+    let (app, _paykit) = test_app_with_payments(pool).await;
     let seller = new_actor(&app).await;
     let first = new_actor(&app).await;
     let second = new_actor(&app).await;
@@ -62,7 +62,7 @@ async fn both_buyers_check_out_the_last_unit_and_the_first_bind_wins(pool: PgPoo
         Some(&seller.token),
         &json!({
             "bitcoin_enabled": false,
-            "stripe_payment_link": "https://buy.stripe.com/test_abc123",
+            "paypal_merchant_email": "merchant@example.com",
         }),
     )
     .await;
@@ -109,7 +109,7 @@ async fn both_buyers_check_out_the_last_unit_and_the_first_bind_wins(pool: PgPoo
         "POST",
         &format!("/v0/orders/{first_order}/payment-method"),
         Some(&first.token),
-        &json!({ "method": "stripe" }),
+        &json!({ "method": "paypal" }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "first bind failed: {first_bind}");
@@ -119,7 +119,7 @@ async fn both_buyers_check_out_the_last_unit_and_the_first_bind_wins(pool: PgPoo
         "POST",
         &format!("/v0/orders/{second_order}/payment-method"),
         Some(&second.token),
-        &json!({ "method": "stripe" }),
+        &json!({ "method": "paypal" }),
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "unexpected: {second_bind}");
@@ -234,7 +234,7 @@ async fn register_locks_acquires_the_hold_and_arms_the_locks_window(pool: PgPool
 // the hold and arms the fiat payment window.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn the_payment_method_bind_acquires_the_hold_and_arms_the_fiat_window(pool: PgPool) {
-    let (app, _stripe, _paykit) = test_app_with_payments(pool).await;
+    let (app, _paykit) = test_app_with_payments(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (status, body) = send(
@@ -244,7 +244,7 @@ async fn the_payment_method_bind_acquires_the_hold_and_arms_the_fiat_window(pool
         Some(&seller.token),
         &json!({
             "bitcoin_enabled": false,
-            "stripe_payment_link": "https://buy.stripe.com/test_abc123",
+            "paypal_merchant_email": "merchant@example.com",
         }),
     )
     .await;
@@ -274,10 +274,10 @@ async fn the_payment_method_bind_acquires_the_hold_and_arms_the_fiat_window(pool
         "POST",
         &format!("/v0/orders/{}/payment-method", order.order_id),
         Some(&buyer.token),
-        &json!({ "method": "stripe" }),
+        &json!({ "method": "paypal" }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "stripe bind failed: {body}");
+    assert_eq!(status, StatusCode::OK, "paypal bind failed: {body}");
     assert_eq!(body["order"]["stock_held"], json!(true));
     // FIAT_PAYMENT_WINDOW_SECONDS is 3600 in the test config.
     assert_eq!(body["order"]["hold_expires_at"], json!(ts_after(3_600)));
@@ -291,7 +291,7 @@ async fn the_payment_method_bind_acquires_the_hold_and_arms_the_fiat_window(pool
         "POST",
         &format!("/v0/orders/{sibling_order}/payment-method"),
         Some(&second_buyer.token),
-        &json!({ "method": "stripe" }),
+        &json!({ "method": "paypal" }),
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "unexpected: {sibling_bind}");
@@ -304,7 +304,7 @@ async fn the_payment_method_bind_acquires_the_hold_and_arms_the_fiat_window(pool
         "POST",
         &format!("/v0/orders/{}/payment-method", order.order_id),
         Some(&buyer.token),
-        &json!({ "method": "stripe" }),
+        &json!({ "method": "paypal" }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "re-bind failed: {body}");
@@ -524,7 +524,7 @@ async fn the_backfill_marks_exactly_the_legacy_pending_checkout_orders(pool: PgP
     let auction_pending = Uuid::new_v4();
     let already_paid = Uuid::new_v4();
     insert_order(plain_pending, "pending_payment", None, None).await;
-    insert_order(fiat_pending, "pending_payment", None, Some("stripe")).await;
+    insert_order(fiat_pending, "pending_payment", None, Some("paypal")).await;
     insert_order(correlated_pending, "pending_payment", None, None).await;
     insert_order(
         auction_pending,

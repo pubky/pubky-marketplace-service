@@ -32,6 +32,7 @@ const stagingEnv = {
   LOCKS_BUNDLE_ENCRYPTION_KEY: preserve(),
   LOCKS_LOOKUP_HMAC_KEY: preserve(),
   LOCKS_SERVER_URL: preserve(),
+  NEXUS_URL: preserve(),
   MARKETPLACE_GRANT_CLIENT_ID: preserve(),
   MARKETPLACE_GRANT_CREATE_PER_IP_PER_MINUTE: preserve(),
   MARKETPLACE_GRANT_CREATE_PER_PUBKY_PER_MINUTE: preserve(),

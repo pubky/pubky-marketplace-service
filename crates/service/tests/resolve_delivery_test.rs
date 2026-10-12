@@ -182,7 +182,7 @@ async fn deliver(app: &TestApp, paykit: &PaykitClient, now: DateTime<Utc>) -> u6
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn delivery_sends_the_canonical_signed_resolve_and_stamps(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, invoice_id) =
@@ -231,7 +231,7 @@ async fn delivery_sends_the_canonical_signed_resolve_and_stamps(pool: PgPool) {
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn permanent_refusals_terminate_visibly_without_retries(pool: PgPool) {
     install_log_capture();
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let cases: Vec<(&str, u16, &str, &str)> = vec![
         ("unknown_invoice", 404, "unknown_invoice", "unknown_invoice"),
         ("not_found", 404, "not_found", "not_found"),
@@ -312,7 +312,7 @@ async fn permanent_refusals_terminate_visibly_without_retries(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn unmapped_classes_terminate_with_status_and_code_recorded(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, invoice_id) =
@@ -357,7 +357,7 @@ async fn unmapped_classes_terminate_with_status_and_code_recorded(pool: PgPool) 
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn transient_statuses_retry_then_deliver(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let client = paykit_client(&app);
     // Every named transient status, through the real HTTP harness.
     for status in [408u16, 425, 429, 500, 502, 503, 504] {
@@ -411,7 +411,7 @@ async fn transient_statuses_retry_then_deliver(pool: PgPool) {
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn baseline_in_progress_retries_and_401_alerts_once(pool: PgPool) {
     install_log_capture();
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let client = paykit_client(&app);
 
     // invoice_baseline_in_progress: the one transient refusal.
@@ -473,7 +473,7 @@ async fn baseline_in_progress_retries_and_401_alerts_once(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn retry_after_is_a_floor_never_an_undercut(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let client = paykit_client(&app);
 
     // 429 with a Retry-After LONGER than the backoff: honoured as the next
@@ -595,7 +595,7 @@ async fn retry_after_is_a_floor_never_an_undercut(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn the_deadline_terminates_regardless_of_class(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let client = paykit_client(&app);
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
@@ -645,7 +645,7 @@ async fn the_deadline_terminates_regardless_of_class(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn pinned_a_then_repoint_b_delivers_only_to_a(pool: PgPool) {
-    let (app, _stripe, paykit_a) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit_a) = test_app_with_payments(pool.clone()).await;
     let paykit_b = spawn_fake_paykit().await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
@@ -722,7 +722,7 @@ async fn pinned_a_then_repoint_b_delivers_only_to_a(pool: PgPool) {
 /// never sent there.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_fork_row_is_never_sent_to_an_endpoint_answering_upstream_readiness(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let upstream = spawn_fake_paykit().await;
     upstream.set_rail_health(json!({
         "status": "ready",
@@ -761,7 +761,7 @@ async fn a_fork_row_is_never_sent_to_an_endpoint_answering_upstream_readiness(po
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn redelivery_is_a_terminal_ok_noop(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, invoice_id) =
@@ -810,7 +810,7 @@ async fn redelivery_is_a_terminal_ok_noop(pool: PgPool) {
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn acknowledgement_gates_the_drain_and_the_escape_is_delivery_only(pool: PgPool) {
     install_log_capture();
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let client = paykit_client(&app);
 
     // A terminally-failed row blocks condition 6 until acknowledged.
@@ -908,7 +908,7 @@ async fn acknowledgement_gates_the_drain_and_the_escape_is_delivery_only(pool: P
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn drain_gate_7_6_7_interleavings(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let client = paykit_client(&app);
     let stack = paykit.stack_id();
 

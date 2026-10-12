@@ -544,14 +544,16 @@ async fn migration_0023_adds_the_shared_manual_resolution_schema() {
 /// delivery state 0045, per-user priv data keys 0046, listing
 /// tombstones 0047, notification review reasons 0048, outbox
 /// quarantine 0049, fenced listing deletion 0050, and listing revival
-/// proof 0051, and upstream Paykit lifecycle identity 0052.
+/// proof 0051, upstream Paykit lifecycle identity 0052, per-order delivery
+/// terms 0056, and the purge of retired Stripe values 0058. Numbers 0053 to
+/// 0055 and 0057 remain reserved by other work.
 fn sorted_migration_catalog(mut numbers: Vec<u32>) -> Vec<u32> {
     numbers.sort_unstable();
     numbers
 }
 
 #[test]
-fn migration_catalog_is_gapless_through_0052() {
+fn migration_catalog_is_gapless_through_0052_then_0056_and_0058() {
     let numbers: Vec<u32> = std::fs::read_dir(MIGRATIONS_DIR)
         .expect("migrations dir")
         .filter_map(|entry| {
@@ -561,11 +563,11 @@ fn migration_catalog_is_gapless_through_0052() {
                 .and_then(|prefix| prefix.parse::<u32>().ok())
         })
         .collect();
-    let expected = (1..=52).collect::<Vec<_>>();
+    let expected = (1..=52).chain([56, 58]).collect::<Vec<_>>();
     assert_eq!(
         sorted_migration_catalog(numbers),
         expected,
-        "the raw catalog is 0001..=0052, gapless"
+        "the raw catalog is 0001..=0052 gapless, then 0056 and 0058 (0053..=0055 and 0057 are reserved)"
     );
 }
 

@@ -3646,10 +3646,15 @@ struct DeliveredOrderClaim {
     fulfillment: String,
     delivered_at: Option<String>,
     handover_at: Option<DateTime<Utc>>,
+    /// The order's own period (`orders.auto_complete_days`), else the
+    /// configured default.
+    auto_complete_days: i64,
 }
 
-/// Marks `shipped` orders `delivered` once `assume_days` have elapsed since
-/// the ship timestamp — the `delivery_assume` server trigger on the
+/// Marks `shipped` orders `delivered` once the order's own delivery period
+/// (`orders.delivery_assume_days`, frozen from the seller's shop record at
+/// the order's first payment lock point; `default_assume_days` when none was
+/// captured) has elapsed since the ship timestamp — the `delivery_assume` server trigger on the
 /// machine's shipped → delivered edge, standing in for the carrier
 /// tracking feed this service deliberately does not have. The update is a
 /// compare-and-swap on `state = 'shipped'`, so a double-claim (lease
@@ -3658,6 +3663,10 @@ struct DeliveredOrderClaim {
 /// delivery was assumed, not confirmed. Both participants are notified;
 /// the event is attributed to the system actor, never a peer.
 ///
+/// The same period also ends a paid manual digital order the seller never
+/// marked delivered, counted from the payment (see
+/// `assume_due_digital_deliveries_batch`).
+///
 /// Claims are bounded (`batch_size` per inner transaction, up to
 /// `max_batches` per call) so a backlog cannot hold row locks on every due
 /// order at once. Malformed `shipped_at` values are skipped and logged by
@@ -3665,15 +3674,21 @@ struct DeliveredOrderClaim {
 pub async fn assume_due_deliveries(
     pool: &PgPool,
     now: DateTime<Utc>,
-    assume_days: i64,
+    default_assume_days: i64,
     batch_size: i64,
     max_batches: u32,
 ) -> anyhow::Result<u64> {
-    let cutoff = now - chrono::Duration::days(assume_days);
-    let cutoff_text = crate::clock::format_timestamp(cutoff);
     let mut assumed = 0u64;
     for _ in 0..max_batches {
-        let pass = assume_due_deliveries_batch(pool, now, cutoff, &cutoff_text, batch_size).await?;
+        let pass = assume_due_deliveries_batch(pool, now, default_assume_days, batch_size).await?;
+        assumed += pass.processed;
+        if pass.claimed < batch_size as u64 {
+            break;
+        }
+    }
+    for _ in 0..max_batches {
+        let pass =
+            assume_due_digital_deliveries_batch(pool, now, default_assume_days, batch_size).await?;
         assumed += pass.processed;
         if pass.claimed < batch_size as u64 {
             break;
@@ -3682,32 +3697,137 @@ pub async fn assume_due_deliveries(
     Ok(assumed)
 }
 
-async fn assume_due_deliveries_batch(
+/// Assumes delivery of paid digital orders the seller never marked
+/// delivered: a manual ("I'll email it" / "I'll send it in messages") order
+/// that sits in `paid` past its frozen delivered-assumption period, counted
+/// from the receipt's issue instant (the payment), moves `paid → delivered`
+/// exactly as a shipped order does after shipment. Instant-only digital
+/// orders are delivered at payment and never wait here. An open
+/// cancellation request (`cancel_requested`) takes the order out of the
+/// sweep by construction, and so does a PayPal reversal outstanding on the
+/// order (`payment_reversed_at`): the seller cannot read the address while
+/// the money is taken back, so the clock is only honored once it is
+/// restored (the period has usually elapsed by then, so the next pass
+/// assumes delivery). The assumption stamps `digital_delivered_at` (the
+/// auto-complete clock) and `delivery_assumed`, so the buyer sees it was
+/// assumed, and the later `delivered → completed` edge starts the sealed
+/// delivery-email retention clock.
+async fn assume_due_digital_deliveries_batch(
     pool: &PgPool,
     now: DateTime<Utc>,
-    cutoff: DateTime<Utc>,
-    cutoff_text: &str,
+    default_assume_days: i64,
     batch_size: i64,
 ) -> anyhow::Result<DeliverySweepClaim> {
     let mut tx = pool.begin().await?;
-    let due: Vec<(Uuid, Value, String, String, Option<String>)> = sqlx::query_as(
-        "SELECT id, shipment, buyer_pubky, seller_pubky, shipment->>'shipped_at' \
-         FROM orders \
-         WHERE state = 'shipped' AND fulfillment <> 'digital' \
-         AND (shipment->>'shipped_at' IS NULL \
-              OR shipment->>'shipped_at' !~ $2 \
-              OR left(shipment->>'shipped_at', 19) <= left($1, 19)) \
-         ORDER BY id LIMIT $3 FOR UPDATE SKIP LOCKED",
+    let due: Vec<(Uuid, String, String)> = sqlx::query_as(
+        "SELECT o.id, o.buyer_pubky, o.seller_pubky \
+         FROM orders o JOIN receipts r ON r.order_id = o.id \
+         WHERE o.state = 'paid' AND o.fulfillment = 'digital' \
+         AND o.payment_reversed_at IS NULL \
+         AND r.issued_at <= $1 - interval '1 day' * COALESCE(o.delivery_assume_days::bigint, $2) \
+         ORDER BY o.id LIMIT $3 FOR UPDATE OF o SKIP LOCKED",
     )
-    .bind(cutoff_text)
-    .bind(SHIPMENT_INSTANT_PREFIX)
+    .bind(now)
+    .bind(default_assume_days)
     .bind(batch_size)
     .fetch_all(&mut *tx)
     .await?;
 
     let claimed = due.len() as u64;
     let mut processed = 0u64;
-    for (order_id, shipment, buyer_pubky, seller_pubky, shipped_at) in due {
+    for (order_id, buyer_pubky, seller_pubky) in due {
+        debug_assert!(marketplace_domain::state_machines::can_transition(
+            &marketplace_domain::state_machines::order_machine(),
+            "paid",
+            "delivered"
+        ));
+        let updated: Option<(i64,)> = sqlx::query_as(
+            "UPDATE orders SET revision = revision + 1, state = 'delivered', \
+             digital_delivered_at = $2, delivery_assumed = TRUE, updated_at = $2 \
+             WHERE id = $1 AND state = 'paid' RETURNING revision",
+        )
+        .bind(order_id)
+        .bind(now)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((revision,)) = updated else {
+            continue;
+        };
+        let aggregate_id = ids::order_aggregate_id(order_id);
+        let event_id = crate::executor::insert_event(
+            &mut tx,
+            Uuid::new_v4(),
+            &aggregate_id,
+            revision,
+            SYSTEM_ACTOR,
+            "fulfillment.digital_delivered",
+            now,
+        )
+        .await?;
+        insert_notification_intent(
+            &mut tx,
+            event_id,
+            "order_delivery_assumed",
+            &buyer_pubky,
+            SYSTEM_ACTOR,
+            &aggregate_id,
+            None,
+            now,
+        )
+        .await?;
+        insert_notification_intent(
+            &mut tx,
+            event_id,
+            "order_delivered",
+            &seller_pubky,
+            SYSTEM_ACTOR,
+            &aggregate_id,
+            None,
+            now,
+        )
+        .await?;
+        tracing::info!(order_id = %order_id, "assumed digital delivery on server time");
+        processed += 1;
+    }
+    tx.commit().await?;
+    Ok(DeliverySweepClaim { claimed, processed })
+}
+
+async fn assume_due_deliveries_batch(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+    default_assume_days: i64,
+    batch_size: i64,
+) -> anyhow::Result<DeliverySweepClaim> {
+    let mut tx = pool.begin().await?;
+    // Each order is due `COALESCE(orders.delivery_assume_days, default)` days
+    // after shipment: the period frozen on the order when its payment
+    // started, else the configured default. The per-order cutoff is built
+    // in SQL (as the same `YYYY-MM-DDTHH:MM:SS` text the shipment instant
+    // is compared against) so the batch limit never fills with orders that
+    // are not due yet.
+    let due: Vec<(Uuid, Value, String, String, Option<String>, i64)> = sqlx::query_as(
+        "SELECT id, shipment, buyer_pubky, seller_pubky, shipment->>'shipped_at', \
+                COALESCE(delivery_assume_days::bigint, $4) \
+         FROM orders \
+         WHERE state = 'shipped' AND fulfillment <> 'digital' \
+         AND (shipment->>'shipped_at' IS NULL \
+              OR shipment->>'shipped_at' !~ $2 \
+              OR left(shipment->>'shipped_at', 19) <= to_char( \
+                   ($1::timestamptz - interval '1 day' * COALESCE(delivery_assume_days::bigint, $4)) \
+                   AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS')) \
+         ORDER BY id LIMIT $3 FOR UPDATE SKIP LOCKED",
+    )
+    .bind(now)
+    .bind(SHIPMENT_INSTANT_PREFIX)
+    .bind(batch_size)
+    .bind(default_assume_days)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    let claimed = due.len() as u64;
+    let mut processed = 0u64;
+    for (order_id, shipment, buyer_pubky, seller_pubky, shipped_at, assume_days) in due {
         let Some(shipped_at) = parse_shipment_instant(shipped_at.as_deref()) else {
             tracing::warn!(
                 order_id = %order_id,
@@ -3715,7 +3835,7 @@ async fn assume_due_deliveries_batch(
             );
             continue;
         };
-        if shipped_at > cutoff {
+        if shipped_at > now - chrono::Duration::days(assume_days) {
             continue;
         }
         let mut delivered = shipment;
@@ -3784,8 +3904,10 @@ async fn assume_due_deliveries_batch(
     Ok(DeliverySweepClaim { claimed, processed })
 }
 
-/// Completes `delivered` orders once `auto_complete_days` have elapsed
-/// since the delivery timestamp — the `order_auto_complete` server trigger
+/// Completes `delivered` orders once the order's own completion period
+/// (`orders.auto_complete_days`, frozen like the delivery period;
+/// `default_auto_complete_days` when none was captured) has elapsed since
+/// the delivery timestamp — the `order_auto_complete` server trigger
 /// on the machine's delivered → completed edge. An open return or cancel
 /// request blocks completion by construction: `return_requested`,
 /// `return_approved`, `return_received`, and `cancel_requested` are their
@@ -3795,16 +3917,15 @@ async fn assume_due_deliveries_batch(
 pub async fn complete_due_delivered_orders(
     pool: &PgPool,
     now: DateTime<Utc>,
-    auto_complete_days: i64,
+    default_auto_complete_days: i64,
     batch_size: i64,
     max_batches: u32,
 ) -> anyhow::Result<u64> {
-    let cutoff = now - chrono::Duration::days(auto_complete_days);
-    let cutoff_text = crate::clock::format_timestamp(cutoff);
     let mut completed = 0u64;
     for _ in 0..max_batches {
-        let pass = complete_due_delivered_orders_batch(pool, now, cutoff, &cutoff_text, batch_size)
-            .await?;
+        let pass =
+            complete_due_delivered_orders_batch(pool, now, default_auto_complete_days, batch_size)
+                .await?;
         completed += pass.processed;
         if pass.claimed < batch_size as u64 {
             break;
@@ -3816,11 +3937,15 @@ pub async fn complete_due_delivered_orders(
 async fn complete_due_delivered_orders_batch(
     pool: &PgPool,
     now: DateTime<Utc>,
-    cutoff: DateTime<Utc>,
-    cutoff_text: &str,
+    default_auto_complete_days: i64,
     batch_size: i64,
 ) -> anyhow::Result<DeliverySweepClaim> {
     let mut tx = pool.begin().await?;
+    // Each order completes `COALESCE(orders.auto_complete_days, default)`
+    // days after delivery: the period frozen on the order when its payment
+    // started, else the configured default. The per-order cutoff is built
+    // in SQL so the batch limit never fills with orders that are not due.
+    //
     // The delivery instant COALESCES the two sources (§A6): the handover
     // record's server instant for pickup orders, the shipment
     // `delivered_at` for shipped ones. The join locks `FOR UPDATE OF o`
@@ -3830,22 +3955,27 @@ async fn complete_due_delivered_orders_batch(
         "SELECT o.id, o.buyer_pubky, o.seller_pubky, o.fulfillment, \
                     o.shipment->>'delivered_at' AS delivered_at, \
                     CASE WHEN o.fulfillment = 'digital' THEN o.digital_delivered_at \
-                         ELSE h.confirmed_at END AS handover_at \
+                         ELSE h.confirmed_at END AS handover_at, \
+                    COALESCE(o.auto_complete_days::bigint, $2) AS auto_complete_days \
              FROM orders o LEFT JOIN pickup_handovers h ON h.order_id = o.id \
              WHERE o.state = 'delivered' \
              AND ( \
-               (o.fulfillment = 'pickup' AND (h.confirmed_at IS NULL OR h.confirmed_at <= $1)) \
+               (o.fulfillment = 'pickup' AND (h.confirmed_at IS NULL \
+                  OR h.confirmed_at <= $1 - interval '1 day' * COALESCE(o.auto_complete_days::bigint, $2))) \
                OR (o.fulfillment = 'digital' \
-                   AND (o.digital_delivered_at IS NULL OR o.digital_delivered_at <= $1)) \
+                   AND (o.digital_delivered_at IS NULL \
+                  OR o.digital_delivered_at <= $1 - interval '1 day' * COALESCE(o.auto_complete_days::bigint, $2))) \
                OR (o.fulfillment NOT IN ('pickup', 'digital') AND ( \
                     o.shipment->>'delivered_at' IS NULL \
                     OR o.shipment->>'delivered_at' !~ $3 \
-                    OR left(o.shipment->>'delivered_at', 19) <= left($2, 19))) \
+                    OR left(o.shipment->>'delivered_at', 19) <= to_char( \
+                         ($1 - interval '1 day' * COALESCE(o.auto_complete_days::bigint, $2)) \
+                         AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS'))) \
              ) \
              ORDER BY o.id LIMIT $4 FOR UPDATE OF o SKIP LOCKED",
     )
-    .bind(cutoff)
-    .bind(cutoff_text)
+    .bind(now)
+    .bind(default_auto_complete_days)
     .bind(SHIPMENT_INSTANT_PREFIX)
     .bind(batch_size)
     .fetch_all(&mut *tx)
@@ -3861,7 +3991,9 @@ async fn complete_due_delivered_orders_batch(
             fulfillment,
             delivered_at: shipment_delivered_at,
             handover_at,
+            auto_complete_days,
         } = claim;
+        let cutoff = now - chrono::Duration::days(auto_complete_days);
         if fulfillment == "pickup" || fulfillment == "digital" {
             // A delivered pickup order always carries its handover row, and a
             // delivered digital order its `digital_delivered_at`
@@ -4259,8 +4391,10 @@ pub async fn run_once(
         }
     }
     // Post-purchase liveness is server time (no carrier tracking feed):
-    // assume delivery after DELIVERY_ASSUME_DAYS, then auto-complete after
-    // AUTO_COMPLETE_DAYS unless a return/cancel request is open.
+    // assume delivery, then auto-complete, after the periods the seller set
+    // (captured per order); DELIVERY_ASSUME_DAYS / AUTO_COMPLETE_DAYS apply
+    // only where the seller left one unset. A return/cancel request that is
+    // open takes the order out of the sweep.
     if try_acquire_lease(
         &state.pool,
         TASK_DELIVERY_AUTOCOMPLETE,

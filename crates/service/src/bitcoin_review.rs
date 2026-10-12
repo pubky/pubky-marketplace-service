@@ -790,7 +790,7 @@ pub async fn resolve_bitcoin_payment(
         );
     }
     // Scope (r12): Paykit Bitcoin only, with both pins persisted. Locks,
-    // Stripe, PayPal, sandbox, and missing-pin rows are out of scope.
+    // PayPal, sandbox, and missing-pin rows are out of scope.
     if order.payment_method.as_deref() != Some("bitcoin") {
         return audited_resolve_refusal(
             &state,

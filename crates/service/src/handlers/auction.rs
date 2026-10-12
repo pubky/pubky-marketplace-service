@@ -486,7 +486,7 @@ pub async fn close_locked_auction(
             total_minor,
             final_price.currency.clone(),
             final_price.exponent,
-            1,
+            Some(1),
             payment_id,
             false,
             None,

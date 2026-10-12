@@ -584,7 +584,7 @@ async fn new_version_keeps_existing_pins(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn instant_confirm_delivers_on_every_path(pool: PgPool) {
-    let (app, _stripe, paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
+    let (app, paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
     let app = with_digital(app);
 
     // Sandbox.
@@ -773,7 +773,7 @@ async fn post_completed_ipn(app: &TestApp, order_id: &str) -> StatusCode {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn late_completion_instant_ends_delivered(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let app = with_digital(app);
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
@@ -809,7 +809,7 @@ async fn late_completion_instant_ends_delivered(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn refund_required_never_delivers(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let app = with_digital(app);
     let seller = new_actor(&app).await;
     let first = new_actor(&app).await;
@@ -891,7 +891,7 @@ async fn drop_current_version(app: &TestApp, seller: &str) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn confirm_with_nothing_to_pin_refund_required(pool: PgPool) {
-    let (app, _stripe, paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
+    let (app, paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
     let app = with_digital(app);
 
     // Paykit.
@@ -997,7 +997,7 @@ async fn confirm_with_nothing_to_pin_refund_required(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn nothing_to_pin_not_retried(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let app = with_digital(app);
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
@@ -1042,7 +1042,7 @@ async fn order_facts_payment_id(pool: &PgPool, order_id: &str) -> Uuid {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn version_open_failure_aborts_and_retries(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let app = with_digital(app);
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
@@ -1269,6 +1269,34 @@ async fn completed_digital_order_still_downloads(pool: PgPool) {
     let (status, _, body) = read_delivery(&app, &buyer.token, &order.order_id).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["lines"][0]["text"], json!(TEXT_V1));
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn digital_order_completes_on_its_own_frozen_period(pool: PgPool) {
+    let (app, paykit) = paykit_app(pool).await;
+    let (_seller, _buyer, order) = paykit_delivered_order(&app, &paykit).await;
+    sqlx::query("UPDATE orders SET auto_complete_days = 2 WHERE id = $1::uuid")
+        .bind(&order.order_id)
+        .execute(&app.pool)
+        .await
+        .expect("freeze the seller's period");
+    let default_days = app.state.config.auto_complete_days;
+    assert!(
+        default_days > 2,
+        "the default must outlast the seller's period"
+    );
+
+    let early = app.clock.now() + chrono::Duration::days(1);
+    let completed = complete_due_delivered_orders(&app.pool, early, default_days, 100, 10)
+        .await
+        .expect("auto-complete");
+    assert_eq!(completed, 0);
+    let due = app.clock.now() + chrono::Duration::days(2) + chrono::Duration::hours(1);
+    let completed = complete_due_delivered_orders(&app.pool, due, default_days, 100, 10)
+        .await
+        .expect("auto-complete");
+    assert_eq!(completed, 1);
+    assert_eq!(order_facts(&app, &order.order_id).await.0, "completed");
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]

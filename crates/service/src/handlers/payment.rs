@@ -23,16 +23,19 @@ use crate::handlers::{
     fetch_listing_for_update, fetch_order_for_update, fetch_order_reviews,
     insert_notification_intent, order_json_with_reviews,
 };
+use crate::homeserver::HomeserverListingClient;
 use crate::model::{money_json, OrderRow, PaymentRow, ReceiptRow};
 use crate::queries::{ORDER_COLUMNS, PAYMENT_COLUMNS};
 use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
 
+#[allow(clippy::too_many_arguments)]
 pub async fn advance(
     tx: &mut Transaction<'_, Postgres>,
     actor: &str,
     command: &Command,
     payload: &AdvanceSandboxPaymentPayload,
     sandbox_payment_window_seconds: i64,
+    homeserver: Option<&dyn HomeserverListingClient>,
     keys: crate::ConfirmKeys<'_>,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
@@ -116,6 +119,8 @@ pub async fn advance(
     // inventory hold (or re-arms a drop claim's window) before anything
     // else moves.
     let order = if payment.state == "awaiting_entitlement" {
+        crate::seller_terms::capture_for_order(tx, homeserver, order.id, &order.seller_pubky, now)
+            .await?;
         match crate::handlers::holds::acquire_payment_hold(
             tx,
             order,
