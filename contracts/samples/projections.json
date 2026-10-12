@@ -265,6 +265,7 @@
     },
     "response": {
       "body": {
+        "auto_complete_days": null,
         "bitcoin_payable": {
           "amount_minor": 51637,
           "currency": "SAT",
@@ -283,6 +284,7 @@
         "buyer_pubky": "<pubky:buyer>",
         "cancellation_reason": null,
         "created_at": "<timestamp:1>",
+        "delivery_assume_days": null,
         "delivery_assumed": false,
         "drop_aggregate_id": null,
         "edition": null,
@@ -401,6 +403,7 @@
     },
     "response": {
       "body": {
+        "auto_complete_days": null,
         "bitcoin_payable": {
           "amount_minor": 51637,
           "currency": "SAT",
@@ -419,6 +422,7 @@
         "buyer_pubky": "<pubky:buyer>",
         "cancellation_reason": null,
         "created_at": "<timestamp:1>",
+        "delivery_assume_days": null,
         "delivery_assumed": false,
         "drop_aggregate_id": null,
         "edition": null,
@@ -537,6 +541,7 @@
     },
     "response": {
       "body": {
+        "auto_complete_days": null,
         "bitcoin_payable": {
           "amount_minor": 51637,
           "currency": "SAT",
@@ -555,6 +560,7 @@
         "buyer_pubky": "<pubky:buyer>",
         "cancellation_reason": "payment window elapsed",
         "created_at": "<timestamp:1>",
+        "delivery_assume_days": null,
         "delivery_assumed": false,
         "drop_aggregate_id": null,
         "edition": null,
@@ -673,6 +679,7 @@
     },
     "response": {
       "body": {
+        "auto_complete_days": null,
         "bitcoin_payable": null,
         "bitcoin_quote": {
           "currency": null,
@@ -687,6 +694,7 @@
         "buyer_pubky": "<pubky:buyer>",
         "cancellation_reason": null,
         "created_at": "<timestamp:1>",
+        "delivery_assume_days": null,
         "delivery_assumed": false,
         "drop_aggregate_id": null,
         "edition": null,
@@ -805,6 +813,7 @@
     },
     "response": {
       "body": {
+        "auto_complete_days": null,
         "bitcoin_payable": {
           "amount_minor": 51637,
           "currency": "SAT",
@@ -823,6 +832,7 @@
         "buyer_pubky": "<pubky:buyer>",
         "cancellation_reason": null,
         "created_at": "<timestamp:1>",
+        "delivery_assume_days": null,
         "delivery_assumed": false,
         "drop_aggregate_id": null,
         "edition": null,
@@ -955,6 +965,7 @@
       "body": {
         "orders": [
           {
+            "auto_complete_days": null,
             "bitcoin_payable": null,
             "bitcoin_quote": {
               "currency": null,
@@ -969,6 +980,7 @@
             "buyer_pubky": "<pubky:buyer>",
             "cancellation_reason": null,
             "created_at": "<timestamp:1>",
+            "delivery_assume_days": null,
             "delivery_assumed": false,
             "drop_aggregate_id": null,
             "edition": null,
@@ -1094,6 +1106,7 @@
     },
     "response": {
       "body": {
+        "auto_complete_days": null,
         "bitcoin_payable": {
           "amount_minor": 51637,
           "currency": "SAT",
@@ -1112,6 +1125,7 @@
         "buyer_pubky": "<pubky:buyer>",
         "cancellation_reason": null,
         "created_at": "<timestamp:1>",
+        "delivery_assume_days": null,
         "delivery_assumed": false,
         "drop_aggregate_id": null,
         "edition": null,
@@ -1242,6 +1256,7 @@
     },
     "response": {
       "body": {
+        "auto_complete_days": null,
         "bitcoin_payable": {
           "amount_minor": 51637,
           "currency": "SAT",
@@ -1260,6 +1275,7 @@
         "buyer_pubky": "<pubky:buyer>",
         "cancellation_reason": "payment window elapsed",
         "created_at": "<timestamp:1>",
+        "delivery_assume_days": null,
         "delivery_assumed": false,
         "drop_aggregate_id": null,
         "edition": null,
@@ -1390,6 +1406,7 @@
     },
     "response": {
       "body": {
+        "auto_complete_days": null,
         "bitcoin_payable": null,
         "bitcoin_quote": {
           "currency": null,
@@ -1416,6 +1433,7 @@
           },
           "format": "plaintext_v1"
         },
+        "delivery_assume_days": null,
         "delivery_assumed": false,
         "drop_aggregate_id": null,
         "edition": null,

@@ -279,7 +279,11 @@ pub async fn handle(
     .bind(total)
     .bind(currency)
     .bind(exponent)
-    .bind(payload.guarantee_policy_version as i32)
+    .bind(
+        payload
+            .guarantee_policy_version
+            .map(|version| version as i32),
+    )
     .bind(payment_id)
     .bind(hold_expires_at)
     .bind(lock_now)

@@ -449,9 +449,12 @@ deliberately excludes payment details and delivery addresses:
 
 `id`, `buyer_pubky`, `seller_pubky`, `revision`, `state`, `lines`,
 `subtotal_minor`, `shipping_minor`, `total_minor`, `currency`, `exponent`,
-`guarantee_policy_version`, `receipt_id`, `edition`, `drop_aggregate_id`,
+`guarantee_policy_version` (`null` unless the creating checkout carried it),
+`receipt_id`, `edition`, `drop_aggregate_id`,
 `cancellation_reason`, `stock_held`, `hold_expires_at`, `shipment`,
-`delivery_assumed`, `return_request`, `external_refund`, `fulfillment`,
+`delivery_assumed`, `delivery_assume_days`, `auto_complete_days` (the seller's
+periods frozen on the order, `null` when the seller left one unset),
+`return_request`, `external_refund`, `fulfillment`,
 `payment_method`, `created_at`, `updated_at`.
 
 Money is in minor units with `currency` and `exponent`. Anything a seller

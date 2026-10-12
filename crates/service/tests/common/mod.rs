@@ -676,6 +676,7 @@ impl HomeserverListingClient for CommandMirrorHomeserver {
 /// [`HttpHomeserverClient`], so header handling, status mapping, and JSON
 /// parsing are exercised end to end.
 pub struct FakeHomeserver {
+    shops: Arc<Mutex<HashMap<String, Value>>>,
     records: HomeserverRecordMap,
     drop_records: HomeserverRecordMap,
     events: HomeserverEventLog,
@@ -791,6 +792,30 @@ impl FakeHomeserver {
             .record(user, "PUT", path.to_string());
     }
 
+    /// Publishes the seller's shop record at `shop.json`.
+    pub fn put_shop_record(&self, seller_pubky: &str, record: Value) {
+        self.shops
+            .lock()
+            .expect("fake homeserver shops lock")
+            .insert(seller_pubky.to_string(), record);
+    }
+
+    pub fn delete_shop_record(&self, seller_pubky: &str) {
+        self.shops
+            .lock()
+            .expect("fake homeserver shops lock")
+            .remove(seller_pubky);
+    }
+
+    /// Answers 500 for this seller's shop record until [`Self::heal_shop_record`].
+    pub fn fail_shop_record(&self, seller_pubky: &str) {
+        self.fail_record(seller_pubky, "shop.json");
+    }
+
+    pub fn heal_shop_record(&self, seller_pubky: &str) {
+        self.heal_record(seller_pubky, "shop.json");
+    }
+
     pub fn put_drop_record(&self, seller_pubky: &str, drop_id: &str, record: Value) {
         self.drop_records
             .lock()
@@ -835,6 +860,37 @@ async fn serve_homeserver_record(
         .lock()
         .expect("fake homeserver records lock")
         .get(&(seller, listing_id))
+        .cloned();
+    match stored {
+        Some(record) => (StatusCode::OK, axum::Json(record)).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn serve_shop_record(
+    axum::extract::State(shops): axum::extract::State<Arc<Mutex<HashMap<String, Value>>>>,
+    axum::Extension(delay_ms): axum::Extension<Arc<std::sync::atomic::AtomicU64>>,
+    axum::Extension(failing): axum::Extension<HomeserverFailingRecords>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    homeserver_delay(&delay_ms).await;
+    let seller = headers
+        .get("pubky-host")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    if failing
+        .lock()
+        .expect("fake homeserver failing lock")
+        .contains(&(seller.clone(), "shop.json".to_string()))
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let stored = shops
+        .lock()
+        .expect("fake homeserver shops lock")
+        .get(&seller)
         .cloned();
     match stored {
         Some(record) => (StatusCode::OK, axum::Json(record)).into_response(),
@@ -928,7 +984,12 @@ pub async fn spawn_fake_homeserver() -> FakeHomeserver {
     let events: HomeserverEventLog = Arc::default();
     let delay_ms: Arc<std::sync::atomic::AtomicU64> = Arc::default();
     let failing: HomeserverFailingRecords = Arc::default();
+    let shops: Arc<Mutex<HashMap<String, Value>>> = Arc::default();
     let router = Router::new()
+        .route(
+            "/pub/pubky.app/marketplace/v1/shop.json",
+            axum::routing::get(serve_shop_record).with_state(shops.clone()),
+        )
         .route(
             "/pub/pubky.app/marketplace/v1/listings/{listing_id}",
             axum::routing::get(serve_homeserver_record),
@@ -959,6 +1020,7 @@ pub async fn spawn_fake_homeserver() -> FakeHomeserver {
             .expect("fake homeserver serves");
     });
     FakeHomeserver {
+        shops,
         records,
         drop_records,
         events,
@@ -1004,6 +1066,120 @@ pub async fn test_app_with_homeserver_config(
         },
         homeserver,
     )
+}
+
+/// Wraps an app's existing homeserver double and answers shop records from a
+/// real [`FakeHomeserver`] through the production [`HttpHomeserverClient`],
+/// so seller delivery terms are read over HTTP while everything else the
+/// double served stays unchanged.
+struct ShopOverlayHomeserver {
+    listings: Arc<dyn HomeserverListingClient>,
+    shop: Arc<dyn HomeserverListingClient>,
+}
+
+impl HomeserverListingClient for ShopOverlayHomeserver {
+    fn fetch_listing<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        listing_id: &'a str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = marketplace_service::homeserver::HomeserverFetchOutcome>
+                + Send
+                + 'a,
+        >,
+    > {
+        self.listings.fetch_listing(seller_pubky, listing_id)
+    }
+
+    fn fetch_listing_raw<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        listing_id: &'a str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = marketplace_service::homeserver::HomeserverRawFetchOutcome>
+                + Send
+                + 'a,
+        >,
+    > {
+        self.listings.fetch_listing_raw(seller_pubky, listing_id)
+    }
+
+    fn fetch_drop<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        drop_id: &'a str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = marketplace_service::homeserver::HomeserverFetchOutcome>
+                + Send
+                + 'a,
+        >,
+    > {
+        self.listings.fetch_drop(seller_pubky, drop_id)
+    }
+
+    fn fetch_content_lock<'a>(
+        &'a self,
+        creator_pubky: &'a str,
+        content_path: &'a str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = marketplace_service::homeserver::HomeserverFetchOutcome>
+                + Send
+                + 'a,
+        >,
+    > {
+        self.listings
+            .fetch_content_lock(creator_pubky, content_path)
+    }
+
+    fn fetch_shop<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = marketplace_service::homeserver::HomeserverFetchOutcome>
+                + Send
+                + 'a,
+        >,
+    > {
+        self.shop.fetch_shop(seller_pubky)
+    }
+}
+
+/// A test app whose seller shop records are served by the returned fake
+/// homeserver (read over HTTP), with listings mirrored from commands as in
+/// [`test_app`].
+pub async fn test_app_with_shop_homeserver(pool: PgPool) -> (TestApp, FakeHomeserver) {
+    let homeserver = spawn_fake_homeserver().await;
+    let app = with_shop_homeserver(test_app(pool).await, &homeserver);
+    (app, homeserver)
+}
+
+/// Rewires an existing test app (for example a payments- or Locks-enabled
+/// one) so seller shop records are read from `homeserver`; the app's own
+/// homeserver double keeps serving everything else.
+pub fn with_shop_homeserver(app: TestApp, homeserver: &FakeHomeserver) -> TestApp {
+    let listings = app
+        .state
+        .homeserver
+        .clone()
+        .expect("the app has a homeserver double to wrap");
+    let state = app
+        .state
+        .clone()
+        .with_homeserver(Some(Arc::new(ShopOverlayHomeserver {
+            listings,
+            shop: homeserver.client(),
+        })));
+    TestApp {
+        router: build_router(state.clone()),
+        pool: app.pool,
+        clock: app.clock,
+        state,
+    }
 }
 
 /// A test app wired to a freshly spawned fake homeserver.

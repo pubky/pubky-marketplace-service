@@ -58,6 +58,8 @@ pub enum HomeserverRawFetchOutcome {
     Unavailable,
 }
 
+/// Where Shop writes a seller's shop record (singleton).
+pub const SHOP_PATH: &str = "/pub/pubky.app/marketplace/v1/shop.json";
 /// Where Shop writes a seller's listing records.
 pub const LISTINGS_PATH: &str = "/pub/pubky.app/marketplace/v1/listings/";
 /// Upper bound on one `/events-stream` batch body. A batch is at most
@@ -500,6 +502,18 @@ pub trait HomeserverListingClient: Send + Sync + 'static {
         drop_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>>;
 
+    /// Fetches the seller's shop record at [`SHOP_PATH`]. Same path
+    /// ownership doctrine as listings: only the seller can write it. The
+    /// default answers `NotFound` (no shop record), so implementations that
+    /// predate the shop-record terms read as sellers without any.
+    fn fetch_shop<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
+        let _ = seller_pubky;
+        Box::pin(async { HomeserverFetchOutcome::NotFound })
+    }
+
     /// Fetches the seller's public content-lock document. This mirrors
     /// `pubky/locks@ba49a777:locks-sdk/src/discovery.rs:13-52`: the request
     /// is addressed through the creator's homeserver identity and callers
@@ -776,6 +790,13 @@ impl HomeserverListingClient for HttpHomeserverClient {
         content_path: &'a str,
     ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
         Box::pin(async move { self.fetch_inner(creator_pubky, content_path).await })
+    }
+
+    fn fetch_shop<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
+        Box::pin(async move { self.fetch_inner(seller_pubky, SHOP_PATH).await })
     }
 
     fn fetch_deliverable_digest<'a>(

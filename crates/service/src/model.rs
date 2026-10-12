@@ -575,7 +575,9 @@ pub struct OrderRow {
     pub total_minor: i64,
     pub currency: String,
     pub exponent: i32,
-    pub guarantee_policy_version: i32,
+    /// Legacy: set only when the creating command carried it (and for
+    /// auction orders, which have always stored `1`). NULL otherwise.
+    pub guarantee_policy_version: Option<i32>,
     pub payment_id: Uuid,
     pub receipt_id: Option<Uuid>,
     /// The order's edition inside its drop (ADR-0026 layer 2): the value
@@ -604,6 +606,14 @@ pub struct OrderRow {
     /// so the UI can tell an assumed delivery apart and ask the buyer to
     /// report a non-arrival.
     pub delivery_assumed: bool,
+    /// Days after shipment the service assumes delivery for this order,
+    /// frozen from the seller's shop record at the order's first payment
+    /// lock point. NULL: no seller terms captured; the configured default
+    /// applies.
+    pub delivery_assume_days: Option<i32>,
+    /// Days after delivery this order completes unless a return is opened,
+    /// frozen like [`Self::delivery_assume_days`].
+    pub auto_complete_days: Option<i32>,
     pub return_request: Option<Value>,
     pub external_refund: Option<Value>,
     /// The buyer-bound payment method (`bitcoin` | `stripe` | `paypal`),
@@ -736,6 +746,8 @@ impl std::fmt::Debug for OrderRow {
             .field("hold_source", &self.hold_source)
             .field("shipment", &self.shipment)
             .field("delivery_assumed", &self.delivery_assumed)
+            .field("delivery_assume_days", &self.delivery_assume_days)
+            .field("auto_complete_days", &self.auto_complete_days)
             .field("return_request", &self.return_request)
             .field("external_refund", &self.external_refund)
             .field("payment_method", &self.payment_method)
@@ -811,7 +823,7 @@ impl OrderRow {
         total_minor: i64,
         currency: String,
         exponent: i32,
-        guarantee_policy_version: i32,
+        guarantee_policy_version: Option<i32>,
         payment_id: Uuid,
         stock_held: bool,
         hold_expires_at: Option<DateTime<Utc>>,
@@ -845,6 +857,8 @@ impl OrderRow {
             hold_source: None,
             shipment: None,
             delivery_assumed: false,
+            delivery_assume_days: None,
+            auto_complete_days: None,
             return_request: None,
             external_refund: None,
             payment_method: None,
@@ -1111,6 +1125,8 @@ impl OrderRow {
             "updated_at": format_timestamp(self.updated_at),
         });
         view["priced_from"] = json!(self.priced_from);
+        view["delivery_assume_days"] = json!(self.delivery_assume_days);
+        view["auto_complete_days"] = json!(self.auto_complete_days);
         view["paykit_delivery_state"] = json!(self.paykit_delivery_state);
         view["payment_reversed_at"] = self.payment_reversed_at.map(format_timestamp).into();
         view["payment_reversal_cancelled_at"] = self
@@ -1261,7 +1277,7 @@ mod tests {
             0,
             "SAT".to_string(),
             0,
-            1,
+            Some(1),
             Uuid::nil(),
             false,
             None,

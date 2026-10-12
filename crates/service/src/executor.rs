@@ -589,6 +589,7 @@ async fn dispatch(
                 command,
                 payload,
                 state.config.sandbox_payment_window_seconds,
+                state.homeserver.as_deref(),
                 state.confirm_keys(),
                 now,
             )

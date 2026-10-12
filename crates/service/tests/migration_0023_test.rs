@@ -543,15 +543,17 @@ async fn migration_0023_adds_the_shared_manual_resolution_schema() {
 /// delivery 0043, accepted offer fulfillment methods 0044, Paykit
 /// delivery state 0045, per-user priv data keys 0046, listing
 /// tombstones 0047, notification review reasons 0048, outbox
-/// quarantine 0049, fenced listing deletion 0050, and listing revival
-/// proof 0051.
+/// quarantine 0049, fenced listing deletion 0050, listing revival
+/// proof 0051, and per-order delivery terms 0056. Numbers 0052 to 0055 are
+/// claimed by open pull requests and are absent from this branch; the
+/// catalog is gapless through 0056 once they land.
 fn sorted_migration_catalog(mut numbers: Vec<u32>) -> Vec<u32> {
     numbers.sort_unstable();
     numbers
 }
 
 #[test]
-fn migration_catalog_is_gapless_through_0051() {
+fn migration_catalog_is_gapless_through_0051_then_0056() {
     let numbers: Vec<u32> = std::fs::read_dir(MIGRATIONS_DIR)
         .expect("migrations dir")
         .filter_map(|entry| {
@@ -561,11 +563,11 @@ fn migration_catalog_is_gapless_through_0051() {
                 .and_then(|prefix| prefix.parse::<u32>().ok())
         })
         .collect();
-    let expected = (1..=51).collect::<Vec<_>>();
+    let expected = (1..=51).chain([56]).collect::<Vec<_>>();
     assert_eq!(
         sorted_migration_catalog(numbers),
         expected,
-        "the raw catalog is 0001..=0051, gapless"
+        "the raw catalog is 0001..=0051 gapless, then 0056 (0052..=0055 are held by open pull requests)"
     );
 }
 
