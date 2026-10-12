@@ -3731,7 +3731,6 @@ async fn assume_due_digital_deliveries_batch(
     .bind(now)
     .bind(default_assume_days)
     .bind(batch_size)
-    .bind(default_assume_days)
     .fetch_all(&mut *tx)
     .await?;
 
