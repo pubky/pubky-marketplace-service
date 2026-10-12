@@ -1400,6 +1400,19 @@ impl PaykitClient {
         seller_pubky: &str,
         reference: &str,
     ) -> (PaykitStatusOutcome, Option<PaykitDeliveryState>) {
+        if self.api == PaykitApi::Upstream {
+            // The payment-request lifecycle this build speaks is the fork's,
+            // so a request it polls under the upstream configuration was
+            // issued by the fork before the flip and is still in flight
+            // (README, "Cutover runbook"). One alert per request per poll.
+            tracing::error!(
+                code = "paykit_fork_row_polled_under_upstream",
+                seller_pubky,
+                reference,
+                "ALERT fork-issued paykit request polled under PAYKIT_SERVER_API=upstream; \
+                 its payment may not be observed until the fork configuration is restored"
+            );
+        }
         let url = format!("{}/transactions/status", self.base_url);
         let Ok((body, signature)) = self.signed_body(
             &url,

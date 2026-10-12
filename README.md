@@ -287,13 +287,92 @@ both modes (upstream answers `status`, `postgres`, `electrum`,
 `paykit_delivery`, `outbox`; only `status: ready` with `electrum: ready` is
 true, and a 503 is an outage).
 
-Flipping the setting is a deployment step: register the service's public key
-in the upstream allowlist first, then set `PAYKIT_SERVER_API=upstream` and
-repoint `PAYKIT_SERVER_URL`; setting it back to `fork` (or unsetting it) and
-repointing is the rollback. Upstream does not serve the payment-request
-lifecycle routes (prepare, activate, void, resolve) yet, so with `upstream`
-a Bitcoin bind answers `paykit_unavailable` until those land. PayPal is
-not affected.
+#### Cutover runbook
+
+This build issues, activates, voids, resolves and polls payment requests with
+the fork's contract in both modes: `upstream` changes only the signature and
+the readiness lookup. Do not set `PAYKIT_SERVER_API=upstream` on a deployment
+that sells Bitcoin until a build with upstream lifecycle support (open pull
+request #95) is deployed. PayPal is not affected by the setting.
+
+The flip is safe only when no fork request still needs this service to
+observe it. A request is pinned to the stack that issued it
+(`paykit_stack_id`, `paykit_stack_endpoint`); activation, voiding and the
+seller's resolution dial that pinned endpoint whatever the configuration, but
+status polling asks the configured server only, so a fork request polled
+under `upstream` is not observed and its payment is not seen.
+
+1. **Register the key.** Add the service's public key (the public half of
+   `PAYKIT_REQUEST_SIGNING_KEY`) to upstream's
+   `[signed_services] trusted_public_keys`.
+2. **Stop new fork requests.** Bitcoin is offered only while
+   `bitcoin_available` and `bitcoin_offer_available` are both true, and
+   `bitcoin_offer_available` follows the fork's `GET /health/ready`. Taking
+   that gate down on the fork withdraws Bitcoin from the Shop within
+   `PAYKIT_POLL_SECONDS`. It does not stop a client calling
+   `POST /v0/orders/{id}/payment-method` directly.
+3. **Drain.** Run the gate query below on the production database until it
+   returns `0 | 0`. It counts the fork requests that are preparing, active
+   (`pending`), `detected` or `awaiting_seller_confirmation`, those whose
+   payment expired but are still inside the 24 h late window or have a
+   detection, and the released attempts still `watching`. Each clears by
+   itself: a payment confirms, or its window and the 24 h late window pass
+   (a released attempt closes at the first check 24 h after its expiry; a
+   detection keeps it watched for up to 7 days, then it moves to
+   `needs_review` with an `ALERT` and no longer blocks the gate).
+
+   <!-- paykit-cutover-gate-query -->
+   ```sql
+   SELECT
+     (SELECT count(*) FROM orders o JOIN payments p ON p.order_id = o.id
+       WHERE p.adapter = 'paykit'
+         AND o.paykit_request_state IN
+             ('preparing', 'pending', 'detected', 'awaiting_seller_confirmation')
+         AND (p.state = 'awaiting_entitlement'
+              OR (p.state = 'expired'
+                  AND (o.paykit_request_state = 'detected'
+                       OR o.paykit_expires_at + interval '24 hours' > now())))
+     ) AS orders_in_flight,
+     (SELECT count(*) FROM paykit_superseded_attempts
+       WHERE state = 'watching') AS released_attempts_watching;
+   ```
+
+4. **Flip.** In one deployment set `PAYKIT_SERVER_API=upstream` and repoint
+   `PAYKIT_SERVER_URL`, on staging first.
+5. **Check.** The log carries no line with code
+   `paykit_fork_row_polled_under_upstream`. The service writes one
+   `ALERT fork-issued paykit request polled under PAYKIT_SERVER_API=upstream`
+   line per request per poll (every `PAYKIT_POLL_SECONDS`), naming the
+   request's reference and seller. Any such line means a fork request was
+   still in flight: roll back, then drain again.
+
+**Rollback.** Set `PAYKIT_SERVER_API=fork` (or unset it) and restore
+`PAYKIT_SERVER_URL`. A status poll that cannot be read fails closed and
+changes nothing, so fork requests polled under `upstream` are untouched and
+resume on the next poll. The same rule holds in reverse: a request issued by
+one server is observed only while the service is configured for that server,
+so roll back before requests issued by the upstream server exist, or drain
+them first.
+
+**Retiring the fork server** is a separate step from the flip. The seller's
+resolution of a payment in manual review is delivered to the pinned fork
+endpoint, so keep the fork server running until this query returns `0 | 0`
+(the §C.16 conditions 7 and 6: no order awaiting seller confirmation or in
+manual review pinned to a stack, and every `paykit.resolve` row delivered or
+acknowledged):
+
+<!-- paykit-cutover-decommission-query -->
+```sql
+SELECT
+  (SELECT count(*) FROM orders o JOIN payments p ON p.order_id = o.id
+    WHERE o.paykit_stack_id IS NOT NULL
+      AND (o.paykit_request_state = 'awaiting_seller_confirmation'
+           OR p.state = 'manual_review')) AS orders_pinned_awaiting_resolution,
+  (SELECT count(*) FROM paykit_resolve_outbox
+    WHERE delivery_state = 'queued'
+       OR (delivery_state = 'terminal_unresolved'
+           AND acknowledged_at IS NULL)) AS resolutions_unfinished;
+```
 
 ### Address autocomplete proxy
 
@@ -327,9 +406,10 @@ public Nominatim instance forbids autocomplete; Photon is built for it.
 ### Two-phase Paykit payment requests
 
 This section describes the **fork** mode (`PAYKIT_SERVER_API=fork`, the
-default), the only mode in which the service serves the payment-request
-lifecycle. In `upstream` mode a Bitcoin bind answers `paykit_unavailable` until
-upstream lifecycle support lands (open pull request #95).
+default), the only mode this build supports for the payment-request
+lifecycle; `upstream` mode keeps this contract until upstream lifecycle
+support lands (open pull request #95). See the
+[cutover runbook](#cutover-runbook).
 
 Bitcoin binding is a two-phase protocol with paykit-server (the message
 contract is design §B.11.3, verbatim; this section describes the
