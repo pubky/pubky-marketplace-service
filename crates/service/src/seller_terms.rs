@@ -11,13 +11,11 @@
 //! configured `DELIVERY_ASSUME_DAYS` / `AUTO_COMPLETE_DAYS` default.
 
 use chrono::{DateTime, Utc};
-use marketplace_domain::ErrorCode;
 use serde_json::Value;
 use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::homeserver::{HomeserverFetchOutcome, HomeserverListingClient};
-use crate::result::CommandFailure;
 
 /// Shortest period a seller may set, in days.
 pub const MIN_TERM_DAYS: i64 = 1;
@@ -28,10 +26,6 @@ pub const MAX_TERM_DAYS: i64 = 60;
 const DELIVERY_ASSUME_FIELD: &str = "deliveryAssumeDays";
 /// Shop-record field naming the days after delivery when the order completes.
 const AUTO_COMPLETE_FIELD: &str = "autoCompleteDays";
-
-/// The refusal copy when the seller's shop record cannot be read.
-pub const SHOP_UNAVAILABLE_COPY: &str =
-    "The seller's shop settings could not be read. Try again shortly.";
 
 /// The periods a seller set. `None` means unset: the configured default
 /// applies when the sweeps run.
@@ -69,16 +63,18 @@ fn bounded_days(record: &Value, field: &str) -> Option<i32> {
 ///   reading the homeserver again.
 /// - Without a configured homeserver, or when the seller has no shop record
 ///   (`NotFound`), the order captures no periods and the defaults apply.
-/// - When the shop record cannot be read (`Unavailable`), the payment does
-///   not start: a silent fallback would contradict the periods the seller
-///   published and the buyer was shown. The buyer retries.
+/// - When the shop record cannot be read (`Unavailable`), the payment still
+///   starts: the order freezes the configured defaults and an
+///   `ALERT seller_terms_fallback_unreadable_shop_record` is logged with the
+///   seller pubky and order id, so payments are not coupled to homeserver
+///   availability.
 pub async fn capture_for_order(
     tx: &mut Transaction<'_, Postgres>,
     homeserver: Option<&dyn HomeserverListingClient>,
     order_id: Uuid,
     seller_pubky: &str,
     now: DateTime<Utc>,
-) -> Result<Result<(), CommandFailure>, sqlx::Error> {
+) -> Result<(), sqlx::Error> {
     let already_captured: bool = sqlx::query_scalar(
         "SELECT delivery_terms_captured_at IS NOT NULL FROM orders WHERE id = $1",
     )
@@ -86,7 +82,7 @@ pub async fn capture_for_order(
     .fetch_one(&mut **tx)
     .await?;
     if already_captured {
-        return Ok(Ok(()));
+        return Ok(());
     }
     let terms = match homeserver {
         None => SellerDeliveryTerms::default(),
@@ -94,11 +90,14 @@ pub async fn capture_for_order(
             HomeserverFetchOutcome::Found(record) => SellerDeliveryTerms::from_shop_record(&record),
             HomeserverFetchOutcome::NotFound => SellerDeliveryTerms::default(),
             HomeserverFetchOutcome::Unavailable => {
-                return Ok(Err(CommandFailure::refused(
-                    crate::refusal_audit::RefusalKind::UpstreamUnavailable,
-                    ErrorCode::UpstreamUnavailable,
-                    SHOP_UNAVAILABLE_COPY,
-                )));
+                tracing::error!(
+                    seller_pubky = %seller_pubky,
+                    order_id = %order_id,
+                    "ALERT seller_terms_fallback_unreadable_shop_record: seller shop record \
+                     unreadable at payment start; order frozen with the configured default \
+                     delivery periods (seller_pubky={seller_pubky} order_id={order_id})"
+                );
+                SellerDeliveryTerms::default()
             }
         },
     };
@@ -113,7 +112,7 @@ pub async fn capture_for_order(
     .bind(now)
     .execute(&mut **tx)
     .await?;
-    Ok(Ok(()))
+    Ok(())
 }
 
 #[cfg(test)]

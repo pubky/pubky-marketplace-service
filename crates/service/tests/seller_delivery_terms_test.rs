@@ -14,16 +14,16 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use common::{
-    checkout_command, checkout_command_with_id, count, create_pending_order, execute,
-    indexed_command_id, new_actor, order_command, payment_command, register_command, send,
-    test_app_with_payments, test_app_with_shop_homeserver, with_shop_homeserver, FakeHomeserver,
-    TestActor, TestApp,
+    captured_logs, checkout_command, checkout_command_with_id, count, create_pending_order,
+    execute, indexed_command_id, install_log_capture, new_actor, order_command, payment_command,
+    register_command, send, test_app_with_payments, test_app_with_shop_homeserver,
+    with_shop_homeserver, FakeHomeserver, TestActor, TestApp,
 };
 use marketplace_service::clock::Clock;
 use marketplace_service::config::{
     DEFAULT_AUTO_COMPLETE_DAYS, DEFAULT_DELIVERY_ASSUME_DAYS, DEFAULT_DELIVERY_SWEEP_BATCH_SIZE,
 };
-use marketplace_service::seller_terms::{capture_for_order, SHOP_UNAVAILABLE_COPY};
+use marketplace_service::seller_terms::capture_for_order;
 use marketplace_service::workers::{
     assume_due_deliveries, complete_due_delivered_orders, DELIVERY_SWEEP_MAX_BATCHES,
 };
@@ -336,7 +336,10 @@ async fn periods_outside_one_to_sixty_days_read_as_unset(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn an_unreadable_shop_record_stops_the_payment_until_it_can_be_read(pool: PgPool) {
+async fn an_unreadable_shop_record_does_not_block_the_payment_and_falls_back_to_defaults(
+    pool: PgPool,
+) {
+    install_log_capture();
     let (app, homeserver) = test_app_with_shop_homeserver(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
@@ -351,25 +354,76 @@ async fn an_unreadable_shop_record_stops_the_payment_until_it_can_be_read(pool: 
     homeserver.fail_shop_record(&seller.pubky);
 
     let (status, body) = confirm_payment(&app, &buyer, &pending.payment_id).await;
-    assert_ne!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["error"]["code"], json!("UPSTREAM_UNAVAILABLE"));
-    assert_eq!(body["error"]["message"], json!(SHOP_UNAVAILABLE_COPY));
-    assert_eq!(
-        order_state(&app.pool, &pending.order_id).await,
-        "pending_payment"
-    );
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(order_state(&app.pool, &pending.order_id).await, "paid");
     assert_eq!(
         terms_row(&app.pool, &pending.order_id).await,
-        (None, None, false),
-        "a refused payment captures nothing"
+        (None, None, true),
+        "the order freezes the configured defaults"
+    );
+    let alert = captured_logs()
+        .lines()
+        .find(|line| line.contains(&pending.order_id))
+        .map(str::to_owned)
+        .expect("an alert names the order");
+    assert!(
+        alert.contains("ALERT seller_terms_fallback_unreadable_shop_record"),
+        "{alert}"
+    );
+    assert!(alert.contains(&seller.pubky), "{alert}");
+
+    // The seller's record healing later never moves the frozen order.
+    homeserver.heal_shop_record(&seller.pubky);
+    assert_eq!(
+        terms_row(&app.pool, &pending.order_id).await,
+        (None, None, true)
     );
 
-    homeserver.heal_shop_record(&seller.pubky);
-    let (status, body) = confirm_payment(&app, &buyer, &pending.payment_id).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
+    ship(&app, &seller, &pending.order_id, 0x5641).await;
     assert_eq!(
-        terms_row(&app.pool, &pending.order_id).await,
-        (Some(4), Some(6), true)
+        assume_due(
+            &app.pool,
+            days_after(&app, DEFAULT_DELIVERY_ASSUME_DAYS - 1)
+        )
+        .await,
+        0,
+        "the seller's 4 days were never read"
+    );
+    let assumed_at = days_after(&app, DEFAULT_DELIVERY_ASSUME_DAYS);
+    assert_eq!(assume_due(&app.pool, assumed_at).await, 1);
+    assert_eq!(
+        complete_due(
+            &app.pool,
+            assumed_at + chrono::Duration::days(DEFAULT_AUTO_COMPLETE_DAYS - 1)
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        complete_due(
+            &app.pool,
+            assumed_at + chrono::Duration::days(DEFAULT_AUTO_COMPLETE_DAYS)
+        )
+        .await,
+        1
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_readable_shop_record_raises_no_fallback_alert(pool: PgPool) {
+    install_log_capture();
+    let (app, homeserver) = test_app_with_shop_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    homeserver.put_shop_record(
+        &seller.pubky,
+        shop_record(&seller, json!({ "deliveryAssumeDays": 4 })),
+    );
+    let order_id = paid_order(&app, &seller, &buyer).await;
+    assert!(
+        !captured_logs().lines().any(|line| line.contains(&order_id)
+            && line.contains("seller_terms_fallback_unreadable_shop_record")),
+        "a readable record never raises the fallback alert"
     );
 }
 
@@ -398,8 +452,7 @@ async fn capture_happens_once_per_order(pool: PgPool) {
         app.clock.now(),
     )
     .await
-    .expect("capture runs")
-    .expect("capture accepted");
+    .expect("capture runs");
     tx.commit().await.expect("commit");
 
     homeserver.put_shop_record(
@@ -418,8 +471,7 @@ async fn capture_happens_once_per_order(pool: PgPool) {
         app.clock.now(),
     )
     .await
-    .expect("second capture runs")
-    .expect("second capture accepted");
+    .expect("second capture runs");
     tx.commit().await.expect("commit");
 
     assert_eq!(
@@ -438,7 +490,6 @@ async fn capture_happens_once_per_order(pool: PgPool) {
         app.clock.now(),
     )
     .await
-    .expect("third capture runs")
     .expect("an already captured order never reads the record");
     tx.commit().await.expect("commit");
 }
@@ -488,14 +539,42 @@ async fn the_payment_method_bind_captures_the_sellers_periods(pool: PgPool) {
     );
     let order = create_pending_order(&app, &seller, &buyer).await;
 
-    homeserver.fail_shop_record(&seller.pubky);
     let (status, body) = bind_paypal(&app, &buyer, &order.order_id).await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    assert_eq!(body["error"]["reason"], json!("shop_unavailable"));
+    assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         terms_row(&app.pool, &order.order_id).await,
-        (None, None, false)
+        (Some(10), Some(12), true)
     );
+    assert_eq!(body["order"]["delivery_assume_days"], json!(10));
+    assert_eq!(body["order"]["auto_complete_days"], json!(12));
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn the_payment_method_bind_proceeds_when_the_shop_record_is_unreadable(pool: PgPool) {
+    install_log_capture();
+    let (app, _stripe, _paykit) = test_app_with_payments(pool).await;
+    let homeserver: FakeHomeserver = common::spawn_fake_homeserver().await;
+    let app = with_shop_homeserver(app, &homeserver);
+    let seller = paypal_seller(&app).await;
+    let buyer = new_actor(&app).await;
+    homeserver.put_shop_record(
+        &seller.pubky,
+        shop_record(
+            &seller,
+            json!({ "deliveryAssumeDays": 10, "autoCompleteDays": 12 }),
+        ),
+    );
+    let order = create_pending_order(&app, &seller, &buyer).await;
+
+    homeserver.fail_shop_record(&seller.pubky);
+    let (status, body) = bind_paypal(&app, &buyer, &order.order_id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        terms_row(&app.pool, &order.order_id).await,
+        (None, None, true)
+    );
+    assert_eq!(body["order"]["delivery_assume_days"], Value::Null);
+    assert_eq!(body["order"]["auto_complete_days"], Value::Null);
     assert_eq!(
         count(
             &app.pool,
@@ -505,19 +584,17 @@ async fn the_payment_method_bind_captures_the_sellers_periods(pool: PgPool) {
             )
         )
         .await,
-        0,
-        "a refused bind takes no hold"
+        1,
+        "the bind still takes its hold"
     );
-
-    homeserver.heal_shop_record(&seller.pubky);
-    let (status, body) = bind_paypal(&app, &buyer, &order.order_id).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(
-        terms_row(&app.pool, &order.order_id).await,
-        (Some(10), Some(12), true)
+    assert!(
+        captured_logs()
+            .lines()
+            .any(|line| line.contains(&order.order_id)
+                && line.contains("ALERT seller_terms_fallback_unreadable_shop_record")
+                && line.contains(&seller.pubky)),
+        "the fallback is alerted with the seller and the order"
     );
-    assert_eq!(body["order"]["delivery_assume_days"], json!(10));
-    assert_eq!(body["order"]["auto_complete_days"], json!(12));
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]

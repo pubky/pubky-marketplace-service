@@ -879,11 +879,13 @@ and refund branches):
   the order and the sweeps apply `DELIVERY_ASSUME_DAYS` /
   `AUTO_COMPLETE_DAYS`; a seller with no shop record, a deployment without a
   homeserver, and every order that predates migration 0056 read the same
-  way. When the shop record exists but cannot be read (transport failure or
-  a non-404 error), the payment does not start (`UPSTREAM_UNAVAILABLE`,
-  `error.reason = shop_unavailable` on the bind) and the buyer retries,
-  because a silent fallback would contradict the periods the seller
-  published and the buyer was shown.
+  way. An unreadable shop record (transport failure or a non-404 error)
+  never blocks a payment: the order freezes the configured defaults (both
+  periods NULL, capture stamped) and the service logs
+  `ALERT seller_terms_fallback_unreadable_shop_record` with the seller pubky
+  and order id, so payments are not coupled to homeserver availability. The
+  seller's periods are not applied to that order later, even once the
+  record is readable again.
 - **`guarantee_policy_version`.** `checkout.create` and `offer.checkout` no
   longer require it. A command that omits it is accepted and its order
   stores and projects `guarantee_policy_version: null`; a command that still
