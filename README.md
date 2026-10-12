@@ -1021,6 +1021,53 @@ refund after delivery is recorded straight from `delivered` or `completed`
 line keeps that line sold. `/health` reports `digital_delivery_available` and
 `digital_delivery_max_bytes`.
 
+## Personal data held for delivery and payment
+
+What the service keeps about buyers beyond the order itself, verified against
+the code and pinned by tests.
+
+**Buyer delivery email** (digital `email` lines only; `order_delivery_emails`).
+
+- Encrypted at rest. The address is sealed with XChaCha20-Poly1305 under
+  `DIGITAL_DELIVERY_ENCRYPTION_KEY`, bound to the order and buyer
+  (`buyer-email/v1|{order_id}|{buyer_pubky}`), and exists nowhere else:
+  command results, events, notifications, projections and logs never carry it
+  (`delivery_email_sentinel_absent_everywhere` scans every text, JSON and
+  bytea column and the captured logs). Without the key, checkout refuses
+  digital lines.
+- Purged on a schedule. The `delivery_email_purge` worker task sets
+  `email_ciphertext` to `NULL` and stamps `purged_at`, keeping only `emailed_at`:
+  30 days after `orders.ended_at` for an order that was paid (a receipt
+  exists) and has reached `completed`, `cancelled`, `refunded_external` or
+  `closed` (`BUYER_EMAIL_RETENTION_DAYS`), and 7 days after `ended_at` for an
+  unpaid checkout that was cancelled or expired
+  (`BUYER_EMAIL_UNPAID_RETENTION_DAYS`). `ended_at` is stamped when the order
+  enters one of those states and later writes do not move it.
+  `/ready` answers `delivery_email_purge_overdue` while an address is more
+  than a day past its retention.
+- The clock starts when the order ends. A paid order whose seller never marks
+  the email delivered and never ends is a live order and keeps its sealed
+  address until it does.
+
+**PayPal records.** Only a postback-verified IPN is read, and only these
+values are stored:
+
+- the payment's `txn_id` (`orders.paypal_txn_id`, `fiat_transaction_ref`) and
+  the seller's PayPal account it was verified against (`receiver_email` and
+  `receiver_id`, `orders.paypal_receiver_email` and `paypal_receiver_id`);
+- for a refund, reversal or canceled reversal: its `txn_id`, `parent_txn_id`,
+  status and amount (`order_gateway_refunds`); one that cannot be applied yet
+  waits in `gateway_refund_inbox` with ten allow-listed fields (`payment_status`,
+  `txn_id`, `parent_txn_id`, `custom`, `mc_gross`, `mc_currency`,
+  `receiver_email`, `business`, `receiver_id`, `reason_code`).
+
+No payer detail (`payer_email`, `payer_id`, `first_name`, `last_name`,
+`address_*`, `payer_status`, `residence_country` and the rest) is stored or
+logged. `paypal_ipn_stores_nothing_about_the_payer` posts the full fixture
+notifications, with all those fields, and scans every column and the logs for
+them. The buyer-typed transaction reference of `POST
+/v0/orders/{id}/fiat/mark-paid` is the buyer's own input, not IPN data.
+
 ## Drops (ADR-0026)
 
 Timed, limited releases. A drop is registered by the convergent `drop.sync`
