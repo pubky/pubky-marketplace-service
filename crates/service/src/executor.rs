@@ -68,7 +68,7 @@ pub async fn execute(
                     == crate::listing_moderation::ModerationVerdict::Moderated
                 {
                     let failure = CommandFailure::refused(
-                        RefusalKind::InvalidState,
+                        crate::refusal_audit::RefusalKind::InvalidState,
                         ErrorCode::ListingModerated,
                         crate::listing_moderation::LISTING_MODERATED_MESSAGE,
                     );
