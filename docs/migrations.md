@@ -100,6 +100,13 @@ primary key. It builds no index on an existing table and sets
 `lock_timeout` like 0050. No index serves the follower's revival read (live
 listings with `revived_from_cursor` set); it filters the live listings.
 
+0058 (purge retired Stripe values) is one `UPDATE` that sets
+`seller_payment_configs.stripe_payment_link` and
+`stripe_restricted_key_ciphertext` to `NULL` for the rows that hold a value.
+It changes no schema and builds no index, and a second run matches no row.
+The two columns stay: 0009 created them and dropping a column is not
+additive. Orders and payments bound to Stripe are not touched.
+
 ## Numbers claimed by open pull requests
 
 `main` ends at 0051. Pull requests that are open when this was written claim
@@ -113,6 +120,9 @@ and take the next free number rather than assume 0052:
 | 0053 | `0053_payment_assets.sql` | #91, and #99 (the same change stacked on #95) |
 | 0054 | `0054_refund_destinations.sql` | #94, and #101 (stacked on #95) |
 | 0055 | `0055_user_priv_key_custody_releases.sql` | #92 (`/priv` Phase 4) |
+| 0056 | `0056_order_delivery_terms.sql` | #106 (seller-set delivery periods, optional `guarantee_policy_version`) |
+| 0057 | none yet | reserved for other work |
+| 0058 | `0058_purge_retired_stripe_values.sql` | #104 (remove the Stripe rail) |
 
 The stacked pairs (#91/#99, #94/#101) are alternative bases for the same file,
 not two migrations. Only one of each pair will merge. #93 and #100 carry no

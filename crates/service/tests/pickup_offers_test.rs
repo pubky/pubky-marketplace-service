@@ -98,16 +98,7 @@ async fn pickup_offer_app(
     fulfillment: &'static [&'static str],
     shipping: bool,
 ) -> (TestApp, FakePaypalIpn) {
-    pickup_offer_app_with(pool, fulfillment, shipping, config_durable()).await
-}
-
-async fn pickup_offer_app_with(
-    pool: PgPool,
-    fulfillment: &'static [&'static str],
-    shipping: bool,
-    config: marketplace_service::config::Config,
-) -> (TestApp, FakePaypalIpn) {
-    let (app, _stripe, _paykit, ipn, _shippo) = test_app_with_payments_config(pool, config).await;
+    let (app, _paykit, ipn, _shippo) = test_app_with_payments_config(pool, config_durable()).await;
     let state = app
         .state
         .clone()

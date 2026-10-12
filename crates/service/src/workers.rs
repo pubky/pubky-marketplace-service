@@ -3403,6 +3403,10 @@ struct DeliveredOrderClaim {
 /// delivery was assumed, not confirmed. Both participants are notified;
 /// the event is attributed to the system actor, never a peer.
 ///
+/// The same period also ends a paid manual digital order the seller never
+/// marked delivered, counted from the payment (see
+/// `assume_due_digital_deliveries_batch`).
+///
 /// Claims are bounded (`batch_size` per inner transaction, up to
 /// `max_batches` per call) so a backlog cannot hold row locks on every due
 /// order at once. Malformed `shipped_at` values are skipped and logged by
@@ -3422,7 +3426,112 @@ pub async fn assume_due_deliveries(
             break;
         }
     }
+    for _ in 0..max_batches {
+        let pass =
+            assume_due_digital_deliveries_batch(pool, now, default_assume_days, batch_size).await?;
+        assumed += pass.processed;
+        if pass.claimed < batch_size as u64 {
+            break;
+        }
+    }
     Ok(assumed)
+}
+
+/// Assumes delivery of paid digital orders the seller never marked
+/// delivered: a manual ("I'll email it" / "I'll send it in messages") order
+/// that sits in `paid` past its frozen delivered-assumption period, counted
+/// from the receipt's issue instant (the payment), moves `paid → delivered`
+/// exactly as a shipped order does after shipment. Instant-only digital
+/// orders are delivered at payment and never wait here. An open
+/// cancellation request (`cancel_requested`) takes the order out of the
+/// sweep by construction, and so does a PayPal reversal outstanding on the
+/// order (`payment_reversed_at`): the seller cannot read the address while
+/// the money is taken back, so the clock is only honored once it is
+/// restored (the period has usually elapsed by then, so the next pass
+/// assumes delivery). The assumption stamps `digital_delivered_at` (the
+/// auto-complete clock) and `delivery_assumed`, so the buyer sees it was
+/// assumed, and the later `delivered → completed` edge starts the sealed
+/// delivery-email retention clock.
+async fn assume_due_digital_deliveries_batch(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+    default_assume_days: i64,
+    batch_size: i64,
+) -> anyhow::Result<DeliverySweepClaim> {
+    let mut tx = pool.begin().await?;
+    let due: Vec<(Uuid, String, String)> = sqlx::query_as(
+        "SELECT o.id, o.buyer_pubky, o.seller_pubky \
+         FROM orders o JOIN receipts r ON r.order_id = o.id \
+         WHERE o.state = 'paid' AND o.fulfillment = 'digital' \
+         AND o.payment_reversed_at IS NULL \
+         AND r.issued_at <= $1 - interval '1 day' * COALESCE(o.delivery_assume_days::bigint, $2) \
+         ORDER BY o.id LIMIT $3 FOR UPDATE OF o SKIP LOCKED",
+    )
+    .bind(now)
+    .bind(default_assume_days)
+    .bind(batch_size)
+    .bind(default_assume_days)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    let claimed = due.len() as u64;
+    let mut processed = 0u64;
+    for (order_id, buyer_pubky, seller_pubky) in due {
+        debug_assert!(marketplace_domain::state_machines::can_transition(
+            &marketplace_domain::state_machines::order_machine(),
+            "paid",
+            "delivered"
+        ));
+        let updated: Option<(i64,)> = sqlx::query_as(
+            "UPDATE orders SET revision = revision + 1, state = 'delivered', \
+             digital_delivered_at = $2, delivery_assumed = TRUE, updated_at = $2 \
+             WHERE id = $1 AND state = 'paid' RETURNING revision",
+        )
+        .bind(order_id)
+        .bind(now)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((revision,)) = updated else {
+            continue;
+        };
+        let aggregate_id = ids::order_aggregate_id(order_id);
+        let event_id = crate::executor::insert_event(
+            &mut tx,
+            Uuid::new_v4(),
+            &aggregate_id,
+            revision,
+            SYSTEM_ACTOR,
+            "fulfillment.digital_delivered",
+            now,
+        )
+        .await?;
+        insert_notification_intent(
+            &mut tx,
+            event_id,
+            "order_delivery_assumed",
+            &buyer_pubky,
+            SYSTEM_ACTOR,
+            &aggregate_id,
+            None,
+            now,
+        )
+        .await?;
+        insert_notification_intent(
+            &mut tx,
+            event_id,
+            "order_delivered",
+            &seller_pubky,
+            SYSTEM_ACTOR,
+            &aggregate_id,
+            None,
+            now,
+        )
+        .await?;
+        tracing::info!(order_id = %order_id, "assumed digital delivery on server time");
+        processed += 1;
+    }
+    tx.commit().await?;
+    Ok(DeliverySweepClaim { claimed, processed })
 }
 
 async fn assume_due_deliveries_batch(

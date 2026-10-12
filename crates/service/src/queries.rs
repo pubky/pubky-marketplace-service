@@ -52,8 +52,6 @@ pub const ORDER_COLUMNS: &str =
      EXISTS (SELECT 1 FROM seller_payment_configs AS seller_config \
        WHERE seller_config.seller_pubky = orders.seller_pubky \
        AND (seller_config.bitcoin_enabled \
-         OR (seller_config.stripe_payment_link IS NOT NULL \
-             AND seller_config.stripe_restricted_key_ciphertext IS NOT NULL) \
          OR seller_config.paypal_merchant_email IS NOT NULL)) AS seller_has_rail, revision, \
      state, lines, delivery_address, checkout_command_id, delivery_address_envelope, \
      delivery_key_id, subtotal_minor, shipping_minor, total_minor, \
@@ -90,7 +88,6 @@ pub async fn seller_has_rail(
         "SELECT EXISTS (SELECT 1 FROM seller_payment_configs \
          WHERE seller_pubky = $1 \
          AND (bitcoin_enabled \
-           OR (stripe_payment_link IS NOT NULL AND stripe_restricted_key_ciphertext IS NOT NULL) \
            OR paypal_merchant_email IS NOT NULL))",
     )
     .bind(seller_pubky)

@@ -21,7 +21,7 @@ use common::{
 
 const HOLDING_COPY: &str = "Another buyer's payment is holding this item. If it isn't completed in time, the item restocks.";
 
-async fn put_stripe_config(app: &common::TestApp, token: &str) {
+async fn put_paypal_config(app: &common::TestApp, token: &str) {
     let (status, body) = send(
         app.router.clone(),
         "PUT",
@@ -29,32 +29,32 @@ async fn put_stripe_config(app: &common::TestApp, token: &str) {
         Some(token),
         &json!({
             "bitcoin_enabled": false,
-            "stripe_payment_link": "https://buy.stripe.com/test_abc123",
+            "paypal_merchant_email": "merchant@example.com",
         }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "config put failed: {body}");
 }
 
-async fn bind_stripe(router: axum::Router, token: String, order_id: String) -> (StatusCode, Value) {
+async fn bind_paypal(router: axum::Router, token: String, order_id: String) -> (StatusCode, Value) {
     send(
         router,
         "POST",
         &format!("/v0/orders/{order_id}/payment-method"),
         Some(&token),
-        &json!({ "method": "stripe" }),
+        &json!({ "method": "paypal" }),
     )
     .await
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn hundred_concurrent_binds_against_qty_one_yield_one_hold(pool: PgPool) {
-    let (app, _stripe, _paykit) = test_app_with_payments(pool).await;
+    let (app, _paykit) = test_app_with_payments(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (status, _) = execute(&app, &seller.token, &register_command(&seller.pubky, 1)).await;
     assert_eq!(status, StatusCode::OK);
-    put_stripe_config(&app, &seller.token).await;
+    put_paypal_config(&app, &seller.token).await;
 
     let mut create_handles = Vec::with_capacity(100);
     for index in 1..=100u64 {
@@ -92,7 +92,7 @@ async fn hundred_concurrent_binds_against_qty_one_yield_one_hold(pool: PgPool) {
         let router = app.router.clone();
         let token = buyer.token.clone();
         bind_handles.push(tokio::spawn(async move {
-            bind_stripe(router, token, order_id).await
+            bind_paypal(router, token, order_id).await
         }));
     }
     let mut wins = 0;
@@ -128,12 +128,12 @@ async fn hundred_concurrent_binds_against_qty_one_yield_one_hold(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn hundred_concurrent_binds_against_qty_ten_yield_ten_holds(pool: PgPool) {
-    let (app, _stripe, _paykit) = test_app_with_payments(pool).await;
+    let (app, _paykit) = test_app_with_payments(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (status, _) = execute(&app, &seller.token, &register_command(&seller.pubky, 10)).await;
     assert_eq!(status, StatusCode::OK);
-    put_stripe_config(&app, &seller.token).await;
+    put_paypal_config(&app, &seller.token).await;
 
     let mut create_handles = Vec::with_capacity(100);
     for index in 1..=100u64 {
@@ -166,7 +166,7 @@ async fn hundred_concurrent_binds_against_qty_ten_yield_ten_holds(pool: PgPool) 
         let router = app.router.clone();
         let token = buyer.token.clone();
         bind_handles.push(tokio::spawn(async move {
-            bind_stripe(router, token, order_id).await
+            bind_paypal(router, token, order_id).await
         }));
     }
     let mut wins = 0;
@@ -211,12 +211,12 @@ async fn two_concurrent_binds_on_one_connection_never_return_5xx(pool: PgPool) {
         .connect_with(pool.connect_options().as_ref().clone())
         .await
         .expect("one-connection pool");
-    let (app, _stripe, _paykit) = test_app_with_payments(tight).await;
+    let (app, _paykit) = test_app_with_payments(tight).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (status, _) = execute(&app, &seller.token, &register_command(&seller.pubky, 1)).await;
     assert_eq!(status, StatusCode::OK);
-    put_stripe_config(&app, &seller.token).await;
+    put_paypal_config(&app, &seller.token).await;
 
     let mut order_ids = Vec::with_capacity(2);
     for index in 1..=2u64 {
@@ -236,12 +236,12 @@ async fn two_concurrent_binds_on_one_connection_never_return_5xx(pool: PgPool) {
         );
     }
 
-    let left = bind_stripe(
+    let left = bind_paypal(
         app.router.clone(),
         buyer.token.clone(),
         order_ids[0].clone(),
     );
-    let right = bind_stripe(
+    let right = bind_paypal(
         app.router.clone(),
         buyer.token.clone(),
         order_ids[1].clone(),

@@ -514,7 +514,6 @@ async fn paypal_seller(app: &TestApp) -> TestActor {
         Some(&seller.token),
         &json!({
             "bitcoin_enabled": false,
-            "stripe_payment_link": null,
             "paypal_merchant_email": "merchant@example.com",
         }),
     )
@@ -525,7 +524,7 @@ async fn paypal_seller(app: &TestApp) -> TestActor {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn the_payment_method_bind_captures_the_sellers_periods(pool: PgPool) {
-    let (app, _stripe, _paykit) = test_app_with_payments(pool).await;
+    let (app, _paykit) = test_app_with_payments(pool).await;
     let homeserver: FakeHomeserver = common::spawn_fake_homeserver().await;
     let app = with_shop_homeserver(app, &homeserver);
     let seller = paypal_seller(&app).await;
@@ -552,7 +551,7 @@ async fn the_payment_method_bind_captures_the_sellers_periods(pool: PgPool) {
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn the_payment_method_bind_proceeds_when_the_shop_record_is_unreadable(pool: PgPool) {
     install_log_capture();
-    let (app, _stripe, _paykit) = test_app_with_payments(pool).await;
+    let (app, _paykit) = test_app_with_payments(pool).await;
     let homeserver: FakeHomeserver = common::spawn_fake_homeserver().await;
     let app = with_shop_homeserver(app, &homeserver);
     let seller = paypal_seller(&app).await;

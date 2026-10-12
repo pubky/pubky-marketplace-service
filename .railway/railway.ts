@@ -40,6 +40,7 @@ const sharedEnv = {
   LOCKS_BUNDLE_ENCRYPTION_KEY: preserve(),
   LOCKS_LOOKUP_HMAC_KEY: preserve(),
   LOCKS_SERVER_URL: preserve(),
+  NEXUS_URL: preserve(),
   PAYKIT_REQUEST_SIGNING_KEY: preserve(),
   PAYKIT_SERVER_URL: preserve(),
   PICKUP_DETAILS_ENCRYPTION_KEY: preserve(),

@@ -992,7 +992,7 @@ async fn late_settlement(
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn late_bitcoin_money_takes_no_stock_from_a_deleted_or_revived_listing(pool: PgPool) {
-    let (app, _stripe, paykit) = common::test_app_with_payments(pool).await;
+    let (app, paykit) = common::test_app_with_payments(pool).await;
 
     // Control: with the listing live, the late money takes its unit back.
     let (_, _, reason, committed) = late_settlement(&app, &paykit, "live").await;
@@ -1010,7 +1010,7 @@ async fn late_bitcoin_money_takes_no_stock_from_a_deleted_or_revived_listing(poo
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_held_manual_review_on_a_deleted_listing_still_resolves_paid(pool: PgPool) {
     use common::paykit_review::{into_manual_review_held, resolve_call};
-    let (app, _stripe, paykit) = common::test_app_with_payments(pool).await;
+    let (app, paykit) = common::test_app_with_payments(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, _reference) = into_manual_review_held(&app, &paykit, &seller, &buyer).await;
@@ -2693,7 +2693,7 @@ async fn a_multi_line_hold_release_and_a_drop_sync_lock_listings_in_one_order(po
 async fn a_late_bitcoin_reacquire_and_a_drop_sync_lock_listings_in_one_order(pool: PgPool) {
     use common::paykit_review::{enable_bitcoin, status_confirmed};
 
-    let (app, _stripe, paykit) = common::test_app_with_payments(pool).await;
+    let (app, paykit) = common::test_app_with_payments(pool).await;
     // The payments app mirrors listing records but serves no drops; the
     // sync runs through a second app on the same database.
     let homeserver = common::spawn_fake_homeserver().await;

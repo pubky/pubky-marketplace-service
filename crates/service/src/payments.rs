@@ -1,19 +1,13 @@
-//! Seller-configurable payment rails: config secrecy, Stripe verification,
-//! and the signed Paykit client for physical bitcoin orders.
+//! Seller-configurable payment rails: seller-secret sealing, PayPal IPN
+//! verification, Shippo, and the signed Paykit client for physical bitcoin
+//! orders.
 //!
-//! Ownership decision (Task C): Stripe verification lives HERE, in the
-//! transaction service, not in the fiat-verifier. The verifier is a
-//! platform-credential gateway for Locks-guarded fiat criteria; per-seller
-//! restricted keys belong with the per-seller payment config this service
-//! owns, and the order state transition the verification drives must happen
-//! in the same database transaction domain as the order itself. One owner,
-//! one ledger.
-//!
-//! Secrecy rules mirror the Locks bundle-id handling: the Stripe restricted
-//! key is sealed with XChaCha20-Poly1305 under `STRIPE_KEY_ENCRYPTION_KEY`
-//! with the seller pubky as associated data, is never returned by any read,
-//! and appears in outbound traffic only as the Authorization header of the
-//! server-side Stripe API call.
+//! Secrecy rules mirror the Locks bundle-id handling: a seller's Shippo API
+//! token is sealed with XChaCha20-Poly1305 under the seller-secret key
+//! (`STRIPE_KEY_ENCRYPTION_KEY`, a legacy name kept so deployments need no
+//! change), with the seller pubky as associated data, is never returned by
+//! any read, and appears in outbound traffic only as the Authorization
+//! header of the server-side Shippo API call.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -26,13 +20,11 @@ use ed25519_dalek::{Signer, SigningKey};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
-/// Environment variable holding the 32-byte hex key sealing Stripe
-/// restricted keys at rest. Setting it enables the payment-methods surface.
-pub const ENV_STRIPE_KEY_ENCRYPTION_KEY: &str = "STRIPE_KEY_ENCRYPTION_KEY";
-/// Environment variable overriding the Stripe API base URL. Production
-/// deployments leave it unset (`https://api.stripe.com`); tests point it at
-/// a local double so the real HTTP client is exercised end to end.
-pub const ENV_STRIPE_API_BASE: &str = "STRIPE_API_BASE";
+/// Environment variable holding the 32-byte hex key sealing seller secrets
+/// (Shippo API tokens) at rest. Setting it enables the payment-methods
+/// surface. The name predates the removal of the Stripe rail and is kept so
+/// existing deployments keep working.
+pub const ENV_SELLER_SECRET_KEY: &str = "STRIPE_KEY_ENCRYPTION_KEY";
 /// Environment variable naming the paykit-server base URL. Setting it
 /// enables the bitcoin method and makes the signing key mandatory.
 pub const ENV_PAYKIT_SERVER_URL: &str = "PAYKIT_SERVER_URL";
@@ -57,37 +49,32 @@ const XNONCE_LEN: usize = 24;
 const KEY_LEN: usize = 32;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const AVAILABILITY_HTTP_TIMEOUT: Duration = Duration::from_secs(3);
-/// How many 100-item Checkout Session pages a verification scans before
-/// honestly reporting "not found". Payment Links have no server-side
-/// `client_reference_id` filter, so recent sessions are listed and matched.
-const STRIPE_MAX_PAGES: usize = 3;
-
-/// Seals and opens Stripe restricted keys.
-pub struct StripeKeyCipher {
+/// Seals and opens seller secrets (Shippo API tokens).
+pub struct SellerSecretCipher {
     key: [u8; KEY_LEN],
 }
 
-impl std::fmt::Debug for StripeKeyCipher {
+impl std::fmt::Debug for SellerSecretCipher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("StripeKeyCipher(<redacted>)")
+        f.write_str("SellerSecretCipher(<redacted>)")
     }
 }
 
-impl StripeKeyCipher {
+impl SellerSecretCipher {
     pub fn from_hex(hex_value: &str) -> anyhow::Result<Self> {
         let bytes = hex::decode(hex_value.trim()).map_err(|_| {
-            anyhow::anyhow!("{ENV_STRIPE_KEY_ENCRYPTION_KEY} must be 64 hexadecimal characters")
+            anyhow::anyhow!("{ENV_SELLER_SECRET_KEY} must be 64 hexadecimal characters")
         })?;
         let key = <[u8; KEY_LEN]>::try_from(bytes).map_err(|_| {
-            anyhow::anyhow!("{ENV_STRIPE_KEY_ENCRYPTION_KEY} must decode to exactly 32 bytes")
+            anyhow::anyhow!("{ENV_SELLER_SECRET_KEY} must decode to exactly 32 bytes")
         })?;
         Ok(Self { key })
     }
 
-    /// Seals a restricted key: random 24-byte nonce followed by the
+    /// Seals a secret: random 24-byte nonce followed by the
     /// ciphertext, with the seller pubky as associated data so ciphertexts
     /// cannot be transplanted between sellers.
-    pub fn encrypt(&self, seller_pubky: &str, restricted_key: &str) -> Vec<u8> {
+    pub fn encrypt(&self, seller_pubky: &str, secret: &str) -> Vec<u8> {
         let cipher = XChaCha20Poly1305::new((&self.key).into());
         let mut nonce_bytes = [0u8; XNONCE_LEN];
         rand::thread_rng().fill_bytes(&mut nonce_bytes);
@@ -95,7 +82,7 @@ impl StripeKeyCipher {
             .encrypt(
                 XNonce::from_slice(&nonce_bytes),
                 Payload {
-                    msg: restricted_key.as_bytes(),
+                    msg: secret.as_bytes(),
                     aad: seller_pubky.as_bytes(),
                 },
             )
@@ -108,7 +95,7 @@ impl StripeKeyCipher {
 
     pub fn decrypt(&self, seller_pubky: &str, sealed: &[u8]) -> anyhow::Result<String> {
         if sealed.len() <= XNONCE_LEN {
-            anyhow::bail!("sealed restricted key is too short");
+            anyhow::bail!("sealed secret is too short");
         }
         let (nonce_bytes, ciphertext) = sealed.split_at(XNONCE_LEN);
         let cipher = XChaCha20Poly1305::new((&self.key).into());
@@ -121,134 +108,9 @@ impl StripeKeyCipher {
                 },
             )
             .map_err(|_| {
-                anyhow::anyhow!("restricted key ciphertext did not authenticate under this key")
+                anyhow::anyhow!("secret ciphertext did not authenticate under this key")
             })?;
-        String::from_utf8(plaintext)
-            .map_err(|_| anyhow::anyhow!("restricted key is not valid UTF-8"))
-    }
-}
-
-/// A matched, paid Stripe Checkout Session for an order.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StripeMatch {
-    pub session_id: String,
-}
-
-/// How a Stripe verification attempt failed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StripeError {
-    /// Stripe rejected the seller's restricted key (401/403): the seller
-    /// must fix their configuration.
-    KeyInvalid,
-    /// Transport trouble or an unexpected Stripe response; retryable.
-    Unavailable,
-}
-
-#[derive(Deserialize)]
-struct StripeSessionList {
-    data: Vec<StripeSession>,
-    #[serde(default)]
-    has_more: bool,
-}
-
-#[derive(Deserialize)]
-struct StripeSession {
-    id: String,
-    #[serde(default)]
-    client_reference_id: Option<String>,
-    #[serde(default)]
-    payment_status: Option<String>,
-    #[serde(default)]
-    amount_total: Option<i64>,
-    #[serde(default)]
-    currency: Option<String>,
-}
-
-/// The real Stripe API client. The trait seam used elsewhere in this
-/// codebase is deliberately absent: tests exercise this exact client against
-/// a local HTTP double (`STRIPE_API_BASE`), so header handling, pagination,
-/// and status mapping are covered end to end.
-pub struct StripeClient {
-    base_url: String,
-    http: reqwest::Client,
-}
-
-impl std::fmt::Debug for StripeClient {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StripeClient")
-            .field("base_url", &self.base_url)
-            .finish()
-    }
-}
-
-impl StripeClient {
-    pub fn new(base_url: &str) -> anyhow::Result<Self> {
-        let base_url = base_url.trim_end_matches('/').to_string();
-        if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
-            anyhow::bail!("{ENV_STRIPE_API_BASE} must be an http(s) URL");
-        }
-        Ok(Self {
-            base_url,
-            http: reqwest::Client::builder().timeout(HTTP_TIMEOUT).build()?,
-        })
-    }
-
-    /// Lists recent Checkout Sessions with the seller's restricted key and
-    /// returns the first PAID session whose `client_reference_id` is this
-    /// order and whose amount and currency match the order total exactly.
-    pub async fn find_paid_session(
-        &self,
-        restricted_key: &str,
-        order_id: &str,
-        amount_minor: i64,
-        currency: &str,
-    ) -> Result<Option<StripeMatch>, StripeError> {
-        let wanted_currency = currency.to_ascii_lowercase();
-        let mut starting_after: Option<String> = None;
-        for _ in 0..STRIPE_MAX_PAGES {
-            let mut request = self
-                .http
-                .get(format!("{}/v1/checkout/sessions", self.base_url))
-                .bearer_auth(restricted_key)
-                .query(&[("limit", "100")]);
-            if let Some(cursor) = &starting_after {
-                request = request.query(&[("starting_after", cursor.as_str())]);
-            }
-            let response = request.send().await.map_err(|_| {
-                tracing::warn!("stripe checkout session listing transport failure");
-                StripeError::Unavailable
-            })?;
-            let status = response.status();
-            if status == reqwest::StatusCode::UNAUTHORIZED
-                || status == reqwest::StatusCode::FORBIDDEN
-            {
-                return Err(StripeError::KeyInvalid);
-            }
-            if !status.is_success() {
-                tracing::warn!(status = %status, "stripe checkout session listing rejected");
-                return Err(StripeError::Unavailable);
-            }
-            let page: StripeSessionList = response.json().await.map_err(|_| {
-                tracing::warn!("stripe checkout session listing returned a malformed body");
-                StripeError::Unavailable
-            })?;
-            for session in &page.data {
-                if session.client_reference_id.as_deref() == Some(order_id)
-                    && session.payment_status.as_deref() == Some("paid")
-                    && session.amount_total == Some(amount_minor)
-                    && session.currency.as_deref() == Some(wanted_currency.as_str())
-                {
-                    return Ok(Some(StripeMatch {
-                        session_id: session.id.clone(),
-                    }));
-                }
-            }
-            match (page.has_more, page.data.last()) {
-                (true, Some(last)) => starting_after = Some(last.id.clone()),
-                _ => break,
-            }
-        }
-        Ok(None)
+        String::from_utf8(plaintext).map_err(|_| anyhow::anyhow!("secret is not valid UTF-8"))
     }
 }
 
@@ -431,8 +293,7 @@ fn joined_messages(messages: &[ShippoMessageWire]) -> String {
 }
 
 /// The real Shippo API client, reached with each SELLER's own API token —
-/// the service holds no platform shipping credentials (same trust shape as
-/// the Stripe restricted key). Tests exercise this exact client against a
+/// the service holds no platform shipping credentials. Tests exercise this exact client against a
 /// local double (`SHIPPO_API_BASE`).
 pub struct ShippoClient {
     base_url: String,
@@ -1539,6 +1400,19 @@ impl PaykitClient {
         seller_pubky: &str,
         reference: &str,
     ) -> (PaykitStatusOutcome, Option<PaykitDeliveryState>) {
+        if self.api == PaykitApi::Upstream {
+            // The payment-request lifecycle this build speaks is the fork's,
+            // so a request it polls under the upstream configuration was
+            // issued by the fork before the flip and is still in flight
+            // (README, "Cutover runbook"). One alert per request per poll.
+            tracing::error!(
+                code = "paykit_fork_row_polled_under_upstream",
+                seller_pubky,
+                reference,
+                "ALERT fork-issued paykit request polled under PAYKIT_SERVER_API=upstream; \
+                 its payment may not be observed until the fork configuration is restored"
+            );
+        }
         let url = format!("{}/transactions/status", self.base_url);
         let Ok((body, signature)) = self.signed_body(
             &url,
@@ -1648,11 +1522,11 @@ impl PaykitClient {
 }
 
 /// The payment-methods runtime carried on [`crate::AppState`]: absent when
-/// `STRIPE_KEY_ENCRYPTION_KEY` is unset (the whole surface is refused), with
-/// the Paykit leg additionally gated on its own pair of variables.
+/// `STRIPE_KEY_ENCRYPTION_KEY` (the seller-secret key) is unset (the whole
+/// surface is refused), with the Paykit leg additionally gated on its own
+/// pair of variables.
 pub struct PaymentsRuntime {
-    pub stripe_key_cipher: StripeKeyCipher,
-    pub stripe: StripeClient,
+    pub secret_cipher: SellerSecretCipher,
     pub paykit: Option<PaykitClient>,
     pub paypal_ipn: PaypalIpnVerifier,
     pub shippo: ShippoClient,
@@ -1700,21 +1574,18 @@ fn paykit_client_from_settings(
 /// `STRIPE_KEY_ENCRYPTION_KEY` enables the surface; `PAYKIT_SERVER_URL` and
 /// `PAYKIT_REQUEST_SIGNING_KEY` must be set together or not at all.
 pub fn payments_runtime_from_env() -> anyhow::Result<Option<Arc<PaymentsRuntime>>> {
-    let Some(encryption_key) = std::env::var(ENV_STRIPE_KEY_ENCRYPTION_KEY).ok() else {
+    let Some(encryption_key) = std::env::var(ENV_SELLER_SECRET_KEY).ok() else {
         let partial_paykit = std::env::var(ENV_PAYKIT_SERVER_URL).is_ok()
             || std::env::var(ENV_PAYKIT_REQUEST_SIGNING_KEY).is_ok();
         if partial_paykit {
             anyhow::bail!(
                 "payment methods are partially configured: {ENV_PAYKIT_SERVER_URL} is set \
-                 without {ENV_STRIPE_KEY_ENCRYPTION_KEY}"
+                 without {ENV_SELLER_SECRET_KEY}"
             );
         }
         return Ok(None);
     };
-    let stripe_key_cipher = StripeKeyCipher::from_hex(&encryption_key)?;
-    let stripe_base =
-        std::env::var(ENV_STRIPE_API_BASE).unwrap_or_else(|_| "https://api.stripe.com".to_string());
-    let stripe = StripeClient::new(&stripe_base)?;
+    let secret_cipher = SellerSecretCipher::from_hex(&encryption_key)?;
     let paykit = paykit_client_from_settings(
         std::env::var(ENV_PAYKIT_SERVER_URL).ok(),
         std::env::var(ENV_PAYKIT_REQUEST_SIGNING_KEY).ok(),
@@ -1727,8 +1598,7 @@ pub fn payments_runtime_from_env() -> anyhow::Result<Option<Arc<PaymentsRuntime>
         .unwrap_or_else(|_| "https://api.goshippo.com".to_string());
     let shippo = ShippoClient::new(&shippo_base)?;
     Ok(Some(Arc::new(PaymentsRuntime {
-        stripe_key_cipher,
-        stripe,
+        secret_cipher,
         paykit,
         paypal_ipn,
         shippo,
@@ -1776,27 +1646,6 @@ impl PaykitStatusSource for PaykitClient {
     }
 }
 
-/// Validates a Stripe Payment Link URL: HTTPS on `buy.stripe.com` or
-/// `book.stripe.com`, no credentials, no fragment.
-pub fn validate_stripe_payment_link(value: &str) -> Result<(), &'static str> {
-    let parsed: url::Url = value
-        .parse()
-        .map_err(|_| "stripe_payment_link must be a valid URL")?;
-    if parsed.scheme() != "https" {
-        return Err("stripe_payment_link must use https");
-    }
-    if !matches!(
-        parsed.host_str(),
-        Some("buy.stripe.com") | Some("book.stripe.com")
-    ) {
-        return Err("stripe_payment_link must be a buy.stripe.com or book.stripe.com URL");
-    }
-    if parsed.username() != "" || parsed.password().is_some() || parsed.fragment().is_some() {
-        return Err("stripe_payment_link must not carry credentials or fragments");
-    }
-    Ok(())
-}
-
 /// Validates the shape of a PayPal merchant email (single `@`, non-empty
 /// local part, dotted domain, no whitespace or control characters).
 pub fn validate_paypal_email(value: &str) -> Result<(), &'static str> {
@@ -1812,18 +1661,6 @@ pub fn validate_paypal_email(value: &str) -> Result<(), &'static str> {
     }
     if domain.starts_with('.') || domain.ends_with('.') || domain.contains("..") {
         return Err(error);
-    }
-    Ok(())
-}
-
-/// Validates a Stripe restricted key: only `rk_`-prefixed keys are accepted
-/// so full secret keys (`sk_`) are never stored.
-pub fn validate_stripe_restricted_key(value: &str) -> Result<(), &'static str> {
-    if !value.starts_with("rk_") {
-        return Err("stripe_restricted_key must be a restricted key (rk_...)");
-    }
-    if value.len() < 12 || value.len() > 255 || !value.chars().all(|c| c.is_ascii_graphic()) {
-        return Err("stripe_restricted_key is malformed");
     }
     Ok(())
 }
@@ -1952,20 +1789,20 @@ mod tests {
     }
 
     #[test]
-    fn restricted_keys_round_trip_and_bind_the_seller() {
-        let cipher = StripeKeyCipher::from_hex(KEY).unwrap();
-        let sealed = cipher.encrypt(&"y".repeat(52), "rk_test_abc123456789");
+    fn sealed_secrets_round_trip_and_bind_the_seller() {
+        let cipher = SellerSecretCipher::from_hex(KEY).unwrap();
+        let sealed = cipher.encrypt(&"y".repeat(52), "shippo_test_abc123456789");
         assert!(!sealed
-            .windows(b"rk_test".len())
-            .any(|window| window == b"rk_test"));
+            .windows(b"shippo_test".len())
+            .any(|window| window == b"shippo_test"));
         assert_eq!(
             cipher.decrypt(&"y".repeat(52), &sealed).unwrap(),
-            "rk_test_abc123456789"
+            "shippo_test_abc123456789"
         );
         cipher
             .decrypt(&"o".repeat(52), &sealed)
             .expect_err("a transplanted ciphertext must not decrypt");
-        StripeKeyCipher::from_hex("abcd").expect_err("short key rejected");
+        SellerSecretCipher::from_hex("abcd").expect_err("short key rejected");
     }
 
     #[test]
@@ -2012,21 +1849,6 @@ mod tests {
     }
 
     #[test]
-    fn payment_link_validation_accepts_stripe_hosted_links_only() {
-        validate_stripe_payment_link("https://buy.stripe.com/test_abc").unwrap();
-        validate_stripe_payment_link("https://book.stripe.com/abc").unwrap();
-        for rejected in [
-            "http://buy.stripe.com/test_abc",
-            "https://evil.example/buy.stripe.com",
-            "https://buy.stripe.com.evil.example/x",
-            "not a url",
-            "https://buy.stripe.com/x#fragment",
-        ] {
-            validate_stripe_payment_link(rejected).expect_err(rejected);
-        }
-    }
-
-    #[test]
     fn paypal_email_validation_accepts_plain_addresses_only() {
         validate_paypal_email("merchant@example.com").unwrap();
         validate_paypal_email("a.b+c@sub.example.co").unwrap();
@@ -2042,13 +1864,5 @@ mod tests {
         ] {
             validate_paypal_email(rejected).expect_err(rejected);
         }
-    }
-
-    #[test]
-    fn restricted_key_validation_refuses_secret_keys() {
-        validate_stripe_restricted_key("rk_test_abc123456789").unwrap();
-        validate_stripe_restricted_key("sk_test_abc123456789")
-            .expect_err("secret keys are never stored");
-        validate_stripe_restricted_key("rk_short").expect_err("too short");
     }
 }

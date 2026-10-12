@@ -90,6 +90,7 @@ pub(crate) fn error_code_name(code: Option<ErrorCode>) -> &'static str {
         Some(ErrorCode::AwardVariantMismatch) => "AWARD_VARIANT_MISMATCH",
         Some(ErrorCode::AwardListingChanged) => "AWARD_LISTING_CHANGED",
         Some(ErrorCode::AwardHoldMissing) => "AWARD_HOLD_MISSING",
+        Some(ErrorCode::ListingModerated) => "LISTING_MODERATED",
         None => "",
     }
 }
@@ -108,7 +109,7 @@ pub(crate) fn log_http_request(method: &str, route: &str, response: &Response, l
         .extensions()
         .get::<crate::auth::Actor>()
         .map(|actor| actor_prefix(&actor.0));
-    if route == "/health" || route == "/version" {
+    if route == "/health" {
         tracing::debug!(method, route, status, latency_ms, "http.request");
     } else if let Some(actor_prefix) = actor_prefix_value {
         tracing::info!(

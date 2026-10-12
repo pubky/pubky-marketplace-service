@@ -71,6 +71,8 @@ also has
 
 - `HOMESERVER_URL` — the homeserver the `listing.sync` command reads
   seller-signed listing records from (an http(s) URL);
+- `NEXUS_URL` — the marketplace index the moderation gate reads (an http(s)
+  URL; see [Listing moderation](#listing-moderation));
 - `REFUSAL_AUDIT_DATABASE_URL` and `REFUSAL_AUDIT_RETENTION_DATABASE_URL` —
   two separate Postgres URLs that log in as
   `marketplace_refusal_audit_writer_login` and
@@ -129,6 +131,7 @@ Railway IaC `preserve()`):
 | --- | --- | --- |
 | `DATABASE_URL` | required | Postgres connection string |
 | `HOMESERVER_URL` | required | homeserver base URL (http(s)) the `listing.sync` command fetches seller-signed records from; the service refuses to boot without it |
+| `NEXUS_URL` | required | base URL (http(s)) of the marketplace index (Nexus) the service asks whether a listing is moderated before it accepts a checkout, a bid or an offer on it; the service refuses to boot without it. See [Listing moderation](#listing-moderation) |
 | `REFUSAL_AUDIT_*` | required | refusal-audit logins, HMAC key pair and attestations; see [Run](#run) |
 | `BIND_ADDR` | `127.0.0.1:8080` | HTTP listen address |
 | `ALLOWED_ORIGINS` | empty | comma-separated exact CORS origins |
@@ -152,21 +155,20 @@ Railway IaC `preserve()`):
 | `LOCKS_LOOKUP_HMAC_KEY` | unset | 32-byte hex key for the HMAC-SHA256 correlation lookup token; must differ from the encryption key |
 | `LOCKS_PAYMENT_WINDOW_SECONDS` | `3600` | hold window armed by the `payment.register_locks` lock point (≥ 60); the correlation window IS the hold window |
 | `CHECKOUT_HOLD_WINDOW_SECONDS` | `900` | unbound leftover cancel for ordinary `pending_payment` rows with `stock_held=false` and no payment method (≥ 60). Ordinary `checkout.create` does not hold stock |
-| `FIAT_PAYMENT_WINDOW_SECONDS` | `600` | hold window armed by a PayPal/Stripe payment-method bind (`POST /v0/orders/{id}/payment-method`) (≥ 60). Default 10 minutes; live Railway may still preserve a longer override |
+| `FIAT_PAYMENT_WINDOW_SECONDS` | `600` | hold window armed by a PayPal payment-method bind (`POST /v0/orders/{id}/payment-method`) (≥ 60). Default 10 minutes; live Railway may still preserve a longer override |
 | `BITCOIN_PAYMENT_WINDOW_SECONDS` | `1800` | hold window armed by a bitcoin payment-method bind; the same instant is Paykit `expires_at` — never longer than the invoice the buyer is shown (≥ 60). Honor a deployment value ≥ 60; do not cap below a live Railway override |
 | `SANDBOX_PAYMENT_WINDOW_SECONDS` | `900` | hold window armed by the sandbox lock point (`payment.sandbox_advance`'s first transition out of `awaiting_entitlement`) (≥ 60) |
 | `DROP_CLAIM_WINDOW_SECONDS` | `600` | hold window armed at checkout for drop-bound orders (lock-at-claim) (≥ 60) |
 | `LOCKS_POLL_SECONDS` | `30` | minimum interval between lifecycle lookups per pending correlation |
 | `ATTESTOR_SECRET_KEY` | unset | 32-byte hex Ed25519 secret of the attestor identity (ADR 0024); its z-base-32 public key is the attestor pubky |
 | `ATTESTOR_ORDER_SALT` | unset | 32-byte hex salt for `order_ref` hashing; must stay stable for the attestor identity's lifetime |
-| `STRIPE_KEY_ENCRYPTION_KEY` | unset | 32-byte hex key sealing seller Stripe restricted keys at rest; setting it enables the `/v0` payment-methods surface |
-| `STRIPE_API_BASE` | `https://api.stripe.com` | Stripe API base URL (overridden only by tests) |
+| `STRIPE_KEY_ENCRYPTION_KEY` | unset | 32-byte hex key sealing seller secrets (Shippo API tokens) at rest; setting it enables the `/v0` payment-methods surface. The name is a legacy of the removed Stripe rail and is kept so deployments need no change |
 | `PAYKIT_SERVER_URL` | unset | paykit-server base URL; setting it enables the bitcoin method |
 | `PAYKIT_REQUEST_SIGNING_KEY` | unset | 32-byte hex ed25519 seed signing paykit-server requests. Its pubky-formatted public key goes into paykit-server's `[signed_services] trusted_public_keys`, beside the Locks key, when `PAYKIT_SERVER_API=upstream`; on the fork (`fork`, the default) it is `marketplace.trusted_public_key`. See [Paykit server API](#paykit-server-api) |
 | `PAYKIT_SERVER_API` | `fork` | which paykit-server the service speaks to: `fork` (today's production server) or `upstream` (`pubky/paykit-server` with the signed-services allowlist, first shipped in v0.1.0-rc9, #55; the latest tagged release is v0.1.0-rc11). Set only together with `PAYKIT_SERVER_URL`. See [Paykit server API](#paykit-server-api) |
 | `PAYKIT_POLL_SECONDS` | `15` | minimum interval between paykit status polls per pending bitcoin order |
 | `PAYKIT_RAIL_STALE_SECONDS` | `60` | stale-out window for cached Paykit rail and seller claim availability; must be at least `PAYKIT_POLL_SECONDS` |
-| `DELIVERY_ASSUME_DAYS` | `14` | default for the days after shipment when the worker marks a `shipped` order `delivered` on server time (no carrier tracking feed), flagging the projection `delivery_assumed` (≥ 1). Applies only to an order whose seller left `deliveryAssumeDays` unset on their shop record; see [Seller-set periods](#seller-set-periods) |
+| `DELIVERY_ASSUME_DAYS` | `14` | default for the days after shipment when the worker marks a `shipped` order `delivered` on server time (no carrier tracking feed), flagging the projection `delivery_assumed` (≥ 1). The same period counts from payment for a paid manual digital order the seller never marks delivered. Applies only to an order whose seller left `deliveryAssumeDays` unset on their shop record; see [Seller-set periods](#seller-set-periods) |
 | `AUTO_COMPLETE_DAYS` | `14` | default for the days after delivery when the worker completes a `delivered` order on server time, unless a return/cancel request is open (≥ 1). Applies only to an order whose seller left `autoCompleteDays` unset on their shop record; see [Seller-set periods](#seller-set-periods) |
 | `DELIVERY_SWEEP_BATCH_SIZE` | `100` | rows claimed per inner delivery/auto-complete sweep pass (≥ 1); the worker loops until a short batch or the per-lease cap |
 | `PUBLIC_APP_ORIGIN` | unset | the web app's public origin (e.g. `https://shop.pubky.app`); when set, hosted checkouts that support a return destination (PayPal `_xclick`) send the buyer back to `{origin}/marketplace/orders` after commit/cancel |
@@ -192,6 +194,35 @@ Railway IaC `preserve()`):
 | `PRIV_DATA_KEY_ENCRYPTION_KEY_PREVIOUS` | unset | optional previous priv data key sealing key for the dual-key read window during rotation; the re-seal worker moves every row to the current key. Keep it set until the pass reports zero rows under the previous key |
 | `PICKUP_DISPUTE_RETENTION_DAYS` | `30` | days a cancelled-after-payment order's pinned pickup snapshot is retained as the dispute exhibit when no refund evidence ever lands, before the ordinary terminal-order purge takes it (≥ 1) |
 
+### Listing moderation
+
+pubky.app's moderation (a moderator account's tags on content and users)
+removes content from the marketplace index. The index reports a listing's
+state at `GET {NEXUS_URL}/v0/listing/{seller}/{listing_id}/moderation`
+(`moderated` is true when the listing itself, or its seller, is moderated).
+Before the service accepts `checkout.create`, `offer.checkout`,
+`offer.create`, `offer.counter`, `offer.accept` or `auction.place_bid` it
+asks, and refuses a moderated listing with `LISTING_MODERATED` (HTTP 409, audited as
+`invalid_state`) without writing anything. Withdrawing or rejecting an offer,
+and closing an auction, sell nothing and stay open. A command id that already
+has a stored result is answered from it without asking the index. The check
+runs before the command's transaction, so a slow index never holds a domain
+connection.
+
+When the index cannot answer (transport failure, timeout, a non-success
+status such as the 404 of an index that predates the route, or a body without
+`moderated`), the service **fails open** and logs at ERROR
+`ALERT the index moderation lookup is unavailable; allowing the command
+without a moderation check`. The index is not the transaction authority
+(ADR 0019), so an outage there does not stop sales; the exception is a
+listing the gate has seen moderated: it stays refused until the index answers
+that it is clear (`ALERT the index could not confirm a moderated listing is
+still moderated; refusing it on the last moderated answer`). Only "moderated"
+answers are cached (5 minutes, per listing); a "clear" answer is never cached,
+so a moderation placed meanwhile is seen on the next command and lifting one
+takes effect once the cached answer expires. Orders created before a listing
+was moderated are not cancelled by this check.
+
 ### Public payment configuration availability
 
 `GET /v0/sellers/{pubky}/payment-config` always returns HTTP 200. Its
@@ -205,13 +236,26 @@ A seller's new Paykit claim becomes visible to buyers within
 `PAYKIT_POLL_SECONDS`.
 
 The endpoint is unauthenticated, so it returns booleans only:
-`paypal_available` (a merchant email is stored) and `stripe_available` (a
-payment link and restricted key are stored). It never returns the seller's
-PayPal email, Stripe payment link, or any other payout or contact identifier.
+`paypal_available` (a merchant email is stored). It never returns the seller's
+PayPal email or any other payout or contact identifier.
 The PayPal email reaches a buyer only inside the `fiat_checkout_url` of an
 order they bound to PayPal (`POST /v0/orders/{id}/payment-method`), which only
 that order's buyer and seller can read. The seller reads their own stored
 values from the authenticated `GET /v0/sellers/me/payment-config`.
+
+Stripe is not a payment method: the service has no Stripe client, binding
+`stripe` answers `invalid_method`, and `PUT /v0/sellers/me/payment-config`
+answers `stripe_removed` to a non-empty `stripe_payment_link` or
+`stripe_restricted_key`. Two retired fields remain in the seller's own view
+only because a Shop that predates the removal requires them:
+`stripe_payment_link` is always `null` and `stripe_restricted_key_set` is
+always `false`; they go once the Shop stops reading them. The columns
+`seller_payment_configs.stripe_payment_link` and
+`stripe_restricted_key_ciphertext` are unused and always `NULL`: migration
+0058 clears every stored value, and nothing writes them after that. Orders
+bound to Stripe before the removal keep `payment_method = 'stripe'` and read
+`fiat_verification: 'processor'`, and the `payments.adapter` and
+`orders.payment_method` check constraints still admit `stripe` for them.
 
 During deployment ordering, an older paykit-server response without
 `bitcoin_offer_available` is compatible: `electrum: "ready"` or
@@ -244,13 +288,92 @@ both modes (upstream answers `status`, `postgres`, `electrum`,
 `paykit_delivery`, `outbox`; only `status: ready` with `electrum: ready` is
 true, and a 503 is an outage).
 
-Flipping the setting is a deployment step: register the service's public key
-in the upstream allowlist first, then set `PAYKIT_SERVER_API=upstream` and
-repoint `PAYKIT_SERVER_URL`; setting it back to `fork` (or unsetting it) and
-repointing is the rollback. Upstream does not serve the payment-request
-lifecycle routes (prepare, activate, void, resolve) yet, so with `upstream`
-a Bitcoin bind answers `paykit_unavailable` until those land. PayPal and
-Stripe are not affected.
+#### Cutover runbook
+
+This build issues, activates, voids, resolves and polls payment requests with
+the fork's contract in both modes: `upstream` changes only the signature and
+the readiness lookup. Do not set `PAYKIT_SERVER_API=upstream` on a deployment
+that sells Bitcoin until a build with upstream lifecycle support (open pull
+request #95) is deployed. PayPal is not affected by the setting.
+
+The flip is safe only when no fork request still needs this service to
+observe it. A request is pinned to the stack that issued it
+(`paykit_stack_id`, `paykit_stack_endpoint`); activation, voiding and the
+seller's resolution dial that pinned endpoint whatever the configuration, but
+status polling asks the configured server only, so a fork request polled
+under `upstream` is not observed and its payment is not seen.
+
+1. **Register the key.** Add the service's public key (the public half of
+   `PAYKIT_REQUEST_SIGNING_KEY`) to upstream's
+   `[signed_services] trusted_public_keys`.
+2. **Stop new fork requests.** Bitcoin is offered only while
+   `bitcoin_available` and `bitcoin_offer_available` are both true, and
+   `bitcoin_offer_available` follows the fork's `GET /health/ready`. Taking
+   that gate down on the fork withdraws Bitcoin from the Shop within
+   `PAYKIT_POLL_SECONDS`. It does not stop a client calling
+   `POST /v0/orders/{id}/payment-method` directly.
+3. **Drain.** Run the gate query below on the production database until it
+   returns `0 | 0`. It counts the fork requests that are preparing, active
+   (`pending`), `detected` or `awaiting_seller_confirmation`, those whose
+   payment expired but are still inside the 24 h late window or have a
+   detection, and the released attempts still `watching`. Each clears by
+   itself: a payment confirms, or its window and the 24 h late window pass
+   (a released attempt closes at the first check 24 h after its expiry; a
+   detection keeps it watched for up to 7 days, then it moves to
+   `needs_review` with an `ALERT` and no longer blocks the gate).
+
+   <!-- paykit-cutover-gate-query -->
+   ```sql
+   SELECT
+     (SELECT count(*) FROM orders o JOIN payments p ON p.order_id = o.id
+       WHERE p.adapter = 'paykit'
+         AND o.paykit_request_state IN
+             ('preparing', 'pending', 'detected', 'awaiting_seller_confirmation')
+         AND (p.state = 'awaiting_entitlement'
+              OR (p.state = 'expired'
+                  AND (o.paykit_request_state = 'detected'
+                       OR o.paykit_expires_at + interval '24 hours' > now())))
+     ) AS orders_in_flight,
+     (SELECT count(*) FROM paykit_superseded_attempts
+       WHERE state = 'watching') AS released_attempts_watching;
+   ```
+
+4. **Flip.** In one deployment set `PAYKIT_SERVER_API=upstream` and repoint
+   `PAYKIT_SERVER_URL`, on staging first.
+5. **Check.** The log carries no line with code
+   `paykit_fork_row_polled_under_upstream`. The service writes one
+   `ALERT fork-issued paykit request polled under PAYKIT_SERVER_API=upstream`
+   line per request per poll (every `PAYKIT_POLL_SECONDS`), naming the
+   request's reference and seller. Any such line means a fork request was
+   still in flight: roll back, then drain again.
+
+**Rollback.** Set `PAYKIT_SERVER_API=fork` (or unset it) and restore
+`PAYKIT_SERVER_URL`. A status poll that cannot be read fails closed and
+changes nothing, so fork requests polled under `upstream` are untouched and
+resume on the next poll. The same rule holds in reverse: a request issued by
+one server is observed only while the service is configured for that server,
+so roll back before requests issued by the upstream server exist, or drain
+them first.
+
+**Retiring the fork server** is a separate step from the flip. The seller's
+resolution of a payment in manual review is delivered to the pinned fork
+endpoint, so keep the fork server running until this query returns `0 | 0`
+(the §C.16 conditions 7 and 6: no order awaiting seller confirmation or in
+manual review pinned to a stack, and every `paykit.resolve` row delivered or
+acknowledged):
+
+<!-- paykit-cutover-decommission-query -->
+```sql
+SELECT
+  (SELECT count(*) FROM orders o JOIN payments p ON p.order_id = o.id
+    WHERE o.paykit_stack_id IS NOT NULL
+      AND (o.paykit_request_state = 'awaiting_seller_confirmation'
+           OR p.state = 'manual_review')) AS orders_pinned_awaiting_resolution,
+  (SELECT count(*) FROM paykit_resolve_outbox
+    WHERE delivery_state = 'queued'
+       OR (delivery_state = 'terminal_unresolved'
+           AND acknowledged_at IS NULL)) AS resolutions_unfinished;
+```
 
 ### Address autocomplete proxy
 
@@ -284,9 +407,10 @@ public Nominatim instance forbids autocomplete; Photon is built for it.
 ### Two-phase Paykit payment requests
 
 This section describes the **fork** mode (`PAYKIT_SERVER_API=fork`, the
-default), the only mode in which the service serves the payment-request
-lifecycle. In `upstream` mode a Bitcoin bind answers `paykit_unavailable` until
-upstream lifecycle support lands (open pull request #95).
+default), the only mode this build supports for the payment-request
+lifecycle; `upstream` mode keeps this contract until upstream lifecycle
+support lands (open pull request #95). See the
+[cutover runbook](#cutover-runbook).
 
 Bitcoin binding is a two-phase protocol with paykit-server (the message
 contract is design §B.11.3, verbatim; this section describes the
@@ -701,7 +825,7 @@ and arms a bounded server-time hold window on the order
 | Lock point | Window |
 | --- | --- |
 | `payment.register_locks` | `LOCKS_PAYMENT_WINDOW_SECONDS` (default 3600) — the existing correlation window IS the hold window; one window concept, not two |
-| `POST /v0/orders/{id}/payment-method` (PayPal / Stripe) | `FIAT_PAYMENT_WINDOW_SECONDS` (default 600, min 60) |
+| `POST /v0/orders/{id}/payment-method` (PayPal) | `FIAT_PAYMENT_WINDOW_SECONDS` (default 600, min 60) |
 | `POST /v0/orders/{id}/payment-method` (bitcoin) | `BITCOIN_PAYMENT_WINDOW_SECONDS` (default 1800, min 60) — equals Paykit `expires_at` |
 | `payment.sandbox_advance` transitioning OUT of `awaiting_entitlement` (the first transition; gated by `SANDBOX_PAYMENTS_ENABLED` as always) | `SANDBOX_PAYMENT_WINDOW_SECONDS` (default 900, min 60) |
 
@@ -831,7 +955,11 @@ and refund branches):
   `auto_complete_days`). Capture happens once: a later change to the shop
   record never moves an open order's clock, and a second lock point on the
   same order does not read the record again. The sweeps (`delivery_assume`,
-  `order_auto_complete`) then use each order's own period. A period the
+  `order_auto_complete`) then use each order's own period, and the same two
+  periods govern a paid manual digital order ("I'll email it" / "I'll send
+  it in messages") the seller never marks delivered: the delivered
+  assumption counts from payment rather than shipment (see
+  [Digital delivery](#digital-delivery)). A period the
   seller left unset (absent, not an integer, or outside 1 to 60) stays NULL on
   the order and the sweeps apply `DELIVERY_ASSUME_DAYS` /
   `AUTO_COMPLETE_DAYS`; a seller with no shop record, a deployment without a
@@ -1013,7 +1141,17 @@ downloading while the order stands, including `completed`. For `email` and
 `message` lines the seller reads the address at
 `GET /v1/orders/{id}/delivery-email` and records the delivery with
 `fulfillment.deliver_digital` (`channel`: `email` or `message`); when every
-manual line is marked the order moves `paid` to `delivered`. A background
+manual line is marked the order moves `paid` to `delivered`. A seller who
+never marks it does not strand the order: the `delivery_assume` sweep moves a
+paid manual digital order `paid` to `delivered` once the order's frozen
+delivered-assumption period (the seller's `deliveryAssumeDays`, else
+`DELIVERY_ASSUME_DAYS`) has elapsed since the receipt was issued, flagging it
+`delivery_assumed` and notifying both parties exactly as for a shipped order.
+The `order_auto_complete` sweep then completes it after the frozen
+auto-complete period (`autoCompleteDays`, else `AUTO_COMPLETE_DAYS`), which
+starts the sealed address's retention clock. An open cancellation request or
+a PayPal reversal outstanding on the order holds the assumption; instant-only
+orders are delivered at payment and never wait for it. A background
 worker deletes the sealed address after its retention (see
 `BUYER_EMAIL_RETENTION_DAYS`), and `/ready` reports `unavailable` if the purge
 falls behind.
@@ -1042,6 +1180,53 @@ refund after delivery is recorded straight from `delivered` or `completed`
 (`refund.record_external`). A cancellation after the buyer opened an instant
 line keeps that line sold. `/health` reports `digital_delivery_available` and
 `digital_delivery_max_bytes`.
+
+## Personal data held for delivery and payment
+
+What the service keeps about buyers beyond the order itself, verified against
+the code and pinned by tests.
+
+**Buyer delivery email** (digital `email` lines only; `order_delivery_emails`).
+
+- Encrypted at rest. The address is sealed with XChaCha20-Poly1305 under
+  `DIGITAL_DELIVERY_ENCRYPTION_KEY`, bound to the order and buyer
+  (`buyer-email/v1|{order_id}|{buyer_pubky}`), and exists nowhere else:
+  command results, events, notifications, projections and logs never carry it
+  (`delivery_email_sentinel_absent_everywhere` scans every text, JSON and
+  bytea column and the captured logs). Without the key, checkout refuses
+  digital lines.
+- Purged on a schedule. The `delivery_email_purge` worker task sets
+  `email_ciphertext` to `NULL` and stamps `purged_at`, keeping only `emailed_at`:
+  30 days after `orders.ended_at` for an order that was paid (a receipt
+  exists) and has reached `completed`, `cancelled`, `refunded_external` or
+  `closed` (`BUYER_EMAIL_RETENTION_DAYS`), and 7 days after `ended_at` for an
+  unpaid checkout that was cancelled or expired
+  (`BUYER_EMAIL_UNPAID_RETENTION_DAYS`). `ended_at` is stamped when the order
+  enters one of those states and later writes do not move it.
+  `/ready` answers `delivery_email_purge_overdue` while an address is more
+  than a day past its retention.
+- The clock starts when the order ends. A paid order whose seller never marks
+  the email delivered and never ends is a live order and keeps its sealed
+  address until it does.
+
+**PayPal records.** Only a postback-verified IPN is read, and only these
+values are stored:
+
+- the payment's `txn_id` (`orders.paypal_txn_id`, `fiat_transaction_ref`) and
+  the seller's PayPal account it was verified against (`receiver_email` and
+  `receiver_id`, `orders.paypal_receiver_email` and `paypal_receiver_id`);
+- for a refund, reversal or canceled reversal: its `txn_id`, `parent_txn_id`,
+  status and amount (`order_gateway_refunds`); one that cannot be applied yet
+  waits in `gateway_refund_inbox` with ten allow-listed fields (`payment_status`,
+  `txn_id`, `parent_txn_id`, `custom`, `mc_gross`, `mc_currency`,
+  `receiver_email`, `business`, `receiver_id`, `reason_code`).
+
+No payer detail (`payer_email`, `payer_id`, `first_name`, `last_name`,
+`address_*`, `payer_status`, `residence_country` and the rest) is stored or
+logged. `paypal_ipn_stores_nothing_about_the_payer` posts the full fixture
+notifications, with all those fields, and scans every column and the logs for
+them. The buyer-typed transaction reference of `POST
+/v0/orders/{id}/fiat/mark-paid` is the buyer's own input, not IPN data.
 
 ## Drops (ADR-0026)
 
@@ -1506,8 +1691,8 @@ commands, exactly as in the engine.
 - `/health` is liveness plus a capability summary; `/ready` answers 503
   when the refusal-audit pipeline is not ready, the database probe fails, or
   buyer delivery emails are past their retention (the purge worker is not
-  running); `/version` reports the crate version, the commit (`GIT_COMMIT`, else
-  `RAILWAY_GIT_COMMIT_SHA`, else `git rev-parse HEAD`) and `BUILD_TIME`,
-  baked in at build time, each `unknown` when missing.
+  running). The service publishes no version endpoint: the running build is the
+  image digest (and its `org.opencontainers.image.revision` label) recorded for
+  the deploy.
 - The worker runtime runs in-process; every drain is guarded by leases plus
   `FOR UPDATE SKIP LOCKED`, so multiple service instances are safe.

@@ -48,9 +48,9 @@ async fn main() -> anyhow::Result<()> {
     // without salt, or salt without key) refuses to start rather than
     // issuing attestations with unlinkable order refs.
     let attestor = marketplace_service::attestor::Attestor::from_env()?;
-    // Fail closed for payment methods: STRIPE_KEY_ENCRYPTION_KEY enables the
-    // surface, and the Paykit pair (server URL + signing key) is
-    // all-or-nothing within it.
+    // Fail closed for payment methods: STRIPE_KEY_ENCRYPTION_KEY (the
+    // seller-secret key, a legacy name) enables the surface, and the Paykit
+    // pair (server URL + signing key) is all-or-nothing within it.
     let payments = marketplace_service::payments::payments_runtime_from_env()?;
     match &payments {
         Some(payments) => tracing::info!(
@@ -61,7 +61,7 @@ async fn main() -> anyhow::Result<()> {
             },
             "payment methods enabled"
         ),
-        None => tracing::info!("payment methods disabled (no Stripe key encryption key)"),
+        None => tracing::info!("payment methods disabled (no seller-secret encryption key)"),
     }
     // All-or-none for local pickup (§A8): PICKUP_DETAILS_ENCRYPTION_KEY
     // enables the sealed pickup-details store; absent, pickup is OFF and
@@ -104,6 +104,15 @@ async fn main() -> anyhow::Result<()> {
     // silently re-open the unregistered-listing dead-end it exists to fix.
     let homeserver = Arc::new(marketplace_service::homeserver::client_from_env()?);
     tracing::info!("homeserver listing sync enabled");
+    // NEXUS_URL is required: checkout, bids and offers on a moderated listing
+    // are refused from the index's moderation state, and running without it
+    // would sell moderated listings by omission.
+    let listing_moderation = Arc::new(
+        marketplace_service::listing_moderation::ListingModerationGate::new(Arc::new(
+            marketplace_service::listing_moderation::client_from_env()?,
+        )),
+    );
+    tracing::info!("listing moderation gate enabled");
     match &attestor {
         Some(attestor) => tracing::info!(
             attestor_pubky = attestor.pubky(),
@@ -167,6 +176,7 @@ async fn main() -> anyhow::Result<()> {
         .with_locks(locks)
         .with_attestor(attestor)
         .with_homeserver(Some(homeserver))
+        .with_listing_moderation(Some(listing_moderation))
         .with_payments(payments)
         .with_pickup(pickup)
         .with_digital(digital)
