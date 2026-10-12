@@ -1,0 +1,16 @@
+{
+  "name": "activate",
+  "server_revision": "80352cebb011d2f57318170068ae4ec24af6a417",
+  "request": {
+    "method": "POST",
+    "path": "/marketplace/payment-requests/activate",
+    "content_type": null,
+    "signature": "mOIPlRnkWh6oyPptMdTJg1Hy5_5GovquFK4oWH1xUllJxWHNpOVl5Ju84PLrAZkOOdoNxogO8wSXqXiruG2JDA",
+    "body": "{\"creator\":\"pubkybuuk6nr1caaumhms4tph5oa656z9f5k9q867h4u8ze441mpfuhyo\",\"invoice_id\":\"22e960e0-0a8a-43b3-b901-c6bc7ea9072c\",\"total_sats\":50000}"
+  },
+  "response": {
+    "status": 200,
+    "content_type": "application/json",
+    "body": "{\"invoice_id\":\"22e960e0-0a8a-43b3-b901-c6bc7ea9072c\",\"state\":\"active\",\"activated_at\":\"2026-10-11T13:24:44.395669Z\",\"payment_deadline\":\"2026-10-11T14:24:44.395669Z\",\"total_sats\":50000}"
+  }
+}

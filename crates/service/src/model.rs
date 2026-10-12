@@ -7,6 +7,7 @@ use sqlx::FromRow;
 use uuid::Uuid;
 
 use crate::clock::format_timestamp;
+use crate::payments::ShippoDestination;
 
 /// Serde adapter for the canonical wire timestamp format (RFC 3339 with
 /// milliseconds and `Z`), used inside the auction JSONB document.
@@ -625,19 +626,20 @@ pub struct OrderRow {
     pub auto_complete_days: Option<i32>,
     pub return_request: Option<Value>,
     pub external_refund: Option<Value>,
-    /// The buyer-bound payment method (`bitcoin` | `stripe` | `paypal`),
-    /// NULL until bound.
+    /// The buyer-bound payment method (`bitcoin` | `paypal`; historical rows may
+    /// still read `stripe`), NULL until bound.
     pub payment_method: Option<String>,
     /// Snapshot of the fiat checkout URL taken at binding time.
     pub fiat_checkout_url: Option<String>,
     /// When the buyer reported an out-of-band fiat payment (PayPal leg).
     pub payment_reported_at: Option<DateTime<Utc>>,
     /// Optional processor/transaction reference: the buyer-supplied PayPal
-    /// transaction id, or the matched Stripe Checkout Session id.
+    /// transaction id (historical Stripe rows hold the matched Checkout
+    /// Session id).
     pub fiat_transaction_ref: Option<String>,
-    /// Who verified the fiat payment that paid the order: `processor`
-    /// (Stripe key lookup), `gateway` (verified PayPal IPN), or `seller`
-    /// (manual confirm-received). NULL until verified.
+    /// Who verified the fiat payment that paid the order: `gateway`
+    /// (verified PayPal IPN) or `seller` (manual confirm-received); historical
+    /// Stripe rows read `processor`. NULL until verified.
     pub fiat_verified_by: Option<String>,
     /// Set while a verified PayPal reversal (a buyer chargeback or dispute)
     /// is outstanding on the order; cleared when `Canceled_Reversal`
@@ -668,6 +670,14 @@ pub struct OrderRow {
     /// Two-phase paykit protocol (§B.11): the invoice phase 1 prepared.
     /// Internal correlation, never serialized.
     pub paykit_invoice_id: Option<Uuid>,
+    /// Durable lifecycle protocol for this invoice. Configuration changes
+    /// must not reinterpret queued work.
+    pub paykit_api: Option<String>,
+    /// Upstream support identity, persisted together; all NULL for fork.
+    pub paykit_payment_reference: Option<Uuid>,
+    pub paykit_operation_id: Option<String>,
+    pub paykit_payment_window_seconds: Option<i32>,
+    pub paykit_asset: Option<String>,
     /// The issuing stack's identity, from the phase-1 response body (never
     /// configuration); every later message on this invoice is checked
     /// against it. Never serialized.
@@ -776,6 +786,14 @@ impl std::fmt::Debug for OrderRow {
             .field("paykit_delivery_state", &self.paykit_delivery_state)
             .field("paykit_last_checked_at", &self.paykit_last_checked_at)
             .field("paykit_invoice_id", &self.paykit_invoice_id)
+            .field("paykit_api", &self.paykit_api)
+            .field("paykit_payment_reference", &self.paykit_payment_reference)
+            .field("paykit_operation_id", &self.paykit_operation_id)
+            .field(
+                "paykit_payment_window_seconds",
+                &self.paykit_payment_window_seconds,
+            )
+            .field("paykit_asset", &self.paykit_asset)
             .field("paykit_stack_id", &self.paykit_stack_id)
             .field("paykit_stack_endpoint", &self.paykit_stack_endpoint)
             .field("paykit_total_sats", &self.paykit_total_sats)
@@ -888,6 +906,11 @@ impl OrderRow {
             paykit_delivery_state: None,
             paykit_last_checked_at: None,
             paykit_invoice_id: None,
+            paykit_api: None,
+            paykit_payment_reference: None,
+            paykit_operation_id: None,
+            paykit_payment_window_seconds: None,
+            paykit_asset: None,
             paykit_stack_id: None,
             paykit_stack_endpoint: None,
             paykit_total_sats: None,
@@ -985,6 +1008,28 @@ impl OrderRow {
             .flatten()
     }
 
+    pub(crate) fn shippo_destination(&self, actor: &str) -> Option<ShippoDestination> {
+        let address = self.eligible_delivery_address(actor)?.as_object()?;
+        let field = |name: &str| {
+            address
+                .get(name)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        Some(ShippoDestination::new(
+            field("name"),
+            field("line1"),
+            field("line2"),
+            field("city"),
+            field("region"),
+            field("postal_code"),
+            field("country_code"),
+            field("phone"),
+            field("email"),
+        ))
+    }
+
     /// The participant projection with seller-only Paykit review evidence.
     /// The stored observation is intentionally reduced to the facts needed
     /// for the seller's attestation decision.
@@ -1047,12 +1092,12 @@ impl OrderRow {
         }
     }
 
-    /// How the bound fiat method is verified: `processor` (Stripe, via the
-    /// seller's restricted key against the Stripe API), `gateway-notified`
+    /// How the bound fiat method is verified: `gateway-notified`
     /// (PayPal, a postback-verified IPN from PayPal's servers paid the
     /// order), or `seller-attested` (PayPal fallback: buyer reports + seller
-    /// confirms). The provenance asymmetry is deliberate and must stay
-    /// visible to both parties.
+    /// confirms). Historical Stripe-bound orders keep reading `processor`.
+    /// The provenance asymmetry is deliberate and must stay visible to both
+    /// parties.
     pub fn fiat_verification(&self) -> Value {
         match self.payment_method.as_deref() {
             Some("stripe") => json!("processor"),

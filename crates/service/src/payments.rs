@@ -1,19 +1,13 @@
-//! Seller-configurable payment rails: config secrecy, Stripe verification,
-//! and the signed Paykit client for physical bitcoin orders.
+//! Seller-configurable payment rails: seller-secret sealing, PayPal IPN
+//! verification, Shippo, and the signed Paykit client for physical bitcoin
+//! orders.
 //!
-//! Ownership decision (Task C): Stripe verification lives HERE, in the
-//! transaction service, not in the fiat-verifier. The verifier is a
-//! platform-credential gateway for Locks-guarded fiat criteria; per-seller
-//! restricted keys belong with the per-seller payment config this service
-//! owns, and the order state transition the verification drives must happen
-//! in the same database transaction domain as the order itself. One owner,
-//! one ledger.
-//!
-//! Secrecy rules mirror the Locks bundle-id handling: the Stripe restricted
-//! key is sealed with XChaCha20-Poly1305 under `STRIPE_KEY_ENCRYPTION_KEY`
-//! with the seller pubky as associated data, is never returned by any read,
-//! and appears in outbound traffic only as the Authorization header of the
-//! server-side Stripe API call.
+//! Secrecy rules mirror the Locks bundle-id handling: a seller's Shippo API
+//! token is sealed with XChaCha20-Poly1305 under the seller-secret key
+//! (`STRIPE_KEY_ENCRYPTION_KEY`, a legacy name kept so deployments need no
+//! change), with the seller pubky as associated data, is never returned by
+//! any read, and appears in outbound traffic only as the Authorization
+//! header of the server-side Shippo API call.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -24,15 +18,13 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use ed25519_dalek::{Signer, SigningKey};
 use rand::RngCore;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-/// Environment variable holding the 32-byte hex key sealing Stripe
-/// restricted keys at rest. Setting it enables the payment-methods surface.
-pub const ENV_STRIPE_KEY_ENCRYPTION_KEY: &str = "STRIPE_KEY_ENCRYPTION_KEY";
-/// Environment variable overriding the Stripe API base URL. Production
-/// deployments leave it unset (`https://api.stripe.com`); tests point it at
-/// a local double so the real HTTP client is exercised end to end.
-pub const ENV_STRIPE_API_BASE: &str = "STRIPE_API_BASE";
+/// Environment variable holding the 32-byte hex key sealing seller secrets
+/// (Shippo API tokens) at rest. Setting it enables the payment-methods
+/// surface. The name predates the removal of the Stripe rail and is kept so
+/// existing deployments keep working.
+pub const ENV_SELLER_SECRET_KEY: &str = "STRIPE_KEY_ENCRYPTION_KEY";
 /// Environment variable naming the paykit-server base URL. Setting it
 /// enables the bitcoin method and makes the signing key mandatory.
 pub const ENV_PAYKIT_SERVER_URL: &str = "PAYKIT_SERVER_URL";
@@ -43,6 +35,10 @@ pub const ENV_PAYKIT_REQUEST_SIGNING_KEY: &str = "PAYKIT_REQUEST_SIGNING_KEY";
 /// Environment variable selecting the paykit-server API the client speaks:
 /// `fork` (the default) or `upstream`. See [`PaykitApi`].
 pub const ENV_PAYKIT_SERVER_API: &str = "PAYKIT_SERVER_API";
+/// Environment variable overriding the Shippo API base URL. Production
+/// leaves it unset (`https://api.goshippo.com`); tests point it at a local
+/// double so the real HTTP client is exercised end to end.
+pub const ENV_SHIPPO_API_BASE: &str = "SHIPPO_API_BASE";
 /// Environment variable overriding PayPal's IPN validation endpoint.
 /// Production leaves it unset (`https://ipnpb.paypal.com/cgi-bin/webscr`);
 /// tests point it at a local double so the real postback client is
@@ -53,37 +49,32 @@ const XNONCE_LEN: usize = 24;
 const KEY_LEN: usize = 32;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const AVAILABILITY_HTTP_TIMEOUT: Duration = Duration::from_secs(3);
-/// How many 100-item Checkout Session pages a verification scans before
-/// honestly reporting "not found". Payment Links have no server-side
-/// `client_reference_id` filter, so recent sessions are listed and matched.
-const STRIPE_MAX_PAGES: usize = 3;
-
-/// Seals and opens Stripe restricted keys.
-pub struct StripeKeyCipher {
+/// Seals and opens seller secrets (Shippo API tokens).
+pub struct SellerSecretCipher {
     key: [u8; KEY_LEN],
 }
 
-impl std::fmt::Debug for StripeKeyCipher {
+impl std::fmt::Debug for SellerSecretCipher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("StripeKeyCipher(<redacted>)")
+        f.write_str("SellerSecretCipher(<redacted>)")
     }
 }
 
-impl StripeKeyCipher {
+impl SellerSecretCipher {
     pub fn from_hex(hex_value: &str) -> anyhow::Result<Self> {
         let bytes = hex::decode(hex_value.trim()).map_err(|_| {
-            anyhow::anyhow!("{ENV_STRIPE_KEY_ENCRYPTION_KEY} must be 64 hexadecimal characters")
+            anyhow::anyhow!("{ENV_SELLER_SECRET_KEY} must be 64 hexadecimal characters")
         })?;
         let key = <[u8; KEY_LEN]>::try_from(bytes).map_err(|_| {
-            anyhow::anyhow!("{ENV_STRIPE_KEY_ENCRYPTION_KEY} must decode to exactly 32 bytes")
+            anyhow::anyhow!("{ENV_SELLER_SECRET_KEY} must decode to exactly 32 bytes")
         })?;
         Ok(Self { key })
     }
 
-    /// Seals a restricted key: random 24-byte nonce followed by the
+    /// Seals a secret: random 24-byte nonce followed by the
     /// ciphertext, with the seller pubky as associated data so ciphertexts
     /// cannot be transplanted between sellers.
-    pub fn encrypt(&self, seller_pubky: &str, restricted_key: &str) -> Vec<u8> {
+    pub fn encrypt(&self, seller_pubky: &str, secret: &str) -> Vec<u8> {
         let cipher = XChaCha20Poly1305::new((&self.key).into());
         let mut nonce_bytes = [0u8; XNONCE_LEN];
         rand::thread_rng().fill_bytes(&mut nonce_bytes);
@@ -91,7 +82,7 @@ impl StripeKeyCipher {
             .encrypt(
                 XNonce::from_slice(&nonce_bytes),
                 Payload {
-                    msg: restricted_key.as_bytes(),
+                    msg: secret.as_bytes(),
                     aad: seller_pubky.as_bytes(),
                 },
             )
@@ -104,7 +95,7 @@ impl StripeKeyCipher {
 
     pub fn decrypt(&self, seller_pubky: &str, sealed: &[u8]) -> anyhow::Result<String> {
         if sealed.len() <= XNONCE_LEN {
-            anyhow::bail!("sealed restricted key is too short");
+            anyhow::bail!("sealed secret is too short");
         }
         let (nonce_bytes, ciphertext) = sealed.split_at(XNONCE_LEN);
         let cipher = XChaCha20Poly1305::new((&self.key).into());
@@ -117,71 +108,211 @@ impl StripeKeyCipher {
                 },
             )
             .map_err(|_| {
-                anyhow::anyhow!("restricted key ciphertext did not authenticate under this key")
+                anyhow::anyhow!("secret ciphertext did not authenticate under this key")
             })?;
-        String::from_utf8(plaintext)
-            .map_err(|_| anyhow::anyhow!("restricted key is not valid UTF-8"))
+        String::from_utf8(plaintext).map_err(|_| anyhow::anyhow!("secret is not valid UTF-8"))
     }
 }
 
-/// A matched, paid Stripe Checkout Session for an order.
+/// How a Shippo API call failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StripeMatch {
-    pub session_id: String,
-}
-
-/// How a Stripe verification attempt failed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StripeError {
-    /// Stripe rejected the seller's restricted key (401/403): the seller
-    /// must fix their configuration.
+pub enum ShippoError {
+    /// Shippo rejected the seller's API token (401/403).
     KeyInvalid,
-    /// Transport trouble or an unexpected Stripe response; retryable.
+    /// Shippo refused the request with actionable messages (bad address,
+    /// unpurchasable rate, ...). The joined messages are seller-facing.
+    Rejected(String),
+    /// Shippo is unreachable or answered malformed; retryable.
     Unavailable,
 }
 
-#[derive(Deserialize)]
-struct StripeSessionList {
-    data: Vec<StripeSession>,
-    #[serde(default)]
-    has_more: bool,
+pub(crate) struct ShippoDestination {
+    name: String,
+    street1: String,
+    street2: String,
+    city: String,
+    state: String,
+    zip: String,
+    country: String,
+    phone: String,
+    email: String,
 }
 
-#[derive(Deserialize)]
-struct StripeSession {
-    id: String,
+impl ShippoDestination {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        name: String,
+        street1: String,
+        street2: String,
+        city: String,
+        state: String,
+        zip: String,
+        country: String,
+        phone: String,
+        email: String,
+    ) -> Self {
+        Self {
+            name,
+            street1,
+            street2,
+            city,
+            state,
+            zip,
+            country,
+            phone,
+            email,
+        }
+    }
+
+    fn as_json(&self) -> serde_json::Value {
+        let mut address = serde_json::json!({
+            "name": self.name,
+            "street1": self.street1,
+            "city": self.city,
+            "zip": self.zip,
+            "country": self.country,
+        });
+        for (key, value) in [
+            ("street2", self.street2.as_str()),
+            ("state", self.state.as_str()),
+            ("phone", self.phone.as_str()),
+            ("email", self.email.as_str()),
+        ] {
+            if !value.is_empty() {
+                address[key] = serde_json::Value::String(value.to_string());
+            }
+        }
+        address
+    }
+}
+
+/// One purchasable rate from a Shippo shipment quote.
+#[derive(Debug, Clone, Serialize)]
+pub struct ShippoRate {
+    pub rate_id: String,
+    pub provider: String,
+    pub servicelevel: String,
+    /// Decimal amount string exactly as Shippo quotes it (e.g. `"7.85"`).
+    pub amount: String,
+    pub currency: String,
+    pub estimated_days: Option<i64>,
+    pub duration_terms: Option<String>,
+}
+
+/// A purchased Shippo label.
+#[derive(Debug, Clone, Serialize)]
+pub struct ShippoLabel {
+    pub transaction_id: String,
+    pub carrier: String,
+    pub servicelevel: String,
+    pub amount: String,
+    pub currency: String,
+    pub tracking_number: String,
+    pub tracking_url: Option<String>,
+    pub label_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ShippoRateWire {
+    object_id: String,
     #[serde(default)]
-    client_reference_id: Option<String>,
+    provider: Option<String>,
     #[serde(default)]
-    payment_status: Option<String>,
+    servicelevel: Option<ShippoServiceLevelWire>,
     #[serde(default)]
-    amount_total: Option<i64>,
+    amount: Option<String>,
     #[serde(default)]
     currency: Option<String>,
+    #[serde(default)]
+    estimated_days: Option<i64>,
+    #[serde(default)]
+    duration_terms: Option<String>,
 }
 
-/// The real Stripe API client. The trait seam used elsewhere in this
-/// codebase is deliberately absent: tests exercise this exact client against
-/// a local HTTP double (`STRIPE_API_BASE`), so header handling, pagination,
-/// and status mapping are covered end to end.
-pub struct StripeClient {
+#[derive(Debug, Deserialize)]
+struct ShippoServiceLevelWire {
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ShippoMessageWire {
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ShippoShipmentWire {
+    #[serde(default)]
+    rates: Vec<ShippoRateWire>,
+    #[serde(default)]
+    messages: Vec<ShippoMessageWire>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ShippoTransactionWire {
+    object_id: String,
+    status: String,
+    #[serde(default)]
+    tracking_number: Option<String>,
+    #[serde(default)]
+    tracking_url_provider: Option<String>,
+    #[serde(default)]
+    label_url: Option<String>,
+    #[serde(default)]
+    messages: Vec<ShippoMessageWire>,
+}
+
+impl ShippoRateWire {
+    fn into_rate(self) -> ShippoRate {
+        ShippoRate {
+            rate_id: self.object_id,
+            provider: self.provider.unwrap_or_default(),
+            servicelevel: self
+                .servicelevel
+                .and_then(|level| level.name)
+                .unwrap_or_default(),
+            amount: self.amount.unwrap_or_default(),
+            currency: self.currency.unwrap_or_default(),
+            estimated_days: self.estimated_days,
+            duration_terms: self.duration_terms,
+        }
+    }
+}
+
+fn joined_messages(messages: &[ShippoMessageWire]) -> String {
+    let joined: Vec<&str> = messages
+        .iter()
+        .filter_map(|message| message.text.as_deref())
+        .collect();
+    if joined.is_empty() {
+        "Shippo refused the request.".to_string()
+    } else {
+        joined.join(" ")
+    }
+}
+
+/// The real Shippo API client, reached with each SELLER's own API token —
+/// the service holds no platform shipping credentials. Tests exercise this exact client against a
+/// local double (`SHIPPO_API_BASE`).
+pub struct ShippoClient {
     base_url: String,
     http: reqwest::Client,
 }
 
-impl std::fmt::Debug for StripeClient {
+impl std::fmt::Debug for ShippoClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StripeClient")
+        f.debug_struct("ShippoClient")
             .field("base_url", &self.base_url)
             .finish()
     }
 }
 
-impl StripeClient {
+impl ShippoClient {
     pub fn new(base_url: &str) -> anyhow::Result<Self> {
         let base_url = base_url.trim_end_matches('/').to_string();
         if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
-            anyhow::bail!("{ENV_STRIPE_API_BASE} must be an http(s) URL");
+            anyhow::bail!("{ENV_SHIPPO_API_BASE} must be an http(s) URL");
         }
         Ok(Self {
             base_url,
@@ -189,62 +320,137 @@ impl StripeClient {
         })
     }
 
-    /// Lists recent Checkout Sessions with the seller's restricted key and
-    /// returns the first PAID session whose `client_reference_id` is this
-    /// order and whose amount and currency match the order total exactly.
-    pub async fn find_paid_session(
+    async fn post(
         &self,
-        restricted_key: &str,
-        order_id: &str,
-        amount_minor: i64,
-        currency: &str,
-    ) -> Result<Option<StripeMatch>, StripeError> {
-        let wanted_currency = currency.to_ascii_lowercase();
-        let mut starting_after: Option<String> = None;
-        for _ in 0..STRIPE_MAX_PAGES {
-            let mut request = self
-                .http
-                .get(format!("{}/v1/checkout/sessions", self.base_url))
-                .bearer_auth(restricted_key)
-                .query(&[("limit", "100")]);
-            if let Some(cursor) = &starting_after {
-                request = request.query(&[("starting_after", cursor.as_str())]);
-            }
-            let response = request.send().await.map_err(|_| {
-                tracing::warn!("stripe checkout session listing transport failure");
-                StripeError::Unavailable
+        api_key: &str,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> Result<reqwest::Response, ShippoError> {
+        let response = self
+            .http
+            .post(format!("{}{path}", self.base_url))
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("ShippoToken {api_key}"),
+            )
+            .json(body)
+            .send()
+            .await
+            .map_err(|_| {
+                tracing::warn!("shippo transport failure");
+                ShippoError::Unavailable
             })?;
-            let status = response.status();
-            if status == reqwest::StatusCode::UNAUTHORIZED
-                || status == reqwest::StatusCode::FORBIDDEN
-            {
-                return Err(StripeError::KeyInvalid);
-            }
-            if !status.is_success() {
-                tracing::warn!(status = %status, "stripe checkout session listing rejected");
-                return Err(StripeError::Unavailable);
-            }
-            let page: StripeSessionList = response.json().await.map_err(|_| {
-                tracing::warn!("stripe checkout session listing returned a malformed body");
-                StripeError::Unavailable
-            })?;
-            for session in &page.data {
-                if session.client_reference_id.as_deref() == Some(order_id)
-                    && session.payment_status.as_deref() == Some("paid")
-                    && session.amount_total == Some(amount_minor)
-                    && session.currency.as_deref() == Some(wanted_currency.as_str())
-                {
-                    return Ok(Some(StripeMatch {
-                        session_id: session.id.clone(),
-                    }));
-                }
-            }
-            match (page.has_more, page.data.last()) {
-                (true, Some(last)) => starting_after = Some(last.id.clone()),
-                _ => break,
-            }
+        let status = response.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return Err(ShippoError::KeyInvalid);
         }
-        Ok(None)
+        Ok(response)
+    }
+
+    /// Quotes a synchronous shipment and returns its purchasable rates.
+    pub(crate) async fn shipment_rates(
+        &self,
+        api_key: &str,
+        address_from: &serde_json::Value,
+        address_to: &ShippoDestination,
+        parcel: &serde_json::Value,
+    ) -> Result<Vec<ShippoRate>, ShippoError> {
+        let body = serde_json::json!({
+            "address_from": address_from,
+            "address_to": address_to.as_json(),
+            "parcels": [parcel],
+            "async": false,
+        });
+        let response = self.post(api_key, "/shipments/", &body).await?;
+        let status = response.status();
+        let shipment: ShippoShipmentWire = response.json().await.map_err(|_| {
+            tracing::warn!("shippo shipment response was malformed");
+            ShippoError::Unavailable
+        })?;
+        if !status.is_success() {
+            return Err(ShippoError::Rejected(joined_messages(&shipment.messages)));
+        }
+        let rates: Vec<ShippoRate> = shipment
+            .rates
+            .into_iter()
+            .map(ShippoRateWire::into_rate)
+            .collect();
+        if rates.is_empty() {
+            return Err(ShippoError::Rejected(joined_messages(&shipment.messages)));
+        }
+        Ok(rates)
+    }
+
+    /// Purchases a label for a previously quoted rate. The rate is re-read
+    /// first so the stored label carries the carrier and price the seller
+    /// actually bought.
+    pub async fn purchase_label(
+        &self,
+        api_key: &str,
+        rate_id: &str,
+    ) -> Result<ShippoLabel, ShippoError> {
+        let rate_response = self
+            .http
+            .get(format!("{}/rates/{rate_id}", self.base_url))
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("ShippoToken {api_key}"),
+            )
+            .send()
+            .await
+            .map_err(|_| ShippoError::Unavailable)?;
+        let rate_status = rate_response.status();
+        if rate_status == reqwest::StatusCode::UNAUTHORIZED
+            || rate_status == reqwest::StatusCode::FORBIDDEN
+        {
+            return Err(ShippoError::KeyInvalid);
+        }
+        if rate_status == reqwest::StatusCode::NOT_FOUND {
+            return Err(ShippoError::Rejected(
+                "The selected rate no longer exists; quote rates again.".to_string(),
+            ));
+        }
+        if !rate_status.is_success() {
+            return Err(ShippoError::Unavailable);
+        }
+        let rate: ShippoRateWire = rate_response
+            .json()
+            .await
+            .map_err(|_| ShippoError::Unavailable)?;
+        let rate = rate.into_rate();
+
+        let body = serde_json::json!({
+            "rate": rate_id,
+            "label_file_type": "PDF",
+            "async": false,
+        });
+        let response = self.post(api_key, "/transactions/", &body).await?;
+        let status = response.status();
+        let transaction: ShippoTransactionWire = response.json().await.map_err(|_| {
+            tracing::warn!("shippo transaction response was malformed");
+            ShippoError::Unavailable
+        })?;
+        if !status.is_success() || transaction.status != "SUCCESS" {
+            return Err(ShippoError::Rejected(joined_messages(
+                &transaction.messages,
+            )));
+        }
+        let (Some(tracking_number), Some(label_url)) =
+            (transaction.tracking_number, transaction.label_url)
+        else {
+            tracing::warn!("shippo SUCCESS transaction lacked tracking or label url");
+            return Err(ShippoError::Unavailable);
+        };
+        Ok(ShippoLabel {
+            transaction_id: transaction.object_id,
+            carrier: rate.provider,
+            servicelevel: rate.servicelevel,
+            amount: rate.amount,
+            currency: rate.currency,
+            tracking_number,
+            tracking_url: transaction.tracking_url_provider,
+            label_url,
+        })
     }
 }
 
@@ -396,6 +602,10 @@ pub struct PaykitObservation {
 pub struct PaykitStatusFacts {
     pub allocation_mode: String,
     pub late_settlement: bool,
+    /// Upstream's exact activated invoice deadline. Fork status does not
+    /// carry it. Used to re-pin a lost activation response before applying
+    /// later status.
+    pub payment_deadline: Option<chrono::DateTime<chrono::Utc>>,
     pub observation: PaykitObservation,
 }
 
@@ -437,6 +647,12 @@ impl PaykitDeliveryState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaykitStatusOutcome {
     Undetected,
+    /// Upstream Marketplace invoice is active without a Bitcoin observation.
+    /// Its producer-owned deadline must survive lost-activation recovery so
+    /// the worker can keep polling through the bounded late-observation tail.
+    ActiveUndetected {
+        payment_deadline: chrono::DateTime<chrono::Utc>,
+    },
     Detected {
         facts: PaykitStatusFacts,
     },
@@ -446,8 +662,56 @@ pub enum PaykitStatusOutcome {
         amount_matched: bool,
         facts: PaykitStatusFacts,
     },
+    /// Matching money observed before request acceptance reaches status.
+    /// This is not payment authority; worker polls until existing deadline.
+    AcceptancePending {
+        facts: PaykitStatusFacts,
+    },
+    /// Producer reported a lifecycle that cannot be trusted automatically.
+    ManualReview {
+        reason: String,
+        observation: Option<PaykitObservation>,
+    },
     NotFound,
     Unavailable,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MarketplaceBitcoinStatus {
+    txid: String,
+    observed_sats: u64,
+    confirmations: u32,
+    amount_matched: bool,
+    paid_on_time: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MarketplaceStatusBody {
+    invoice_id: uuid::Uuid,
+    state: String,
+    proposal_delivery_state: String,
+    request_state: Option<String>,
+    payment_state: Option<String>,
+    activated_at: Option<chrono::DateTime<chrono::Utc>>,
+    payment_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    bitcoin: Option<MarketplaceBitcoinStatus>,
+    outcome: Option<String>,
+    resolved_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MarketplaceStatusErrorEnvelope {
+    error: MarketplaceStatusErrorBody,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MarketplaceStatusErrorBody {
+    code: String,
+    message: String,
 }
 
 /// Reads upstream paykit-server's `/transactions/status` body, which is
@@ -508,32 +772,77 @@ pub enum PaykitRequestError {
     Unavailable,
 }
 
-/// The phase-1 prepared invoice, parsed from the verbatim §B.11.3 200 body.
-/// Every field is required: a body missing any of them is a contract-shape
-/// violation and the bind is refused.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// One prepared invoice, with API-specific fields kept closed instead of
+/// manufacturing fork pins for upstream invoices.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaykitPrepared {
+    Fork {
+        invoice_id: uuid::Uuid,
+        stack_id: String,
+        allocation_mode: String,
+        nonce_sats: u64,
+        total_sats: u64,
+        expires_at: chrono::DateTime<chrono::Utc>,
+        prepare_expires_at: chrono::DateTime<chrono::Utc>,
+        derived_address_fingerprint: String,
+    },
+    Upstream {
+        invoice_id: uuid::Uuid,
+        total_sats: u64,
+        prepare_expires_at: chrono::DateTime<chrono::Utc>,
+    },
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PaykitPrepared {
-    pub invoice_id: uuid::Uuid,
-    pub state: String,
-    pub stack_id: String,
-    pub allocation_mode: String,
-    pub nonce_sats: u64,
-    pub total_sats: u64,
-    pub expires_at: chrono::DateTime<chrono::Utc>,
-    pub prepare_expires_at: chrono::DateTime<chrono::Utc>,
-    pub derived_address_fingerprint: String,
+struct ForkPrepared {
+    invoice_id: uuid::Uuid,
+    state: String,
+    stack_id: String,
+    allocation_mode: String,
+    nonce_sats: u64,
+    total_sats: u64,
+    expires_at: chrono::DateTime<chrono::Utc>,
+    prepare_expires_at: chrono::DateTime<chrono::Utc>,
+    derived_address_fingerprint: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpstreamPrepared {
+    invoice_id: uuid::Uuid,
+    state: String,
+    total_sats: u64,
+    prepare_expires_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// The phase-2 activation 200 body (`state` is `"observing"`).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaykitActivated {
     pub invoice_id: uuid::Uuid,
-    pub state: String,
     pub activated_at: chrono::DateTime<chrono::Utc>,
-    pub expires_at: chrono::DateTime<chrono::Utc>,
+    pub payment_deadline: chrono::DateTime<chrono::Utc>,
     pub total_sats: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ForkActivated {
+    invoice_id: uuid::Uuid,
+    state: String,
+    activated_at: chrono::DateTime<chrono::Utc>,
+    expires_at: chrono::DateTime<chrono::Utc>,
+    total_sats: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpstreamActivated {
+    invoice_id: uuid::Uuid,
+    state: String,
+    activated_at: chrono::DateTime<chrono::Utc>,
+    payment_deadline: chrono::DateTime<chrono::Utc>,
+    total_sats: u64,
 }
 
 /// The void 200 body.
@@ -548,13 +857,27 @@ pub struct PaykitVoided {
 /// The resolve success body (§B.9): the recorded resolution, echoing the
 /// invoice, the resolution, and the instant, with the finalized state
 /// (`resolved_paid_manually` / `resolved_closed`).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaykitResolved {
     pub invoice_id: uuid::Uuid,
-    pub resolution: String,
+    pub outcome: String,
     pub resolved_at: chrono::DateTime<chrono::Utc>,
-    pub state: String,
+}
+
+/// Durable address of one invoice. Upstream deliberately has no stack pin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaykitLifecycleTarget {
+    Fork { endpoint: String, stack_id: String },
+    Upstream { creator: String },
+}
+
+impl PaykitLifecycleTarget {
+    fn api(&self) -> PaykitApi {
+        match self {
+            Self::Fork { .. } => PaykitApi::Fork,
+            Self::Upstream { .. } => PaykitApi::Upstream,
+        }
+    }
 }
 
 /// The verbatim outcome of one signed `resolve` call, for the delivery
@@ -603,8 +926,11 @@ impl PaykitCommandError {
         match (status.as_u16(), code.as_str()) {
             (409, "prepare_expired") => PaykitCommandError::PrepareExpired,
             (409, "invoice_finalized") => PaykitCommandError::InvoiceFinalized,
+            (409, "lifecycle_terminal" | "invoice_active") => PaykitCommandError::InvoiceFinalized,
             (404, "unknown_invoice") => PaykitCommandError::UnknownInvoice,
+            (404, "not_found") => PaykitCommandError::UnknownInvoice,
             (409, "activation_total_mismatch") => PaykitCommandError::ActivationTotalMismatch,
+            (409, "total_mismatch") => PaykitCommandError::ActivationTotalMismatch,
             (409, "stack_identity_mismatch") => PaykitCommandError::StackIdentityMismatch,
             _ if status.is_server_error() => PaykitCommandError::Unavailable,
             _ if status.is_client_error() => PaykitCommandError::UnexpectedRejection(code),
@@ -623,10 +949,9 @@ impl PaykitCommandError {
 ///   [`paykit_signature_preimage`] (method, path and body), and seller
 ///   readiness is the signed `POST /setup/status`.
 ///
-/// The payment-request lifecycle routes (prepare, activate, void, resolve)
-/// are fork routes today. Under `Upstream` they are signed like every other
-/// request but upstream does not serve them yet, so a Bitcoin bind answers
-/// `paykit_unavailable` until the lifecycle adapter lands.
+/// New work uses this configured API. Follow-up lifecycle commands instead
+/// use the API persisted with their invoice, so a cutover or rollback cannot
+/// reinterpret queued work's route, body, or signature framing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PaykitApi {
     #[default]
@@ -641,6 +966,13 @@ impl PaykitApi {
             "fork" => Ok(Self::Fork),
             "upstream" => Ok(Self::Upstream),
             _ => anyhow::bail!("{ENV_PAYKIT_SERVER_API} must be `fork` or `upstream`"),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fork => "fork",
+            Self::Upstream => "upstream",
         }
     }
 }
@@ -705,6 +1037,28 @@ pub fn attempt_reference(order_id: uuid::Uuid, attempt: i32) -> String {
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest[..16]);
     crockford_bundle_id(&bytes)
+}
+
+/// Stable UUID-v4 reference for one upstream bind attempt. Version and
+/// variant bits are set after deterministic derivation, so transport replay
+/// reuses one reference while a new bind attempt gets a new one.
+pub fn upstream_attempt_reference(order_id: uuid::Uuid, attempt: i32) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::new()
+        .chain_update(b"pubky-marketplace/upstream-paykit-reference/v1")
+        .chain_update(order_id.as_bytes())
+        .chain_update(attempt.to_be_bytes())
+        .finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    uuid::Uuid::from_bytes(bytes).to_string()
+}
+
+/// Stable operation identity paired with [`upstream_attempt_reference`].
+pub fn upstream_operation_id(reference: &str, attempt: i32) -> String {
+    format!("marketplace-payment:{reference}:{attempt}")
 }
 
 /// The single per-order reference every bind used before per-attempt
@@ -880,13 +1234,14 @@ impl PaykitClient {
     /// Canonicalizes `value` and signs it for a `POST` to `url`. The fork
     /// signs the body alone; upstream signs the request preimage, whose path
     /// is the URL's path (including any base-URL prefix the server sees).
-    fn signed_body(
+    fn signed_body_for_api(
         &self,
+        api: PaykitApi,
         url: &str,
         value: &serde_json::Value,
     ) -> anyhow::Result<(String, String)> {
         let body = serde_json_canonicalizer::to_string(value)?;
-        let message = match self.api {
+        let message = match api {
             PaykitApi::Fork => body.as_bytes().to_vec(),
             PaykitApi::Upstream => {
                 let url = url::Url::parse(url)?;
@@ -900,12 +1255,24 @@ impl PaykitClient {
         Ok((body, signature))
     }
 
+    fn signed_body(
+        &self,
+        url: &str,
+        value: &serde_json::Value,
+    ) -> anyhow::Result<(String, String)> {
+        self.signed_body_for_api(self.api, url, value)
+    }
+
     /// The base URL this client dials. The bind persists this value as the
     /// order's `paykit_stack_endpoint` in the same transaction as phase 1,
     /// so later activate/void calls route to the issuing stack even after
     /// `PAYKIT_SERVER_URL` is repointed.
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    pub fn api(&self) -> PaykitApi {
+        self.api
     }
 
     /// Phase 1 (§B.11.3): prepares (or idempotently replays) the Paykit
@@ -915,28 +1282,47 @@ impl PaykitClient {
     /// `{reference}:{bind_attempt}`. The 200 body is the verbatim
     /// prepared shape; a legacy 204 or a body missing any field is a
     /// hard refusal.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_payment_request(
         &self,
         seller_pubky: &str,
         buyer_pubky: &str,
-        reference: &str,
+        order_id: uuid::Uuid,
+        bind_attempt: i32,
         amount_sats: u64,
         expires_at: chrono::DateTime<chrono::Utc>,
-        idempotency_key: &str,
+        payment_window_seconds: i64,
     ) -> Result<PaykitPrepared, PaykitRequestError> {
-        let url = format!("{}/v0/payment-requests", self.base_url);
-        let (body, signature) = self
-            .signed_body(
-                &url,
-                &serde_json::json!({
+        let reference = match self.api {
+            PaykitApi::Fork => attempt_reference(order_id, bind_attempt),
+            PaykitApi::Upstream => upstream_attempt_reference(order_id, bind_attempt),
+        };
+        let (url, request) = match self.api {
+            PaykitApi::Fork => (
+                format!("{}/v0/payment-requests", self.base_url),
+                serde_json::json!({
                     "amount_sats": amount_sats,
                     "creator": pubky_app_key(seller_pubky),
                     "reader": pubky_app_key(buyer_pubky),
                     "reference": reference,
                     "expires_at": expires_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                    "idempotency_key": idempotency_key,
+                    "idempotency_key": format!("{reference}:{bind_attempt}"),
                 }),
-            )
+            ),
+            PaykitApi::Upstream => (
+                format!("{}/marketplace/payment-requests/prepare", self.base_url),
+                serde_json::json!({
+                    "amount_sats": amount_sats,
+                    "creator": pubky_app_key(seller_pubky),
+                    "operation_id": upstream_operation_id(&reference, bind_attempt),
+                    "payment_window_seconds": payment_window_seconds,
+                    "reader": pubky_app_key(buyer_pubky),
+                    "reference": reference,
+                }),
+            ),
+        };
+        let (body, signature) = self
+            .signed_body(&url, &request)
             .map_err(|_| PaykitRequestError::Rejected)?;
         let response = self
             .http
@@ -955,16 +1341,39 @@ impl PaykitClient {
                 );
                 return Err(PaykitRequestError::Rejected);
             }
-            return match response.json::<PaykitPrepared>().await {
-                Ok(prepared) => Ok(prepared),
-                Err(error) => {
-                    tracing::error!(
-                        error = %error,
-                        "paykit phase 1 returned a body violating the prepared shape"
-                    );
-                    Err(PaykitRequestError::Rejected)
-                }
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|_| PaykitRequestError::Rejected)?;
+            let prepared = match self.api {
+                PaykitApi::Fork => serde_json::from_slice::<ForkPrepared>(&bytes)
+                    .ok()
+                    .filter(|prepared| prepared.state == "prepared")
+                    .map(|prepared| PaykitPrepared::Fork {
+                        invoice_id: prepared.invoice_id,
+                        stack_id: prepared.stack_id,
+                        allocation_mode: prepared.allocation_mode,
+                        nonce_sats: prepared.nonce_sats,
+                        total_sats: prepared.total_sats,
+                        expires_at: prepared.expires_at,
+                        prepare_expires_at: prepared.prepare_expires_at,
+                        derived_address_fingerprint: prepared.derived_address_fingerprint,
+                    }),
+                PaykitApi::Upstream => serde_json::from_slice::<UpstreamPrepared>(&bytes)
+                    .ok()
+                    .filter(|prepared| {
+                        prepared.state == "prepared" && prepared.total_sats == amount_sats
+                    })
+                    .map(|prepared| PaykitPrepared::Upstream {
+                        invoice_id: prepared.invoice_id,
+                        total_sats: prepared.total_sats,
+                        prepare_expires_at: prepared.prepare_expires_at,
+                    }),
             };
+            return prepared.ok_or_else(|| {
+                tracing::error!("paykit phase 1 returned a body violating the prepared shape");
+                PaykitRequestError::Rejected
+            });
         }
         let code = response
             .json::<serde_json::Value>()
@@ -972,11 +1381,37 @@ impl PaykitClient {
             .ok()
             .and_then(|body| body["error"]["code"].as_str().map(str::to_owned))
             .unwrap_or_default();
-        match code.as_str() {
-            "creator_session_invalid" => Err(PaykitRequestError::SellerAccountUnavailable),
-            "reader_not_payable" => Err(PaykitRequestError::ReaderNotPayable),
-            "reader_setup_pending" => Err(PaykitRequestError::ReaderSetupPending),
-            "invalid_request" | "invoice_conflict" => Err(PaykitRequestError::Rejected),
+        match (status, code.as_str()) {
+            (_, "creator_session_invalid" | "seller_setup_pending") => {
+                Err(PaykitRequestError::SellerAccountUnavailable)
+            }
+            (_, "reader_not_payable") => Err(PaykitRequestError::ReaderNotPayable),
+            (_, "reader_setup_pending") => Err(PaykitRequestError::ReaderSetupPending),
+            (_, "operation_conflict") => {
+                tracing::error!(
+                    %status,
+                    %code,
+                    %order_id,
+                    "ALERT upstream paykit refused a marketplace-derived prepare request"
+                );
+                Err(PaykitRequestError::Rejected)
+            }
+            (_, "invalid_signature") => {
+                tracing::error!(
+                    %status,
+                    %code,
+                    %order_id,
+                    "ALERT upstream paykit rejected the Marketplace signing identity"
+                );
+                Err(PaykitRequestError::Unavailable)
+            }
+            (_, "invalid_request" | "invoice_conflict") | (reqwest::StatusCode::CONFLICT, _) => {
+                Err(PaykitRequestError::Rejected)
+            }
+            // A timed-out preparation may have committed remotely. Never
+            // replay this spent attempt: next bind reserves a fresh identity,
+            // while orphan preparation stays unpublished and expires.
+            (_, "dependency_timeout") => Err(PaykitRequestError::Unavailable),
             // `bitcoin_creation_disabled` (503, §C.16) and everything else:
             // refused cleanly as an availability failure, as today.
             _ => Err(PaykitRequestError::Unavailable),
@@ -987,12 +1422,13 @@ impl PaykitClient {
     /// stack endpoint, which may predate the configured base URL).
     async fn post_signed_to(
         &self,
+        api: PaykitApi,
         endpoint: &str,
         path: &str,
         body: serde_json::Value,
     ) -> Result<reqwest::Response, PaykitCommandError> {
         let url = format!("{}{path}", endpoint.trim_end_matches('/'));
-        let (body, signature) = self.signed_body(&url, &body).map_err(|_| {
+        let (body, signature) = self.signed_body_for_api(api, &url, &body).map_err(|_| {
             PaykitCommandError::UnexpectedRejection("body did not canonicalize".to_string())
         })?;
         self.http
@@ -1020,33 +1456,68 @@ impl PaykitClient {
     /// `total_sats` are echoed as guards.
     pub async fn activate_payment_request(
         &self,
-        endpoint: &str,
+        target: &PaykitLifecycleTarget,
         invoice_id: uuid::Uuid,
-        stack_id: &str,
         total_sats: u64,
         activation_attempt: u64,
     ) -> Result<PaykitActivated, PaykitCommandError> {
-        let response = self
-            .post_signed_to(
-                endpoint,
-                &format!("/v0/payment-requests/{invoice_id}/activate"),
+        let (endpoint, path, body) = match target {
+            PaykitLifecycleTarget::Fork { endpoint, stack_id } => (
+                endpoint.as_str(),
+                format!("/v0/payment-requests/{invoice_id}/activate"),
                 serde_json::json!({
                     "invoice_id": invoice_id,
                     "stack_id": stack_id,
                     "total_sats": total_sats,
                     "activation_attempt": activation_attempt,
                 }),
-            )
+            ),
+            PaykitLifecycleTarget::Upstream { creator } => (
+                self.base_url.as_str(),
+                "/marketplace/payment-requests/activate".to_string(),
+                serde_json::json!({
+                    "creator": pubky_app_key(creator),
+                    "invoice_id": invoice_id,
+                    "total_sats": total_sats,
+                }),
+            ),
+        };
+        let response = self
+            .post_signed_to(target.api(), endpoint, &path, body)
             .await?;
         let status = response.status();
         if status.is_success() {
-            return response.json::<PaykitActivated>().await.map_err(|error| {
-                tracing::warn!(
-                    error = %error,
-                    "paykit activate returned a malformed success body; retrying"
-                );
-                PaykitCommandError::Unavailable
-            });
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|_| PaykitCommandError::Unavailable)?;
+            let activated = match target {
+                PaykitLifecycleTarget::Fork { .. } => {
+                    serde_json::from_slice::<ForkActivated>(&bytes)
+                        .ok()
+                        .filter(|body| body.state == "observing")
+                        .map(|body| PaykitActivated {
+                            invoice_id: body.invoice_id,
+                            activated_at: body.activated_at,
+                            payment_deadline: body.expires_at,
+                            total_sats: body.total_sats,
+                        })
+                }
+                PaykitLifecycleTarget::Upstream { .. } => {
+                    serde_json::from_slice::<UpstreamActivated>(&bytes)
+                        .ok()
+                        .filter(|body| body.state == "active")
+                        .map(|body| PaykitActivated {
+                            invoice_id: body.invoice_id,
+                            activated_at: body.activated_at,
+                            payment_deadline: body.payment_deadline,
+                            total_sats: body.total_sats,
+                        })
+                }
+            };
+            return activated
+                .filter(|body| body.invoice_id == invoice_id && body.total_sats == total_sats)
+                .ok_or(PaykitCommandError::Unavailable);
         }
         let (status, code) = Self::error_code(response).await;
         Err(PaykitCommandError::from_status(status, code))
@@ -1056,31 +1527,47 @@ impl PaykitClient {
     /// value phase 1 returned, never one re-derived from configuration.
     pub async fn void_payment_request(
         &self,
-        endpoint: &str,
+        target: &PaykitLifecycleTarget,
         invoice_id: uuid::Uuid,
-        stack_id: &str,
         reason: &str,
     ) -> Result<PaykitVoided, PaykitCommandError> {
-        let response = self
-            .post_signed_to(
-                endpoint,
-                &format!("/v0/payment-requests/{invoice_id}/void"),
+        let (endpoint, path, body) = match target {
+            PaykitLifecycleTarget::Fork { endpoint, stack_id } => (
+                endpoint.as_str(),
+                format!("/v0/payment-requests/{invoice_id}/void"),
                 serde_json::json!({
                     "invoice_id": invoice_id,
                     "stack_id": stack_id,
                     "reason": reason,
                 }),
-            )
+            ),
+            PaykitLifecycleTarget::Upstream { creator } => (
+                self.base_url.as_str(),
+                "/marketplace/payment-requests/void".to_string(),
+                serde_json::json!({
+                    "creator": pubky_app_key(creator),
+                    "invoice_id": invoice_id,
+                }),
+            ),
+        };
+        let response = self
+            .post_signed_to(target.api(), endpoint, &path, body)
             .await?;
         let status = response.status();
         if status.is_success() {
-            return response.json::<PaykitVoided>().await.map_err(|error| {
-                tracing::warn!(
-                    error = %error,
-                    "paykit void returned a malformed success body; retrying"
-                );
-                PaykitCommandError::Unavailable
-            });
+            let body = response
+                .json::<PaykitVoided>()
+                .await
+                .map_err(|_| PaykitCommandError::Unavailable)?;
+            let accepted_state = match target {
+                PaykitLifecycleTarget::Fork { .. } => body.state.starts_with("void_"),
+                PaykitLifecycleTarget::Upstream { .. } => body.state == "voided",
+            };
+            return if body.invoice_id == invoice_id && accepted_state {
+                Ok(body)
+            } else {
+                Err(PaykitCommandError::Unavailable)
+            };
         }
         let (status, code) = Self::error_code(response).await;
         Err(PaykitCommandError::from_status(status, code))
@@ -1093,23 +1580,34 @@ impl PaykitClient {
     /// phase 1 returned, and the call dials the ROW's pinned endpoint.
     pub async fn resolve_payment_request(
         &self,
-        endpoint: &str,
+        target: &PaykitLifecycleTarget,
         invoice_id: uuid::Uuid,
-        stack_id: &str,
         resolution: &str,
         resolved_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<PaykitResolveResponse, PaykitCommandError> {
-        let response = self
-            .post_signed_to(
-                endpoint,
-                &format!("/v0/payment-requests/{invoice_id}/resolve"),
+        let (endpoint, path, request) = match target {
+            PaykitLifecycleTarget::Fork { endpoint, stack_id } => (
+                endpoint.as_str(),
+                format!("/v0/payment-requests/{invoice_id}/resolve"),
                 serde_json::json!({
                     "invoice_id": invoice_id,
                     "resolution": resolution,
                     "resolved_at": resolved_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
                     "stack_id": stack_id,
                 }),
-            )
+            ),
+            PaykitLifecycleTarget::Upstream { creator } => (
+                self.base_url.as_str(),
+                "/marketplace/payment-requests/resolve".to_string(),
+                serde_json::json!({
+                    "creator": pubky_app_key(creator),
+                    "invoice_id": invoice_id,
+                    "outcome": resolution,
+                }),
+            ),
+        };
+        let response = self
+            .post_signed_to(target.api(), endpoint, &path, request)
             .await?;
         let status = response.status();
         let retry_after = response
@@ -1119,15 +1617,43 @@ impl PaykitClient {
             .map(str::to_owned);
         let body = response.text().await.unwrap_or_default();
         if status.is_success() {
-            let resolved = serde_json::from_str::<PaykitResolved>(&body)
-                .map_err(|error| {
-                    tracing::warn!(
-                        error = %error,
-                        "paykit resolve returned a malformed success body"
-                    );
-                    error
-                })
-                .ok();
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct ForkResolved {
+                invoice_id: uuid::Uuid,
+                resolution: String,
+                resolved_at: chrono::DateTime<chrono::Utc>,
+                state: String,
+            }
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct UpstreamResolved {
+                invoice_id: uuid::Uuid,
+                outcome: String,
+                resolved_at: chrono::DateTime<chrono::Utc>,
+            }
+            let resolved = match target {
+                PaykitLifecycleTarget::Fork { .. } => serde_json::from_str::<ForkResolved>(&body)
+                    .ok()
+                    .filter(|value| value.invoice_id == invoice_id && !value.state.is_empty())
+                    .map(|value| PaykitResolved {
+                        invoice_id: value.invoice_id,
+                        outcome: value.resolution,
+                        resolved_at: value.resolved_at,
+                    }),
+                PaykitLifecycleTarget::Upstream { .. } => {
+                    serde_json::from_str::<UpstreamResolved>(&body)
+                        .ok()
+                        .filter(|value| {
+                            value.invoice_id == invoice_id && value.outcome == resolution
+                        })
+                        .map(|value| PaykitResolved {
+                            invoice_id: value.invoice_id,
+                            outcome: value.outcome,
+                            resolved_at: value.resolved_at,
+                        })
+                }
+            };
             return Ok(PaykitResolveResponse {
                 status,
                 code: None,
@@ -1173,6 +1699,181 @@ impl PaykitClient {
         Ok(body["stack_id"].as_str().map(str::to_owned))
     }
 
+    /// Reads one Marketplace invoice through the dedicated signed status
+    /// endpoint. Producer fixture: paykit-server
+    /// `34620d4dd612818152f3039e2ea34b214a2725ce`, tree
+    /// `1d731a345f89ab4d6fb26a6ff15dd5b9a564ff2c` (typed lifecycle error
+    /// envelopes on top of the published status contract).
+    pub async fn marketplace_payment_status(
+        &self,
+        seller_pubky: &str,
+        invoice_id: uuid::Uuid,
+        expected_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> (PaykitStatusOutcome, Option<PaykitDeliveryState>) {
+        let response = self
+            .post_signed_to(
+                PaykitApi::Upstream,
+                &self.base_url,
+                "/marketplace/payment-requests/status",
+                serde_json::json!({
+                    "creator": pubky_app_key(seller_pubky),
+                    "invoice_id": invoice_id,
+                }),
+            )
+            .await;
+        let Ok(response) = response else {
+            return (PaykitStatusOutcome::Unavailable, None);
+        };
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return (PaykitStatusOutcome::NotFound, None);
+        }
+        if !response.status().is_success() {
+            let status = response.status();
+            let Ok(envelope) = response.json::<MarketplaceStatusErrorEnvelope>().await else {
+                return (PaykitStatusOutcome::Unavailable, None);
+            };
+            let reason = match (status, envelope.error.code.as_str()) {
+                (reqwest::StatusCode::SERVICE_UNAVAILABLE, "recovery_required") => {
+                    "recovery_required"
+                }
+                (reqwest::StatusCode::CONFLICT, "invalid_conflict") => "invalid_conflict",
+                _ => return (PaykitStatusOutcome::Unavailable, None),
+            };
+            tracing::error!(
+                %invoice_id,
+                reason,
+                message = %envelope.error.message,
+                "ALERT upstream paykit request lifecycle requires manual review"
+            );
+            return (
+                PaykitStatusOutcome::ManualReview {
+                    reason: reason.to_string(),
+                    observation: None,
+                },
+                None,
+            );
+        }
+        let Ok(body) = response.json::<MarketplaceStatusBody>().await else {
+            return (PaykitStatusOutcome::Unavailable, None);
+        };
+        if body.invoice_id != invoice_id
+            || !matches!(body.state.as_str(), "prepared" | "active" | "voided")
+            || !body.request_state.as_deref().is_none_or(|state| {
+                matches!(
+                    state,
+                    "proposed"
+                        | "proposal_expired"
+                        | "accepted"
+                        | "rejected"
+                        | "canceled"
+                        | "proof_submitted"
+                        | "active_recurring"
+                )
+            })
+            || !body.payment_state.as_deref().is_none_or(|state| {
+                matches!(state, "undetected" | "detected" | "confirmed" | "expired")
+            })
+            || !body
+                .outcome
+                .as_deref()
+                .is_none_or(|value| matches!(value, "paid_manually" | "refunded" | "abandoned"))
+            || body.outcome.is_some() != body.resolved_at.is_some()
+        {
+            return (PaykitStatusOutcome::Unavailable, None);
+        }
+        let delivery = match body.proposal_delivery_state.as_str() {
+            "unpublished" => None,
+            "pending" => Some(PaykitDeliveryState::Pending),
+            "delivered" => Some(PaykitDeliveryState::Delivered),
+            "failed" => Some(PaykitDeliveryState::Failed),
+            _ => return (PaykitStatusOutcome::Unavailable, None),
+        };
+        // PostgreSQL timestamps retain microsecond precision. Compare the
+        // producer deadline at that persisted precision so a valid status
+        // remains pollable after its recovered deadline is round-tripped.
+        let deadline_matches = expected_deadline.is_none_or(|expected| {
+            body.payment_deadline
+                .is_some_and(|actual| actual.timestamp_micros() == expected.timestamp_micros())
+        });
+        if body.state != "active"
+            || body.activated_at.is_none()
+            || body.payment_deadline.is_none()
+            || !deadline_matches
+            || delivery.is_none()
+        {
+            return if matches!(body.state.as_str(), "prepared" | "voided")
+                && body.proposal_delivery_state == "unpublished"
+                && body.request_state.is_none()
+                && body.payment_state.is_none()
+                && body.activated_at.is_none()
+                && body.payment_deadline.is_none()
+                && body.bitcoin.is_none()
+            {
+                (PaykitStatusOutcome::Undetected, None)
+            } else {
+                (PaykitStatusOutcome::Unavailable, None)
+            };
+        }
+        let safe_request = matches!(
+            body.request_state.as_deref(),
+            Some("accepted" | "proof_submitted" | "active_recurring")
+        );
+        let Some(bitcoin) = body.bitcoin else {
+            return match body.payment_state.as_deref() {
+                Some("undetected" | "expired") => (
+                    PaykitStatusOutcome::ActiveUndetected {
+                        payment_deadline: body
+                            .payment_deadline
+                            .expect("active status requires a payment deadline"),
+                    },
+                    delivery,
+                ),
+                _ => (PaykitStatusOutcome::Unavailable, delivery),
+            };
+        };
+        let facts = PaykitStatusFacts {
+            allocation_mode: "exclusive".to_string(),
+            late_settlement: !bitcoin.paid_on_time
+                || !safe_request
+                || body.payment_state.as_deref() == Some("expired"),
+            payment_deadline: body.payment_deadline,
+            observation: PaykitObservation {
+                txid: Some(bitcoin.txid),
+                observed_sats: Some(bitcoin.observed_sats),
+                confirmations: Some(bitcoin.confirmations),
+            },
+        };
+
+        if bitcoin.amount_matched
+            && matches!(body.request_state.as_deref(), None | Some("proposed"))
+        {
+            return (PaykitStatusOutcome::AcceptancePending { facts }, delivery);
+        }
+        let outcome = if bitcoin.amount_matched
+            && (!safe_request || body.payment_state.as_deref() == Some("expired"))
+        {
+            PaykitStatusOutcome::Confirmed {
+                amount_matched: true,
+                facts,
+            }
+        } else {
+            match body.payment_state.as_deref() {
+                Some("confirmed") => PaykitStatusOutcome::Confirmed {
+                    amount_matched: bitcoin.amount_matched,
+                    facts,
+                },
+                Some("detected") => PaykitStatusOutcome::Detected { facts },
+                Some("undetected" | "expired") => PaykitStatusOutcome::ActiveUndetected {
+                    payment_deadline: body
+                        .payment_deadline
+                        .expect("active status requires a payment deadline"),
+                },
+                _ => PaykitStatusOutcome::Unavailable,
+            }
+        };
+        (outcome, delivery)
+    }
+
     /// Polls the payment status for one order reference against the strict
     /// `paykit.bitcoin_status/v2` contract (W1.14): a missing/wrong
     /// `contract_version`, a missing/unknown `allocation_mode`, an unknown
@@ -1194,6 +1895,21 @@ impl PaykitClient {
         seller_pubky: &str,
         reference: &str,
     ) -> (PaykitStatusOutcome, Option<PaykitDeliveryState>) {
+        if self.api == PaykitApi::Upstream {
+            // This fork-status path accepts a Locks bundle_id, not the
+            // Marketplace UUID reference or invoice_id. Reaching it on an
+            // upstream-configured client means a fork request survived the
+            // cutover drain. Alert, then fail closed instead of guessing an
+            // identity or attributing another flow. One alert per poll.
+            tracing::error!(
+                code = "paykit_fork_row_polled_under_upstream",
+                seller_pubky,
+                reference,
+                "ALERT fork-issued paykit request polled under PAYKIT_SERVER_API=upstream; \
+                 its payment may not be observed until the fork configuration is restored"
+            );
+            return (PaykitStatusOutcome::Unavailable, None);
+        }
         let url = format!("{}/transactions/status", self.base_url);
         let Ok((body, signature)) = self.signed_body(
             &url,
@@ -1283,6 +1999,7 @@ impl PaykitClient {
         let facts = PaykitStatusFacts {
             allocation_mode,
             late_settlement: body.late_settlement,
+            payment_deadline: None,
             observation: PaykitObservation {
                 txid: body.txid,
                 observed_sats: body.observed_sats,
@@ -1303,13 +2020,14 @@ impl PaykitClient {
 }
 
 /// The payment-methods runtime carried on [`crate::AppState`]: absent when
-/// `STRIPE_KEY_ENCRYPTION_KEY` is unset (the whole surface is refused), with
-/// the Paykit leg additionally gated on its own pair of variables.
+/// `STRIPE_KEY_ENCRYPTION_KEY` (the seller-secret key) is unset (the whole
+/// surface is refused), with the Paykit leg additionally gated on its own
+/// pair of variables.
 pub struct PaymentsRuntime {
-    pub stripe_key_cipher: StripeKeyCipher,
-    pub stripe: StripeClient,
+    pub secret_cipher: SellerSecretCipher,
     pub paykit: Option<PaykitClient>,
     pub paypal_ipn: PaypalIpnVerifier,
+    pub shippo: ShippoClient,
 }
 
 impl std::fmt::Debug for PaymentsRuntime {
@@ -1354,21 +2072,18 @@ fn paykit_client_from_settings(
 /// `STRIPE_KEY_ENCRYPTION_KEY` enables the surface; `PAYKIT_SERVER_URL` and
 /// `PAYKIT_REQUEST_SIGNING_KEY` must be set together or not at all.
 pub fn payments_runtime_from_env() -> anyhow::Result<Option<Arc<PaymentsRuntime>>> {
-    let Some(encryption_key) = std::env::var(ENV_STRIPE_KEY_ENCRYPTION_KEY).ok() else {
+    let Some(encryption_key) = std::env::var(ENV_SELLER_SECRET_KEY).ok() else {
         let partial_paykit = std::env::var(ENV_PAYKIT_SERVER_URL).is_ok()
             || std::env::var(ENV_PAYKIT_REQUEST_SIGNING_KEY).is_ok();
         if partial_paykit {
             anyhow::bail!(
                 "payment methods are partially configured: {ENV_PAYKIT_SERVER_URL} is set \
-                 without {ENV_STRIPE_KEY_ENCRYPTION_KEY}"
+                 without {ENV_SELLER_SECRET_KEY}"
             );
         }
         return Ok(None);
     };
-    let stripe_key_cipher = StripeKeyCipher::from_hex(&encryption_key)?;
-    let stripe_base =
-        std::env::var(ENV_STRIPE_API_BASE).unwrap_or_else(|_| "https://api.stripe.com".to_string());
-    let stripe = StripeClient::new(&stripe_base)?;
+    let secret_cipher = SellerSecretCipher::from_hex(&encryption_key)?;
     let paykit = paykit_client_from_settings(
         std::env::var(ENV_PAYKIT_SERVER_URL).ok(),
         std::env::var(ENV_PAYKIT_REQUEST_SIGNING_KEY).ok(),
@@ -1377,11 +2092,14 @@ pub fn payments_runtime_from_env() -> anyhow::Result<Option<Arc<PaymentsRuntime>
     let ipn_verify_url = std::env::var(ENV_PAYPAL_IPN_VERIFY_URL)
         .unwrap_or_else(|_| "https://ipnpb.paypal.com/cgi-bin/webscr".to_string());
     let paypal_ipn = PaypalIpnVerifier::new(&ipn_verify_url)?;
+    let shippo_base = std::env::var(ENV_SHIPPO_API_BASE)
+        .unwrap_or_else(|_| "https://api.goshippo.com".to_string());
+    let shippo = ShippoClient::new(&shippo_base)?;
     Ok(Some(Arc::new(PaymentsRuntime {
-        stripe_key_cipher,
-        stripe,
+        secret_cipher,
         paykit,
         paypal_ipn,
+        shippo,
     })))
 }
 
@@ -1405,6 +2123,21 @@ pub trait PaykitStatusSource: Send + Sync + 'static {
     {
         Box::pin(async move { (self.status(seller_pubky, reference).await, None) })
     }
+
+    /// Polls using identity persisted with one invoice. Implementations that
+    /// only support the fork keep using the reference route.
+    fn status_for<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        reference: &'a str,
+        api: PaykitApi,
+        invoice_id: uuid::Uuid,
+        expected_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Pin<Box<dyn Future<Output = (PaykitStatusOutcome, Option<PaykitDeliveryState>)> + Send + 'a>>
+    {
+        let _ = (api, invoice_id, expected_deadline);
+        self.status_with_delivery(seller_pubky, reference)
+    }
 }
 
 impl PaykitStatusSource for PaykitClient {
@@ -1424,27 +2157,25 @@ impl PaykitStatusSource for PaykitClient {
     {
         Box::pin(self.payment_status_with_delivery(seller_pubky, reference))
     }
-}
 
-/// Validates a Stripe Payment Link URL: HTTPS on `buy.stripe.com` or
-/// `book.stripe.com`, no credentials, no fragment.
-pub fn validate_stripe_payment_link(value: &str) -> Result<(), &'static str> {
-    let parsed: url::Url = value
-        .parse()
-        .map_err(|_| "stripe_payment_link must be a valid URL")?;
-    if parsed.scheme() != "https" {
-        return Err("stripe_payment_link must use https");
+    fn status_for<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        reference: &'a str,
+        api: PaykitApi,
+        invoice_id: uuid::Uuid,
+        expected_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Pin<Box<dyn Future<Output = (PaykitStatusOutcome, Option<PaykitDeliveryState>)> + Send + 'a>>
+    {
+        match api {
+            PaykitApi::Fork => self.status_with_delivery(seller_pubky, reference),
+            PaykitApi::Upstream => Box::pin(self.marketplace_payment_status(
+                seller_pubky,
+                invoice_id,
+                expected_deadline,
+            )),
+        }
     }
-    if !matches!(
-        parsed.host_str(),
-        Some("buy.stripe.com") | Some("book.stripe.com")
-    ) {
-        return Err("stripe_payment_link must be a buy.stripe.com or book.stripe.com URL");
-    }
-    if parsed.username() != "" || parsed.password().is_some() || parsed.fragment().is_some() {
-        return Err("stripe_payment_link must not carry credentials or fragments");
-    }
-    Ok(())
 }
 
 /// Validates the shape of a PayPal merchant email (single `@`, non-empty
@@ -1466,18 +2197,6 @@ pub fn validate_paypal_email(value: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Validates a Stripe restricted key: only `rk_`-prefixed keys are accepted
-/// so full secret keys (`sk_`) are never stored.
-pub fn validate_stripe_restricted_key(value: &str) -> Result<(), &'static str> {
-    if !value.starts_with("rk_") {
-        return Err("stripe_restricted_key must be a restricted key (rk_...)");
-    }
-    if value.len() < 12 || value.len() > 255 || !value.chars().all(|c| c.is_ascii_graphic()) {
-        return Err("stripe_restricted_key is malformed");
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1489,6 +2208,47 @@ mod tests {
     const UPSTREAM_TEST_SEED: &str =
         "0707070707070707070707070707070707070707070707070707070707070707";
     const UPSTREAM_CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+
+    #[test]
+    fn upstream_attempt_identity_known_answers_stay_stable() {
+        for (order, attempt, expected) in [
+            (
+                "00000000-0000-0000-0000-000000000000",
+                1,
+                "24078310-6330-4644-b272-86ca913119df",
+            ),
+            (
+                "00112233-4455-6677-8899-aabbccddeeff",
+                42,
+                "aced6b3e-d2bb-4dc4-8e63-d5e2ab88b625",
+            ),
+        ] {
+            let reference = upstream_attempt_reference(order.parse().unwrap(), attempt);
+            assert_eq!(reference, expected);
+            assert_eq!(
+                upstream_operation_id(&reference, attempt),
+                format!("marketplace-payment:{expected}:{attempt}")
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_lifecycle_codes_map_to_existing_worker_outcomes() {
+        for code in ["lifecycle_terminal", "invoice_active"] {
+            assert_eq!(
+                PaykitCommandError::from_status(reqwest::StatusCode::CONFLICT, code.into()),
+                PaykitCommandError::InvoiceFinalized
+            );
+        }
+        assert_eq!(
+            PaykitCommandError::from_status(reqwest::StatusCode::CONFLICT, "total_mismatch".into(),),
+            PaykitCommandError::ActivationTotalMismatch
+        );
+        assert_eq!(
+            PaykitCommandError::from_status(reqwest::StatusCode::NOT_FOUND, "not_found".into()),
+            PaykitCommandError::UnknownInvoice
+        );
+    }
 
     fn upstream_test_client(api: PaykitApi) -> PaykitClient {
         PaykitClient::new("https://paykit.example", UPSTREAM_TEST_SEED)
@@ -1602,20 +2362,20 @@ mod tests {
     }
 
     #[test]
-    fn restricted_keys_round_trip_and_bind_the_seller() {
-        let cipher = StripeKeyCipher::from_hex(KEY).unwrap();
-        let sealed = cipher.encrypt(&"y".repeat(52), "rk_test_abc123456789");
+    fn sealed_secrets_round_trip_and_bind_the_seller() {
+        let cipher = SellerSecretCipher::from_hex(KEY).unwrap();
+        let sealed = cipher.encrypt(&"y".repeat(52), "shippo_test_abc123456789");
         assert!(!sealed
-            .windows(b"rk_test".len())
-            .any(|window| window == b"rk_test"));
+            .windows(b"shippo_test".len())
+            .any(|window| window == b"shippo_test"));
         assert_eq!(
             cipher.decrypt(&"y".repeat(52), &sealed).unwrap(),
-            "rk_test_abc123456789"
+            "shippo_test_abc123456789"
         );
         cipher
             .decrypt(&"o".repeat(52), &sealed)
             .expect_err("a transplanted ciphertext must not decrypt");
-        StripeKeyCipher::from_hex("abcd").expect_err("short key rejected");
+        SellerSecretCipher::from_hex("abcd").expect_err("short key rejected");
     }
 
     #[test]
@@ -1662,21 +2422,6 @@ mod tests {
     }
 
     #[test]
-    fn payment_link_validation_accepts_stripe_hosted_links_only() {
-        validate_stripe_payment_link("https://buy.stripe.com/test_abc").unwrap();
-        validate_stripe_payment_link("https://book.stripe.com/abc").unwrap();
-        for rejected in [
-            "http://buy.stripe.com/test_abc",
-            "https://evil.example/buy.stripe.com",
-            "https://buy.stripe.com.evil.example/x",
-            "not a url",
-            "https://buy.stripe.com/x#fragment",
-        ] {
-            validate_stripe_payment_link(rejected).expect_err(rejected);
-        }
-    }
-
-    #[test]
     fn paypal_email_validation_accepts_plain_addresses_only() {
         validate_paypal_email("merchant@example.com").unwrap();
         validate_paypal_email("a.b+c@sub.example.co").unwrap();
@@ -1692,13 +2437,5 @@ mod tests {
         ] {
             validate_paypal_email(rejected).expect_err(rejected);
         }
-    }
-
-    #[test]
-    fn restricted_key_validation_refuses_secret_keys() {
-        validate_stripe_restricted_key("rk_test_abc123456789").unwrap();
-        validate_stripe_restricted_key("sk_test_abc123456789")
-            .expect_err("secret keys are never stored");
-        validate_stripe_restricted_key("rk_short").expect_err("too short");
     }
 }

@@ -84,7 +84,6 @@ and write. "Automation" means the inventory capability plus the
 | Method | Path | Notes |
 | --- | --- | --- |
 | GET | `/health` | [Operational endpoints](#operational-endpoints) |
-| GET | `/version` | [Operational endpoints](#operational-endpoints) |
 | GET | `/ready` | [Operational endpoints](#operational-endpoints) |
 | POST | `/v1/auth/sessions` | Exchange an AuthToken for a bearer. |
 | GET | `/v1/auth/sessions` | Needs a bearer with the inventory capability (checked in the handler); consumes the `session.admin` rate limit. |
@@ -127,11 +126,13 @@ and write. "Automation" means the inventory capability plus the
 | GET | `/v1/me/priv-keys` |
 | PUT, GET | `/v0/sellers/me/payment-config` |
 | POST | `/v0/orders/{id}/payment-method` |
-| POST | `/v0/orders/{id}/fiat/verify` |
 | POST | `/v0/orders/{id}/fiat/mark-paid` |
 | POST | `/v0/orders/{id}/fiat/confirm-received` |
 | POST | `/v0/orders/{id}/confirm-bitcoin-payment` |
 | POST | `/v0/orders/{id}/bitcoin/resolve` |
+| PUT, GET | `/v0/sellers/me/shipping-config` |
+| POST | `/v0/orders/{id}/shipping/rates` |
+| POST, GET | `/v0/orders/{id}/shipping/label` |
 
 These are the buyer and seller application routes. Authorization on them is
 per resource (participants only) and per command (keyed on the session's
@@ -307,9 +308,16 @@ request failed, so clients should branch on HTTP status first, and parse
    | `NOT_FOUND` | 404 |
    | `REVISION_CONFLICT`, `IDEMPOTENCY_CONFLICT`, `INSUFFICIENT_INVENTORY`, `INVARIANT_VIOLATION`, `OFFER_EXPIRED`, `INVALID_STATE`, `AUCTION_CLOSED`, `BID_TOO_LOW`, `SELLER_REGISTRATION_REQUIRED` | 409 |
    | `AWARD_EXPIRED`, `AWARD_ALREADY_CONVERTED`, `AWARD_QUANTITY_MISMATCH`, `AWARD_VARIANT_MISMATCH`, `AWARD_LISTING_CHANGED`, `AWARD_HOLD_MISSING` | 409 |
+   | `LISTING_MODERATED` | 409 |
    | `UPSTREAM_UNAVAILABLE` | 503 (retriable) |
 
    A command error may also carry `issues` and `reason` fields.
+
+   `LISTING_MODERATED` refuses `checkout.create`, `offer.checkout`,
+   `offer.create`, `offer.counter`, `offer.accept` and `auction.place_bid`
+   when the marketplace index reports the listing, or its seller, as
+   moderated (see [Listing moderation](../README.md#listing-moderation)). It is a
+   409, not a 403, because clients read a 403 on a command as a session problem.
 
 ### Automation error codes
 
@@ -887,21 +895,9 @@ refusal-audit pipeline is not ready, the database probe fails, or buyer
 delivery emails are held beyond their retention window (in that case the body
 also carries `"reason":"delivery_email_purge_overdue"`).
 
-### `GET /version`
-
-```json
-{
-  "name": "marketplace-service",
-  "version": "0.1.0",
-  "commit": "7cb803d7191e6424ad025d9eb803f36e05b2ee97",
-  "built_at": "2026-10-11T12:00:00Z"
-}
-```
-
-`version` is the crate version. `commit` is baked at build time from
-`GIT_COMMIT`, falling back to `RAILWAY_GIT_COMMIT_SHA`, then `git rev-parse`;
-`built_at` comes from `BUILD_TIME`. Either is the string `"unknown"` when the
-build did not provide it.
+The service publishes no version endpoint. Identify the running build from the
+deploy record: the digest of the image that is deployed (Railway, or GCP once
+the service runs there) and its `org.opencontainers.image.revision` label.
 
 ## Grant-flow routes (Shop BFF)
 

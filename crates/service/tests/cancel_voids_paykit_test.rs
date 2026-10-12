@@ -144,7 +144,7 @@ async fn undelivered(pool: &PgPool, kind: &str) -> i64 {
 // outbox pass. The request must never be activated.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn cancel_before_activation_voids_the_prepared_request(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, invoice_id) = preparing_order(&app, &paykit, &seller, &buyer).await;
@@ -209,7 +209,7 @@ async fn cancel_before_activation_voids_the_prepared_request(pool: PgPool) {
 // applies the void first: the late activate is refused.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn cancel_during_activation_voids_first_and_refuses_the_late_activate(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, invoice_id) = preparing_order(&app, &paykit, &seller, &buyer).await;
@@ -263,7 +263,7 @@ async fn cancel_during_activation_voids_first_and_refuses_the_late_activate(pool
 // late-money fork while the unit is free.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn cancel_racing_a_committed_activation_keeps_the_invoice_observed(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, invoice_id) = preparing_order(&app, &paykit, &seller, &buyer).await;
@@ -324,7 +324,7 @@ async fn cancel_racing_a_committed_activation_keeps_the_invoice_observed(pool: P
 // money that arrives after a second buyer took the unit is refund-required.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn cancel_after_activation_expires_the_payment_and_keeps_tail_observation(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, invoice_id) = preparing_order(&app, &paykit, &seller, &buyer).await;
@@ -386,7 +386,7 @@ async fn cancel_after_activation_expires_the_payment_and_keeps_tail_observation(
 // cancel and the unit stays held.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn cancel_is_refused_once_bitcoin_money_is_observed(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, _invoice_id) = preparing_order(&app, &paykit, &seller, &buyer).await;
@@ -442,7 +442,7 @@ async fn cancel_is_refused_once_bitcoin_money_is_observed(pool: PgPool) {
 // voids instead of publishing.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn activation_arm_refuses_an_order_that_left_pending_payment(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, invoice_id) = preparing_order(&app, &paykit, &seller, &buyer).await;
@@ -540,7 +540,7 @@ where
 // order both written) taking the payment first, like cancel.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn terminal_activation_void_locks_the_payment_before_the_order(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, invoice_id) = preparing_order(&app, &paykit, &seller, &buyer).await;
@@ -574,7 +574,7 @@ async fn terminal_activation_void_locks_the_payment_before_the_order(pool: PgPoo
 // takes the payment first.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn activation_flip_locks_the_payment_before_the_order(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, _invoice_id) = preparing_order(&app, &paykit, &seller, &buyer).await;
@@ -605,7 +605,7 @@ async fn activation_flip_locks_the_payment_before_the_order(pool: PgPool) {
 // payment and cancels the order taking the payment first.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn hold_expiry_void_locks_the_payment_before_the_order(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, invoice_id) = preparing_order(&app, &paykit, &seller, &buyer).await;
@@ -725,7 +725,7 @@ async fn skipped_order_free_while_sweep_is_open(
 // row being locked.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn held_window_sweep_locks_the_payment_before_the_order(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let first_seller = new_actor(&app).await;
     let second_seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
@@ -758,7 +758,7 @@ async fn held_window_sweep_locks_the_payment_before_the_order(pool: PgPool) {
 // the order, the same way.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn idle_checkout_sweep_locks_the_payment_before_the_order(pool: PgPool) {
-    let (app, _stripe, _paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, _paykit) = test_app_with_payments(pool.clone()).await;
     let first_seller = new_actor(&app).await;
     let second_seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;

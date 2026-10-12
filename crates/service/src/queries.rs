@@ -52,8 +52,6 @@ pub const ORDER_COLUMNS: &str =
      EXISTS (SELECT 1 FROM seller_payment_configs AS seller_config \
        WHERE seller_config.seller_pubky = orders.seller_pubky \
        AND (seller_config.bitcoin_enabled \
-         OR (seller_config.stripe_payment_link IS NOT NULL \
-             AND seller_config.stripe_restricted_key_ciphertext IS NOT NULL) \
          OR seller_config.paypal_merchant_email IS NOT NULL)) AS seller_has_rail, revision, \
      state, lines, delivery_address, checkout_command_id, delivery_address_envelope, \
      delivery_key_id, subtotal_minor, shipping_minor, total_minor, \
@@ -65,7 +63,9 @@ pub const ORDER_COLUMNS: &str =
        WHERE refund_inbox.order_id = orders.id AND refund_inbox.resolved_at IS NULL) \
        AS gateway_refund_unmatched, shipping_label, paykit_request_reference, paykit_request_state, \
      paykit_delivery_state, \
-     paykit_last_checked_at, paykit_invoice_id, paykit_stack_id, paykit_stack_endpoint, \
+     paykit_last_checked_at, paykit_invoice_id, paykit_api, paykit_payment_reference, \
+     paykit_operation_id, paykit_payment_window_seconds, paykit_asset, \
+     paykit_stack_id, paykit_stack_endpoint, \
      paykit_total_sats, paykit_expires_at, paykit_prepare_expires_at, paykit_allocation_mode, \
      bitcoin_quote_rate, bitcoin_quote_source, bitcoin_quote_fetched_at, bitcoin_quoted_sats, \
      bitcoin_quote_expires_at, bitcoin_quote_currency, bitcoin_quote_exponent, \
@@ -90,7 +90,6 @@ pub async fn seller_has_rail(
         "SELECT EXISTS (SELECT 1 FROM seller_payment_configs \
          WHERE seller_pubky = $1 \
          AND (bitcoin_enabled \
-           OR (stripe_payment_link IS NOT NULL AND stripe_restricted_key_ciphertext IS NOT NULL) \
            OR paypal_merchant_email IS NOT NULL))",
     )
     .bind(seller_pubky)

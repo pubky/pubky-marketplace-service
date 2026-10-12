@@ -94,7 +94,7 @@ async fn migration_0042_on_a_production_schema_clone_recovers_released_attempts(
         "the production ledger"
     );
 
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seeded = [
         seed_released_shape(&pool, &paykit.base_url).await,
         seed_released_shape(&pool, &paykit.base_url).await,

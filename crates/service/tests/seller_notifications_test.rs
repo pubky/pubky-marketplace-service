@@ -106,7 +106,7 @@ async fn assert_review_notice(
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn canary_131a7457_an_on_time_sighting_flagged_late_waits_for_the_seller(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, _payment_id, reference) =
@@ -209,7 +209,7 @@ async fn canary_131a7457_an_on_time_sighting_flagged_late_waits_for_the_seller(p
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_redelivered_payment_seen_intent_notifies_the_seller_once(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, _payment_id) = into_awaiting_confirmation(&app, &paykit, &seller, &buyer).await;
@@ -256,7 +256,7 @@ async fn a_redelivered_payment_seen_intent_notifies_the_seller_once(pool: PgPool
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_late_report_inside_the_seller_window_never_auto_pays_after_a_mode_change(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, _payment_id, reference) =
@@ -284,7 +284,7 @@ async fn a_late_report_inside_the_seller_window_never_auto_pays_after_a_mode_cha
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_late_settlement_review_tells_the_seller_why(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     for (mode, status) in [
         ("shared_manual", LIVE_SHARED_MANUAL_LATE_STATUS),
         ("exclusive", LIVE_EXCLUSIVE_LATE_STATUS),
@@ -310,7 +310,7 @@ async fn a_late_settlement_review_tells_the_seller_why(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn an_amount_mismatch_review_tells_the_seller_why(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, _payment_id) = into_manual_review_mismatch(&app, &paykit, &seller, &buyer).await;
@@ -319,7 +319,7 @@ async fn an_amount_mismatch_review_tells_the_seller_why(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_confirmation_the_order_cannot_take_tells_the_seller_why(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, _payment_id, reference) =
@@ -341,7 +341,7 @@ async fn a_confirmation_the_order_cannot_take_tells_the_seller_why(pool: PgPool)
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn an_unpinned_legacy_review_sends_no_resolution_prompt(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, _payment_id, reference) =
@@ -367,7 +367,7 @@ async fn an_unpinned_legacy_review_sends_no_resolution_prompt(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn the_seller_window_elapsing_tells_the_seller_why(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, _payment_id) = into_manual_review_held(&app, &paykit, &seller, &buyer).await;
@@ -383,7 +383,7 @@ async fn the_seller_window_elapsing_tells_the_seller_why(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn an_overdue_review_reminds_the_seller_once(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, _payment_id) = into_manual_review_held(&app, &paykit, &seller, &buyer).await;

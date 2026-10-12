@@ -61,7 +61,9 @@ fn rendered_snapshot(name: &str, value: &Value) -> Vec<u8> {
 #[test]
 fn delivery_address_serialization_has_one_source_guarded_path() {
     fn violation(path: &Path, source: &str) -> Option<String> {
-        if source.contains("delivery_address_for_shipping") {
+        if source.contains("delivery_address_for_shipping")
+            || source.contains("ShippoDestination::as_value")
+        {
             return Some("raw delivery-address API".to_string());
         }
         if path.file_name().and_then(|name| name.to_str()) == Some("model.rs") {
@@ -615,7 +617,7 @@ fn one_byte_snapshot_mutation_is_rejected_by_canonical_compare() {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn confirm_contract_map_executes_every_case(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool).await;
+    let (app, paykit) = test_app_with_payments(pool).await;
     let mut map = ContractMap::new();
 
     let seller = new_actor(&app).await;
@@ -750,7 +752,7 @@ async fn confirm_contract_map_executes_every_case(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn resolve_contract_map_executes_every_case(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let mut map = ContractMap::new();
 
     let (seller, _buyer, order_id) = fresh_held(&app, &paykit).await;
@@ -1245,7 +1247,7 @@ fn projections_snapshot_value(map: &ContractMap) -> Value {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn projection_contract_map_executes_every_role_and_state(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool).await;
+    let (app, paykit) = test_app_with_payments(pool).await;
     let mut map = ContractMap::new();
 
     let seller = new_actor(&app).await;

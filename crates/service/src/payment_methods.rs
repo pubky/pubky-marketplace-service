@@ -7,15 +7,13 @@
 //!   idempotent no-op; a different method is refused once one is bound
 //!   (switching rails after a payment request or checkout URL exists could
 //!   double-collect).
-//! - The Stripe leg is processor-verified: the service lists the seller's
-//!   recent Checkout Sessions with their stored restricted key and matches
-//!   `client_reference_id == order id` plus exact amount and currency.
 //! - The PayPal leg is gateway-notified when it can be: PayPal's IPN
 //!   callback (postback-verified, matched against the seller's configured
 //!   email and the exact order total) pays the order automatically. The
 //!   buyer-reports/seller-confirms pair remains as the fallback when no IPN
 //!   arrives. The projection exposes the provenance as `fiat_verification:
-//!   'processor' | 'gateway-notified' | 'seller-attested'`.
+//!   'gateway-notified' | 'seller-attested'` (historical Stripe-bound orders
+//!   keep reading `'processor'`).
 //! - PayPal `Refunded`/`Reversed`/`Canceled_Reversal` IPNs are recorded on
 //!   the order whose gateway-verified payment id is their `parent_txn_id`,
 //!   or held in `gateway_refund_inbox` (`paypal_refund`,
@@ -48,24 +46,32 @@ use crate::handlers::{
 };
 use crate::model::{OrderRow, PaymentRow};
 use crate::payments::{
-    attempt_reference, validate_paypal_email, validate_stripe_payment_link,
-    validate_stripe_restricted_key, PaykitRequestError, PaymentsRuntime, StripeError,
+    attempt_reference, upstream_attempt_reference, upstream_operation_id, validate_paypal_email,
+    PaykitApi, PaykitLifecycleTarget, PaykitPrepared, PaykitRequestError, PaymentsRuntime,
 };
 use crate::queries::PAYMENT_COLUMNS;
 use crate::AppState;
 
 mod paypal_refund;
 
-const CONFIG_COLUMNS: &str = "seller_pubky, bitcoin_enabled, stripe_payment_link, \
-     stripe_restricted_key_ciphertext, paypal_merchant_email, created_at, updated_at";
+const CONFIG_COLUMNS: &str =
+    "seller_pubky, bitcoin_enabled, paypal_merchant_email, created_at, updated_at";
+
+/// Bounded Marketplace/Paykit clock and expiry-sweep margin used only for
+/// upstream two-phase binds. See `docs/paykit-upstream-inventory-hold.md`.
+pub const UPSTREAM_HOLD_CLOCK_SKEW_SECONDS: i64 = 60;
+
+#[derive(Clone)]
+struct PreparedBind {
+    invoice_id: Uuid,
+    target: PaykitLifecycleTarget,
+}
 
 #[derive(Debug, sqlx::FromRow)]
 struct SellerPaymentConfigRow {
     #[allow(dead_code)]
     seller_pubky: String,
     bitcoin_enabled: bool,
-    stripe_payment_link: Option<String>,
-    stripe_restricted_key_ciphertext: Option<Vec<u8>>,
     paypal_merchant_email: Option<String>,
     #[allow(dead_code)]
     created_at: DateTime<Utc>,
@@ -73,7 +79,7 @@ struct SellerPaymentConfigRow {
 }
 
 /// Machine-readable failure: the standard command error envelope plus a
-/// `reason` sub-code the client can branch on (e.g. `stripe_key_invalid`).
+/// `reason` sub-code the client can branch on (e.g. `invalid_paypal_email`).
 fn method_error(code: ErrorCode, reason: &str, message: &str) -> Response {
     (
         StatusCode::from_u16(code.http_status()).expect("error codes map to valid statuses"),
@@ -98,7 +104,8 @@ fn internal(context: &str, error: &dyn std::fmt::Display) -> Response {
 }
 
 /// The payment-methods surface is enabled only when the deployment carries
-/// the payments runtime (`STRIPE_KEY_ENCRYPTION_KEY`); fail closed otherwise.
+/// the payments runtime (`STRIPE_KEY_ENCRYPTION_KEY`, the seller-secret key);
+/// fail closed otherwise.
 fn payments_runtime(state: &AppState) -> Result<std::sync::Arc<PaymentsRuntime>, Box<Response>> {
     state.payments.clone().ok_or_else(|| {
         Box::new(method_error(
@@ -128,11 +135,12 @@ where
 #[serde(deny_unknown_fields)]
 pub struct PutPaymentConfigBody {
     bitcoin_enabled: bool,
-    /// Absent or null clears the stored link.
+    /// Retired Stripe field, still parsed so a client that has not dropped it
+    /// keeps saving: only absent or null is accepted.
     #[serde(default)]
     stripe_payment_link: Option<String>,
-    /// Write-only. Absent or null PRESERVES the stored key (the client can
-    /// never read it back to re-send it); an empty string clears it.
+    /// Retired Stripe field: only absent, null or the empty string (the old
+    /// "clear it" value) is accepted.
     #[serde(default)]
     stripe_restricted_key: Option<String>,
     /// Absent or null clears the stored email.
@@ -140,102 +148,70 @@ pub struct PutPaymentConfigBody {
     paypal_merchant_email: Option<String>,
 }
 
+/// The seller's own view. `stripe_payment_link` (always null) and
+/// `stripe_restricted_key_set` (always false) are retired Stripe fields kept
+/// only because a Shop that has not yet dropped them requires both keys.
 fn config_view(
     bitcoin_enabled: bool,
-    stripe_payment_link: &Option<String>,
     paypal_merchant_email: &Option<String>,
-    stripe_restricted_key_set: bool,
     updated_at: DateTime<Utc>,
 ) -> Value {
     json!({
         "bitcoin_enabled": bitcoin_enabled,
-        "stripe_payment_link": stripe_payment_link,
+        "stripe_payment_link": Value::Null,
         "paypal_merchant_email": paypal_merchant_email,
-        "stripe_restricted_key_set": stripe_restricted_key_set,
+        "stripe_restricted_key_set": false,
         "updated_at": format_timestamp(updated_at),
     })
 }
 
 /// `PUT /v0/sellers/me/payment-config` (seller session): full replace of the
-/// seller's rail configuration, except the write-only restricted key, which
-/// only an explicit value changes. The restricted key is never returned.
+/// seller's rail configuration. Any Stripe values stored before the rail was
+/// removed are cleared by the save.
 pub async fn put_payment_config(
     State(state): State<AppState>,
     Extension(actor): Extension<Actor>,
     Json(body): Json<PutPaymentConfigBody>,
 ) -> Response {
-    let payments = match payments_runtime(&state) {
-        Ok(payments) => payments,
-        Err(response) => return *response,
-    };
-    if let Some(link) = &body.stripe_payment_link {
-        if let Err(message) = validate_stripe_payment_link(link) {
-            return method_error(ErrorCode::InvalidCommand, "invalid_payment_link", message);
-        }
+    if let Err(response) = payments_runtime(&state) {
+        return *response;
+    }
+    if body.stripe_payment_link.is_some()
+        || body
+            .stripe_restricted_key
+            .as_deref()
+            .is_some_and(|key| !key.is_empty())
+    {
+        return method_error(
+            ErrorCode::InvalidCommand,
+            "stripe_removed",
+            "Stripe payments are no longer supported.",
+        );
     }
     if let Some(email) = &body.paypal_merchant_email {
         if let Err(message) = validate_paypal_email(email) {
             return method_error(ErrorCode::InvalidCommand, "invalid_paypal_email", message);
         }
     }
-    // None = preserve; Some(None) = clear; Some(Some(ciphertext)) = replace.
-    let restricted_key_update: Option<Option<Vec<u8>>> = match body.stripe_restricted_key.as_deref()
-    {
-        None => None,
-        Some("") => Some(None),
-        Some(key) => {
-            if let Err(message) = validate_stripe_restricted_key(key) {
-                return method_error(ErrorCode::InvalidCommand, "invalid_restricted_key", message);
-            }
-            Some(Some(payments.stripe_key_cipher.encrypt(&actor.0, key)))
-        }
-    };
     let now = state.clock.now();
-    let stored: Result<SellerPaymentConfigRow, sqlx::Error> = match restricted_key_update {
-        None => {
-            sqlx::query_as(&format!(
-                "INSERT INTO seller_payment_configs \
-                 (seller_pubky, bitcoin_enabled, stripe_payment_link, paypal_merchant_email, \
-                  created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $5) \
-                 ON CONFLICT (seller_pubky) DO UPDATE SET \
-                 bitcoin_enabled = EXCLUDED.bitcoin_enabled, \
-                 stripe_payment_link = EXCLUDED.stripe_payment_link, \
-                 paypal_merchant_email = EXCLUDED.paypal_merchant_email, \
-                 updated_at = EXCLUDED.updated_at \
-                 RETURNING {CONFIG_COLUMNS}"
-            ))
-            .bind(&actor.0)
-            .bind(body.bitcoin_enabled)
-            .bind(&body.stripe_payment_link)
-            .bind(&body.paypal_merchant_email)
-            .bind(now)
-            .fetch_one(&state.pool)
-            .await
-        }
-        Some(ciphertext) => {
-            sqlx::query_as(&format!(
-                "INSERT INTO seller_payment_configs \
-                 (seller_pubky, bitcoin_enabled, stripe_payment_link, \
-                  stripe_restricted_key_ciphertext, paypal_merchant_email, created_at, \
-                  updated_at) VALUES ($1, $2, $3, $4, $5, $6, $6) \
-                 ON CONFLICT (seller_pubky) DO UPDATE SET \
-                 bitcoin_enabled = EXCLUDED.bitcoin_enabled, \
-                 stripe_payment_link = EXCLUDED.stripe_payment_link, \
-                 stripe_restricted_key_ciphertext = EXCLUDED.stripe_restricted_key_ciphertext, \
-                 paypal_merchant_email = EXCLUDED.paypal_merchant_email, \
-                 updated_at = EXCLUDED.updated_at \
-                 RETURNING {CONFIG_COLUMNS}"
-            ))
-            .bind(&actor.0)
-            .bind(body.bitcoin_enabled)
-            .bind(&body.stripe_payment_link)
-            .bind(&ciphertext)
-            .bind(&body.paypal_merchant_email)
-            .bind(now)
-            .fetch_one(&state.pool)
-            .await
-        }
-    };
+    let stored: Result<SellerPaymentConfigRow, sqlx::Error> = sqlx::query_as(&format!(
+        "INSERT INTO seller_payment_configs \
+         (seller_pubky, bitcoin_enabled, paypal_merchant_email, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $4) \
+         ON CONFLICT (seller_pubky) DO UPDATE SET \
+         bitcoin_enabled = EXCLUDED.bitcoin_enabled, \
+         stripe_payment_link = NULL, \
+         stripe_restricted_key_ciphertext = NULL, \
+         paypal_merchant_email = EXCLUDED.paypal_merchant_email, \
+         updated_at = EXCLUDED.updated_at \
+         RETURNING {CONFIG_COLUMNS}"
+    ))
+    .bind(&actor.0)
+    .bind(body.bitcoin_enabled)
+    .bind(&body.paypal_merchant_email)
+    .bind(now)
+    .fetch_one(&state.pool)
+    .await;
     match stored {
         Ok(row) => (
             StatusCode::OK,
@@ -243,9 +219,7 @@ pub async fn put_payment_config(
                 "ok": true,
                 "payment_config": config_view(
                     row.bitcoin_enabled,
-                    &row.stripe_payment_link,
                     &row.paypal_merchant_email,
-                    row.stripe_restricted_key_ciphertext.is_some(),
                     row.updated_at,
                 ),
             })),
@@ -258,8 +232,7 @@ pub async fn put_payment_config(
 /// `GET /v0/sellers/me/payment-config` (seller session): the seller's own
 /// stored configuration, exactly as the PUT returns it. This is the raw row
 /// (`bitcoin_enabled` as stored, no paykit availability lookup) so the
-/// settings page can load state on mount. The restricted key is never
-/// returned, only `stripe_restricted_key_set`.
+/// settings page can load state on mount.
 pub async fn get_own_payment_config(
     State(state): State<AppState>,
     Extension(actor): Extension<Actor>,
@@ -270,9 +243,7 @@ pub async fn get_own_payment_config(
             Json(json!({
                 "payment_config": config_view(
                     row.bitcoin_enabled,
-                    &row.stripe_payment_link,
                     &row.paypal_merchant_email,
-                    row.stripe_restricted_key_ciphertext.is_some(),
                     row.updated_at,
                 ),
             })),
@@ -288,15 +259,13 @@ pub async fn get_own_payment_config(
 }
 
 /// The unauthenticated rail projection. Booleans only: a seller's PayPal
-/// email, Stripe payment link, and any other payout or contact identifier
-/// never leave the service here. The PayPal email reaches a buyer only inside
+/// email and any other payout or contact identifier never leave the service here. The PayPal email reaches a buyer only inside
 /// the `fiat_checkout_url` of an order they bound to PayPal, which only the
 /// order's participants can read.
 fn public_config_view(
     bitcoin_available: bool,
     bitcoin_offer_available: bool,
     paypal_available: bool,
-    stripe_available: bool,
 ) -> Response {
     (
         StatusCode::OK,
@@ -304,7 +273,6 @@ fn public_config_view(
             "bitcoin_available": bitcoin_available,
             "bitcoin_offer_available": bitcoin_offer_available,
             "paypal_available": paypal_available,
-            "stripe_available": stripe_available,
         })),
     )
         .into_response()
@@ -318,9 +286,7 @@ fn public_config_view(
 /// be read, is not offered Bitcoin.
 /// `bitcoin_offer_available` is the cached rail-wide Paykit gate. Older
 /// paykit-server responses without that field derive it from `status`.
-/// `paypal_available` is a stored merchant email; `stripe_available` is a
-/// stored payment link plus restricted key (the same rule as
-/// `seller_has_rail`), since Stripe payments are verified with that key.
+/// `paypal_available` is a stored merchant email.
 pub async fn get_payment_config(
     State(state): State<AppState>,
     Path(seller_pubky): Path<String>,
@@ -355,7 +321,7 @@ pub async fn get_payment_config(
         None => false,
     };
     let Some(config) = config else {
-        return public_config_view(false, rail_health, false, false);
+        return public_config_view(false, rail_health, false);
     };
     let bitcoin_available = if config.bitcoin_enabled {
         let paykit = state
@@ -384,7 +350,6 @@ pub async fn get_payment_config(
         bitcoin_available,
         rail_health,
         config.paypal_merchant_email.is_some(),
-        config.stripe_payment_link.is_some() && config.stripe_restricted_key_ciphertext.is_some(),
     )
 }
 
@@ -546,11 +511,11 @@ pub async fn bind_payment_method(
         Err(response) => return *response,
     };
     let method = body.method.as_str();
-    if !matches!(method, "bitcoin" | "stripe" | "paypal") {
+    if !matches!(method, "bitcoin" | "paypal") {
         return method_error(
             ErrorCode::InvalidCommand,
             "invalid_method",
-            "The payment method must be bitcoin, stripe, or paypal.",
+            "The payment method must be bitcoin or paypal.",
         );
     }
     let now = state.clock.now();
@@ -760,32 +725,12 @@ pub async fn bind_payment_method(
                 let Some(attempt) = reserved_attempt else {
                     return internal("paykit bind attempt", &"no attempt was reserved");
                 };
-                (None, Some(attempt_reference(order.id, attempt)), "paykit")
-            }
-            "stripe" => {
-                let Some(link) = config
-                    .as_ref()
-                    .and_then(|config| config.stripe_payment_link.clone())
-                else {
-                    return method_error(
-                        ErrorCode::InvalidState,
-                        "method_unavailable",
-                        "The seller has no Stripe payment link configured.",
-                    );
+                let paykit = payments.paykit.as_ref().expect("checked above");
+                let reference = match paykit.api() {
+                    PaykitApi::Fork => attempt_reference(order.id, attempt),
+                    PaykitApi::Upstream => upstream_attempt_reference(order.id, attempt),
                 };
-                if !is_fiat_currency(&order) {
-                    return method_error(
-                        ErrorCode::InvalidState,
-                        "currency_unsupported",
-                        "Stripe payment requires a fiat-denominated order.",
-                    );
-                }
-                let separator = if link.contains('?') { '&' } else { '?' };
-                (
-                    Some(format!("{link}{separator}client_reference_id={}", order.id)),
-                    None,
-                    "stripe",
-                )
+                (None, Some(reference), "paykit")
             }
             "paypal" => {
                 let Some(email) = config
@@ -839,7 +784,8 @@ pub async fn bind_payment_method(
         "UPDATE orders SET revision = revision + 1, payment_method = $2, \
          fiat_checkout_url = $3, paykit_request_reference = $4, \
          paykit_request_state = CASE WHEN $4::text IS NULL THEN NULL ELSE 'preparing' END, \
-         paykit_delivery_state = NULL, \
+         paykit_delivery_state = NULL, paykit_api = NULL, paykit_payment_reference = NULL, \
+         paykit_operation_id = NULL, paykit_payment_window_seconds = NULL, paykit_asset = NULL, \
          updated_at = $5 WHERE id = $1 RETURNING {}",
         crate::queries::ORDER_COLUMNS
     ))
@@ -903,7 +849,7 @@ pub async fn bind_payment_method(
     // or a retry after a rolled-back bind — is a new Paykit invoice, never
     // a second binding against an old one. The bind AND the
     // `paykit.activate` outbox row commit atomically or not at all.
-    let mut prepared: Option<(uuid::Uuid, String, String)> = None;
+    let mut prepared: Option<PreparedBind> = None;
     // The re-read key for an ambiguous COMMIT: the attempt's reference
     // plus the invoice id, captured when phase 1 runs.
     let mut bind_reference: Option<String> = None;
@@ -913,19 +859,18 @@ pub async fn bind_payment_method(
             .as_ref()
             .map(|(_, sats)| *sats)
             .expect("checked above");
-        let endpoint = paykit.base_url().to_string();
         let expires_at = updated_order.hold_expires_at.unwrap_or_else(|| {
             now + chrono::Duration::seconds(state.config.bitcoin_payment_window_seconds)
         });
-        let idempotency_key = format!("{reference}:{attempt}");
         let phase1 = paykit
             .create_payment_request(
                 &order.seller_pubky,
                 &order.buyer_pubky,
-                reference,
+                order.id,
+                attempt,
                 amount_sats,
                 expires_at,
-                &idempotency_key,
+                state.config.bitcoin_payment_window_seconds,
             )
             .await;
         let phase1 = match phase1 {
@@ -968,13 +913,112 @@ pub async fn bind_payment_method(
                 };
             }
         };
-        if phase1.total_sats != amount_sats + phase1.nonce_sats {
+        let (
+            invoice_id,
+            total_sats,
+            prepare_expires_at,
+            paykit_expires_at,
+            stack_id,
+            stack_endpoint,
+            allocation_mode,
+            address_fingerprint,
+            target,
+        ) = match phase1 {
+            PaykitPrepared::Fork {
+                invoice_id,
+                stack_id,
+                allocation_mode,
+                nonce_sats,
+                total_sats,
+                expires_at: echoed_expires_at,
+                prepare_expires_at,
+                derived_address_fingerprint,
+            } => {
+                if total_sats != amount_sats + nonce_sats {
+                    tracing::error!(
+                        order_id = %order.id,
+                        "ALERT paykit phase 1 total_sats != amount_sats + nonce_sats"
+                    );
+                    let _ = tx.rollback().await;
+                    return method_error(
+                        ErrorCode::InvalidState,
+                        "paykit_total_inconsistent",
+                        "The Paykit server returned an inconsistent payment total.",
+                    );
+                }
+                if echoed_expires_at.timestamp() != expires_at.timestamp() {
+                    tracing::error!(
+                        order_id = %order.id,
+                        "ALERT paykit phase 1 expires_at != the hold deadline"
+                    );
+                    let target = PaykitLifecycleTarget::Fork {
+                        endpoint: paykit.base_url().to_string(),
+                        stack_id: stack_id.clone(),
+                    };
+                    prepared = Some(PreparedBind { invoice_id, target });
+                    let _ = tx.rollback().await;
+                    spawn_courtesy_void(&payments, &prepared, "marketplace_bind_rolled_back");
+                    return method_error(
+                        ErrorCode::InvalidState,
+                        "paykit_expiry_inconsistent",
+                        "The Paykit server returned an inconsistent payment expiry.",
+                    );
+                }
+                let endpoint = paykit.base_url().to_string();
+                let target = PaykitLifecycleTarget::Fork {
+                    endpoint: endpoint.clone(),
+                    stack_id: stack_id.clone(),
+                };
+                (
+                    invoice_id,
+                    total_sats,
+                    prepare_expires_at,
+                    Some(expires_at),
+                    Some(stack_id),
+                    Some(endpoint),
+                    Some(allocation_mode),
+                    Some(derived_address_fingerprint),
+                    target,
+                )
+            }
+            PaykitPrepared::Upstream {
+                invoice_id,
+                total_sats,
+                prepare_expires_at,
+            } => {
+                if total_sats != amount_sats {
+                    tracing::error!(order_id = %order.id, "ALERT upstream paykit changed requested total");
+                    let _ = tx.rollback().await;
+                    return method_error(
+                        ErrorCode::InvalidState,
+                        "paykit_total_inconsistent",
+                        "The Paykit server returned an inconsistent payment total.",
+                    );
+                }
+                (
+                    invoice_id,
+                    total_sats,
+                    prepare_expires_at,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    PaykitLifecycleTarget::Upstream {
+                        creator: order.seller_pubky.clone(),
+                    },
+                )
+            }
+        };
+        prepared = Some(PreparedBind {
+            invoice_id,
+            target: target.clone(),
+        });
+        bind_reference = Some(reference.clone());
+        if total_sats == 0 {
             tracing::error!(
                 order_id = %order.id,
-                amount_sats,
-                nonce_sats = phase1.nonce_sats,
-                total_sats = phase1.total_sats,
-                "ALERT paykit phase 1 total_sats != amount_sats + nonce_sats; refusing the bind"
+                "ALERT paykit phase 1 returned a zero total; refusing the bind"
             );
             let _ = tx.rollback().await;
             return method_error(
@@ -983,30 +1027,64 @@ pub async fn bind_payment_method(
                 "The Paykit server returned an inconsistent payment total.",
             );
         }
-        prepared = Some((phase1.invoice_id, phase1.stack_id.clone(), endpoint.clone()));
-        bind_reference = Some(reference.clone());
-        // The echoed `expires_at` must equal the hold deadline this call
-        // sent (the wire format truncates to UTC seconds, so the comparison
-        // is exact at second precision): a stack answering with a later
-        // expiry would keep the remote invoice payable past the local void
-        // at hold + 30 min, breaking the hard bound. Refuse in the same
-        // class as a total mismatch — no bind, the rollback releases the
-        // hold, one courtesy void, alerted.
-        if phase1.expires_at.timestamp() != expires_at.timestamp() {
-            tracing::error!(
-                order_id = %order.id,
-                hold_expires_at = %expires_at,
-                echoed_expires_at = %phase1.expires_at,
-                "ALERT paykit phase 1 expires_at != the hold deadline; refusing the bind"
-            );
+
+        // Upstream starts the immutable payment window at activation, not at
+        // prepare. Its database atomically refuses activation at
+        // `prepare_expires_at`, so the latest possible producer deadline is
+        // prepare expiry + the full payment window. Fix the inventory hold to
+        // that bound plus one explicit clock/reaper margin. Fork semantics stay
+        // unchanged: its request already carries Marketplace's exact hold.
+        let upstream_hold_expires_at = if matches!(target, PaykitLifecycleTarget::Upstream { .. }) {
+            // Re-sample after the network call: handler-entry time would let a
+            // slow prepare response hide an already exhausted producer TTL.
+            let response_received_at = state.clock.now();
+            let activation_cutoff = response_received_at
+                .checked_add_signed(chrono::Duration::seconds(UPSTREAM_HOLD_CLOCK_SKEW_SECONDS));
+            let maximum_prepare_expiry = state
+                .config
+                .paykit_max_prepare_ttl_seconds
+                .checked_add(UPSTREAM_HOLD_CLOCK_SKEW_SECONDS)
+                .and_then(chrono::Duration::try_seconds)
+                .and_then(|ttl| response_received_at.checked_add_signed(ttl));
+            let hold_extension_seconds = state
+                .config
+                .bitcoin_payment_window_seconds
+                .checked_add(UPSTREAM_HOLD_CLOCK_SKEW_SECONDS);
+            if activation_cutoff.is_none_or(|cutoff| prepare_expires_at <= cutoff)
+                || maximum_prepare_expiry.is_none_or(|maximum| prepare_expires_at > maximum)
+            {
+                tracing::error!(
+                    order_id = %order.id,
+                    %prepare_expires_at,
+                    max_prepare_ttl_seconds = state.config.paykit_max_prepare_ttl_seconds,
+                    "ALERT upstream paykit returned a prepare deadline outside local bounds"
+                );
+                let _ = tx.rollback().await;
+                spawn_courtesy_void(&payments, &prepared, "marketplace_bind_rolled_back");
+                return method_error(
+                    ErrorCode::InvalidState,
+                    "paykit_expiry_inconsistent",
+                    "The Paykit server returned an inconsistent preparation expiry.",
+                );
+            }
+            hold_extension_seconds
+                .and_then(chrono::Duration::try_seconds)
+                .and_then(|extension| prepare_expires_at.checked_add_signed(extension))
+        } else {
+            None
+        };
+        if matches!(target, PaykitLifecycleTarget::Upstream { .. })
+            && upstream_hold_expires_at.is_none()
+        {
             let _ = tx.rollback().await;
             spawn_courtesy_void(&payments, &prepared, "marketplace_bind_rolled_back");
             return method_error(
                 ErrorCode::InvalidState,
                 "paykit_expiry_inconsistent",
-                "The Paykit server returned an inconsistent payment expiry.",
+                "The Paykit server returned an inconsistent preparation expiry.",
             );
         }
+
         // Persist the prepared invoice in the SAME transaction as the bind:
         // the stack identity and endpoint come from this call (never from
         // configuration read later), the total is the figure the buyer is
@@ -1016,27 +1094,48 @@ pub async fn bind_payment_method(
         // phase 2 durable. Any failure below rolls the whole bind back; the
         // courtesy void after the error return is best-effort (paykit's
         // 15-minute reaper is the guarantee).
+        let activation_payload = match &target {
+            PaykitLifecycleTarget::Fork { endpoint, stack_id } => json!({
+                "invoice_id": invoice_id,
+                "order_id": order.id,
+                "paykit_api": paykit.api().as_str(),
+                "stack_id": stack_id,
+                "stack_endpoint": endpoint,
+                "total_sats": total_sats,
+                "activation_attempt": 0,
+            }),
+            PaykitLifecycleTarget::Upstream { .. } => json!({
+                "invoice_id": invoice_id,
+                "order_id": order.id,
+                "paykit_api": paykit.api().as_str(),
+                "total_sats": total_sats,
+                "activation_attempt": 0,
+            }),
+        };
         let persisted = async {
             sqlx::query(
-                "UPDATE orders SET paykit_invoice_id = $2, paykit_stack_id = $3, \
+                "UPDATE orders SET paykit_invoice_id = $2, paykit_api = $19, paykit_stack_id = $3, \
                  paykit_stack_endpoint = $4, paykit_total_sats = $5, paykit_expires_at = $6, \
                  paykit_prepare_expires_at = $7, paykit_allocation_mode = $8, \
                  paykit_address_fingerprint = $9, paykit_activation_state = 'preparing', \
                  updated_at = $10, bitcoin_quote_rate = $11, bitcoin_quote_source = $12, \
                  bitcoin_quote_fetched_at = $13, bitcoin_quoted_sats = $14, \
                  bitcoin_quote_expires_at = $18, bitcoin_quote_currency = $15, \
-                 bitcoin_quote_exponent = $16, bitcoin_quote_spread_bps = $17 \
+                 bitcoin_quote_exponent = $16, bitcoin_quote_spread_bps = $17, \
+                 hold_expires_at = COALESCE($20, hold_expires_at), \
+                 paykit_payment_reference = $21, paykit_operation_id = $22, \
+                 paykit_payment_window_seconds = $23, paykit_asset = $24 \
                  WHERE id = $1",
             )
             .bind(order.id)
-            .bind(phase1.invoice_id)
-            .bind(&phase1.stack_id)
-            .bind(&endpoint)
-            .bind(i64::try_from(phase1.total_sats).expect("total_sats fits i64"))
-            .bind(expires_at)
-            .bind(phase1.prepare_expires_at)
-            .bind(&phase1.allocation_mode)
-            .bind(&phase1.derived_address_fingerprint)
+            .bind(invoice_id)
+            .bind(&stack_id)
+            .bind(&stack_endpoint)
+            .bind(i64::try_from(total_sats).expect("total_sats fits i64"))
+            .bind(paykit_expires_at)
+            .bind(prepare_expires_at)
+            .bind(&allocation_mode)
+            .bind(&address_fingerprint)
             .bind(now)
             .bind(
                 bitcoin_quote
@@ -1089,6 +1188,31 @@ pub async fn bind_payment_method(
                     .and_then(|(quote, _)| quote.as_ref())
                     .map(|_| expires_at),
             )
+            .bind(paykit.api().as_str())
+            .bind(upstream_hold_expires_at)
+            .bind(if paykit.api() == PaykitApi::Upstream {
+                Some(reference.parse::<Uuid>().expect("upstream reference is UUID"))
+            } else {
+                None
+            })
+            .bind(if paykit.api() == PaykitApi::Upstream {
+                Some(upstream_operation_id(reference, attempt))
+            } else {
+                None
+            })
+            .bind(if paykit.api() == PaykitApi::Upstream {
+                Some(
+                    i32::try_from(state.config.bitcoin_payment_window_seconds)
+                        .expect("validated payment window fits i32"),
+                )
+            } else {
+                None
+            })
+            .bind(if paykit.api() == PaykitApi::Upstream {
+                Some("BTC")
+            } else {
+                None
+            })
             .execute(&mut *tx)
             .await?;
             // Bitcoin settlement is typed as SAT/0. Merchandise terms stay
@@ -1098,7 +1222,7 @@ pub async fn bind_payment_method(
                  updated_at = $3 WHERE id = $1",
             )
             .bind(payment.id)
-            .bind(i64::try_from(phase1.total_sats).expect("total_sats fits i64"))
+            .bind(i64::try_from(total_sats).expect("total_sats fits i64"))
             .bind(now)
             .execute(&mut *tx)
             .await?;
@@ -1107,14 +1231,7 @@ pub async fn bind_payment_method(
                  VALUES ($1, 'paykit.activate', $2, $3)",
             )
             .bind(event_id)
-            .bind(json!({
-                "invoice_id": phase1.invoice_id,
-                "order_id": order.id,
-                "stack_id": phase1.stack_id,
-                "total_sats": phase1.total_sats,
-                "stack_endpoint": endpoint,
-                "activation_attempt": 0,
-            }))
+            .bind(activation_payload)
             .bind(now)
             .execute(&mut *tx)
             .await?;
@@ -1229,14 +1346,15 @@ pub mod test_faults {
 async fn resolve_ambiguous_bind_commit(
     state: &AppState,
     payments: &std::sync::Arc<PaymentsRuntime>,
-    prepared: &Option<(uuid::Uuid, String, String)>,
+    prepared: &Option<PreparedBind>,
     order_id: Uuid,
     bind_reference: &Option<String>,
     commit_error: &sqlx::Error,
 ) {
-    let (Some((invoice_id, _, _)), Some(reference)) = (prepared, bind_reference) else {
+    let (Some(prepared), Some(reference)) = (prepared, bind_reference) else {
         return;
     };
+    let invoice_id = prepared.invoice_id;
     // The reference names the attempt. `paykit_bind_attempt` is not
     // compared: a concurrent bind may reserve the next number after this
     // one committed.
@@ -1265,7 +1383,11 @@ async fn resolve_ambiguous_bind_commit(
         Ok(None) => {
             // Confirmed absent: the transaction rolled back. One
             // best-effort void (paykit's 15-minute reaper is the guarantee).
-            spawn_courtesy_void(payments, prepared, "marketplace_bind_rolled_back");
+            spawn_courtesy_void(
+                payments,
+                &Some(prepared.clone()),
+                "marketplace_bind_rolled_back",
+            );
         }
         Err(read_error) => {
             // Outcome unknown: enqueue nothing. If the bind is durable its
@@ -1289,10 +1411,10 @@ async fn resolve_ambiguous_bind_commit(
 /// phase-1 call used; paykit's 15-minute prepare reaper is the guarantee.
 fn spawn_courtesy_void(
     payments: &std::sync::Arc<PaymentsRuntime>,
-    prepared: &Option<(uuid::Uuid, String, String)>,
+    prepared: &Option<PreparedBind>,
     reason: &'static str,
 ) {
-    let Some((invoice_id, stack_id, endpoint)) = prepared.clone() else {
+    let Some(prepared) = prepared.clone() else {
         return;
     };
     let payments = payments.clone();
@@ -1301,14 +1423,14 @@ fn spawn_courtesy_void(
             return;
         };
         let outcome = paykit
-            .void_payment_request(&endpoint, invoice_id, &stack_id, reason)
+            .void_payment_request(&prepared.target, prepared.invoice_id, reason)
             .await;
         match outcome {
             Ok(voided) => {
-                tracing::info!(invoice_id = %invoice_id, state = %voided.state, "courtesy void delivered")
+                tracing::info!(invoice_id = %prepared.invoice_id, state = %voided.state, "courtesy void delivered")
             }
             Err(error) => tracing::warn!(
-                invoice_id = %invoice_id,
+                invoice_id = %prepared.invoice_id,
                 error = ?error,
                 "courtesy void failed; paykit's prepare reaper is the backstop"
             ),
@@ -1661,121 +1783,6 @@ async fn read_order_and_payment(
     Ok(payment.map(|payment| (order, payment)))
 }
 
-/// `POST /v0/orders/{id}/fiat/verify` (either participant): server-side
-/// Stripe verification with the SELLER's stored restricted key. On a match
-/// the order is paid; `verified: false` means no matching paid session was
-/// found yet (the buyer may not have completed checkout).
-pub async fn verify_fiat_payment(
-    State(state): State<AppState>,
-    Extension(actor): Extension<Actor>,
-    Path(order_id): Path<Uuid>,
-) -> Response {
-    let payments = match payments_runtime(&state) {
-        Ok(payments) => payments,
-        Err(response) => return *response,
-    };
-    let (order, payment) = match read_order_and_payment(&state, order_id).await {
-        Ok(Some(pair)) => pair,
-        Ok(None) => {
-            return method_error(
-                ErrorCode::NotFound,
-                "order_not_found",
-                "The order was not found.",
-            )
-        }
-        Err(error) => return internal("order lookup", &error),
-    };
-    if actor.0 != order.buyer_pubky && actor.0 != order.seller_pubky {
-        return method_error(
-            ErrorCode::Unauthorized,
-            "not_participant",
-            "Only order participants may verify the payment.",
-        );
-    }
-    if order.payment_method.as_deref() != Some("stripe") {
-        return method_error(
-            ErrorCode::InvalidState,
-            "method_mismatch",
-            "Processor verification applies only to Stripe-bound orders.",
-        );
-    }
-    if payment.state != "awaiting_entitlement" {
-        // Already advanced: idempotent success.
-        return match apply_fiat_paid(
-            &state,
-            &actor.0,
-            order_id,
-            None,
-            "processor",
-            None,
-            state.clock.now(),
-        )
-        .await
-        {
-            Ok(response) | Err(response) => response,
-        };
-    }
-    let config = match load_config(&state.pool, &order.seller_pubky).await {
-        Ok(config) => config,
-        Err(error) => return internal("payment config read", &error),
-    };
-    let Some(sealed) = config.and_then(|config| config.stripe_restricted_key_ciphertext) else {
-        return method_error(
-            ErrorCode::InvalidState,
-            "stripe_key_missing",
-            "The seller has no Stripe restricted key configured, so this order cannot be verified.",
-        );
-    };
-    let restricted_key = match payments
-        .stripe_key_cipher
-        .decrypt(&order.seller_pubky, &sealed)
-    {
-        Ok(key) => key,
-        Err(error) => return internal("restricted key decryption", &error),
-    };
-    let matched = payments
-        .stripe
-        .find_paid_session(
-            &restricted_key,
-            &order.id.to_string(),
-            order.total_minor,
-            &order.currency,
-        )
-        .await;
-    match matched {
-        Ok(Some(matched)) => {
-            match apply_fiat_paid(
-                &state,
-                &actor.0,
-                order_id,
-                Some(&matched.session_id),
-                "processor",
-                None,
-                state.clock.now(),
-            )
-            .await
-            {
-                Ok(response) | Err(response) => response,
-            }
-        }
-        Ok(None) => (
-            StatusCode::OK,
-            Json(json!({ "ok": true, "verified": false, "status": "not_found" })),
-        )
-            .into_response(),
-        Err(StripeError::KeyInvalid) => method_error(
-            ErrorCode::InvalidState,
-            "stripe_key_invalid",
-            "Stripe rejected the seller's restricted key; the seller must update their payment configuration.",
-        ),
-        Err(StripeError::Unavailable) => method_error(
-            ErrorCode::UpstreamUnavailable,
-            "stripe_unavailable",
-            "Stripe could not be reached; try again.",
-        ),
-    }
-}
-
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MarkPaidBody {
@@ -1904,8 +1911,7 @@ pub async fn mark_fiat_paid(
 
 /// `POST /v0/orders/{id}/fiat/confirm-received` (seller session): the seller
 /// attests the PayPal payment arrived, which pays the order. This is the
-/// deliberate `seller-attested` counterpart to Stripe's processor
-/// verification.
+/// deliberate `seller-attested` leg of PayPal verification.
 pub async fn confirm_fiat_received(
     State(state): State<AppState>,
     Extension(actor): Extension<Actor>,

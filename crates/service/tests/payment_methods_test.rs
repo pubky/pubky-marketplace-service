@@ -1,6 +1,6 @@
 //! Seller payment-method configuration, per-order method binding, and the
-//! fiat verification legs (processor-verified Stripe, seller-attested
-//! PayPal), plus the paykit verification worker for physical bitcoin orders.
+//! PayPal attestation leg (seller-attested), plus the paykit verification
+//! worker for physical bitcoin orders.
 
 mod common;
 
@@ -13,8 +13,6 @@ use marketplace_service::workers::run_once;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
-
-const RESTRICTED_KEY: &str = "rk_test_51NxyzMarketplace";
 
 async fn put_config(app: &TestApp, token: &str, body: &Value) -> (StatusCode, Value) {
     send(
@@ -68,10 +66,34 @@ async fn bind_method(
 fn full_config_body() -> Value {
     json!({
         "bitcoin_enabled": true,
-        "stripe_payment_link": "https://buy.stripe.com/test_abc123",
-        "stripe_restricted_key": RESTRICTED_KEY,
         "paypal_merchant_email": "merchant@example.com",
     })
+}
+
+/// Stripe values as an earlier deployment stored them, for sellers who never
+/// saved their configuration after the Stripe rail was removed.
+async fn seed_legacy_stripe_values(pool: &PgPool, seller_pubky: &str) {
+    sqlx::query(
+        "UPDATE seller_payment_configs SET \
+         stripe_payment_link = 'https://buy.stripe.com/test_abc123', \
+         stripe_restricted_key_ciphertext = '\\x0102'::bytea \
+         WHERE seller_pubky = $1",
+    )
+    .bind(seller_pubky)
+    .execute(pool)
+    .await
+    .expect("legacy stripe values seed");
+}
+
+async fn legacy_stripe_values_stored(pool: &PgPool, seller_pubky: &str) -> bool {
+    sqlx::query_scalar(
+        "SELECT stripe_payment_link IS NOT NULL OR stripe_restricted_key_ciphertext IS NOT NULL \
+         FROM seller_payment_configs WHERE seller_pubky = $1",
+    )
+    .bind(seller_pubky)
+    .fetch_one(pool)
+    .await
+    .expect("config row exists")
 }
 
 /// Registers a SAT-priced listing and checks out, leaving a
@@ -115,8 +137,8 @@ async fn read_order(app: &TestApp, token: &str, order_id: &str) -> Value {
 // ---------------------------------------------------------------------------
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn payment_config_upserts_and_never_returns_the_restricted_key(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+async fn payment_config_upserts_and_clears_retired_stripe_values(pool: PgPool) {
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
 
     let (status, body) = put_config(&app, &seller.token, &full_config_body()).await;
@@ -124,38 +146,36 @@ async fn payment_config_upserts_and_never_returns_the_restricted_key(pool: PgPoo
     let config = &body["payment_config"];
     assert_eq!(config["bitcoin_enabled"], json!(true));
     assert_eq!(
-        config["stripe_payment_link"],
-        json!("https://buy.stripe.com/test_abc123")
-    );
-    assert_eq!(
         config["paypal_merchant_email"],
         json!("merchant@example.com")
     );
-    assert_eq!(config["stripe_restricted_key_set"], json!(true));
-    assert!(
-        !body.to_string().contains(RESTRICTED_KEY),
-        "the restricted key must never appear in a response"
+    // The retired Stripe fields stay in the own view as constants, because a
+    // Shop that has not dropped them yet requires both keys.
+    assert_eq!(config["stripe_payment_link"], Value::Null);
+    assert_eq!(config["stripe_restricted_key_set"], json!(false));
+
+    // Stripe values stored before the rail was removed are never reported
+    // and are cleared by the seller's next save.
+    seed_legacy_stripe_values(&pool, &seller.pubky).await;
+    let (status, body) = get_own_config(&app, Some(&seller.token)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["payment_config"]["stripe_payment_link"], Value::Null);
+    assert_eq!(
+        body["payment_config"]["stripe_restricted_key_set"],
+        json!(false)
     );
+    assert!(!body.to_string().contains("stripe.com"), "{body}");
+    assert!(legacy_stripe_values_stored(&pool, &seller.pubky).await);
 
-    // The key is sealed at rest: the raw value never reaches the table.
-    let (ciphertext,): (Vec<u8>,) = sqlx::query_as(
-        "SELECT stripe_restricted_key_ciphertext FROM seller_payment_configs \
-         WHERE seller_pubky = $1",
-    )
-    .bind(&seller.pubky)
-    .fetch_one(&pool)
-    .await
-    .expect("config row exists");
-    assert!(!ciphertext
-        .windows(RESTRICTED_KEY.len())
-        .any(|window| window == RESTRICTED_KEY.as_bytes()));
-
-    // Omitting the write-only key preserves it; other fields replace.
+    // A client still sending the empty Stripe form keeps saving, and fields
+    // replace.
     let (status, body) = put_config(
         &app,
         &seller.token,
         &json!({
             "bitcoin_enabled": false,
+            "stripe_payment_link": null,
+            "stripe_restricted_key": "",
             "paypal_merchant_email": "other@example.com",
         }),
     )
@@ -163,24 +183,13 @@ async fn payment_config_upserts_and_never_returns_the_restricted_key(pool: PgPoo
     assert_eq!(status, StatusCode::OK, "config update failed: {body}");
     let config = &body["payment_config"];
     assert_eq!(config["bitcoin_enabled"], json!(false));
-    assert_eq!(config["stripe_payment_link"], Value::Null);
     assert_eq!(config["paypal_merchant_email"], json!("other@example.com"));
-    assert_eq!(config["stripe_restricted_key_set"], json!(true));
-
-    // An explicit empty string clears the stored key.
-    let (status, body) = put_config(
-        &app,
-        &seller.token,
-        &json!({ "bitcoin_enabled": false, "stripe_restricted_key": "" }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "config clear failed: {body}");
-    assert_eq!(
-        body["payment_config"]["stripe_restricted_key_set"],
-        json!(false)
+    assert!(
+        !legacy_stripe_values_stored(&pool, &seller.pubky).await,
+        "the save clears the retired Stripe columns"
     );
 
-    // The public projection never carries key material at all.
+    // The public projection carries booleans only, and no Stripe field.
     paykit.set_claimed(&seller.pubky);
     let (status, body) = get_public_config(&app, &seller.pubky).await;
     assert_eq!(status, StatusCode::OK);
@@ -194,31 +203,26 @@ async fn payment_config_upserts_and_never_returns_the_restricted_key(pool: PgPoo
             "bitcoin_available",
             "bitcoin_offer_available",
             "paypal_available",
-            "stripe_available",
         ])
     );
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn payment_config_validation_refuses_bad_inputs(pool: PgPool) {
-    let (app, _stripe, _paykit) = test_app_with_payments(pool).await;
+    let (app, _paykit) = test_app_with_payments(pool).await;
     let seller = new_actor(&app).await;
     for (body, reason) in [
         (
-            json!({ "bitcoin_enabled": false, "stripe_payment_link": "https://evil.example/x" }),
-            "invalid_payment_link",
+            json!({ "bitcoin_enabled": false, "stripe_payment_link": "https://buy.stripe.com/test_abc123" }),
+            "stripe_removed",
         ),
         (
-            json!({ "bitcoin_enabled": false, "stripe_payment_link": "http://buy.stripe.com/x" }),
-            "invalid_payment_link",
+            json!({ "bitcoin_enabled": false, "stripe_restricted_key": "rk_test_secret12345" }),
+            "stripe_removed",
         ),
         (
             json!({ "bitcoin_enabled": false, "paypal_merchant_email": "not-an-email" }),
             "invalid_paypal_email",
-        ),
-        (
-            json!({ "bitcoin_enabled": false, "stripe_restricted_key": "sk_test_secret12345" }),
-            "invalid_restricted_key",
         ),
     ] {
         let (status, response) = put_config(&app, &seller.token, &body).await;
@@ -232,26 +236,16 @@ async fn payment_config_validation_refuses_bad_inputs(pool: PgPool) {
     // Nothing was stored by the rejected writes.
     let (status, body) = get_public_config(&app, &seller.pubky).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["stripe_available"], json!(false));
     assert_eq!(body["paypal_available"], json!(false));
 }
 
 const MERCHANT_EMAIL: &str = "merchant@example.com";
-const STRIPE_LINK: &str = "https://buy.stripe.com/test_abc123";
 
 /// Fails when a response body carries any configured payout or contact
 /// identifier, in any casing or URL encoding.
 fn assert_no_payout_identifiers(context: &str, body: &Value) {
     let text = body.to_string().to_ascii_lowercase();
-    for needle in [
-        MERCHANT_EMAIL,
-        "merchant%40example.com",
-        "example.com",
-        STRIPE_LINK,
-        "buy.stripe.com",
-        "test_abc123",
-        &RESTRICTED_KEY.to_ascii_lowercase(),
-    ] {
+    for needle in [MERCHANT_EMAIL, "merchant%40example.com", "example.com"] {
         assert!(
             !text.contains(needle),
             "{context}: response exposes `{needle}`: {body}"
@@ -265,7 +259,7 @@ fn assert_no_payout_identifiers(context: &str, body: &Value) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn public_config_never_exposes_payout_identifiers_to_anyone(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool).await;
+    let (app, paykit) = test_app_with_payments(pool).await;
     let seller = new_actor(&app).await;
     let stranger = new_actor(&app).await;
     let (status, body) = put_config(&app, &seller.token, &full_config_body()).await;
@@ -282,10 +276,10 @@ async fn public_config_never_exposes_payout_identifiers_to_anyone(pool: PgPool) 
         assert_eq!(status, StatusCode::OK, "{who}: {body}");
         assert_no_payout_identifiers(who, &body);
         assert_eq!(body["paypal_available"], json!(true), "{who}");
-        assert_eq!(body["stripe_available"], json!(true), "{who}");
         assert_eq!(body["bitcoin_offer_available"], json!(true), "{who}");
         for field in [
             "paypal_merchant_email",
+            "stripe_available",
             "stripe_payment_link",
             "stripe_restricted_key_set",
         ] {
@@ -296,25 +290,20 @@ async fn public_config_never_exposes_payout_identifiers_to_anyone(pool: PgPool) 
         }
     }
 
-    // A Stripe link without the verification key is not an acceptable rail.
-    let (status, body) = put_config(
-        &app,
-        &seller.token,
-        &json!({ "bitcoin_enabled": false, "stripe_payment_link": STRIPE_LINK, "stripe_restricted_key": "" }),
-    )
-    .await;
+    // A seller with no PayPal email and Bitcoin off offers nothing.
+    let (status, body) =
+        put_config(&app, &seller.token, &json!({ "bitcoin_enabled": false })).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (status, body) = get_public_config(&app, &seller.pubky).await;
     assert_eq!(status, StatusCode::OK);
-    assert_no_payout_identifiers("link without key", &body);
-    assert_eq!(body["stripe_available"], json!(false));
+    assert_no_payout_identifiers("no rails", &body);
     assert_eq!(body["paypal_available"], json!(false));
     assert_eq!(body["bitcoin_available"], json!(false));
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn unauthenticated_routes_never_expose_payout_identifiers(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool).await;
+    let (app, paykit) = test_app_with_payments(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     put_config(&app, &seller.token, &full_config_body()).await;
@@ -340,7 +329,7 @@ async fn unauthenticated_routes_never_expose_payout_identifiers(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn the_paypal_email_reaches_only_the_bound_orders_participants(pool: PgPool) {
-    let (app, _stripe, _paykit) = test_app_with_payments(pool).await;
+    let (app, _paykit) = test_app_with_payments(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let stranger = new_actor(&app).await;
@@ -389,7 +378,7 @@ async fn the_paypal_email_reaches_only_the_bound_orders_participants(pool: PgPoo
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn public_config_reports_bitcoin_availability_from_paykit(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool).await;
+    let (app, paykit) = test_app_with_payments(pool).await;
     let seller = new_actor(&app).await;
 
     // No config at all: everything unavailable.
@@ -419,7 +408,7 @@ async fn public_config_reports_bitcoin_availability_from_paykit(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn public_config_mirrors_and_caches_the_rail_gate(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool).await;
+    let (app, paykit) = test_app_with_payments(pool).await;
     let seller = new_actor(&app).await;
 
     paykit.set_rail_health(json!({
@@ -473,7 +462,7 @@ async fn public_config_mirrors_and_caches_the_rail_gate(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn paykit_failure_uses_last_known_then_fails_closed_without_503(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool).await;
+    let (app, paykit) = test_app_with_payments(pool).await;
     let seller = new_actor(&app).await;
 
     let (status, body) = get_public_config(&app, &seller.pubky).await;
@@ -494,7 +483,7 @@ async fn paykit_failure_uses_last_known_then_fails_closed_without_503(pool: PgPo
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn paykit_rail_fallbacks_without_bitcoin_offer_available(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool).await;
+    let (app, paykit) = test_app_with_payments(pool).await;
     let seller = new_actor(&app).await;
     // Upstream paykit-server's (and the pre-Hop-1 fork's) string-component
     // body answers from the aggregate `status`; the Hop 1 electrum object
@@ -558,7 +547,7 @@ async fn paykit_rail_fallbacks_without_bitcoin_offer_available(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn account_failure_returns_ok_with_bitcoin_unavailable(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool).await;
+    let (app, paykit) = test_app_with_payments(pool).await;
     let seller = new_actor(&app).await;
     let (status, body) = put_config(&app, &seller.token, &full_config_body()).await;
     assert_eq!(status, StatusCode::OK, "config put failed: {body}");
@@ -572,7 +561,7 @@ async fn account_failure_returns_ok_with_bitcoin_unavailable(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn worker_refreshes_paykit_rail_for_health(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool).await;
+    let (app, paykit) = test_app_with_payments(pool).await;
     paykit.set_rail_health(json!({
         "status": "ready",
         "bitcoin_offer_available": true,
@@ -589,7 +578,7 @@ async fn worker_refreshes_paykit_rail_for_health(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn own_config_returns_the_stored_row_verbatim(pool: PgPool) {
-    let (app, _stripe, _paykit) = test_app_with_payments(pool).await;
+    let (app, _paykit) = test_app_with_payments(pool).await;
     let seller = new_actor(&app).await;
 
     let (status, put_body) = put_config(&app, &seller.token, &full_config_body()).await;
@@ -604,21 +593,12 @@ async fn own_config_returns_the_stored_row_verbatim(pool: PgPool) {
     let config = &body["payment_config"];
     assert_eq!(config["bitcoin_enabled"], json!(true));
     assert_eq!(
-        config["stripe_payment_link"],
-        json!("https://buy.stripe.com/test_abc123")
-    );
-    assert_eq!(
         config["paypal_merchant_email"],
         json!("merchant@example.com")
     );
-    assert_eq!(config["stripe_restricted_key_set"], json!(true));
     assert!(
         config["updated_at"].as_str().is_some(),
         "updated_at must be present: {config}"
-    );
-    assert!(
-        !body.to_string().contains(RESTRICTED_KEY),
-        "the restricted key must never appear in a response"
     );
 
     // The row is scoped to the session identity: another seller sees nothing.
@@ -641,7 +621,7 @@ async fn own_config_is_null_before_the_first_save(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn own_config_requires_a_session(pool: PgPool) {
-    let (app, _stripe, _paykit) = test_app_with_payments(pool).await;
+    let (app, _paykit) = test_app_with_payments(pool).await;
     let (status, _) = get_own_config(&app, None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
@@ -661,7 +641,7 @@ async fn the_payment_surface_is_refused_without_the_runtime(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn unbound_pending_order_actor_reflects_seller_rail_configuration(pool: PgPool) {
-    let (app, _stripe, _paykit) = test_app_with_payments(pool).await;
+    let (app, _paykit) = test_app_with_payments(pool).await;
     let seller_with_rail = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     put_config(&app, &seller_with_rail.token, &full_config_body()).await;
@@ -683,43 +663,29 @@ async fn unbound_pending_order_actor_reflects_seller_rail_configuration(pool: Pg
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn stripe_binding_snapshots_the_checkout_url(pool: PgPool) {
-    let (app, _stripe, _paykit) = test_app_with_payments(pool).await;
+async fn stripe_is_refused_as_a_payment_method(pool: PgPool) {
+    let (app, _paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     put_config(&app, &seller.token, &full_config_body()).await;
+    seed_legacy_stripe_values(&pool, &seller.pubky).await;
     let order = create_pending_order(&app, &seller, &buyer).await;
 
     let (status, body) = bind_method(&app, &buyer.token, &order.order_id, "stripe").await;
-    assert_eq!(status, StatusCode::OK, "stripe bind failed: {body}");
-    let bound = &body["order"];
-    assert_eq!(bound["payment_method"], json!("stripe"));
-    assert_eq!(bound["fiat_verification"], json!("processor"));
-    assert_eq!(
-        bound["fiat_checkout_url"],
-        json!(format!(
-            "https://buy.stripe.com/test_abc123?client_reference_id={}",
-            order.order_id
-        ))
-    );
-    // The payment adapter leaves the sandbox path permanently.
-    let order_view = read_order(&app, &buyer.token, &order.order_id).await;
-    assert_eq!(order_view["payment"]["adapter"], json!("stripe"));
-
-    // Re-binding the same method is idempotent; a different method refused.
-    let (status, _) = bind_method(&app, &buyer.token, &order.order_id, "stripe").await;
-    assert_eq!(status, StatusCode::OK);
-    let (status, body) = bind_method(&app, &buyer.token, &order.order_id, "paypal").await;
-    assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(
-        body["error"]["reason"],
-        json!("payment_method_already_bound")
-    );
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["reason"], json!("invalid_method"));
+    let method: Option<String> =
+        sqlx::query_scalar("SELECT payment_method FROM orders WHERE id = $1::uuid")
+            .bind(&order.order_id)
+            .fetch_one(&pool)
+            .await
+            .expect("order row");
+    assert_eq!(method, None, "nothing was bound");
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn binding_rejections_cover_role_availability_and_currency(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool).await;
+    let (app, paykit) = test_app_with_payments(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     // Seller config with NO rails at all.
@@ -727,7 +693,7 @@ async fn binding_rejections_cover_role_availability_and_currency(pool: PgPool) {
     let order = create_pending_order(&app, &seller, &buyer).await;
 
     // Only the buyer binds.
-    let (status, body) = bind_method(&app, &seller.token, &order.order_id, "stripe").await;
+    let (status, body) = bind_method(&app, &seller.token, &order.order_id, "paypal").await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
 
     // Unknown method.
@@ -736,7 +702,7 @@ async fn binding_rejections_cover_role_availability_and_currency(pool: PgPool) {
     assert_eq!(body["error"]["reason"], json!("invalid_method"));
 
     // Unconfigured rails are refused per method.
-    for method in ["stripe", "paypal", "bitcoin"] {
+    for method in ["paypal", "bitcoin"] {
         let (status, body) = bind_method(&app, &buyer.token, &order.order_id, method).await;
         assert_eq!(status, StatusCode::CONFLICT, "{method}: {body}");
         assert_eq!(
@@ -776,14 +742,14 @@ async fn binding_rejections_cover_role_availability_and_currency(pool: PgPool) {
     );
 
     // An unknown order is 404.
-    let (status, _) = bind_method(&app, &buyer.token, &Uuid::new_v4().to_string(), "stripe").await;
+    let (status, _) = bind_method(&app, &buyer.token, &Uuid::new_v4().to_string(), "paypal").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(paykit.requests().is_empty(), "nothing reached paykit");
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn paypal_binding_builds_the_seller_direct_checkout_url(pool: PgPool) {
-    let (app, _stripe, _paykit) = test_app_with_payments(pool).await;
+    let (app, _paykit) = test_app_with_payments(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     put_config(&app, &seller.token, &full_config_body()).await;
@@ -820,13 +786,26 @@ async fn paypal_binding_builds_the_seller_direct_checkout_url(pool: PgPool) {
         url.contains("notify_url=https%3A%2F%2Fsvc.test%2Fv0%2Fpaypal%2Fipn"),
         "{url}"
     );
+    // The payment adapter leaves the sandbox path permanently.
+    let order_view = read_order(&app, &buyer.token, &order.order_id).await;
+    assert_eq!(order_view["payment"]["adapter"], json!("paypal"));
+
+    // Re-binding the same method is idempotent; a different method refused.
+    let (status, _) = bind_method(&app, &buyer.token, &order.order_id, "paypal").await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = bind_method(&app, &buyer.token, &order.order_id, "bitcoin").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        body["error"]["reason"],
+        json!("payment_method_already_bound")
+    );
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn paypal_binding_uses_the_configured_sandbox_checkout_host(pool: PgPool) {
     let mut config = Config::for_tests();
     config.paypal_checkout_url = "https://www.sandbox.paypal.com/cgi-bin/webscr".to_string();
-    let (app, _stripe, _paykit, _ipn) = test_app_with_payments_config(pool, config).await;
+    let (app, _paykit, _ipn, _shippo) = test_app_with_payments_config(pool, config).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     put_config(&app, &seller.token, &full_config_body()).await;
@@ -845,7 +824,7 @@ async fn paypal_binding_uses_the_configured_sandbox_checkout_host(pool: PgPool) 
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn bitcoin_binding_creates_the_signed_paykit_request(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     put_config(&app, &seller.token, &full_config_body()).await;
@@ -919,7 +898,7 @@ async fn bitcoin_binding_creates_the_signed_paykit_request(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn bitcoin_binding_binds_small_unquoted_sat_orders(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     put_config(&app, &seller.token, &json!({ "bitcoin_enabled": true })).await;
@@ -961,7 +940,7 @@ async fn bitcoin_binding_binds_small_unquoted_sat_orders(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_refused_paykit_request_leaves_the_order_unbound(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     put_config(&app, &seller.token, &full_config_body()).await;
@@ -982,148 +961,6 @@ async fn a_refused_paykit_request_leaves_the_order_unbound(pool: PgPool) {
     paykit.clear_creation_failure();
     let (status, body) = bind_method(&app, &buyer.token, &order.order_id, "bitcoin").await;
     assert_eq!(status, StatusCode::OK, "{body}");
-}
-
-// ---------------------------------------------------------------------------
-// Stripe verification (processor-verified)
-// ---------------------------------------------------------------------------
-
-async fn stripe_bound_order(
-    app: &TestApp,
-    seller: &TestActor,
-    buyer: &TestActor,
-) -> (PendingOrder, i64) {
-    put_config(app, &seller.token, &full_config_body()).await;
-    let order = create_pending_order(app, seller, buyer).await;
-    let (status, body) = bind_method(app, &buyer.token, &order.order_id, "stripe").await;
-    assert_eq!(status, StatusCode::OK, "stripe bind failed: {body}");
-    let total = body["order"]["total"]["amount_minor"]
-        .as_i64()
-        .expect("order total");
-    (order, total)
-}
-
-async fn verify(app: &TestApp, token: &str, order_id: &str) -> (StatusCode, Value) {
-    send(
-        app.router.clone(),
-        "POST",
-        &format!("/v0/orders/{order_id}/fiat/verify"),
-        Some(token),
-        &Value::Null,
-    )
-    .await
-}
-
-#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn stripe_verification_pays_the_order_on_a_matching_paid_session(pool: PgPool) {
-    let (app, stripe, _paykit) = test_app_with_payments(pool.clone()).await;
-    let seller = new_actor(&app).await;
-    let buyer = new_actor(&app).await;
-    let (order, total) = stripe_bound_order(&app, &seller, &buyer).await;
-    stripe.accept_key(RESTRICTED_KEY);
-
-    // No matching session yet: honestly unverified, nothing advanced.
-    let (status, body) = verify(&app, &buyer.token, &order.order_id).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["verified"], json!(false));
-
-    // A paid session with the wrong amount never matches.
-    stripe.add_session(FakeStripeSession {
-        id: "cs_wrong_amount".into(),
-        client_reference_id: order.order_id.clone(),
-        payment_status: "paid".into(),
-        amount_total: total - 1,
-        currency: "usd".into(),
-    });
-    // An unpaid session with the right amount never matches.
-    stripe.add_session(FakeStripeSession {
-        id: "cs_unpaid".into(),
-        client_reference_id: order.order_id.clone(),
-        payment_status: "unpaid".into(),
-        amount_total: total,
-        currency: "usd".into(),
-    });
-    let (status, body) = verify(&app, &buyer.token, &order.order_id).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["verified"], json!(false), "{body}");
-
-    // The exact match pays the order (either participant may trigger it).
-    stripe.add_session(FakeStripeSession {
-        id: "cs_paid_match".into(),
-        client_reference_id: order.order_id.clone(),
-        payment_status: "paid".into(),
-        amount_total: total,
-        currency: "usd".into(),
-    });
-    let (status, body) = verify(&app, &seller.token, &order.order_id).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["verified"], json!(true));
-    assert_eq!(body["order"]["state"], json!("paid"));
-    assert_eq!(
-        body["order"]["fiat_transaction_ref"],
-        json!("cs_paid_match")
-    );
-    assert!(body["order"]["receipt_id"].is_string());
-
-    let order_view = read_order(&app, &buyer.token, &order.order_id).await;
-    assert_eq!(order_view["payment"]["state"], json!("confirmed"));
-
-    // Re-verification is an idempotent success: exactly one receipt.
-    let (status, body) = verify(&app, &buyer.token, &order.order_id).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["verified"], json!(true));
-    assert_eq!(
-        count(&pool, "SELECT COUNT(*) FROM receipts").await,
-        1,
-        "confirmation effects applied exactly once"
-    );
-}
-
-#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn stripe_verification_surfaces_key_problems_honestly(pool: PgPool) {
-    let (app, stripe, _paykit) = test_app_with_payments(pool.clone()).await;
-    let seller = new_actor(&app).await;
-    let buyer = new_actor(&app).await;
-    let stranger = new_actor(&app).await;
-    let (order, _total) = stripe_bound_order(&app, &seller, &buyer).await;
-
-    // Only participants verify.
-    let (status, _) = verify(&app, &stranger.token, &order.order_id).await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
-
-    // The fake accepts no keys, so the stored key is rejected upstream.
-    let (status, body) = verify(&app, &buyer.token, &order.order_id).await;
-    assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(
-        body["error"]["reason"],
-        json!("stripe_key_invalid"),
-        "{body}"
-    );
-    assert!(stripe.request_count() >= 1, "the real key reached Stripe");
-
-    // A seller who clears their key leaves the order unverifiable, stated
-    // as exactly that.
-    let (status, _) = put_config(
-        &app,
-        &seller.token,
-        &json!({
-            "bitcoin_enabled": false,
-            "stripe_payment_link": "https://buy.stripe.com/test_abc123",
-            "stripe_restricted_key": "",
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let (status, body) = verify(&app, &buyer.token, &order.order_id).await;
-    assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(body["error"]["reason"], json!("stripe_key_missing"));
-
-    // Verification never applies to orders without a bound Stripe method.
-    let seller2 = new_actor(&app).await;
-    let order2 = create_pending_order(&app, &seller2, &stranger).await;
-    let (status, body) = verify(&app, &stranger.token, &order2.order_id).await;
-    assert_eq!(status, StatusCode::CONFLICT);
-    assert_eq!(body["error"]["reason"], json!("method_mismatch"), "{body}");
 }
 
 // ---------------------------------------------------------------------------
@@ -1159,7 +996,7 @@ async fn confirm_received(app: &TestApp, token: &str, order_id: &str) -> (Status
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn paypal_two_step_attestation_pays_the_order(pool: PgPool) {
-    let (app, _stripe, _paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, _paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     put_config(&app, &seller.token, &full_config_body()).await;
@@ -1227,10 +1064,11 @@ async fn paypal_two_step_attestation_pays_the_order(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn paypal_attestation_applies_only_to_paypal_orders(pool: PgPool) {
-    let (app, _stripe, _paykit) = test_app_with_payments(pool).await;
+    let (app, _paykit) = test_app_with_payments(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    let (order, _total) = stripe_bound_order(&app, &seller, &buyer).await;
+    put_config(&app, &seller.token, &full_config_body()).await;
+    let order = create_pending_order(&app, &seller, &buyer).await;
     let (status, body) = mark_paid(&app, &buyer.token, &order.order_id, &json!({})).await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["error"]["reason"], json!("method_mismatch"));
@@ -1280,7 +1118,7 @@ async fn post_ipn(app: &TestApp, body: String) -> StatusCode {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_verified_completed_ipn_pays_the_order_without_any_participant(pool: PgPool) {
-    let (app, _stripe, _paykit, ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
+    let (app, _paykit, ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     put_config(&app, &seller.token, &full_config_body()).await;
@@ -1326,7 +1164,7 @@ async fn a_verified_completed_ipn_pays_the_order_without_any_participant(pool: P
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn an_ipn_that_fails_postback_validation_is_dropped(pool: PgPool) {
-    let (app, _stripe, _paykit, ipn) = test_app_with_payments_and_ipn(pool).await;
+    let (app, _paykit, ipn) = test_app_with_payments_and_ipn(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     put_config(&app, &seller.token, &full_config_body()).await;
@@ -1344,7 +1182,7 @@ async fn an_ipn_that_fails_postback_validation_is_dropped(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn an_ipn_that_does_not_match_server_held_facts_is_dropped(pool: PgPool) {
-    let (app, _stripe, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
+    let (app, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     put_config(&app, &seller.token, &full_config_body()).await;
@@ -1388,7 +1226,7 @@ async fn an_ipn_that_does_not_match_server_held_facts_is_dropped(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn duplicate_ipns_confirm_exactly_once(pool: PgPool) {
-    let (app, _stripe, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
+    let (app, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     put_config(&app, &seller.token, &full_config_body()).await;
@@ -1410,7 +1248,7 @@ async fn duplicate_ipns_confirm_exactly_once(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn the_paykit_worker_confirms_a_settled_bitcoin_order(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     put_config(&app, &seller.token, &full_config_body()).await;
@@ -1505,7 +1343,7 @@ async fn the_paykit_worker_confirms_a_settled_bitcoin_order(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_confirmed_but_mismatched_amount_routes_to_manual_review(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     put_config(&app, &seller.token, &full_config_body()).await;
