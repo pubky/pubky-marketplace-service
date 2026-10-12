@@ -458,6 +458,119 @@ pub struct DeliveryAddress {
     pub country_code: String,
 }
 
+/// Exact byte length of a sealed delivery address: the HPKE encapsulated key
+/// (32) plus the 2,048-byte padded plaintext and the 16-byte AEAD tag.
+pub const DELIVERY_ENVELOPE_BYTES: usize = 2096;
+/// Length of [`DELIVERY_ENVELOPE_BYTES`] as unpadded base64url.
+pub const DELIVERY_ENVELOPE_BASE64_CHARS: usize = 2795;
+/// Length of a delivery key id: the hex of the first 16 bytes of the
+/// SHA-256 of the seller's published delivery public key.
+pub const DELIVERY_KEY_ID_CHARS: usize = 32;
+
+/// A buyer delivery address sealed (RFC 9180 HPKE) to one seller's published
+/// delivery key by the buyer's client. The service stores the bytes and
+/// cannot open them; it checks only the key id and the exact encoded length.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeliveryEnvelope {
+    pub key_id: String,
+    pub envelope: String,
+}
+
+impl std::fmt::Debug for DeliveryEnvelope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeliveryEnvelope")
+            .field("key_id", &self.key_id)
+            .field("envelope", &"<sealed>")
+            .finish()
+    }
+}
+
+/// A [`DeliveryEnvelope`] addressed to one seller of a multi-seller checkout.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SellerDeliveryEnvelope {
+    pub seller_pubky: String,
+    pub key_id: String,
+    pub envelope: String,
+}
+
+impl std::fmt::Debug for SellerDeliveryEnvelope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SellerDeliveryEnvelope")
+            .field("seller_pubky", &self.seller_pubky)
+            .field("key_id", &self.key_id)
+            .field("envelope", &"<sealed>")
+            .finish()
+    }
+}
+
+impl SellerDeliveryEnvelope {
+    pub fn sealed(&self) -> DeliveryEnvelope {
+        DeliveryEnvelope {
+            key_id: self.key_id.clone(),
+            envelope: self.envelope.clone(),
+        }
+    }
+}
+
+/// Decodes an envelope that already passed [`validate_delivery_envelope`]
+/// into its 2,096 bytes. `None` if the text is not canonical unpadded
+/// base64url of exactly that length.
+pub fn decode_delivery_envelope(envelope: &str) -> Option<Vec<u8>> {
+    if envelope.len() != DELIVERY_ENVELOPE_BASE64_CHARS {
+        return None;
+    }
+    let mut out = Vec::with_capacity(DELIVERY_ENVELOPE_BYTES);
+    let mut accumulator: u32 = 0;
+    let mut bits = 0u32;
+    for byte in envelope.bytes() {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            _ => return None,
+        };
+        accumulator = (accumulator << 6) | u32::from(value);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((accumulator >> bits) as u8);
+            accumulator &= (1 << bits) - 1;
+        }
+    }
+    // 2,795 characters carry 16,770 bits: 16,768 data bits and two trailing
+    // bits that a canonical encoding leaves zero.
+    (accumulator == 0 && out.len() == DELIVERY_ENVELOPE_BYTES).then_some(out)
+}
+
+/// Shape check for one envelope. Issues name the field, never the value.
+pub fn validate_delivery_envelope(
+    path: &str,
+    key_id: &str,
+    envelope: &str,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    let key_id_ok = key_id.len() == DELIVERY_KEY_ID_CHARS
+        && key_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    if !key_id_ok {
+        issues.push(issue(
+            &format!("{path}.key_id"),
+            "Expected 32 lowercase hex characters",
+        ));
+    }
+    if decode_delivery_envelope(envelope).is_none() {
+        issues.push(issue(
+            &format!("{path}.envelope"),
+            "Expected a 2096-byte envelope as unpadded base64url",
+        ));
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateCheckoutPayload {
@@ -468,6 +581,12 @@ pub struct CreateCheckoutPayload {
     /// malicious client cannot smuggle one into storage (§A2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery_address: Option<DeliveryAddress>,
+    /// The delivery address sealed to each shipped seller's published
+    /// delivery key, one entry per shipped seller. Replaces
+    /// `delivery_address`: a checkout carries one or the other, never both.
+    /// The service cannot open it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_address_envelopes: Option<Vec<SellerDeliveryEnvelope>>,
     /// Where the seller of an email-kind digital line sends the purchase
     /// (digital delivery design §4.3). Required exactly when a line is
     /// email-kind; the handler refuses it otherwise.
@@ -588,6 +707,10 @@ pub struct OfferCheckoutPayload {
     /// Required when the award ships; absent for a pickup award (§A2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery_address: Option<DeliveryAddress>,
+    /// The delivery address sealed to the offer seller's published delivery
+    /// key. Replaces `delivery_address`: one or the other, never both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_address_envelope: Option<DeliveryEnvelope>,
     /// The buyer's fulfillment choice. Absent means `shipping` — old clients
     /// are unaffected. The service validates it against the methods the
     /// listing publishes and never silently rewrites it.
@@ -1660,23 +1783,41 @@ fn validate_offer_checkout(
             "Expected a quantity between 1 and 1000000",
         ));
     }
+    if payload.delivery_address.is_some() && payload.delivery_address_envelope.is_some() {
+        issues.push(issue(
+            "payload.delivery_address_envelope",
+            "Send the delivery address or its envelope, not both",
+        ));
+    }
     match (
         payload.fulfillment.unwrap_or(FulfillmentMethod::Shipping),
         &mut payload.delivery_address,
+        &payload.delivery_address_envelope,
     ) {
-        (FulfillmentMethod::Shipping, Some(address)) => {
+        (FulfillmentMethod::Shipping, Some(address), None) => {
             validate_delivery_address("payload.delivery_address", address, &mut issues)
         }
-        (FulfillmentMethod::Shipping, None) => issues.push(issue(
+        (FulfillmentMethod::Shipping, None, Some(sealed)) => validate_delivery_envelope(
+            "payload.delivery_address_envelope",
+            &sealed.key_id,
+            &sealed.envelope,
+            &mut issues,
+        ),
+        (FulfillmentMethod::Shipping, Some(_), Some(_)) => {}
+        (FulfillmentMethod::Shipping, None, None) => issues.push(issue(
             "payload.delivery_address",
             "A delivery address is required when the offer ships",
         )),
-        (FulfillmentMethod::Pickup, Some(_)) => issues.push(issue(
+        (FulfillmentMethod::Pickup, Some(_), _) => issues.push(issue(
             "payload.delivery_address",
             "A pickup offer checkout must not carry a delivery address",
         )),
-        (FulfillmentMethod::Pickup, None) => {}
-        (FulfillmentMethod::Digital, _) => issues.push(issue(
+        (FulfillmentMethod::Pickup, None, Some(_)) => issues.push(issue(
+            "payload.delivery_address_envelope",
+            "A pickup offer checkout must not carry a delivery address",
+        )),
+        (FulfillmentMethod::Pickup, None, None) => {}
+        (FulfillmentMethod::Digital, _, _) => issues.push(issue(
             "payload.fulfillment",
             "Offer checkout supports shipping or pickup",
         )),
@@ -2276,11 +2417,55 @@ fn validate_create_checkout(
         .lines
         .iter()
         .all(|line| line.fulfillment == Some(FulfillmentMethod::Pickup));
-    match (&mut payload.delivery_address, any_shipping) {
-        (Some(address), true) => {
+    if payload.delivery_address.is_some() && payload.delivery_address_envelopes.is_some() {
+        issues.push(issue(
+            "payload.delivery_address_envelopes",
+            "Send the delivery address or its envelopes, not both",
+        ));
+    }
+    if let Some(envelopes) = &payload.delivery_address_envelopes {
+        if !any_shipping {
+            issues.push(issue(
+                "payload.delivery_address_envelopes",
+                if all_pickup {
+                    "A pickup-only checkout must not carry a delivery address"
+                } else {
+                    "A checkout with no shipped line must not carry a delivery address"
+                },
+            ));
+        } else if envelopes.is_empty() || envelopes.len() > payload.lines.len() {
+            issues.push(issue(
+                "payload.delivery_address_envelopes",
+                "Expected one envelope per shipped seller",
+            ));
+        }
+        let mut sellers = std::collections::HashSet::new();
+        for (index, sealed) in envelopes.iter().enumerate() {
+            let path = format!("payload.delivery_address_envelopes.{index}");
+            if !is_valid_pubky(&sealed.seller_pubky) {
+                issues.push(issue(
+                    &format!("{path}.seller_pubky"),
+                    "Expected a 52-character z-base-32 Pubky",
+                ));
+            } else if !sellers.insert(sealed.seller_pubky.as_str()) {
+                issues.push(issue(
+                    &format!("{path}.seller_pubky"),
+                    "Expected one envelope per seller",
+                ));
+            }
+            validate_delivery_envelope(&path, &sealed.key_id, &sealed.envelope, &mut issues);
+        }
+    }
+    match (
+        &mut payload.delivery_address,
+        any_shipping,
+        payload.delivery_address_envelopes.is_some(),
+    ) {
+        (Some(address), true, _) => {
             validate_delivery_address("payload.delivery_address", address, &mut issues)
         }
-        (Some(_), false) => {
+        (None, _, true) => {}
+        (Some(_), false, _) => {
             issues.push(issue(
                 "payload.delivery_address",
                 if all_pickup {
@@ -2290,13 +2475,13 @@ fn validate_create_checkout(
                 },
             ));
         }
-        (None, true) => {
+        (None, true, false) => {
             issues.push(issue(
                 "payload.delivery_address",
                 "A delivery address is required when any checkout line ships",
             ));
         }
-        (None, false) => {}
+        (None, false, false) => {}
     }
     if payload
         .guarantee_policy_version
@@ -3475,6 +3660,248 @@ mod tests {
                 .map(|lock| lock.policy_uri.as_str()),
             Some(bare.as_str()),
             "the payload bound to SQL carries the canonical bare form"
+        );
+    }
+    fn sealed_envelope() -> String {
+        "A".repeat(DELIVERY_ENVELOPE_BASE64_CHARS)
+    }
+
+    const SELLER_ONE: &str = "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy";
+    const SELLER_TWO: &str = "oooooooooooooooooooooooooooooooooooooooooooooooooooo";
+
+    fn sealed_checkout_json() -> Value {
+        let mut raw = checkout_command_json();
+        raw["payload"]
+            .as_object_mut()
+            .expect("payload object")
+            .remove("delivery_address");
+        raw["payload"]["delivery_address_envelopes"] = json!([{
+            "seller_pubky": SELLER_ONE,
+            "key_id": "0123456789abcdef0123456789abcdef",
+            "envelope": sealed_envelope(),
+        }]);
+        raw
+    }
+
+    fn envelope_issue_paths(raw: &Value) -> Vec<String> {
+        parse_command(raw)
+            .expect_err("expected the command to be refused")
+            .into_iter()
+            .map(|issue| issue.path)
+            .collect()
+    }
+
+    #[test]
+    fn checkout_accepts_sealed_envelopes_in_place_of_the_plaintext_address() {
+        let command = parse_command(&sealed_checkout_json()).expect("sealed checkout parses");
+        let CommandPayload::CreateCheckout(payload) = &command.payload else {
+            panic!("expected checkout payload");
+        };
+        assert!(payload.delivery_address.is_none());
+        let envelopes = payload
+            .delivery_address_envelopes
+            .as_ref()
+            .expect("envelopes present");
+        assert_eq!(envelopes.len(), 1);
+        assert_eq!(envelopes[0].seller_pubky, SELLER_ONE);
+        let debug = format!("{:?}", command.payload);
+        assert!(debug.contains("<sealed>"));
+        assert!(!debug.contains(&sealed_envelope()));
+    }
+
+    #[test]
+    fn checkout_refuses_plaintext_and_envelopes_together() {
+        let mut raw = sealed_checkout_json();
+        raw["payload"]["delivery_address"] =
+            checkout_command_json()["payload"]["delivery_address"].clone();
+        assert!(
+            envelope_issue_paths(&raw).contains(&"payload.delivery_address_envelopes".to_string())
+        );
+    }
+
+    #[test]
+    fn checkout_refuses_a_shipping_line_with_no_address_or_envelope() {
+        let mut raw = sealed_checkout_json();
+        raw["payload"]
+            .as_object_mut()
+            .expect("payload object")
+            .remove("delivery_address_envelopes");
+        assert!(envelope_issue_paths(&raw).contains(&"payload.delivery_address".to_string()));
+    }
+
+    #[test]
+    fn checkout_refuses_envelopes_when_no_line_ships() {
+        let mut raw = sealed_checkout_json();
+        raw["payload"]["lines"][0]["fulfillment"] = json!("pickup");
+        assert!(
+            envelope_issue_paths(&raw).contains(&"payload.delivery_address_envelopes".to_string())
+        );
+    }
+
+    #[test]
+    fn checkout_refuses_malformed_envelope_shapes() {
+        let flip_last = {
+            let mut text = sealed_envelope();
+            text.pop();
+            text.push('B');
+            text
+        };
+        let cases: Vec<(&str, Value, &str)> = vec![
+            ("short", json!("A".repeat(2794)), "envelope"),
+            ("long", json!("A".repeat(2796)), "envelope"),
+            (
+                "padded",
+                json!(format!("{}=", "A".repeat(2794))),
+                "envelope",
+            ),
+            (
+                "standard alphabet",
+                json!(format!("+{}", "A".repeat(2794))),
+                "envelope",
+            ),
+            ("trailing bits set", json!(flip_last), "envelope"),
+            (
+                "non ascii",
+                json!(format!("é{}", "A".repeat(2793))),
+                "envelope",
+            ),
+        ];
+        for (label, value, field) in cases {
+            let mut raw = sealed_checkout_json();
+            raw["payload"]["delivery_address_envelopes"][0]["envelope"] = value;
+            assert!(
+                envelope_issue_paths(&raw)
+                    .contains(&format!("payload.delivery_address_envelopes.0.{field}")),
+                "{label} must be refused"
+            );
+        }
+        for key_id in [
+            "",
+            "ABCDEF0123456789abcdef0123456789",
+            "0123456789abcdef0123456789abcde",
+            "0123456789abcdef0123456789abcdefa",
+            "0123456789abcdef0123456789abcdeg",
+        ] {
+            let mut raw = sealed_checkout_json();
+            raw["payload"]["delivery_address_envelopes"][0]["key_id"] = json!(key_id);
+            assert!(
+                envelope_issue_paths(&raw)
+                    .contains(&"payload.delivery_address_envelopes.0.key_id".to_string()),
+                "key id {key_id:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn checkout_refuses_duplicate_and_malformed_envelope_sellers() {
+        let mut raw = sealed_checkout_json();
+        let entry = raw["payload"]["delivery_address_envelopes"][0].clone();
+        raw["payload"]["lines"] = json!([
+            checkout_command_json()["payload"]["lines"][0].clone(),
+            {
+                "listing_aggregate_id": format!("listing:{}_boots_02", "y".repeat(52)),
+                "expected_revision": 1,
+                "quantity": 1,
+            }
+        ]);
+        raw["payload"]["delivery_address_envelopes"] = json!([entry.clone(), entry]);
+        assert!(envelope_issue_paths(&raw)
+            .contains(&"payload.delivery_address_envelopes.1.seller_pubky".to_string()));
+
+        raw["payload"]["delivery_address_envelopes"][1]["seller_pubky"] = json!("not-a-pubky");
+        assert!(envelope_issue_paths(&raw)
+            .contains(&"payload.delivery_address_envelopes.1.seller_pubky".to_string()));
+
+        raw["payload"]["delivery_address_envelopes"][1]["seller_pubky"] = json!(SELLER_TWO);
+        parse_command(&raw).expect("two distinct sellers parse");
+    }
+
+    #[test]
+    fn checkout_refuses_more_envelopes_than_lines_and_unknown_fields() {
+        let mut raw = sealed_checkout_json();
+        let entry = raw["payload"]["delivery_address_envelopes"][0].clone();
+        let mut other = entry.clone();
+        other["seller_pubky"] = json!(SELLER_TWO);
+        raw["payload"]["delivery_address_envelopes"] = json!([entry, other]);
+        assert!(
+            envelope_issue_paths(&raw).contains(&"payload.delivery_address_envelopes".to_string())
+        );
+
+        let mut smuggled = sealed_checkout_json();
+        smuggled["payload"]["delivery_address_envelopes"][0]["line1"] = json!("secret-address");
+        assert!(parse_command(&smuggled).is_err());
+    }
+
+    fn sealed_offer_checkout_json() -> Value {
+        json!({
+            "version": 1,
+            "command_id": "00000000-0000-4000-8000-000000002002",
+            "aggregate_id": "checkout:00000000-0000-4000-8000-000000002002",
+            "expected_revision": 0,
+            "issued_at": "2026-08-19T22:00:00.000Z",
+            "kind": "offer.checkout",
+            "payload": {
+                "offer_id": "00000000-0000-4000-8000-000000002003",
+                "award_id": "00000000-0000-4000-8000-000000002004",
+                "listing_aggregate_id": format!("listing:{}_boots_01", "y".repeat(52)),
+                "listing_revision": 1,
+                "listing_record_sha256": "a".repeat(64),
+                "variant_id": "variant_01",
+                "quantity": 1,
+                "delivery_address_envelope": {
+                    "key_id": "0123456789abcdef0123456789abcdef",
+                    "envelope": sealed_envelope(),
+                },
+            },
+        })
+    }
+
+    #[test]
+    fn offer_checkout_accepts_a_sealed_envelope_and_refuses_the_other_shapes() {
+        let command = parse_command(&sealed_offer_checkout_json()).expect("sealed offer checkout");
+        let CommandPayload::OfferCheckout(payload) = &command.payload else {
+            panic!("expected offer checkout payload");
+        };
+        assert!(payload.delivery_address.is_none());
+        assert!(payload.delivery_address_envelope.is_some());
+
+        let mut both = sealed_offer_checkout_json();
+        both["payload"]["delivery_address"] =
+            checkout_command_json()["payload"]["delivery_address"].clone();
+        assert!(
+            envelope_issue_paths(&both).contains(&"payload.delivery_address_envelope".to_string())
+        );
+
+        let mut neither = sealed_offer_checkout_json();
+        neither["payload"]
+            .as_object_mut()
+            .expect("payload object")
+            .remove("delivery_address_envelope");
+        assert!(envelope_issue_paths(&neither).contains(&"payload.delivery_address".to_string()));
+
+        let mut pickup = sealed_offer_checkout_json();
+        pickup["payload"]["fulfillment"] = json!("pickup");
+        assert!(envelope_issue_paths(&pickup)
+            .contains(&"payload.delivery_address_envelope".to_string()));
+
+        let mut short = sealed_offer_checkout_json();
+        short["payload"]["delivery_address_envelope"]["envelope"] = json!("A".repeat(10));
+        assert!(envelope_issue_paths(&short)
+            .contains(&"payload.delivery_address_envelope.envelope".to_string()));
+    }
+
+    #[test]
+    fn delivery_envelope_decoder_is_canonical_and_exact() {
+        let bytes = decode_delivery_envelope(&sealed_envelope()).expect("decodes");
+        assert_eq!(bytes.len(), DELIVERY_ENVELOPE_BYTES);
+        assert!(bytes.iter().all(|byte| *byte == 0));
+        let mut ones = "_".repeat(DELIVERY_ENVELOPE_BASE64_CHARS - 1);
+        ones.push('8');
+        let decoded = decode_delivery_envelope(&ones).expect("0xff run decodes");
+        assert!(decoded.iter().all(|byte| *byte == 0xff));
+        assert_eq!(
+            decode_delivery_envelope(&format!("{}x", &ones[..2794])),
+            None
         );
     }
 }

@@ -118,3 +118,12 @@ The stacked pairs (#91/#99, #94/#101) are alternative bases for the same file,
 not two migrations. Only one of each pair will merge. #93 and #100 carry no
 migration. This table describes unmerged work and goes stale as pull requests
 land; trust `crates/service/migrations/` on `main` over it.
+
+## Sealed delivery addresses (0057)
+
+`0057_encrypted_delivery_address.sql` adds `orders.delivery_address_envelope`
+and `orders.delivery_key_id`, two `NOT VALID`-then-`VALIDATE` constraints
+(the pair travels together at exactly 2,096 bytes and a 32-hex key id; a
+plaintext address and an envelope never share a row), and clears
+`delivery_address` on orders already in a final state. Numbers 0052 to 0055
+belong to open pull requests and 0056 to the seller delivery terms.

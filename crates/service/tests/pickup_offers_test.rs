@@ -98,8 +98,16 @@ async fn pickup_offer_app(
     fulfillment: &'static [&'static str],
     shipping: bool,
 ) -> (TestApp, FakePaypalIpn) {
-    let (app, _stripe, _paykit, ipn, _shippo) =
-        test_app_with_payments_config(pool, config_durable()).await;
+    pickup_offer_app_with(pool, fulfillment, shipping, config_durable()).await
+}
+
+async fn pickup_offer_app_with(
+    pool: PgPool,
+    fulfillment: &'static [&'static str],
+    shipping: bool,
+    config: marketplace_service::config::Config,
+) -> (TestApp, FakePaypalIpn) {
+    let (app, _stripe, _paykit, ipn, _shippo) = test_app_with_payments_config(pool, config).await;
     let state = app
         .state
         .clone()
@@ -455,6 +463,141 @@ async fn shipping_award_on_a_shipping_and_pickup_listing_keeps_shipped_terms(poo
         order["total"]["amount_minor"],
         json!(OFFER_MINOR + SHIPPING_MINOR)
     );
+}
+
+/// `offer_checkout` with the address sealed instead of sent in plaintext.
+fn sealed_offer_checkout(
+    seller: &str,
+    award: &Award,
+    fulfillment: Option<&str>,
+    seed: u8,
+) -> Value {
+    let mut command = offer_checkout(seller, award, fulfillment, false);
+    command["payload"]["delivery_address_envelope"] = json!({
+        "key_id": common::TEST_DELIVERY_KEY_ID,
+        "envelope": common::test_envelope(seed),
+    });
+    command
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_shipped_award_stores_the_sealed_address_and_no_plaintext(pool: PgPool) {
+    let (app, _ipn) = pickup_offer_app(pool, &["physical", "shipping"], true).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let award = accepted_award(&app, &seller, &buyer, &["shipping"], SHIPPING_MINOR).await;
+
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &sealed_offer_checkout(&seller.pubky, &award, None, 7),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "sealed offer checkout failed: {body}"
+    );
+    assert!(
+        !body.to_string().contains(&common::test_envelope(7)),
+        "{body}"
+    );
+    let order_id = body["result"]["order"]["id"].as_str().expect("order id");
+
+    let (plaintext_is_null, envelope, key_id, command_id): (
+        bool,
+        Option<Vec<u8>>,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT delivery_address IS NULL, delivery_address_envelope, delivery_key_id, \
+         checkout_command_id::text FROM orders WHERE id = $1::uuid",
+    )
+    .bind(order_id)
+    .fetch_one(&app.pool)
+    .await
+    .expect("order row");
+    assert!(plaintext_is_null);
+    assert_eq!(envelope, Some(common::test_envelope_bytes(7)));
+    assert_eq!(key_id.as_deref(), Some(common::TEST_DELIVERY_KEY_ID));
+    assert_eq!(
+        command_id.as_deref(),
+        Some("00000000-0000-4000-8000-00000000c102")
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn award_checkout_refuses_a_sealed_address_on_pickup_both_formats_and_none(pool: PgPool) {
+    let (app, _ipn) = pickup_offer_app(pool, &["shipping", "pickup"], true).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let award = accepted_award(&app, &seller, &buyer, &["shipping", "pickup"], 0).await;
+
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &sealed_offer_checkout(&seller.pubky, &award, Some("pickup"), 7),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+
+    let mut both = sealed_offer_checkout(&seller.pubky, &award, Some("shipping"), 7);
+    both["payload"]["delivery_address"] =
+        offer_checkout(&seller.pubky, &award, Some("shipping"), true)["payload"]
+            ["delivery_address"]
+            .clone();
+    let (status, body) = execute(&app, &buyer.token, &both).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &offer_checkout(&seller.pubky, &award, Some("shipping"), false),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+
+    let mut malformed = sealed_offer_checkout(&seller.pubky, &award, Some("shipping"), 7);
+    malformed["payload"]["delivery_address_envelope"]["envelope"] = json!("AAAA");
+    let (status, body) = execute(&app, &buyer.token, &malformed).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(!body.to_string().contains("AAAA"), "{body}");
+
+    let orders: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM orders")
+        .fetch_one(&app.pool)
+        .await
+        .expect("order count");
+    assert_eq!(orders, 0, "refused award checkouts write nothing");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn with_the_flag_on_an_award_checkout_refuses_plaintext_and_accepts_sealed(pool: PgPool) {
+    let mut config = config_durable();
+    config.require_encrypted_delivery_address = true;
+    let (app, _ipn) = pickup_offer_app_with(pool, &["physical", "shipping"], true, config).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let award = accepted_award(&app, &seller, &buyer, &["shipping"], SHIPPING_MINOR).await;
+
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &offer_checkout(&seller.pubky, &award, None, true),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(
+        body["error"]["reason"],
+        json!("encrypted_delivery_required")
+    );
+
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &sealed_offer_checkout(&seller.pubky, &award, None, 7),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 // The fulfillment is the buyer's explicit choice, checked against what the

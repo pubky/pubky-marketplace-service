@@ -243,7 +243,7 @@ async fn migration_0034_caps_conflicts_and_indexes_the_count_prefix(pool: PgPool
 }
 
 #[test]
-fn migration_catalog_is_contiguous_through_0051_then_0056() {
+fn migration_catalog_is_contiguous_through_0051_then_0056_and_0057() {
     let mut numbers: Vec<u32> = std::fs::read_dir(MIGRATIONS_DIR)
         .expect("migrations dir")
         .filter_map(|entry| {
@@ -255,5 +255,5 @@ fn migration_catalog_is_contiguous_through_0051_then_0056() {
         .collect();
     numbers.sort_unstable();
     // 0052..=0055 are held by open pull requests.
-    assert_eq!(numbers, (1..=51).chain([56]).collect::<Vec<_>>());
+    assert_eq!(numbers, (1..=51).chain([56, 57]).collect::<Vec<_>>());
 }
