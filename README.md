@@ -218,11 +218,11 @@ only because a Shop that predates the removal requires them:
 `stripe_payment_link` is always `null` and `stripe_restricted_key_set` is
 always `false`; they go once the Shop stops reading them. The columns
 `seller_payment_configs.stripe_payment_link` and
-`stripe_restricted_key_ciphertext` are unused: nothing reads them, and each
-seller's next save sets them to `NULL`. Orders bound to Stripe before the
-removal keep `payment_method = 'stripe'` and read `fiat_verification:
-'processor'`, and the `payments.adapter` and `orders.payment_method` check
-constraints still admit `stripe` for them.
+`stripe_restricted_key_ciphertext` are unused and always `NULL`: migration
+0058 clears every stored value, and nothing writes them after that. Orders
+bound to Stripe before the removal keep `payment_method = 'stripe'` and read
+`fiat_verification: 'processor'`, and the `payments.adapter` and
+`orders.payment_method` check constraints still admit `stripe` for them.
 
 During deployment ordering, an older paykit-server response without
 `bitcoin_offer_available` is compatible: `electrum: "ready"` or
