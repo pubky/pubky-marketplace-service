@@ -29,6 +29,7 @@ pub mod homeserver;
 pub mod http;
 pub mod inventory;
 pub mod listing_deletion;
+pub mod listing_moderation;
 pub mod locks;
 pub(crate) mod logging;
 pub mod migrations;
@@ -59,6 +60,7 @@ use crate::clock::Clock;
 use crate::config::Config;
 use crate::digital::DigitalKeys;
 use crate::homeserver::HomeserverListingClient;
+use crate::listing_moderation::ListingModerationGate;
 use crate::locks::LocksRuntime;
 use crate::payment_availability::PaymentAvailabilityCache;
 use crate::payments::PaymentsRuntime;
@@ -135,6 +137,10 @@ pub struct AppState {
     /// when `ADDRESS_SEARCH_DISABLED` is set or in tests that do not use it:
     /// the route then answers `address_search_unavailable`.
     pub address_search: Option<Arc<address_search::AddressSearchRuntime>>,
+    /// The index moderation gate checked before a checkout, a bid or an offer
+    /// on a listing. Required in production (`NEXUS_URL`); `None` only in
+    /// tests that do not exercise it, where no check is made.
+    pub listing_moderation: Option<Arc<ListingModerationGate>>,
 }
 
 impl AppState {
@@ -181,6 +187,7 @@ impl AppState {
             refusal_audit_retention_pool: None,
             grant: None,
             address_search: None,
+            listing_moderation: None,
         }
     }
 
@@ -234,6 +241,14 @@ impl AppState {
         address_search: Option<Arc<address_search::AddressSearchRuntime>>,
     ) -> Self {
         self.address_search = address_search;
+        self
+    }
+
+    pub fn with_listing_moderation(
+        mut self,
+        listing_moderation: Option<Arc<ListingModerationGate>>,
+    ) -> Self {
+        self.listing_moderation = listing_moderation;
         self
     }
 

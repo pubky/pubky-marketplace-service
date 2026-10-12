@@ -104,6 +104,15 @@ async fn main() -> anyhow::Result<()> {
     // silently re-open the unregistered-listing dead-end it exists to fix.
     let homeserver = Arc::new(marketplace_service::homeserver::client_from_env()?);
     tracing::info!("homeserver listing sync enabled");
+    // NEXUS_URL is required: checkout, bids and offers on a moderated listing
+    // are refused from the index's moderation state, and running without it
+    // would sell moderated listings by omission.
+    let listing_moderation = Arc::new(
+        marketplace_service::listing_moderation::ListingModerationGate::new(Arc::new(
+            marketplace_service::listing_moderation::client_from_env()?,
+        )),
+    );
+    tracing::info!("listing moderation gate enabled");
     match &attestor {
         Some(attestor) => tracing::info!(
             attestor_pubky = attestor.pubky(),
@@ -167,6 +176,7 @@ async fn main() -> anyhow::Result<()> {
         .with_locks(locks)
         .with_attestor(attestor)
         .with_homeserver(Some(homeserver))
+        .with_listing_moderation(Some(listing_moderation))
         .with_payments(payments)
         .with_pickup(pickup)
         .with_digital(digital)

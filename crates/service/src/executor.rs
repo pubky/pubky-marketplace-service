@@ -51,6 +51,53 @@ pub async fn execute(
     };
     let request_hash = command.request_hash();
 
+    // A command that sells a listing is refused when the index says the
+    // listing, or its seller, is moderated. The index is read before the
+    // transaction, so a slow index never holds a domain connection. A command
+    // id that already has a stored result is a replay and is answered from it.
+    if let Some(gate) = state.listing_moderation.as_deref() {
+        let listings =
+            crate::listing_moderation::listings_a_command_sells(&state.pool, &command).await?;
+        if !listings.is_empty()
+            && stored_command_result(&state.pool, actor, command.command_id)
+                .await?
+                .is_none()
+        {
+            for (seller_pubky, listing_id) in &listings {
+                if gate.check(seller_pubky, listing_id).await
+                    == crate::listing_moderation::ModerationVerdict::Moderated
+                {
+                    let failure = CommandFailure::refused(
+                        RefusalKind::InvalidState,
+                        ErrorCode::ListingModerated,
+                        crate::listing_moderation::LISTING_MODERATED_MESSAGE,
+                    );
+                    log_command(
+                        actor,
+                        command.kind(),
+                        &command.command_id.to_string(),
+                        &command.aggregate_id,
+                        "refused",
+                        Some(failure.code()),
+                        Some(failure.message()),
+                        command.expected_revision,
+                        started.elapsed().as_millis() as u64,
+                    );
+                    enqueue_refusal(
+                        state,
+                        actor,
+                        state.clock.now(),
+                        SurfaceKind::V1Command,
+                        command_kind(&command.payload),
+                        failure.refusal_kind(),
+                        Some(command.command_id),
+                    );
+                    return Ok(failure_response(&failure));
+                }
+            }
+        }
+    }
+
     // A `listing.register` that needs the seller's public record reads it
     // here, before the transaction and the command's advisory lock, so a slow
     // homeserver never holds a domain connection or blocks a duplicate. It
