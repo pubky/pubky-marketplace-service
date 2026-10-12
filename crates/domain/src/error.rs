@@ -26,6 +26,10 @@ pub enum ErrorCode {
     AwardVariantMismatch,
     AwardListingChanged,
     AwardHoldMissing,
+    /// The listing, or its seller, is moderated: it cannot be bought, bid on
+    /// or offered on. A 409, not a 403: clients read a 403 on a command as a
+    /// session problem and ask the user to sign in again.
+    ListingModerated,
 }
 
 impl ErrorCode {
@@ -50,7 +54,8 @@ impl ErrorCode {
             | ErrorCode::AwardQuantityMismatch
             | ErrorCode::AwardVariantMismatch
             | ErrorCode::AwardListingChanged
-            | ErrorCode::AwardHoldMissing => 409,
+            | ErrorCode::AwardHoldMissing
+            | ErrorCode::ListingModerated => 409,
             ErrorCode::UpstreamUnavailable => 503,
         }
     }
