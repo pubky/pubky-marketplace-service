@@ -1663,11 +1663,10 @@ async fn naive_resolution_write(
 /// `late_completion`; an exhausted drop stamps `refund_required`.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn drop_late_paid_reacquires_or_refuses(pool: PgPool) {
-    let (app, _stripe, paykit, _ipn, _shippo, homeserver) = {
+    let (app, _stripe, paykit, _ipn, homeserver) = {
         let stripe = spawn_fake_stripe().await;
         let paykit = spawn_fake_paykit().await;
         let ipn = spawn_fake_paypal_ipn().await;
-        let shippo = spawn_fake_shippo().await;
         let homeserver = spawn_fake_homeserver().await;
         let runtime = std::sync::Arc::new(marketplace_service::payments::PaymentsRuntime {
             stripe_key_cipher: marketplace_service::payments::StripeKeyCipher::from_hex(
@@ -1685,8 +1684,6 @@ async fn drop_late_paid_reacquires_or_refuses(pool: PgPool) {
             ),
             paypal_ipn: marketplace_service::payments::PaypalIpnVerifier::new(&ipn.base_url)
                 .expect("ipn"),
-            shippo: marketplace_service::payments::ShippoClient::new(&shippo.base_url)
-                .expect("shippo"),
         });
         let now: DateTime<Utc> = NOW.parse().expect("valid test timestamp");
         let clock = std::sync::Arc::new(marketplace_service::clock::AdjustableClock::new(now));
@@ -1703,7 +1700,7 @@ async fn drop_late_paid_reacquires_or_refuses(pool: PgPool) {
             clock,
             state,
         };
-        (app, stripe, paykit, ipn, shippo, homeserver)
+        (app, stripe, paykit, ipn, homeserver)
     };
 
     for exhaust_drop in [true, false] {

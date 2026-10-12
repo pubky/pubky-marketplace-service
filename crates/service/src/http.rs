@@ -179,18 +179,6 @@ pub fn build_router(state: AppState) -> Router {
             "/v0/orders/{id}/bitcoin/resolve",
             post(crate::bitcoin_review::resolve_bitcoin_payment),
         )
-        .route(
-            "/v0/sellers/me/shipping-config",
-            put(crate::shipping::put_shipping_config).get(crate::shipping::get_shipping_config),
-        )
-        .route(
-            "/v0/orders/{id}/shipping/rates",
-            post(crate::shipping::quote_shipping_rates),
-        )
-        .route(
-            "/v0/orders/{id}/shipping/label",
-            post(crate::shipping::purchase_shipping_label).get(crate::shipping::get_shipping_label),
-        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_session,

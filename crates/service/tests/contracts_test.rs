@@ -61,9 +61,7 @@ fn rendered_snapshot(name: &str, value: &Value) -> Vec<u8> {
 #[test]
 fn delivery_address_serialization_has_one_source_guarded_path() {
     fn violation(path: &Path, source: &str) -> Option<String> {
-        if source.contains("delivery_address_for_shipping")
-            || source.contains("ShippoDestination::as_value")
-        {
+        if source.contains("delivery_address_for_shipping") {
             return Some("raw delivery-address API".to_string());
         }
         if path.file_name().and_then(|name| name.to_str()) == Some("model.rs") {

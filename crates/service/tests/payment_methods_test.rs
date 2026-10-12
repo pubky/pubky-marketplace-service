@@ -826,7 +826,7 @@ async fn paypal_binding_builds_the_seller_direct_checkout_url(pool: PgPool) {
 async fn paypal_binding_uses_the_configured_sandbox_checkout_host(pool: PgPool) {
     let mut config = Config::for_tests();
     config.paypal_checkout_url = "https://www.sandbox.paypal.com/cgi-bin/webscr".to_string();
-    let (app, _stripe, _paykit, _ipn, _shippo) = test_app_with_payments_config(pool, config).await;
+    let (app, _stripe, _paykit, _ipn) = test_app_with_payments_config(pool, config).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     put_config(&app, &seller.token, &full_config_body()).await;

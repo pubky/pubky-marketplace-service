@@ -107,7 +107,7 @@ async fn pickup_offer_app_with(
     shipping: bool,
     config: marketplace_service::config::Config,
 ) -> (TestApp, FakePaypalIpn) {
-    let (app, _stripe, _paykit, ipn, _shippo) = test_app_with_payments_config(pool, config).await;
+    let (app, _stripe, _paykit, ipn) = test_app_with_payments_config(pool, config).await;
     let state = app
         .state
         .clone()

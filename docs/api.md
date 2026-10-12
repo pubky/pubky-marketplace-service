@@ -132,9 +132,6 @@ and write. "Automation" means the inventory capability plus the
 | POST | `/v0/orders/{id}/fiat/confirm-received` |
 | POST | `/v0/orders/{id}/confirm-bitcoin-payment` |
 | POST | `/v0/orders/{id}/bitcoin/resolve` |
-| PUT, GET | `/v0/sellers/me/shipping-config` |
-| POST | `/v0/orders/{id}/shipping/rates` |
-| POST, GET | `/v0/orders/{id}/shipping/label` |
 
 These are the buyer and seller application routes. Authorization on them is
 per resource (participants only) and per command (keyed on the session's
