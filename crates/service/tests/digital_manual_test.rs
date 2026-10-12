@@ -2105,3 +2105,84 @@ async fn a_paypal_reversal_holds_the_assumption_until_restored(pool: PgPool) {
     assert_eq!(assume_due(&app, due).await, 1);
     assert_eq!(state_of(&app, &order.id).await, "delivered");
 }
+
+// The digital sweep honors each of its three parameters: the claim bound
+// (`batch_size`), the config default for orders without a frozen period, and
+// the order's own frozen period when it has one.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn the_digital_assumption_sweep_honors_its_batch_bound_and_periods(pool: PgPool) {
+    let (app, paykit, _server) = keyed_app(pool).await;
+    let seller = bitcoin_seller(&app, &paykit).await;
+    let buyer = new_actor(&app).await;
+    let mut orders = Vec::new();
+    for listing_id in ["guide_01", "guide_02", "guide_03"] {
+        listing(&app, &seller, listing_id, email_kind()).await;
+        let order = one_order(&app, &buyer, &[(&seller, listing_id)], Some(EMAIL)).await;
+        paykit_pay(&app, &paykit, &buyer, &order).await;
+        orders.push(order);
+    }
+    let paid_at = app.clock.now();
+    let default_days = DEFAULT_DELIVERY_ASSUME_DAYS;
+
+    sqlx::query("UPDATE orders SET delivery_assume_days = NULL WHERE id = $1::uuid")
+        .bind(&orders[0].id)
+        .execute(&app.pool)
+        .await
+        .expect("clear frozen period");
+    sqlx::query("UPDATE orders SET delivery_assume_days = $2 WHERE id = $1::uuid")
+        .bind(&orders[1].id)
+        .bind((default_days + 10) as i32)
+        .execute(&app.pool)
+        .await
+        .expect("freeze a longer period");
+    sqlx::query("UPDATE orders SET delivery_assume_days = $2 WHERE id = $1::uuid")
+        .bind(&orders[2].id)
+        .bind(1_i32)
+        .execute(&app.pool)
+        .await
+        .expect("freeze a shorter period");
+
+    let sweep = |days: i64, default: i64, batch: i64, batches: u32| {
+        let pool = app.pool.clone();
+        let at = days_from(paid_at, days);
+        async move {
+            assume_due_deliveries(&pool, at, default, batch, batches)
+                .await
+                .expect("assume sweep runs")
+        }
+    };
+
+    // Day 1: only the order that froze a one-day period is due, whatever the
+    // default is.
+    assert_eq!(sweep(1, default_days, 100, 10).await, 1);
+    assert_eq!(state_of(&app, &orders[2].id).await, "delivered");
+
+    // The config default applies to the order with no frozen period, and the
+    // longer frozen period still holds the other order back.
+    assert_eq!(sweep(default_days, default_days + 100, 100, 10).await, 0);
+    assert_eq!(state_of(&app, &orders[0].id).await, "paid");
+    assert_eq!(sweep(default_days, default_days, 100, 10).await, 1);
+    assert_eq!(state_of(&app, &orders[0].id).await, "delivered");
+    assert_eq!(state_of(&app, &orders[1].id).await, "paid");
+
+    // One claim per pass when the batch bound is 1: a single pass assumes one
+    // order and a second pass picks up the remainder.
+    sqlx::query(
+        "UPDATE orders SET state = 'paid', delivery_assumed = FALSE WHERE id = ANY($1::uuid[])",
+    )
+    .bind(vec![
+        orders[0].id.parse::<uuid::Uuid>().expect("uuid"),
+        orders[2].id.parse::<uuid::Uuid>().expect("uuid"),
+    ])
+    .execute(&app.pool)
+    .await
+    .expect("rewind two orders");
+    let late = default_days + 10;
+    assert_eq!(sweep(late, default_days, 1, 1).await, 1);
+    assert_eq!(sweep(late, default_days, 1, 1).await, 1);
+    assert_eq!(sweep(late, default_days, 1, 1).await, 1);
+    assert_eq!(sweep(late, default_days, 1, 1).await, 0);
+    for order in &orders {
+        assert_eq!(state_of(&app, &order.id).await, "delivered");
+    }
+}
