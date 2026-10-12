@@ -593,14 +593,23 @@ async fn upstream_usd_activation_updates_quote_deadline_and_keeps_outbox_moving(
         .as_ref()
         .and_then(|payments| payments.paykit.as_ref())
         .expect("paykit client");
-    assert_eq!(
-        drain_outbox(&pool, Some(client), now, 30)
-            .await
-            .expect("both activation rows drain"),
-        2,
-        "a USD activation must not stall later outbox rows"
-    );
+    drain_outbox(&pool, Some(client), now, 30)
+        .await
+        .expect("both activation rows drain");
     for order in [&first, &second] {
+        let activation_delivered_at: Option<DateTime<Utc>> = sqlx::query_scalar(
+            "SELECT delivered_at FROM outbox WHERE kind = 'paykit.activate' \
+             AND payload->>'order_id' = $1",
+        )
+        .bind(&order.order_id)
+        .fetch_one(&pool)
+        .await
+        .expect("activation row");
+        assert!(
+            activation_delivered_at.is_some(),
+            "the activation row for {} must drain",
+            order.order_id
+        );
         let facts = order_facts(&pool, &order.order_id).await;
         assert_eq!(facts.paykit_request_state.as_deref(), Some("pending"));
         assert!(facts.paykit_expires_at.is_some());
@@ -637,7 +646,9 @@ async fn upstream_usd_status_recovery_updates_quote_deadline_with_paykit_deadlin
     .execute(&pool)
     .await
     .expect("model lost activation response");
-    let deadline = now + Duration::minutes(30);
+    let deadline =
+        DateTime::from_timestamp_micros((now + Duration::minutes(30)).timestamp_micros())
+            .expect("microsecond payment deadline");
     fixture.paykit.set_marketplace_status(
         invoice_id,
         json!({
