@@ -121,7 +121,7 @@ and take the next free number rather than assume 0052:
 | 0054 | `0054_refund_destinations.sql` | #94, and #101 (stacked on #95) |
 | 0055 | `0055_user_priv_key_custody_releases.sql` | #92 (`/priv` Phase 4) |
 | 0056 | `0056_order_delivery_terms.sql` | #106 (seller-set delivery periods, optional `guarantee_policy_version`) |
-| 0057 | none yet | reserved for other work |
+| 0057 | `0057_encrypted_delivery_address.sql` | #110 (sealed delivery addresses) |
 | 0058 | `0058_purge_retired_stripe_values.sql` | #104 (remove the Stripe rail) |
 
 The stacked pairs (#91/#99, #94/#101) are alternative bases for the same file,
