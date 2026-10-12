@@ -62,10 +62,10 @@ promise. No consumer other than the Shop SDK is known.
 | --- | --- | --- |
 | `POST /v1/auth/sessions` token exchange and bearer format | Stable | Used by every authenticated surface; covered by `auth` tests. |
 | Capability gate (inventory scope `/pub/pubky.app/marketplace-service/v1/` read+write) | Stable | Enforced by middleware and handlers. |
-| Inventory adjust / projection (`schema_version: 1`) | Stable | The only surface with generated JSON Schemas (`inventory_adjust_schema`, `inventory_projection_schema`) and a checked contract sample at `contracts/samples/inventory.json`. |
+| Inventory adjust / projection (`schema_version: 1`) | Stable | Generated JSON Schemas (`inventory_adjust_schema`, `inventory_projection_schema`) and a checked contract sample at `contracts/samples/inventory.json`. |
 | Webhook signing: header names, `v1=` HMAC framing, `Pubky-Webhook-Version: 1` | Stable | Pinned by `signature_framing_matches_the_cross_language_vector` and `outbound_headers_and_raw_body_are_exact_and_stable`. |
 | Rate-limit behaviour and `429` envelope | Stable | Covered by automation tests. |
-| Export and event envelopes (`seller_listing_export`, `seller_order_export`, `seller_event_feed`) | Experimental | They carry `schema_version: 1` but are built from `serde_json::Value`, with no generated schema. Fields may be added. Record shapes inside `listings[]` follow the projection tables. |
+| Export and event envelopes (`seller_listing_export`, `seller_order_export`, `seller_event_feed`) | Experimental | They carry `schema_version: 1` but are built from `serde_json::Value`, with no generated schema or checked sample. Fields may be added. Record shapes inside `listings[]` follow the projection tables. |
 | Event `data` object | Experimental | Always `{}` today; it is reserved for future per-event payloads. |
 | Event `type` values | Experimental | The set is open and grows with the domain (see [Event feed](#event-feed)). Consumers must ignore unknown types. |
 | Session `label` / `metadata` | Experimental | Informational only. |
@@ -940,15 +940,25 @@ and `SHOP_BFF_REQUEST_VERIFYING_KEYS_JSON`.
 ## OpenAPI
 
 There is no OpenAPI document. Generating one mechanically is not possible
-today: only the inventory endpoints have typed request and response schemas
-(generated with `schemars` and checked against `contracts/samples/inventory.json`).
-Every other automation route builds its response with `serde_json::Value`, so
-a generated file would either be hand-written (and drift) or empty of detail.
+today: only some endpoints have typed schemas, and they are partial.
 
-Follow-up if an OpenAPI file is wanted: introduce typed response structs for
-the export, event, webhook and session routes, derive their schemas the same
-way the inventory ones are, emit a document from `emit-contracts`, and add a
-test that fails when the checked-in file differs from the generated one (the
-`contract_artifact_is_in_sync` test is the pattern). The route table above is
-checked against `crates/service/src/http.rs` by a test, so the paths at least
-cannot silently drift.
+- Inventory adjust and projection have schemas generated with `schemars`
+  (`inventory_adjust_schema()` / `inventory_projection_schema()`) and a checked
+  sample at `contracts/samples/inventory.json`.
+- The two shared-manual seller review endpoints
+  (`POST /v0/orders/{id}/confirm-bitcoin-payment` and
+  `POST /v0/orders/{id}/bitcoin/resolve`) have generated request schemas and a
+  reason catalog in `contracts/endpoints.json`, checked by
+  `crates/service/tests/contracts_test.rs`.
+- Every other route, including all of the automation routes in this document,
+  builds its responses with `serde_json::Value`, so a generated file would
+  either be hand-written (and drift) or empty of detail.
+
+Follow-up if an OpenAPI file is wanted: introduce typed request and response
+structs for the export, event, webhook and session routes, derive their
+schemas the same way, emit a document alongside `contracts/endpoints.json`, and
+fail a test when the checked-in file differs from the generated one (the
+existing contract snapshot tests are the pattern). In the meantime, the route
+table above is checked against `crates/service/src/http.rs` by
+`crates/service/tests/api_docs_test.rs`, so the set of paths cannot silently
+drift; the request and response shapes are not checked.

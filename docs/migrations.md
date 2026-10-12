@@ -99,3 +99,22 @@ default (no rewrite), a `listings` trigger that maintains it, replaces the
 primary key. It builds no index on an existing table and sets
 `lock_timeout` like 0050. No index serves the follower's revival read (live
 listings with `revived_from_cursor` set); it filters the live listings.
+
+## Numbers claimed by open pull requests
+
+`main` ends at 0051. Pull requests that are open when this was written claim
+the next numbers, so a new migration must check the open list (`gh pr list`)
+and take the next free number rather than assume 0052:
+
+| Number | File | Pull request |
+| --- | --- | --- |
+| 0052 | `0052_paykit_upstream_lifecycle.sql` | #95 (upstream Paykit lifecycle) |
+| 0052 | `0052_paykit_prepared_attempts.sql` | #89, which collides with #95 and must be reconciled before either merges |
+| 0053 | `0053_payment_assets.sql` | #91, and #99 (the same change stacked on #95) |
+| 0054 | `0054_refund_destinations.sql` | #94, and #101 (stacked on #95) |
+| 0055 | `0055_user_priv_key_custody_releases.sql` | #92 (`/priv` Phase 4) |
+
+The stacked pairs (#91/#99, #94/#101) are alternative bases for the same file,
+not two migrations. Only one of each pair will merge. #93 and #100 carry no
+migration. This table describes unmerged work and goes stale as pull requests
+land; trust `crates/service/migrations/` on `main` over it.
