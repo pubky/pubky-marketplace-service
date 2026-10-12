@@ -573,6 +573,17 @@ pub async fn prepare(
             "The seller's Locks document does not match the payment.",
         )));
     }
+    if let Err(failure) = crate::seller_terms::capture_for_order(
+        tx,
+        Some(homeserver),
+        order.id,
+        &order.seller_pubky,
+        now,
+    )
+    .await?
+    {
+        return Ok(Err(failure));
+    }
     if let Err(failure) = holds::acquire_payment_hold(
         tx,
         order,
@@ -596,7 +607,7 @@ pub async fn prepare(
          lock_resource_hash, amount_minor, asset, exponent, policy_version, verification_state, window_expires_at, \
          expected_resource_ciphertext, expected_resource_hash, criterion_id, expected_reader_pubky, expected_recipient_pubky, \
          client_reference_ciphertext, preparation_state, binding_outcome, created_at, updated_at) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,(SELECT guarantee_policy_version FROM orders WHERE id=$3),'pending',$10,$11,$6,$12,$4,$5,$13,'prepared','prepared',$14,$14)",
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,COALESCE((SELECT guarantee_policy_version FROM orders WHERE id=$3), 1),'pending',$10,$11,$6,$12,$4,$5,$13,'prepared','prepared',$14,$14)",
     )
     .bind(correlation_id).bind(payment.id).bind(snapshot.order_id).bind(&snapshot.expected_reader_pubky)
     .bind(&snapshot.expected_recipient_pubky).bind(&snapshot.expected_resource_hash).bind(snapshot.amount_minor).bind(&snapshot.asset)

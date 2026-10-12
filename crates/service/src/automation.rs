@@ -439,7 +439,8 @@ pub async fn list_seller_orders(
          subtotal_minor, shipping_minor, total_minor, currency, exponent, \
          guarantee_policy_version, receipt_id, edition, drop_aggregate_id, \
          cancellation_reason, stock_held, hold_expires_at, shipment, \
-         delivery_assumed, return_request, external_refund, fulfillment, \
+         delivery_assumed, delivery_assume_days, auto_complete_days, \
+         return_request, external_refund, fulfillment, \
          payment_method, created_at, updated_at \
          FROM orders WHERE seller_pubky = $1 \
          AND (revision > $2 OR (revision = $2 AND id::text > $3)) \
@@ -483,7 +484,7 @@ pub async fn list_seller_orders(
                 "total_minor": row.try_get::<i64, _>("total_minor")?,
                 "currency": row.try_get::<String, _>("currency")?,
                 "exponent": row.try_get::<i32, _>("exponent")?,
-                "guarantee_policy_version": row.try_get::<i32, _>("guarantee_policy_version")?,
+                "guarantee_policy_version": row.try_get::<Option<i32>, _>("guarantee_policy_version")?,
                 "receipt_id": row.try_get::<Option<Uuid>, _>("receipt_id")?,
                 "edition": row.try_get::<Option<i32>, _>("edition")?,
                 "drop_aggregate_id": row.try_get::<Option<String>, _>("drop_aggregate_id")?,
@@ -493,6 +494,8 @@ pub async fn list_seller_orders(
                     .map(format_timestamp),
                 "shipment": row.try_get::<Option<Value>, _>("shipment")?,
                 "delivery_assumed": row.try_get::<bool, _>("delivery_assumed")?,
+                "delivery_assume_days": row.try_get::<Option<i32>, _>("delivery_assume_days")?,
+                "auto_complete_days": row.try_get::<Option<i32>, _>("auto_complete_days")?,
                 "return_request": row.try_get::<Option<Value>, _>("return_request")?,
                 "external_refund": row.try_get::<Option<Value>, _>("external_refund")?,
                 "fulfillment": row.try_get::<String, _>("fulfillment")?,

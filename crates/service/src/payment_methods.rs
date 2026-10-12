@@ -670,6 +670,23 @@ pub async fn bind_payment_method(
     } else {
         state.config.fiat_payment_window_seconds
     };
+    // The seller's delivery and completion periods freeze on the order at its
+    // first payment lock point.
+    match crate::seller_terms::capture_for_order(
+        &mut tx,
+        state.homeserver.as_deref(),
+        order.id,
+        &order.seller_pubky,
+        now,
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(failure)) => {
+            return method_error(failure.code(), "shop_unavailable", failure.message());
+        }
+        Err(error) => return internal("seller delivery terms capture", &error),
+    }
     let order = match crate::handlers::holds::acquire_payment_hold(
         &mut tx,
         order,

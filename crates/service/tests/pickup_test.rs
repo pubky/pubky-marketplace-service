@@ -2052,6 +2052,48 @@ async fn confirm_pickup_matrix_and_method_guards(pool: PgPool) {
     assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
 }
 
+// A pickup order completes on its own frozen period (the seller's
+// `autoCompleteDays` captured at payment), not the configured default.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn auto_complete_uses_the_pickup_orders_own_period(pool: PgPool) {
+    let (app, fake) = test_app_with_pickup_and_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = paid_pickup_order(&app, &fake, &seller, &buyer, "boots_01", 0x1e).await;
+    sqlx::query("UPDATE orders SET auto_complete_days = 3 WHERE id = $1::uuid")
+        .bind(&order.order_id)
+        .execute(&app.pool)
+        .await
+        .expect("freeze the seller's period");
+    let (_, revision) = order_row(&app.pool, &order.order_id).await;
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &order_command(
+            "fulfillment.confirm_pickup",
+            &order.order_id,
+            revision,
+            json!({}),
+            0x2e1,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let at_2 = app.clock.now() + chrono::Duration::days(2);
+    let completed = workers::complete_due_delivered_orders(&app.pool, at_2, 14, 100, 2)
+        .await
+        .expect("sweep runs");
+    assert_eq!(completed, 0);
+    let at_3 = app.clock.now() + chrono::Duration::days(3);
+    let completed = workers::complete_due_delivered_orders(&app.pool, at_3, 14, 100, 2)
+        .await
+        .expect("sweep runs");
+    assert_eq!(completed, 1);
+    let (state, _) = order_row(&app.pool, &order.order_id).await;
+    assert_eq!(state, "completed");
+}
+
 // The auto-complete sweep coalesces the handover instant for pickup orders
 // on the same deadline as shipped orders' shipment delivered_at.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
