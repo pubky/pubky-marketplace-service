@@ -177,7 +177,6 @@ Railway IaC `preserve()`):
 | `PAYPAL_IPN_VERIFY_URL` | `https://ipnpb.paypal.com/cgi-bin/webscr` | PayPal's IPN validation endpoint; tests point it at a local double |
 | `PAYPAL_CHECKOUT_URL` | `https://www.paypal.com/cgi-bin/webscr` | PayPal `_xclick` checkout base. HTTPS only; host must be `www.paypal.com` (live) or `www.sandbox.paypal.com`. Default stays live. |
 | `REQUIRE_ENCRYPTED_DELIVERY_ADDRESS` | `false` | `true`/`1` refuses a checkout or award checkout that carries a plaintext `delivery_address` (422 `INVALID_COMMAND`, reason `encrypted_delivery_required`); only sealed envelopes are accepted. Leave unset until the Shop version that seals is the deployed one (see [Sealed delivery address](#sealed-delivery-address)) |
-| `SHIPPO_API_BASE` | `https://api.goshippo.com` | Shippo API base for the seller-token label integration (`/v0/sellers/me/shipping-config`, `/v0/orders/{id}/shipping/*`); tests point it at a local double |
 | `ADDRESS_SEARCH_UPSTREAM_URL` | `https://photon.komoot.io` | Photon geocoder behind `POST /v0/address/suggest`. HTTPS only (http for loopback in tests). Point it at a self-hosted Photon to stop using the public instance |
 | `ADDRESS_SEARCH_DISABLED` | unset | `1`/`true` turns the address proxy off; the route answers `address_search_unavailable` |
 | `ADDRESS_SEARCH_CLIENT_IP_HEADER` | unset | name of a header set by a trusted edge that carries the client address (last value is used); unset keys the per-client limit on the socket peer |
@@ -1065,6 +1064,13 @@ approval) and sends the envelope instead of `delivery_address`:
 - Migration 0057 adds the two columns, forbids a plaintext address and an
   envelope on one row, and clears the plaintext address from every order
   already in a final state.
+- The service no longer calls Shippo. The seller's client buys labels
+  directly with a device-local token, and records the tracking number
+  through the existing ship command. The `/v0/sellers/me/shipping-config`
+  and `/v0/orders/{id}/shipping/*` routes are gone. Rows already in
+  `shipping_configs` are left in place and nothing reads them; the
+  `orders.shipping_label` column stays as a read-only legacy projection.
+  Deploy this release after the Shop version that buys labels itself.
 
 The seller's pickup details (spot or address, instructions, availability
 windows with their IANA zone) live ONLY in the service, sealed

@@ -7,7 +7,6 @@ use sqlx::FromRow;
 use uuid::Uuid;
 
 use crate::clock::format_timestamp;
-use crate::payments::ShippoDestination;
 
 /// Serde adapter for the canonical wire timestamp format (RFC 3339 with
 /// milliseconds and `Z`), used inside the auction JSONB document.
@@ -1006,28 +1005,6 @@ impl OrderRow {
         allow_plaintext_delivery_address(self, actor)
             .then_some(self.delivery_address.as_ref())
             .flatten()
-    }
-
-    pub(crate) fn shippo_destination(&self, actor: &str) -> Option<ShippoDestination> {
-        let address = self.eligible_delivery_address(actor)?.as_object()?;
-        let field = |name: &str| {
-            address
-                .get(name)
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string()
-        };
-        Some(ShippoDestination::new(
-            field("name"),
-            field("line1"),
-            field("line2"),
-            field("city"),
-            field("region"),
-            field("postal_code"),
-            field("country_code"),
-            field("phone"),
-            field("email"),
-        ))
     }
 
     /// The participant projection with seller-only Paykit review evidence.
