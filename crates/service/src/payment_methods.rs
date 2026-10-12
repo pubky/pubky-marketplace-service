@@ -1686,8 +1686,12 @@ pub async fn verify_fiat_payment(
             "Processor verification applies only to Stripe-bound orders.",
         );
     }
-    if payment.state != "awaiting_entitlement" {
-        // Already advanced: idempotent success.
+    // `awaiting_entitlement` and `expired` are the only states this call can
+    // advance to paid (`expired` through the late-money fork), so both need a
+    // paid Stripe session below. `confirmed`, `manual_review` and `detected`
+    // have already recorded their outcome and `apply_fiat_paid` changes
+    // nothing for them: an idempotent success.
+    if !matches!(payment.state.as_str(), "awaiting_entitlement" | "expired") {
         return match apply_fiat_paid(
             &state,
             &actor.0,
