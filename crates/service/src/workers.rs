@@ -1135,6 +1135,8 @@ async fn deliver_paykit_activation(
             let flipped = sqlx::query(
                 "UPDATE orders SET paykit_activation_state = 'active', \
                  paykit_request_state = 'pending', paykit_expires_at = $3, \
+                 bitcoin_quote_expires_at = CASE \
+                     WHEN bitcoin_quote_rate IS NULL THEN NULL ELSE $3 END, \
                  hold_expires_at = CASE WHEN paykit_api = 'fork' THEN $3 ELSE hold_expires_at END, \
                  updated_at = $2 \
                  WHERE id = $1 AND paykit_activation_state = 'preparing'",
@@ -2751,7 +2753,10 @@ async fn apply_paykit_status_outcome(
     if row.paykit_api == "upstream" && row.paykit_expires_at.is_none() {
         if let Some(deadline) = recovered_deadline {
             sqlx::query(
-                "UPDATE orders SET paykit_expires_at = $3 WHERE id = $1 \
+                "UPDATE orders SET paykit_expires_at = $3, \
+                 bitcoin_quote_expires_at = CASE \
+                     WHEN bitcoin_quote_rate IS NULL THEN NULL ELSE $3 END \
+                 WHERE id = $1 \
                  AND paykit_invoice_id = $2 AND paykit_expires_at IS NULL",
             )
             .bind(row.id)

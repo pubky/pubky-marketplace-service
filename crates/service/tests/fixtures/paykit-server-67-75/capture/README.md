@@ -6,6 +6,13 @@ running `pubky/paykit-server` at exact #75 head
 `20e584cb520acea32280cc71f9b49d661bbd1519`). That commit contains #67's
 reviewed lifecycle head `ca0a88e8f3f34874ec0ee0b41dc672b238043397`.
 
+#67 was squash-merged to `master` as `c7fe8efd`. A later provenance check
+repeated this capture procedure at that merged producer commit: method, path,
+status, content type, field order, payment reference, and operation id matched.
+Only ephemeral keys, invoice ids, timestamps, and signatures differed. These
+files remain the original byte-preserving captures; they were not rewritten
+to look like a capture from the squash commit.
+
 Nothing in the request or response envelopes was written by hand. Each file
 stores the method, path, absent/present content type, exact canonical request
 body, `x-paykit-signature`, response status, response content type, and exact

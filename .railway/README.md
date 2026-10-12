@@ -43,10 +43,43 @@ railway config apply
 
 ## Status in this repo
 
-`railway.toml` is still present and is still what Railway reads on a git deploy.
-Nothing here is live yet. Deleting `railway.toml` before running
-`railway config apply` would leave the service with no build or healthcheck
-configuration.
+`railway.toml` is still present, and it is the build and healthcheck
+configuration a git deploy uses until it is deliberately removed (see
+"Applying (operator)" below). Whether `railway config apply` has already been
+run against either project cannot be read from this repository: run
+`railway config plan` for the project you care about (a 0/0/0 plan means the
+live project already matches the graph). Deleting `railway.toml` before both
+projects have been applied would leave the service with no build or
+healthcheck configuration.
+
+### Image pins
+
+Both graphs pin `ghcr.io/bitcoinerrorlog/pubky-marketplace-service@sha256:...`
+(`LIVE_IMAGE` in `railway.ts`, `STAGING_IMAGE` in `railway.staging.ts`). The pin
+moves only when a release closeout PR edits it (last bumped by the
+address-search image pin, PR #81), so it normally trails `main`, and it is
+not the source of truth for what is running: use `GET /version` on the service
+(its `commit` is the baked build commit) to see the deployed commit. The
+image workflow `.github/workflows/production-image.yml` now publishes to
+`ghcr.io/<repository owner>/pubky-marketplace-service` (lowercased, tagged
+`sha-<commit>`), which for this repository is `ghcr.io/pubky/...`; the pins
+above still name the `bitcoinerrorlog` namespace. Before bumping a pin, check
+that the digest exists in the namespace the running service pulls from, and
+make `railway config plan` 0/0/0 before applying.
+
+### Variables an apply would delete
+
+Only the variables in the graphs' `preserve()` lists survive an apply. The
+service also reads variables that are not listed, for example
+`PAYKIT_SERVER_API`, the worker tuning variables (`WORKER_*`), the automation,
+event and webhook variables (`AUTOMATION_*`, `EVENT_RETENTION_DAYS`,
+`WEBHOOK_*`) and the inventory rate limits (`INVENTORY_*`). If any of them is
+set on a live service, add it as a `preserve()` entry (or a literal) before
+applying, otherwise the plan will show it as a delete. Variables the code
+defaults when unset are unaffected. `PAYKIT_SERVER_URL`,
+`PAYKIT_REQUEST_SIGNING_KEY`, `HOMESERVER_URL` and the grant-flow variables are
+already preserved. The key-material rule is enforced by
+`crates/service/tests/railway_iac_test.rs`.
 
 `.railway/railway.ts` covers both Railway projects this service runs in:
 

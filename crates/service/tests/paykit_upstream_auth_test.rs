@@ -854,13 +854,24 @@ async fn upstream_bind_persists_api_and_recovers_activation_after_config_rollbac
     drain_outbox(&pool, Some(&rollback_client), app.clock.now(), 30)
         .await
         .expect("queued upstream activation drains after rollback");
-    let activation: Option<String> =
-        sqlx::query_scalar("SELECT paykit_activation_state FROM orders WHERE id = $1")
-            .bind(order_id)
-            .fetch_one(&pool)
-            .await
-            .expect("activation state");
+    let (activation, paykit_expires_at, bitcoin_quote_expires_at): (
+        Option<String>,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    ) = sqlx::query_as(
+        "SELECT paykit_activation_state, paykit_expires_at, bitcoin_quote_expires_at \
+         FROM orders WHERE id = $1",
+    )
+    .bind(order_id)
+    .fetch_one(&pool)
+    .await
+    .expect("activation state and deadlines");
     assert_eq!(activation.as_deref(), Some("active"));
+    assert!(paykit_expires_at.is_some());
+    assert_eq!(
+        bitcoin_quote_expires_at, None,
+        "SAT orders remain quote-free when activation records a deadline"
+    );
     assert_eq!(
         paykit.invoice(invoice_id).expect("upstream invoice").state,
         "active"

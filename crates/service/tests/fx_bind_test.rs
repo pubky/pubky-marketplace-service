@@ -127,6 +127,24 @@ async fn fx_fixture(pool: PgPool) -> FxFixture {
     }
 }
 
+async fn upstream_fx_fixture(pool: PgPool) -> FxFixture {
+    let (app, paykit, fx) = test_app_with_upstream_paykit_and_fx(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    enable_bitcoin(&app, &paykit, &seller).await;
+    let (status, body) = execute(&app, &seller.token, &register_command(&seller.pubky, 20)).await;
+    assert_eq!(status, StatusCode::OK, "register failed: {body}");
+    let now = app.clock.now();
+    fx.set_body(fx_body(RATE, now.timestamp_millis()));
+    FxFixture {
+        app,
+        paykit,
+        fx,
+        seller,
+        buyer,
+    }
+}
+
 async fn checkout_usd(app: &TestApp, seller: &TestActor, buyer: &TestActor) -> PendingOrder {
     let revision: i64 =
         sqlx::query_scalar("SELECT server_revision FROM listings WHERE aggregate_id = $1")
@@ -553,6 +571,93 @@ async fn lifecycle_prepare_activate_void_and_expiry_keep_the_quote(pool: PgPool)
         Some(expected as i64),
         "void keeps the quote"
     );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn upstream_usd_activation_updates_quote_deadline_and_keeps_outbox_moving(pool: PgPool) {
+    let fixture = upstream_fx_fixture(pool.clone()).await;
+    let now = fixture.app.clock.now();
+    seed_fx_samples(&pool, RATE, now, 3).await;
+
+    let first = checkout_usd(&fixture.app, &fixture.seller, &fixture.buyer).await;
+    let (status, body) = bind_bitcoin(&fixture.app, &fixture.buyer.token, &first.order_id).await;
+    assert_eq!(status, StatusCode::OK, "first bind failed: {body}");
+    let second = checkout_usd(&fixture.app, &fixture.seller, &fixture.buyer).await;
+    let (status, body) = bind_bitcoin(&fixture.app, &fixture.buyer.token, &second.order_id).await;
+    assert_eq!(status, StatusCode::OK, "second bind failed: {body}");
+
+    let client = fixture
+        .app
+        .state
+        .payments
+        .as_ref()
+        .and_then(|payments| payments.paykit.as_ref())
+        .expect("paykit client");
+    assert_eq!(
+        drain_outbox(&pool, Some(client), now, 30)
+            .await
+            .expect("both activation rows drain"),
+        2,
+        "a USD activation must not stall later outbox rows"
+    );
+    for order in [&first, &second] {
+        let facts = order_facts(&pool, &order.order_id).await;
+        assert_eq!(facts.paykit_request_state.as_deref(), Some("pending"));
+        assert!(facts.paykit_expires_at.is_some());
+        assert_eq!(
+            facts.bitcoin_quote_expires_at, facts.paykit_expires_at,
+            "the FX constraint follows the producer payment deadline"
+        );
+    }
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn upstream_usd_status_recovery_updates_quote_deadline_with_paykit_deadline(pool: PgPool) {
+    let fixture = upstream_fx_fixture(pool.clone()).await;
+    let now = fixture.app.clock.now();
+    seed_fx_samples(&pool, RATE, now, 3).await;
+    let order = checkout_usd(&fixture.app, &fixture.seller, &fixture.buyer).await;
+    let (status, body) = bind_bitcoin(&fixture.app, &fixture.buyer.token, &order.order_id).await;
+    assert_eq!(status, StatusCode::OK, "bind failed: {body}");
+    let order_id = Uuid::parse_str(&order.order_id).expect("order id");
+    let invoice_id: Uuid = sqlx::query_scalar("SELECT paykit_invoice_id FROM orders WHERE id = $1")
+        .bind(order_id)
+        .fetch_one(&pool)
+        .await
+        .expect("upstream invoice id");
+
+    // Model activation committed upstream while Marketplace lost its response.
+    // Tracking resumes without a known producer deadline; status must recover it.
+    fixture.paykit.set_invoice_state(invoice_id, "active");
+    sqlx::query(
+        "UPDATE orders SET paykit_activation_state = 'active', paykit_request_state = 'pending' \
+         WHERE id = $1",
+    )
+    .bind(order_id)
+    .execute(&pool)
+    .await
+    .expect("model lost activation response");
+    let deadline = now + Duration::minutes(30);
+    fixture.paykit.set_marketplace_status(
+        invoice_id,
+        json!({
+            "invoice_id": invoice_id,
+            "state": "active",
+            "activated_at": now,
+            "payment_deadline": deadline,
+            "proposal_delivery_state": "delivered",
+            "request_state": "accepted",
+            "payment_state": "undetected",
+            "bitcoin": null,
+            "outcome": null,
+            "resolved_at": null
+        }),
+    );
+
+    assert_eq!(poll_now(&fixture.app, now).await, 0);
+    let facts = order_facts(&pool, &order.order_id).await;
+    assert_eq!(facts.paykit_expires_at, Some(deadline));
+    assert_eq!(facts.bitcoin_quote_expires_at, Some(deadline));
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]

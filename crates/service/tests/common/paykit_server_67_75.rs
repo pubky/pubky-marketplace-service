@@ -1,6 +1,7 @@
 //! HTTP exchanges captured from `pubky/paykit-server` #75 at
 //! `80352cebb011d2f57318170068ae4ec24af6a417`, which contains #67 head
-//! `ca0a88e8f3f34874ec0ee0b41dc672b238043397`.
+//! `ca0a88e8f3f34874ec0ee0b41dc672b238043397`. #67 was squash-merged as
+//! `c7fe8efd`; see the capture README for the merged-producer provenance check.
 
 use std::{
     collections::VecDeque,

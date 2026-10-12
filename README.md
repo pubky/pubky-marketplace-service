@@ -2,14 +2,17 @@
 
 Server-authoritative Rust service for marketplace inventory, reservations,
 checkout/orders, and payments, per
-[ADR-0019](https://github.com/BitcoinErrorLog/pubky-app/blob/marketplace/pr25-ux/docs/adr/0019-marketplace-transaction-authority.md)
+[ADR-0019](https://github.com/pubky/pubky-marketplace/blob/master/docs/adr/0019-marketplace-transaction-authority.md)
 (Marketplace Transaction Authority) and
-[ADR-0022](https://github.com/BitcoinErrorLog/pubky-app/blob/marketplace/pr25-ux/docs/adr/0022-marketplace-transaction-service-rust.md)
+[ADR-0022](https://github.com/pubky/pubky-marketplace/blob/master/docs/adr/0022-marketplace-transaction-service-rust.md)
 (Rust implementation). The TypeScript prototype engine
-(`services/marketplace/src/transaction-service.ts` in
-[`BitcoinErrorLog/pubky-app`](https://github.com/BitcoinErrorLog/pubky-app))
+([`services/marketplace/src/transaction-service.ts`](https://github.com/pubky/pubky-marketplace/blob/master/services/marketplace/src/transaction-service.ts)
+in `pubky/pubky-marketplace`)
 is the executable specification; its test cases are ported command by command
 before each command is enabled here.
+
+The HTTP API for seller automation (sessions, inventory, exports, the event
+feed, webhooks) is documented in [`docs/api.md`](docs/api.md).
 
 ## Workspace layout
 
@@ -22,13 +25,29 @@ crates/service     axum HTTP service: Postgres schema (sqlx migrations),
                    idempotency, command handlers, Locks lifecycle
                    verification (encrypted correlations, HMAC lookup
                    tokens, Lock Server client), background worker runtime
-                   (expiry, auction close, outbox delivery, Locks
-                   verification, payment window — all with leases).
+                   (see "Background workers": 22 lease-guarded tasks plus
+                   the webhook delivery worker). Besides the server binary
+                   (`marketplace-service`) it builds the operator binaries
+                   `refusal-audit-admin` and `paykit-attempts-admin`.
 contracts/         state-machines.json — the machine-readable state machine
                    contract emitted from crates/domain.
                    postal-region-rules.json — country table for
                    `delivery_address.region` (required vs optional; US/CA/AU
                    ISO 3166-2 suffixes). Shop should consume this file.
+                   endpoints.json — generated request schemas and reason
+                   catalog of the two shared-manual seller review endpoints
+                   (confirm-bitcoin-payment, bitcoin/resolve); samples/ —
+                   checked response samples (inventory, projections,
+                   attestations). Both are guarded by
+                   crates/service/tests/contracts_test.rs.
+docs/              api.md (seller automation API), migrations.md and the
+                   operations notes (lock order, listing deletion follower,
+                   PayPal refund IPN, released Paykit attempts, refusal-audit
+                   operations).
+scripts/           ci-test.sh (the CI test split), the pre-push gate
+                   (prepush*.sh), and schema-rehearsal helpers.
+.railway/          Railway infrastructure as code (see .railway/README.md);
+                   railway.toml is the git-deploy build/healthcheck config.
 docker-compose.yml Dev/test PostgreSQL 17 on port 55432.
 ```
 
@@ -47,15 +66,43 @@ export DATABASE_URL='postgres://marketplace:marketplace@localhost:55432/marketpl
 cargo run -p marketplace-service
 ```
 
+`DATABASE_URL` alone is not enough: the service refuses to start unless it
+also has
+
+- `HOMESERVER_URL` — the homeserver the `listing.sync` command reads
+  seller-signed listing records from (an http(s) URL);
+- `REFUSAL_AUDIT_DATABASE_URL` and `REFUSAL_AUDIT_RETENTION_DATABASE_URL` —
+  two separate Postgres URLs that log in as
+  `marketplace_refusal_audit_writer_login` and
+  `marketplace_refusal_audit_retention` respectively (each with a password,
+  and neither equal to `DATABASE_URL` or to the other). Migrations 0032 and
+  0037 create those roles; the tests set their passwords with
+  `ALTER ROLE ... PASSWORD` and `GRANT CONNECT ON DATABASE` (see
+  `claim_named_login` in `crates/service/tests/common/mod.rs`);
+- `REFUSAL_AUDIT_HMAC_ROOT_B64` (32 bytes, canonical base64) and
+  `REFUSAL_AUDIT_HMAC_KEY_EPOCH` (positive integer), plus the optional pair
+  `REFUSAL_AUDIT_HMAC_PREVIOUS_ROOT_B64` /
+  `REFUSAL_AUDIT_HMAC_PREVIOUS_KEY_EPOCH` during a rotation (both or neither);
+- `REFUSAL_AUDIT_BACKUP_EXPIRY_ATTESTED`,
+  `REFUSAL_AUDIT_REPLICA_EXPIRY_ATTESTED` and
+  `REFUSAL_AUDIT_RESIDUAL_RISK_ACCEPTED`, each `true`.
+
+The refusal-audit operator binary (`refusal-audit-admin`) additionally uses
+`REFUSAL_AUDIT_ADMIN_DATABASE_URL`; see
+[`docs/refusal-audit-operations.md`](docs/refusal-audit-operations.md).
+Everything else in the table below is optional.
+
 Migrations in `crates/service/migrations/` are applied automatically at boot
 (they can also be applied manually with `sqlx migrate run` from
-`crates/service/`).
+`crates/service/`). Rules for writing a new migration, and the numbers
+reserved by open pull requests, are in [`docs/migrations.md`](docs/migrations.md).
 
 **Migration 0018 (remove operator authority) remediates rows.** Before it
 narrows the order-state and annotation-outcome check constraints, it
 completes any `disputed` order (no arbiter exists any more, so an order
 awaiting adjudication completes as if undisputed — a seller-favour default,
-owner-approved for the staging test data; production has no rows) and
+owner-approved for the staging test data; production had no rows when it
+was applied) and
 deletes the operator annotation outcomes
 (`dispute_resolved_for_buyer`/`dispute_resolved_for_seller`/
 `attestation_disavowed`, artefacts with no meaning in a peer-to-peer
@@ -67,21 +114,39 @@ totals are what buyers actually paid and the receipts attest them, so they
 are kept as-is, while the constraint still enforces
 `total = subtotal + shipping` for every new insert/update. There is
 **no DOWN migration** — dropped tables and
-columns cannot be restored — so production must be empty or backed up
-before applying (it is empty as of 2026-09-05). Configuration is
-environment-based. Window keys and their defaults also live in
+columns cannot be restored — so production had to be empty or backed up
+before applying (it was empty as of 2026-09-05). The migration is applied
+everywhere this service runs; this paragraph is history, not a pending
+step.
+
+## Configuration
+
+Configuration is environment-based. Window keys and their defaults also live in
 [`.env.example`](.env.example) (config-parity with `Config::from_env` and
 Railway IaC `preserve()`):
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `DATABASE_URL` | required | Postgres connection string |
+| `HOMESERVER_URL` | required | homeserver base URL (http(s)) the `listing.sync` command fetches seller-signed records from; the service refuses to boot without it |
+| `REFUSAL_AUDIT_*` | required | refusal-audit logins, HMAC key pair and attestations; see [Run](#run) |
 | `BIND_ADDR` | `127.0.0.1:8080` | HTTP listen address |
 | `ALLOWED_ORIGINS` | empty | comma-separated exact CORS origins |
 | `AUTH_TOKEN_WINDOW_SECONDS` | `120` | acceptance window around server time for an AuthToken's signing timestamp |
 | `AUTH_SESSION_TTL_SECONDS` | `86400` | session token lifetime |
 | `WORKER_INTERVAL_SECONDS` | `10` | background worker pass interval |
 | `WORKER_LEASE_SECONDS` | `30` | worker task/outbox lease duration |
+| `LISTING_DELETION_PASS_BUDGET_MS` | `10000` | time budget of one listing-deletion follower pass; must be at most half of `WORKER_LEASE_SECONDS`. See [`docs/listing-deletion-follower.md`](docs/listing-deletion-follower.md) |
+| `LOCKS_SNAPSHOT_RETENTION_DAYS` | `90` | days Locks lifecycle snapshots are kept before the purge (≥ 1) |
+| `FX_FEED_URL` | fixed production URL | FX rate feed for the sampler. A release binary ignores this variable and always uses the fixed URL; only in-process test configuration repoints it |
+| `AUTOMATION_RATE_LIMIT_PER_MINUTE` | `120` | seller automation rate limit per `(actor, endpoint class)`; see [`docs/api.md`](docs/api.md#rate-limits) |
+| `AUTOMATION_RATE_LIMIT_BURST_MULTIPLIER` | `2` | burst capacity multiplier (max 10); rate × multiplier must be at most 20000 |
+| `INVENTORY_AUTHENTICATED_RATE_LIMIT_PER_MINUTE` | `120` | inventory API rate per session (1–10000) |
+| `INVENTORY_ANONYMOUS_RATE_LIMIT_PER_MINUTE` | `20` | inventory API rate for requests without a valid session |
+| `INVENTORY_RATE_LIMIT_BURST_MULTIPLIER` | `2` | inventory burst multiplier (max 10) |
+| `EVENT_RETENTION_DAYS` | `30` | seller event feed retention; older cursors answer `410 cursor_expired` |
+| `WEBHOOK_*` | see docs | webhook delivery tuning (`WEBHOOK_MAX_ATTEMPTS` 12, `WEBHOOK_MAX_AGE_HOURS` 24, `WEBHOOK_RETRY_BASE_SECONDS` 5, `WEBHOOK_RETRY_MAX_SECONDS` 3600, `WEBHOOK_MAX_ENDPOINTS_PER_SELLER` 100, and the worker/purge knobs); full list in [`docs/api.md`](docs/api.md#delivery) |
+| `MARKETPLACE_GRANT_*`, `GRANT_FLOW_*`, `GRANT_RESULT_*`, `SHOP_*` | unset | Shop BFF grant-flow configuration (flow disabled unless `MARKETPLACE_GRANT_FLOW_ENABLED`); see [`docs/api.md`](docs/api.md#grant-flow-routes-shop-bff) |
 | `LOCKS_SERVER_URL` | unset | Lock Server base URL; setting it enables Locks verification |
 | `LOCKS_BUNDLE_ENCRYPTION_KEY` | unset | 32-byte hex key encrypting bundle ids at rest (XChaCha20-Poly1305) |
 | `LOCKS_LOOKUP_HMAC_KEY` | unset | 32-byte hex key for the HMAC-SHA256 correlation lookup token; must differ from the encryption key |
@@ -98,7 +163,7 @@ Railway IaC `preserve()`):
 | `STRIPE_API_BASE` | `https://api.stripe.com` | Stripe API base URL (overridden only by tests) |
 | `PAYKIT_SERVER_URL` | unset | paykit-server base URL; setting it enables the bitcoin method |
 | `PAYKIT_REQUEST_SIGNING_KEY` | unset | 32-byte hex ed25519 seed signing paykit-server requests. Its pubky-formatted public key goes into paykit-server's `[signed_services] trusted_public_keys`, beside the Locks key, when `PAYKIT_SERVER_API=upstream`; on the fork (`fork`, the default) it is `marketplace.trusted_public_key`. See [Paykit server API](#paykit-server-api) |
-| `PAYKIT_SERVER_API` | `fork` | which paykit-server the service speaks to: `fork` (today's production server) or `upstream` (`pubky/paykit-server` rc9 with the signed-services allowlist, #55). Set only together with `PAYKIT_SERVER_URL`. See [Paykit server API](#paykit-server-api) |
+| `PAYKIT_SERVER_API` | `fork` | which paykit-server the service speaks to: `fork` (today's production server) or `upstream` (`pubky/paykit-server` with the signed-services allowlist, first shipped in v0.1.0-rc9, #55; the latest tagged release is v0.1.0-rc11). Set only together with `PAYKIT_SERVER_URL`. See [Paykit server API](#paykit-server-api) |
 | `PAYKIT_MAX_PREPARE_TTL_SECONDS` | `900` | largest remaining upstream Paykit preparation TTL Marketplace accepts (60–86400). Align with producer `prepare_ttl_seconds`; a longer response is voided and its bind/inventory transaction rolls back. Up to 60 additional seconds are accepted only for bounded cross-service clock skew |
 | `PAYKIT_POLL_SECONDS` | `15` | minimum interval between paykit status polls per pending bitcoin order |
 | `PAYKIT_RAIL_STALE_SECONDS` | `60` | stale-out window for cached Paykit rail and seller claim availability; must be at least `PAYKIT_POLL_SECONDS` |
@@ -182,10 +247,12 @@ true, and a 503 is an outage).
 Flipping the setting is a deployment step: register the service's public key
 in the upstream allowlist first, then set `PAYKIT_SERVER_API=upstream` and
 repoint `PAYKIT_SERVER_URL`; setting it back to `fork` (or unsetting it) and
-repointing is the rollback. Upstream does not serve the payment-request
-lifecycle routes (prepare, activate, void, resolve) yet, so with `upstream`
-a Bitcoin bind answers `paykit_unavailable` until those land. PayPal and
-Stripe are not affected.
+repointing is the rollback. Upstream serves the signed payment-request
+lifecycle routes (prepare, activate, void, resolve, and status). Cut over only
+after no fork invoice remains preparing, active, or inside the configured late
+observation window. Once upstream mode is selected, a fork-pinned invoice is
+unavailable to polling and can no longer be confirmed or noticed late. PayPal
+and Stripe are not affected.
 
 ### Address autocomplete proxy
 
@@ -217,6 +284,12 @@ public Nominatim instance forbids autocomplete; Photon is built for it.
   `region` is Photon's state name; clients map it to their own codes.
 
 ### Two-phase Paykit payment requests
+
+This section describes the original **fork** mode (`PAYKIT_SERVER_API=fork`,
+the default). Upstream mode uses signed prepare, activate, void, resolve, and
+status routes with producer-issued invoice identity and deadlines; its fixed
+inventory-hold boundary is documented in
+[`docs/paykit-upstream-inventory-hold.md`](docs/paykit-upstream-inventory-hold.md).
 
 Bitcoin binding is a two-phase protocol with paykit-server (the message
 contract is design §B.11.3, verbatim; this section describes the
@@ -415,7 +488,8 @@ append `attestation_annotations` rows keyed by the
 salted `order_ref`, and the worker signs weekly per-seller stat attestations
 into `seller_stat_attestations`. Publication of annotations and stat
 attestations to the attestor's homeserver is Phase 3 of the trust &
-reputation plan (pubky-app `docs/ecommerce/trust-reputation-plan.md`) and is
+reputation plan (`pubky/pubky-marketplace`
+[`docs/ecommerce/trust-reputation-plan.md`](https://github.com/pubky/pubky-marketplace/blob/master/docs/ecommerce/trust-reputation-plan.md)) and is
 not part of this service yet — the rows accumulate here as the publisher's
 ground truth.
 
@@ -478,18 +552,11 @@ Like the receipt attestation, every claim derives from stored rows, so
 repeated fetches by either participant return the byte-identical token and
 nothing is stored.
 
-Endpoints: `GET /health`, `GET /version` (name, crate version, commit and
-build time), `GET /ready` (checks the database),
-`POST /v1/auth/sessions`,
-`POST /v1/commands` (Bearer session required),
-the public drop projection `GET /v0/drops/{seller_pubky}/{drop_id}`
-(no session — see Drops below), and the role-scoped read projections
-(Bearer session required — see Read projections below):
-`GET /v1/listings/{aggregate_id}`, `GET /v1/drops/{aggregate_id}`,
-`GET /v1/drops/{aggregate_id}/me`, `GET /v1/offers`,
-`GET /v1/orders`, `GET /v1/orders/{id}`,
-`GET /v1/payments/{id}`, `GET /v1/receipts/{id}`, and
-`GET /v1/notifications`.
+Endpoints: every route, with its auth requirement, is tabulated in
+[`docs/api.md`](docs/api.md#route-table); the seller automation routes
+(sessions, inventory, exports, event feed, webhooks) are specified there in
+full. The buyer and seller application routes are described in the feature
+sections below (see "Read projections" for the role-scoped reads).
 
 ## Test
 
@@ -502,8 +569,15 @@ export DATABASE_URL='postgres://marketplace:marketplace@localhost:55432/marketpl
 cargo test --workspace
 ```
 
-Gates: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
-`cargo test --workspace`.
+Gates (the same as CI): `cargo fmt --check`,
+`cargo clippy --workspace --all-targets -- -D warnings`, and
+`bash scripts/ci-test.sh`. The script exists because several integration
+binaries mutate cluster-global Postgres roles and must run one test at a time
+after the parallel ones, so a bare `cargo test --workspace` can fail on role
+contention. CI runs the toolchain 1.89.0 against PostgreSQL 16; the
+`docker-compose.yml` database is PostgreSQL 17. The pre-push hook
+(`scripts/prepush.sh`) runs the fast gate for the packages a change touches;
+`PREPUSH_FULL=1` runs everything.
 
 ## Command envelope (ADR-0019 §3)
 
@@ -711,7 +785,7 @@ and refund branches):
   marks the winning auction reservation converted — the
   `payment_confirmation` triggers declared in the contract. If a winning
   auction hold has already lapsed on server time, confirmation is refused
-  (`INVALID_STATE`) rather than overselling. (The pubky-app client
+  (`INVALID_STATE`) rather than overselling. (The `pubky/pubky-marketplace` client
   currently refuses to send `payment.sandbox_advance` to the durable
   service as a matter of client policy; the command exists here so the
   post-purchase lifecycle is real and testable end to end.) Real payments
@@ -1079,10 +1153,14 @@ secret key. The challenge endpoint has been removed.
    0.11.0), built from the same `pubky/pubky-homeserver` repository as the
    `@synonymdev/pubky` SDK, so client and server share one implementation of
    the token format. The token's public key becomes the authenticated actor.
-   The token's capabilities are echoed back to the caller in the mint response
-   but are **not** persisted: `auth_sessions.capabilities` is intentionally
-   stored empty and is not an access-control list. Authorization is per
-   command, keyed on the actor pubky.
+   The token's verified capabilities are returned in the mint response and
+   persisted, normalized, in `auth_sessions.capabilities`. They gate the
+   inventory and seller automation routes (a session needs read and write on
+   `/pub/pubky.app/marketplace-service/v1/`; otherwise `403
+   capability_required`), and `/priv` access for `GET /v1/me/priv-keys`.
+   Commands and the buyer/seller application routes are not capability gated:
+   their authorization is per command and per resource, keyed on the actor
+   pubky. See [`docs/api.md`](docs/api.md#authentication-and-sessions).
 
    Client and server do **not** have to be on the same version. The signature
    encoding was refactored between minor versions, so this was measured rather
@@ -1090,7 +1168,9 @@ secret key. The challenge endpoint has been removed.
    signed with 0.11.0 verifies under the 0.8.0 SDK. Both directions round-trip.
    Reproduce by signing with `AuthToken::sign` under each version and
    cross-verifying with `AuthToken::verify` and the SDK's `AuthToken.verify`.
-   This matters in practice because `pubky-app` currently ships SDK 0.8.0.
+   This was measured when the client shipped SDK 0.8.0; the client
+   (`pubky/pubky-marketplace`) now ships `@synonymdev/pubky` 0.11.0, the same
+   version as the service.
 3. Replay protection is enforced by the service, not assumed from the
    token: the token's `(public key, timestamp)` identity is recorded in
    `auth_token_uses`, so each token is single-use; its signing timestamp
@@ -1099,7 +1179,8 @@ secret key. The challenge endpoint has been removed.
    system time). Server time is authoritative throughout.
 4. On success the service returns its own opaque 32-byte session token
    (base64url) with a TTL; only the SHA-256 of the token is stored.
-5. `POST /v1/commands` requires `Authorization: Bearer <token>`; middleware
+5. Every route except the public ones requires `Authorization: Bearer <token>`
+   (`POST /v1/commands` is the main one); middleware
    resolves the actor pubky from the stored hash. There are no trust-me
    actor headers, and body fields can never select a different actor.
 
@@ -1192,9 +1273,16 @@ Not served, deliberately (no fabricated or empty-by-default reads):
 
 ## Background workers (tasks 3.4, 4.5)
 
-One worker runtime (`crates/service/src/workers.rs`) drains six server-time
-tasks: reservation expiry, offer expiry, auction close, the outbox, Locks
-lifecycle verification, and the marketplace payment window.
+One worker runtime (`crates/service/src/workers.rs`) drains 22 lease-guarded
+server-time tasks: `reservation_expiry`, `drop_transitions`, `offer_expiry`,
+`auction_close`, `outbox`, `locks_verification`, `paykit_verification`,
+`payment_window`, `stat_attestations`, `delivery_autocomplete`,
+`pickup_reseal`, `digital_reseal`, `priv_key_reseal`, `delivery_email_purge`,
+`read_rate_purge`, `pickup_retention`, `seller_confirmation_window`,
+`manual_review_watch`, `paykit_resolve_delivery`, `fx_sampler`,
+`refusal_audit_retention` and `listing_deletions`. Webhook delivery runs in a
+separate worker (`spawn_webhook_worker` in `crates/service/src/automation.rs`;
+see [`docs/api.md`](docs/api.md#webhooks)).
 
 - **Leases.** Each task has a row in `worker_leases`; an instance takes (or
   renews) it with a conditional upsert and holds it for
@@ -1257,7 +1345,7 @@ cargo run -p marketplace-domain --bin emit-contracts
 
 The domain test `contract_artifact_is_in_sync` fails whenever the JSON on
 disk is stale, so the artifact cannot drift from the Rust tables. The
-pubky-app client validates its TypeScript contracts in
+`pubky/pubky-marketplace` client validates its TypeScript contracts in
 `src/libs/commerce` against this artifact in CI (cross-language contract
 tests, per ADR-0022). Any artifact change here fails the client's
 `state-machines.contract.test.ts` until the JSON is re-vendored — and the
@@ -1348,8 +1436,10 @@ commands, exactly as in the engine.
 - Structured logs via `tracing`; log fields are command kind, command id,
   aggregate id, revision, and outcome code — no payload contents, no
   addresses, no message bodies.
-- `/health` is liveness; `/ready` verifies database connectivity;
-  `/version` reports the crate version, the commit (`GIT_COMMIT`, else
+- `/health` is liveness plus a capability summary; `/ready` answers 503
+  when the refusal-audit pipeline is not ready, the database probe fails, or
+  buyer delivery emails are past their retention (the purge worker is not
+  running); `/version` reports the crate version, the commit (`GIT_COMMIT`, else
   `RAILWAY_GIT_COMMIT_SHA`, else `git rev-parse HEAD`) and `BUILD_TIME`,
   baked in at build time, each `unknown` when missing.
 - The worker runtime runs in-process; every drain is guarded by leases plus

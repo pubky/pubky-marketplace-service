@@ -3587,8 +3587,26 @@ async fn test_app_with_payments_api(
 pub async fn test_app_with_payments_and_fx(
     pool: PgPool,
 ) -> (TestApp, FakePaykit, fx_feed::FakeFxFeed) {
+    test_app_with_payments_and_fx_api(pool, PaykitApi::Fork).await
+}
+
+/// [`test_app_with_payments_and_fx`] with both the Paykit client and double
+/// using the upstream lifecycle API.
+pub async fn test_app_with_upstream_paykit_and_fx(
+    pool: PgPool,
+) -> (TestApp, FakePaykit, fx_feed::FakeFxFeed) {
+    test_app_with_payments_and_fx_api(pool, PaykitApi::Upstream).await
+}
+
+async fn test_app_with_payments_and_fx_api(
+    pool: PgPool,
+    api: PaykitApi,
+) -> (TestApp, FakePaykit, fx_feed::FakeFxFeed) {
     let stripe = spawn_fake_stripe().await;
     let paykit = spawn_fake_paykit().await;
+    if api == PaykitApi::Upstream {
+        paykit.use_upstream_api();
+    }
     let ipn = spawn_fake_paypal_ipn().await;
     let shippo = spawn_fake_shippo().await;
     let fx = fx_feed::spawn_fake_fx().await;
@@ -3598,12 +3616,17 @@ pub async fn test_app_with_payments_and_fx(
         stripe: StripeClient::new(&stripe.base_url).expect("fake stripe client builds"),
         paykit: Some(
             PaykitClient::new(&paykit.base_url, TEST_PAYKIT_SIGNING_SEED)
-                .expect("fake paykit client builds"),
+                .expect("fake paykit client builds")
+                .with_api(api),
         ),
         paypal_ipn: PaypalIpnVerifier::new(&ipn.base_url).expect("fake ipn verifier builds"),
         shippo: ShippoClient::new(&shippo.base_url).expect("fake shippo client builds"),
     });
-    let now: DateTime<Utc> = NOW.parse().expect("valid test timestamp");
+    let now: DateTime<Utc> = if api == PaykitApi::Upstream {
+        Utc::now()
+    } else {
+        NOW.parse().expect("valid test timestamp")
+    };
     let clock = Arc::new(AdjustableClock::new(now));
     let mut config = Config::for_tests();
     config.fx_feed_url = fx.base_url.clone();
