@@ -520,6 +520,71 @@ fn with(mut body: Value, key: &str, value: Value) -> Value {
     body
 }
 
+/// The retired Stripe fields get the same refusal on the flag-on body as on
+/// the flag-off one, and a refused save stores neither the rails nor the
+/// USDT consent that rode along with it.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn the_flag_on_body_refuses_stripe_values_and_stores_nothing(pool: PgPool) {
+    let (app, paykit) = upstream_app(pool.clone()).await;
+    let seller = new_actor(&app).await;
+
+    for stripe in [
+        (
+            "stripe_payment_link",
+            json!("https://buy.stripe.com/test_abc123"),
+        ),
+        ("stripe_restricted_key", json!("rk_test_secret12345")),
+    ] {
+        let body = with(
+            with(rails(true), "usdt_enabled", json!(true)),
+            stripe.0,
+            stripe.1,
+        );
+        let (status, response) = put(&app, &seller.token, &body).await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{body}: {response}"
+        );
+        assert_eq!(
+            response["error"]["reason"],
+            json!("stripe_removed"),
+            "{body}"
+        );
+    }
+
+    let configs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM seller_payment_configs")
+        .fetch_one(&pool)
+        .await
+        .expect("count configs");
+    let options: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM seller_accepted_payment_options")
+        .fetch_one(&pool)
+        .await
+        .expect("count options");
+    assert_eq!((configs, options), (0, 0), "a refused save stores nothing");
+
+    // The old "clear it" value, an empty restricted key, and an explicit
+    // null link are still accepted, as on the flag-off body.
+    replay(
+        &paykit,
+        &seller.pubky,
+        "setup_status_usdt_dual",
+        "setup_status_authority_ready",
+    );
+    let accepted = with(
+        with(rails(true), "stripe_restricted_key", json!("")),
+        "stripe_payment_link",
+        Value::Null,
+    );
+    let (status, body) = put(&app, &seller.token, &accepted).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["payment_config"]["stripe_payment_link"], Value::Null);
+    assert_eq!(
+        body["payment_config"]["stripe_restricted_key_set"],
+        json!(false)
+    );
+}
+
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn an_omitted_usdt_enabled_leaves_the_stored_consent_unchanged(pool: PgPool) {
     let (app, paykit) = upstream_app(pool.clone()).await;
