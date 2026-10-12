@@ -573,17 +573,14 @@ pub async fn prepare(
             "The seller's Locks document does not match the payment.",
         )));
     }
-    if let Err(failure) = crate::seller_terms::capture_for_order(
+    crate::seller_terms::capture_for_order(
         tx,
         Some(homeserver),
         order.id,
         &order.seller_pubky,
         now,
     )
-    .await?
-    {
-        return Ok(Err(failure));
-    }
+    .await?;
     if let Err(failure) = holds::acquire_payment_hold(
         tx,
         order,

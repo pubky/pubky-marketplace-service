@@ -119,17 +119,8 @@ pub async fn advance(
     // inventory hold (or re-arms a drop claim's window) before anything
     // else moves.
     let order = if payment.state == "awaiting_entitlement" {
-        if let Err(failure) = crate::seller_terms::capture_for_order(
-            tx,
-            homeserver,
-            order.id,
-            &order.seller_pubky,
-            now,
-        )
-        .await?
-        {
-            return Ok(Err(failure));
-        }
+        crate::seller_terms::capture_for_order(tx, homeserver, order.id, &order.seller_pubky, now)
+            .await?;
         match crate::handlers::holds::acquire_payment_hold(
             tx,
             order,
