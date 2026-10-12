@@ -1272,6 +1272,34 @@ async fn completed_digital_order_still_downloads(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn digital_order_completes_on_its_own_frozen_period(pool: PgPool) {
+    let (app, paykit) = paykit_app(pool).await;
+    let (_seller, _buyer, order) = paykit_delivered_order(&app, &paykit).await;
+    sqlx::query("UPDATE orders SET auto_complete_days = 2 WHERE id = $1::uuid")
+        .bind(&order.order_id)
+        .execute(&app.pool)
+        .await
+        .expect("freeze the seller's period");
+    let default_days = app.state.config.auto_complete_days;
+    assert!(
+        default_days > 2,
+        "the default must outlast the seller's period"
+    );
+
+    let early = app.clock.now() + chrono::Duration::days(1);
+    let completed = complete_due_delivered_orders(&app.pool, early, default_days, 100, 10)
+        .await
+        .expect("auto-complete");
+    assert_eq!(completed, 0);
+    let due = app.clock.now() + chrono::Duration::days(2) + chrono::Duration::hours(1);
+    let completed = complete_due_delivered_orders(&app.pool, due, default_days, 100, 10)
+        .await
+        .expect("auto-complete");
+    assert_eq!(completed, 1);
+    assert_eq!(order_facts(&app, &order.order_id).await.0, "completed");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn sandbox_confirmed_never_delivers(pool: PgPool) {
     let (app, _server) = keyed_app(pool).await;
     let seller = new_actor(&app).await;

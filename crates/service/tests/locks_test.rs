@@ -655,6 +655,77 @@ async fn prepare_pins_the_locks_adapter_atomically(pool: PgPool) {
     );
 }
 
+// The Locks lock point freezes the seller's delivery periods like every
+// other payment lock point.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn prepare_captures_the_sellers_delivery_periods(pool: PgPool) {
+    let (app, _fake) = test_app_with_locks(pool).await;
+    let homeserver = common::spawn_fake_homeserver().await;
+    let app = common::with_shop_homeserver(app, &homeserver);
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    homeserver.put_shop_record(
+        &seller.pubky,
+        json!({
+            "schemaVersion": 1,
+            "recordType": "shop",
+            "ownerPubky": seller.pubky,
+            "name": "Locks Shop",
+            "deliveryAssumeDays": 6,
+            "autoCompleteDays": 8,
+        }),
+    );
+    let order = create_pending_order(&app, &seller, &buyer).await;
+
+    let command = common::prepare_locks_command(&order.payment_id, 120);
+    let (status, body) = execute(&app, &buyer.token, &command).await;
+    assert_eq!(status, StatusCode::OK, "preparation: {body}");
+    let terms: (Option<i32>, Option<i32>) = sqlx::query_as(
+        "SELECT delivery_assume_days, auto_complete_days FROM orders WHERE id = $1::uuid",
+    )
+    .bind(&order.order_id)
+    .fetch_one(&app.pool)
+    .await
+    .expect("order row");
+    assert_eq!(terms, (Some(6), Some(8)));
+}
+
+// An unreadable shop record does not block the preparation: the order freezes
+// the configured defaults (NULL periods) and the fallback is alerted.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn prepare_proceeds_with_defaults_when_the_shop_record_is_unreadable(pool: PgPool) {
+    common::install_log_capture();
+    let (app, _fake) = test_app_with_locks(pool).await;
+    let homeserver = common::spawn_fake_homeserver().await;
+    let app = common::with_shop_homeserver(app, &homeserver);
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_order(&app, &seller, &buyer).await;
+
+    homeserver.fail_shop_record(&seller.pubky);
+    let command = common::prepare_locks_command(&order.payment_id, 120);
+    let (status, body) = execute(&app, &buyer.token, &command).await;
+    assert_eq!(status, StatusCode::OK, "preparation: {body}");
+    let terms: (Option<i32>, Option<i32>, bool) = sqlx::query_as(
+        "SELECT delivery_assume_days, auto_complete_days, \
+                delivery_terms_captured_at IS NOT NULL \
+         FROM orders WHERE id = $1::uuid",
+    )
+    .bind(&order.order_id)
+    .fetch_one(&app.pool)
+    .await
+    .expect("order row");
+    assert_eq!(terms, (None, None, true));
+    assert!(
+        common::captured_logs()
+            .lines()
+            .any(|line| line.contains(&order.order_id)
+                && line.contains("ALERT seller_terms_fallback_unreadable_shop_record")
+                && line.contains(&seller.pubky)),
+        "the fallback is alerted with the seller and the order"
+    );
+}
+
 // Every designed binding outcome is recorded in the static vocabulary:
 // `prepared`/`registered` stamp the correlation row transactionally and
 // append to the audit table in the transaction that performs the state

@@ -11,12 +11,18 @@ use axum::http::{Request, StatusCode};
 use common::paykit_review::{poll_now, status_confirmed, status_detected};
 use common::*;
 use marketplace_service::clock::Clock;
+use marketplace_service::config::{
+    DEFAULT_AUTO_COMPLETE_DAYS, DEFAULT_DELIVERY_ASSUME_DAYS, DEFAULT_DELIVERY_SWEEP_BATCH_SIZE,
+};
 use marketplace_service::handlers::digital_manual::{
     overdue_delivery_emails, purge_delivery_emails, read_delivery_email_with_hook,
     DeliveryEmailReadHook,
 };
 use marketplace_service::payments::attempt_reference;
-use marketplace_service::workers::{drain_outbox, expire_due_payment_windows};
+use marketplace_service::workers::{
+    assume_due_deliveries, complete_due_delivered_orders, drain_outbox, expire_due_payment_windows,
+    DELIVERY_SWEEP_MAX_BATCHES,
+};
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1775,4 +1781,327 @@ async fn paypal_reversal_withholds_the_buyer_email_from_the_seller(pool: PgPool)
     let (status, _, body) = read_email(&app, &seller.token, &order.id).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["delivery_email"], json!(EMAIL));
+}
+
+// ---------------------------------------------------------------------------
+// Assumed delivery of manual digital orders the seller never marks
+// ---------------------------------------------------------------------------
+
+fn days_from(start: chrono::DateTime<chrono::Utc>, days: i64) -> chrono::DateTime<chrono::Utc> {
+    start + chrono::Duration::days(days)
+}
+
+async fn assume_due(app: &TestApp, at: chrono::DateTime<chrono::Utc>) -> u64 {
+    assume_due_deliveries(
+        &app.pool,
+        at,
+        DEFAULT_DELIVERY_ASSUME_DAYS,
+        DEFAULT_DELIVERY_SWEEP_BATCH_SIZE,
+        DELIVERY_SWEEP_MAX_BATCHES,
+    )
+    .await
+    .expect("assume sweep runs")
+}
+
+async fn complete_due(app: &TestApp, at: chrono::DateTime<chrono::Utc>) -> u64 {
+    complete_due_delivered_orders(
+        &app.pool,
+        at,
+        DEFAULT_AUTO_COMPLETE_DAYS,
+        DEFAULT_DELIVERY_SWEEP_BATCH_SIZE,
+        DELIVERY_SWEEP_MAX_BATCHES,
+    )
+    .await
+    .expect("complete sweep runs")
+}
+
+async fn notifications(app: &TestApp, kind: &str, recipient: &TestActor) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM outbox WHERE kind = $1 AND payload->>'recipient_pubky' = $2",
+    )
+    .bind(format!("notification.{kind}"))
+    .bind(&recipient.pubky)
+    .fetch_one(&app.pool)
+    .await
+    .expect("notifications")
+}
+
+async fn assumed_flag(app: &TestApp, order_id: &str) -> (bool, bool) {
+    sqlx::query_as(
+        "SELECT delivery_assumed, digital_delivered_at IS NOT NULL FROM orders \
+         WHERE id = $1::uuid",
+    )
+    .bind(order_id)
+    .fetch_one(&app.pool)
+    .await
+    .expect("assumed flag")
+}
+
+// A paid email order the seller never marks emailed ends on its own: it is
+// assumed delivered after the (config default) period counted from payment,
+// auto-completes after the auto-complete period, and the sealed address is
+// purged after the retention window that starts at completion.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_unmarked_email_order_is_assumed_delivered_completed_and_purged(pool: PgPool) {
+    let (app, paykit, _server) = keyed_app(pool).await;
+    let (seller, buyer, order) = email_order(&app, &paykit).await;
+    paykit_pay(&app, &paykit, &buyer, &order).await;
+    let paid_at = app.clock.now();
+    assert_eq!(state_of(&app, &order.id).await, "paid");
+
+    assert_eq!(
+        assume_due(
+            &app,
+            days_from(paid_at, DEFAULT_DELIVERY_ASSUME_DAYS) - chrono::Duration::seconds(1)
+        )
+        .await,
+        0,
+        "not due before the period has elapsed"
+    );
+    assert_eq!(state_of(&app, &order.id).await, "paid");
+
+    let assumed_at = days_from(paid_at, DEFAULT_DELIVERY_ASSUME_DAYS);
+    assert_eq!(assume_due(&app, assumed_at).await, 1);
+    assert_eq!(state_of(&app, &order.id).await, "delivered");
+    assert_eq!(assumed_flag(&app, &order.id).await, (true, true));
+    assert_eq!(
+        assume_due(&app, assumed_at).await,
+        0,
+        "the assumption happens once"
+    );
+    let system_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events WHERE aggregate_id = $1 \
+         AND kind = 'fulfillment.digital_delivered' AND actor_pubky = 'system'",
+    )
+    .bind(format!("order:{}", order.id))
+    .fetch_one(&app.pool)
+    .await
+    .expect("events");
+    assert_eq!(system_events, 1);
+    assert_eq!(
+        notifications(&app, "order_delivery_assumed", &buyer).await,
+        1
+    );
+    assert_eq!(notifications(&app, "order_delivered", &seller).await, 1);
+
+    // The seller can no longer mark an order the service already delivered.
+    app.clock.set(assumed_at);
+    let (status, _) = mark(&app, &seller, &order.id, "email").await;
+    assert_ne!(status, StatusCode::OK);
+
+    // Auto-completion counts from the assumption, not from payment.
+    assert_eq!(
+        complete_due(
+            &app,
+            days_from(assumed_at, DEFAULT_AUTO_COMPLETE_DAYS) - chrono::Duration::seconds(1)
+        )
+        .await,
+        0
+    );
+    assert_eq!(state_of(&app, &order.id).await, "delivered");
+    let completed_at = days_from(assumed_at, DEFAULT_AUTO_COMPLETE_DAYS);
+    assert_eq!(complete_due(&app, completed_at).await, 1);
+    assert_eq!(state_of(&app, &order.id).await, "completed");
+
+    // The sealed address lives 30 days past completion, then is purged.
+    assert_eq!(email_rows(&app).await, vec![(order.id.clone(), true)]);
+    assert_eq!(
+        purge_delivery_emails(&app.pool, days_from(completed_at, 29), 30, 7)
+            .await
+            .expect("purge"),
+        0
+    );
+    assert_eq!(
+        purge_delivery_emails(&app.pool, days_from(completed_at, 31), 30, 7)
+            .await
+            .expect("purge"),
+        1
+    );
+    assert_eq!(email_rows(&app).await, vec![(order.id.clone(), false)]);
+}
+
+// The seller's own periods (frozen on the order at payment) drive a manual
+// digital order exactly as they drive a shipped one.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_message_order_follows_the_sellers_frozen_periods(pool: PgPool) {
+    let (app, paykit, _server) = keyed_app(pool).await;
+    let homeserver = common::spawn_fake_homeserver().await;
+    let app = common::with_shop_homeserver(app, &homeserver);
+    let seller = bitcoin_seller(&app, &paykit).await;
+    let buyer = new_actor(&app).await;
+    homeserver.put_shop_record(
+        &seller.pubky,
+        json!({
+            "schemaVersion": 1,
+            "recordType": "shop",
+            "ownerPubky": seller.pubky,
+            "name": "Digital Shop",
+            "deliveryAssumeDays": 3,
+            "autoCompleteDays": 5,
+        }),
+    );
+    listing(&app, &seller, "guide_01", json!({ "kind": "message" })).await;
+    let order = one_order(&app, &buyer, &[(&seller, "guide_01")], None).await;
+    paykit_pay(&app, &paykit, &buyer, &order).await;
+    let paid_at = app.clock.now();
+
+    // A later change to the shop record never moves the open order.
+    homeserver.put_shop_record(
+        &seller.pubky,
+        json!({
+            "schemaVersion": 1,
+            "recordType": "shop",
+            "ownerPubky": seller.pubky,
+            "name": "Digital Shop",
+            "deliveryAssumeDays": 40,
+            "autoCompleteDays": 40,
+        }),
+    );
+
+    assert_eq!(assume_due(&app, days_from(paid_at, 2)).await, 0);
+    assert_eq!(state_of(&app, &order.id).await, "paid");
+    let assumed_at = days_from(paid_at, 3);
+    assert_eq!(assume_due(&app, assumed_at).await, 1);
+    assert_eq!(state_of(&app, &order.id).await, "delivered");
+    assert_eq!(
+        complete_due(&app, days_from(assumed_at, 4)).await,
+        0,
+        "the seller's 5 days, not the 14-day default"
+    );
+    assert_eq!(complete_due(&app, days_from(assumed_at, 5)).await, 1);
+    assert_eq!(state_of(&app, &order.id).await, "completed");
+}
+
+// A seller who delivers in time is untouched, and an instant-only digital
+// order (delivered at payment) never enters the paid-order assumption.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn the_assumption_leaves_marked_and_instant_orders_alone(pool: PgPool) {
+    let (app, paykit, _server) = keyed_app(pool).await;
+    let seller = bitcoin_seller(&app, &paykit).await;
+    let buyer = new_actor(&app).await;
+    listing(&app, &seller, "guide_01", email_kind()).await;
+    listing(&app, &seller, "guide_02", text_kind()).await;
+    let marked = one_order(&app, &buyer, &[(&seller, "guide_01")], Some(EMAIL)).await;
+    paykit_pay(&app, &paykit, &buyer, &marked).await;
+    let instant = one_order(&app, &buyer, &[(&seller, "guide_02")], None).await;
+    paykit_pay(&app, &paykit, &buyer, &instant).await;
+    assert_eq!(state_of(&app, &instant.id).await, "delivered");
+    let (status, body) = mark(&app, &seller, &marked.id, "email").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let marked_flags = assumed_flag(&app, &marked.id).await;
+    assert_eq!(marked_flags, (false, true));
+
+    let later = days_from(app.clock.now(), DEFAULT_DELIVERY_ASSUME_DAYS + 1);
+    assert_eq!(assume_due(&app, later).await, 0);
+    assert_eq!(assumed_flag(&app, &marked.id).await, (false, true));
+    assert_eq!(assumed_flag(&app, &instant.id).await, (false, true));
+}
+
+// An open cancellation request takes a paid digital order out of the sweep,
+// and an order with a mixed (instant plus email) cart is assumed like any
+// other manual order once its period elapses.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_cancel_request_holds_the_assumption_and_a_mixed_order_is_assumed(pool: PgPool) {
+    let (app, paykit, _server) = keyed_app(pool).await;
+    let seller = bitcoin_seller(&app, &paykit).await;
+    let buyer = new_actor(&app).await;
+    listing(&app, &seller, "guide_01", email_kind()).await;
+    listing(&app, &seller, "guide_02", text_kind()).await;
+    let cancelling = one_order(&app, &buyer, &[(&seller, "guide_01")], Some(EMAIL)).await;
+    paykit_pay(&app, &paykit, &buyer, &cancelling).await;
+    let (status, body) = act(
+        &app,
+        &buyer.token,
+        "order.cancel_request",
+        &cancelling.id,
+        json!({ "reason": "Changed my mind" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let mixed = one_order(
+        &app,
+        &buyer,
+        &[(&seller, "guide_01"), (&seller, "guide_02")],
+        Some(EMAIL_2),
+    )
+    .await;
+    paykit_pay(&app, &paykit, &buyer, &mixed).await;
+    assert_eq!(state_of(&app, &mixed.id).await, "paid");
+
+    let later = days_from(app.clock.now(), DEFAULT_DELIVERY_ASSUME_DAYS);
+    assert_eq!(assume_due(&app, later).await, 1);
+    assert_eq!(state_of(&app, &cancelling.id).await, "cancel_requested");
+    assert_eq!(state_of(&app, &mixed.id).await, "delivered");
+}
+
+// A PayPal reversal outstanding on the order holds the assumption (the
+// seller cannot read the address meanwhile); once PayPal restores it the
+// next pass assumes delivery.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_paypal_reversal_holds_the_assumption_until_restored(pool: PgPool) {
+    let (app, _paykit, _server) = keyed_app(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (status, body) = send(
+        app.router.clone(),
+        "PUT",
+        "/v0/sellers/me/payment-config",
+        Some(&seller.token),
+        &json!({ "bitcoin_enabled": false, "paypal_merchant_email": "merchant@example.com" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "config put failed: {body}");
+    register(
+        &app,
+        &seller,
+        "guide_01",
+        json!({ "amount_minor": 13_700, "currency": "USD", "exponent": 2 }),
+        5,
+    )
+    .await;
+    set_kind(&app, &seller, "guide_01", email_kind()).await;
+    let order = one_order(&app, &buyer, &[(&seller, "guide_01")], Some(EMAIL)).await;
+    let (status, body) = send(
+        app.router.clone(),
+        "POST",
+        &format!("/v0/orders/{}/payment-method", order.id),
+        Some(&buyer.token),
+        &json!({ "method": "paypal" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "bind failed: {body}");
+    assert_eq!(
+        post_ipn_fixture(&app, "completed.ipn", &order.id, &[]).await,
+        StatusCode::OK
+    );
+    let paid_at = app.clock.now();
+    assert_eq!(
+        post_ipn_fixture(
+            &app,
+            "reversal-full.ipn",
+            &order.id,
+            &[("mc_gross", "-40.00"), ("txn_id", "5MC93249NP7742999")]
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(state_of(&app, &order.id).await, "paid");
+
+    let due = days_from(paid_at, DEFAULT_DELIVERY_ASSUME_DAYS);
+    assert_eq!(assume_due(&app, due).await, 0);
+    assert_eq!(state_of(&app, &order.id).await, "paid");
+
+    assert_eq!(
+        post_ipn_fixture(
+            &app,
+            "canceled-reversal.ipn",
+            &order.id,
+            &[("mc_gross", "40.00"), ("txn_id", "6ND04350PQ8853999")]
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(assume_due(&app, due).await, 1);
+    assert_eq!(state_of(&app, &order.id).await, "delivered");
 }

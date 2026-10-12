@@ -389,7 +389,9 @@ pub async fn handle(
             total_minor,
             currency.clone(),
             exponent,
-            payload.guarantee_policy_version as i32,
+            payload
+                .guarantee_policy_version
+                .map(|version| version as i32),
             payment_id,
             stock_held,
             hold_expires_at,

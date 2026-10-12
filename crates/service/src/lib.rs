@@ -48,6 +48,7 @@ pub mod resolve_delivery;
 pub mod result;
 pub mod rotating_keys;
 pub mod seal;
+pub mod seller_terms;
 pub mod shipping;
 pub mod workers;
 
