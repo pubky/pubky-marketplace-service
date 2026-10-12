@@ -164,7 +164,7 @@ def issued_at() -> str:
 
 
 def bind_body(method: str) -> dict[str, str]:
-    """Shop payment-method bind: `{ "method": "paypal" | "stripe" | "bitcoin" }`."""
+    """Shop payment-method bind: `{ "method": "paypal" | "bitcoin" }`."""
     return {"method": method}
 
 
@@ -292,7 +292,6 @@ def digital_listing_query(kind: str, exclude: set[str]) -> str:
         "|| '|' || l.available_quantity::text || '|' || l.fulfillment_methods::text "
         "|| '|' || CASE "
         "WHEN c.paypal_merchant_email IS NOT NULL AND btrim(c.paypal_merchant_email) <> '' THEN 'paypal' "
-        "WHEN c.stripe_payment_link IS NOT NULL AND btrim(c.stripe_payment_link) <> '' THEN 'stripe' "
         "ELSE '' END "
         "FROM listings l "
         "LEFT JOIN seller_payment_configs c ON c.seller_pubky = l.seller_pubky "
@@ -300,8 +299,7 @@ def digital_listing_query(kind: str, exclude: set[str]) -> str:
         "AND l.available_quantity>=1 AND l.reserved_quantity=0 "
         "AND l.fulfillment_methods::text LIKE '%digital%' "
         f"AND l.digital_delivery_kind='{kind}' "
-        "AND (c.paypal_merchant_email IS NOT NULL AND btrim(c.paypal_merchant_email) <> '' "
-        "OR c.stripe_payment_link IS NOT NULL AND btrim(c.stripe_payment_link) <> '') "
+        "AND c.paypal_merchant_email IS NOT NULL AND btrim(c.paypal_merchant_email) <> '' "
         f"{excluded}"
         "ORDER BY l.updated_at DESC NULLS LAST LIMIT 5;"
     )
@@ -353,8 +351,6 @@ def self_check() -> None:
     assert_shape(pickup, shipping=False)
     if bind_body("paypal") != {"method": "paypal"}:
         raise RuntimeError("paypal bind body")
-    if bind_body("stripe") != {"method": "stripe"}:
-        raise RuntimeError("stripe bind body")
     if not ttl_matches_window(590.0, 600):
         raise RuntimeError("ttl slack around fiat default")
     if ttl_matches_window(500.0, 600):
@@ -680,7 +676,6 @@ def pick_listing(
         "|| '|' || l.available_quantity::text || '|' || l.fulfillment_methods::text "
         "|| '|' || CASE "
         "WHEN c.paypal_merchant_email IS NOT NULL AND btrim(c.paypal_merchant_email) <> '' THEN 'paypal' "
-        "WHEN c.stripe_payment_link IS NOT NULL AND btrim(c.stripe_payment_link) <> '' THEN 'stripe' "
         "ELSE '' END "
         "FROM listings l "
         "LEFT JOIN seller_payment_configs c ON c.seller_pubky = l.seller_pubky "
@@ -689,14 +684,13 @@ def pick_listing(
         f"{clause} {excluded}"
         "ORDER BY (CASE "
         "WHEN c.paypal_merchant_email IS NOT NULL AND btrim(c.paypal_merchant_email) <> '' THEN 0 "
-        "WHEN c.stripe_payment_link IS NOT NULL AND btrim(c.stripe_payment_link) <> '' THEN 1 "
-        "ELSE 2 END), l.updated_at DESC NULLS LAST LIMIT 5;"
+        "ELSE 1 END), l.updated_at DESC NULLS LAST LIMIT 5;"
     )
     rows = parse_listing_rows(raw)
     if require_bind:
-        rows = [row for row in rows if row.get("bind_method") in {"paypal", "stripe"}]
+        rows = [row for row in rows if row.get("bind_method") == "paypal"]
     if not rows:
-        suffix = " with paypal/stripe" if require_bind else ""
+        suffix = " with paypal" if require_bind else ""
         raise RuntimeError(f"no qty-1 available {label} listing{suffix}\n{raw!r}")
     listing = rows[0]
     methods = listing["fulfillment_methods"]
@@ -807,7 +801,6 @@ def refresh_listing(aggregate_id: str) -> dict[str, Any]:
         "|| '|' || l.available_quantity::text || '|' || l.fulfillment_methods::text "
         "|| '|' || CASE "
         "WHEN c.paypal_merchant_email IS NOT NULL AND btrim(c.paypal_merchant_email) <> '' THEN 'paypal' "
-        "WHEN c.stripe_payment_link IS NOT NULL AND btrim(c.stripe_payment_link) <> '' THEN 'stripe' "
         "ELSE '' END "
         "FROM listings l "
         "LEFT JOIN seller_payment_configs c ON c.seller_pubky = l.seller_pubky "
@@ -869,7 +862,7 @@ def pick_digital_listing(kind: str, exclude: set[str]) -> dict[str, Any]:
     rows = parse_listing_rows(raw)
     if not rows:
         raise RuntimeError(
-            f"no available staging listing with {kind} delivery set and a PayPal or Stripe rail; "
+            f"no available staging listing with {kind} delivery set and a PayPal rail; "
             f"publish one on staging (sell with Digital delivery, then set {kind} on the edit page) "
             f"or run with --digital-kinds without {kind}\n{raw!r}"
         )
@@ -970,8 +963,8 @@ class Smoke:
         expected_stored_region: set[str] | None,
     ) -> dict[str, Any]:
         method = listing.get("bind_method") or ""
-        if method not in {"paypal", "stripe"}:
-            raise RuntimeError(f"{case}: listing has no paypal/stripe bind method {listing!r}")
+        if method != "paypal":
+            raise RuntimeError(f"{case}: listing has no paypal bind method {listing!r}")
         window = self.load_fiat_window()
         buyer_a = z32_pubky()
         buyer_b = z32_pubky()
@@ -1147,8 +1140,8 @@ class Smoke:
         """
         case = f"digital_{kind}"
         method = listing.get("bind_method") or ""
-        if method not in {"paypal", "stripe"}:
-            raise RuntimeError(f"{case}: listing has no paypal/stripe bind method {listing!r}")
+        if method != "paypal":
+            raise RuntimeError(f"{case}: listing has no paypal bind method {listing!r}")
         window = self.load_fiat_window()
         aggregate_id = listing["aggregate_id"]
         stock_before = listing_stock(aggregate_id)

@@ -127,7 +127,6 @@ and write. "Automation" means the inventory capability plus the
 | GET | `/v1/me/priv-keys` |
 | PUT, GET | `/v0/sellers/me/payment-config` |
 | POST | `/v0/orders/{id}/payment-method` |
-| POST | `/v0/orders/{id}/fiat/verify` |
 | POST | `/v0/orders/{id}/fiat/mark-paid` |
 | POST | `/v0/orders/{id}/fiat/confirm-received` |
 | POST | `/v0/orders/{id}/confirm-bitcoin-payment` |

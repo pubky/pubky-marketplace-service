@@ -134,7 +134,7 @@ fn late(mut status: Value) -> Value {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn money_on_a_released_attempt_after_a_rebind_reaches_late_money(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, first) = released_first_attempt(&app, &paykit, &seller, &buyer).await;
@@ -228,7 +228,7 @@ async fn money_on_a_released_attempt_after_a_rebind_reaches_late_money(pool: PgP
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_released_attempt_without_money_closes_after_its_tail(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, first) = released_first_attempt(&app, &paykit, &seller, &buyer).await;
@@ -260,7 +260,7 @@ async fn a_released_attempt_without_money_closes_after_its_tail(pool: PgPool) {
 // none at all once a fiat bind replaced it.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn migration_0042_backfills_attempts_released_before_it(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let unbound_buyer = new_actor(&app).await;
     let (unbound, unbound_invoice) =
@@ -280,7 +280,7 @@ async fn migration_0042_backfills_attempts_released_before_it(pool: PgPool) {
         .await
         .expect("the pre-0042 order-id reference");
     sqlx::query(
-        "UPDATE orders SET paykit_request_reference = NULL, payment_method = 'stripe' \
+        "UPDATE orders SET paykit_request_reference = NULL, payment_method = 'paypal' \
          WHERE id = $1",
     )
     .bind(fiat)
@@ -332,7 +332,7 @@ async fn migration_0042_backfills_attempts_released_before_it(pool: PgPool) {
             .expect("order row");
     assert_eq!(
         method.as_deref(),
-        Some("stripe"),
+        Some("paypal"),
         "the fiat bind is untouched"
     );
 }
@@ -342,7 +342,7 @@ async fn migration_0042_backfills_attempts_released_before_it(pool: PgPool) {
 /// expired, activation voided, request state cleared, method still bitcoin).
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_cancelled_preparing_attempt_is_recorded_backfilled_and_routed(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     paykit.set_allocation_mode("exclusive");
@@ -566,7 +566,7 @@ async fn status_calls(paykit: &FakePaykit, reference: &str) -> usize {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn released_attempt_checks_back_off_and_a_stale_detection_escalates(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, first) = released_first_attempt(&app, &paykit, &seller, &buyer).await;
@@ -710,7 +710,7 @@ async fn dismissal_is_refused_then_refund_resolves(pool: &PgPool, order_id: Uuid
 // current attempt: held for an operator, who records the refund.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn an_operator_resolves_a_released_attempt_held_for_review(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, first) = released_first_attempt(&app, &paykit, &seller, &buyer).await;
@@ -835,7 +835,7 @@ async fn attempt_state(pool: &PgPool, order_id: Uuid, invoice: Uuid) -> (String,
 // attempt must not move the payment off Locks.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn money_on_a_released_attempt_of_a_locks_payment_is_held_for_review(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, first) = released_first_attempt(&app, &paykit, &seller, &buyer).await;
@@ -882,7 +882,7 @@ async fn money_on_a_released_attempt_of_a_locks_payment_is_held_for_review(pool:
 // goes to manual review, never to completion.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_mismatched_amount_on_a_released_attempt_goes_to_manual_review(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, first) = released_first_attempt(&app, &paykit, &seller, &buyer).await;
@@ -917,7 +917,7 @@ async fn a_mismatched_amount_on_a_released_attempt_goes_to_manual_review(pool: P
 // never activated.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_preparing_current_attempt_is_released_and_never_activated(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, first) = released_first_attempt(&app, &paykit, &seller, &buyer).await;
@@ -967,7 +967,7 @@ async fn a_preparing_current_attempt_is_released_and_never_activated(pool: PgPoo
 // seller or the seller-window reaper moves it.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn money_on_a_released_attempt_never_moves_an_order_waiting_for_its_seller(pool: PgPool) {
-    let (app, _stripe, paykit) = test_app_with_payments(pool.clone()).await;
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let (order_id, first) = released_first_attempt(&app, &paykit, &seller, &buyer).await;

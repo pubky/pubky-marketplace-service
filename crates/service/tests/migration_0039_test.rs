@@ -105,7 +105,7 @@ async fn rerun(pool: &PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn migration_0039_backfills_only_gateway_verified_payment_ids(pool: PgPool) {
-    let (app, _stripe, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
+    let (app, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
     let plain = gateway_paid_order(&app, None, "1HH00000HH0000001").await;
 
     // A buyer report appended before the gateway's payment is what the
@@ -182,7 +182,7 @@ async fn migration_0039_backfills_only_gateway_verified_payment_ids(pool: PgPool
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn migration_0039_skips_a_reference_shared_by_two_orders(pool: PgPool) {
-    let (app, _stripe, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
+    let (app, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
     let first = gateway_paid_order(&app, None, "1HH00000HH0000005").await;
     let second = gateway_paid_order(&app, None, "1HH00000HH0000006").await;
     sqlx::query("UPDATE orders SET fiat_transaction_ref = '1HH00000HH0000005' WHERE id = $1::uuid")
@@ -197,7 +197,7 @@ async fn migration_0039_skips_a_reference_shared_by_two_orders(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn migration_0039_constraints_hold(pool: PgPool) {
-    let (app, _stripe, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
+    let (app, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
     let paid = gateway_paid_order(&app, None, "1HH00000HH0000007").await;
     let other = gateway_paid_order(&app, None, "1HH00000HH0000008").await;
     rerun(&pool).await;
@@ -270,7 +270,7 @@ async fn migration_0039_constraints_hold(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_refund_on_a_backfilled_payment_is_held_as_receiver_unverified(pool: PgPool) {
-    let (app, _stripe, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
+    let (app, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
     let paid = gateway_paid_order(&app, None, "1HH00000HH0000009").await;
     rerun(&pool).await;
     assert_eq!(

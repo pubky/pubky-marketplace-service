@@ -160,10 +160,6 @@ pub fn build_router(state: AppState) -> Router {
             post(crate::payment_methods::bind_payment_method),
         )
         .route(
-            "/v0/orders/{id}/fiat/verify",
-            post(crate::payment_methods::verify_fiat_payment),
-        )
-        .route(
             "/v0/orders/{id}/fiat/mark-paid",
             post(crate::payment_methods::mark_fiat_paid),
         )
