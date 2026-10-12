@@ -58,8 +58,10 @@ Both graphs pin `ghcr.io/bitcoinerrorlog/pubky-marketplace-service@sha256:...`
 (`LIVE_IMAGE` in `railway.ts`, `STAGING_IMAGE` in `railway.staging.ts`). The pin
 moves only when a release closeout PR edits it (last bumped by the
 address-search image pin, PR #81), so it normally trails `main`, and it is
-not the source of truth for what is running: use `GET /version` on the service
-(its `commit` is the baked build commit) to see the deployed commit. The
+not the source of truth for what is running: read the image digest of the
+service's active deployment (Railway deployment details, or the revision's
+image on GCP) and the `org.opencontainers.image.revision` label of that image to
+see the deployed commit. The service serves no version endpoint. The
 image workflow `.github/workflows/production-image.yml` now publishes to
 `ghcr.io/<repository owner>/pubky-marketplace-service` (lowercased, tagged
 `sha-<commit>`), which for this repository is `ghcr.io/pubky/...`; the pins

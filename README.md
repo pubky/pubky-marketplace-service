@@ -1435,8 +1435,8 @@ commands, exactly as in the engine.
 - `/health` is liveness plus a capability summary; `/ready` answers 503
   when the refusal-audit pipeline is not ready, the database probe fails, or
   buyer delivery emails are past their retention (the purge worker is not
-  running); `/version` reports the crate version, the commit (`GIT_COMMIT`, else
-  `RAILWAY_GIT_COMMIT_SHA`, else `git rev-parse HEAD`) and `BUILD_TIME`,
-  baked in at build time, each `unknown` when missing.
+  running). The service publishes no version endpoint: the running build is the
+  image digest (and its `org.opencontainers.image.revision` label) recorded for
+  the deploy.
 - The worker runtime runs in-process; every drain is guarded by leases plus
   `FOR UPDATE SKIP LOCKED`, so multiple service instances are safe.
