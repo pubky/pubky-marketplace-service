@@ -310,9 +310,16 @@ request failed, so clients should branch on HTTP status first, and parse
    | `NOT_FOUND` | 404 |
    | `REVISION_CONFLICT`, `IDEMPOTENCY_CONFLICT`, `INSUFFICIENT_INVENTORY`, `INVARIANT_VIOLATION`, `OFFER_EXPIRED`, `INVALID_STATE`, `AUCTION_CLOSED`, `BID_TOO_LOW`, `SELLER_REGISTRATION_REQUIRED` | 409 |
    | `AWARD_EXPIRED`, `AWARD_ALREADY_CONVERTED`, `AWARD_QUANTITY_MISMATCH`, `AWARD_VARIANT_MISMATCH`, `AWARD_LISTING_CHANGED`, `AWARD_HOLD_MISSING` | 409 |
+   | `LISTING_MODERATED` | 409 |
    | `UPSTREAM_UNAVAILABLE` | 503 (retriable) |
 
    A command error may also carry `issues` and `reason` fields.
+
+   `LISTING_MODERATED` refuses `checkout.create`, `offer.checkout`,
+   `offer.create`, `offer.counter`, `offer.accept` and `auction.place_bid`
+   when the marketplace index reports the listing, or its seller, as
+   moderated (see [Listing moderation](../README.md#listing-moderation)). It is a
+   409, not a 403, because clients read a 403 on a command as a session problem.
 
 ### Automation error codes
 

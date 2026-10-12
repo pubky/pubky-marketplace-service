@@ -71,6 +71,8 @@ also has
 
 - `HOMESERVER_URL` — the homeserver the `listing.sync` command reads
   seller-signed listing records from (an http(s) URL);
+- `NEXUS_URL` — the marketplace index the moderation gate reads (an http(s)
+  URL; see [Listing moderation](#listing-moderation));
 - `REFUSAL_AUDIT_DATABASE_URL` and `REFUSAL_AUDIT_RETENTION_DATABASE_URL` —
   two separate Postgres URLs that log in as
   `marketplace_refusal_audit_writer_login` and
@@ -129,6 +131,7 @@ Railway IaC `preserve()`):
 | --- | --- | --- |
 | `DATABASE_URL` | required | Postgres connection string |
 | `HOMESERVER_URL` | required | homeserver base URL (http(s)) the `listing.sync` command fetches seller-signed records from; the service refuses to boot without it |
+| `NEXUS_URL` | required | base URL (http(s)) of the marketplace index (Nexus) the service asks whether a listing is moderated before it accepts a checkout, a bid or an offer on it; the service refuses to boot without it. See [Listing moderation](#listing-moderation) |
 | `REFUSAL_AUDIT_*` | required | refusal-audit logins, HMAC key pair and attestations; see [Run](#run) |
 | `BIND_ADDR` | `127.0.0.1:8080` | HTTP listen address |
 | `ALLOWED_ORIGINS` | empty | comma-separated exact CORS origins |
@@ -190,6 +193,35 @@ Railway IaC `preserve()`):
 | `PRIV_DATA_KEY_ENCRYPTION_KEY` | unset | 32-byte hex key sealing per-user `/priv` data keys at rest (XChaCha20-Poly1305); must differ from the Locks, pickup and digital delivery keys; `GET /v1/me/priv-keys` answers `priv_keys_unavailable` without it, and the service refuses to boot while sealed rows exist without it |
 | `PRIV_DATA_KEY_ENCRYPTION_KEY_PREVIOUS` | unset | optional previous priv data key sealing key for the dual-key read window during rotation; the re-seal worker moves every row to the current key. Keep it set until the pass reports zero rows under the previous key |
 | `PICKUP_DISPUTE_RETENTION_DAYS` | `30` | days a cancelled-after-payment order's pinned pickup snapshot is retained as the dispute exhibit when no refund evidence ever lands, before the ordinary terminal-order purge takes it (≥ 1) |
+
+### Listing moderation
+
+pubky.app's moderation (a moderator account's tags on content and users)
+removes content from the marketplace index. The index reports a listing's
+state at `GET {NEXUS_URL}/v0/listing/{seller}/{listing_id}/moderation`
+(`moderated` is true when the listing itself, or its seller, is moderated).
+Before the service accepts `checkout.create`, `offer.checkout`,
+`offer.create`, `offer.counter`, `offer.accept` or `auction.place_bid` it
+asks, and refuses a moderated listing with `LISTING_MODERATED` (HTTP 409, audited as
+`invalid_state`) without writing anything. Withdrawing or rejecting an offer,
+and closing an auction, sell nothing and stay open. A command id that already
+has a stored result is answered from it without asking the index. The check
+runs before the command's transaction, so a slow index never holds a domain
+connection.
+
+When the index cannot answer (transport failure, timeout, a non-success
+status such as the 404 of an index that predates the route, or a body without
+`moderated`), the service **fails open** and logs at ERROR
+`ALERT the index moderation lookup is unavailable; allowing the command
+without a moderation check`. The index is not the transaction authority
+(ADR 0019), so an outage there does not stop sales; the exception is a
+listing the gate has seen moderated: it stays refused until the index answers
+that it is clear (`ALERT the index could not confirm a moderated listing is
+still moderated; refusing it on the last moderated answer`). Only "moderated"
+answers are cached (5 minutes, per listing); a "clear" answer is never cached,
+so a moderation placed meanwhile is seen on the next command and lifting one
+takes effect once the cached answer expires. Orders created before a listing
+was moderated are not cancelled by this check.
 
 ### Public payment configuration availability
 
