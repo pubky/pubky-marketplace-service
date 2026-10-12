@@ -891,6 +891,177 @@ async fn stripe_verify_after_expire_with_stock_gone_is_refund_required(pool: PgP
     assert_eq!(reason.as_deref(), Some("refund_required"));
 }
 
+async fn expired_stripe_order(
+    app: &TestApp,
+    seller: &TestActor,
+    buyer: &TestActor,
+) -> (String, i64) {
+    put_config(app, &seller.token, &full_config_body()).await;
+    let order = create_pending_order(app, seller, buyer).await;
+    let (status, body) = bind_method(app, &buyer.token, &order.order_id, "stripe").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let total = body["order"]["total"]["amount_minor"]
+        .as_i64()
+        .expect("total");
+    let after = app.clock.now() + chrono::Duration::seconds(3700);
+    assert!(
+        expire_due_payment_windows(&app.state, after)
+            .await
+            .expect("expire")
+            >= 1
+    );
+    (order.order_id, total)
+}
+
+async fn verify_stripe(app: &TestApp, token: &str, order_id: &str) -> (StatusCode, Value) {
+    send(
+        app.router.clone(),
+        "POST",
+        &format!("/v0/orders/{order_id}/fiat/verify"),
+        Some(token),
+        &Value::Null,
+    )
+    .await
+}
+
+async fn order_and_payment_state(pool: &PgPool, order_id: &str) -> (String, String) {
+    sqlx::query_as(
+        "SELECT o.state, p.state FROM orders o JOIN payments p ON p.order_id = o.id \
+         WHERE o.id = $1::uuid",
+    )
+    .bind(order_id)
+    .fetch_one(pool)
+    .await
+    .expect("order and payment state")
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn stripe_verify_after_expire_without_a_paid_session_never_pays(pool: PgPool) {
+    let (app, stripe, _paykit) = test_app_with_payments(pool.clone()).await;
+    stripe.accept_key(RESTRICTED_KEY);
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (order_id, total) = expired_stripe_order(&app, &seller, &buyer).await;
+    assert_eq!(
+        order_and_payment_state(&pool, &order_id).await,
+        ("cancelled".to_string(), "expired".to_string())
+    );
+
+    let requests_before = stripe.request_count();
+    let (status, body) = verify_stripe(&app, &buyer.token, &order_id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["verified"], json!(false), "{body}");
+    assert_eq!(body["status"], json!("not_found"), "{body}");
+    assert!(
+        stripe.request_count() > requests_before,
+        "an expired payment is verified against Stripe, never taken on the buyer's word"
+    );
+
+    // Sessions that are unpaid or that do not match the order never verify it.
+    stripe.add_session(FakeStripeSession {
+        id: "cs_expired_unpaid".into(),
+        client_reference_id: order_id.clone(),
+        payment_status: "unpaid".into(),
+        amount_total: total,
+        currency: "usd".into(),
+    });
+    stripe.add_session(FakeStripeSession {
+        id: "cs_expired_wrong_amount".into(),
+        client_reference_id: order_id.clone(),
+        payment_status: "paid".into(),
+        amount_total: total - 1,
+        currency: "usd".into(),
+    });
+    for token in [&buyer.token, &seller.token] {
+        let (status, body) = verify_stripe(&app, token, &order_id).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["verified"], json!(false), "{body}");
+    }
+
+    assert_eq!(
+        order_and_payment_state(&pool, &order_id).await,
+        ("cancelled".to_string(), "expired".to_string())
+    );
+    assert_eq!(count(&pool, "SELECT COUNT(*) FROM receipts").await, 0);
+    let (stock_held, _, _) = hold_row(&pool, &order_id).await;
+    assert!(!stock_held, "an unverified payment never takes stock back");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn stripe_verify_after_expire_needs_a_usable_seller_key(pool: PgPool) {
+    let (app, stripe, _paykit) = test_app_with_payments(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (order_id, _total) = expired_stripe_order(&app, &seller, &buyer).await;
+
+    // The fake accepts no keys, so Stripe rejects the stored key: an expired
+    // payment is not paid, and the rejection is reported instead of hidden.
+    let (status, body) = verify_stripe(&app, &buyer.token, &order_id).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        body["error"]["reason"],
+        json!("stripe_key_invalid"),
+        "{body}"
+    );
+
+    let (status, _) = put_config(
+        &app,
+        &seller.token,
+        &json!({
+            "bitcoin_enabled": false,
+            "stripe_payment_link": "https://buy.stripe.com/test_abc123",
+            "stripe_restricted_key": "",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = verify_stripe(&app, &buyer.token, &order_id).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        body["error"]["reason"],
+        json!("stripe_key_missing"),
+        "{body}"
+    );
+
+    assert_eq!(
+        order_and_payment_state(&pool, &order_id).await,
+        ("cancelled".to_string(), "expired".to_string())
+    );
+    assert_eq!(stripe.request_count(), 1);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn stripe_verify_after_expire_with_a_paid_session_and_free_stock_completes(pool: PgPool) {
+    let (app, stripe, _paykit) = test_app_with_payments(pool.clone()).await;
+    stripe.accept_key(RESTRICTED_KEY);
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (order_id, total) = expired_stripe_order(&app, &seller, &buyer).await;
+    stripe.add_session(FakeStripeSession {
+        id: "cs_late_paid".into(),
+        client_reference_id: order_id.clone(),
+        payment_status: "paid".into(),
+        amount_total: total,
+        currency: "usd".into(),
+    });
+
+    let (status, body) = verify_stripe(&app, &buyer.token, &order_id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["verified"], json!(true), "{body}");
+    assert_eq!(body["order"]["state"], json!("paid"), "{body}");
+    assert_eq!(
+        order_and_payment_state(&pool, &order_id).await,
+        ("paid".to_string(), "confirmed".to_string())
+    );
+    assert_eq!(count(&pool, "SELECT COUNT(*) FROM receipts").await, 1);
+
+    // Re-verification of the now-confirmed payment stays an idempotent success.
+    let (status, body) = verify_stripe(&app, &seller.token, &order_id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["verified"], json!(true), "{body}");
+    assert_eq!(count(&pool, "SELECT COUNT(*) FROM receipts").await, 1);
+}
+
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn sandbox_confirm_inside_window_pays_held_checkout(pool: PgPool) {
     let app = test_app(pool).await;
