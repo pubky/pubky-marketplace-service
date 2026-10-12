@@ -1,0 +1,16 @@
+{
+  "name": "status_active",
+  "server_revision": "80352cebb011d2f57318170068ae4ec24af6a417",
+  "request": {
+    "method": "POST",
+    "path": "/marketplace/payment-requests/status",
+    "content_type": null,
+    "signature": "Ie6tFQQM2NMCQN9GNWxfhR_KQuNj_FBuW8YU8l-YbXFVY5e3GO_RfrSwHECVQOorU9mjH3Ho42fvgrFDALWRBg",
+    "body": "{\"creator\":\"pubkybuuk6nr1caaumhms4tph5oa656z9f5k9q867h4u8ze441mpfuhyo\",\"invoice_id\":\"22e960e0-0a8a-43b3-b901-c6bc7ea9072c\"}"
+  },
+  "response": {
+    "status": 200,
+    "content_type": "application/json",
+    "body": "{\"invoice_id\":\"22e960e0-0a8a-43b3-b901-c6bc7ea9072c\",\"state\":\"active\",\"proposal_delivery_state\":\"pending\",\"request_state\":null,\"payment_state\":\"undetected\",\"activated_at\":\"2026-10-11T13:24:44.395669Z\",\"payment_deadline\":\"2026-10-11T14:24:44.395669Z\",\"bitcoin\":null,\"outcome\":null,\"resolved_at\":null}"
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "name": "void",
+  "server_revision": "80352cebb011d2f57318170068ae4ec24af6a417",
+  "request": {
+    "method": "POST",
+    "path": "/marketplace/payment-requests/void",
+    "content_type": null,
+    "signature": "K866fAKR4WPo_iPFomq6jviLVrggV815bWE2J_K-camqzDbLLId7Zng39kwHZYXjSxOJ2I34CMVK0_2f8Cm9AA",
+    "body": "{\"creator\":\"pubkybuuk6nr1caaumhms4tph5oa656z9f5k9q867h4u8ze441mpfuhyo\",\"invoice_id\":\"47c99077-7bd5-4494-914d-52118a525455\"}"
+  },
+  "response": {
+    "status": 200,
+    "content_type": "application/json",
+    "body": "{\"invoice_id\":\"47c99077-7bd5-4494-914d-52118a525455\",\"state\":\"voided\",\"voided_at\":\"2026-10-11T13:24:44.668485Z\"}"
+  }
+}
