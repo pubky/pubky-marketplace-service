@@ -84,7 +84,6 @@ and write. "Automation" means the inventory capability plus the
 | Method | Path | Notes |
 | --- | --- | --- |
 | GET | `/health` | [Operational endpoints](#operational-endpoints) |
-| GET | `/version` | [Operational endpoints](#operational-endpoints) |
 | GET | `/ready` | [Operational endpoints](#operational-endpoints) |
 | POST | `/v1/auth/sessions` | Exchange an AuthToken for a bearer. |
 | GET | `/v1/auth/sessions` | Needs a bearer with the inventory capability (checked in the handler); consumes the `session.admin` rate limit. |
@@ -893,21 +892,9 @@ refusal-audit pipeline is not ready, the database probe fails, or buyer
 delivery emails are held beyond their retention window (in that case the body
 also carries `"reason":"delivery_email_purge_overdue"`).
 
-### `GET /version`
-
-```json
-{
-  "name": "marketplace-service",
-  "version": "0.1.0",
-  "commit": "7cb803d7191e6424ad025d9eb803f36e05b2ee97",
-  "built_at": "2026-10-11T12:00:00Z"
-}
-```
-
-`version` is the crate version. `commit` is baked at build time from
-`GIT_COMMIT`, falling back to `RAILWAY_GIT_COMMIT_SHA`, then `git rev-parse`;
-`built_at` comes from `BUILD_TIME`. Either is the string `"unknown"` when the
-build did not provide it.
+The service publishes no version endpoint. Identify the running build from the
+deploy record: the digest of the image that is deployed (Railway, or GCP once
+the service runs there) and its `org.opencontainers.image.revision` label.
 
 ## Grant-flow routes (Shop BFF)
 
