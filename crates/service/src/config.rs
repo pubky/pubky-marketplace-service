@@ -142,8 +142,9 @@ pub struct Config {
     /// iterates until a pass claims fewer than this many rows or the
     /// per-lease batch cap is hit.
     pub delivery_sweep_batch_size: i64,
-    /// The deployment's public web-app origin (`PUBLIC_APP_ORIGIN`, e.g.
-    /// `https://shop.pubky.app`), used as the buyer return destination on
+    /// The deployment's public web-app URL (`PUBLIC_APP_ORIGIN`: an origin,
+    /// e.g. `https://shop.pubky.app`, plus the mount path when the Shop is
+    /// served under one, e.g. `https://pubky.app/shop`), used as the buyer return destination on
     /// hosted checkouts that support one (PayPal `_xclick` `return`/
     /// `cancel_return`). Optional: unset omits the return parameters.
     pub public_app_origin: Option<String>,
@@ -698,6 +699,19 @@ fn parse_app_base(name: &str, raw: &str) -> anyhow::Result<String> {
     {
         anyhow::bail!("{name} must be an origin with an optional mount path only");
     }
+    let raw_path = trimmed
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split_once('/'))
+        .map_or("", |(_, path)| path);
+    if raw_path.split('/').any(|segment| {
+        let segment = segment.to_ascii_lowercase();
+        matches!(
+            segment.as_str(),
+            "." | ".." | "%2e" | "%2e%2e" | ".%2e" | "%2e."
+        )
+    }) {
+        anyhow::bail!("{name} must not contain dot segments in its mount path");
+    }
     Ok(trimmed.to_string())
 }
 
@@ -770,6 +784,10 @@ mod tests {
             "https://pubky.app/shop#top",
             "https://user:pw@pubky.app/shop",
             "https://user@pubky.app/shop",
+            "https://pubky.app/shop/../admin",
+            "https://pubky.app/./shop",
+            "https://pubky.app/shop/%2e%2e/admin",
+            "https://pubky.app/shop/.%2E/admin",
         ] {
             assert!(
                 parse_app_base("PUBLIC_APP_ORIGIN", raw).is_err(),
