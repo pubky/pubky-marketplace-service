@@ -74,3 +74,85 @@ async fn migration_0057_removes_plaintext_from_final_orders_only(pool: PgPool) {
         .await
         .expect("a second rerun");
 }
+
+async fn total_balance_validated(pool: &PgPool) -> Option<bool> {
+    sqlx::query_scalar(
+        "SELECT convalidated FROM pg_constraint \
+         WHERE conname = 'orders_total_balance' AND conrelid = 'orders'::regclass",
+    )
+    .fetch_optional(pool)
+    .await
+    .expect("orders_total_balance")
+}
+
+// Staging's Aug 2026 orders carry totals that include the tax 0018 dropped,
+// so they break `orders_total_balance`, which has been NOT VALID since 0018.
+// The sweep is an UPDATE, which re-checks that constraint on every row it
+// touches, so without the drop and re-add the first deploy of 0057 on staging
+// rolled back with `orders_total_balance` violated.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn migration_0057_sweeps_final_orders_that_break_the_total_balance(pool: PgPool) {
+    let address = r#"{"line1":"1 Market Street"}"#;
+    let cancelled = seed_order(&pool, "cancelled", Some(address)).await;
+    let open = seed_order(&pool, "paid", Some(address)).await;
+
+    sqlx::raw_sql(
+        "ALTER TABLE orders DROP CONSTRAINT orders_total_balance; \
+         UPDATE orders SET total_minor = 125 WHERE id IN (SELECT id FROM orders); \
+         ALTER TABLE orders ADD CONSTRAINT orders_total_balance \
+         CHECK (total_minor = subtotal_minor + shipping_minor) NOT VALID",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed orders that predate the narrowed total check");
+
+    let unfixed = sqlx::raw_sql(
+        "UPDATE orders SET delivery_address = NULL WHERE id IN (SELECT id FROM orders)",
+    )
+    .execute(&pool)
+    .await;
+    assert!(
+        unfixed.is_err(),
+        "the seeded rows must trip orders_total_balance on UPDATE, or this test proves nothing"
+    );
+
+    sqlx::raw_sql(MIGRATION)
+        .execute(&pool)
+        .await
+        .expect("0057 applies over orders that break orders_total_balance");
+
+    assert!(
+        address_is_null(&pool, cancelled).await,
+        "the unbalanced final order still loses its plaintext address"
+    );
+    assert!(
+        !address_is_null(&pool, open).await,
+        "an open order keeps its address until it ends"
+    );
+    let totals: Vec<i64> = sqlx::query_scalar("SELECT total_minor FROM orders ORDER BY id")
+        .fetch_all(&pool)
+        .await
+        .expect("totals");
+    assert!(
+        totals.iter().all(|total| *total == 125),
+        "what buyers paid is not rewritten"
+    );
+    assert_eq!(
+        total_balance_validated(&pool).await,
+        Some(false),
+        "orders_total_balance is back, NOT VALID"
+    );
+    let new_unbalanced = sqlx::raw_sql(
+        "INSERT INTO orders (id, buyer_pubky, seller_pubky, revision, state, lines, \
+         subtotal_minor, shipping_minor, total_minor, currency, exponent, \
+         guarantee_policy_version, payment_id, created_at, updated_at) \
+         VALUES (gen_random_uuid(), 'buyer', 'seller', 1, 'paid', '[]', 100, 10, 125, \
+         'EUR', 2, 1, gen_random_uuid(), now(), now())",
+    )
+    .execute(&pool)
+    .await;
+    assert!(
+        new_unbalanced.is_err(),
+        "the balance is still enforced for every new order"
+    );
+}
