@@ -22,7 +22,7 @@ use chrono::{DateTime, Duration, Utc};
 use ed25519_dalek::{Signature, VerifyingKey};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
-use pubky::deep_links::DeepLink;
+use pubky::deep_links::{DeepLink, GrantRelayChannel};
 use pubky::{
     AuthFlowKind, Capabilities, Capability, ClientId, EncryptedHttpRelayInboxChannel,
     GrantAuthFlowState, GrantClaims, PubkyGrantAuthFlow, PubkyHttpClient, PublicKey,
@@ -2476,9 +2476,26 @@ fn inbox_from_saved(saved: &GrantAuthFlowState) -> anyhow::Result<(Url, [u8; 32]
     match DeepLink::from_str(&saved.authorization_url)
         .map_err(|error| anyhow::anyhow!("saved grant deep link is invalid: {error}"))?
     {
-        DeepLink::SigninGrant(link) => Ok((link.params().relay.clone(), link.params().secret)),
-        DeepLink::SignupGrant(link) => Ok((link.params().relay.clone(), link.params().secret)),
+        DeepLink::SigninGrant(link) => {
+            shared_secret_inbox(&link.params().relay, link.params().relay_channel)
+        }
+        DeepLink::SignupGrant(link) => {
+            shared_secret_inbox(&link.params().relay, link.params().relay_channel)
+        }
         _ => anyhow::bail!("saved grant state must contain a grant deep link"),
+    }
+}
+
+/// The service always starts bare-grant flows, which use the shared-secret
+/// relay channel. An HPKE channel would mean a signed-approval flow this
+/// service never requests, so it fails closed instead of polling a channel it
+/// cannot decrypt.
+fn shared_secret_inbox(relay: &Url, channel: GrantRelayChannel) -> anyhow::Result<(Url, [u8; 32])> {
+    match channel {
+        GrantRelayChannel::SharedSecret(secret) => Ok((relay.clone(), secret)),
+        GrantRelayChannel::Hpke { .. } => {
+            anyhow::bail!("saved grant link uses an HPKE relay channel")
+        }
     }
 }
 

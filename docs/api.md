@@ -169,7 +169,7 @@ then the handler. Request bodies are limited to 64 KiB (inventory: 4096 bytes).
 ### Create a session: `POST /v1/auth/sessions`
 
 The request body is the raw postcard-encoded Pubky `AuthToken` bytes (not
-JSON, not base64). The service verifies the token with `pubky-common` 0.11.0.
+JSON, not base64). The service verifies the token with `pubky-common` 0.16.1.
 A token is accepted when its timestamp is within `AUTH_TOKEN_WINDOW_SECONDS`
 (120) of server time (the library's own window is 180 s) and is single use:
 the `(public key, timestamp)` identity is recorded in `auth_token_uses`, so a
