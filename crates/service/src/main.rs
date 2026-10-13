@@ -171,6 +171,9 @@ async fn main() -> anyhow::Result<()> {
         "address search proxy resolved"
     );
 
+    let listing_availability =
+        Arc::new(marketplace_service::listing_availability::AvailabilityLimiter::from_env()?);
+
     let bind_addr = config.bind_addr;
     let state = AppState::new(pool, Arc::new(SystemClock), config)
         .with_locks(locks)
@@ -184,7 +187,8 @@ async fn main() -> anyhow::Result<()> {
         .with_refusal_audit(refusal_audit)
         .with_refusal_audit_retention_pool(audit_retention_pool)
         .with_grant(grant)
-        .with_address_search(address_search);
+        .with_address_search(address_search)
+        .with_listing_availability(listing_availability);
     workers::spawn(state.clone());
     marketplace_service::automation::spawn_webhook_worker(state.clone());
     marketplace_service::grant::spawn(state.clone());

@@ -28,6 +28,7 @@ pub mod handlers;
 pub mod homeserver;
 pub mod http;
 pub mod inventory;
+pub mod listing_availability;
 pub mod listing_deletion;
 pub mod listing_moderation;
 pub mod locks;
@@ -145,6 +146,10 @@ pub struct AppState {
     /// on a listing. Required in production (`NEXUS_URL`); `None` only in
     /// tests that do not exercise it, where no check is made.
     pub listing_moderation: Option<Arc<ListingModerationGate>>,
+    /// Per-client limiter for the public listing availability read
+    /// (`GET /v0/listings/{seller}/{listing_id}/availability`). Always
+    /// installed; `new` uses the defaults and no trusted client header.
+    pub listing_availability: Arc<listing_availability::AvailabilityLimiter>,
 }
 
 impl AppState {
@@ -192,6 +197,7 @@ impl AppState {
             grant: None,
             address_search: None,
             listing_moderation: None,
+            listing_availability: Arc::new(listing_availability::AvailabilityLimiter::default()),
         }
     }
 
@@ -253,6 +259,14 @@ impl AppState {
         listing_moderation: Option<Arc<ListingModerationGate>>,
     ) -> Self {
         self.listing_moderation = listing_moderation;
+        self
+    }
+
+    pub fn with_listing_availability(
+        mut self,
+        listing_availability: Arc<listing_availability::AvailabilityLimiter>,
+    ) -> Self {
+        self.listing_availability = listing_availability;
         self
     }
 

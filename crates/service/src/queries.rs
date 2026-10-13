@@ -927,6 +927,84 @@ pub async fn get_public_drop(
         .into_response()
 }
 
+/// `GET /v0/listings/{seller_pubky}/{listing_id}/availability`: public, no
+/// bearer. Answers only the listing's stock state (`available`, `reserved` or
+/// `sold`) and the server time, so a viewer without a session can still see
+/// that another buyer holds the item. It carries no quantity, buyer, order or
+/// hold deadline. A listing that is unknown or tombstoned is 404. A per-client
+/// token bucket answers 429 with `Retry-After`.
+pub async fn get_public_listing_availability(
+    State(state): State<AppState>,
+    Path((seller_pubky, listing_id)): Path<(String, String)>,
+    request: axum::extract::Request,
+) -> Response {
+    let peer = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|axum::extract::ConnectInfo(address)| address.ip());
+    let now = state.clock.now();
+    if let Err(retry_after) = state
+        .listing_availability
+        .admit(request.headers(), peer, now)
+    {
+        let mut response = (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({
+                "ok": false,
+                "error": { "code": "rate_limited", "message": "The request rate limit was exceeded." },
+            })),
+        )
+            .into_response();
+        response.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            axum::http::HeaderValue::from_str(&retry_after.to_string())
+                .expect("retry-after is a safe integer"),
+        );
+        response.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+        return response;
+    }
+    let row: Result<Option<(String, String)>, sqlx::Error> = sqlx::query_as(
+        "SELECT aggregate_id, state FROM listings \
+         WHERE seller_pubky = $1 AND listing_id = $2 AND deleted_at IS NULL",
+    )
+    .bind(&seller_pubky)
+    .bind(&listing_id)
+    .fetch_optional(&state.pool)
+    .await;
+    match row {
+        Ok(Some((aggregate_id, listing_state))) => {
+            let mut response = (
+                StatusCode::OK,
+                Json(json!({
+                    "aggregate_id": aggregate_id,
+                    "state": listing_state,
+                    "server_time": format_timestamp(now),
+                })),
+            )
+                .into_response();
+            response.headers_mut().insert(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static(
+                    crate::listing_availability::CACHE_CONTROL_VALUE,
+                ),
+            );
+            response
+        }
+        Ok(None) => {
+            let mut response = query_error(ErrorCode::NotFound, "The listing was not found.");
+            response.headers_mut().insert(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-store"),
+            );
+            response
+        }
+        Err(error) => internal_error("listing availability", &error),
+    }
+}
+
 /// `GET /v1/drops/{aggregate_id}`: the seller's own drop projection — the
 /// full facts (exact remaining, paid count, distinct buyer count, schedule,
 /// caps, listing ids, revision) plus `server_time`. Scoped to exactly the
