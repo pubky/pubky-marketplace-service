@@ -1496,6 +1496,14 @@ advance a payment (ADR-0019 §7).
   window IS the hold window. It flips the payment to the `locks` adapter,
   which permanently refuses `payment.sandbox_advance`, and does **not**
   advance the payment state.
+- **No delivery address.** A Locks listing registers as shipping (the
+  derivation skips `digital`), but what it sells is delivered by the Lock
+  Server, so `checkout.create` accepts `fulfillment: "digital"` on a line
+  whose listing carries a Locks lock. That order is a digital order with no
+  shipping charge and no delivery address (a checkout that presents one is
+  refused `INVALID_COMMAND`), and it needs neither
+  `DIGITAL_DELIVERY_ENCRYPTION_KEY` nor a seller deliverable. A listing
+  without a lock still refuses `digital` unless it publishes it.
 - **Lock resources.** A listing's `digitalLock.policyUri` is
   `[pubky://]<creator><prefix><LOCK_ID>.json`, where `<prefix>` is the
   fork's `/pub/locks.app/` or upstream Locks v0.1.0-rc10's

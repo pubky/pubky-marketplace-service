@@ -1401,6 +1401,59 @@ async fn worker_confirms_a_verified_completion_exactly_once(pool: PgPool) {
 // Pending, in-progress, not-found, and unavailable lookups leave the
 // payment untouched and the correlation pending; polling is rate-limited by
 // the poll interval and history rows are appended only on status change.
+// A Locks listing checks out as digital, with no delivery address, and the
+// Lock Server's verified completion pays that order like any other.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_digital_locks_order_without_an_address_is_confirmed_by_the_worker(pool: PgPool) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let holder = Uuid::new_v4();
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let mut listing = register_command(&seller.pubky, 1);
+    listing["payload"]["digital_lock"] = json!({
+        // A digital order carries no shipping, so the lock prices the item alone.
+        "policyUri": lock_resource_for_payment(&seller.pubky, 12_500, "USD"),
+        "criterionId": "paykit",
+    });
+    let (status, body) = execute(&app, &seller.token, &listing).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut checkout =
+        checkout_command_with_id(&seller.pubky, "00000000-0000-4000-8000-000000000150");
+    checkout["payload"]
+        .as_object_mut()
+        .expect("payload object")
+        .remove("delivery_address");
+    checkout["payload"]["lines"][0]["fulfillment"] = json!("digital");
+    let (status, body) = execute(&app, &buyer.token, &checkout).await;
+    assert_eq!(status, StatusCode::OK, "digital Locks checkout: {body}");
+    let order = PendingOrder {
+        order_id: body["result"]["orders"][0]["id"]
+            .as_str()
+            .expect("order id")
+            .to_string(),
+        payment_id: body["result"]["payments"][0]["id"]
+            .as_str()
+            .expect("payment id")
+            .to_string(),
+    };
+    assert_eq!(body["result"]["orders"][0]["fulfillment"], json!("digital"));
+
+    register_locks(&app, &buyer.token, &order, &seller.pubky).await;
+    fake.set_outcome(
+        TEST_BUNDLE_ID,
+        LocksLookupOutcome::Status(LocksTaskStatus::Completed),
+    );
+    let summary = run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    assert_eq!(summary.locks_completions_applied, 1);
+
+    let (state, adapter, _) = payment_state(&app.pool, &order.payment_id).await;
+    assert_eq!((state.as_str(), adapter.as_str()), ("confirmed", "locks"));
+    assert_eq!(order_state(&app.pool, &order.order_id).await, "paid");
+    assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM receipts").await, 1);
+}
+
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn non_terminal_lifecycles_stay_pending_and_poll_boundedly(pool: PgPool) {
     let (app, fake) = test_app_with_locks(pool).await;
