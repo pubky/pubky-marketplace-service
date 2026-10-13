@@ -17,6 +17,16 @@
 -- a long lock and a legacy row that violates one stops the deploy loudly
 -- instead of slipping through.
 --
+-- The sweep rewrites rows, and an UPDATE re-checks every CHECK constraint on
+-- the rows it touches, NOT VALID ones included. `orders_total_balance` is NOT
+-- VALID since 0018 because historical staging orders carry totals that include
+-- a since-dropped tax; those totals are what buyers paid and are not
+-- rewritten, so the sweep would abort on them (staging has cancelled ones).
+-- As in 0043, the constraint is dropped for the sweep and re-added NOT VALID,
+-- which enforces it on every new insert and update and leaves existing rows
+-- as they are. Both statements run in this file's transaction, so no writer
+-- sees the table without it.
+--
 -- Additive and rerunnable. There is NO DOWN migration.
 
 SET LOCAL lock_timeout = '10s';
@@ -40,7 +50,13 @@ ALTER TABLE orders
     ) NOT VALID;
 ALTER TABLE orders VALIDATE CONSTRAINT orders_delivery_address_xor_envelope;
 
+ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_total_balance;
+
 UPDATE orders
 SET delivery_address = NULL
 WHERE delivery_address IS NOT NULL
   AND state IN ('completed', 'cancelled', 'refunded_external', 'closed');
+
+ALTER TABLE orders
+    ADD CONSTRAINT orders_total_balance
+    CHECK (total_minor = subtotal_minor + shipping_minor) NOT VALID;

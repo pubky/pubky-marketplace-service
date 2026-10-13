@@ -155,5 +155,8 @@ This table describes unmerged work and goes stale as pull requests land; trust
 and `orders.delivery_key_id`, two `NOT VALID`-then-`VALIDATE` constraints
 (the pair travels together at exactly 2,096 bytes and a 32-hex key id; a
 plaintext address and an envelope never share a row), and clears
-`delivery_address` on orders already in a final state. Number 0055 belongs to an
+`delivery_address` on orders already in a final state. The sweep is an UPDATE,
+so it drops `orders_total_balance` and re-adds it `NOT VALID` around itself, as
+0043 does: staging's tax-era orders break that constraint and would otherwise
+abort the file. Number 0055 belongs to an
 open pull request.
