@@ -295,7 +295,8 @@ def digital_listing_query(kind: str, exclude: set[str]) -> str:
         "ELSE '' END "
         "FROM listings l "
         "LEFT JOIN seller_payment_configs c ON c.seller_pubky = l.seller_pubky "
-        "WHERE l.sale_format='fixed_price' AND l.state='available' "
+        "WHERE l.deleted_at IS NULL "
+        "AND l.sale_format='fixed_price' AND l.state='available' "
         "AND l.available_quantity>=1 AND l.reserved_quantity=0 "
         "AND l.fulfillment_methods::text LIKE '%digital%' "
         f"AND l.digital_delivery_kind='{kind}' "
@@ -375,6 +376,11 @@ def self_check() -> None:
             raise RuntimeError(f"delivery_email must ride only the email kind ({kind})")
         if kind not in digital_listing_query(kind, {"listing:a"}):
             raise RuntimeError(f"digital listing query misses {kind}")
+        query = digital_listing_query(kind, set())
+        if "l.deleted_at IS NULL" not in query:
+            raise RuntimeError(f"digital listing query must skip tombstoned listings ({kind})")
+        if "c.paypal_merchant_email IS NOT NULL" not in query:
+            raise RuntimeError(f"digital listing query must require a seller payment rail ({kind})")
     for bad in (
         lambda: checkout_body(
             digital_listing, str(uuid.uuid4()), fulfillment="digital", address=SHIPPING_ADDRESSES["ca_iso_suffix"]
