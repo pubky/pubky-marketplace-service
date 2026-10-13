@@ -205,7 +205,16 @@ state at `GET {NEXUS_URL}/v0/listing/{seller}/{listing_id}/moderation`
 Before the service accepts `checkout.create`, `offer.checkout`,
 `offer.create`, `offer.counter`, `offer.accept` or `auction.place_bid` it
 asks, and refuses a moderated listing with `LISTING_MODERATED` (HTTP 409, audited as
-`invalid_state`) without writing anything. Withdrawing or rejecting an offer,
+`invalid_state`) without writing anything. An order created before its listing
+was moderated is gated again where its payment starts: the buyer's
+`POST /v0/orders/{id}/payment-method` (any method) and the first
+`payment.prepare_locks` on its payment answer `LISTING_MODERATED` (the bind
+with `reason: "listing_moderated"`) before an attempt number is spent, a hold
+is armed or Paykit is called, and the order stays `pending_payment` until its
+hold lapses. A re-bind of the method already bound, a Locks payment already
+pinned to Locks, `payment.register_locks`, and any request from someone other
+than the order's buyer never ask the index, so money already in flight is not
+stranded and the moderation state is not disclosed to a stranger. Withdrawing or rejecting an offer,
 and closing an auction, sell nothing and stay open. A command id that already
 has a stored result is answered from it without asking the index. The check
 runs before the command's transaction, so a slow index never holds a domain
