@@ -111,6 +111,15 @@ index on an existing table; it sets `lock_timeout` like 0050. A binary from
 before it lists its `orders` columns and ignores them. The asset, network and
 quote basis have no CHECK on purpose: a later value is not a migration.
 
+0054 (refund destinations) creates `order_refund_destinations` with its
+primary key and a foreign key to `orders`, and appends one refusal-audit
+command kind (`confirm_refund_destination`, 39). The table holds the
+Arbitrum One address a buyer confirmed for a USDT refund, one row per order.
+Its CHECKs fix the asset (`USDT`), the network (`arbitrum-one`), the address
+shape and the source (`buyer_entered`); a later source is a widened CHECK in
+a later migration. It builds no index on an existing table and sets
+`lock_timeout` like 0050.
+
 0058 (purge retired Stripe values) is one `UPDATE` that sets
 `seller_payment_configs.stripe_payment_link` and
 `stripe_restricted_key_ciphertext` to `NULL` for the rows that hold a value.
@@ -120,15 +129,14 @@ additive. Orders and payments bound to Stripe are not touched.
 
 ## Numbers claimed by open pull requests
 
-`main` has 0001 to 0052, then 0056 and 0058. Pull requests that are open when
+`main` has 0001 to 0053, then 0056 and 0058. Pull requests that are open when
 this was written claim the missing numbers, so a new migration must check the
 open list (`gh pr list`) and take the next free number rather than assume
-0053:
+0054:
 
 | Number | File | Pull request |
 | --- | --- | --- |
-| 0053 | `0053_payment_assets.sql` | #99 (USDT asset model, S1) |
-| 0054 | `0054_refund_destinations.sql` | #101 (USDT refund destination, S6, stacked on #99) |
+| 0054 | `0054_refund_destinations.sql` | #101 (USDT refund destination, S6) |
 | 0055 | `0055_user_priv_key_custody_releases.sql` | #92 (`/priv` Phase 4) |
 | 0057 | `0057_encrypted_delivery_address.sql` | #110 (sealed delivery address envelopes) |
 
