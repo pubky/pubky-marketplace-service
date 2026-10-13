@@ -120,6 +120,12 @@ shape and the source (`buyer_entered`); a later source is a widened CHECK in
 a later migration. It builds no index on an existing table and sets
 `lock_timeout` like 0050.
 
+0055 (priv data key custody releases) creates `user_priv_key_custody_releases`
+with its primary key and a key-count check. It builds no index on an existing
+table and takes no lock on one. Roll forward rather than back once any row
+exists: a binary that predates 0055 would create a new data key for a released
+owner (see [private data key custody](priv-key-custody.md)).
+
 0058 (purge retired Stripe values) is one `UPDATE` that sets
 `seller_payment_configs.stripe_payment_link` and
 `stripe_restricted_key_ciphertext` to `NULL` for the rows that hold a value.
@@ -135,16 +141,15 @@ defaults, so a rolling replacement is safe.
 
 ## Numbers claimed by open pull requests
 
-`main` has 0001 to 0054, then 0056 to 0058, and 0059 follows with the listing
-deletion follower backoff. Pull requests that are open when
-this was written claim the missing numbers, so a new migration must check the
-open list (`gh pr list`) and take the next free number rather than assume
-0055:
+`main` has 0001 to 0054 and 0056 to 0059; 0055 is #92, so the catalog is
+gapless 0001 to 0059 once it lands. Pull requests that are open when this was
+written claim numbers, so a new migration must check the open list
+(`gh pr list`) and take the next free number (0060 or later) rather than
+assume it is free:
 
 | Number | File | Pull request |
 | --- | --- | --- |
 | 0055 | `0055_user_priv_key_custody_releases.sql` | #92 (`/priv` Phase 4) |
-| 0057 | `0057_encrypted_delivery_address.sql` | #110 (sealed delivery addresses) |
 
 This table describes unmerged work and goes stale as pull requests land; trust
 `crates/service/migrations/` on `main` over it.
@@ -158,5 +163,5 @@ plaintext address and an envelope never share a row), and clears
 `delivery_address` on orders already in a final state. The sweep is an UPDATE,
 so it drops `orders_total_balance` and re-adds it `NOT VALID` around itself, as
 0043 does: staging's tax-era orders break that constraint and would otherwise
-abort the file. Number 0055 belongs to an
-open pull request.
+abort the file. Number 0055 belongs to the owner-held key custody release
+table (#92).
