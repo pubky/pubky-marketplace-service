@@ -95,6 +95,7 @@ and write. "Automation" means the inventory capability plus the
 | POST | `/v1/auth/grant-flows/{flow_id}/claim` | Grant-flow (Shop BFF). |
 | GET | `/v0/sellers/{pubky}/payment-config` | Public payment configuration of a seller. |
 | GET | `/v0/drops/{seller_pubky}/{drop_id}` | Public drop read. |
+| GET | `/v0/listings/{seller_pubky}/{listing_id}/availability` | Stock state of one listing, state only. See [Public listing availability](#public-listing-availability). |
 | POST | `/v0/address/suggest` | Address autocomplete. |
 | POST | `/v0/paypal/ipn` | PayPal IPN callback. Unauthenticated by nature; authenticity is the PayPal postback. See [paypal-refund-ipn.md](paypal-refund-ipn.md). |
 
@@ -344,8 +345,10 @@ The inventory error codes are listed with the [inventory endpoints](#inventory).
 
 ## Rate limits
 
-Two independent limiters exist. Neither emits `X-RateLimit-*` headers; the
-only signal is the `429` response and its `Retry-After` header.
+Two independent limiters guard the authenticated surfaces, and the public
+[listing availability](#public-listing-availability) read has its own
+per-client limiter. None emits `X-RateLimit-*` headers; the only signal is the
+`429` response and its `Retry-After` header.
 
 ### Automation limiter
 
@@ -389,6 +392,55 @@ with classes `inventory.adjust` and `inventory.read`.
 Capacity must be at most 20000. A `429` always carries `Retry-After: 1` and an
 inventory-shaped envelope with `limit_class`. An exact idempotent replay of an
 earlier adjustment returns its stored `200` before the limiter is consulted.
+
+### Public availability limiter
+
+`GET /v0/listings/{seller_pubky}/{listing_id}/availability` takes no bearer, so
+it is limited per client address instead. The limiter is an in-memory token
+bucket keyed by a salted hash of the address; nothing is persisted. Each
+request costs one token and a bucket holds 30. The client address is the last
+value of the trusted header named by `LISTING_AVAILABILITY_CLIENT_IP_HEADER`
+(falling back to `ADDRESS_SEARCH_CLIENT_IP_HEADER`) when it is set and valid,
+otherwise the socket peer. Set the header when the service sits behind a proxy,
+or every client shares the proxy's bucket.
+
+| Variable | Default | Range |
+| --- | --- | --- |
+| `LISTING_AVAILABILITY_CLIENT_PER_MINUTE` | 120 | 1..10000 |
+| `LISTING_AVAILABILITY_CLIENT_IP_HEADER` | unset | a header name |
+
+When the bucket is empty: `429` with `Retry-After: <integer seconds>`,
+`Cache-Control: no-store` and
+`{"ok":false,"error":{"code":"rate_limited","message":"..."}}`.
+
+## Public listing availability
+
+### `GET /v0/listings/{seller_pubky}/{listing_id}/availability`
+
+No bearer. It answers one question for a viewer whose session has lapsed: is
+another buyer holding this item. It exists because the full listing projection
+(`GET /v1/listings/{aggregate_id}`) is a session read.
+
+```json
+{
+  "aggregate_id": "listing:<pubky>_poster-01",
+  "state": "reserved",
+  "server_time": "2026-10-13T07:45:00.000Z"
+}
+```
+
+- `state` is the listing's stock state, `available`, `reserved` or `sold`. It
+  is the same `state` the projection carries. `reserved` means a buyer's
+  in-flight payment holds the last units; it returns to `available` when the
+  hold lapses or is cancelled.
+- Nothing else is exposed: no quantity, buyer, order, hold deadline or price.
+  An auction listing returns its stock state like any other.
+- `404 NOT_FOUND` for an unknown or tombstoned listing (a listing whose seller
+  deleted its record).
+- A `200` carries `Cache-Control: public, max-age=5`. A `404` and a `429` carry
+  `no-store`.
+- Rate limited per client; see
+  [Public availability limiter](#public-availability-limiter).
 
 ## Seller exports
 

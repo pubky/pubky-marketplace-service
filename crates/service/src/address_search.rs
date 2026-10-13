@@ -477,27 +477,37 @@ pub enum SearchError {
     Unavailable { retry_after_seconds: u64 },
 }
 
-struct Bucket {
+#[derive(Debug)]
+pub(crate) struct Bucket {
     tokens: f64,
     updated: DateTime<Utc>,
 }
 
 impl Bucket {
-    fn full(capacity: f64, now: DateTime<Utc>) -> Self {
+    pub(crate) fn full(capacity: f64, now: DateTime<Utc>) -> Self {
         Self {
             tokens: capacity,
             updated: now,
         }
     }
 
-    fn refill(&mut self, now: DateTime<Utc>, per_second: f64, capacity: f64) {
+    pub(crate) fn tokens(&self) -> f64 {
+        self.tokens
+    }
+
+    pub(crate) fn refill(&mut self, now: DateTime<Utc>, per_second: f64, capacity: f64) {
         let elapsed = (now - self.updated).num_milliseconds().max(0) as f64 / 1_000.0;
         self.tokens = (self.tokens + elapsed * per_second).min(capacity);
         self.updated = now;
     }
 
     /// Takes one token, or returns the whole seconds until one is available.
-    fn take(&mut self, now: DateTime<Utc>, per_second: f64, capacity: f64) -> Result<(), u64> {
+    pub(crate) fn take(
+        &mut self,
+        now: DateTime<Utc>,
+        per_second: f64,
+        capacity: f64,
+    ) -> Result<(), u64> {
         self.refill(now, per_second, capacity);
         if self.tokens >= 1.0 {
             self.tokens -= 1.0;
@@ -610,6 +620,26 @@ impl Drop for BreakerTicket<'_> {
             self.settle(&mut inner.breaker);
         }
     }
+}
+
+/// The client address a public limiter keys on: the configured trusted header
+/// (last value) when present and valid, else the socket peer.
+pub(crate) fn resolve_client_address(
+    header: Option<&HeaderName>,
+    headers: &HeaderMap,
+    peer: Option<IpAddr>,
+) -> String {
+    if let Some(name) = header {
+        let from_header = headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.rsplit(',').next())
+            .and_then(|value| value.trim().parse::<IpAddr>().ok());
+        if let Some(ip) = from_header {
+            return ip.to_string();
+        }
+    }
+    peer.map(|ip| ip.to_string()).unwrap_or_default()
 }
 
 pub struct AddressSearchRuntime {
@@ -725,17 +755,7 @@ impl AddressSearchRuntime {
     /// The client address the limiter keys on: the configured trusted header
     /// (last value) when present and valid, else the socket peer.
     pub fn client_address(&self, headers: &HeaderMap, peer: Option<IpAddr>) -> String {
-        if let Some(name) = &self.client_ip_header {
-            let from_header = headers
-                .get(name)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.rsplit(',').next())
-                .and_then(|value| value.trim().parse::<IpAddr>().ok());
-            if let Some(ip) = from_header {
-                return ip.to_string();
-            }
-        }
-        peer.map(|ip| ip.to_string()).unwrap_or_default()
+        resolve_client_address(self.client_ip_header.as_ref(), headers, peer)
     }
 
     fn cached(&self, key: &CacheKey, now: DateTime<Utc>) -> Option<Arc<Vec<Suggestion>>> {
@@ -1025,7 +1045,7 @@ pub fn runtime_from_env() -> anyhow::Result<Option<Arc<AddressSearchRuntime>>> {
     )?)))
 }
 
-fn env_u32(name: &str, default: u32) -> anyhow::Result<u32> {
+pub(crate) fn env_u32(name: &str, default: u32) -> anyhow::Result<u32> {
     match std::env::var(name).ok().filter(|v| !v.trim().is_empty()) {
         None => Ok(default),
         Some(raw) => raw

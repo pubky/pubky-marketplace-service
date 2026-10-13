@@ -185,6 +185,8 @@ Railway IaC `preserve()`):
 | `ADDRESS_SEARCH_CLIENT_IP_HEADER` | unset | name of a header set by a trusted edge that carries the client address (last value is used); unset keys the per-client limit on the socket peer |
 | `ADDRESS_SEARCH_CLIENT_PER_MINUTE` | `30` | sustained address searches per client per minute (burst 8), 1–10000 |
 | `ADDRESS_SEARCH_UPSTREAM_PER_SECOND` | `2` | address searches sent upstream per second across all clients (burst 3 seconds' worth), 1–10000 |
+| `LISTING_AVAILABILITY_CLIENT_IP_HEADER` | falls back to `ADDRESS_SEARCH_CLIENT_IP_HEADER` | name of a header set by a trusted edge that carries the client address (last value is used) for the per-client limit on `GET /v0/listings/{seller}/{listing_id}/availability`; with neither set the limit keys on the socket peer |
+| `LISTING_AVAILABILITY_CLIENT_PER_MINUTE` | `120` | sustained public availability reads per client per minute (burst 30), 1–10000 |
 | `SANDBOX_PAYMENTS_ENABLED` | `false` | accept `payment.sandbox_advance` at all; must stay `false` on any deployment handling real orders |
 | `PICKUP_DETAILS_ENCRYPTION_KEY` | unset | 32-byte hex key sealing local-pickup details and pinned payment snapshots at rest (XChaCha20-Poly1305); must differ from the Locks key material; pickup is OFF without it |
 | `PICKUP_DETAILS_ENCRYPTION_KEY_PREVIOUS` | unset | optional previous pickup key for the dual-key read window during rotation; the re-seal worker migrates both sealed families to the current key |

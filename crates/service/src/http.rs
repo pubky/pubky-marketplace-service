@@ -232,6 +232,13 @@ pub fn build_router(state: AppState) -> Router {
             "/v0/drops/{seller_pubky}/{drop_id}",
             get(queries::get_public_drop),
         )
+        // Public: the stock state of one listing (available, reserved or
+        // sold) and the server time, so a viewer without a session still sees
+        // another buyer's hold. State only; per-client rate limited.
+        .route(
+            "/v0/listings/{seller_pubky}/{listing_id}/availability",
+            get(queries::get_public_listing_availability),
+        )
         // Public: address autocomplete over OpenStreetMap data. The query is
         // a POST body, never logged, and never bound to a session.
         .route("/v0/address/suggest", post(crate::address_search::suggest))
