@@ -1528,7 +1528,8 @@ async fn upstream_auction_winner_activation_refused_after_reservation_lapses(poo
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn upstream_auction_payment_window_is_capped_at_reservation_expiry(pool: PgPool) {
     use marketplace_service::payment_methods::{
-        AUCTION_MIN_PAYMENT_WINDOW_SECONDS, UPSTREAM_HOLD_CLOCK_SKEW_SECONDS,
+        AUCTION_ACTIVATION_SLACK_SECONDS, AUCTION_MIN_PAYMENT_WINDOW_SECONDS,
+        UPSTREAM_HOLD_CLOCK_SKEW_SECONDS,
     };
     let (app, paykit) = test_app_with_upstream_paykit(pool.clone()).await;
     let seller = new_actor(&app).await;
@@ -1570,7 +1571,10 @@ async fn upstream_auction_payment_window_is_capped_at_reservation_expiry(pool: P
     // Less than the minimum useful window left: refused before any prepare.
     set_reservation_expiry(
         now + chrono::Duration::seconds(
-            AUCTION_MIN_PAYMENT_WINDOW_SECONDS + 2 * UPSTREAM_HOLD_CLOCK_SKEW_SECONDS - 1,
+            AUCTION_MIN_PAYMENT_WINDOW_SECONDS
+                + 2 * UPSTREAM_HOLD_CLOCK_SKEW_SECONDS
+                + AUCTION_ACTIVATION_SLACK_SECONDS
+                - 1,
         ),
     )
     .await;
@@ -1585,11 +1589,12 @@ async fn upstream_auction_payment_window_is_capped_at_reservation_expiry(pool: P
         "no request prepared"
     );
 
-    // 20 minutes left, below the configured window: the window ends one
-    // skew margin before the reservation, with one more for activation.
+    // 20 minutes left, below the configured window: the window ends two
+    // skew margins before the reservation, less the activation slack.
     let reservation_expires_at = now + chrono::Duration::seconds(1_200);
     set_reservation_expiry(reservation_expires_at).await;
-    let expected_window = 1_200 - 2 * UPSTREAM_HOLD_CLOCK_SKEW_SECONDS;
+    let expected_window =
+        1_200 - 2 * UPSTREAM_HOLD_CLOCK_SKEW_SECONDS - AUCTION_ACTIVATION_SLACK_SECONDS;
     assert!(expected_window < app.state.config.bitcoin_payment_window_seconds);
     let (status, body) = bind().await;
     assert_eq!(status, StatusCode::OK, "capped bind: {body}");
@@ -1635,6 +1640,123 @@ async fn upstream_auction_payment_window_is_capped_at_reservation_expiry(pool: P
         deadline.is_some_and(|deadline| deadline <= cap),
         "the request cannot outlive the reservation"
     );
+    assert!(
+        deadline
+            .zip(hold)
+            .is_some_and(|(deadline, hold)| deadline <= hold),
+        "the activated deadline fits the shown hold (no activation-bounds alert)"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn upstream_auction_activation_past_slack_voids_and_rebinds_with_less_time(pool: PgPool) {
+    use marketplace_service::payment_methods::{
+        AUCTION_ACTIVATION_SLACK_SECONDS, UPSTREAM_HOLD_CLOCK_SKEW_SECONDS,
+    };
+    let (app, paykit) = test_app_with_upstream_paykit(pool.clone()).await;
+    // A prepare TTL that outlasts the late drain below, so only the
+    // reservation bound can refuse it.
+    paykit.set_upstream_prepare_ttl_seconds(1_200);
+    // Postgres stores microseconds: truncate so windows are whole seconds.
+    app.clock.set(
+        chrono::DateTime::from_timestamp_micros(app.clock.now().timestamp_micros())
+            .expect("microsecond timestamp"),
+    );
+    let seller = new_actor(&app).await;
+    let winner = new_actor(&app).await;
+    let (order_id, aggregate) = auction_winning_order(&app, &seller, &winner, 1).await;
+    enable_bitcoin_for_review(&app, &paykit, &seller).await;
+    let reservation_expires_at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+        "SELECT expires_at FROM reservations WHERE listing_aggregate_id = $1 AND status = 'active'",
+    )
+    .bind(&aggregate)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let bind_path = format!("/v0/orders/{order_id}/payment-method");
+    let bind_body = json!({"method":"bitcoin"});
+    let windows = || {
+        paykit
+            .calls()
+            .into_iter()
+            .filter(|call| call.path == "/marketplace/payment-requests/prepare")
+            .map(|call| {
+                call.body["payment_window_seconds"]
+                    .as_i64()
+                    .expect("window")
+            })
+            .collect::<Vec<_>>()
+    };
+    let expected_window = |bind_at: chrono::DateTime<chrono::Utc>| {
+        (reservation_expires_at - bind_at).num_seconds()
+            - 2 * UPSTREAM_HOLD_CLOCK_SKEW_SECONDS
+            - AUCTION_ACTIVATION_SLACK_SECONDS
+    };
+
+    let first_bind_at = app.clock.now();
+    let (status, body) = send(
+        app.router.clone(),
+        "POST",
+        &bind_path,
+        Some(&winner.token),
+        &bind_body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "first bind: {body}");
+    assert_eq!(windows(), vec![expected_window(first_bind_at)]);
+
+    // The activation lands one second past the slack: refused, voided.
+    let client = app
+        .state
+        .payments
+        .as_ref()
+        .and_then(|payments| payments.paykit.as_ref());
+    let late = first_bind_at + chrono::Duration::seconds(AUCTION_ACTIVATION_SLACK_SECONDS + 1);
+    drain_outbox(&pool, client, late, 30).await.unwrap();
+    assert!(
+        paykit
+            .calls()
+            .iter()
+            .all(|call| call.path != "/marketplace/payment-requests/activate"),
+        "no signed activation left Marketplace"
+    );
+    let (activation, method): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT paykit_activation_state, payment_method FROM orders WHERE id = $1::uuid",
+    )
+    .bind(&order_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(activation.as_deref(), Some("voided"));
+    assert_eq!(method, None);
+    let reservation_status: String = sqlx::query_scalar(
+        "SELECT status FROM reservations WHERE listing_aggregate_id = $1 AND buyer_pubky = $2",
+    )
+    .bind(&aggregate)
+    .bind(&winner.pubky)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        reservation_status, "active",
+        "the void keeps the reservation"
+    );
+
+    // The winner binds again with the time left: a smaller window.
+    app.clock.set(late);
+    let (status, body) = send(
+        app.router.clone(),
+        "POST",
+        &bind_path,
+        Some(&winner.token),
+        &bind_body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "second bind: {body}");
+    let windows = windows();
+    assert_eq!(windows.len(), 2);
+    assert_eq!(windows[1], expected_window(late));
+    assert!(windows[1] < windows[0]);
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]

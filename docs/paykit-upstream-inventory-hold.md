@@ -33,9 +33,11 @@ Marketplace persists this deadline in the same transaction as the prepared invoi
 
 An auction winner's hold is its reservation (`AUCTION_HOLD_SECONDS` from close), not a bind hold, and that deadline never extends. The bind therefore caps the requested window:
 
-`payment_window_seconds = min(bitcoin_payment_window_seconds, reservation expires_at - bind time - 2 × 60 seconds)`
+`payment_window_seconds = min(bitcoin_payment_window_seconds, reservation expires_at - bind time - 2 × 60 seconds - AUCTION_ACTIVATION_SLACK_SECONDS)`
 
-It persists that window and caps the shown hold at `reservation expires_at - 60 seconds`. A winner with less than `AUCTION_MIN_PAYMENT_WINDOW_SECONDS` (300) left, or no active reservation, is refused the bitcoin bind (`auction_payment_window_too_short`). The activation guard requires the active reservation and `Marketplace time + persisted window + 60 seconds <= reservation expires_at`, so the payment deadline ends at least one skew margin before the reservation can be released; an activation that lands later than that is refused and the bind voided.
+`AUCTION_ACTIVATION_SLACK_SECONDS` (180) is the time the activation has to land after the bind, so one failed activate and its outbox lease retry fit.
+
+It persists that window and caps the shown hold at `reservation expires_at - 60 seconds`. A winner with less than `AUCTION_MIN_PAYMENT_WINDOW_SECONDS` (300) left, or no active reservation, is refused the bitcoin bind (`auction_payment_window_too_short`). The activation guard requires the active reservation and `Marketplace time + persisted window + 2 × 60 seconds <= reservation expires_at`, so activation passes for the slack after the bind, and Paykit's deadline (its activation clock, at most 60 seconds ahead, plus the window) still fits inside the shown hold and never trips the activation-bounds alert. An activation that lands later is refused and the bind voided; the reservation stays active and the winner can bind again with the time left.
 
 ## Activation guard and races
 
@@ -43,7 +45,7 @@ Before each signed upstream activation, worker locks payment then order and requ
 
 - order remains `pending_payment`;
 - activation remains `preparing`;
-- inventory remains held and the original hold has not elapsed (for an auction order: the active reservation outlasts the payment window plus 60 seconds);
+- inventory remains held and the original hold has not elapsed (for an auction order: the active reservation outlasts the payment window plus 2 × 60 seconds);
 - Marketplace time plus 60-second skew margin is before authoritative `prepare_expires_at`.
 
 A failed guard never sends activation. Existing prepared-invoice release handling records attempt for reconciliation, releases inventory atomically, and leaves producer prepare reaper/void handling to close unpublished invoice.
