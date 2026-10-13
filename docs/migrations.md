@@ -111,6 +111,15 @@ index on an existing table; it sets `lock_timeout` like 0050. A binary from
 before it lists its `orders` columns and ignores them. The asset, network and
 quote basis have no CHECK on purpose: a later value is not a migration.
 
+0054 (refund destinations) creates `order_refund_destinations` with its
+primary key and a foreign key to `orders`, and appends one refusal-audit
+command kind (`confirm_refund_destination`, 39). The table holds the
+Arbitrum One address a buyer confirmed for a USDT refund, one row per order.
+Its CHECKs fix the asset (`USDT`), the network (`arbitrum-one`), the address
+shape and the source (`buyer_entered`); a later source is a widened CHECK in
+a later migration. It builds no index on an existing table and sets
+`lock_timeout` like 0050.
+
 0058 (purge retired Stripe values) is one `UPDATE` that sets
 `seller_payment_configs.stripe_payment_link` and
 `stripe_restricted_key_ciphertext` to `NULL` for the rows that hold a value.
@@ -120,19 +129,18 @@ additive. Orders and payments bound to Stripe are not touched.
 
 ## Numbers claimed by open pull requests
 
-`main` has 0001 to 0053, then 0056 and 0058. Pull requests that are open when
+`main` has 0001 to 0054, then 0056 and 0058. Pull requests that are open when
 this was written claim the missing numbers, so a new migration must check the
 open list (`gh pr list`) and take the next free number rather than assume
-0054:
+0055:
 
 | Number | File | Pull request |
 | --- | --- | --- |
-| 0054 | `0054_refund_destinations.sql` | #101 (USDT refund destination, S6) |
 | 0055 | `0055_user_priv_key_custody_releases.sql` | #92 (`/priv` Phase 4) |
 | 0057 | `0057_encrypted_delivery_address.sql` | #110 (sealed delivery addresses) |
 
-#100 carries no migration. This table describes unmerged work and goes stale as
-pull requests land; trust `crates/service/migrations/` on `main` over it.
+This table describes unmerged work and goes stale as pull requests land; trust
+`crates/service/migrations/` on `main` over it.
 
 ## Sealed delivery addresses (0057)
 
@@ -140,5 +148,5 @@ pull requests land; trust `crates/service/migrations/` on `main` over it.
 and `orders.delivery_key_id`, two `NOT VALID`-then-`VALIDATE` constraints
 (the pair travels together at exactly 2,096 bytes and a 32-hex key id; a
 plaintext address and an envelope never share a row), and clears
-`delivery_address` on orders already in a final state. Numbers 0054 and 0055
-belong to open pull requests.
+`delivery_address` on orders already in a final state. Number 0055 belongs to an
+open pull request.
