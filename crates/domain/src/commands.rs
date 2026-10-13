@@ -2025,7 +2025,9 @@ fn validate_review_terms(
     }
 }
 
-fn validate_delivery_address(
+/// Trims and canonicalizes a plaintext delivery address in place. Issues name
+/// the field, never the value.
+pub fn validate_delivery_address(
     path: &str,
     address: &mut DeliveryAddress,
     issues: &mut Vec<ValidationIssue>,

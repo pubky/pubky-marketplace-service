@@ -10,7 +10,10 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use marketplace_domain::commands::{decode_delivery_envelope, DeliveryEnvelope};
+use marketplace_domain::commands::{
+    decode_delivery_envelope, validate_delivery_address, validate_delivery_envelope,
+    DeliveryAddress, DeliveryEnvelope,
+};
 use marketplace_domain::ErrorCode;
 
 use crate::refusal_audit::RefusalKind;
@@ -18,6 +21,10 @@ use crate::result::CommandFailure;
 
 pub const REASON_ENCRYPTED_REQUIRED: &str = "encrypted_delivery_required";
 pub const REASON_ENVELOPE_SELLERS: &str = "delivery_envelope_sellers";
+pub const REASON_ADDRESS_REQUIRED: &str = "delivery_address_required";
+pub const REASON_ADDRESS_NOT_ACCEPTED: &str = "delivery_address_not_accepted";
+pub const REASON_ADDRESS_INVALID: &str = "invalid_delivery_address";
+pub const REASON_ADDRESS_BOTH: &str = "delivery_address_and_envelope";
 
 /// An envelope ready to bind into the `orders` insert.
 #[derive(Clone)]
@@ -111,6 +118,91 @@ pub(crate) fn match_offer_envelope(
     envelope
         .map(|sealed| StoredEnvelope::from_wire(sealed).ok_or_else(malformed))
         .transpose()
+}
+
+/// A refusal of the delivery address an auction winner sends with the payment
+/// method. The messages are static: they never echo an address or envelope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WinnerDeliveryRefusal {
+    pub code: ErrorCode,
+    pub reason: &'static str,
+    pub message: &'static str,
+}
+
+impl WinnerDeliveryRefusal {
+    pub(crate) const REQUIRED: Self = Self {
+        code: ErrorCode::InvalidState,
+        reason: REASON_ADDRESS_REQUIRED,
+        message: "Send a delivery address before choosing a payment method for this auction order.",
+    };
+    pub(crate) const NOT_ACCEPTED: Self = Self {
+        code: ErrorCode::InvalidCommand,
+        reason: REASON_ADDRESS_NOT_ACCEPTED,
+        message:
+            "Only an auction winner's order takes its delivery address with the payment method.",
+    };
+    const PLAINTEXT: Self = Self {
+        code: ErrorCode::InvalidCommand,
+        reason: REASON_ENCRYPTED_REQUIRED,
+        message: "This deployment accepts only an encrypted delivery address.",
+    };
+    const BOTH: Self = Self {
+        code: ErrorCode::InvalidCommand,
+        reason: REASON_ADDRESS_BOTH,
+        message: "Send the delivery address or its envelope, not both.",
+    };
+    const INVALID: Self = Self {
+        code: ErrorCode::InvalidCommand,
+        reason: REASON_ADDRESS_INVALID,
+        message: "The delivery address is invalid.",
+    };
+}
+
+/// The delivery address an auction winner sends with the payment method,
+/// validated and ready to store: one of a plaintext address (legacy) or a
+/// sealed envelope.
+pub(crate) struct WinnerDelivery {
+    pub address: Option<serde_json::Value>,
+    pub envelope: Option<StoredEnvelope>,
+}
+
+/// An auction order is created at close, so its delivery address arrives
+/// with the winner's payment-method bind. Same rules as a checkout: one of
+/// address or envelope, never both, and a deployment that requires encrypted
+/// addresses refuses a plaintext one.
+pub(crate) fn match_winner_delivery(
+    address: Option<DeliveryAddress>,
+    envelope: Option<&DeliveryEnvelope>,
+    require_encrypted: bool,
+) -> Result<Option<WinnerDelivery>, WinnerDeliveryRefusal> {
+    match (address, envelope) {
+        (None, None) => Ok(None),
+        (Some(_), Some(_)) => Err(WinnerDeliveryRefusal::BOTH),
+        (Some(_), None) if require_encrypted => Err(WinnerDeliveryRefusal::PLAINTEXT),
+        (Some(mut address), None) => {
+            let mut issues = Vec::new();
+            validate_delivery_address("address", &mut address, &mut issues);
+            if !issues.is_empty() {
+                return Err(WinnerDeliveryRefusal::INVALID);
+            }
+            Ok(Some(WinnerDelivery {
+                address: Some(serde_json::to_value(address).expect("address serializes")),
+                envelope: None,
+            }))
+        }
+        (None, Some(sealed)) => {
+            let mut issues = Vec::new();
+            validate_delivery_envelope("envelope", &sealed.key_id, &sealed.envelope, &mut issues);
+            if !issues.is_empty() {
+                return Err(WinnerDeliveryRefusal::INVALID);
+            }
+            let stored = StoredEnvelope::from_wire(sealed).ok_or(WinnerDeliveryRefusal::INVALID)?;
+            Ok(Some(WinnerDelivery {
+                address: None,
+                envelope: Some(stored),
+            }))
+        }
+    }
 }
 
 /// Rows one purge tick clears; a larger backlog drains over the next ticks.

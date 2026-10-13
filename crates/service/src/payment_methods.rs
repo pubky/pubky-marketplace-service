@@ -29,6 +29,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use chrono::{DateTime, Utc};
+use marketplace_domain::commands::{DeliveryAddress, DeliveryEnvelope};
 use marketplace_domain::{ids, ErrorCode};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -714,10 +715,30 @@ async fn order_response(
     Ok((StatusCode::OK, Json(body)).into_response())
 }
 
-#[derive(Debug, Deserialize)]
+/// `delivery_address` or `delivery_address_envelope` is sent only by an
+/// auction winner, whose order is created at close without one; every other
+/// order took its address at checkout.
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BindPaymentMethodBody {
     method: String,
+    #[serde(default)]
+    delivery_address: Option<DeliveryAddress>,
+    #[serde(default)]
+    delivery_address_envelope: Option<DeliveryEnvelope>,
+}
+
+impl std::fmt::Debug for BindPaymentMethodBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BindPaymentMethodBody")
+            .field("method", &self.method)
+            .field("delivery_address", &self.delivery_address.is_some())
+            .field(
+                "delivery_address_envelope",
+                &self.delivery_address_envelope.is_some(),
+            )
+            .finish()
+    }
 }
 
 /// Where PayPal sends the buyer after commit or cancel: the order list of the
@@ -908,6 +929,14 @@ pub async fn bind_payment_method(
     if option == PaymentOption::PaykitUsdtArbitrumOne {
         return usdt_unavailable(&state, payments.paykit.as_ref().map(PaykitClient::api));
     }
+    let winner_delivery = match crate::handlers::delivery_envelope::match_winner_delivery(
+        body.delivery_address,
+        body.delivery_address_envelope.as_ref(),
+        state.config.require_encrypted_delivery_address,
+    ) {
+        Ok(delivery) => delivery,
+        Err(refusal) => return method_error(refusal.code, refusal.reason, refusal.message),
+    };
     // An order created before its listing was moderated is not payable: the
     // index is read before any attempt is spent or transaction opened, with
     // the same fail-open-with-ALERT semantics as the commands that sell.
@@ -1020,6 +1049,90 @@ pub async fn bind_payment_method(
             "locks_managed",
             "A Locks-correlated payment advances only by server-side verification.",
         );
+    }
+    // An auction winner's hold is the winning reservation, and its end is the
+    // order's deadline: the bind neither opens a new window nor reads the
+    // payment window as one. A bind after the reservation ended is refused.
+    let auction_hold_expires_at = match &order.auction_aggregate_id {
+        Some(auction_aggregate_id) => {
+            let reservation_end: Option<DateTime<Utc>> = match sqlx::query_scalar(
+                "SELECT expires_at FROM reservations \
+                 WHERE listing_aggregate_id = $1 AND buyer_pubky = $2 AND status = 'active' \
+                 ORDER BY expires_at DESC LIMIT 1 FOR UPDATE",
+            )
+            .bind(auction_aggregate_id)
+            .bind(&order.buyer_pubky)
+            .fetch_optional(&mut *tx)
+            .await
+            {
+                Ok(end) => end,
+                Err(error) => return internal("auction reservation lookup", &error),
+            };
+            match reservation_end.filter(|end| *end > now) {
+                Some(end) => Some(end),
+                None => {
+                    return method_error(
+                        ErrorCode::InvalidState,
+                        "auction_window_ended",
+                        "Your window to pay for this auction has ended.",
+                    )
+                }
+            }
+        }
+        None => None,
+    };
+    let takes_delivery_address = order.auction_aggregate_id.is_some()
+        && order.fulfillment == "shipping"
+        && order.state == "pending_payment";
+    match (&winner_delivery, takes_delivery_address) {
+        (Some(_), false) => {
+            let refusal = crate::handlers::delivery_envelope::WinnerDeliveryRefusal::NOT_ACCEPTED;
+            return method_error(refusal.code, refusal.reason, refusal.message);
+        }
+        (None, true) if !order.has_delivery_address() => {
+            let refusal = crate::handlers::delivery_envelope::WinnerDeliveryRefusal::REQUIRED;
+            return method_error(refusal.code, refusal.reason, refusal.message);
+        }
+        _ => {}
+    }
+    if let Some(auction_hold_expires_at) = auction_hold_expires_at {
+        let stored = match &winner_delivery {
+            Some(delivery) => {
+                sqlx::query(
+                    "UPDATE orders SET hold_expires_at = $2, delivery_address = $3, \
+                     delivery_address_envelope = $4, delivery_key_id = $5, \
+                     checkout_command_id = $6 WHERE id = $1",
+                )
+                .bind(order.id)
+                .bind(auction_hold_expires_at)
+                .bind(&delivery.address)
+                .bind(
+                    delivery
+                        .envelope
+                        .as_ref()
+                        .map(|stored| stored.bytes.as_slice()),
+                )
+                .bind(
+                    delivery
+                        .envelope
+                        .as_ref()
+                        .map(|stored| stored.key_id.as_str()),
+                )
+                .bind(delivery.envelope.as_ref().map(|_| order.id))
+                .execute(&mut *tx)
+                .await
+            }
+            None => {
+                sqlx::query("UPDATE orders SET hold_expires_at = $2 WHERE id = $1")
+                    .bind(order.id)
+                    .bind(auction_hold_expires_at)
+                    .execute(&mut *tx)
+                    .await
+            }
+        };
+        if let Err(error) = stored {
+            return internal("auction winner delivery update", &error);
+        }
     }
     // Stay on this transaction. A second pool checkout while other binds
     // already hold connections can exhaust the pool (PoolTimedOut → INTERNAL
@@ -1602,7 +1715,11 @@ pub async fn bind_payment_method(
                     .map(|_| expires_at),
             )
             .bind(paykit.api().as_str())
-            .bind(upstream_hold_expires_at)
+            .bind(if auction_hold_expires_at.is_some() {
+                None
+            } else {
+                upstream_hold_expires_at
+            })
             .bind(if paykit.api() == PaykitApi::Upstream {
                 Some(reference.parse::<Uuid>().expect("upstream reference is UUID"))
             } else {

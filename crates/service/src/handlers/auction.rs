@@ -488,7 +488,7 @@ pub async fn close_locked_auction(
             final_price.exponent,
             payment_id,
             false,
-            None,
+            Some(expires_at),
             "shipping".to_string(),
             now,
             "listing".to_string(),
@@ -497,9 +497,9 @@ pub async fn close_locked_auction(
             "INSERT INTO orders (id, auction_aggregate_id, buyer_pubky, seller_pubky, revision, \
              state, lines, delivery_address, subtotal_minor, shipping_minor, \
              total_minor, currency, exponent, payment_id, \
-             fulfillment, created_at, updated_at) \
+             fulfillment, hold_expires_at, created_at, updated_at) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, $8, $9, $10, $11, $12, $13, 'shipping', \
-             $14, $14)",
+             $15, $14, $14)",
         )
         .bind(order.id)
         .bind(&listing.aggregate_id)
@@ -515,6 +515,7 @@ pub async fn close_locked_auction(
         .bind(order.exponent)
         .bind(order.payment_id)
         .bind(now)
+        .bind(expires_at)
         .execute(&mut **tx)
         .await?;
 

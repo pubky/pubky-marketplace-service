@@ -23,7 +23,7 @@ use marketplace_service::bitcoin_review::{
 use marketplace_service::clock::Clock;
 use marketplace_service::payments::attempt_reference;
 use marketplace_service::workers::{
-    close_due_auctions, drain_outbox, expire_due_payment_windows, verify_due_locks_lifecycles,
+    drain_outbox, expire_due_payment_windows, verify_due_locks_lifecycles,
     verify_due_paykit_payments,
 };
 use serde_json::{json, Value};
@@ -1822,90 +1822,6 @@ async fn drop_late_paid_reacquires_or_refuses(pool: PgPool) {
     }
 }
 
-/// A SAT auction command fixture (the USD fixture's shape, priced in sats
-/// so the winner can bind bitcoin). Each auction gets a distinct listing id
-/// and command id, so several auctions can run in one test.
-fn register_sat_auction_command(
-    seller_pubky: &str,
-    listing_id: &str,
-    index: u64,
-    starts_at: DateTime<Utc>,
-) -> Value {
-    let mut command = register_listing_command(seller_pubky, listing_id, 1, index + 100);
-    command["payload"]["unit_price"] =
-        json!({ "amount_minor": 45_000, "currency": "SAT", "exponent": 0 });
-    command["payload"]["sale_format"] = json!("auction");
-    command["payload"]["auction_terms"] = json!({
-        "starts_at": marketplace_service::clock::format_timestamp(starts_at),
-        "ends_at": marketplace_service::clock::format_timestamp(
-            starts_at + chrono::Duration::seconds(600),
-        ),
-        "minimum_increment": { "amount_minor": 5_000, "currency": "SAT", "exponent": 0 },
-        "anti_sniping_window_seconds": 60,
-        "anti_sniping_extension_seconds": 120,
-    });
-    command["payload"]["auction_reserve"] = json!({
-        "expected_record_revision": 0,
-        "record_revision": 1,
-        "reserve_price": { "amount_minor": 45_000, "currency": "SAT", "exponent": 0 },
-    });
-    command
-}
-
-fn auction_listing(seller_pubky: &str, index: u64) -> (String, String) {
-    let listing_id = format!("auction_{index}");
-    (
-        listing_id.clone(),
-        format!("listing:{seller_pubky}_{listing_id}"),
-    )
-}
-
-/// Closes a SAT auction with one winning bid and returns the winner's
-/// order id plus the listing aggregate id.
-async fn auction_winning_order(
-    app: &TestApp,
-    seller: &TestActor,
-    winner: &TestActor,
-    index: u64,
-) -> (String, String) {
-    let (listing_id, aggregate) = auction_listing(&seller.pubky, index);
-    let (status, body) = execute(
-        app,
-        &seller.token,
-        &register_sat_auction_command(&seller.pubky, &listing_id, index, app.clock.now()),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "register auction: {body}");
-    let bid = json!({
-        "version": 1,
-        "command_id": indexed_command_id(0x8001, index),
-        "aggregate_id": aggregate,
-        "expected_revision": 1,
-        "issued_at": "2026-08-19T22:00:00.000Z",
-        "kind": "auction.place_bid",
-        "payload": {
-            "maximum_amount": { "amount_minor": 100_000, "currency": "SAT", "exponent": 0 },
-        },
-    });
-    let (status, body) = execute(app, &winner.token, &bid).await;
-    assert_eq!(status, StatusCode::OK, "bid: {body}");
-    app.clock.advance_seconds(660);
-    let closed = close_due_auctions(&app.pool, app.clock.now())
-        .await
-        .expect("close runs");
-    assert_eq!(closed.closed, 1, "the auction closed");
-    assert_eq!(closed.failed, 0, "the auction close did not fail");
-    let (order_id,): (String,) = sqlx::query_as(
-        "SELECT id::text FROM orders WHERE auction_aggregate_id = $1 AND buyer_pubky = $2",
-    )
-    .bind(&aggregate)
-    .bind(&winner.pubky)
-    .fetch_one(&app.pool)
-    .await
-    .expect("winning order");
-    (order_id, aggregate)
-}
-
 /// Auction cells: the reservation is extended at entry and PRESERVED
 /// through manual_review; a paid resolution converts it; an abandoned one
 /// releases it. The lapsed-reservation entry class reacquires or 409s.
@@ -1924,7 +1840,13 @@ async fn auction_entries_resolve_through_the_reservation(pool: PgPool) {
         "POST",
         &format!("/v0/orders/{order_id}/payment-method"),
         Some(&winner.token),
-        &json!({ "method": "bitcoin" }),
+        &json!({
+            "method": "bitcoin",
+            "delivery_address_envelope": {
+                "key_id": TEST_DELIVERY_KEY_ID,
+                "envelope": test_envelope(7),
+            },
+        }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "bind: {body}");
@@ -2013,7 +1935,13 @@ async fn auction_entries_resolve_through_the_reservation(pool: PgPool) {
         "POST",
         &format!("/v0/orders/{order_id}/payment-method"),
         Some(&winner.token),
-        &json!({ "method": "bitcoin" }),
+        &json!({
+            "method": "bitcoin",
+            "delivery_address_envelope": {
+                "key_id": TEST_DELIVERY_KEY_ID,
+                "envelope": test_envelope(7),
+            },
+        }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "bind: {body}");
@@ -2075,7 +2003,13 @@ async fn auction_entries_resolve_through_the_reservation(pool: PgPool) {
         "POST",
         &format!("/v0/orders/{order_id}/payment-method"),
         Some(&winner.token),
-        &json!({ "method": "bitcoin" }),
+        &json!({
+            "method": "bitcoin",
+            "delivery_address_envelope": {
+                "key_id": TEST_DELIVERY_KEY_ID,
+                "envelope": test_envelope(7),
+            },
+        }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "bind: {body}");
