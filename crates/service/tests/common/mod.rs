@@ -3707,7 +3707,7 @@ pub async fn test_app_with_paykit_api_config(
     config: Config,
     api: PaykitApi,
 ) -> (TestApp, FakePaykit) {
-    let (app, paykit, _ipn, _shippo) = test_app_with_payments_api(pool, config, api).await;
+    let (app, paykit, _ipn) = test_app_with_payments_api(pool, config, api).await;
     (app, paykit)
 }
 

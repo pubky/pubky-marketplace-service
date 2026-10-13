@@ -333,8 +333,7 @@ async fn a_paypal_bind_is_the_same_with_the_flag_on_and_off(pool: PgPool) {
     for flag in [false, true] {
         let mut config = Config::for_tests();
         config.usdt_payments_enabled = flag;
-        let (app, _paykit, _ipn, _shippo) =
-            test_app_with_payments_config(pool.clone(), config).await;
+        let (app, _paykit, _ipn) = test_app_with_payments_config(pool.clone(), config).await;
         let seller = new_actor(&app).await;
         let buyer = new_actor(&app).await;
         let (status, body) = send(
