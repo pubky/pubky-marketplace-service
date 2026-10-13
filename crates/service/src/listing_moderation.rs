@@ -1,11 +1,13 @@
-//! Moderation gate for the commands that sell a listing.
+//! Moderation gate for the commands and requests that sell a listing.
 //!
 //! The marketplace index (Nexus) applies pubky.app's moderation: a listing
 //! the moderator tagged, or whose seller the moderator tagged, is out of the
 //! index. The index reports that state at
 //! `GET {NEXUS_URL}/v0/listing/{seller}/{listing_id}/moderation`. Before the
 //! service accepts a checkout, a bid or an offer on a listing it asks, and
-//! refuses with `LISTING_MODERATED` when the answer is moderated.
+//! refuses with `LISTING_MODERATED` when the answer is moderated. An order
+//! created before the listing was moderated is gated again where its payment
+//! starts: the payment-method bind and the Locks payment preparation.
 //!
 //! The index is read, never trusted for anything else: it is not the
 //! transaction authority (ADR 0019), so an unreachable or unusable index is
@@ -28,6 +30,7 @@ use marketplace_domain::commands::{Command, CommandPayload};
 use serde::Deserialize;
 use sqlx::PgPool;
 use url::Url;
+use uuid::Uuid;
 
 /// The index base URL. Required: the service refuses to boot without it, so
 /// a deployment never sells without a moderation check by omission.
@@ -159,11 +162,16 @@ pub const LISTING_MODERATED_MESSAGE: &str =
 /// not registered (the handler refuses those itself).
 ///
 /// The commands are `checkout.create`, `offer.checkout`, `offer.create`,
-/// `offer.counter`, `offer.accept` and `auction.place_bid`. Withdrawing or
-/// rejecting an offer and closing an auction stay open: they wind a
-/// negotiation down and sell nothing.
+/// `offer.counter`, `offer.accept`, `auction.place_bid`, and
+/// `payment.prepare_locks`, which starts a Locks payment on an existing
+/// order. Only the first preparation is gated: once the payment is pinned to
+/// Locks, `payment.register_locks` and any later preparation stay open so
+/// money already in flight is never stranded. Withdrawing or rejecting an
+/// offer and closing an auction stay open: they wind a negotiation down and
+/// sell nothing.
 pub async fn listings_a_command_sells(
     pool: &PgPool,
+    actor: &str,
     command: &Command,
 ) -> Result<Vec<(String, String)>, sqlx::Error> {
     match &command.payload {
@@ -199,8 +207,49 @@ pub async fn listings_a_command_sells(
             .fetch_all(pool)
             .await
         }
+        CommandPayload::PrepareLocks(payload) => {
+            sqlx::query_as(
+                "SELECT DISTINCT l.seller_pubky, l.listing_id \
+                 FROM payments p \
+                 JOIN orders o ON o.id = p.order_id \
+                 CROSS JOIN LATERAL jsonb_array_elements(o.lines) AS line \
+                 JOIN listings l ON l.aggregate_id = line ->> 'listing_aggregate_id' \
+                 WHERE p.id = $1 AND p.buyer_pubky = $2 AND o.state = 'pending_payment' \
+                   AND p.state = 'awaiting_entitlement' AND p.adapter <> 'locks' \
+                 ORDER BY l.seller_pubky, l.listing_id",
+            )
+            .bind(payload.payment_id)
+            .bind(actor)
+            .fetch_all(pool)
+            .await
+        }
         _ => Ok(Vec::new()),
     }
+}
+
+/// The `(seller_pubky, listing_id)` of every listing on an order that is
+/// about to have a payment method bound, for the buyer's own order only.
+/// Empty when the order is not the buyer's, is no longer awaiting a payment
+/// method, or already has one (a re-bind of the bound method sells nothing
+/// new), so the existing bind answers those cases itself.
+pub async fn listings_a_bind_sells(
+    pool: &PgPool,
+    order_id: Uuid,
+    buyer_pubky: &str,
+) -> Result<Vec<(String, String)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT DISTINCT l.seller_pubky, l.listing_id \
+         FROM orders o \
+         CROSS JOIN LATERAL jsonb_array_elements(o.lines) AS line \
+         JOIN listings l ON l.aggregate_id = line ->> 'listing_aggregate_id' \
+         WHERE o.id = $1 AND o.buyer_pubky = $2 \
+           AND o.state = 'pending_payment' AND o.payment_method IS NULL \
+         ORDER BY l.seller_pubky, l.listing_id",
+    )
+    .bind(order_id)
+    .bind(buyer_pubky)
+    .fetch_all(pool)
+    .await
 }
 
 /// The decision for one listing.

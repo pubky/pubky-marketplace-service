@@ -511,6 +511,250 @@ async fn commands_that_sell_nothing_never_ask_the_index(pool: PgPool) {
     assert_eq!(index.lookups(), 0, "registering a listing is not a sale");
 }
 
+/// A payments-enabled app whose bind passes the moderation gate over `index`.
+async fn moderated_payments_app(pool: PgPool) -> (TestApp, Arc<FakeIndex>, common::FakePaykit) {
+    let (mut app, paykit) = common::test_app_with_payments(pool).await;
+    let index = Arc::new(FakeIndex::default());
+    let gate = ListingModerationGate::with_moderated_ttl(index.clone(), Duration::ZERO);
+    app.state = app
+        .state
+        .clone()
+        .with_listing_moderation(Some(Arc::new(gate)));
+    app.router = build_router(app.state.clone());
+    (app, index, paykit)
+}
+
+async fn bind(app: &TestApp, token: &str, order_id: &str, method: &str) -> (StatusCode, Value) {
+    common::send(
+        app.router.clone(),
+        "POST",
+        &format!("/v0/orders/{order_id}/payment-method"),
+        Some(token),
+        &json!({ "method": method }),
+    )
+    .await
+}
+
+fn assert_bind_moderated_refusal(status: StatusCode, body: &Value) {
+    assert_eq!(status, StatusCode::CONFLICT, "expected a refusal: {body}");
+    assert_eq!(body["ok"], json!(false));
+    assert_eq!(body["error"]["code"], json!("LISTING_MODERATED"));
+    assert_eq!(body["error"]["reason"], json!("listing_moderated"));
+    assert_eq!(body["error"]["message"], json!(MODERATED_MESSAGE));
+}
+
+/// Registers a SAT-priced listing, enables Bitcoin and PayPal for the seller
+/// and checks out while the listing is clear, leaving a pending order.
+async fn pending_sat_order(
+    app: &TestApp,
+    paykit: &common::FakePaykit,
+    seller: &TestActor,
+    buyer: &TestActor,
+) -> common::PendingOrder {
+    let (status, body) = common::send(
+        app.router.clone(),
+        "PUT",
+        "/v0/sellers/me/payment-config",
+        Some(&seller.token),
+        &json!({ "bitcoin_enabled": true, "paypal_merchant_email": "merchant@example.com" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "payment config failed: {body}");
+    paykit.set_claimed(&seller.pubky);
+    let (status, body) = execute(
+        app,
+        &seller.token,
+        &common::register_sat_command(&seller.pubky, 2),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "register fixture failed: {body}");
+    let (status, body) = execute(app, &buyer.token, &checkout_command(&seller.pubky)).await;
+    assert_eq!(status, StatusCode::OK, "checkout fixture failed: {body}");
+    common::PendingOrder {
+        order_id: body["result"]["orders"][0]["id"]
+            .as_str()
+            .expect("order id")
+            .to_string(),
+        payment_id: body["result"]["payments"][0]["id"]
+            .as_str()
+            .expect("payment id")
+            .to_string(),
+    }
+}
+
+async fn order_is_unbound_and_unheld(app: &TestApp, order_id: &str) {
+    let (method, attempt, hold): (Option<String>, i32, Option<chrono::DateTime<chrono::Utc>>) =
+        sqlx::query_as(
+            "SELECT payment_method, paykit_bind_attempt, hold_expires_at FROM orders \
+             WHERE id = $1::uuid",
+        )
+        .bind(order_id)
+        .fetch_one(&app.pool)
+        .await
+        .expect("order row");
+    assert_eq!(method, None, "the refused bind left a method on the order");
+    assert_eq!(attempt, 0, "the refused bind spent a Paykit attempt");
+    assert_eq!(hold, None, "the refused bind armed a hold");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_moderation_landing_between_checkout_and_bind_refuses_the_bind(pool: PgPool) {
+    let (app, index, paykit) = moderated_payments_app(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = pending_sat_order(&app, &paykit, &seller, &buyer).await;
+    assert_eq!(index.lookups(), 1, "only the checkout asked so far");
+
+    // The race: the listing was clear when the order was created and is
+    // moderated before the buyer chooses how to pay.
+    index.moderate(&seller.pubky, "boots_01");
+    for method in ["bitcoin", "paypal"] {
+        let (status, body) = bind(&app, &buyer.token, &order.order_id, method).await;
+        assert_bind_moderated_refusal(status, &body);
+    }
+    order_is_unbound_and_unheld(&app, &order.order_id).await;
+    assert!(paykit.requests().is_empty(), "no Paykit request was made");
+    assert_eq!(
+        count(
+            &app.pool,
+            "SELECT COUNT(*) FROM outbox WHERE kind = 'paykit.activate'"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        count(
+            &app.pool,
+            "SELECT COUNT(*) FROM orders WHERE state = 'pending_payment'"
+        )
+        .await,
+        1,
+        "the order itself is not cancelled by the refusal"
+    );
+
+    // Lifted, the same order binds
+    index.lift(&seller.pubky, "boots_01");
+    let (status, body) = bind(&app, &buyer.token, &order.order_id, "bitcoin").await;
+    assert_eq!(status, StatusCode::OK, "bind failed after the lift: {body}");
+    assert_eq!(body["order"]["payment_method"], json!("bitcoin"));
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_rebind_of_the_bound_method_and_other_actors_never_ask_the_index(pool: PgPool) {
+    let (app, index, paykit) = moderated_payments_app(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let stranger = new_actor(&app).await;
+    let order = pending_sat_order(&app, &paykit, &seller, &buyer).await;
+
+    // A stranger is told what they are told without a moderation lookup
+    let lookups = index.lookups();
+    index.moderate(&seller.pubky, "boots_01");
+    let (status, body) = bind(&app, &stranger.token, &order.order_id, "paypal").await;
+    assert_ne!(
+        body["error"]["code"],
+        json!("LISTING_MODERATED"),
+        "a non-buyer must not learn the moderation state: {body}"
+    );
+    assert_ne!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(index.lookups(), lookups);
+
+    // Once bound, moderation does not strand the buyer's own re-read
+    index.lift(&seller.pubky, "boots_01");
+    let (status, body) = bind(&app, &buyer.token, &order.order_id, "bitcoin").await;
+    assert_eq!(status, StatusCode::OK, "bind failed: {body}");
+    index.moderate(&seller.pubky, "boots_01");
+    let lookups = index.lookups();
+    let (status, body) = bind(&app, &buyer.token, &order.order_id, "bitcoin").await;
+    assert_eq!(status, StatusCode::OK, "re-bind was refused: {body}");
+    assert_eq!(index.lookups(), lookups, "a re-bind never asks the index");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_bind_during_an_index_outage_fails_open_with_an_alert_unless_known_moderated(
+    pool: PgPool,
+) {
+    install_log_capture();
+    let (app, index, paykit) = moderated_payments_app(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = pending_sat_order(&app, &paykit, &seller, &buyer).await;
+
+    // Known moderated, then the index goes down: still refused, alerted
+    index.moderate(&seller.pubky, "boots_01");
+    let (status, body) = bind(&app, &buyer.token, &order.order_id, "paypal").await;
+    assert_bind_moderated_refusal(status, &body);
+    index.set_unavailable(true);
+    let (status, body) = bind(&app, &buyer.token, &order.order_id, "paypal").await;
+    assert_bind_moderated_refusal(status, &body);
+    assert!(
+        captured_logs().contains("ALERT the index could not confirm a moderated listing"),
+        "the stale refusal must be alerted"
+    );
+    order_is_unbound_and_unheld(&app, &order.order_id).await;
+
+    // Never seen moderated and the index is down: the bind goes through
+    let other_seller = new_actor(&app).await;
+    let other_buyer = new_actor(&app).await;
+    let other = pending_sat_order(&app, &paykit, &other_seller, &other_buyer).await;
+    let (status, body) = bind(&app, &other_buyer.token, &other.order_id, "bitcoin").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "bind failed during the outage: {body}"
+    );
+    assert!(
+        captured_logs().contains("ALERT the index moderation lookup is unavailable"),
+        "the outage must be alerted"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn locks_payment_preparation_on_a_moderated_listing_is_refused(pool: PgPool) {
+    let (mut app, _fake) = common::test_app_with_locks(pool).await;
+    let index = Arc::new(FakeIndex::default());
+    let gate = ListingModerationGate::with_moderated_ttl(index.clone(), Duration::ZERO);
+    app.state = app
+        .state
+        .clone()
+        .with_listing_moderation(Some(Arc::new(gate)));
+    app.router = build_router(app.state.clone());
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = common::create_pending_order(&app, &seller, &buyer).await;
+
+    index.moderate(&seller.pubky, "boots_01");
+    let command = common::prepare_locks_command(&order.payment_id, 120);
+    let (status, body) = execute(&app, &buyer.token, &command).await;
+    assert_moderated_refusal(status, &body);
+    let adapter: String = sqlx::query_scalar("SELECT adapter FROM payments WHERE id = $1::uuid")
+        .bind(&order.payment_id)
+        .fetch_one(&app.pool)
+        .await
+        .expect("payment row");
+    assert_ne!(adapter, "locks", "the refused preparation pinned Locks");
+
+    // Lifted, the preparation goes through; moderated again afterwards, the
+    // payment already in flight is not stranded by a later registration.
+    index.lift(&seller.pubky, "boots_01");
+    let (status, body) = execute(&app, &buyer.token, &command).await;
+    assert_eq!(status, StatusCode::OK, "preparation failed: {body}");
+    index.moderate(&seller.pubky, "boots_01");
+    let lookups = index.lookups();
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &common::prepare_locks_command(&order.payment_id, 121),
+    )
+    .await;
+    assert_ne!(
+        body["error"]["code"],
+        json!("LISTING_MODERATED"),
+        "a payment already pinned to Locks is not gated again: {status} {body}"
+    );
+    assert_eq!(index.lookups(), lookups);
+}
+
 /// The production client against a local index: the path, the `moderated`
 /// field, and every answer that is not a usable verdict.
 #[tokio::test]

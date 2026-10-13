@@ -314,7 +314,10 @@ request failed, so clients should branch on HTTP status first, and parse
    A command error may also carry `issues` and `reason` fields.
 
    `LISTING_MODERATED` refuses `checkout.create`, `offer.checkout`,
-   `offer.create`, `offer.counter`, `offer.accept` and `auction.place_bid`
+   `offer.create`, `offer.counter`, `offer.accept`, `auction.place_bid` and
+   the first `payment.prepare_locks` of a payment, and it refuses
+   `POST /v0/orders/{id}/payment-method` (with `reason: "listing_moderated"`)
+   on an order whose listing was moderated after the order was created,
    when the marketplace index reports the listing, or its seller, as
    moderated (see [Listing moderation](../README.md#listing-moderation)). It is a
    409, not a 403, because clients read a 403 on a command as a session problem.

@@ -57,7 +57,8 @@ pub async fn execute(
     // id that already has a stored result is a replay and is answered from it.
     if let Some(gate) = state.listing_moderation.as_deref() {
         let listings =
-            crate::listing_moderation::listings_a_command_sells(&state.pool, &command).await?;
+            crate::listing_moderation::listings_a_command_sells(&state.pool, actor, &command)
+                .await?;
         if !listings.is_empty()
             && stored_command_result(&state.pool, actor, command.command_id)
                 .await?
