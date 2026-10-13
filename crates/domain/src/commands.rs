@@ -595,9 +595,9 @@ pub struct CreateCheckoutPayload {
     /// email-kind; the handler refuses it otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery_email: Option<DeliveryEmail>,
-    /// Legacy field. Clients that still send it must send `1`; it is no
-    /// longer required, and the service attaches no policy to an order whose
-    /// command omits it.
+    /// Retired field. A client that still sends it must send `1`; it is
+    /// accepted for compatibility and otherwise ignored: the service neither
+    /// stores nor projects it. Do not read it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guarantee_policy_version: Option<u32>,
 }

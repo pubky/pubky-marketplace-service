@@ -386,9 +386,7 @@ async fn a_seller_who_never_saved_gets_the_usdt_fields_without_a_stored_row(pool
         body["payment_config"],
         json!({
             "bitcoin_enabled": false,
-            "stripe_payment_link": null,
             "paypal_merchant_email": null,
-            "stripe_restricted_key_set": false,
             "updated_at": EPOCH,
             "usdt_enabled": false,
             "usdt_setup": "setup_required",
@@ -578,11 +576,12 @@ async fn the_flag_on_body_refuses_stripe_values_and_stores_nothing(pool: PgPool)
     );
     let (status, body) = put(&app, &seller.token, &accepted).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["payment_config"]["stripe_payment_link"], Value::Null);
-    assert_eq!(
-        body["payment_config"]["stripe_restricted_key_set"],
-        json!(false)
-    );
+    for retired in ["stripe_payment_link", "stripe_restricted_key_set"] {
+        assert!(
+            body["payment_config"].get(retired).is_none(),
+            "`{retired}` present: {body}"
+        );
+    }
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
@@ -988,13 +987,7 @@ async fn readiness_is_cached_per_seller_and_asset(pool: PgPool) {
 // Flag off and the fork
 // ---------------------------------------------------------------------------
 
-const RAIL_KEYS: [&str; 5] = [
-    "bitcoin_enabled",
-    "paypal_merchant_email",
-    "stripe_payment_link",
-    "stripe_restricted_key_set",
-    "updated_at",
-];
+const RAIL_KEYS: [&str; 3] = ["bitcoin_enabled", "paypal_merchant_email", "updated_at"];
 
 fn keys(value: &Value) -> Vec<String> {
     let mut keys: Vec<String> = value.as_object().expect("object").keys().cloned().collect();

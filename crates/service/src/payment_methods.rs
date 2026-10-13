@@ -172,9 +172,7 @@ pub struct PutPaymentConfigUsdtBody {
     usdt_enabled: Option<bool>,
 }
 
-/// The seller's own view. `stripe_payment_link` (always null) and
-/// `stripe_restricted_key_set` (always false) are retired Stripe fields kept
-/// only because a Shop that has not yet dropped them requires both keys.
+/// The seller's own view.
 fn config_view(
     bitcoin_enabled: bool,
     paypal_merchant_email: &Option<String>,
@@ -183,9 +181,7 @@ fn config_view(
 ) -> Value {
     let mut view = json!({
         "bitcoin_enabled": bitcoin_enabled,
-        "stripe_payment_link": Value::Null,
         "paypal_merchant_email": paypal_merchant_email,
-        "stripe_restricted_key_set": false,
         "updated_at": format_timestamp(updated_at),
     });
     // Only while the USDT flag is on, so every other body is byte-identical

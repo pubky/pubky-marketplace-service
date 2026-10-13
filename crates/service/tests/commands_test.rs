@@ -320,7 +320,7 @@ async fn creates_immutable_checkout_snapshot_order_and_sandbox_payment(pool: PgP
     // The total is exactly the listed price plus the seller-signed flat
     // shipping from the registration payload — nothing else is added.
     assert_eq!(order["total"]["amount_minor"], json!(13_700));
-    assert_eq!(order["guarantee_policy_version"], json!(1));
+    assert!(order.get("guarantee_policy_version").is_none(), "{order}");
     let line = &order["lines"][0];
     assert_eq!(line["listing_revision"], json!(1));
     assert_eq!(line["content_hash"], json!("a".repeat(64)));

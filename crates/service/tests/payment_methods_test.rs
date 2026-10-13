@@ -149,21 +149,22 @@ async fn payment_config_upserts_and_clears_retired_stripe_values(pool: PgPool) {
         config["paypal_merchant_email"],
         json!("merchant@example.com")
     );
-    // The retired Stripe fields stay in the own view as constants, because a
-    // Shop that has not dropped them yet requires both keys.
-    assert_eq!(config["stripe_payment_link"], Value::Null);
-    assert_eq!(config["stripe_restricted_key_set"], json!(false));
+    // The retired Stripe fields are not part of the own view.
+    for retired in ["stripe_payment_link", "stripe_restricted_key_set"] {
+        assert!(config.get(retired).is_none(), "`{retired}` present: {body}");
+    }
 
     // Stripe values stored before the rail was removed are never reported
     // and are cleared by the seller's next save.
     seed_legacy_stripe_values(&pool, &seller.pubky).await;
     let (status, body) = get_own_config(&app, Some(&seller.token)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["payment_config"]["stripe_payment_link"], Value::Null);
-    assert_eq!(
-        body["payment_config"]["stripe_restricted_key_set"],
-        json!(false)
-    );
+    for retired in ["stripe_payment_link", "stripe_restricted_key_set"] {
+        assert!(
+            body["payment_config"].get(retired).is_none(),
+            "`{retired}` present: {body}"
+        );
+    }
     assert!(!body.to_string().contains("stripe.com"), "{body}");
     assert!(legacy_stripe_values_stored(&pool, &seller.pubky).await);
 

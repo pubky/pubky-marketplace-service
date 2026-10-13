@@ -486,7 +486,6 @@ pub async fn close_locked_auction(
             total_minor,
             final_price.currency.clone(),
             final_price.exponent,
-            Some(1),
             payment_id,
             false,
             None,
@@ -497,10 +496,10 @@ pub async fn close_locked_auction(
         sqlx::query(
             "INSERT INTO orders (id, auction_aggregate_id, buyer_pubky, seller_pubky, revision, \
              state, lines, delivery_address, subtotal_minor, shipping_minor, \
-             total_minor, currency, exponent, guarantee_policy_version, payment_id, \
+             total_minor, currency, exponent, payment_id, \
              fulfillment, created_at, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, $8, $9, $10, $11, $12, $13, $14, 'shipping', \
-             $15, $15)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, $8, $9, $10, $11, $12, $13, 'shipping', \
+             $14, $14)",
         )
         .bind(order.id)
         .bind(&listing.aggregate_id)
@@ -514,7 +513,6 @@ pub async fn close_locked_auction(
         .bind(order.total_minor)
         .bind(&order.currency)
         .bind(order.exponent)
-        .bind(order.guarantee_policy_version)
         .bind(order.payment_id)
         .bind(now)
         .execute(&mut **tx)

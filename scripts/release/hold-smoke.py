@@ -131,8 +131,8 @@ ENVELOPE_KEYS = {
     "kind",
     "payload",
 }
-SHIPPING_PAYLOAD_KEYS = {"lines", "delivery_address", "guarantee_policy_version"}
-PICKUP_PAYLOAD_KEYS = {"lines", "guarantee_policy_version"}
+SHIPPING_PAYLOAD_KEYS = {"lines", "delivery_address"}
+PICKUP_PAYLOAD_KEYS = {"lines"}
 ADDRESS_KEYS = {"name", "line1", "line2", "city", "region", "postal_code", "country_code"}
 LINE_KEYS = {"listing_aggregate_id", "expected_revision", "quantity", "variant_id", "fulfillment"}
 # The variant id production Shop sent for a single-variant listing (order
@@ -144,7 +144,7 @@ DIGITAL_KINDS = ("file", "link", "text", "email", "message")
 # The address the email-kind case checks out with. The service seals it and
 # the unpaid-checkout purge deletes it after BUYER_EMAIL_UNPAID_RETENTION_DAYS.
 DIGITAL_SMOKE_EMAIL = "hold-smoke.digital@example.com"
-DIGITAL_PAYLOAD_KEYS = {"lines", "guarantee_policy_version"}
+DIGITAL_PAYLOAD_KEYS = {"lines"}
 
 
 def refuse_production(url: str, project: str) -> None:
@@ -188,10 +188,7 @@ def checkout_body(
         "variant_id": SHOP_VARIANT_ID,
         "fulfillment": fulfillment,
     }
-    payload: dict[str, Any] = {
-        "lines": [line],
-        "guarantee_policy_version": 1,
-    }
+    payload: dict[str, Any] = {"lines": [line]}
     if fulfillment == "shipping":
         if address is None:
             raise RuntimeError("shipping checkout requires delivery_address")

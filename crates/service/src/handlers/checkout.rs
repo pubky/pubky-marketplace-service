@@ -416,9 +416,6 @@ pub async fn handle(
             total_minor,
             currency.clone(),
             exponent,
-            payload
-                .guarantee_policy_version
-                .map(|version| version as i32),
             payment_id,
             stock_held,
             hold_expires_at,
@@ -433,10 +430,10 @@ pub async fn handle(
             "INSERT INTO orders (id, checkout_command_id, drop_aggregate_id, buyer_pubky, \
              seller_pubky, revision, state, lines, delivery_address, subtotal_minor, \
              shipping_minor, total_minor, currency, exponent, \
-             guarantee_policy_version, payment_id, stock_held, hold_expires_at, hold_source, \
+             payment_id, stock_held, hold_expires_at, hold_source, \
              fulfillment, created_at, updated_at, delivery_address_envelope, delivery_key_id) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, \
-             $18, $19, $20, $21, $21, $22, $23)",
+             $18, $19, $20, $20, $21, $22)",
         )
         .bind(order.id)
         .bind(command.command_id)
@@ -456,7 +453,6 @@ pub async fn handle(
         .bind(order.total_minor)
         .bind(&order.currency)
         .bind(order.exponent)
-        .bind(order.guarantee_policy_version)
         .bind(order.payment_id)
         .bind(order.stock_held)
         .bind(order.hold_expires_at)

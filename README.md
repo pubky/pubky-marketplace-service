@@ -258,10 +258,8 @@ values from the authenticated `GET /v0/sellers/me/payment-config`.
 Stripe is not a payment method: the service has no Stripe client, binding
 `stripe` answers `invalid_method`, and `PUT /v0/sellers/me/payment-config`
 answers `stripe_removed` to a non-empty `stripe_payment_link` or
-`stripe_restricted_key`. Two retired fields remain in the seller's own view
-only because a Shop that predates the removal requires them:
-`stripe_payment_link` is always `null` and `stripe_restricted_key_set` is
-always `false`; they go once the Shop stops reading them. The columns
+`stripe_restricted_key`. The seller's own view no longer carries
+`stripe_payment_link` or `stripe_restricted_key_set`. The columns
 `seller_payment_configs.stripe_payment_link` and
 `stripe_restricted_key_ciphertext` are unused and always `NULL`: migration
 0058 clears every stored value, and nothing writes them after that. Orders
@@ -1127,12 +1125,12 @@ and refund branches):
   and order id, so payments are not coupled to homeserver availability. The
   seller's periods are not applied to that order later, even once the
   record is readable again.
-- **`guarantee_policy_version`.** `checkout.create` and `offer.checkout` no
-  longer require it. A command that omits it is accepted and its order
-  stores and projects `guarantee_policy_version: null`; a command that still
-  carries it (an older Shop) is accepted when it is `1`, stored as before,
-  and any other value is `INVALID_COMMAND`. Auction orders, which no buyer
-  command creates, keep storing `1`.
+- **`guarantee_policy_version`.** Retired. `checkout.create` and
+  `offer.checkout` do not require it, and no order response, export or
+  stored row carries it any more (`orders.guarantee_policy_version` is no
+  longer written; the column stays, nullable, because migrations are
+  additive-only). A command that still carries it (an older Shop) is
+  accepted when it is `1`, ignored, and any other value is `INVALID_COMMAND`.
 - **Returns.** `return.request` (buyer, from `delivered`/`completed`, capped
   at the order total), `return.approve` and `return.receive` (seller). The
   return sub-state (`requested → approved → received → refunded`) is a
