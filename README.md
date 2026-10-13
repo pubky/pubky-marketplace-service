@@ -1559,7 +1559,7 @@ secret key. The challenge endpoint has been removed.
    `POST /v1/auth/sessions`.
 2. The service verifies the bytes with the
    [`pubky-common`](https://crates.io/crates/pubky-common) crate (pinned at
-   0.11.0), built from the same `pubky/pubky-homeserver` repository as the
+   0.16.1), built from the same `pubky/pubky-homeserver` repository as the
    `@synonymdev/pubky` SDK, so client and server share one implementation of
    the token format. The token's public key becomes the authenticated actor.
    The token's verified capabilities are returned in the mint response and
@@ -1575,11 +1575,13 @@ secret key. The challenge endpoint has been removed.
    encoding was refactored between minor versions, so this was measured rather
    than assumed: a token signed with 0.8.0 verifies under 0.11.0, and a token
    signed with 0.11.0 verifies under the 0.8.0 SDK. Both directions round-trip.
+   `AuthToken` (`pubky-common/src/auth/auth_token.rs`) is byte-identical
+   between 0.11.0 and 0.16.1, so tokens from either SDK verify here.
    Reproduce by signing with `AuthToken::sign` under each version and
    cross-verifying with `AuthToken::verify` and the SDK's `AuthToken.verify`.
    This was measured when the client shipped SDK 0.8.0; the client
-   (`pubky/pubky-marketplace`) now ships `@synonymdev/pubky` 0.11.0, the same
-   version as the service.
+   (`pubky/pubky-marketplace`) now ships `@synonymdev/pubky` 0.16.0 (the live Shop
+   still runs 0.11 JS until the next release), and the service pins 0.16.1.
 3. Replay protection is enforced by the service, not assumed from the
    token: the token's `(public key, timestamp)` identity is recorded in
    `auth_token_uses`, so each token is single-use; its signing timestamp
