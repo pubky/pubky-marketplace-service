@@ -265,6 +265,7 @@
     },
     "response": {
       "body": {
+        "auction_aggregate_id": null,
         "auto_complete_days": null,
         "bitcoin_payable": {
           "amount_minor": 51637,
@@ -374,6 +375,7 @@
           "currency": "SAT",
           "exponent": 0
         },
+        "shipping_address_required": false,
         "state": "pending_payment",
         "stock_held": true,
         "subtotal": {
@@ -402,6 +404,7 @@
     },
     "response": {
       "body": {
+        "auction_aggregate_id": null,
         "auto_complete_days": null,
         "bitcoin_payable": {
           "amount_minor": 51637,
@@ -511,6 +514,7 @@
           "currency": "SAT",
           "exponent": 0
         },
+        "shipping_address_required": false,
         "state": "pending_payment",
         "stock_held": true,
         "subtotal": {
@@ -539,6 +543,7 @@
     },
     "response": {
       "body": {
+        "auction_aggregate_id": null,
         "auto_complete_days": null,
         "bitcoin_payable": {
           "amount_minor": 51637,
@@ -648,6 +653,7 @@
           "currency": "SAT",
           "exponent": 0
         },
+        "shipping_address_required": false,
         "state": "cancelled",
         "stock_held": false,
         "subtotal": {
@@ -676,6 +682,7 @@
     },
     "response": {
       "body": {
+        "auction_aggregate_id": null,
         "auto_complete_days": null,
         "bitcoin_payable": null,
         "bitcoin_quote": {
@@ -781,6 +788,7 @@
           "currency": "USD",
           "exponent": 2
         },
+        "shipping_address_required": false,
         "state": "paid",
         "stock_held": false,
         "subtotal": {
@@ -809,6 +817,7 @@
     },
     "response": {
       "body": {
+        "auction_aggregate_id": null,
         "auto_complete_days": null,
         "bitcoin_payable": {
           "amount_minor": 51637,
@@ -930,6 +939,7 @@
           "currency": "SAT",
           "exponent": 0
         },
+        "shipping_address_required": false,
         "state": "pending_payment",
         "stock_held": true,
         "subtotal": {
@@ -960,6 +970,7 @@
       "body": {
         "orders": [
           {
+            "auction_aggregate_id": null,
             "auto_complete_days": null,
             "bitcoin_payable": null,
             "bitcoin_quote": {
@@ -1070,6 +1081,7 @@
               "currency": "USD",
               "exponent": 2
             },
+            "shipping_address_required": false,
             "state": "paid",
             "stock_held": false,
             "subtotal": {
@@ -1100,6 +1112,7 @@
     },
     "response": {
       "body": {
+        "auction_aggregate_id": null,
         "auto_complete_days": null,
         "bitcoin_payable": {
           "amount_minor": 51637,
@@ -1221,6 +1234,7 @@
           "currency": "SAT",
           "exponent": 0
         },
+        "shipping_address_required": false,
         "state": "pending_payment",
         "stock_held": true,
         "subtotal": {
@@ -1249,6 +1263,7 @@
     },
     "response": {
       "body": {
+        "auction_aggregate_id": null,
         "auto_complete_days": null,
         "bitcoin_payable": {
           "amount_minor": 51637,
@@ -1370,6 +1385,7 @@
           "currency": "SAT",
           "exponent": 0
         },
+        "shipping_address_required": false,
         "state": "cancelled",
         "stock_held": false,
         "subtotal": {
@@ -1398,6 +1414,7 @@
     },
     "response": {
       "body": {
+        "auction_aggregate_id": null,
         "auto_complete_days": null,
         "bitcoin_payable": null,
         "bitcoin_quote": {
@@ -1514,6 +1531,7 @@
           "currency": "USD",
           "exponent": 2
         },
+        "shipping_address_required": false,
         "state": "paid",
         "stock_held": false,
         "subtotal": {
@@ -1542,6 +1560,7 @@
     },
     "response": {
       "body": {
+        "auction_aggregate_id": null,
         "auto_complete_days": null,
         "bitcoin_payable": null,
         "bitcoin_quote": {
@@ -1664,6 +1683,7 @@
           "currency": "USD",
           "exponent": 2
         },
+        "shipping_address_required": false,
         "state": "paid",
         "stock_held": false,
         "subtotal": {

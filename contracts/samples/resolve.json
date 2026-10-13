@@ -17,6 +17,7 @@
       "body": {
         "ok": true,
         "order": {
+          "auction_aggregate_id": null,
           "auto_complete_days": null,
           "bitcoin_payable": {
             "amount_minor": 51637,
@@ -109,6 +110,7 @@
             "currency": "SAT",
             "exponent": 0
           },
+          "shipping_address_required": false,
           "state": "cancelled",
           "stock_held": false,
           "subtotal": {
@@ -378,6 +380,7 @@
       "body": {
         "ok": true,
         "order": {
+          "auction_aggregate_id": null,
           "auto_complete_days": null,
           "bitcoin_payable": {
             "amount_minor": 51637,
@@ -470,6 +473,7 @@
             "currency": "SAT",
             "exponent": 0
           },
+          "shipping_address_required": false,
           "state": "paid",
           "stock_held": false,
           "subtotal": {
@@ -539,6 +543,7 @@
       "body": {
         "ok": true,
         "order": {
+          "auction_aggregate_id": null,
           "auto_complete_days": null,
           "bitcoin_payable": {
             "amount_minor": 51637,
@@ -635,6 +640,7 @@
             "currency": "SAT",
             "exponent": 0
           },
+          "shipping_address_required": false,
           "state": "refunded_external",
           "stock_held": false,
           "subtotal": {
@@ -679,6 +685,7 @@
       "body": {
         "ok": true,
         "order": {
+          "auction_aggregate_id": null,
           "auto_complete_days": null,
           "bitcoin_payable": {
             "amount_minor": 51637,
@@ -771,6 +778,7 @@
             "currency": "SAT",
             "exponent": 0
           },
+          "shipping_address_required": false,
           "state": "paid",
           "stock_held": false,
           "subtotal": {
