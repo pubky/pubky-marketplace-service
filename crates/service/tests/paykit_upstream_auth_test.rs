@@ -1561,7 +1561,11 @@ async fn upstream_auction_payment_window_is_capped_at_reservation_expiry(pool: P
             &bind_body,
         )
     };
-    let now = app.clock.now();
+    // Postgres stores microseconds: truncate so the reservation expiry
+    // read back at bind leaves exactly the intended whole-second window.
+    let now = chrono::DateTime::from_timestamp_micros(app.clock.now().timestamp_micros())
+        .expect("microsecond timestamp");
+    app.clock.set(now);
 
     // Less than the minimum useful window left: refused before any prepare.
     set_reservation_expiry(
