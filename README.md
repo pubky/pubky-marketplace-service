@@ -563,7 +563,10 @@ This section describes the original **fork** mode (`PAYKIT_SERVER_API=fork`,
 the default). Upstream mode uses signed prepare, activate, void, resolve, and
 status routes with producer-issued invoice identity and deadlines; its fixed
 inventory-hold boundary is documented in
-[`docs/paykit-upstream-inventory-hold.md`](docs/paykit-upstream-inventory-hold.md).
+[`docs/paykit-upstream-inventory-hold.md`](docs/paykit-upstream-inventory-hold.md),
+and what the upstream prepare request carries (an exact-price amount, no
+description) in
+[`docs/paykit-upstream-request-fields.md`](docs/paykit-upstream-request-fields.md).
 
 Bitcoin binding is a two-phase protocol with paykit-server (the message
 contract is design §B.11.3, verbatim; this section describes the
