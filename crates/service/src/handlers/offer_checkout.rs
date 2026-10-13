@@ -262,10 +262,10 @@ pub async fn handle(
     sqlx::query(
         "INSERT INTO orders (id, checkout_command_id, offer_award_id, priced_from, \
          buyer_pubky, seller_pubky, revision, state, lines, delivery_address, subtotal_minor, \
-         shipping_minor, total_minor, currency, exponent, guarantee_policy_version, payment_id, \
+         shipping_minor, total_minor, currency, exponent, payment_id, \
          stock_held, hold_expires_at, fulfillment, created_at, updated_at) \
          VALUES ($1, $2, $3, 'offer', $4, $5, 1, 'pending_payment', $6, $7, $8, $9, $10, \
-         $11, $12, $13, $14, TRUE, $15, $17, $16, $16)",
+         $11, $12, $13, TRUE, $14, $16, $15, $15)",
     )
     .bind(order_id)
     .bind(command.command_id)
@@ -279,11 +279,6 @@ pub async fn handle(
     .bind(total)
     .bind(currency)
     .bind(exponent)
-    .bind(
-        payload
-            .guarantee_policy_version
-            .map(|version| version as i32),
-    )
     .bind(payment_id)
     .bind(hold_expires_at)
     .bind(lock_now)

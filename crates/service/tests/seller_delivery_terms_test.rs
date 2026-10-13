@@ -3,7 +3,8 @@
 //! `autoCompleteDays`), are frozen on the order when its payment starts, and
 //! drive the sweeps per order. The configured `DELIVERY_ASSUME_DAYS` /
 //! `AUTO_COMPLETE_DAYS` apply only to a period the seller left unset. The
-//! checkout `guarantee_policy_version` is optional on the wire.
+//! checkout `guarantee_policy_version` is retired: accepted, never stored or
+//! projected.
 
 mod common;
 
@@ -190,7 +191,7 @@ async fn seller_periods_freeze_on_the_order_and_drive_both_sweeps(pool: PgPool) 
     assert_eq!(status, StatusCode::OK, "{projected}");
     assert_eq!(projected["delivery_assume_days"], json!(3));
     assert_eq!(projected["auto_complete_days"], json!(5));
-    assert_eq!(projected["guarantee_policy_version"], json!(1));
+    assert!(projected.get("guarantee_policy_version").is_none());
 
     // Delivery is assumed after the seller's 3 days, not the 14-day default.
     assert_eq!(assume_due(&app.pool, days_after(&app, 2)).await, 0);
@@ -597,7 +598,7 @@ async fn the_payment_method_bind_proceeds_when_the_shop_record_is_unreadable(poo
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn checkout_no_longer_requires_a_guarantee_policy_version(pool: PgPool) {
+async fn checkout_accepts_but_neither_stores_nor_projects_a_guarantee_policy_version(pool: PgPool) {
     let (app, _homeserver) = test_app_with_shop_homeserver(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
@@ -612,10 +613,9 @@ async fn checkout_no_longer_requires_a_guarantee_policy_version(pool: PgPool) {
         .remove("guarantee_policy_version");
     let (status, body) = execute(&app, &buyer.token, &absent).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(
-        body["result"]["orders"][0]["guarantee_policy_version"],
-        Value::Null
-    );
+    assert!(body["result"]["orders"][0]
+        .get("guarantee_policy_version")
+        .is_none());
     let order_id = body["result"]["orders"][0]["id"]
         .as_str()
         .expect("order id")
@@ -628,16 +628,27 @@ async fn checkout_no_longer_requires_a_guarantee_policy_version(pool: PgPool) {
             .expect("order row");
     assert_eq!(stored, None);
 
-    // Present (an older Shop): still accepted and stored as before.
+    // Present (an older Shop): still accepted, and still neither stored nor
+    // projected.
     let present = checkout_command_with_id(&seller.pubky, &indexed_command_id(0x5641, 2));
     let (status, body) = execute(&app, &buyer.token, &present).await;
     // Checkout does not hold stock, so a second checkout of the listing is
     // accepted too.
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(
-        body["result"]["orders"][0]["guarantee_policy_version"],
-        json!(1)
-    );
+    assert!(body["result"]["orders"][0]
+        .get("guarantee_policy_version")
+        .is_none());
+    let stored: Option<i32> =
+        sqlx::query_scalar("SELECT guarantee_policy_version FROM orders WHERE id = $1::uuid")
+            .bind(
+                body["result"]["orders"][0]["id"]
+                    .as_str()
+                    .expect("order id"),
+            )
+            .fetch_one(&app.pool)
+            .await
+            .expect("order row");
+    assert_eq!(stored, None);
 
     // A version other than 1 is still refused.
     let mut unknown = checkout_command_with_id(&seller.pubky, &indexed_command_id(0x5641, 3));

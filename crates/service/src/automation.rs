@@ -437,7 +437,7 @@ pub async fn list_seller_orders(
     let rows = match sqlx::query(
         "SELECT id, buyer_pubky, seller_pubky, revision, state, lines, \
          subtotal_minor, shipping_minor, total_minor, currency, exponent, \
-         guarantee_policy_version, receipt_id, edition, drop_aggregate_id, \
+         receipt_id, edition, drop_aggregate_id, \
          cancellation_reason, stock_held, hold_expires_at, shipment, \
          delivery_assumed, delivery_assume_days, auto_complete_days, \
          return_request, external_refund, fulfillment, \
@@ -484,7 +484,6 @@ pub async fn list_seller_orders(
                 "total_minor": row.try_get::<i64, _>("total_minor")?,
                 "currency": row.try_get::<String, _>("currency")?,
                 "exponent": row.try_get::<i32, _>("exponent")?,
-                "guarantee_policy_version": row.try_get::<Option<i32>, _>("guarantee_policy_version")?,
                 "receipt_id": row.try_get::<Option<Uuid>, _>("receipt_id")?,
                 "edition": row.try_get::<Option<i32>, _>("edition")?,
                 "drop_aggregate_id": row.try_get::<Option<String>, _>("drop_aggregate_id")?,

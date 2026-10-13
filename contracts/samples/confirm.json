@@ -215,7 +215,6 @@
           "fulfillment": "shipping",
           "gateway_refund_review_at": null,
           "gateway_refund_unmatched": false,
-          "guarantee_policy_version": 1,
           "hold_expires_at": null,
           "hold_source": "bind",
           "id": "<uuid:1>",

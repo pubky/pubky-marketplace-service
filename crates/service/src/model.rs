@@ -575,9 +575,6 @@ pub struct OrderRow {
     pub total_minor: i64,
     pub currency: String,
     pub exponent: i32,
-    /// Legacy: set only when the creating command carried it (and for
-    /// auction orders, which have always stored `1`). NULL otherwise.
-    pub guarantee_policy_version: Option<i32>,
     pub payment_id: Uuid,
     pub receipt_id: Option<Uuid>,
     /// The order's edition inside its drop (ADR-0026 layer 2): the value
@@ -756,7 +753,6 @@ impl std::fmt::Debug for OrderRow {
             .field("total_minor", &self.total_minor)
             .field("currency", &self.currency)
             .field("exponent", &self.exponent)
-            .field("guarantee_policy_version", &self.guarantee_policy_version)
             .field("payment_id", &self.payment_id)
             .field("receipt_id", &self.receipt_id)
             .field("edition", &self.edition)
@@ -856,7 +852,6 @@ impl OrderRow {
         total_minor: i64,
         currency: String,
         exponent: i32,
-        guarantee_policy_version: Option<i32>,
         payment_id: Uuid,
         stock_held: bool,
         hold_expires_at: Option<DateTime<Utc>>,
@@ -880,7 +875,6 @@ impl OrderRow {
             total_minor,
             currency,
             exponent,
-            guarantee_policy_version,
             payment_id,
             receipt_id: None,
             edition: None,
@@ -1129,7 +1123,6 @@ impl OrderRow {
             "subtotal": money_json(self.subtotal_minor, &self.currency, self.exponent),
             "shipping": money_json(self.shipping_minor, &self.currency, self.exponent),
             "total": money_json(displayed_total, &self.currency, self.exponent),
-            "guarantee_policy_version": self.guarantee_policy_version,
             "payment_id": self.payment_id,
             "receipt_id": self.receipt_id,
             "edition": self.edition,
@@ -1336,7 +1329,6 @@ mod tests {
             0,
             "SAT".to_string(),
             0,
-            Some(1),
             Uuid::nil(),
             false,
             None,
