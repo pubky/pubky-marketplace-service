@@ -25,7 +25,7 @@ crates/service     axum HTTP service: Postgres schema (sqlx migrations),
                    idempotency, command handlers, Locks lifecycle
                    verification (encrypted correlations, HMAC lookup
                    tokens, Lock Server client), background worker runtime
-                   (see "Background workers": 22 lease-guarded tasks plus
+                   (see "Background workers": 23 lease-guarded tasks plus
                    the webhook delivery worker). Besides the server binary
                    (`marketplace-service`) it builds the operator binaries
                    `refusal-audit-admin` and `paykit-attempts-admin`.
@@ -178,6 +178,7 @@ Railway IaC `preserve()`):
 | `PUBLIC_SERVICE_ORIGIN` | unset | this service's own public origin; when set, PayPal checkout links carry `notify_url={origin}/v0/paypal/ipn` so PayPal's IPN pays the order automatically (postback-verified, matched against seller email + exact order total) and records the seller's PayPal refunds and the buyer's reversals on it. Unset, PayPal stays participant-attested |
 | `PAYPAL_IPN_VERIFY_URL` | `https://ipnpb.paypal.com/cgi-bin/webscr` | PayPal's IPN validation endpoint; tests point it at a local double |
 | `PAYPAL_CHECKOUT_URL` | `https://www.paypal.com/cgi-bin/webscr` | PayPal `_xclick` checkout base. HTTPS only; host must be `www.paypal.com` (live) or `www.sandbox.paypal.com`. Default stays live. |
+| `REQUIRE_ENCRYPTED_DELIVERY_ADDRESS` | `false` | `true`/`1` refuses a checkout or award checkout that carries a plaintext `delivery_address` (422 `INVALID_COMMAND`, reason `encrypted_delivery_required`); only sealed envelopes are accepted. Leave unset until the Shop version that seals is the deployed one (see [Sealed delivery address](#sealed-delivery-address)) |
 | `SHIPPO_API_BASE` | `https://api.goshippo.com` | Shippo API base for the seller-token label integration (`/v0/sellers/me/shipping-config`, `/v0/orders/{id}/shipping/*`); tests point it at a local double |
 | `ADDRESS_SEARCH_UPSTREAM_URL` | `https://photon.komoot.io` | Photon geocoder behind `POST /v0/address/suggest`. HTTPS only (http for loopback in tests). Point it at a self-hosted Photon to stop using the public instance |
 | `ADDRESS_SEARCH_DISABLED` | unset | `1`/`true` turns the address proxy off; the route answers `address_search_unavailable` |
@@ -1179,6 +1180,39 @@ shipped, pickup and digital lines becomes one order per (seller, method), and
 a digital-only checkout takes no address and charges no shipping (see
 [Digital delivery](#digital-delivery)).
 
+### Sealed delivery address
+
+The buyer's client seals the delivery address to the seller's published
+delivery key (RFC 9180 HPKE, base mode; DHKEM(X25519, HKDF-SHA256),
+HKDF-SHA256, ChaCha20-Poly1305 — the suite pubky-core uses for grant
+approval) and sends the envelope instead of `delivery_address`:
+
+- `checkout.create` takes `delivery_address_envelopes`: one
+  `{seller_pubky, key_id, envelope}` per shipped seller and none for any
+  other seller. `offer.checkout` takes one
+  `delivery_address_envelope: {key_id, envelope}`. Sending both the
+  plaintext address and an envelope, or an envelope for an order that ships
+  nothing, is refused `INVALID_COMMAND`.
+- `envelope` is 2,096 bytes (`enc`, 32, then the padded ciphertext, 2,064) as
+  unpadded base64url (2,795 characters); `key_id` is 32 lowercase hex
+  characters. The service checks only the shape, stores the bytes in
+  `orders.delivery_address_envelope` and `orders.delivery_key_id`, and has no
+  key and no code path that opens one. Refusals never echo an envelope.
+- The seller's single-order projection returns
+  `delivery_address: {format: "hpke_v1", key_id, command_id, envelope}`.
+  `command_id` is the checkout command id the buyer's client bound into the
+  envelope's authenticated data. Orders that predate the change project
+  `{format: "plaintext_v1", address}` until they reach a final state.
+- The `delivery_address_purge` worker task clears `delivery_address`,
+  `delivery_address_envelope` and `delivery_key_id` on every order in a final
+  state (`completed`, `cancelled`, `refunded_external`, `closed`), 500 rows
+  per tick, with no retention window. It needs no key. The seller's client
+  decrypts and uses the address before the order ends; after that the
+  service holds nothing.
+- Migration 0057 adds the two columns, forbids a plaintext address and an
+  envelope on one row, and clears the plaintext address from every order
+  already in a final state.
+
 The seller's pickup details (spot or address, instructions, availability
 windows with their IANA zone) live ONLY in the service, sealed
 (XChaCha20-Poly1305, AAD-bound, fresh nonce per seal) under
@@ -1586,10 +1620,15 @@ the whole convention.
 
 **Redaction (ADR-0019 §8).** Projections never expose:
 
-- `orders.delivery_address` — private delivery detail. The buyer receives
-  it back once, in the checkout command result they authored; read
-  projections and every post-purchase command result omit it for both
-  participants.
+- `orders.delivery_address` — private delivery detail (legacy plaintext
+  orders). The buyer receives it back once, in the checkout command result
+  they authored; read projections and every post-purchase command result
+  omit it for both participants. The seller of a paid shipped order reads it
+  only in the single-order projection, as `delivery_address`.
+- `orders.delivery_address_envelope` — the sealed address. Only the seller
+  of a paid shipped order receives it, in the single-order projection; the
+  buyer, any list and every command result omit it (see
+  [Sealed delivery address](#sealed-delivery-address)).
 - **The Locks bundle id and lock resource** (`access credentials or
   bundle_id` in ADR-0019 §8). The former plaintext
   `payments.locks_bundle_id` column has been **removed entirely**: the
@@ -1633,12 +1672,12 @@ Not served, deliberately (no fabricated or empty-by-default reads):
 
 ## Background workers (tasks 3.4, 4.5)
 
-One worker runtime (`crates/service/src/workers.rs`) drains 22 lease-guarded
+One worker runtime (`crates/service/src/workers.rs`) drains 23 lease-guarded
 server-time tasks: `reservation_expiry`, `drop_transitions`, `offer_expiry`,
 `auction_close`, `outbox`, `locks_verification`, `paykit_verification`,
 `payment_window`, `stat_attestations`, `delivery_autocomplete`,
 `pickup_reseal`, `digital_reseal`, `priv_key_reseal`, `delivery_email_purge`,
-`read_rate_purge`, `pickup_retention`, `seller_confirmation_window`,
+`delivery_address_purge`, `read_rate_purge`, `pickup_retention`, `seller_confirmation_window`,
 `manual_review_watch`, `paykit_resolve_delivery`, `fx_sampler`,
 `refusal_audit_retention` and `listing_deletions`. Webhook delivery runs in a
 separate worker (`spawn_webhook_worker` in `crates/service/src/automation.rs`;

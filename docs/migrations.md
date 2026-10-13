@@ -129,16 +129,24 @@ additive. Orders and payments bound to Stripe are not touched.
 
 ## Numbers claimed by open pull requests
 
-`main` has 0001 to 0053, then 0056 and 0058. Pull requests that are open when
+`main` has 0001 to 0054, then 0056 and 0058. Pull requests that are open when
 this was written claim the missing numbers, so a new migration must check the
 open list (`gh pr list`) and take the next free number rather than assume
-0054:
+0055:
 
 | Number | File | Pull request |
 | --- | --- | --- |
-| 0054 | `0054_refund_destinations.sql` | #101 (USDT refund destination, S6) |
 | 0055 | `0055_user_priv_key_custody_releases.sql` | #92 (`/priv` Phase 4) |
-| 0057 | `0057_encrypted_delivery_address.sql` | #110 (sealed delivery address envelopes) |
+| 0057 | `0057_encrypted_delivery_address.sql` | #110 (sealed delivery addresses) |
 
-#100 carries no migration. This table describes unmerged work and goes stale as
-pull requests land; trust `crates/service/migrations/` on `main` over it.
+This table describes unmerged work and goes stale as pull requests land; trust
+`crates/service/migrations/` on `main` over it.
+
+## Sealed delivery addresses (0057)
+
+`0057_encrypted_delivery_address.sql` adds `orders.delivery_address_envelope`
+and `orders.delivery_key_id`, two `NOT VALID`-then-`VALIDATE` constraints
+(the pair travels together at exactly 2,096 bytes and a 32-hex key id; a
+plaintext address and an envelope never share a row), and clears
+`delivery_address` on orders already in a final state. Number 0055 belongs to an
+open pull request.

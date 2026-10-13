@@ -6,8 +6,8 @@ use common::paykit_review::{
     into_manual_review_late, resolve_call, OBSERVED_TXID, TOTAL_SATS,
 };
 use common::{
-    create_paid_order, create_pending_order, execute, listing_aggregate, new_actor,
-    place_bid_command, register_auction_command, register_command, send, test_app,
+    create_paid_order, create_pending_order, create_sealed_paid_order, execute, listing_aggregate,
+    new_actor, place_bid_command, register_auction_command, register_command, send, test_app,
     test_app_with_payments, TestActor, TestApp,
 };
 use marketplace_service::contracts::{
@@ -22,6 +22,9 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 type ContractMap = BTreeMap<String, Value>;
+
+const SELLER_ADDRESS_CASE: &str = "seller_paid_shipping_address";
+const SELLER_SEALED_ADDRESS_CASE: &str = "seller_paid_sealed_address";
 
 fn repository_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -43,7 +46,11 @@ fn rendered_snapshot(name: &str, value: &Value) -> Vec<u8> {
     let normalized = normalized_snapshot(value);
     assert_no_sensitive_values_for_contract_with_seller(
         &normalized,
-        (name == "projections").then_some("seller_paid_shipping_address"),
+        if name == "projections" {
+            &[SELLER_ADDRESS_CASE, SELLER_SEALED_ADDRESS_CASE]
+        } else {
+            &[]
+        },
         (name == "projections").then_some("auction_seller_projection"),
     );
     let mut rendered = serde_json::to_vec_pretty(&normalized).expect("snapshot serializes");
@@ -330,7 +337,7 @@ fn seller_contract_allows_only_labeled_top_level_seller_reserve_fields() {
     });
     assert_no_sensitive_values_for_contract_with_seller(
         &seller,
-        None,
+        &[],
         Some("auction_seller_projection"),
     );
     for bad in [
@@ -364,7 +371,7 @@ fn seller_contract_allows_only_labeled_top_level_seller_reserve_fields() {
             std::panic::catch_unwind(|| {
                 assert_no_sensitive_values_for_contract_with_seller(
                     &bad,
-                    None,
+                    &[],
                     Some("auction_seller_projection"),
                 )
             })
@@ -388,7 +395,10 @@ fn delivery_address_contract_requires_tagged_plaintext_variant() {
             }
         }
     });
-    assert_no_sensitive_values_for_contract(&accepted, Some("seller_paid_shipping_address"));
+    assert_no_sensitive_values_for_contract(
+        &accepted,
+        &[SELLER_ADDRESS_CASE, SELLER_SEALED_ADDRESS_CASE],
+    );
     for rejected in [
         json!({"delivery_address": {"name": "Buyer"}}),
         json!({"delivery_address": {"format": "ciphertext_v1", "address": {}}}),
@@ -397,6 +407,34 @@ fn delivery_address_contract_requires_tagged_plaintext_variant() {
         assert!(
             std::panic::catch_unwind(|| assert_no_sensitive_values(&rejected)).is_err(),
             "delivery address variant must fail closed: {rejected}"
+        );
+    }
+}
+
+#[test]
+fn delivery_address_contract_accepts_only_the_exact_sealed_variant() {
+    let sealed = |address: Value| json!({"seller_paid_sealed_address": {"response": {"body": {"delivery_address": address}}}});
+    assert_no_sensitive_values_for_contract(
+        &sealed(json!({
+            "format": "hpke_v1",
+            "key_id": "<key_id>",
+            "command_id": "<command_id>",
+            "envelope": "AAAA"
+        })),
+        &[SELLER_ADDRESS_CASE, SELLER_SEALED_ADDRESS_CASE],
+    );
+    for rejected in [
+        json!({"format": "hpke_v1", "key_id": "k", "command_id": "c"}),
+        json!({"format": "hpke_v1", "key_id": "k", "command_id": "c", "envelope": 1}),
+        json!({"format": "hpke_v1", "key_id": "k", "command_id": "c", "envelope": "e", "address": {}}),
+    ] {
+        assert!(
+            std::panic::catch_unwind(|| assert_no_sensitive_values_for_contract(
+                &sealed(rejected.clone()),
+                &[SELLER_ADDRESS_CASE, SELLER_SEALED_ADDRESS_CASE],
+            ))
+            .is_err(),
+            "sealed variant must fail closed: {rejected}"
         );
     }
 }
@@ -416,7 +454,10 @@ fn buyer_sample_tagged_delivery_address_is_rejected() {
         }
     });
     assert!(std::panic::catch_unwind(|| {
-        assert_no_sensitive_values_for_contract(&buyer_sample, Some("seller_paid_shipping_address"))
+        assert_no_sensitive_values_for_contract(
+            &buyer_sample,
+            &[SELLER_ADDRESS_CASE, SELLER_SEALED_ADDRESS_CASE],
+        )
     })
     .is_err());
 }
@@ -434,7 +475,10 @@ fn seller_list_tagged_delivery_address_is_rejected() {
         }
     });
     assert!(std::panic::catch_unwind(|| {
-        assert_no_sensitive_values_for_contract(&list_sample, Some("seller_paid_shipping_address"))
+        assert_no_sensitive_values_for_contract(
+            &list_sample,
+            &[SELLER_ADDRESS_CASE, SELLER_SEALED_ADDRESS_CASE],
+        )
     })
     .is_err());
 }
@@ -1429,6 +1473,36 @@ async fn projection_contract_map_executes_every_role_and_state(pool: PgPool) {
         response,
     );
 
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let sealed = create_sealed_paid_order(&app, &seller, &buyer).await;
+    let (status, response) = projection_request(&app, &seller, &sealed.order_id).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["delivery_address"]["format"], json!("hpke_v1"));
+    assert!(response["delivery_address"].get("address").is_none());
+    let mut response = response;
+    assert_eq!(
+        response["delivery_address"]["envelope"]
+            .as_str()
+            .expect("envelope string")
+            .len(),
+        2795,
+        "the sample carries a full-size envelope"
+    );
+    assert_eq!(
+        response["delivery_address"]["key_id"],
+        json!(common::TEST_DELIVERY_KEY_ID)
+    );
+    response["delivery_address"]["envelope"] = json!("<envelope:2795 base64url chars>");
+    response["delivery_address"]["key_id"] = json!("<key_id:32 hex chars>");
+    insert_projection(
+        &mut map,
+        SELLER_SEALED_ADDRESS_CASE,
+        &sealed.order_id,
+        status,
+        response,
+    );
+
     assert_exact_keys(
         &map,
         &[
@@ -1441,6 +1515,7 @@ async fn projection_contract_map_executes_every_role_and_state(pool: PgPool) {
             "auction_seller_projection",
             "auction_non_seller_bidder_projection",
             "accepted_offer_with_award",
+            "seller_paid_sealed_address",
             "seller_paid_shipping_address",
             "buyer_paid_shipping_address",
             "seller_list_paid_shipping_address",

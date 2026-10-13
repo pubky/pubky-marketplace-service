@@ -554,6 +554,7 @@ async fn dispatch(
                 crate::handlers::checkout::CheckoutContext {
                     drop_claim_seconds: state.config.drop_claim_window_seconds,
                     digital: state.digital.as_deref(),
+                    require_encrypted_delivery: state.config.require_encrypted_delivery_address,
                 },
                 now,
             )
@@ -605,6 +606,7 @@ async fn dispatch(
                 payload,
                 state.clock.as_ref(),
                 hold_window_seconds,
+                state.config.require_encrypted_delivery_address,
             )
             .await
         }

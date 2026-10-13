@@ -22,6 +22,9 @@ pub struct CheckoutContext<'a> {
     /// The digital delivery sealing keys; `None` when digital delivery is
     /// off on this deployment.
     pub digital: Option<&'a crate::digital::DigitalKeys>,
+    /// Refuse a checkout that carries a plaintext delivery address
+    /// (`REQUIRE_ENCRYPTED_DELIVERY_ADDRESS`).
+    pub require_encrypted_delivery: bool,
 }
 
 pub async fn handle(
@@ -231,15 +234,20 @@ pub async fn handle(
     let any_shipped = groups
         .iter()
         .any(|(_, method, _)| *method == FulfillmentMethod::Shipping);
-    match (&payload.delivery_address, any_shipped) {
-        (Some(_), false) => {
+    match (
+        &payload.delivery_address,
+        &payload.delivery_address_envelopes,
+        any_shipped,
+    ) {
+        (None, Some(_), true) => {}
+        (None, Some(_), false) | (Some(_), _, false) => {
             return Ok(Err(CommandFailure::refused(
                 crate::refusal_audit::RefusalKind::InvalidCommand,
                 ErrorCode::InvalidCommand,
                 "A checkout with no shipped group must not carry a delivery address.",
             )));
         }
-        (None, true) => {
+        (None, None, true) => {
             return Ok(Err(CommandFailure::refused(
                 crate::refusal_audit::RefusalKind::InvalidCommand,
                 ErrorCode::InvalidCommand,
@@ -248,6 +256,20 @@ pub async fn handle(
         }
         _ => {}
     }
+    let shipped_sellers: std::collections::BTreeSet<&str> = groups
+        .iter()
+        .filter(|(_, method, _)| *method == FulfillmentMethod::Shipping)
+        .map(|(seller, _, _)| seller.as_str())
+        .collect();
+    let envelopes = match crate::handlers::delivery_envelope::match_checkout_envelopes(
+        payload.delivery_address.is_some(),
+        payload.delivery_address_envelopes.as_deref(),
+        &shipped_sellers,
+        context.require_encrypted_delivery,
+    ) {
+        Ok(envelopes) => envelopes,
+        Err(failure) => return Ok(Err(failure)),
+    };
 
     // The delivery email is required exactly when a line is email-kind, and
     // refused otherwise, so no client can store an address the order does
@@ -371,6 +393,11 @@ pub async fn handle(
             .is_some()
             .then(|| now + chrono::Duration::seconds(drop_claim_window_seconds));
 
+        let sealed = if unshipped {
+            None
+        } else {
+            envelopes.get(seller_pubky)
+        };
         let mut order = OrderRow::new_for_insert(
             order_id,
             None,
@@ -407,9 +434,9 @@ pub async fn handle(
              seller_pubky, revision, state, lines, delivery_address, subtotal_minor, \
              shipping_minor, total_minor, currency, exponent, \
              guarantee_policy_version, payment_id, stock_held, hold_expires_at, hold_source, \
-             fulfillment, created_at, updated_at) \
+             fulfillment, created_at, updated_at, delivery_address_envelope, delivery_key_id) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, \
-             $18, $19, $20, $21, $21)",
+             $18, $19, $20, $21, $21, $22, $23)",
         )
         .bind(order.id)
         .bind(command.command_id)
@@ -436,6 +463,8 @@ pub async fn handle(
         .bind(&order.hold_source)
         .bind(&order.fulfillment)
         .bind(now)
+        .bind(sealed.map(|stored| stored.bytes.as_slice()))
+        .bind(sealed.map(|stored| stored.key_id.as_str()))
         .execute(&mut **tx)
         .await?;
         // One sealed address per email-kind order, in the order-create
