@@ -164,6 +164,11 @@ pub struct Config {
     /// no real meeting point can be stored against — or revealed under —
     /// fake money.
     pub sandbox_payments_enabled: bool,
+    /// Refuse a checkout or offer checkout that carries a plaintext
+    /// delivery address (`REQUIRE_ENCRYPTED_DELIVERY_ADDRESS`, default
+    /// false). Off until the Shop release that seals addresses is deployed;
+    /// then on, so no client can send the service a readable address.
+    pub require_encrypted_delivery_address: bool,
     /// Days a cancelled-after-payment order's pinned pickup snapshot is
     /// retained as the dispute exhibit when no refund evidence ever lands,
     /// before the ordinary terminal-order purge takes it
@@ -345,6 +350,8 @@ impl Config {
             DEFAULT_DELIVERY_SWEEP_BATCH_SIZE,
         )?;
         let sandbox_payments_enabled = env_bool("SANDBOX_PAYMENTS_ENABLED", false)?;
+        let require_encrypted_delivery_address =
+            env_bool("REQUIRE_ENCRYPTED_DELIVERY_ADDRESS", false)?;
         let pickup_dispute_retention_days = env_days("PICKUP_DISPUTE_RETENTION_DAYS", 30)?;
         let buyer_email_retention_days = env_days("BUYER_EMAIL_RETENTION_DAYS", 30)?;
         let buyer_email_unpaid_retention_days = env_days("BUYER_EMAIL_UNPAID_RETENTION_DAYS", 7)?;
@@ -416,6 +423,7 @@ impl Config {
             public_app_origin,
             public_service_origin,
             sandbox_payments_enabled,
+            require_encrypted_delivery_address,
             pickup_dispute_retention_days,
             digital_delivery_max_bytes,
             buyer_email_retention_days,
@@ -480,6 +488,7 @@ impl Config {
             public_app_origin: Some("https://app.test".to_string()),
             public_service_origin: Some("https://svc.test".to_string()),
             sandbox_payments_enabled: true,
+            require_encrypted_delivery_address: false,
             pickup_dispute_retention_days: 30,
             digital_delivery_max_bytes: DEFAULT_DIGITAL_DELIVERY_MAX_BYTES,
             buyer_email_retention_days: 30,

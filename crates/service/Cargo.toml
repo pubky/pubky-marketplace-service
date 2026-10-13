@@ -49,3 +49,6 @@ http-body-util.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tower.workspace = true
 marketplace-service = { path = ".", features = ["test-faults"] }
+# The suite pubky-core's homeserver uses for grant approvals (same crate, same
+# features). Used only to prove the Shop's hpke-js envelope opens with it.
+hpke = { version = "0.14.1", default-features = false, features = ["alloc", "chacha", "x25519"] }

@@ -1,3 +1,4 @@
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, Utc};
 use marketplace_domain::Money;
 use serde::{Deserialize, Serialize};
@@ -570,6 +571,15 @@ pub struct OrderRow {
     pub state: String,
     pub lines: Value,
     delivery_address: Option<Value>,
+    /// The checkout command that created the order; the buyer's client binds
+    /// it into the delivery envelope's AAD. `NULL` for auction orders.
+    checkout_command_id: Option<Uuid>,
+    /// The buyer's delivery address sealed to the seller's delivery key (RFC
+    /// 9180 HPKE, exactly 2,096 bytes). The service cannot open it, never
+    /// logs it, and nulls it with `delivery_address` at a final state.
+    delivery_address_envelope: Option<Vec<u8>>,
+    /// The seller delivery key the envelope was sealed to.
+    delivery_key_id: Option<String>,
     pub subtotal_minor: i64,
     pub shipping_minor: i64,
     pub total_minor: i64,
@@ -870,6 +880,9 @@ impl OrderRow {
             state: "pending_payment".to_string(),
             lines,
             delivery_address,
+            checkout_command_id: None,
+            delivery_address_envelope: None,
+            delivery_key_id: None,
             subtotal_minor,
             shipping_minor,
             total_minor,
@@ -969,14 +982,39 @@ impl OrderRow {
             | ProjectionContext::Notification => None,
         };
         if let Some(actor) = authenticated_actor {
-            if let Some(address) = self.eligible_delivery_address(actor) {
-                view["delivery_address"] = json!({
-                    "format": "plaintext_v1",
-                    "address": address,
-                });
+            if let Some(address) = self.seller_delivery_address(actor) {
+                view["delivery_address"] = json!(address);
             }
         }
         view
+    }
+
+    /// The one seller-only delivery-address shape. A sealed order yields
+    /// `hpke_v1`: the ciphertext the seller's client opens, with the key id
+    /// and command id it needs to find the private key and rebuild the AAD,
+    /// and nothing about the address itself. An order that predates
+    /// encryption and has not reached a final state yet still yields
+    /// `plaintext_v1`.
+    fn seller_delivery_address(&self, actor: &str) -> Option<Value> {
+        if let (true, Some(envelope), Some(key_id), Some(command_id)) = (
+            allow_plaintext_delivery_address(self, actor),
+            self.delivery_address_envelope.as_deref(),
+            self.delivery_key_id.as_deref(),
+            self.checkout_command_id,
+        ) {
+            return Some(json!({
+                "format": "hpke_v1",
+                "key_id": key_id,
+                "command_id": command_id,
+                "envelope": URL_SAFE_NO_PAD.encode(envelope),
+            }));
+        }
+        self.eligible_delivery_address(actor).map(|address| {
+            json!({
+                "format": "plaintext_v1",
+                "address": address,
+            })
+        })
     }
 
     fn eligible_delivery_address(&self, actor: &str) -> Option<&Value> {
@@ -1280,6 +1318,7 @@ mod tests {
         can_reveal_delivery_address, next_actor_for_order, redact_command_result,
         seller_observation, OrderRow,
     };
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
     use chrono::Utc;
     use serde_json::json;
     use uuid::Uuid;
@@ -1337,6 +1376,96 @@ mod tests {
             "listing".to_string(),
         );
         assert!(!format!("{row:?}").contains("123 Distinctive Privacy Lane"));
+    }
+
+    fn sealed_row(state: &str) -> OrderRow {
+        let mut row = OrderRow::new_for_insert(
+            Uuid::nil(),
+            None,
+            None,
+            "buyer".to_string(),
+            "seller".to_string(),
+            false,
+            json!([]),
+            None,
+            0,
+            0,
+            0,
+            "SAT".to_string(),
+            0,
+            Uuid::nil(),
+            false,
+            None,
+            "shipping".to_string(),
+            Utc::now(),
+            "listing".to_string(),
+        );
+        row.state = state.to_string();
+        row.checkout_command_id = Some(Uuid::from_u128(7));
+        row.delivery_address_envelope = Some(vec![0xAB; 2096]);
+        row.delivery_key_id = Some("0123456789abcdef0123456789abcdef".to_string());
+        row
+    }
+
+    #[test]
+    fn only_the_seller_of_a_paid_order_receives_the_sealed_envelope() {
+        let row = sealed_row("paid");
+        let sealed = row.seller_projection_for_actor("seller")["delivery_address"].clone();
+        assert_eq!(sealed["format"], "hpke_v1");
+        assert_eq!(sealed["key_id"], "0123456789abcdef0123456789abcdef");
+        assert_eq!(sealed["command_id"], Uuid::from_u128(7).to_string());
+        assert_eq!(
+            URL_SAFE_NO_PAD
+                .decode(sealed["envelope"].as_str().expect("envelope text"))
+                .expect("base64url"),
+            vec![0xAB; 2096]
+        );
+        assert_eq!(
+            sealed.as_object().expect("object").len(),
+            4,
+            "the projection carries the ciphertext and its binding, nothing else"
+        );
+
+        assert!(
+            sealed_row("processing").seller_projection_for_actor("seller")["delivery_address"]
+                .is_object()
+        );
+        for state in [
+            "pending_payment",
+            "shipped",
+            "completed",
+            "cancelled",
+            "closed",
+        ] {
+            assert!(
+                sealed_row(state)
+                    .seller_projection_for_actor("seller")
+                    .get("delivery_address")
+                    .is_none(),
+                "{state} must not project the envelope"
+            );
+        }
+        let buyer = row.projection_for_actor("buyer").to_string();
+        let stranger = row.seller_projection_for_actor("someone-else").to_string();
+        let participant = row.project(super::ProjectionContext::ParticipantList {
+            authenticated_actor: "seller",
+        });
+        for view in [buyer, stranger, participant.to_string()] {
+            assert!(!view.contains("hpke_v1"));
+            assert!(!view.contains("delivery_address"));
+            assert!(!view.contains(&URL_SAFE_NO_PAD.encode(vec![0xAB; 2096])));
+        }
+        assert!(!format!("{row:?}").contains("171, 171"));
+    }
+
+    #[test]
+    fn a_pickup_order_never_projects_an_envelope() {
+        let mut row = sealed_row("paid");
+        row.fulfillment = "pickup".to_string();
+        assert!(row
+            .seller_projection_for_actor("seller")
+            .get("delivery_address")
+            .is_none());
     }
 
     #[test]

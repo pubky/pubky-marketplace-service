@@ -2,6 +2,7 @@ pub mod attestation;
 pub mod auction;
 pub mod cancellation;
 pub mod checkout;
+pub mod delivery_envelope;
 pub mod digital;
 pub mod digital_manual;
 pub mod digital_orders;

@@ -29,6 +29,7 @@ pub async fn handle(
     payload: &OfferCheckoutPayload,
     clock: &dyn Clock,
     hold_window_seconds: i64,
+    require_encrypted_delivery: bool,
 ) -> Result<HandlerResult, sqlx::Error> {
     let offer: Option<OfferRow> = sqlx::query_as(&format!(
         "SELECT {OFFER_COLUMNS} FROM offers WHERE id = $1 FOR UPDATE"
@@ -188,21 +189,42 @@ pub async fn handle(
         )));
     }
     let pickup = fulfillment == FulfillmentMethod::Pickup;
-    let delivery_address = match (&payload.delivery_address, pickup) {
-        (Some(address), false) => Some(serde_json::to_value(address).expect("address serializes")),
-        (None, true) => None,
-        (Some(_), true) => {
+    let sealed = match crate::handlers::delivery_envelope::match_offer_envelope(
+        payload.delivery_address.is_some(),
+        payload.delivery_address_envelope.as_ref(),
+        require_encrypted_delivery,
+    ) {
+        Ok(sealed) => sealed,
+        Err(failure) => return Ok(Err(failure)),
+    };
+    let delivery_address = match (
+        &payload.delivery_address,
+        &payload.delivery_address_envelope,
+        pickup,
+    ) {
+        (Some(address), None, false) => {
+            Some(serde_json::to_value(address).expect("address serializes"))
+        }
+        (None, Some(_), false) | (None, None, true) => None,
+        (_, _, true) => {
             return Ok(Err(CommandFailure::refused(
                 crate::refusal_audit::RefusalKind::InvalidCommand,
                 ErrorCode::InvalidCommand,
                 "A checkout with no shipped group must not carry a delivery address.",
             )));
         }
-        (None, false) => {
+        (None, None, false) => {
             return Ok(Err(CommandFailure::refused(
                 crate::refusal_audit::RefusalKind::InvalidCommand,
                 ErrorCode::InvalidCommand,
                 "A delivery address is required when any checkout group ships.",
+            )));
+        }
+        (Some(_), Some(_), false) => {
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::InvalidCommand,
+                ErrorCode::InvalidCommand,
+                "Send the delivery address or its envelope, not both.",
             )));
         }
     };
@@ -263,9 +285,10 @@ pub async fn handle(
         "INSERT INTO orders (id, checkout_command_id, offer_award_id, priced_from, \
          buyer_pubky, seller_pubky, revision, state, lines, delivery_address, subtotal_minor, \
          shipping_minor, total_minor, currency, exponent, payment_id, \
-         stock_held, hold_expires_at, fulfillment, created_at, updated_at) \
+         stock_held, hold_expires_at, fulfillment, created_at, updated_at, \
+         delivery_address_envelope, delivery_key_id) \
          VALUES ($1, $2, $3, 'offer', $4, $5, 1, 'pending_payment', $6, $7, $8, $9, $10, \
-         $11, $12, $13, TRUE, $14, $16, $15, $15)",
+         $11, $12, $13, TRUE, $14, $16, $15, $15, $17, $18)",
     )
     .bind(order_id)
     .bind(command.command_id)
@@ -283,6 +306,8 @@ pub async fn handle(
     .bind(hold_expires_at)
     .bind(lock_now)
     .bind(fulfillment.as_str())
+    .bind(sealed.as_ref().map(|stored| stored.bytes.as_slice()))
+    .bind(sealed.as_ref().map(|stored| stored.key_id.as_str()))
     .execute(&mut **tx)
     .await?;
     sqlx::query(

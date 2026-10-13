@@ -321,7 +321,7 @@ fn is_pubky(value: &str) -> bool {
 }
 
 pub fn assert_no_sensitive_values(value: &Value) {
-    assert_no_sensitive_values_for_contract_with_seller(value, None, None);
+    assert_no_sensitive_values_for_contract_with_seller(value, &[], None);
 }
 
 /// Raw pre-normalization reserve audience guard for generated artifacts.
@@ -373,41 +373,52 @@ pub fn assert_reserve_contract_audience(value: &Value, allowed_seller_case: Opti
     walk(value, &mut Vec::new(), allowed_path.as_deref());
 }
 
-pub fn assert_no_sensitive_values_for_contract(
-    value: &Value,
-    allowed_single_order_case: Option<&str>,
-) {
-    assert_no_sensitive_values_for_contract_with_seller(value, allowed_single_order_case, None);
+pub fn assert_no_sensitive_values_for_contract(value: &Value, allowed_single_order_cases: &[&str]) {
+    assert_no_sensitive_values_for_contract_with_seller(value, allowed_single_order_cases, None);
 }
 
 pub fn assert_no_sensitive_values_for_contract_with_seller(
     value: &Value,
-    allowed_single_order_case: Option<&str>,
+    allowed_single_order_cases: &[&str],
     allowed_seller_listing_case: Option<&str>,
 ) {
-    let allowed_delivery_path = allowed_single_order_case
-        .map(|case| vec![case.to_string(), "response".to_string(), "body".to_string()]);
+    let allowed_delivery_paths: Vec<Vec<String>> = allowed_single_order_cases
+        .iter()
+        .map(|case| vec![case.to_string(), "response".to_string(), "body".to_string()])
+        .collect();
     let allowed_reserve_path = allowed_seller_listing_case
         .map(|case| vec![case.to_string(), "response".to_string(), "body".to_string()]);
     fn walk(
         value: &Value,
         key: Option<&str>,
         path: &mut Vec<String>,
-        allowed_delivery_path: Option<&[String]>,
+        allowed_delivery_paths: &[Vec<String>],
         allowed_reserve_path: Option<&[String]>,
     ) {
         match value {
             Value::Object(object) => {
                 for (key, value) in object {
                     if key == "delivery_address" {
-                        let tagged = value
+                        let tagged = match value
                             .as_object()
                             .and_then(|object| object.get("format").and_then(Value::as_str))
-                            == Some("plaintext_v1")
-                            && value.get("address").is_some_and(Value::is_object);
+                        {
+                            Some("plaintext_v1") => {
+                                value.get("address").is_some_and(Value::is_object)
+                            }
+                            Some("hpke_v1") => {
+                                let text =
+                                    |field: &str| value.get(field).is_some_and(Value::is_string);
+                                value.as_object().is_some_and(|object| object.len() == 4)
+                                    && text("key_id")
+                                    && text("command_id")
+                                    && text("envelope")
+                            }
+                            _ => false,
+                        };
                         assert!(
                             tagged
-                                && allowed_delivery_path.is_some_and(|allowed| path == allowed),
+                                && allowed_delivery_paths.iter().any(|allowed| path == allowed),
                             "delivery_address is allowed only in the seller single-order contract case"
                         );
                     } else if crate::reserve_secrecy::is_reserve_audience_key(key) {
@@ -441,7 +452,7 @@ pub fn assert_no_sensitive_values_for_contract_with_seller(
                         value,
                         Some(key),
                         path,
-                        allowed_delivery_path,
+                        allowed_delivery_paths,
                         allowed_reserve_path,
                     );
                     path.pop();
@@ -452,7 +463,7 @@ pub fn assert_no_sensitive_values_for_contract_with_seller(
                     value,
                     key,
                     path,
-                    allowed_delivery_path,
+                    allowed_delivery_paths,
                     allowed_reserve_path,
                 )
             }),
@@ -476,7 +487,7 @@ pub fn assert_no_sensitive_values_for_contract_with_seller(
         value,
         None,
         &mut Vec::new(),
-        allowed_delivery_path.as_deref(),
+        &allowed_delivery_paths,
         allowed_reserve_path.as_deref(),
     );
 }
