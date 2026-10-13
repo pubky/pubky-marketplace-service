@@ -1019,7 +1019,9 @@ async fn deliver_paykit_activation(
                 // An auction order never takes a bind hold: its inventory
                 // hold is the winner's reservation (`acquire_payment_hold`).
                 // Read it under this transaction so the reservation sweep
-                // cannot flip it while the guard decides.
+                // cannot flip it while the guard decides. Upstream starts
+                // the payment window at activation, so the window must also
+                // end one skew margin before the reservation does.
                 let reservation_expires_at: Option<DateTime<Utc>> = sqlx::query_scalar(
                     "SELECT expires_at FROM reservations \
                      WHERE listing_aggregate_id = $1 AND buyer_pubky = $2 \
@@ -1029,7 +1031,16 @@ async fn deliver_paykit_activation(
                 .bind(&order.buyer_pubky)
                 .fetch_optional(&mut *tx)
                 .await?;
-                reservation_expires_at.is_some_and(|deadline| guard_now < deadline)
+                let window = order.paykit_payment_window_seconds.map(|seconds| {
+                    chrono::Duration::seconds(
+                        i64::from(seconds)
+                            + crate::payment_methods::UPSTREAM_HOLD_CLOCK_SKEW_SECONDS,
+                    )
+                });
+                match (reservation_expires_at, window) {
+                    (Some(deadline), Some(window)) => guard_now + window <= deadline,
+                    _ => false,
+                }
             } else {
                 order.stock_held
                     && order

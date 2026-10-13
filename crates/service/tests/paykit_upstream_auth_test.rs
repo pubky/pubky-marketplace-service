@@ -1526,6 +1526,114 @@ async fn upstream_auction_winner_activation_refused_after_reservation_lapses(poo
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn upstream_auction_payment_window_is_capped_at_reservation_expiry(pool: PgPool) {
+    use marketplace_service::payment_methods::{
+        AUCTION_MIN_PAYMENT_WINDOW_SECONDS, UPSTREAM_HOLD_CLOCK_SKEW_SECONDS,
+    };
+    let (app, paykit) = test_app_with_upstream_paykit(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let winner = new_actor(&app).await;
+    let (order_id, aggregate) = auction_winning_order(&app, &seller, &winner, 1).await;
+    enable_bitcoin_for_review(&app, &paykit, &seller).await;
+    let set_reservation_expiry = |expires_at: chrono::DateTime<chrono::Utc>| {
+        let pool = pool.clone();
+        let aggregate = aggregate.clone();
+        async move {
+            sqlx::query(
+                "UPDATE reservations SET expires_at = $2 \
+                 WHERE listing_aggregate_id = $1 AND status = 'active'",
+            )
+            .bind(&aggregate)
+            .bind(expires_at)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+    };
+    let bind_path = format!("/v0/orders/{order_id}/payment-method");
+    let bind_body = json!({"method":"bitcoin"});
+    let bind = || {
+        send(
+            app.router.clone(),
+            "POST",
+            &bind_path,
+            Some(&winner.token),
+            &bind_body,
+        )
+    };
+    let now = app.clock.now();
+
+    // Less than the minimum useful window left: refused before any prepare.
+    set_reservation_expiry(
+        now + chrono::Duration::seconds(
+            AUCTION_MIN_PAYMENT_WINDOW_SECONDS + 2 * UPSTREAM_HOLD_CLOCK_SKEW_SECONDS - 1,
+        ),
+    )
+    .await;
+    let (status, body) = bind().await;
+    assert_eq!(status, StatusCode::CONFLICT, "short window bind: {body}");
+    assert_eq!(body["error"]["reason"], "auction_payment_window_too_short");
+    assert!(
+        paykit
+            .calls()
+            .iter()
+            .all(|call| call.path != "/marketplace/payment-requests/prepare"),
+        "no request prepared"
+    );
+
+    // 20 minutes left, below the configured window: the window ends one
+    // skew margin before the reservation, with one more for activation.
+    let reservation_expires_at = now + chrono::Duration::seconds(1_200);
+    set_reservation_expiry(reservation_expires_at).await;
+    let expected_window = 1_200 - 2 * UPSTREAM_HOLD_CLOCK_SKEW_SECONDS;
+    assert!(expected_window < app.state.config.bitcoin_payment_window_seconds);
+    let (status, body) = bind().await;
+    assert_eq!(status, StatusCode::OK, "capped bind: {body}");
+    let prepare = paykit
+        .calls()
+        .into_iter()
+        .find(|call| call.path == "/marketplace/payment-requests/prepare")
+        .expect("prepare call");
+    assert_eq!(
+        prepare.body["payment_window_seconds"],
+        json!(expected_window)
+    );
+    let cap = reservation_expires_at - chrono::Duration::seconds(UPSTREAM_HOLD_CLOCK_SKEW_SECONDS);
+    let (window, hold): (Option<i32>, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as(
+        "SELECT paykit_payment_window_seconds, hold_expires_at FROM orders WHERE id = $1::uuid",
+    )
+    .bind(&order_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(window.map(i64::from), Some(expected_window));
+    assert!(
+        hold.is_some_and(|hold| hold <= cap),
+        "shown deadline within the reservation"
+    );
+
+    let client = app
+        .state
+        .payments
+        .as_ref()
+        .and_then(|payments| payments.paykit.as_ref());
+    drain_outbox(&pool, client, now, 30).await.unwrap();
+    let (activation, deadline): (Option<String>, Option<chrono::DateTime<chrono::Utc>>) =
+        sqlx::query_as(
+            "SELECT paykit_activation_state, paykit_expires_at FROM orders WHERE id = $1::uuid",
+        )
+        .bind(&order_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(activation.as_deref(), Some("active"));
+    assert!(
+        deadline.is_some_and(|deadline| deadline <= cap),
+        "the request cannot outlive the reservation"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn upstream_hold_expiry_racing_activation_never_revives_inventory(pool: PgPool) {
     let (app, paykit) = test_app_with_upstream_paykit(pool.clone()).await;
     let (_seller, _buyer, order_id, _invoice_id) = bind_upstream_order(&app, &paykit).await;

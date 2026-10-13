@@ -63,6 +63,10 @@ const CONFIG_COLUMNS: &str =
 /// upstream two-phase binds. See `docs/paykit-upstream-inventory-hold.md`.
 pub const UPSTREAM_HOLD_CLOCK_SKEW_SECONDS: i64 = 60;
 
+/// The shortest upstream payment window an auction winner is offered. A
+/// winner whose reservation leaves less is refused the bitcoin bind.
+pub const AUCTION_MIN_PAYMENT_WINDOW_SECONDS: i64 = 300;
+
 #[derive(Clone)]
 struct PreparedBind {
     invoice_id: Uuid,
@@ -1272,9 +1276,54 @@ pub async fn bind_payment_method(
             .as_ref()
             .map(|(_, sats)| *sats)
             .expect("checked above");
-        let expires_at = updated_order.hold_expires_at.unwrap_or_else(|| {
-            now + chrono::Duration::seconds(state.config.bitcoin_payment_window_seconds)
-        });
+        // An auction order's hold is the winner's reservation, which never
+        // extends (the auction deadline). Upstream fixes the window at
+        // prepare and starts it at activation, so cap it to end one skew
+        // margin before the reservation, with one more margin for the
+        // activation to land; the activation guard enforces the same bound.
+        let mut payment_window_seconds = state.config.bitcoin_payment_window_seconds;
+        let mut auction_hold_cap: Option<DateTime<Utc>> = None;
+        if paykit.api() == PaykitApi::Upstream {
+            if let Some(auction_aggregate_id) = &order.auction_aggregate_id {
+                let reservation_expires_at: Option<DateTime<Utc>> = match sqlx::query_scalar(
+                    "SELECT expires_at FROM reservations \
+                     WHERE listing_aggregate_id = $1 AND buyer_pubky = $2 \
+                     AND status = 'active' FOR SHARE",
+                )
+                .bind(auction_aggregate_id)
+                .bind(&order.buyer_pubky)
+                .fetch_optional(&mut *tx)
+                .await
+                {
+                    Ok(expires_at) => expires_at,
+                    Err(error) => return internal("auction reservation", &error),
+                };
+                let remaining = reservation_expires_at.map(|deadline| {
+                    (deadline - now).num_seconds() - 2 * UPSTREAM_HOLD_CLOCK_SKEW_SECONDS
+                });
+                match (reservation_expires_at, remaining) {
+                    (Some(deadline), Some(remaining))
+                        if remaining >= AUCTION_MIN_PAYMENT_WINDOW_SECONDS =>
+                    {
+                        payment_window_seconds = payment_window_seconds.min(remaining);
+                        auction_hold_cap = Some(
+                            deadline - chrono::Duration::seconds(UPSTREAM_HOLD_CLOCK_SKEW_SECONDS),
+                        );
+                    }
+                    _ => {
+                        let _ = tx.rollback().await;
+                        return method_error(
+                            ErrorCode::InvalidState,
+                            "auction_payment_window_too_short",
+                            "Too little time is left on this auction win to pay with Bitcoin.",
+                        );
+                    }
+                }
+            }
+        }
+        let expires_at = updated_order
+            .hold_expires_at
+            .unwrap_or_else(|| now + chrono::Duration::seconds(payment_window_seconds));
         let phase1 = paykit
             .create_payment_request(
                 &order.seller_pubky,
@@ -1283,7 +1332,7 @@ pub async fn bind_payment_method(
                 attempt,
                 amount_sats,
                 expires_at,
-                state.config.bitcoin_payment_window_seconds,
+                payment_window_seconds,
             )
             .await;
         let phase1 = match phase1 {
@@ -1459,10 +1508,8 @@ pub async fn bind_payment_method(
                 .checked_add(UPSTREAM_HOLD_CLOCK_SKEW_SECONDS)
                 .and_then(chrono::Duration::try_seconds)
                 .and_then(|ttl| response_received_at.checked_add_signed(ttl));
-            let hold_extension_seconds = state
-                .config
-                .bitcoin_payment_window_seconds
-                .checked_add(UPSTREAM_HOLD_CLOCK_SKEW_SECONDS);
+            let hold_extension_seconds =
+                payment_window_seconds.checked_add(UPSTREAM_HOLD_CLOCK_SKEW_SECONDS);
             if activation_cutoff.is_none_or(|cutoff| prepare_expires_at <= cutoff)
                 || maximum_prepare_expiry.is_none_or(|maximum| prepare_expires_at > maximum)
             {
@@ -1483,6 +1530,7 @@ pub async fn bind_payment_method(
             hold_extension_seconds
                 .and_then(chrono::Duration::try_seconds)
                 .and_then(|extension| prepare_expires_at.checked_add_signed(extension))
+                .map(|hold| auction_hold_cap.map_or(hold, |cap| hold.min(cap)))
         } else {
             None
         };
@@ -1615,7 +1663,7 @@ pub async fn bind_payment_method(
             })
             .bind(if paykit.api() == PaykitApi::Upstream {
                 Some(
-                    i32::try_from(state.config.bitcoin_payment_window_seconds)
+                    i32::try_from(payment_window_seconds)
                         .expect("validated payment window fits i32"),
                 )
             } else {
