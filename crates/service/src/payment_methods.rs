@@ -720,11 +720,18 @@ pub struct BindPaymentMethodBody {
     method: String,
 }
 
+/// Where PayPal sends the buyer after commit or cancel: the order list of the
+/// web app at `app_base` (an origin, plus the mount path when the Shop is
+/// served under one, as at `https://pubky.app/shop`).
+fn paypal_return_url(app_base: &str) -> String {
+    format!("{}/marketplace/orders", app_base.trim_end_matches('/'))
+}
+
 /// Builds the PayPal "Buy Now" (`_xclick`) checkout URL: seller-direct,
 /// no platform credentials, with the order id in `custom` for the buyer's
 /// later report.
 ///
-/// `return_origin` (the deployment's public app origin, when configured)
+/// `return_origin` (the deployment's public app URL, when configured)
 /// gives PayPal somewhere to send the buyer after commit. Without a
 /// `return` URL PayPal's legacy WPS flow has no receipt destination and its
 /// post-payment page can dead-end ("Things don't appear to be working") —
@@ -759,8 +766,8 @@ fn paypal_checkout_url(
         .append_pair("custom", &order.id.to_string())
         .append_pair("no_shipping", "1")
         .append_pair("no_note", "1");
-    if let Some(origin) = return_origin {
-        let orders_url = format!("{}/marketplace/orders", origin.trim_end_matches('/'));
+    if let Some(app_base) = return_origin {
+        let orders_url = paypal_return_url(app_base);
         url.query_pairs_mut()
             .append_pair("return", &orders_url)
             .append_pair("cancel_return", &orders_url);
@@ -2507,6 +2514,27 @@ pub async fn paypal_ipn(State(state): State<AppState>, body: String) -> Response
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     StatusCode::OK.into_response()
+}
+
+#[cfg(test)]
+mod paypal_return_tests {
+    use super::paypal_return_url;
+
+    #[test]
+    fn the_return_link_keeps_the_apps_mount_path() {
+        assert_eq!(
+            paypal_return_url("https://shop.pubky.app"),
+            "https://shop.pubky.app/marketplace/orders"
+        );
+        assert_eq!(
+            paypal_return_url("https://pubky.app/shop"),
+            "https://pubky.app/shop/marketplace/orders"
+        );
+        assert_eq!(
+            paypal_return_url("https://staging.pubky.app/shop/"),
+            "https://staging.pubky.app/shop/marketplace/orders"
+        );
+    }
 }
 
 #[cfg(test)]
