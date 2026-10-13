@@ -1001,7 +1001,14 @@ pub async fn get_public_listing_availability(
             );
             response
         }
-        Err(error) => internal_error("listing availability", &error),
+        Err(error) => {
+            let mut response = internal_error("listing availability", &error);
+            response.headers_mut().insert(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-store"),
+            );
+            response
+        }
     }
 }
 

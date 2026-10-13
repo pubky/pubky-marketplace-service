@@ -174,6 +174,21 @@ async fn unknown_listings_are_not_found(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_failed_read_is_a_500_that_is_never_cached(pool: PgPool) {
+    let app = test_app(pool.clone()).await;
+    let router = router_for(&app, None);
+    pool.close().await;
+
+    let (status, headers, body) = availability(&router, "someoneelse", "boots_01").await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "unexpected: {body}"
+    );
+    assert_eq!(headers.get("cache-control").unwrap(), "no-store");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_listing_its_seller_deleted_is_not_found(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
     let seller = new_actor(&app).await;
