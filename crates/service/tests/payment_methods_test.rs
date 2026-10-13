@@ -824,6 +824,33 @@ async fn paypal_binding_uses_the_configured_sandbox_checkout_host(pool: PgPool) 
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn paypal_binding_returns_the_buyer_under_the_apps_mount_path(pool: PgPool) {
+    let mut config = Config::for_tests();
+    config.public_app_origin = Some("https://pubky.app/shop".to_string());
+    let (app, _paykit, _ipn, _shippo) = test_app_with_payments_config(pool, config).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    put_config(&app, &seller.token, &full_config_body()).await;
+    let order = create_pending_order(&app, &seller, &buyer).await;
+
+    let (status, body) = bind_method(&app, &buyer.token, &order.order_id, "paypal").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let url = body["order"]["fiat_checkout_url"]
+        .as_str()
+        .expect("checkout url");
+    let parsed = url::Url::parse(url).expect("checkout url parses");
+    let pairs: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+    assert_eq!(
+        pairs.get("return").map(String::as_str),
+        Some("https://pubky.app/shop/marketplace/orders")
+    );
+    assert_eq!(
+        pairs.get("cancel_return").map(String::as_str),
+        Some("https://pubky.app/shop/marketplace/orders")
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn bitcoin_binding_creates_the_signed_paykit_request(pool: PgPool) {
     let (app, paykit) = test_app_with_payments(pool.clone()).await;
     let seller = new_actor(&app).await;

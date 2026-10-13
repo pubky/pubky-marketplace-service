@@ -365,7 +365,7 @@ impl Config {
         // is a permanent bounded single source, so no environment variable
         // is consulted here (a release binary cannot be repointed).
         let fx_feed_url = crate::fx::FX_URL.to_string();
-        let public_app_origin = env_origin("PUBLIC_APP_ORIGIN")?;
+        let public_app_origin = env_app_base("PUBLIC_APP_ORIGIN")?;
         let public_service_origin = env_origin("PUBLIC_SERVICE_ORIGIN")?;
         let paypal_checkout_url =
             parse_paypal_checkout_url(std::env::var("PAYPAL_CHECKOUT_URL").ok().as_deref())?;
@@ -672,6 +672,35 @@ fn env_origin(name: &str) -> anyhow::Result<Option<String>> {
     }
 }
 
+/// The web app's public URL from the environment: an http(s) origin plus an
+/// optional mount path, with no trailing slash. A Shop served under a path
+/// of another origin (`https://pubky.app/shop`) needs the path, because
+/// buyer return links are built as `{value}/marketplace/orders`. A query,
+/// fragment or credentials would corrupt that join, so they are refused.
+fn env_app_base(name: &str) -> anyhow::Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(raw) => parse_app_base(name, &raw).map(Some),
+        Err(_) => Ok(None),
+    }
+}
+
+fn parse_app_base(name: &str, raw: &str) -> anyhow::Result<String> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    let parsed = Url::parse(trimmed).map_err(|_| anyhow::anyhow!("{name} must be a valid URL"))?;
+    if parsed.scheme() != "https" && parsed.scheme() != "http" {
+        anyhow::bail!("{name} must be an http(s) origin, optionally with a mount path");
+    }
+    if parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        anyhow::bail!("{name} must be an origin with an optional mount path only");
+    }
+    Ok(trimmed.to_string())
+}
+
 fn env_bool(name: &str, default: bool) -> anyhow::Result<bool> {
     match std::env::var(name) {
         Ok(value) => match value.trim() {
@@ -706,7 +735,7 @@ fn parse_paypal_checkout_url(raw: Option<&str>) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        automation_rate_capacity, parse_days, parse_paypal_checkout_url,
+        automation_rate_capacity, parse_app_base, parse_days, parse_paypal_checkout_url,
         refusal_audit_keys_from_env, reject_audit_url_reuse, required_postgres_url,
         validate_postgres_url, Config, AUTOMATION_RATE_LIMIT_MAX_TOKENS,
         DEFAULT_AUTO_COMPLETE_DAYS, DEFAULT_DELIVERY_ASSUME_DAYS, DEFAULT_PAYPAL_CHECKOUT_URL,
@@ -715,6 +744,39 @@ mod tests {
 
     /// Serializes the environment-mutating test (env is process-global).
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn app_base_accepts_an_origin_with_or_without_a_mount_path() {
+        for (raw, expected) in [
+            ("https://shop.pubky.app", "https://shop.pubky.app"),
+            ("https://shop.pubky.app/", "https://shop.pubky.app"),
+            ("https://pubky.app/shop", "https://pubky.app/shop"),
+            (
+                "  https://staging.pubky.app/shop/ ",
+                "https://staging.pubky.app/shop",
+            ),
+            ("http://localhost:3000", "http://localhost:3000"),
+        ] {
+            assert_eq!(parse_app_base("PUBLIC_APP_ORIGIN", raw).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn app_base_refuses_values_that_would_corrupt_the_return_link() {
+        for raw in [
+            "pubky.app/shop",
+            "ftp://pubky.app/shop",
+            "https://pubky.app/shop?x=1",
+            "https://pubky.app/shop#top",
+            "https://user:pw@pubky.app/shop",
+            "https://user@pubky.app/shop",
+        ] {
+            assert!(
+                parse_app_base("PUBLIC_APP_ORIGIN", raw).is_err(),
+                "{raw} should be refused"
+            );
+        }
+    }
 
     #[test]
     fn from_env_never_consults_fx_feed_url() {
