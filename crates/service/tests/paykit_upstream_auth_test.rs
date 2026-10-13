@@ -1653,9 +1653,12 @@ async fn upstream_auction_activation_past_slack_voids_and_rebinds_with_less_time
     use marketplace_service::payment_methods::{
         AUCTION_ACTIVATION_SLACK_SECONDS, UPSTREAM_HOLD_CLOCK_SKEW_SECONDS,
     };
-    let (app, paykit) = test_app_with_upstream_paykit(pool.clone()).await;
     // A prepare TTL that outlasts the late drain below, so only the
-    // reservation bound can refuse it.
+    // reservation bound can refuse it; the accepted maximum matches it.
+    let mut config = marketplace_service::config::Config::for_tests();
+    config.paykit_max_prepare_ttl_seconds = 1_200;
+    let (app, paykit) =
+        test_app_with_paykit_api_config(pool.clone(), config, PaykitApi::Upstream).await;
     paykit.set_upstream_prepare_ttl_seconds(1_200);
     // Postgres stores microseconds: truncate so windows are whole seconds.
     app.clock.set(
