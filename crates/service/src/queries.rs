@@ -53,7 +53,8 @@ pub const ORDER_COLUMNS: &str =
        WHERE seller_config.seller_pubky = orders.seller_pubky \
        AND (seller_config.bitcoin_enabled \
          OR seller_config.paypal_merchant_email IS NOT NULL)) AS seller_has_rail, revision, \
-     state, lines, delivery_address, subtotal_minor, shipping_minor, total_minor, \
+     state, lines, delivery_address, checkout_command_id, delivery_address_envelope, \
+     delivery_key_id, subtotal_minor, shipping_minor, total_minor, \
      currency, exponent, guarantee_policy_version, payment_id, receipt_id, edition, \
      cancellation_reason, stock_held, hold_expires_at, hold_source, \
      shipment, delivery_assumed, delivery_assume_days, auto_complete_days, return_request, external_refund, payment_method, fiat_checkout_url, \

@@ -79,6 +79,7 @@ pub const TASK_PICKUP_RESEAL: &str = "pickup_reseal";
 pub const TASK_DIGITAL_RESEAL: &str = "digital_reseal";
 pub const TASK_PRIV_KEY_RESEAL: &str = "priv_key_reseal";
 pub const TASK_DELIVERY_EMAIL_PURGE: &str = "delivery_email_purge";
+pub const TASK_DELIVERY_ADDRESS_PURGE: &str = "delivery_address_purge";
 pub const TASK_READ_RATE_PURGE: &str = "read_rate_purge";
 pub const TASK_PICKUP_RETENTION: &str = "pickup_retention";
 pub const TASK_SELLER_CONFIRMATION_WINDOW: &str = "seller_confirmation_window";
@@ -4087,6 +4088,7 @@ pub struct WorkerSummary {
     pub digital_rows_resealed: u64,
     pub priv_keys_resealed: u64,
     pub delivery_emails_purged: u64,
+    pub delivery_addresses_purged: u64,
     pub read_rate_buckets_purged: u64,
     pub seller_windows_routed: u64,
     pub manual_review_sla_alerts: u64,
@@ -4508,6 +4510,22 @@ pub async fn run_once(
         release_lease(&state.pool, TASK_DELIVERY_EMAIL_PURGE, holder, now).await?;
         summary.delivery_emails_purged = result?;
     }
+    // The delivery address leaves the service when the order ends: sealed
+    // envelopes and legacy plaintext alike. It needs no key.
+    if try_acquire_lease(
+        &state.pool,
+        TASK_DELIVERY_ADDRESS_PURGE,
+        holder,
+        now,
+        lease_seconds,
+    )
+    .await?
+    {
+        let result =
+            crate::handlers::delivery_envelope::purge_final_delivery_addresses(&state.pool).await;
+        release_lease(&state.pool, TASK_DELIVERY_ADDRESS_PURGE, holder, now).await?;
+        summary.delivery_addresses_purged = result?;
+    }
     // Download-rate buckets idle past READ_RATE_LIMIT_IDLE. Deleting one
     // changes no later read: it has refilled to a full bucket, which is
     // what the next read seeds.
@@ -4885,6 +4903,7 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
                             fx_samples_accepted = summary.fx_samples_accepted,
                             refusal_audit_rows_purged = summary.refusal_audit_rows_purged,
                             read_rate_buckets_purged = summary.read_rate_buckets_purged,
+                            delivery_addresses_purged = summary.delivery_addresses_purged,
                             listings_tombstoned = summary.listings_tombstoned,
                             "worker pass completed"
                         );

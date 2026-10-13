@@ -905,6 +905,29 @@ pub async fn bind_payment_method(
     if option == PaymentOption::PaykitUsdtArbitrumOne {
         return usdt_unavailable(&state, payments.paykit.as_ref().map(PaykitClient::api));
     }
+    // An order created before its listing was moderated is not payable: the
+    // index is read before any attempt is spent or transaction opened, with
+    // the same fail-open-with-ALERT semantics as the commands that sell.
+    if let Some(gate) = state.listing_moderation.as_deref() {
+        let listings =
+            match crate::listing_moderation::listings_a_bind_sells(&state.pool, order_id, &actor.0)
+                .await
+            {
+                Ok(listings) => listings,
+                Err(error) => return internal("bind moderation lookup", &error),
+            };
+        for (seller_pubky, listing_id) in &listings {
+            if gate.check(seller_pubky, listing_id).await
+                == crate::listing_moderation::ModerationVerdict::Moderated
+            {
+                return method_error(
+                    ErrorCode::ListingModerated,
+                    "listing_moderated",
+                    crate::listing_moderation::LISTING_MODERATED_MESSAGE,
+                );
+            }
+        }
+    }
     let now = state.clock.now();
     // A bitcoin bind spends its attempt number in a committed statement of
     // its own, before the bind transaction: a bind that rolls back after

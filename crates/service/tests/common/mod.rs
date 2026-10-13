@@ -1925,6 +1925,47 @@ pub fn checkout_command_with_id(seller_pubky: &str, command_id: &str) -> Value {
     })
 }
 
+/// The delivery key id every sealed fixture names.
+pub const TEST_DELIVERY_KEY_ID: &str = "0123456789abcdef0123456789abcdef";
+
+/// 2,096 bytes the service stores without opening; `seed` tells envelopes
+/// apart so a test can prove which one a projection returned.
+pub fn test_envelope_bytes(seed: u8) -> Vec<u8> {
+    (0..2096usize)
+        .map(|index| (index % 251) as u8 ^ seed)
+        .collect()
+}
+
+pub fn test_envelope(seed: u8) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(test_envelope_bytes(seed))
+}
+
+/// `checkout_command_with_id` with the address sealed to `seller_pubky`
+/// instead of sent in plaintext.
+pub fn sealed_checkout_command_with_id(
+    seller_pubky: &str,
+    command_id: &str,
+    envelope_seed: u8,
+) -> Value {
+    let mut command = checkout_command_with_id(seller_pubky, command_id);
+    let payload = command["payload"].as_object_mut().expect("payload object");
+    payload.remove("delivery_address");
+    payload.insert(
+        "delivery_address_envelopes".to_string(),
+        json!([{
+            "seller_pubky": seller_pubky,
+            "key_id": TEST_DELIVERY_KEY_ID,
+            "envelope": test_envelope(envelope_seed),
+        }]),
+    );
+    command
+}
+
+pub fn sealed_checkout_command(seller_pubky: &str) -> Value {
+    sealed_checkout_command_with_id(seller_pubky, "00000000-0000-4000-8000-000000001000", 0)
+}
+
 pub fn checkout_command(seller_pubky: &str) -> Value {
     checkout_command_with_id(seller_pubky, "00000000-0000-4000-8000-000000001000")
 }
@@ -1988,6 +2029,46 @@ pub async fn create_paid_order(app: &TestApp, seller: &TestActor, buyer: &TestAc
     assert_eq!(status, StatusCode::OK, "register fixture failed: {body}");
     let (status, body) = execute(app, &buyer.token, &checkout_command(&seller.pubky)).await;
     assert_eq!(status, StatusCode::OK, "checkout fixture failed: {body}");
+    let order_id = body["result"]["orders"][0]["id"]
+        .as_str()
+        .expect("order id present")
+        .to_string();
+    let payment_id = body["result"]["payments"][0]["id"]
+        .as_str()
+        .expect("payment id present")
+        .to_string();
+    let total_minor = body["result"]["orders"][0]["total"]["amount_minor"]
+        .as_i64()
+        .expect("order total present");
+    let (status, body) = execute(
+        app,
+        &buyer.token,
+        &payment_command(&payment_id, 1, "confirmed", 1, 1_050),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "payment fixture failed: {body}");
+    let receipt_id = body["result"]["receipt"]["id"]
+        .as_str()
+        .expect("receipt id present")
+        .to_string();
+    PaidOrder {
+        order_id,
+        payment_id,
+        receipt_id,
+        total_minor,
+    }
+}
+
+/// `create_paid_order` with the address sealed instead of sent in plaintext.
+pub async fn create_sealed_paid_order(
+    app: &TestApp,
+    seller: &TestActor,
+    buyer: &TestActor,
+) -> PaidOrder {
+    let (status, body) = execute(app, &seller.token, &register_command(&seller.pubky, 1)).await;
+    assert_eq!(status, StatusCode::OK, "register fixture failed: {body}");
+    let (status, body) = execute(app, &buyer.token, &sealed_checkout_command(&seller.pubky)).await;
+    assert_eq!(status, StatusCode::OK, "sealed checkout failed: {body}");
     let order_id = body["result"]["orders"][0]["id"]
         .as_str()
         .expect("order id present")
