@@ -23,6 +23,16 @@ the `listing_deletions` lease.
   record's latest event is tombstoned, even when that `DEL` is behind the
   seller's cursor. Every attempt is recorded, so a revival the homeserver
   could not answer for moves behind the ones not yet tried and stays due.
+- **A rejected read is not a poll.** When the homeserver answers the event
+  stream (or the record fetch that confirms a `DEL`) with a `429`, a `5xx`,
+  or nothing, the seller's `polled_at` stays its last successful poll, its
+  consecutive `failures` count grows, and it is not read again before
+  `retry_not_before` (migration 0059): 60 s doubling to 15 min, or the
+  homeserver's `Retry-After` when that is longer, capped at one hour. The
+  cursor still advances over what was settled. Only that seller waits: due
+  sellers inside their backoff are left out of the pass, so they take none
+  of its seller slots, and the rest are served least recently attempted
+  first. A successful poll clears the backoff.
 - **A record accepted after a confirmation wins.** A delete that the
   service accepted a record for after confirming it is settled again on a
   later pass; the seller's cursor stops before it.

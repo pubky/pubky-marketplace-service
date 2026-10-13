@@ -89,6 +89,14 @@ pub struct HomeserverEvent {
 pub enum HomeserverEventsOutcome {
     Events(Vec<HomeserverEvent>),
     UnknownUser,
+    /// The homeserver answered with a status other than success or 404 (a
+    /// `429` rate limit, a `5xx`). `retry_after` is its `Retry-After`, when
+    /// it sent a readable one.
+    Rejected {
+        retry_after: Option<Duration>,
+    },
+    /// The read failed before a status arrived or the body was not an event
+    /// batch (transport failure, oversized or unparseable body).
     Unavailable,
 }
 
@@ -665,6 +673,19 @@ impl HttpHomeserverClient {
     }
 }
 
+/// The delay a response's `Retry-After` header asks for (delay-seconds or
+/// HTTP-date); `None` when it is absent or unreadable.
+fn retry_after_from(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let value = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim();
+    let now = Utc::now();
+    let due = crate::resolve_delivery::retry_after_due_at(value, now)?;
+    (due - now).to_std().ok().or(Some(Duration::ZERO))
+}
+
 fn pubky_host_prefix(seller_pubky: &str) -> &str {
     seller_pubky.get(..8).unwrap_or(seller_pubky)
 }
@@ -900,12 +921,14 @@ impl HomeserverListingClient for HttpHomeserverClient {
                 return HomeserverEventsOutcome::UnknownUser;
             }
             if !status.is_success() {
+                let retry_after = retry_after_from(response.headers());
                 tracing::warn!(
                     pubky_host_prefix = %prefix,
                     status = %status,
+                    retry_after_seconds = retry_after.map(|delay| delay.as_secs()),
                     "homeserver event stream rejected"
                 );
-                return HomeserverEventsOutcome::Unavailable;
+                return HomeserverEventsOutcome::Rejected { retry_after };
             }
             let mut body = Vec::new();
             loop {
@@ -1643,6 +1666,28 @@ mod tests {
         open_ended.as_object_mut().unwrap().remove("endsAt");
         validated_drop_record(&seller, "winter_drop", &open_ended)
             .expect("open-ended schedule validates");
+    }
+
+    #[test]
+    fn retry_after_reads_seconds_and_http_dates() {
+        let header = |value: &str| {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                reqwest::header::RETRY_AFTER,
+                value.parse().expect("header value"),
+            );
+            retry_after_from(&headers)
+        };
+        assert_eq!(header("120"), Some(Duration::from_secs(120)));
+        assert_eq!(header(" 7 "), Some(Duration::from_secs(7)));
+        assert_eq!(header("0"), Some(Duration::ZERO));
+        assert_eq!(header("not a delay"), None);
+        assert_eq!(retry_after_from(&reqwest::header::HeaderMap::new()), None);
+        let date = (Utc::now() + chrono::Duration::seconds(90)).to_rfc2822();
+        let delay = header(&date).expect("an HTTP-date is a delay");
+        assert!((88..=90).contains(&delay.as_secs()), "{delay:?}");
+        let past = header("Sun, 06 Nov 1994 08:49:37 GMT");
+        assert_eq!(past, Some(Duration::ZERO));
     }
 
     #[test]

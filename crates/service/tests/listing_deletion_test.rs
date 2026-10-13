@@ -3256,3 +3256,269 @@ async fn an_unchanged_record_synced_after_the_delete_was_confirmed_is_never_reti
     let (status, _) = get(&app, &seller.token, &format!("/v1/listings/{aggregate_id}")).await;
     assert_eq!(status, StatusCode::OK);
 }
+
+type PollRow = (
+    Option<String>,
+    Option<chrono::DateTime<chrono::Utc>>,
+    Option<chrono::DateTime<chrono::Utc>>,
+    i32,
+    Option<chrono::DateTime<chrono::Utc>>,
+);
+
+/// The follower's row for a seller: cursor, last successful poll, last
+/// attempt, consecutive failures, and when the seller may be polled again.
+async fn poll_row(pool: &PgPool, seller: &str) -> Option<PollRow> {
+    sqlx::query_as(
+        "SELECT event_cursor, polled_at, attempted_at, failures, retry_not_before \
+         FROM listing_deletion_cursors WHERE seller_pubky = $1",
+    )
+    .bind(seller)
+    .fetch_optional(pool)
+    .await
+    .expect("poll row")
+}
+
+async fn follower_pass_at(app: &TestApp, holder: Uuid) -> u64 {
+    marketplace_service::workers::run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass")
+        .listings_tombstoned
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_throttled_event_stream_is_not_a_poll_and_the_delete_lands_once_it_recovers(
+    pool: PgPool,
+) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    published_listing(&app, &homeserver, &seller, 2).await;
+    let aggregate_id = listing_aggregate(&seller.pubky);
+    let holder = Uuid::new_v4();
+
+    // A successful poll first, so the seller has a last-good time to keep.
+    assert_eq!(follower_pass_at(&app, holder).await, 0);
+    let (cursor, polled_at, _, failures, retry) = poll_row(&app.pool, &seller.pubky)
+        .await
+        .expect("first poll recorded");
+    assert_eq!(cursor.as_deref(), Some("1"));
+    assert_eq!((failures, retry), (0, None));
+    let good_poll = polled_at.expect("a successful poll stamps polled_at");
+
+    homeserver.delete_record(&seller.pubky, LISTING_ID);
+    homeserver.throttle_events(&seller.pubky, None);
+
+    app.clock.advance_seconds(61);
+    let failed_at = app.clock.now();
+    assert_eq!(follower_pass_at(&app, holder).await, 0);
+    let (cursor, polled_at, attempted_at, failures, retry) = poll_row(&app.pool, &seller.pubky)
+        .await
+        .expect("failed poll recorded");
+    assert_eq!(cursor.as_deref(), Some("1"), "the cursor does not move");
+    assert_eq!(polled_at, Some(good_poll), "a 429 is not a successful poll");
+    assert_eq!(attempted_at, Some(failed_at));
+    assert_eq!(failures, 1);
+    assert_eq!(retry, Some(failed_at + chrono::Duration::seconds(60)));
+    assert_eq!(homeserver.event_stream_requests(&seller.pubky), 2);
+
+    // The backoff holds: the seller is not asked again before it ends.
+    app.clock.advance_seconds(30);
+    assert_eq!(follower_pass_at(&app, holder).await, 0);
+    assert_eq!(homeserver.event_stream_requests(&seller.pubky), 2);
+
+    // Still throttled after it ends: the backoff doubles.
+    app.clock.advance_seconds(31);
+    let failed_again = app.clock.now();
+    assert_eq!(follower_pass_at(&app, holder).await, 0);
+    assert_eq!(homeserver.event_stream_requests(&seller.pubky), 3);
+    let (_, polled_at, _, failures, retry) = poll_row(&app.pool, &seller.pubky)
+        .await
+        .expect("second failure recorded");
+    assert_eq!(polled_at, Some(good_poll));
+    assert_eq!(failures, 2);
+    assert_eq!(retry, Some(failed_again + chrono::Duration::seconds(120)));
+    assert!(tombstone_row(&app.pool, &aggregate_id).await.0.is_none());
+
+    // Recovered: the next poll after the backoff reads the stream, applies
+    // the DEL, and clears the backoff.
+    homeserver.stop_throttling_events(&seller.pubky);
+    app.clock.advance_seconds(121);
+    assert_eq!(follower_pass_at(&app, holder).await, 1);
+    assert_eq!(
+        tombstone_row(&app.pool, &aggregate_id).await.0.as_deref(),
+        Some("2")
+    );
+    let (cursor, polled_at, _, failures, retry) = poll_row(&app.pool, &seller.pubky)
+        .await
+        .expect("recovered poll recorded");
+    assert_eq!(cursor.as_deref(), Some("2"));
+    assert_eq!(polled_at, Some(app.clock.now()));
+    assert_eq!((failures, retry), (0, None));
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_seller_never_polled_successfully_keeps_its_backoff(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    published_listing(&app, &homeserver, &seller, 2).await;
+    homeserver.throttle_events(&seller.pubky, None);
+    let holder = Uuid::new_v4();
+
+    assert_eq!(follower_pass_at(&app, holder).await, 0);
+    let (cursor, polled_at, _, failures, retry) = poll_row(&app.pool, &seller.pubky)
+        .await
+        .expect("the failed first poll is recorded");
+    assert_eq!((cursor, polled_at), (None, None));
+    assert_eq!(failures, 1);
+    assert_eq!(retry, Some(app.clock.now() + chrono::Duration::seconds(60)));
+
+    // Within the backoff, passes leave it alone even though it was never
+    // polled successfully.
+    for _ in 0..3 {
+        app.clock.advance_seconds(10);
+        assert_eq!(follower_pass_at(&app, holder).await, 0);
+    }
+    assert_eq!(homeserver.event_stream_requests(&seller.pubky), 1);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn the_follower_honors_retry_after_and_bounds_it(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    published_listing(&app, &homeserver, &seller, 2).await;
+    let aggregate_id = listing_aggregate(&seller.pubky);
+    homeserver.delete_record(&seller.pubky, LISTING_ID);
+    homeserver.throttle_events(&seller.pubky, Some("300"));
+    let holder = Uuid::new_v4();
+
+    assert_eq!(follower_pass_at(&app, holder).await, 0);
+    let (.., failures, retry) = poll_row(&app.pool, &seller.pubky).await.expect("row");
+    assert_eq!(failures, 1);
+    assert_eq!(
+        retry,
+        Some(app.clock.now() + chrono::Duration::seconds(300))
+    );
+
+    // Longer than the exponential backoff, the header wins.
+    app.clock.advance_seconds(299);
+    assert_eq!(follower_pass_at(&app, holder).await, 0);
+    assert_eq!(homeserver.event_stream_requests(&seller.pubky), 1);
+
+    // It ends, and the seller is read again and recovers.
+    homeserver.stop_throttling_events(&seller.pubky);
+    app.clock.advance_seconds(2);
+    assert_eq!(follower_pass_at(&app, holder).await, 1);
+    // The forward read, then the confirmation's reverse read.
+    assert_eq!(homeserver.event_stream_requests(&seller.pubky), 3);
+    assert!(tombstone_row(&app.pool, &aggregate_id).await.0.is_some());
+
+    // An absurd header is capped at an hour; an unreadable one falls back to
+    // the exponential backoff.
+    for (header, seconds) in [("86400", 3_600), ("garbage", 60)] {
+        let other = new_actor(&app).await;
+        homeserver.put_record(&other.pubky, LISTING_ID, record(1, 1));
+        register_as(&app, &other, LISTING_ID, 1).await;
+        homeserver.throttle_events(&other.pubky, Some(header));
+        app.clock.advance_seconds(61);
+        follower_pass_at(&app, holder).await;
+        let (.., failures, retry) = poll_row(&app.pool, &other.pubky).await.expect("row");
+        assert_eq!(failures, 1, "{header}");
+        assert_eq!(
+            retry,
+            Some(app.clock.now() + chrono::Duration::seconds(seconds)),
+            "{header}"
+        );
+    }
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_failed_confirmation_backs_the_seller_off_without_losing_its_cursor_progress(
+    pool: PgPool,
+) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    published_listing(&app, &homeserver, &seller, 2).await;
+    let aggregate_id = listing_aggregate(&seller.pubky);
+    homeserver.delete_record(&seller.pubky, LISTING_ID);
+    // The page read succeeds, but the record fetch that confirms the DEL
+    // is rejected: the seller backs off and the cursor stops before the DEL.
+    homeserver.fail_record(&seller.pubky, LISTING_ID);
+    let holder = Uuid::new_v4();
+
+    assert_eq!(follower_pass_at(&app, holder).await, 0);
+    let (cursor, polled_at, _, failures, retry) =
+        poll_row(&app.pool, &seller.pubky).await.expect("row");
+    assert_eq!(
+        cursor.as_deref(),
+        Some("1"),
+        "stops before the unsettled DEL"
+    );
+    assert_eq!(
+        polled_at, None,
+        "a rejected confirmation is not a good poll"
+    );
+    assert_eq!(failures, 1);
+    assert_eq!(retry, Some(app.clock.now() + chrono::Duration::seconds(60)));
+
+    homeserver.heal_record(&seller.pubky, LISTING_ID);
+    app.clock.advance_seconds(61);
+    assert_eq!(follower_pass_at(&app, holder).await, 1);
+    assert!(tombstone_row(&app.pool, &aggregate_id).await.0.is_some());
+    let (cursor, polled_at, _, failures, retry) =
+        poll_row(&app.pool, &seller.pubky).await.expect("row");
+    assert_eq!(cursor.as_deref(), Some("2"));
+    assert!(polled_at.is_some());
+    assert_eq!((failures, retry), (0, None));
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn throttled_sellers_do_not_hold_back_the_others(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    // More throttled sellers than one pass polls, and one healthy seller.
+    let mut throttled = Vec::new();
+    for _ in 0..12 {
+        let seller = new_actor(&app).await;
+        homeserver.put_record(&seller.pubky, LISTING_ID, record(1, 1));
+        register_as(&app, &seller, LISTING_ID, 1).await;
+        homeserver.delete_record(&seller.pubky, LISTING_ID);
+        homeserver.throttle_events(&seller.pubky, Some("600"));
+        throttled.push(seller);
+    }
+    let healthy = new_actor(&app).await;
+    for id in ["kept_01", "gone_01", "gone_02"] {
+        homeserver.put_record(&healthy.pubky, id, record(1, 1));
+        register_as(&app, &healthy, id, 1).await;
+    }
+    homeserver.delete_record(&healthy.pubky, "gone_01");
+    let holder = Uuid::new_v4();
+
+    // Every seller is tried within two passes; the healthy seller's delete
+    // lands even though it may queue behind throttled sellers.
+    let first = follower_pass_at(&app, holder).await;
+    app.clock.advance_seconds(61);
+    let second = follower_pass_at(&app, holder).await;
+    assert_eq!(first + second, 1);
+    assert_eq!(tombstoned_ids(&app.pool, &healthy.pubky).await, ["gone_01"]);
+
+    // Each throttled seller was asked exactly once and is now out of the
+    // rotation for its Retry-After, so passes keep serving the healthy one.
+    for seller in &throttled {
+        assert_eq!(homeserver.event_stream_requests(&seller.pubky), 1);
+        let (.., failures, retry) = poll_row(&app.pool, &seller.pubky).await.expect("row");
+        assert_eq!(failures, 1);
+        assert!(retry.expect("backoff") > app.clock.now());
+    }
+    homeserver.delete_record(&healthy.pubky, "gone_02");
+    app.clock.advance_seconds(61);
+    assert_eq!(follower_pass_at(&app, holder).await, 1);
+    assert_eq!(
+        tombstoned_ids(&app.pool, &healthy.pubky).await,
+        ["gone_01", "gone_02"]
+    );
+    for seller in &throttled {
+        assert_eq!(
+            homeserver.event_stream_requests(&seller.pubky),
+            1,
+            "a seller inside its backoff is not asked again"
+        );
+    }
+}

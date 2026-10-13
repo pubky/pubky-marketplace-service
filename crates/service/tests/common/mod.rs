@@ -684,8 +684,20 @@ pub struct FakeHomeserver {
     events: HomeserverEventLog,
     delay_ms: Arc<std::sync::atomic::AtomicU64>,
     failing: HomeserverFailingRecords,
+    throttled: HomeserverThrottledStreams,
     pub base_url: String,
 }
+
+/// Users whose `/events-stream` answers 429, each with the `Retry-After`
+/// header to send (none when `None`), and every stream request the
+/// homeserver received per user.
+#[derive(Default)]
+pub struct HomeserverThrottle {
+    users: HashMap<String, Option<String>>,
+    requests: HashMap<String, usize>,
+}
+
+type HomeserverThrottledStreams = Arc<Mutex<HomeserverThrottle>>;
 
 /// Records whose fetch answers 500, as a failing homeserver would.
 type HomeserverFailingRecords = Arc<Mutex<std::collections::HashSet<(String, String)>>>;
@@ -825,6 +837,35 @@ impl FakeHomeserver {
             .insert((seller_pubky.to_string(), drop_id.to_string()), record);
     }
 
+    /// Answers 429 to this user's event stream, with `Retry-After` when
+    /// given, until [`Self::stop_throttling_events`].
+    pub fn throttle_events(&self, user: &str, retry_after: Option<&str>) {
+        self.throttled
+            .lock()
+            .expect("fake homeserver throttle lock")
+            .users
+            .insert(user.to_string(), retry_after.map(str::to_string));
+    }
+
+    pub fn stop_throttling_events(&self, user: &str) {
+        self.throttled
+            .lock()
+            .expect("fake homeserver throttle lock")
+            .users
+            .remove(user);
+    }
+
+    /// Event-stream requests received for this user, throttled or not.
+    pub fn event_stream_requests(&self, user: &str) -> usize {
+        self.throttled
+            .lock()
+            .expect("fake homeserver throttle lock")
+            .requests
+            .get(user)
+            .copied()
+            .unwrap_or(0)
+    }
+
     pub fn client(&self) -> Arc<dyn HomeserverListingClient> {
         Arc::new(HttpHomeserverClient::new(&self.base_url).expect("fake homeserver client builds"))
     }
@@ -906,6 +947,7 @@ async fn serve_shop_record(
 async fn serve_event_stream(
     axum::extract::State(log): axum::extract::State<HomeserverEventLog>,
     axum::Extension(delay_ms): axum::Extension<Arc<std::sync::atomic::AtomicU64>>,
+    axum::Extension(throttled): axum::Extension<HomeserverThrottledStreams>,
     axum::extract::RawQuery(query): axum::extract::RawQuery,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
@@ -929,6 +971,20 @@ async fn serve_event_stream(
         ),
         None => (user, None),
     };
+    {
+        let mut throttle = throttled.lock().expect("fake homeserver throttle lock");
+        *throttle.requests.entry(user.clone()).or_default() += 1;
+        if let Some(retry_after) = throttle.users.get(&user) {
+            let mut response = (StatusCode::TOO_MANY_REQUESTS, "Too Many Requests").into_response();
+            if let Some(retry_after) = retry_after {
+                response.headers_mut().insert(
+                    axum::http::header::RETRY_AFTER,
+                    retry_after.parse().expect("retry-after header value"),
+                );
+            }
+            return response;
+        }
+    }
     // The snapshot is taken on arrival and delivered after the delay, like
     // a response slowed on the way back.
     let snapshot = {
@@ -986,6 +1042,7 @@ pub async fn spawn_fake_homeserver() -> FakeHomeserver {
     let events: HomeserverEventLog = Arc::default();
     let delay_ms: Arc<std::sync::atomic::AtomicU64> = Arc::default();
     let failing: HomeserverFailingRecords = Arc::default();
+    let throttled: HomeserverThrottledStreams = Arc::default();
     let shops: Arc<Mutex<HashMap<String, Value>>> = Arc::default();
     let router = Router::new()
         .route(
@@ -1011,7 +1068,8 @@ pub async fn spawn_fake_homeserver() -> FakeHomeserver {
                 .with_state(events.clone()),
         )
         .layer(axum::Extension(delay_ms.clone()))
-        .layer(axum::Extension(failing.clone()));
+        .layer(axum::Extension(failing.clone()))
+        .layer(axum::Extension(throttled.clone()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("fake homeserver binds");
@@ -1028,6 +1086,7 @@ pub async fn spawn_fake_homeserver() -> FakeHomeserver {
         events,
         delay_ms,
         failing,
+        throttled,
         base_url: format!("http://{addr}"),
     }
 }

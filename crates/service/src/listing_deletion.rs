@@ -32,6 +32,8 @@
 //! the lease row and proceeds only while it still names this pass. The
 //! cursor it writes never moves backwards.
 
+use std::time::Duration;
+
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
@@ -57,6 +59,31 @@ const FOLLOW_SELLERS_PER_PASS: i64 = 10;
 /// Deletions confirmed per pass; each costs two homeserver requests.
 const FOLLOW_SETTLES_PER_PASS: usize = 20;
 const FOLLOW_POLL_SECONDS: i64 = 60;
+/// A seller whose read the homeserver rejected or could not answer is not
+/// polled again before `FOLLOW_BACKOFF_BASE_SECONDS`, doubling with each
+/// consecutive failure up to `FOLLOW_BACKOFF_MAX_SECONDS`. A `Retry-After`
+/// the homeserver sent raises that floor, up to
+/// `FOLLOW_RETRY_AFTER_MAX_SECONDS`, so one bad header cannot park a seller
+/// for good.
+const FOLLOW_BACKOFF_BASE_SECONDS: u64 = 60;
+const FOLLOW_BACKOFF_MAX_SECONDS: u64 = 15 * 60;
+const FOLLOW_RETRY_AFTER_MAX_SECONDS: u64 = 60 * 60;
+
+/// How long a seller waits after its `failures`-th consecutive failed poll
+/// (1 for the first). Bounded exponential backoff; a `Retry-After` longer
+/// than the backoff wins.
+fn follow_backoff(failures: i32, retry_after: Option<Duration>) -> chrono::Duration {
+    let doublings = u32::try_from(failures.saturating_sub(1))
+        .unwrap_or(0)
+        .min(16);
+    let exponential = FOLLOW_BACKOFF_BASE_SECONDS
+        .saturating_mul(1u64 << doublings)
+        .min(FOLLOW_BACKOFF_MAX_SECONDS);
+    let requested = retry_after
+        .map(|delay| delay.as_secs().min(FOLLOW_RETRY_AFTER_MAX_SECONDS))
+        .unwrap_or(0);
+    chrono::Duration::seconds(i64::try_from(exponential.max(requested)).unwrap_or(i64::MAX))
+}
 /// Revived listings confirmed per pass, before the forward read and within
 /// the first half of the pass, so neither starves the other.
 const FOLLOW_REVIVAL_CHECKS_PER_PASS: i64 = 5;
@@ -76,8 +103,9 @@ pub enum DeletionCheck {
     /// The record was re-created, never existed on this homeserver, or the
     /// seller is not hosted there.
     NotDeleted,
-    /// The event stream could not be read; retry later.
-    Unavailable,
+    /// The event stream or the record could not be read; retry later. The
+    /// homeserver's `Retry-After`, when it sent one.
+    Unavailable { retry_after: Option<Duration> },
 }
 
 /// Step (2) of the deletion proof. Callers have already seen step (1).
@@ -101,7 +129,10 @@ pub async fn latest_event_is_delete(
             }
         }
         HomeserverEventsOutcome::UnknownUser => DeletionCheck::NotDeleted,
-        HomeserverEventsOutcome::Unavailable => DeletionCheck::Unavailable,
+        HomeserverEventsOutcome::Rejected { retry_after } => {
+            DeletionCheck::Unavailable { retry_after }
+        }
+        HomeserverEventsOutcome::Unavailable => DeletionCheck::Unavailable { retry_after: None },
     }
 }
 
@@ -117,7 +148,7 @@ pub async fn confirm_deleted(
             latest_event_is_delete(homeserver, seller_pubky, listing_id).await
         }
         HomeserverFetchOutcome::Found(_) => DeletionCheck::NotDeleted,
-        HomeserverFetchOutcome::Unavailable => DeletionCheck::Unavailable,
+        HomeserverFetchOutcome::Unavailable => DeletionCheck::Unavailable { retry_after: None },
     }
 }
 
@@ -284,9 +315,13 @@ enum SettleOutcome {
     NotDeleted {
         observed: Option<i64>,
     },
-    /// The homeserver could not answer, the pass ran out of time, or the
-    /// service accepted the listing's record after the delete was
-    /// confirmed: settle again later.
+    /// The homeserver rejected or could not answer a read of the proof: the
+    /// seller backs off.
+    HomeserverUnavailable {
+        retry_after: Option<Duration>,
+    },
+    /// The pass ran out of time, or the service accepted the listing's
+    /// record after the delete was confirmed: settle again later.
     Unsettled,
 }
 
@@ -477,7 +512,10 @@ impl FollowerPass<'_> {
         {
             Some(DeletionCheck::Deleted { cursor }) => cursor,
             Some(DeletionCheck::NotDeleted) => return Ok(Ok(not_deleted)),
-            Some(DeletionCheck::Unavailable) | None => return Ok(Ok(SettleOutcome::Unsettled)),
+            Some(DeletionCheck::Unavailable { retry_after }) => {
+                return Ok(Ok(SettleOutcome::HomeserverUnavailable { retry_after }))
+            }
+            None => return Ok(Ok(SettleOutcome::Unsettled)),
         };
         let written = self
             .within_lease(async {
@@ -517,12 +555,30 @@ impl FollowerPass<'_> {
 
     /// Records a poll while the pass holds its lease. The cursor only
     /// moves forward: one older than the stored cursor keeps the stored one.
+    ///
+    /// A [`Poll::Succeeded`] poll stamps `polled_at` and clears the seller's
+    /// backoff. A [`Poll::Failed`] one leaves `polled_at` as the last
+    /// successful poll, counts the failure, and holds the seller back until
+    /// the backoff ends. Either way `attempted_at` moves the seller behind
+    /// every seller not tried since.
     async fn record_poll(
         &self,
         seller_pubky: &str,
         cursor: Option<&str>,
-        polled_at: DateTime<Utc>,
+        poll: Poll,
     ) -> Result<Result<(), Halt>, sqlx::Error> {
+        let attempted_at = self.clock.now();
+        let (polled_at, failures, retry_not_before) = match poll {
+            Poll::Succeeded { polled_at } => (Some(polled_at), 0, None),
+            Poll::Failed {
+                failures,
+                retry_after,
+            } => (
+                None,
+                failures,
+                Some(attempted_at + follow_backoff(failures, retry_after)),
+            ),
+        };
         let written = self
             .within_lease(async {
                 let Some(mut tx) = self.begin().await? else {
@@ -533,8 +589,10 @@ impl FollowerPass<'_> {
                 }
                 self.authority().declare(&mut tx).await?;
                 sqlx::query(
-                    "INSERT INTO listing_deletion_cursors (seller_pubky, event_cursor, polled_at) \
-                     VALUES ($1, $2, $3) \
+                    "INSERT INTO listing_deletion_cursors \
+                         (seller_pubky, event_cursor, polled_at, attempted_at, failures, \
+                          retry_not_before) \
+                     VALUES ($1, $2, $3, $4, $5, $6) \
                      ON CONFLICT (seller_pubky) DO UPDATE SET \
                          event_cursor = CASE \
                              WHEN listing_deletion_cursors.event_cursor IS NULL \
@@ -542,11 +600,18 @@ impl FollowerPass<'_> {
                                      > listing_deletion_cursors.event_cursor::numeric \
                              THEN EXCLUDED.event_cursor \
                              ELSE listing_deletion_cursors.event_cursor END, \
-                         polled_at = EXCLUDED.polled_at",
+                         polled_at = COALESCE(EXCLUDED.polled_at, \
+                                              listing_deletion_cursors.polled_at), \
+                         attempted_at = EXCLUDED.attempted_at, \
+                         failures = EXCLUDED.failures, \
+                         retry_not_before = EXCLUDED.retry_not_before",
                 )
                 .bind(seller_pubky)
                 .bind(cursor)
                 .bind(polled_at)
+                .bind(attempted_at)
+                .bind(failures)
+                .bind(retry_not_before)
                 .execute(&mut *tx)
                 .await?;
                 tx.commit().await?;
@@ -617,6 +682,20 @@ impl FollowerPass<'_> {
     }
 }
 
+/// What one seller's poll came to.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Poll {
+    Succeeded {
+        polled_at: DateTime<Utc>,
+    },
+    /// The homeserver rejected or could not answer. `failures` counts this
+    /// seller's consecutive failed polls, this one included.
+    Failed {
+        failures: i32,
+        retry_after: Option<Duration>,
+    },
+}
+
 /// The listing id named by an event URI for this seller's listings, if any.
 fn event_listing_id<'a>(seller_pubky: &str, uri: &'a str) -> Option<&'a str> {
     let id = uri
@@ -630,13 +709,18 @@ fn event_listing_id<'a>(seller_pubky: &str, uri: &'a str) -> Option<&'a str> {
 /// It first confirms up to [`FOLLOW_REVIVAL_CHECKS_PER_PASS`] revived
 /// listings (`check_revivals`) within the first half of the pass. Then, for
 /// up to [`FOLLOW_SELLERS_PER_PASS`] sellers with live listings whose
-/// last poll is older than [`FOLLOW_POLL_SECONDS`], reads the next batch of
+/// last successful poll is older than [`FOLLOW_POLL_SECONDS`] and whose
+/// backoff has ended, least recently tried first, reads the next batch of
 /// their listing events in order. A `DEL` that is the batch's latest event
 /// for its listing is settled through [`confirm_deleted`], at most
 /// [`FOLLOW_SETTLES_PER_PASS`] per pass. The seller's cursor advances to the
 /// last event before the first one that could not be settled (homeserver
 /// unavailable, deadline, settle cap, or a record accepted after the
-/// delete was confirmed), so nothing is skipped. The pass stops at the
+/// delete was confirmed), so nothing is skipped. A read the homeserver
+/// rejected (`429`, `5xx`) or could not answer is not a successful poll: the
+/// seller keeps its last successful `polled_at`, and backs off alone, by the
+/// homeserver's `Retry-After` or bounded exponentially, while the other
+/// sellers go on. The pass stops at the
 /// deadline, when its database work reaches the lease deadline, or when its
 /// lease is gone. Returns the number of listings tombstoned.
 pub async fn follow_homeserver_deletions(pass: &FollowerPass<'_>) -> anyhow::Result<u64> {
@@ -655,16 +739,18 @@ pub async fn follow_homeserver_deletions(pass: &FollowerPass<'_>) -> anyhow::Res
             let Some(mut tx) = pass.begin().await? else {
                 return Ok(None);
             };
-            let due: Vec<(String, Option<String>)> = sqlx::query_as(
-                "SELECT s.seller_pubky, c.event_cursor \
+            let due: Vec<(String, Option<String>, i32)> = sqlx::query_as(
+                "SELECT s.seller_pubky, c.event_cursor, COALESCE(c.failures, 0) \
                  FROM (SELECT DISTINCT seller_pubky FROM listings WHERE deleted_at IS NULL) s \
                  LEFT JOIN listing_deletion_cursors c ON c.seller_pubky = s.seller_pubky \
-                 WHERE c.polled_at IS NULL OR c.polled_at <= $1 \
-                 ORDER BY c.polled_at NULLS FIRST, s.seller_pubky \
+                 WHERE (c.polled_at IS NULL OR c.polled_at <= $1) \
+                   AND (c.retry_not_before IS NULL OR c.retry_not_before <= $3) \
+                 ORDER BY GREATEST(c.attempted_at, c.polled_at) NULLS FIRST, s.seller_pubky \
                  LIMIT $2",
             )
             .bind(now - chrono::Duration::seconds(FOLLOW_POLL_SECONDS))
             .bind(FOLLOW_SELLERS_PER_PASS)
+            .bind(now)
             .fetch_all(&mut *tx)
             .await?;
             tx.commit().await?;
@@ -677,7 +763,7 @@ pub async fn follow_homeserver_deletions(pass: &FollowerPass<'_>) -> anyhow::Res
 
     let mut settles = 0usize;
     let mut unhosted = 0usize;
-    for (seller_pubky, cursor) in due {
+    for (seller_pubky, cursor, failures) in due {
         if pass.expired() || settles >= FOLLOW_SETTLES_PER_PASS {
             break;
         }
@@ -692,14 +778,26 @@ pub async fn follow_homeserver_deletions(pass: &FollowerPass<'_>) -> anyhow::Res
             .await
         {
             Some(HomeserverEventsOutcome::Events(events)) => events,
-            Some(outcome) => {
-                if outcome == HomeserverEventsOutcome::UnknownUser {
-                    unhosted += 1;
+            Some(HomeserverEventsOutcome::UnknownUser) => {
+                unhosted += 1;
+                let polled = Poll::Succeeded {
+                    polled_at: pass.clock.now(),
+                };
+                if let Err(halt) = pass.record_poll(&seller_pubky, None, polled).await? {
+                    return Ok(halted(tombstoned, halt));
                 }
-                if let Err(halt) = pass
-                    .record_poll(&seller_pubky, None, pass.clock.now())
-                    .await?
-                {
+                continue;
+            }
+            Some(outcome) => {
+                let retry_after = match outcome {
+                    HomeserverEventsOutcome::Rejected { retry_after } => retry_after,
+                    _ => None,
+                };
+                let failed = Poll::Failed {
+                    failures: failures.saturating_add(1),
+                    retry_after,
+                };
+                if let Err(halt) = pass.record_poll(&seller_pubky, None, failed).await? {
                     return Ok(halted(tombstoned, halt));
                 }
                 continue;
@@ -709,6 +807,7 @@ pub async fn follow_homeserver_deletions(pass: &FollowerPass<'_>) -> anyhow::Res
 
         let mut settled_through: Option<&str> = None;
         let mut complete = true;
+        let mut unavailable: Option<Option<Duration>> = None;
         for (index, event) in events.iter().enumerate() {
             let listing_id = event_listing_id(&seller_pubky, &event.uri);
             let superseded = listing_id.is_some_and(|id| {
@@ -731,6 +830,11 @@ pub async fn follow_homeserver_deletions(pass: &FollowerPass<'_>) -> anyhow::Res
                         complete = false;
                         break;
                     }
+                    Ok(SettleOutcome::HomeserverUnavailable { retry_after }) => {
+                        complete = false;
+                        unavailable = Some(retry_after);
+                        break;
+                    }
                     Err(halt) => return Ok(halted(tombstoned, halt)),
                 }
             }
@@ -739,13 +843,21 @@ pub async fn follow_homeserver_deletions(pass: &FollowerPass<'_>) -> anyhow::Res
 
         // A full page read to its end means more history is waiting: leave
         // the seller due for the next pass instead of the next interval.
-        let polled_at = if complete && events.len() == usize::from(FOLLOW_PAGE) {
-            now - chrono::Duration::seconds(FOLLOW_POLL_SECONDS)
-        } else {
-            pass.clock.now()
+        let poll = match unavailable {
+            Some(retry_after) => Poll::Failed {
+                failures: failures.saturating_add(1),
+                retry_after,
+            },
+            None => Poll::Succeeded {
+                polled_at: if complete && events.len() == usize::from(FOLLOW_PAGE) {
+                    now - chrono::Duration::seconds(FOLLOW_POLL_SECONDS)
+                } else {
+                    pass.clock.now()
+                },
+            },
         };
         if let Err(halt) = pass
-            .record_poll(&seller_pubky, settled_through, polled_at)
+            .record_poll(&seller_pubky, settled_through, poll)
             .await?
         {
             return Ok(halted(tombstoned, halt));
@@ -807,7 +919,7 @@ async fn check_revivals(pass: &FollowerPass<'_>) -> anyhow::Result<Result<u64, (
             }
             Ok(SettleOutcome::NotDeleted { observed: None }) => continue,
             Ok(SettleOutcome::NotDeleted { observed }) => observed,
-            Ok(SettleOutcome::Unsettled) => None,
+            Ok(SettleOutcome::Unsettled | SettleOutcome::HomeserverUnavailable { .. }) => None,
             Err(halt) => return Ok(Err((tombstoned, halt))),
         };
         if let Err(halt) = pass
@@ -836,7 +948,31 @@ fn halted(tombstoned: u64, halt: Halt) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::event_listing_id;
+    use std::time::Duration;
+
+    use super::{event_listing_id, follow_backoff};
+
+    fn seconds(failures: i32, retry_after: Option<u64>) -> i64 {
+        follow_backoff(failures, retry_after.map(Duration::from_secs)).num_seconds()
+    }
+
+    #[test]
+    fn backoff_doubles_to_its_cap() {
+        let steps: Vec<i64> = (1..=7).map(|failures| seconds(failures, None)).collect();
+        assert_eq!(steps, [60, 120, 240, 480, 900, 900, 900]);
+        assert_eq!(seconds(i32::MAX, None), 900);
+        assert_eq!(seconds(0, None), 60);
+        assert_eq!(seconds(-3, None), 60);
+    }
+
+    #[test]
+    fn retry_after_raises_the_backoff_and_is_bounded() {
+        assert_eq!(seconds(1, Some(5)), 60, "a short header never undercuts it");
+        assert_eq!(seconds(1, Some(300)), 300);
+        assert_eq!(seconds(5, Some(300)), 900);
+        assert_eq!(seconds(1, Some(1_800)), 1_800);
+        assert_eq!(seconds(1, Some(u64::MAX)), 3_600);
+    }
 
     #[test]
     fn event_listing_ids_are_exact_seller_listing_records() {
