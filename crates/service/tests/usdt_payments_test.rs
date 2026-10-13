@@ -855,7 +855,7 @@ async fn the_stored_denomination_of_an_upstream_bind_reads_back_as_bitcoin(pool:
         .await
         .expect("an upstream bind records the denomination");
     assert_eq!(PaymentAsset::from_column(&stored), Some(PaymentAsset::Btc));
-    assert_no_payment_terms(&read_order(&app, &buyer.token, &order.order_id).await["order"]);
+    assert_no_payment_terms(&read_order(&app, &buyer.token, &order.order_id).await);
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
