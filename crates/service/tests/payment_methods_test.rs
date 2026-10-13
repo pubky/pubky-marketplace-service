@@ -827,7 +827,7 @@ async fn paypal_binding_uses_the_configured_sandbox_checkout_host(pool: PgPool) 
 async fn paypal_binding_returns_the_buyer_under_the_apps_mount_path(pool: PgPool) {
     let mut config = Config::for_tests();
     config.public_app_origin = Some("https://pubky.app/shop".to_string());
-    let (app, _paykit, _ipn, _shippo) = test_app_with_payments_config(pool, config).await;
+    let (app, _paykit, _ipn) = test_app_with_payments_config(pool, config).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     put_config(&app, &seller.token, &full_config_body()).await;
