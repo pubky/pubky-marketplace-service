@@ -77,7 +77,7 @@ async fn migration_0032_applies_after_already_applied_0033(pool: PgPool) {
 
     common::restore_0032_retention_connlimit(&pool).await;
     ALL_MIGRATIONS.run(&pool).await.expect(
-        "missing 0032 and pending 0034..=0054, 0056 and 0058 apply after already-applied 0033",
+        "missing 0032 and pending 0034..=0054, 0056, 0058 and 0059 apply after already-applied 0033",
     );
 
     let finally_applied: Vec<i64> =
@@ -88,7 +88,7 @@ async fn migration_0032_applies_after_already_applied_0033(pool: PgPool) {
     // 0055 and 0057 are reserved by other work.
     assert_eq!(
         finally_applied,
-        (1..=54).chain([56, 58]).collect::<Vec<_>>()
+        (1..=54).chain([56, 58, 59]).collect::<Vec<_>>()
     );
 }
 

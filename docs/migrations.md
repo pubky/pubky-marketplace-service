@@ -127,9 +127,15 @@ It changes no schema and builds no index, and a second run matches no row.
 The two columns stay: 0009 created them and dropping a column is not
 additive. Orders and payments bound to Stripe are not touched.
 
+0059 (listing deletion follower backoff) drops `NOT NULL` from
+`listing_deletion_cursors.polled_at` and adds `attempted_at`, `failures`
+(`CHECK (failures >= 0)`) and `retry_not_before`. It builds no index. A
+binary from before 0059 ignores the new columns and its inserts take their
+defaults, so a rolling replacement is safe.
+
 ## Numbers claimed by open pull requests
 
-`main` has 0001 to 0053, then 0056 and 0058. Pull requests that are open when
+`main` has 0001 to 0053, then 0056 and 0058 (0059 follows with this change). Pull requests that are open when
 this was written claim the missing numbers, so a new migration must check the
 open list (`gh pr list`) and take the next free number rather than assume
 0054:
