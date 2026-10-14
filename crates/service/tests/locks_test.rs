@@ -3611,3 +3611,210 @@ async fn checkout_snapshots_the_merchandise_denomination(pool: PgPool) {
             .expect("payment row exists");
     assert_eq!(amount, total);
 }
+
+/// One unit of a digital Locks listing `listing_id`, checked out by `buyer`
+/// without an address and registered against `bundle_id`. Every command
+/// number is derived from `n`, so several orders coexist in one test.
+async fn registered_digital_locks_order(
+    app: &TestApp,
+    seller: &TestActor,
+    buyer: &TestActor,
+    listing_id: &str,
+    bundle_id: &str,
+    n: u64,
+) -> PendingOrder {
+    let mut listing = register_listing_command(&seller.pubky, listing_id, 1, n);
+    listing["payload"]["digital_lock"] = json!({
+        "policyUri": lock_resource_for(&seller.pubky),
+        "criterionId": "paykit",
+    });
+    as_digital_locks_listing(&mut listing);
+    let (status, body) = execute(app, &seller.token, &listing).await;
+    assert_eq!(status, StatusCode::OK, "register {listing_id}: {body}");
+
+    let mut checkout = checkout_command_with_id(
+        &seller.pubky,
+        &format!("00000000-0000-4000-8000-{:012x}", 0x9000 + n),
+    );
+    checkout["payload"]["lines"][0]["listing_aggregate_id"] =
+        json!(format!("listing:{}_{listing_id}", seller.pubky));
+    let (status, body) = execute(app, &buyer.token, &as_digital_checkout(checkout)).await;
+    assert_eq!(status, StatusCode::OK, "checkout {listing_id}: {body}");
+    let order = PendingOrder {
+        order_id: body["result"]["orders"][0]["id"]
+            .as_str()
+            .expect("order id")
+            .to_string(),
+        payment_id: body["result"]["payments"][0]["id"]
+            .as_str()
+            .expect("payment id")
+            .to_string(),
+    };
+
+    let mut prepare = payment_command(&order.payment_id, 1, "prepare_locks", 0, 0x9100 + n);
+    prepare["kind"] = json!("payment.prepare_locks");
+    prepare["payload"] = json!({ "payment_id": order.payment_id });
+    let (status, body) = execute(app, &buyer.token, &prepare).await;
+    assert_eq!(status, StatusCode::OK, "prepare {listing_id}: {body}");
+    let (status, body) = execute(
+        app,
+        &buyer.token,
+        &register_locks_command(
+            &order.payment_id,
+            2,
+            bundle_id,
+            &lock_resource_for(&seller.pubky),
+            0x9200 + n,
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "register_locks {listing_id}: {body}"
+    );
+    order
+}
+
+/// Makes confirming exactly `order_id` fail inside the confirmation
+/// transaction: the receipt every confirmation issues is refused.
+async fn refuse_receipt_for(pool: &PgPool, order_id: &str) {
+    sqlx::raw_sql(&format!(
+        "CREATE FUNCTION test_refuse_receipt() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN RAISE EXCEPTION 'receipt store unavailable'; END $$; \
+         CREATE TRIGGER test_refuse_receipt BEFORE INSERT ON receipts \
+         FOR EACH ROW WHEN (NEW.order_id = '{order_id}'::uuid) \
+         EXECUTE FUNCTION test_refuse_receipt();"
+    ))
+    .execute(pool)
+    .await
+    .expect("install failing trigger");
+}
+
+async fn repair_receipt_store(pool: &PgPool) {
+    sqlx::raw_sql(
+        "DROP TRIGGER test_refuse_receipt ON receipts; DROP FUNCTION test_refuse_receipt();",
+    )
+    .execute(pool)
+    .await
+    .expect("remove failing trigger");
+}
+
+// The worker path: a confirmation that fails inside its transaction rolls the
+// whole confirmation back and fails only that item — the pass still returns
+// Ok instead of killing the worker loop. Once the fault clears, the next pass
+// (after the claim and lease deferrals elapse) confirms the payment.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn worker_survives_a_digital_locks_confirmation_that_fails(pool: PgPool) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order =
+        registered_digital_locks_order(&app, &seller, &buyer, "boots_01", TEST_BUNDLE_ID, 0x801)
+            .await;
+    refuse_receipt_for(&app.pool, &order.order_id).await;
+    fake.set_outcome(
+        TEST_BUNDLE_ID,
+        LocksLookupOutcome::Status(LocksTaskStatus::Completed),
+    );
+
+    let summary = run_once(&app.state, Uuid::new_v4(), app.clock.now())
+        .await
+        .expect("the pass logs the failed item instead of failing the tick");
+    assert_eq!(
+        summary.locks_completions_applied, 0,
+        "the failed item is not applied"
+    );
+    assert_eq!(
+        order_state(&app.pool, &order.order_id).await,
+        "pending_payment",
+        "the confirmation rolled back"
+    );
+    let (state, adapter, _) = payment_state(&app.pool, &order.payment_id).await;
+    assert_eq!(
+        (state.as_str(), adapter.as_str()),
+        ("awaiting_entitlement", "locks")
+    );
+    assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM receipts").await, 0);
+
+    repair_receipt_store(&app.pool).await;
+    app.clock.advance_seconds(61);
+    let summary = run_once(&app.state, Uuid::new_v4(), app.clock.now())
+        .await
+        .expect("the worker loop continues after the failed pass");
+    assert_eq!(summary.locks_completions_applied, 1, "payment confirmed");
+    assert_eq!(order_state(&app.pool, &order.order_id).await, "paid");
+    assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM receipts").await, 1);
+}
+
+// Two claimed correlations in one tick: the FIRST fails (its confirmation is
+// refused inside the transaction), the SECOND still confirms in the same pass
+// — a per-item error is logged, never head-of-line for the rest of the batch —
+// and the task lease is released for the next holder.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_failed_claimed_digital_locks_item_does_not_stall_the_rest_of_the_batch(pool: PgPool) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let failing =
+        registered_digital_locks_order(&app, &seller, &buyer, "boots_01", TEST_BUNDLE_ID, 0x851)
+            .await;
+    let healthy =
+        registered_digital_locks_order(&app, &seller, &buyer, "boots_02", OTHER_BUNDLE_ID, 0x852)
+            .await;
+    refuse_receipt_for(&app.pool, &failing.order_id).await;
+    for bundle in [TEST_BUNDLE_ID, OTHER_BUNDLE_ID] {
+        fake.set_outcome(
+            bundle,
+            LocksLookupOutcome::Status(LocksTaskStatus::Completed),
+        );
+    }
+    // Deterministic claim order (last_checked_at ASC): the FAILING correlation
+    // is claimed first, well past the poll interval.
+    for (order, age_seconds) in [(&failing, 3600), (&healthy, 1800)] {
+        sqlx::query(
+            "UPDATE payment_locks_correlations SET last_checked_at = $2 WHERE order_id = $1::uuid",
+        )
+        .bind(&order.order_id)
+        .bind(app.clock.now() - chrono::Duration::seconds(age_seconds))
+        .execute(&app.pool)
+        .await
+        .expect("age the claim");
+    }
+
+    let summary = run_once(&app.state, Uuid::new_v4(), app.clock.now())
+        .await
+        .expect("one bad item does not fail the tick");
+    assert_eq!(
+        summary.locks_completions_applied, 1,
+        "the healthy item confirms in the same tick as the failing one"
+    );
+    assert_eq!(
+        order_state(&app.pool, &failing.order_id).await,
+        "pending_payment",
+        "the failing item's confirmation rolled back"
+    );
+    assert_eq!(
+        order_state(&app.pool, &healthy.order_id).await,
+        "paid",
+        "the healthy item confirmed"
+    );
+    assert_eq!(
+        count(&app.pool, "SELECT COUNT(*) FROM receipts").await,
+        1,
+        "only the healthy order was issued a receipt"
+    );
+
+    assert!(
+        try_acquire_lease(
+            &app.pool,
+            workers::TASK_LOCKS_VERIFICATION,
+            Uuid::new_v4(),
+            app.clock.now(),
+            30,
+        )
+        .await
+        .expect("lease query runs"),
+        "the verification lease is free right after the pass"
+    );
+}
