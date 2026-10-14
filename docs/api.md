@@ -125,6 +125,7 @@ and write. "Automation" means the inventory capability plus the
 | GET | `/v1/receipts/{id}/edition-attestation` |
 | GET | `/v1/notifications` |
 | GET | `/v1/me/priv-keys` |
+| POST | `/v1/me/priv-keys/release` |
 | PUT, GET | `/v0/sellers/me/payment-config` |
 | POST | `/v0/orders/{id}/payment-method` |
 | POST | `/v0/orders/{id}/fiat/mark-paid` |
@@ -197,7 +198,9 @@ replay is rejected.
 - The grant a seller tool should request for automation is
   `/pub/pubky.app/marketplace-service/v1/:rw`. The Shop sign-in flow requests
   `/pub/pubky.app/marketplace-service/v1/:rw,/priv/pubky.app/:rw` (the second
-  scope is only needed for `GET /v1/me/priv-keys`).
+  scope is only needed for `GET /v1/me/priv-keys` and
+  `POST /v1/me/priv-keys/release`, see [private data key
+  custody](priv-key-custody.md)).
 - Failures use the [auth envelope](#error-envelopes): `401` for an invalid,
   stale or replayed token.
 

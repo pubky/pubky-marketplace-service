@@ -76,20 +76,17 @@ async fn migration_0032_applies_after_already_applied_0033(pool: PgPool) {
     assert_eq!(initially_applied, expected_without_0032);
 
     common::restore_0032_retention_connlimit(&pool).await;
-    ALL_MIGRATIONS.run(&pool).await.expect(
-        "missing 0032 and pending 0034..=0054 and 0056..=0059 apply after already-applied 0033",
-    );
+    ALL_MIGRATIONS
+        .run(&pool)
+        .await
+        .expect("missing 0032 and pending 0034..=0059 apply after already-applied 0033");
 
     let finally_applied: Vec<i64> =
         sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
             .fetch_all(&pool)
             .await
             .expect("final migration versions");
-    // 0055 is reserved by other work.
-    assert_eq!(
-        finally_applied,
-        (1..=54).chain([56, 57, 58, 59]).collect::<Vec<_>>()
-    );
+    assert_eq!(finally_applied, (1..=59).collect::<Vec<_>>());
 }
 
 fn aggregate_id(seller: &str, listing_id: &str) -> String {
