@@ -1020,8 +1020,10 @@ async fn deliver_paykit_activation(
                 // hold is the winner's reservation (`acquire_payment_hold`).
                 // Read it under this transaction so the reservation sweep
                 // cannot flip it while the guard decides. Upstream starts
-                // the payment window at activation, so the window must also
-                // end one skew margin before the reservation does.
+                // the payment window at activation, so the window must end
+                // one skew margin before the shown hold (reservation - one
+                // margin): Paykit's activation clock may run up to one
+                // margin ahead, and its deadline then still fits the hold.
                 let reservation_expires_at: Option<DateTime<Utc>> = sqlx::query_scalar(
                     "SELECT expires_at FROM reservations \
                      WHERE listing_aggregate_id = $1 AND buyer_pubky = $2 \
