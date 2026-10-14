@@ -1015,11 +1015,40 @@ async fn deliver_paykit_activation(
                         crate::payment_methods::UPSTREAM_HOLD_CLOCK_SKEW_SECONDS,
                     )
             });
-            let activation_allowed = order.stock_held
-                && order
-                    .hold_expires_at
-                    .is_some_and(|deadline| guard_now < deadline)
-                && activation_cutoff.is_some_and(|deadline| guard_now < deadline);
+            let hold_live = if let Some(auction_aggregate_id) = &order.auction_aggregate_id {
+                // An auction order never takes a bind hold: its inventory
+                // hold is the winner's reservation (`acquire_payment_hold`).
+                // Read it under this transaction so the reservation sweep
+                // cannot flip it while the guard decides. Upstream starts
+                // the payment window at activation, so the window must also
+                // end one skew margin before the reservation does.
+                let reservation_expires_at: Option<DateTime<Utc>> = sqlx::query_scalar(
+                    "SELECT expires_at FROM reservations \
+                     WHERE listing_aggregate_id = $1 AND buyer_pubky = $2 \
+                     AND status = 'active' FOR SHARE",
+                )
+                .bind(auction_aggregate_id)
+                .bind(&order.buyer_pubky)
+                .fetch_optional(&mut *tx)
+                .await?;
+                let window = order.paykit_payment_window_seconds.map(|seconds| {
+                    chrono::Duration::seconds(
+                        i64::from(seconds)
+                            + crate::payment_methods::UPSTREAM_HOLD_CLOCK_SKEW_SECONDS,
+                    )
+                });
+                match (reservation_expires_at, window) {
+                    (Some(deadline), Some(window)) => guard_now + window <= deadline,
+                    _ => false,
+                }
+            } else {
+                order.stock_held
+                    && order
+                        .hold_expires_at
+                        .is_some_and(|deadline| guard_now < deadline)
+            };
+            let activation_allowed =
+                hold_live && activation_cutoff.is_some_and(|deadline| guard_now < deadline);
             if !activation_allowed {
                 // No signed activate leaves this process. A previous attempt
                 // may have committed remotely with a lost response, so record

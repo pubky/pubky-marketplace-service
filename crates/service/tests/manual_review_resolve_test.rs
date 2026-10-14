@@ -11,8 +11,8 @@ mod common;
 use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
 use common::paykit_review::{
-    bound_order, enable_bitcoin, into_manual_review_held, into_manual_review_late,
-    into_manual_review_mismatch, poll_now, resolve_call,
+    auction_winning_order, bound_order, enable_bitcoin, into_manual_review_held,
+    into_manual_review_late, into_manual_review_mismatch, poll_now, resolve_call,
     status_confirmed as shared_status_confirmed,
 };
 use common::*;
