@@ -1,17 +1,19 @@
-//! Historical producer captures pin old request bytes, signatures, and
-//! provenance. Current prepare behavior is exercised against the
-//! signature-verifying producer double because the captured producer predates
-//! `description` support and must not be treated as compatible.
+//! Historical producer captures pin old request bytes, signatures, response
+//! bytes, and provenance. Current prepare behavior is exercised elsewhere
+//! against the signature-verifying producer double because these captures
+//! predate `description` support and must not be treated as compatible.
 
 mod common;
 
 use base64::Engine;
-use common::{paykit_server_67_75, spawn_fake_paykit, TEST_PAYKIT_SIGNING_SEED};
+use common::{paykit_server_67_75, TEST_PAYKIT_SIGNING_SEED};
 use ed25519_dalek::{Signature, SigningKey, Verifier};
-use marketplace_service::payments::{paykit_signature_preimage, PaykitApi, PaykitClient};
+use marketplace_service::payments::{
+    paykit_signature_preimage, PaykitApi, PaykitClient, PaykitDeliveryState, PaykitLifecycleTarget,
+    PaykitStatusOutcome,
+};
 
 const SELLER: &str = "buuk6nr1caaumhms4tph5oa656z9f5k9q867h4u8ze441mpfuhyo";
-const BUYER: &str = "7ahm9mquyezn4ny85baxqo43r8epijtwo6h8149yxsm7eiu155uy";
 
 fn captured_signature_verifies(fixture: &paykit_server_67_75::Fixture) -> bool {
     let seed: [u8; 32] = hex::decode(TEST_PAYKIT_SIGNING_SEED)
@@ -34,6 +36,16 @@ fn captured_signature_verifies(fixture: &paykit_server_67_75::Fixture) -> bool {
             &Signature::from_bytes(&signature),
         )
         .is_ok()
+}
+
+fn captured_invoice_id(prepare_fixture: &str) -> uuid::Uuid {
+    let fixture = paykit_server_67_75::load(prepare_fixture);
+    serde_json::from_str::<serde_json::Value>(&fixture.response_body)
+        .expect("captured prepare response is JSON")["invoice_id"]
+        .as_str()
+        .expect("captured prepare response carries invoice_id")
+        .parse()
+        .expect("captured prepare invoice_id is UUID")
 }
 
 #[test]
@@ -101,33 +113,71 @@ fn captured_exchanges_pin_routes_auth_headers_and_canonical_bytes() {
 }
 
 #[tokio::test]
-async fn signed_prepare_capture_contains_stable_order_label() {
-    let paykit = spawn_fake_paykit().await;
-    paykit.use_upstream_api();
-    let client = PaykitClient::new(&paykit.base_url, TEST_PAYKIT_SIGNING_SEED)
+async fn captured_producer_lifecycle_responses_replay_through_the_consumer() {
+    // Prepare now carries `description`, so its legacy request bytes cannot be
+    // replayed. Seed the unchanged commands from the invoice ids in the real
+    // prepare response captures, then replay the producer's exact response
+    // bytes for activate, status, resolve, and void through current parsers.
+    let activate = paykit_server_67_75::load("activate");
+    let status = paykit_server_67_75::load("status_active");
+    let resolve = paykit_server_67_75::load("resolve_paid_manually");
+    let void = paykit_server_67_75::load("void");
+    let invoice_id = captured_invoice_id("prepare_new");
+    let second_invoice = captured_invoice_id("prepare_for_void");
+    let fixtures = vec![activate, status, resolve, void];
+    assert!(fixtures
+        .iter()
+        .all(|fixture| fixture.server_revision == paykit_server_67_75::SERVER_REVISION));
+    let replay = paykit_server_67_75::spawn_replay(fixtures).await;
+    let client = PaykitClient::new(&replay.base_url, TEST_PAYKIT_SIGNING_SEED)
         .expect("Paykit client")
         .with_api(PaykitApi::Upstream);
-    let order_id = uuid::Uuid::parse_str("8f3a91b2-3333-4333-8333-333333333333").unwrap();
+    let target = PaykitLifecycleTarget::Upstream {
+        creator: SELLER.to_string(),
+    };
 
-    client
-        .create_payment_request(
-            SELLER,
-            BUYER,
-            order_id,
-            19,
-            50_000,
+    let activated = client
+        .activate_payment_request(&target, invoice_id, 50_000, 1)
+        .await
+        .expect("captured activation parses");
+    assert_eq!(activated.invoice_id, invoice_id);
+    assert_eq!(activated.total_sats, 50_000);
+
+    let (status, delivery) = client
+        .marketplace_payment_status(SELLER, invoice_id, Some(activated.payment_deadline))
+        .await;
+    assert!(matches!(
+        status,
+        PaykitStatusOutcome::ActiveUndetected { payment_deadline }
+            if payment_deadline == activated.payment_deadline
+    ));
+    assert_eq!(delivery, Some(PaykitDeliveryState::Pending));
+
+    let resolved = client
+        .resolve_payment_request(
+            &target,
+            invoice_id,
+            "paid_manually",
             chrono::DateTime::UNIX_EPOCH,
-            3_600,
         )
         .await
-        .expect("signature-verifying capture accepts prepare");
-
-    let calls = paykit.calls();
-    assert_eq!(calls.len(), 1);
+        .expect("captured resolve response is reachable");
+    assert_eq!(resolved.status, reqwest::StatusCode::OK);
+    let resolved = resolved.resolved.expect("captured resolve body parses");
+    assert_eq!(resolved.invoice_id, invoice_id);
     assert_eq!(
-        calls[0].body["description"],
-        serde_json::json!("Pubky Shop order 8F3A91")
+        resolved.outcome, "paid_manually",
+        "captured producer outcome remains typed"
     );
+
+    let voided = client
+        .void_payment_request(&target, second_invoice, "not serialized upstream")
+        .await
+        .expect("captured void response parses");
+    assert_eq!(voided.invoice_id, second_invoice);
+    assert_eq!(voided.state, "voided");
+
+    replay.assert_drained();
 }
 
 #[test]
