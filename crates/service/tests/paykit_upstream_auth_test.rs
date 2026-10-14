@@ -1405,6 +1405,18 @@ async fn worker_lag_past_upstream_activation_cutoff_never_publishes(pool: PgPool
     );
 }
 
+/// An auction winner's bind carries a sealed shipping address, which an
+/// auction order cannot choose a payment method without.
+fn auction_bind_body() -> serde_json::Value {
+    json!({
+        "method": "bitcoin",
+        "delivery_address_envelope": {
+            "key_id": TEST_DELIVERY_KEY_ID,
+            "envelope": test_envelope(1),
+        },
+    })
+}
+
 /// Closes an auction for a fresh winner and binds bitcoin on upstream
 /// Paykit. Returns the order id, invoice id, and auction aggregate id.
 async fn bind_upstream_auction_order(
@@ -1420,7 +1432,7 @@ async fn bind_upstream_auction_order(
         "POST",
         &format!("/v0/orders/{order_id}/payment-method"),
         Some(&winner.token),
-        &json!({"method":"bitcoin"}),
+        &auction_bind_body(),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "auction bind failed: {body}");
@@ -1551,7 +1563,7 @@ async fn upstream_auction_payment_window_is_capped_at_reservation_expiry(pool: P
         }
     };
     let bind_path = format!("/v0/orders/{order_id}/payment-method");
-    let bind_body = json!({"method":"bitcoin"});
+    let bind_body = auction_bind_body();
     let bind = || {
         send(
             app.router.clone(),

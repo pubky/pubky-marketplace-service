@@ -1,5 +1,5 @@
-//! A Locks listing registers as shipping but sells digital: its checkout takes
-//! the digital method and collects no delivery address.
+//! A Locks listing is a digital listing: it registers as digital, its checkout
+//! takes the digital method and collects no delivery address.
 
 mod common;
 
@@ -68,11 +68,11 @@ async fn a_digital_locks_listing_checks_out_without_a_delivery_address(pool: PgP
     let (status, body) = execute(
         &app,
         &seller.token,
-        &register_locks_listing(&seller.pubky, json!(["shipping"])),
+        &register_locks_listing(&seller.pubky, json!(["digital"])),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(methods_of(&app, &seller.pubky).await, vec!["shipping"]);
+    assert_eq!(methods_of(&app, &seller.pubky).await, vec!["digital"]);
 
     let (status, body) = execute(
         &app,
@@ -102,7 +102,7 @@ async fn a_locks_checkout_that_presents_an_address_is_still_refused_for_digital(
     execute(
         &app,
         &seller.token,
-        &register_locks_listing(&seller.pubky, json!(["shipping"])),
+        &register_locks_listing(&seller.pubky, json!(["digital"])),
     )
     .await;
 
@@ -133,21 +133,18 @@ async fn a_listing_without_a_lock_cannot_be_bought_as_digital(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn a_locks_listing_still_checks_out_as_shipping_with_an_address(pool: PgPool) {
+async fn a_digital_locks_listing_cannot_be_bought_as_shipping(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     execute(
         &app,
         &seller.token,
-        &register_locks_listing(&seller.pubky, json!(["shipping"])),
+        &register_locks_listing(&seller.pubky, json!(["digital"])),
     )
     .await;
 
     let (status, body) = execute(&app, &buyer.token, &checkout(&seller.pubky, None, true)).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(
-        body["result"]["orders"][0]["fulfillment"],
-        json!("shipping")
-    );
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["reason"], json!("fulfillment_not_published"));
 }

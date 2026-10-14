@@ -331,10 +331,9 @@ impl RegisterListingPayload {
     /// True when the registration carries exactly the unlimited cap with a
     /// shipping or pickup method. `quantity` is the sum of the record's
     /// variants and is at most the cap, so any variant at the cap makes the
-    /// sum the cap. For a listing without a Locks lock this is the refusal.
-    /// A Locks listing registers as shipping even when its record publishes
-    /// only `digital` (the Locks derivation skips `digital`), so for it the
-    /// seller's record decides: see `record_publishes_physical_fulfillment`.
+    /// sum the cap. This is the refusal. A Locks listing registers as
+    /// digital like any other digital listing, so it is not at the cap with a
+    /// physical method.
     pub fn registers_unlimited_cap_with_physical_methods(&self) -> bool {
         self.quantity == UNLIMITED_STOCK_QUANTITY
             && self.fulfillment_methods.iter().any(|method| {

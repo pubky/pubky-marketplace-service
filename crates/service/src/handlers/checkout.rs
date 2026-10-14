@@ -190,16 +190,10 @@ pub async fn handle(
     let mut groups: Vec<(String, FulfillmentMethod, Vec<usize>)> = Vec::new();
     for (index, (line, listing)) in resolved.iter().enumerate() {
         let method = line.fulfillment.unwrap_or(FulfillmentMethod::Shipping);
-        // A Locks listing registers as shipping (its derivation skips
-        // `digital`), but what it sells is digital: the Lock Server delivers
-        // it after payment and nothing ships. A buyer may therefore choose
-        // `digital` for it, which collects no delivery address.
-        let locks_listing = listing.digital_lock_policy_uri.is_some();
         let published = listing
             .fulfillment_methods
             .iter()
-            .any(|published| published == method.as_str())
-            || (locks_listing && method == FulfillmentMethod::Digital);
+            .any(|published| published == method.as_str());
         if !published {
             return Ok(Err(CommandFailure::refused_with_reason(
                 crate::refusal_audit::RefusalKind::InvalidState,
@@ -208,8 +202,10 @@ pub async fn handle(
                 "fulfillment_not_published",
             )));
         }
-        // A Locks listing has no sealed deliverable here, so it needs neither
+        // A Locks listing registers as digital, but the Lock Server delivers
+        // it after payment: it has no sealed deliverable, so it needs neither
         // the digital delivery key nor a seller deliverable.
+        let locks_listing = listing.digital_lock_policy_uri.is_some();
         if method == FulfillmentMethod::Digital && !locks_listing {
             if context.digital.is_none() {
                 return Ok(Err(crate::handlers::digital::unavailable()));

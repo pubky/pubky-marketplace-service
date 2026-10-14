@@ -68,6 +68,46 @@ pub const UPSTREAM_HOLD_CLOCK_SKEW_SECONDS: i64 = 60;
 /// winner whose reservation leaves less is refused the bitcoin bind.
 pub const AUCTION_MIN_PAYMENT_WINDOW_SECONDS: i64 = 300;
 
+/// Where an upstream auction bind may end inside the winner's reservation.
+/// This is the one place the arithmetic lives: the bind caps the payment
+/// window and the order's shown deadline with it, and the activation guard
+/// in `workers` checks the persisted window against the same bound.
+pub struct UpstreamAuctionWindow {
+    /// The longest payment window the winner can be given.
+    pub max_payment_window_seconds: i64,
+    /// The latest the order's hold, and the "Pay by" time shown for it, may be.
+    pub hold_deadline: DateTime<Utc>,
+}
+
+/// The window an upstream bitcoin bind may open at `now` for a winner whose
+/// reservation ends at `reservation_expires_at`: the payment window ends one
+/// skew margin before the reservation, with one more for the activation to
+/// land. `None` when less than [`AUCTION_MIN_PAYMENT_WINDOW_SECONDS`] is left.
+pub fn upstream_auction_window(
+    reservation_expires_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Option<UpstreamAuctionWindow> {
+    let remaining =
+        (reservation_expires_at - now).num_seconds() - 2 * UPSTREAM_HOLD_CLOCK_SKEW_SECONDS;
+    (remaining >= AUCTION_MIN_PAYMENT_WINDOW_SECONDS).then(|| UpstreamAuctionWindow {
+        max_payment_window_seconds: remaining,
+        hold_deadline: reservation_expires_at
+            - chrono::Duration::seconds(UPSTREAM_HOLD_CLOCK_SKEW_SECONDS),
+    })
+}
+
+/// Whether an upstream payment window of `payment_window_seconds`, started at
+/// `activation_at`, still ends inside the reservation with its skew margin.
+pub fn upstream_auction_window_fits(
+    reservation_expires_at: DateTime<Utc>,
+    activation_at: DateTime<Utc>,
+    payment_window_seconds: i64,
+) -> bool {
+    activation_at
+        + chrono::Duration::seconds(payment_window_seconds + UPSTREAM_HOLD_CLOCK_SKEW_SECONDS)
+        <= reservation_expires_at
+}
+
 #[derive(Clone)]
 struct PreparedBind {
     invoice_id: Uuid,
@@ -1056,7 +1096,9 @@ pub async fn bind_payment_method(
     }
     // An auction winner's hold is the winning reservation, and its end is the
     // order's deadline: the bind neither opens a new window nor reads the
-    // payment window as one. A bind after the reservation ended is refused.
+    // payment window as one. Upstream Paykit narrows it to the activation
+    // cutoff inside the reservation. A bind after the reservation ended is
+    // refused.
     let auction_hold_expires_at = match &order.auction_aggregate_id {
         Some(auction_aggregate_id) => {
             let reservation_end: Option<DateTime<Utc>> = match sqlx::query_scalar(
@@ -1411,19 +1453,15 @@ pub async fn bind_payment_method(
                     Ok(expires_at) => expires_at,
                     Err(error) => return internal("auction reservation", &error),
                 };
-                let remaining = reservation_expires_at.map(|deadline| {
-                    (deadline - now).num_seconds() - 2 * UPSTREAM_HOLD_CLOCK_SKEW_SECONDS
-                });
-                match (reservation_expires_at, remaining) {
-                    (Some(deadline), Some(remaining))
-                        if remaining >= AUCTION_MIN_PAYMENT_WINDOW_SECONDS =>
-                    {
-                        payment_window_seconds = payment_window_seconds.min(remaining);
-                        auction_hold_cap = Some(
-                            deadline - chrono::Duration::seconds(UPSTREAM_HOLD_CLOCK_SKEW_SECONDS),
-                        );
+                match reservation_expires_at
+                    .and_then(|deadline| upstream_auction_window(deadline, now))
+                {
+                    Some(window) => {
+                        payment_window_seconds =
+                            payment_window_seconds.min(window.max_payment_window_seconds);
+                        auction_hold_cap = Some(window.hold_deadline);
                     }
-                    _ => {
+                    None => {
                         let _ = tx.rollback().await;
                         return method_error(
                             ErrorCode::InvalidState,
@@ -1763,11 +1801,7 @@ pub async fn bind_payment_method(
                     .map(|_| expires_at),
             )
             .bind(paykit.api().as_str())
-            .bind(if auction_hold_expires_at.is_some() {
-                None
-            } else {
-                upstream_hold_expires_at
-            })
+            .bind(upstream_hold_expires_at)
             .bind(if paykit.api() == PaykitApi::Upstream {
                 Some(reference.parse::<Uuid>().expect("upstream reference is UUID"))
             } else {
@@ -2729,5 +2763,51 @@ mod usdt_bind_tests {
             usdt_unavailable_cause(Some(PaykitApi::Upstream), btc_and_usdt),
             UsdtUnavailableCause::PrepareBitcoinOnly
         );
+    }
+}
+
+#[cfg(test)]
+mod upstream_auction_window_tests {
+    use super::*;
+
+    fn at(seconds: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(1_800_000_000 + seconds, 0).expect("timestamp")
+    }
+
+    #[test]
+    fn the_window_and_the_shown_deadline_end_inside_the_reservation() {
+        let reservation = at(1_200);
+        let window = upstream_auction_window(reservation, at(0)).expect("room to pay");
+        assert_eq!(
+            window.max_payment_window_seconds,
+            1_200 - 2 * UPSTREAM_HOLD_CLOCK_SKEW_SECONDS
+        );
+        assert_eq!(
+            window.hold_deadline,
+            reservation - chrono::Duration::seconds(UPSTREAM_HOLD_CLOCK_SKEW_SECONDS)
+        );
+        assert!(upstream_auction_window_fits(
+            reservation,
+            at(0),
+            window.max_payment_window_seconds
+        ));
+        assert!(upstream_auction_window_fits(
+            reservation,
+            at(UPSTREAM_HOLD_CLOCK_SKEW_SECONDS),
+            window.max_payment_window_seconds
+        ));
+        assert!(!upstream_auction_window_fits(
+            reservation,
+            at(UPSTREAM_HOLD_CLOCK_SKEW_SECONDS + 1),
+            window.max_payment_window_seconds
+        ));
+    }
+
+    #[test]
+    fn a_reservation_with_less_than_the_minimum_window_left_offers_none() {
+        let shortest = AUCTION_MIN_PAYMENT_WINDOW_SECONDS + 2 * UPSTREAM_HOLD_CLOCK_SKEW_SECONDS;
+        assert!(upstream_auction_window(at(shortest), at(0)).is_some());
+        assert!(upstream_auction_window(at(shortest - 1), at(0)).is_none());
+        assert!(upstream_auction_window(at(-10), at(0)).is_none());
     }
 }

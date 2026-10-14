@@ -107,23 +107,21 @@ fn digital_without_lock_derives_digital_never_shipping() {
 }
 
 #[test]
-fn locks_listing_derivation_unchanged() {
-    for methods in [
-        json!(["digital"]),
-        json!(["physical", "shipping", "digital"]),
+fn locks_listing_derives_digital_like_any_digital_listing() {
+    for (methods, expected) in [
+        (json!(["digital"]), vec![FulfillmentMethod::Digital]),
+        (
+            json!(["physical", "shipping", "digital"]),
+            vec![FulfillmentMethod::Shipping, FulfillmentMethod::Digital],
+        ),
     ] {
-        let record = shop_record(SELLER_Z32, "guide_01", methods.clone(), true);
-        let registration = registration_payload_from_record(SELLER_Z32, "guide_01", &record);
-        // A lock whose policy is not a canonical Locks resource is the
-        // existing malformed-lock refusal; the derivation question only
-        // arises for a well-formed lock.
-        if let Ok(Some(payload)) = registration {
-            assert_eq!(
-                payload.fulfillment_methods,
-                vec![FulfillmentMethod::Shipping],
-                "{methods}: digital is skipped for a Locks listing"
-            );
-        }
+        let mut record = shop_record(SELLER_Z32, "guide_01", methods.clone(), true);
+        record["digitalLock"]["policyUri"] = json!(common::lock_resource_for(SELLER_Z32));
+        assert_eq!(
+            derived(&record, SELLER_Z32, "guide_01"),
+            expected,
+            "{methods}"
+        );
     }
 }
 

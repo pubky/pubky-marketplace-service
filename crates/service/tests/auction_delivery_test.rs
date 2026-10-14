@@ -7,7 +7,7 @@ mod common;
 
 use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
-use common::paykit_review::enable_bitcoin;
+use common::paykit_review::{auction_winning_order, enable_bitcoin};
 use common::*;
 use marketplace_service::clock::Clock;
 use marketplace_service::config::Config;
@@ -429,9 +429,12 @@ async fn a_bind_after_the_reservation_ended_is_refused(pool: PgPool) {
 
 /// The bind of an upstream Bitcoin payment used to set the order's hold to
 /// the Paykit prepare expiry plus the payment window and a clock margin, a
-/// deadline well past the 30-minute winner window the buyer was shown.
+/// deadline well past the 30-minute winner window the buyer was shown. It now
+/// ends where the reservation does, less the one clock margin the Paykit
+/// activation guard keeps, and the order page shows that same instant.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn an_upstream_bitcoin_bind_keeps_the_reservation_end_as_the_deadline(pool: PgPool) {
+async fn an_upstream_bitcoin_bind_ends_the_deadline_within_the_reservation(pool: PgPool) {
+    use marketplace_service::payment_methods::UPSTREAM_HOLD_CLOCK_SKEW_SECONDS;
     let (app, paykit) = test_app_with_upstream_paykit(pool).await;
     let seller = new_actor(&app).await;
     let winner = new_actor(&app).await;
@@ -448,14 +451,15 @@ async fn an_upstream_bitcoin_bind_keeps_the_reservation_end_as_the_deadline(pool
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    let deadline = reservation - chrono::Duration::seconds(UPSTREAM_HOLD_CLOCK_SKEW_SECONDS);
     assert_eq!(
         order_hold(&app, &order_id).await,
-        Some(reservation),
-        "the deadline is the reservation end, not the bind time plus a window"
+        Some(deadline),
+        "the deadline is the reservation end less one margin, not the bind time plus a window"
     );
     let view = get_order(&app, &winner.token, &order_id).await;
     assert_eq!(
         view["hold_expires_at"],
-        json!(marketplace_service::clock::format_timestamp(reservation))
+        json!(marketplace_service::clock::format_timestamp(deadline))
     );
 }

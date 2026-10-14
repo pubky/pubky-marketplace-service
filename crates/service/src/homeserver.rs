@@ -196,8 +196,8 @@ pub struct AwardListingSnapshot {
 
 /// The record's physical fulfillment methods. As in
 /// [`registration_payload_from_record`], only `shipping`/`pickup` count, in
-/// first-seen order, and a record naming neither (older records, `physical`,
-/// Locks listings) is shipping-only. Digital listings take no offers, so
+/// first-seen order, and a record naming neither (older records, `physical`)
+/// is shipping-only. Digital listings take no offers, so
 /// they never reach this.
 fn record_physical_fulfillment_methods(object: &serde_json::Map<String, Value>) -> Vec<String> {
     let mut methods: Vec<String> = Vec::new();
@@ -1086,23 +1086,6 @@ fn shipping_minor_from_options(options: &[RecordShippingOption], listing_currenc
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MalformedDigitalLock;
 
-/// Whether a seller's listing record publishes a physical fulfillment, as a
-/// buyer reads it: `shipping` or `pickup`, or none of the known methods (an
-/// older or `physical`-only record sells as shipping). A Locks record that
-/// publishes only `digital` does not, although it registers as shipping.
-/// This matches the Shop's reading of the same record.
-pub fn record_publishes_physical_fulfillment(record: &Value) -> bool {
-    let methods: Vec<&str> = record
-        .get("fulfillmentMethods")
-        .and_then(Value::as_array)
-        .map(|methods| methods.iter().filter_map(Value::as_str).collect())
-        .unwrap_or_default();
-    methods
-        .iter()
-        .any(|method| *method == "shipping" || *method == "pickup")
-        || !methods.contains(&"digital")
-}
-
 /// Derives the registration payload from a fetched record, mirroring the
 /// reference client's `registerListing` field mapping EXACTLY: the title,
 /// `listingRevision = record.revision`, `contentHash = media[0].contentHash`,
@@ -1173,19 +1156,13 @@ pub fn registration_payload_from_record(
     };
     let shipping_minor =
         shipping_minor_from_options(&record.shipping_options, &unit_price.currency);
-    // A Locks listing (`digital` with `digitalLock`) keeps its current
-    // derivation: `digital` is skipped, so it converges to shipping as it
-    // always has (digital delivery design §6 A2).
-    let locks_listing = record.digital_lock.is_some();
     let mut fulfillment_methods: Vec<marketplace_domain::commands::FulfillmentMethod> = record
         .fulfillment_methods
         .iter()
         .filter_map(|method| match method.as_str() {
             "shipping" => Some(marketplace_domain::commands::FulfillmentMethod::Shipping),
             "pickup" => Some(marketplace_domain::commands::FulfillmentMethod::Pickup),
-            "digital" if !locks_listing => {
-                Some(marketplace_domain::commands::FulfillmentMethod::Digital)
-            }
+            "digital" => Some(marketplace_domain::commands::FulfillmentMethod::Digital),
             // An unrecognized method is not a parse failure: the record may
             // come from a newer client vocabulary; ignoring it converges to
             // the methods this service understands.

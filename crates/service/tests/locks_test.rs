@@ -1415,6 +1415,7 @@ async fn a_digital_locks_order_without_an_address_is_confirmed_by_the_worker(poo
         "policyUri": lock_resource_for_payment(&seller.pubky, 12_500, "USD"),
         "criterionId": "paykit",
     });
+    listing["payload"]["fulfillment_methods"] = json!(["digital"]);
     let (status, body) = execute(&app, &seller.token, &listing).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let mut checkout =

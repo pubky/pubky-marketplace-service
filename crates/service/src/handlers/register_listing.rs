@@ -15,8 +15,7 @@ use crate::handlers::{
     fetch_listing, fetch_listing_for_update,
 };
 use crate::homeserver::{
-    record_publishes_physical_fulfillment, registration_payload_from_record,
-    HomeserverFetchOutcome, HomeserverListingClient,
+    registration_payload_from_record, HomeserverFetchOutcome, HomeserverListingClient,
 };
 use crate::model::{money_json, AuctionReserveRow, AuctionState, ListingRow};
 use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
@@ -38,8 +37,7 @@ pub(crate) fn unlimited_cap_refusal() -> CommandFailure {
 /// advisory lock, so a slow homeserver never holds a domain connection. It
 /// is fetched only for a command that needs it (see `needs_public_record`),
 /// passes the cheap actor and aggregate checks, and has no stored result;
-/// the handler decides the auction authority and the Locks cap exemption
-/// from this one record.
+/// the handler decides the auction authority from this one record.
 pub enum RegisterRecordPrefetch {
     NotNeeded,
     Found(Value),
@@ -48,12 +46,9 @@ pub enum RegisterRecordPrefetch {
     NoHomeserver,
 }
 
-/// An auction registers against its public authority, and a Locks payload at
-/// the unlimited cap with a physical method is exempt only by its record.
+/// An auction registers against its public authority.
 fn needs_public_record(payload: &RegisterListingPayload) -> bool {
     payload.sale_format == SaleFormat::Auction
-        || (payload.digital_lock.is_some()
-            && payload.registers_unlimited_cap_with_physical_methods())
 }
 
 /// The seller-signed actor and the aggregate the command names; the handler
@@ -173,46 +168,13 @@ fn public_candidate(
     }
 }
 
-/// `listing.register` at the cap with a physical method. Without a Locks
-/// lock that is the refusal. The Locks derivation registers a digital-only
-/// record as shipping, so a Locks payload is exempt only when the seller's
-/// record publishes digital alone and the command is exactly the
-/// registration that record derives: the same service methods, lock,
-/// quantity and record version. Anything else, including a record that
-/// cannot be read or derived, is refused rather than trusted.
-fn refuse_unlimited_cap(
-    payload: &RegisterListingPayload,
-    prefetched: &RegisterRecordPrefetch,
-) -> Option<CommandFailure> {
-    if !payload.registers_unlimited_cap_with_physical_methods() {
-        return None;
-    }
-    if payload.digital_lock.is_none() {
-        return Some(unlimited_cap_refusal());
-    }
-    let record = match prefetched {
-        RegisterRecordPrefetch::Found(record) => record,
-        RegisterRecordPrefetch::NotFound => return Some(record_not_found()),
-        RegisterRecordPrefetch::Unavailable => return Some(record_unavailable()),
-        RegisterRecordPrefetch::NotNeeded | RegisterRecordPrefetch::NoHomeserver => {
-            return Some(unlimited_cap_refusal())
-        }
-    };
-    if record_publishes_physical_fulfillment(record) {
-        return Some(unlimited_cap_refusal());
-    }
-    match public_candidate(payload, record) {
-        Ok(candidate)
-            if candidate.fulfillment_methods == payload.fulfillment_methods
-                && candidate.digital_lock == payload.digital_lock
-                && candidate.quantity == payload.quantity
-                && candidate.listing_revision == payload.listing_revision
-                && candidate.content_hash == payload.content_hash =>
-        {
-            None
-        }
-        _ => Some(unlimited_cap_refusal()),
-    }
+/// `listing.register` at the cap with a physical method. A Locks listing
+/// registers as digital, so it is never at the cap with a physical method
+/// unless its record publishes one.
+fn refuse_unlimited_cap(payload: &RegisterListingPayload) -> Option<CommandFailure> {
+    payload
+        .registers_unlimited_cap_with_physical_methods()
+        .then(unlimited_cap_refusal)
 }
 
 pub async fn handle(
@@ -237,12 +199,10 @@ pub async fn handle(
             "The listing aggregate id does not match its seller and listing.",
         )));
     }
-    if let Some(refusal) = refuse_unlimited_cap(payload, prefetched) {
+    if let Some(refusal) = refuse_unlimited_cap(payload) {
         return Ok(Err(refusal));
     }
 
-    // The auction's public authority is the same prefetched record the cap
-    // decision read, so the two cannot observe different record versions.
     if payload.sale_format == SaleFormat::Auction {
         let public_record = match prefetched {
             RegisterRecordPrefetch::Found(record) => record,

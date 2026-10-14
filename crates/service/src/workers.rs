@@ -1031,14 +1031,14 @@ async fn deliver_paykit_activation(
                 .bind(&order.buyer_pubky)
                 .fetch_optional(&mut *tx)
                 .await?;
-                let window = order.paykit_payment_window_seconds.map(|seconds| {
-                    chrono::Duration::seconds(
-                        i64::from(seconds)
-                            + crate::payment_methods::UPSTREAM_HOLD_CLOCK_SKEW_SECONDS,
-                    )
-                });
-                match (reservation_expires_at, window) {
-                    (Some(deadline), Some(window)) => guard_now + window <= deadline,
+                match (reservation_expires_at, order.paykit_payment_window_seconds) {
+                    (Some(deadline), Some(seconds)) => {
+                        crate::payment_methods::upstream_auction_window_fits(
+                            deadline,
+                            guard_now,
+                            i64::from(seconds),
+                        )
+                    }
                     _ => false,
                 }
             } else {
