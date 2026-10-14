@@ -22,6 +22,18 @@ use serde_json::json;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+/// An auction winner's bind carries a sealed shipping address, which an
+/// auction order cannot choose a payment method without.
+fn winner_bind_body(method: &str) -> serde_json::Value {
+    json!({
+        "method": method,
+        "delivery_address_envelope": {
+            "key_id": TEST_DELIVERY_KEY_ID,
+            "envelope": test_envelope(1),
+        },
+    })
+}
+
 struct Auction {
     order_id: Uuid,
     aggregate: String,
@@ -42,7 +54,7 @@ async fn bound_bitcoin_auction(app: &TestApp, paykit: &FakePaykit) -> (Auction, 
         "POST",
         &format!("/v0/orders/{order_id}/payment-method"),
         Some(&winner.token),
-        &json!({ "method": "bitcoin" }),
+        &winner_bind_body("bitcoin"),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "bind failed: {body}");
@@ -355,7 +367,7 @@ async fn bound_paypal_auction(app: &TestApp) -> (Auction, String) {
         "POST",
         &format!("/v0/orders/{order_id}/payment-method"),
         Some(&winner.token),
-        &json!({ "method": "paypal" }),
+        &winner_bind_body("paypal"),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "paypal bind failed: {body}");
