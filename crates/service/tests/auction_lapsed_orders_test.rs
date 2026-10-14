@@ -10,7 +10,8 @@ mod common;
 use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
 use common::paykit_review::{
-    auction_winning_order, enable_bitcoin, poll_now, status_confirmed as shared_status_confirmed,
+    auction_winning_order, enable_bitcoin, poll_now, resolve_call,
+    status_confirmed as shared_status_confirmed, OBSERVED_TXID,
 };
 use common::*;
 use marketplace_service::clock::Clock;
@@ -24,6 +25,7 @@ use uuid::Uuid;
 struct Auction {
     order_id: Uuid,
     aggregate: String,
+    seller: TestActor,
     winner: TestActor,
 }
 
@@ -58,6 +60,7 @@ async fn bound_bitcoin_auction(app: &TestApp, paykit: &FakePaykit) -> (Auction, 
         Auction {
             order_id,
             aggregate,
+            seller,
             winner,
         },
         reference,
@@ -203,17 +206,24 @@ async fn on_time_bitcoin_money_for_a_unit_that_was_re_listed_names_refund_requir
     let after = reservation_expiry(&pool, &auction).await + chrono::Duration::seconds(1);
     assert_eq!(expire_due_reservations(&pool, after).await.unwrap(), 1);
 
-    // Another buyer took the unit the sweep returned.
-    sqlx::query(
-        "UPDATE listings SET available_quantity = 0, reserved_quantity = 1, state = 'reserved' \
-         WHERE aggregate_id = $1",
-    )
-    .bind(&auction.aggregate)
-    .execute(&pool)
-    .await
-    .unwrap();
+    take_the_returned_unit(&pool, &auction).await;
 
-    paykit.set_status(&reference, shared_status_confirmed("exclusive", true, 2));
+    let total_sats: i64 = sqlx::query_scalar("SELECT paykit_total_sats FROM orders WHERE id = $1")
+        .bind(auction.order_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    paykit.set_status(
+        &reference,
+        bitcoin_status_v2(
+            "confirmed",
+            true,
+            "exclusive",
+            Some(OBSERVED_TXID),
+            Some(total_sats as u64),
+            Some(2),
+        ),
+    );
     assert!(poll_now(&app, after + chrono::Duration::seconds(10)).await >= 1);
     let (order_state, _reason, payment_state, review_reason) = order_payment(&pool, &auction).await;
     assert_eq!(order_state, "cancelled");
@@ -229,6 +239,54 @@ async fn on_time_bitcoin_money_for_a_unit_that_was_re_listed_names_refund_requir
         "the other buyer's unit is untouched"
     );
     assert_eq!(receipts(&pool, &auction).await, 0);
+    assert_no_reservation_left_over(&pool, &auction, after).await;
+
+    // Recording the refund ends the review; the reservation sweep still
+    // never returns the other buyer's unit.
+    let (status, body) = resolve_call(
+        &app,
+        &auction.seller.token,
+        &auction.order_id.to_string(),
+        Some(Uuid::new_v4()),
+        &json!({ "outcome": "refunded", "external_refund_reference": "tx-refund-1" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "refund resolution: {body}");
+    assert_no_reservation_left_over(&pool, &auction, after).await;
+}
+
+/// Another buyer took the unit the reservation sweep returned.
+async fn take_the_returned_unit(pool: &PgPool, auction: &Auction) {
+    sqlx::query(
+        "UPDATE listings SET available_quantity = 0, reserved_quantity = 1, state = 'reserved' \
+         WHERE aggregate_id = $1",
+    )
+    .bind(&auction.aggregate)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// A `refund_required` outcome re-takes nothing: the winning reservation
+/// stays `expired`, so no later reservation sweep can return the other
+/// buyer's unit.
+async fn assert_no_reservation_left_over(pool: &PgPool, auction: &Auction, after: DateTime<Utc>) {
+    assert_eq!(
+        reservation_status(pool, auction).await,
+        "expired",
+        "refund_required leaves no reservation behind"
+    );
+    assert_eq!(
+        expire_due_reservations(pool, after + chrono::Duration::hours(2))
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        listing_quantities(pool, auction).await,
+        (0, 1, 0),
+        "the other buyer's unit is still held"
+    );
 }
 
 fn ipn_body(order_id: Uuid, gross: &str) -> Vec<u8> {
@@ -306,6 +364,7 @@ async fn bound_paypal_auction(app: &TestApp) -> (Auction, String) {
         Auction {
             order_id,
             aggregate,
+            seller,
             winner,
         },
         gross,
@@ -371,5 +430,29 @@ async fn on_time_paypal_money_seen_after_the_reservation_sweep_keeps_the_unit(po
         listing_quantities(&pool, &auction).await,
         &reservation_status(&pool, &auction).await,
         receipts(&pool, &auction).await,
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn on_time_paypal_money_for_a_unit_that_was_re_listed_names_refund_required(pool: PgPool) {
+    let (app, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
+    let (auction, gross) = bound_paypal_auction(&app).await;
+    let after = reservation_expiry(&pool, &auction).await + chrono::Duration::seconds(1);
+    assert_eq!(expire_due_reservations(&pool, after).await.unwrap(), 1);
+    take_the_returned_unit(&pool, &auction).await;
+
+    post_ipn(&app, &auction, &gross).await;
+    let (order_state, _reason, payment_state, review_reason) = order_payment(&pool, &auction).await;
+    assert_eq!(order_state, "cancelled");
+    assert_eq!(payment_state, "manual_review");
+    assert_eq!(review_reason.as_deref(), Some("refund_required"));
+    assert_eq!(receipts(&pool, &auction).await, 0);
+    assert_no_reservation_left_over(&pool, &auction, after).await;
+
+    post_ipn(&app, &auction, &gross).await;
+    assert_eq!(
+        listing_quantities(&pool, &auction).await,
+        (0, 1, 0),
+        "a repeated IPN does not take the unit"
     );
 }

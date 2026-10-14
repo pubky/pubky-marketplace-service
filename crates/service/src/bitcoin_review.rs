@@ -1548,7 +1548,18 @@ pub(crate) async fn apply_late_money(
         return Ok(LateMoneyOutcome::HeldLateSettlement);
     }
 
-    match reacquire_hold(tx, order, now).await {
+    // A failed reacquire must leave nothing behind: the reservation flip or
+    // drop debit it already made would otherwise outlive the refund path.
+    let mut reacquire = sqlx::Acquire::begin(&mut **tx)
+        .await
+        .map_err(|e| ResolutionFailure::Internal("reacquire savepoint".into(), e.to_string()))?;
+    let reacquired = reacquire_hold(&mut reacquire, order, now).await;
+    match reacquired {
+        Ok(()) => reacquire.commit().await,
+        Err(_) => reacquire.rollback().await,
+    }
+    .map_err(|e| ResolutionFailure::Internal("reacquire savepoint".into(), e.to_string()))?;
+    match reacquired {
         Ok(()) => complete_late_order(tx, keys, payment, order, command_id, event_actor, now)
             .await
             .map(|_| LateMoneyOutcome::Completed),
