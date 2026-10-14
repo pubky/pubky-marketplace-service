@@ -2107,7 +2107,14 @@ async fn apply_fiat_paid(
                 "The order was not found.",
             )
         })?;
-    if payment.state == "expired" {
+    // A verified payment whose auction hold the expiry sweep already lapsed
+    // takes the same fork as an expired payment: the unit is re-taken when
+    // free, otherwise the payment is named `refund_required`.
+    let lapsed_auction_hold = payment.state == "awaiting_entitlement"
+        && crate::bitcoin_review::auction_hold_lapsed(&mut tx, &order)
+            .await
+            .map_err(|error| internal("auction hold check", &error))?;
+    if payment.state == "expired" || lapsed_auction_hold {
         let command_id = Uuid::new_v4();
         match apply_late_money(
             &mut tx,

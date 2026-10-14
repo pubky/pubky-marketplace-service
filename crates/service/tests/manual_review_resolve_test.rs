@@ -1990,9 +1990,10 @@ async fn auction_entries_resolve_through_the_reservation(pool: PgPool) {
             .expect("listing row");
     assert_eq!(available, 1, "the unit restocked");
 
-    // --- the lapsed-reservation entry class (confirmation fallback):
-    // exclusive winner whose reservation expired before the observation;
-    // manual_review via the confirm-failure path, then reacquire-or-409 ---
+    // --- the lapsed-reservation entry class: an exclusive winner whose
+    // reservation expired before the on-time observation. The worker takes
+    // the late-money path, so the unit is re-taken and the order pays
+    // without a manual review ---
     let seller = new_actor(&app).await;
     let winner = new_actor(&app).await;
     let (order_id, aggregate) = auction_winning_order(&app, &seller, &winner, 3).await;
@@ -2030,19 +2031,9 @@ async fn auction_entries_resolve_through_the_reservation(pool: PgPool) {
     let reference = attempt_reference(Uuid::parse_str(&order_id).unwrap(), 1);
     paykit.set_status(&reference, status_confirmed("exclusive", true));
     let applied = poll_now(&app, app.clock.now()).await;
-    assert_eq!(applied, 1, "the confirm failure routes to manual_review");
+    assert_eq!(applied, 1, "the on-time observation is applied");
     let facts = payment_facts(&pool, &order_id).await;
-    assert_eq!(facts.state, "manual_review");
-
-    let (status, body) = resolve_call(
-        &app,
-        &seller.token,
-        &order_id,
-        Some(Uuid::new_v4()),
-        &json!({ "outcome": "paid" }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(facts.state, "confirmed");
     let (order_state, _) = order_row_state(&pool, &order_id).await;
     assert_eq!(order_state, "paid");
     let reservation_status: String = sqlx::query_scalar(

@@ -1449,6 +1449,34 @@ pub(crate) enum LateMoneyOutcome {
     HeldLateSettlement,
 }
 
+/// Whether a still-payable auction order lost its winning reservation to the
+/// expiry sweep (the unit is already back on the listing). Money for such an
+/// order must take [`apply_late_money`]: the sweep can run between the
+/// buyer's on-time payment and the worker's first sight of it, and the plain
+/// confirmation refuses a lapsed hold, which used to park the payment in
+/// `manual_review` with no reason.
+pub(crate) async fn auction_hold_lapsed(
+    tx: &mut Transaction<'_, Postgres>,
+    order: &OrderRow,
+) -> Result<bool, sqlx::Error> {
+    let Some(auction_aggregate_id) = &order.auction_aggregate_id else {
+        return Ok(false);
+    };
+    if order.state != "pending_payment" {
+        return Ok(false);
+    }
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM reservations \
+             WHERE listing_aggregate_id = $1 AND buyer_pubky = $2 AND status = 'expired') \
+         AND NOT EXISTS (SELECT 1 FROM reservations \
+             WHERE listing_aggregate_id = $1 AND buyer_pubky = $2 AND status = 'active')",
+    )
+    .bind(auction_aggregate_id)
+    .bind(&order.buyer_pubky)
+    .fetch_one(&mut **tx)
+    .await
+}
+
 /// Late money observed after the hold window: one transaction, listing
 /// `FOR UPDATE` via [`reacquire_hold`]. Stock free completes the order
 /// (`late_completion`). Stock gone stamps `refund_required` and never

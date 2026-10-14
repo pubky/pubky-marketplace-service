@@ -1992,7 +1992,30 @@ async fn apply_confirmed_paykit_payment(
         );
         return Ok(false);
     }
-    if payment.state == "expired" || (late_settlement && payment.state == "awaiting_entitlement") {
+    // An on-time settlement first seen after the reservation sweep returned
+    // an auction winner's unit: the plain confirmation refuses a lapsed
+    // hold, so it takes the late-money fork, which re-takes the unit when it
+    // is still free and otherwise names `refund_required`. A mismatched
+    // amount keeps its own `amount_mismatch` review below.
+    let lapsed_auction_hold = if payment.state == "awaiting_entitlement" && amount_matched {
+        match fetch_order_for_update(&mut tx, row.id).await? {
+            Some(order) => {
+                let quote_mismatch = order.bitcoin_quoted_sats.is_some()
+                    && observation.observed_sats.is_some_and(|observed| {
+                        i64::try_from(observed).ok() != order.paykit_total_sats
+                    });
+                !quote_mismatch
+                    && crate::bitcoin_review::auction_hold_lapsed(&mut tx, &order).await?
+            }
+            None => false,
+        }
+    } else {
+        false
+    };
+    if payment.state == "expired"
+        || (late_settlement && payment.state == "awaiting_entitlement")
+        || lapsed_auction_hold
+    {
         if !resolution_pins_present {
             tx.rollback().await?;
             tracing::error!(
@@ -3200,8 +3223,10 @@ async fn expire_held_order(
     // A drop-stamped hold credits its drop first (drop lock before the
     // listing lock, the shared order): while live the unit restocks and
     // the buyer's per-drop cap frees; an ended drop keeps honest books
-    // but nothing reopens.
-    if let Some(drop_aggregate_id) = &order.drop_aggregate_id {
+    // but nothing reopens. An auction order's reservation sweep already
+    // credited its drop, so the order sweep never credits it again.
+    if let (Some(drop_aggregate_id), None) = (&order.drop_aggregate_id, &order.auction_aggregate_id)
+    {
         let units: i64 = order
             .lines
             .as_array()
