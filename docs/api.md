@@ -627,7 +627,8 @@ Semantics:
 - Failure modes per item: `NOT_FOUND` (record missing, or listing tombstoned
   once the seller's event stream confirms deletion); `UPSTREAM_UNAVAILABLE`
   (503; homeserver unreachable, retry later); `INVALID_STATE` (record cannot be
-  interpreted, has an invalid digital lock, or fails registration invariants);
+  interpreted, has an invalid digital lock, or fails registration invariants,
+  including a digital lock whose methods are not exactly `[digital]`);
   `SELLER_REGISTRATION_REQUIRED` (auction listings need registration);
   `INVALID_COMMAND` (homeserver sync is disabled on this deployment).
 - The whole batch costs one token of the `listing.sync_many` bucket, not one

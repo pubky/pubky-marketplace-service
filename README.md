@@ -1502,7 +1502,13 @@ advance a payment (ADR-0019 §7).
 - **Digital delivery, no delivery address.** A Locks listing is a digital
   listing: a record that publishes `digital` with a `digitalLock` registers
   (`listing.register`, `listing.sync`) with the `digital` method, like any
-  other digital listing. What it sells is delivered by the Lock Server, so
+  other digital listing. A listing with a lock publishes **exactly**
+  `[digital]`: `listing.register` refuses a lock beside `shipping` or
+  `pickup` with an `INVALID_COMMAND` issue on `payload.fulfillment_methods`,
+  and `listing.sync` refuses such a record (or one that omits its methods,
+  which default to shipping) as `INVALID_STATE` ("does not satisfy
+  registration invariants") with the same issue; nothing is registered or
+  healed. What it sells is delivered by the Lock Server, so
   its `checkout.create` line is `fulfillment: "digital"`: a digital order
   with no shipping charge and no delivery address (a checkout that presents
   one is refused `INVALID_COMMAND`). Unlike other digital listings it needs

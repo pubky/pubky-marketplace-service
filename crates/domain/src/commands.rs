@@ -1652,6 +1652,16 @@ fn validate_listing_payload(
             "Auction listings are shipping-only",
         ));
     }
+    // A Locks listing is a digital listing end to end: its price is the item
+    // alone and nothing ships or is picked up, so any other method alongside
+    // it (or in its place) could never be fulfilled against the lock.
+    if payload.digital_lock.is_some() && payload.fulfillment_methods != [FulfillmentMethod::Digital]
+    {
+        issues.push(issue(
+            "payload.fulfillment_methods",
+            "A Locks listing must be digital-only: fulfillment methods must be exactly [digital]",
+        ));
+    }
     if let Some(lock) = &mut payload.digital_lock {
         // Persist only the canonical bare form: a Shop-authored
         // `pubky://<creator>/pub/app.locks/<id>.json` policy URI and its
@@ -3716,6 +3726,7 @@ mod tests {
     fn register_validation_persists_the_canonical_bare_policy_uri() {
         let bare = bare_lock_resource();
         let mut raw = register_command_json();
+        raw["payload"]["fulfillment_methods"] = json!(["digital"]);
         raw["payload"]["digital_lock"] = json!({
             "policyUri": format!("{PUBKY_RESOURCE_SCHEME}{bare}"),
             "criterionId": "paykit",
@@ -3733,6 +3744,50 @@ mod tests {
             "the payload bound to SQL carries the canonical bare form"
         );
     }
+    fn lock_register_json(methods: Option<Value>) -> Value {
+        let mut raw = register_command_json();
+        if let Some(methods) = methods {
+            raw["payload"]["fulfillment_methods"] = methods;
+        }
+        raw["payload"]["digital_lock"] = json!({
+            "policyUri": bare_lock_resource(),
+            "criterionId": "paykit",
+        });
+        raw
+    }
+
+    #[test]
+    fn a_locks_listing_registers_only_as_exactly_digital() {
+        parse_command(&lock_register_json(Some(json!(["digital"]))))
+            .expect("a digital-only Locks listing is valid");
+        for methods in [
+            Some(json!(["shipping"])),
+            Some(json!(["pickup"])),
+            Some(json!(["shipping", "digital"])),
+            Some(json!(["pickup", "digital"])),
+            Some(json!(["shipping", "pickup", "digital"])),
+            // No methods listed defaults to shipping, which a lock refuses.
+            None,
+        ] {
+            let issues = parse_command(&lock_register_json(methods.clone()))
+                .expect_err("a Locks listing with a physical method is refused");
+            assert!(
+                issues
+                    .iter()
+                    .any(|issue| issue.path == "payload.fulfillment_methods"
+                        && issue.message.contains("digital-only")),
+                "{methods:?} must name the digital-only rule: {issues:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_listing_without_a_lock_keeps_its_methods() {
+        let mut raw = register_command_json();
+        raw["payload"]["fulfillment_methods"] = json!(["shipping", "digital"]);
+        parse_command(&raw).expect("a mixed listing without a lock is valid");
+    }
+
     fn sealed_envelope() -> String {
         "A".repeat(DELIVERY_ENVELOPE_BASE64_CHARS)
     }
