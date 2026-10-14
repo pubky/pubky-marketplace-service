@@ -1992,7 +1992,30 @@ async fn apply_confirmed_paykit_payment(
         );
         return Ok(false);
     }
-    if payment.state == "expired" || (late_settlement && payment.state == "awaiting_entitlement") {
+    // An on-time settlement first seen after the reservation sweep returned
+    // an auction winner's unit: the plain confirmation refuses a lapsed
+    // hold, so it takes the late-money fork, which re-takes the unit when it
+    // is still free and otherwise names `refund_required`. A mismatched
+    // amount keeps its own `amount_mismatch` review below.
+    let lapsed_auction_hold = if payment.state == "awaiting_entitlement" && amount_matched {
+        match fetch_order_for_update(&mut tx, row.id).await? {
+            Some(order) => {
+                let quote_mismatch = order.bitcoin_quoted_sats.is_some()
+                    && observation.observed_sats.is_some_and(|observed| {
+                        i64::try_from(observed).ok() != order.paykit_total_sats
+                    });
+                !quote_mismatch
+                    && crate::bitcoin_review::auction_hold_lapsed(&mut tx, &order).await?
+            }
+            None => false,
+        }
+    } else {
+        false
+    };
+    if payment.state == "expired"
+        || (late_settlement && payment.state == "awaiting_entitlement")
+        || lapsed_auction_hold
+    {
         if !resolution_pins_present {
             tx.rollback().await?;
             tracing::error!(
@@ -3097,8 +3120,51 @@ pub async fn expire_due_payment_windows(
             }
         }
     }
+    let lapsed_auction = expire_lapsed_auction_orders(state, now).await?;
     let idle = expire_idle_unbound_checkouts(state, now).await?;
-    Ok(expired + idle)
+    Ok(expired + lapsed_auction + idle)
+}
+
+/// Cancels an auction winner's unpaid order once its winning reservation has
+/// lapsed. An auction order never takes a bind hold (`stock_held` stays
+/// false), so the held-window sweep above cannot match it, and the
+/// reservation sweep only returns the unit: without this step the order and
+/// its awaiting payment stayed open indefinitely after the hold ended. The
+/// reservation sweep already released the stock, so the expiry effects here
+/// skip the release; a paid order, an order awaiting seller confirmation,
+/// and a payment under manual review never match (their reservation is
+/// preserved or converted, never `expired`).
+async fn expire_lapsed_auction_orders(state: &AppState, now: DateTime<Utc>) -> anyhow::Result<u64> {
+    let mut tx = state.pool.begin().await?;
+    let due: Vec<(Uuid, Uuid, String, String)> = sqlx::query_as(&format!(
+        "SELECT o.id, p.id, p.state, o.buyer_pubky \
+         FROM orders o JOIN payments p ON p.order_id = o.id \
+         WHERE {LAPSED_AUCTION_ORDER} \
+         AND p.state IN ('awaiting_entitlement', 'detected', 'expired') \
+         ORDER BY o.created_at FOR UPDATE OF p SKIP LOCKED"
+    ))
+    .bind(now)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    let mut expired = 0u64;
+    for (order_id, payment_id, payment_state, buyer_pubky) in due {
+        if !lock_sweep_order(&mut tx, LAPSED_AUCTION_ORDER, order_id, now).await? {
+            continue;
+        }
+        expire_held_order(
+            &mut tx,
+            order_id,
+            payment_id,
+            &payment_state,
+            &buyer_pubky,
+            now,
+        )
+        .await?;
+        expired += 1;
+    }
+    tx.commit().await?;
+    Ok(expired)
 }
 
 /// The shared expiry effects for one due order, inside the caller's
@@ -3157,8 +3223,10 @@ async fn expire_held_order(
     // A drop-stamped hold credits its drop first (drop lock before the
     // listing lock, the shared order): while live the unit restocks and
     // the buyer's per-drop cap frees; an ended drop keeps honest books
-    // but nothing reopens.
-    if let Some(drop_aggregate_id) = &order.drop_aggregate_id {
+    // but nothing reopens. An auction order's reservation sweep already
+    // credited its drop, so the order sweep never credits it again.
+    if let (Some(drop_aggregate_id), None) = (&order.drop_aggregate_id, &order.auction_aggregate_id)
+    {
         let units: i64 = order
             .lines
             .as_array()
@@ -3190,22 +3258,26 @@ async fn expire_held_order(
             }
         }
     }
-    if let Err(failure) = crate::handlers::holds::release_lines(
-        tx,
-        &order,
-        crate::handlers::holds::HeldQuantity::Reserved,
-        now,
-    )
-    .await?
-    {
-        if order.hold_expires_at.is_none() {
-            tracing::warn!(
-                order_id = %order_id,
-                error = ?failure,
-                "legacy null-expiry hold: listing unaccounted; still expiring"
-            );
-        } else {
-            anyhow::bail!("expired order {order_id} could not release its hold: {failure:?}");
+    // An auction order's hold is its winning reservation, which the
+    // reservation sweep already returned: releasing again would double-credit.
+    if order.auction_aggregate_id.is_none() {
+        if let Err(failure) = crate::handlers::holds::release_lines(
+            tx,
+            &order,
+            crate::handlers::holds::HeldQuantity::Reserved,
+            now,
+        )
+        .await?
+        {
+            if order.hold_expires_at.is_none() {
+                tracing::warn!(
+                    order_id = %order_id,
+                    error = ?failure,
+                    "legacy null-expiry hold: listing unaccounted; still expiring"
+                );
+            } else {
+                anyhow::bail!("expired order {order_id} could not release its hold: {failure:?}");
+            }
         }
     }
 
@@ -3247,6 +3319,21 @@ const HELD_DUE_ORDER: &str = "o.state = 'pending_payment' AND o.stock_held \
      AND (o.hold_expires_at IS NULL OR o.hold_expires_at <= $1) \
      AND o.paykit_activation_state IS DISTINCT FROM 'preparing' \
      AND o.paykit_request_state IS DISTINCT FROM 'awaiting_seller_confirmation'";
+
+/// The order half of the lapsed auction-winner predicate; `$1` is `now`. The
+/// winning reservation must be `expired` (swept) with no live one left, and
+/// the order must not be mid-activation or waiting on its seller.
+const LAPSED_AUCTION_ORDER: &str = "o.state = 'pending_payment' \
+     AND o.auction_aggregate_id IS NOT NULL \
+     AND o.paykit_activation_state IS DISTINCT FROM 'preparing' \
+     AND o.paykit_request_state IS DISTINCT FROM 'awaiting_seller_confirmation' \
+     AND EXISTS (SELECT 1 FROM reservations r \
+         WHERE r.listing_aggregate_id = o.auction_aggregate_id \
+         AND r.buyer_pubky = o.buyer_pubky \
+         AND r.status = 'expired' AND r.expires_at <= $1) \
+     AND NOT EXISTS (SELECT 1 FROM reservations r \
+         WHERE r.listing_aggregate_id = o.auction_aggregate_id \
+         AND r.buyer_pubky = o.buyer_pubky AND r.status = 'active')";
 
 /// The order half of the idle unbound-checkout predicate; `$1` is the
 /// creation cutoff.

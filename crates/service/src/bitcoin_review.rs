@@ -1449,6 +1449,34 @@ pub(crate) enum LateMoneyOutcome {
     HeldLateSettlement,
 }
 
+/// Whether a still-payable auction order lost its winning reservation to the
+/// expiry sweep (the unit is already back on the listing). Money for such an
+/// order must take [`apply_late_money`]: the sweep can run between the
+/// buyer's on-time payment and the worker's first sight of it, and the plain
+/// confirmation refuses a lapsed hold, which used to park the payment in
+/// `manual_review` with no reason.
+pub(crate) async fn auction_hold_lapsed(
+    tx: &mut Transaction<'_, Postgres>,
+    order: &OrderRow,
+) -> Result<bool, sqlx::Error> {
+    let Some(auction_aggregate_id) = &order.auction_aggregate_id else {
+        return Ok(false);
+    };
+    if order.state != "pending_payment" {
+        return Ok(false);
+    }
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM reservations \
+             WHERE listing_aggregate_id = $1 AND buyer_pubky = $2 AND status = 'expired') \
+         AND NOT EXISTS (SELECT 1 FROM reservations \
+             WHERE listing_aggregate_id = $1 AND buyer_pubky = $2 AND status = 'active')",
+    )
+    .bind(auction_aggregate_id)
+    .bind(&order.buyer_pubky)
+    .fetch_one(&mut **tx)
+    .await
+}
+
 /// Late money observed after the hold window: one transaction, listing
 /// `FOR UPDATE` via [`reacquire_hold`]. Stock free completes the order
 /// (`late_completion`). Stock gone stamps `refund_required` and never
@@ -1520,7 +1548,18 @@ pub(crate) async fn apply_late_money(
         return Ok(LateMoneyOutcome::HeldLateSettlement);
     }
 
-    match reacquire_hold(tx, order, now).await {
+    // A failed reacquire must leave nothing behind: the reservation flip or
+    // drop debit it already made would otherwise outlive the refund path.
+    let mut reacquire = sqlx::Acquire::begin(&mut **tx)
+        .await
+        .map_err(|e| ResolutionFailure::Internal("reacquire savepoint".into(), e.to_string()))?;
+    let reacquired = reacquire_hold(&mut reacquire, order, now).await;
+    match reacquired {
+        Ok(()) => reacquire.commit().await,
+        Err(_) => reacquire.rollback().await,
+    }
+    .map_err(|e| ResolutionFailure::Internal("reacquire savepoint".into(), e.to_string()))?;
+    match reacquired {
         Ok(()) => complete_late_order(tx, keys, payment, order, command_id, event_actor, now)
             .await
             .map(|_| LateMoneyOutcome::Completed),

@@ -15,7 +15,8 @@
 //!   `SANDBOX_PAYMENT_WINDOW_SECONDS`.
 //!
 //! Auction orders are excluded: their hold is the winning `reservations`
-//! row. Drop-bound checkout keeps lock-at-claim and arms
+//! row. Once that reservation is swept to `expired`, the payment-window
+//! worker cancels the unpaid order without a second release. Drop-bound checkout keeps lock-at-claim and arms
 //! `DROP_CLAIM_WINDOW_SECONDS` at checkout.
 //!
 //! The payment-window worker ([`crate::workers::expire_due_payment_windows`])
