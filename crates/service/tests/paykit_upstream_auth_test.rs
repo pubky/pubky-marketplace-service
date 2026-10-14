@@ -1763,6 +1763,94 @@ async fn upstream_auction_activation_past_slack_voids_and_rebinds_with_less_time
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn upstream_auction_activation_retry_within_slack_activates(pool: PgPool) {
+    use marketplace_service::payment_methods::{
+        AUCTION_ACTIVATION_SLACK_SECONDS, UPSTREAM_HOLD_CLOCK_SKEW_SECONDS,
+    };
+    // A prepare TTL that outlasts the retry below, so only the
+    // reservation bound can refuse it; the accepted maximum matches it.
+    let mut config = marketplace_service::config::Config::for_tests();
+    config.paykit_max_prepare_ttl_seconds = 1_200;
+    let (app, paykit) =
+        test_app_with_paykit_api_config(pool.clone(), config, PaykitApi::Upstream).await;
+    paykit.set_upstream_prepare_ttl_seconds(1_200);
+    // Postgres stores microseconds: truncate so windows are whole seconds.
+    app.clock.set(
+        chrono::DateTime::from_timestamp_micros(app.clock.now().timestamp_micros())
+            .expect("microsecond timestamp"),
+    );
+    let (order_id, invoice_id, aggregate) = bind_upstream_auction_order(&app, &paykit).await;
+    let first_bind_at = app.clock.now();
+    let reservation_expires_at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+        "SELECT expires_at FROM reservations WHERE listing_aggregate_id = $1 AND status = 'active'",
+    )
+    .bind(&aggregate)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let activates = || {
+        paykit
+            .calls()
+            .iter()
+            .filter(|call| call.path == "/marketplace/payment-requests/activate")
+            .count()
+    };
+    let client = app
+        .state
+        .payments
+        .as_ref()
+        .and_then(|payments| payments.paykit.as_ref());
+
+    // The first activate fails transiently and leaves the bind standing.
+    paykit.fail_commands_with(503, "unavailable");
+    drain_outbox(&pool, client, first_bind_at, 30)
+        .await
+        .unwrap();
+    paykit.clear_command_failure();
+    assert_eq!(activates(), 1);
+    let activation: Option<String> =
+        sqlx::query_scalar("SELECT paykit_activation_state FROM orders WHERE id = $1")
+            .bind(order_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_ne!(activation.as_deref(), Some("voided"));
+
+    // The retry lands on the last second of the slack: it activates.
+    let retry_at = first_bind_at + chrono::Duration::seconds(AUCTION_ACTIVATION_SLACK_SECONDS);
+    drain_outbox(&pool, client, retry_at, 30).await.unwrap();
+    assert_eq!(activates(), 2, "the retry reached Paykit");
+    let (activation, method): (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT paykit_activation_state, payment_method FROM orders WHERE id = $1")
+            .bind(order_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(activation.as_deref(), Some("active"));
+    assert_eq!(method.as_deref(), Some("bitcoin"));
+    let (deadline, hold): (
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    ) = sqlx::query_as("SELECT paykit_expires_at, hold_expires_at FROM orders WHERE id = $1")
+        .bind(order_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(paykit.invoice(invoice_id).expect("invoice").state, "active");
+    let cap = reservation_expires_at - chrono::Duration::seconds(UPSTREAM_HOLD_CLOCK_SKEW_SECONDS);
+    assert!(
+        deadline.is_some_and(|deadline| deadline <= cap),
+        "the request cannot outlive the reservation"
+    );
+    assert!(
+        deadline
+            .zip(hold)
+            .is_some_and(|(deadline, hold)| deadline <= hold),
+        "the activated deadline fits the shown hold (no activation-bounds alert)"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn upstream_hold_expiry_racing_activation_never_revives_inventory(pool: PgPool) {
     let (app, paykit) = test_app_with_upstream_paykit(pool.clone()).await;
     let (_seller, _buyer, order_id, _invoice_id) = bind_upstream_order(&app, &paykit).await;
