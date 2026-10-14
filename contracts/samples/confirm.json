@@ -247,6 +247,7 @@
           "next_actor": "seller",
           "paykit_activation_state": "active",
           "paykit_delivery_state": null,
+          "paykit_expires_at": "<timestamp:2>",
           "paykit_observation": {
             "amount_matched": true,
             "confirmations": 2,

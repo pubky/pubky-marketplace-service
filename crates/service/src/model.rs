@@ -1175,6 +1175,7 @@ impl OrderRow {
             "paykit_request_state": self.paykit_request_state,
             "paykit_activation_state": self.paykit_activation_state,
             "paykit_total_sats": self.paykit_total_sats,
+            "paykit_expires_at": self.paykit_expires_at.map(format_timestamp),
             "bitcoin_quote": {
                 "rate": self.bitcoin_quote_rate.as_ref().map(ToString::to_string),
                 "source": self.bitcoin_quote_source,
