@@ -1,17 +1,14 @@
-//! Consumer compatibility against verbatim exchanges captured from the real
-//! Paykit producer. Unlike the programmable fake suites, this pins request
-//! bytes/signatures plus response bytes for prepare, activate, status,
-//! resolve, and void.
+//! Historical producer captures pin old request bytes, signatures, and
+//! provenance. Current prepare behavior is exercised against the
+//! signature-verifying producer double because the captured producer predates
+//! `description` support and must not be treated as compatible.
 
 mod common;
 
 use base64::Engine;
-use common::{paykit_server_67_75, TEST_PAYKIT_SIGNING_SEED};
+use common::{paykit_server_67_75, spawn_fake_paykit, TEST_PAYKIT_SIGNING_SEED};
 use ed25519_dalek::{Signature, SigningKey, Verifier};
-use marketplace_service::payments::{
-    paykit_signature_preimage, PaykitApi, PaykitClient, PaykitDeliveryState, PaykitLifecycleTarget,
-    PaykitPrepared, PaykitStatusOutcome,
-};
+use marketplace_service::payments::{paykit_signature_preimage, PaykitApi, PaykitClient};
 
 const SELLER: &str = "buuk6nr1caaumhms4tph5oa656z9f5k9q867h4u8ze441mpfuhyo";
 const BUYER: &str = "7ahm9mquyezn4ny85baxqo43r8epijtwo6h8149yxsm7eiu155uy";
@@ -81,6 +78,12 @@ fn captured_exchanges_pin_routes_auth_headers_and_canonical_bytes() {
         );
         let request: serde_json::Value =
             serde_json::from_str(&fixture.request_body).expect("captured request is JSON");
+        if fixture.path == "/marketplace/payment-requests/prepare" {
+            assert!(
+                request.get("description").is_none(),
+                "legacy capture predates provider description support"
+            );
+        }
         assert_eq!(
             serde_json_canonicalizer::to_string(&request).expect("request canonicalizes"),
             fixture.request_body,
@@ -98,113 +101,33 @@ fn captured_exchanges_pin_routes_auth_headers_and_canonical_bytes() {
 }
 
 #[tokio::test]
-async fn captured_producer_lifecycle_exchanges_replay_through_the_consumer() {
-    let fixtures = paykit_server_67_75::load_all();
-    assert!(fixtures
-        .iter()
-        .all(|fixture| { fixture.server_revision == paykit_server_67_75::SERVER_REVISION }));
-    let replay = paykit_server_67_75::spawn_replay(fixtures).await;
-    let client = PaykitClient::new(&replay.base_url, TEST_PAYKIT_SIGNING_SEED)
+async fn signed_prepare_capture_contains_stable_order_label() {
+    let paykit = spawn_fake_paykit().await;
+    paykit.use_upstream_api();
+    let client = PaykitClient::new(&paykit.base_url, TEST_PAYKIT_SIGNING_SEED)
         .expect("Paykit client")
         .with_api(PaykitApi::Upstream);
-    let target = PaykitLifecycleTarget::Upstream {
-        creator: SELLER.to_string(),
-    };
+    let order_id = uuid::Uuid::parse_str("8f3a91b2-3333-4333-8333-333333333333").unwrap();
 
-    let first_order = uuid::Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
-    let prepared = client
+    client
         .create_payment_request(
             SELLER,
             BUYER,
-            first_order,
-            1,
+            order_id,
+            19,
             50_000,
             chrono::DateTime::UNIX_EPOCH,
             3_600,
         )
         .await
-        .expect("captured prepare response parses");
-    let replayed = client
-        .create_payment_request(
-            SELLER,
-            BUYER,
-            first_order,
-            1,
-            50_000,
-            chrono::DateTime::UNIX_EPOCH,
-            3_600,
-        )
-        .await
-        .expect("captured prepare replay parses");
-    assert_eq!(replayed, prepared, "producer replayed exact prepared body");
-    let PaykitPrepared::Upstream {
-        invoice_id,
-        total_sats,
-        ..
-    } = prepared
-    else {
-        panic!("captured upstream response stays typed upstream")
-    };
+        .expect("signature-verifying capture accepts prepare");
 
-    let activated = client
-        .activate_payment_request(&target, invoice_id, total_sats, 1)
-        .await
-        .expect("captured activation parses");
-    assert_eq!(activated.invoice_id, invoice_id);
-    assert_eq!(activated.total_sats, 50_000);
-
-    let (status, delivery) = client
-        .marketplace_payment_status(SELLER, invoice_id, Some(activated.payment_deadline))
-        .await;
-    assert!(matches!(
-        status,
-        PaykitStatusOutcome::ActiveUndetected { payment_deadline }
-            if payment_deadline == activated.payment_deadline
-    ));
-    assert_eq!(delivery, Some(PaykitDeliveryState::Pending));
-
-    let resolved = client
-        .resolve_payment_request(
-            &target,
-            invoice_id,
-            "paid_manually",
-            chrono::DateTime::UNIX_EPOCH,
-        )
-        .await
-        .expect("captured resolve response is reachable");
-    assert_eq!(resolved.status, reqwest::StatusCode::OK);
-    let resolved = resolved.resolved.expect("captured resolve body parses");
-    assert_eq!(resolved.invoice_id, invoice_id);
-    assert_eq!(resolved.outcome, "paid_manually");
-
-    let second_order = uuid::Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
-    let prepared = client
-        .create_payment_request(
-            SELLER,
-            BUYER,
-            second_order,
-            1,
-            50_000,
-            chrono::DateTime::UNIX_EPOCH,
-            3_600,
-        )
-        .await
-        .expect("captured second prepare response parses");
-    let PaykitPrepared::Upstream {
-        invoice_id: second_invoice,
-        ..
-    } = prepared
-    else {
-        panic!("captured upstream response stays typed upstream")
-    };
-    let voided = client
-        .void_payment_request(&target, second_invoice, "not serialized upstream")
-        .await
-        .expect("captured void response parses");
-    assert_eq!(voided.invoice_id, second_invoice);
-    assert_eq!(voided.state, "voided");
-
-    replay.assert_drained();
+    let calls = paykit.calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].body["description"],
+        serde_json::json!("Pubky Shop order 8F3A91")
+    );
 }
 
 #[test]

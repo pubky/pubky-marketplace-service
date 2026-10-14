@@ -753,6 +753,11 @@ pub fn upstream_operation_id(reference: &str, attempt: i32) -> String {
     format!("marketplace-payment:{reference}:{attempt}")
 }
 
+fn upstream_order_description(order_id: uuid::Uuid) -> String {
+    let compact = order_id.simple().to_string();
+    format!("Pubky Shop order {}", compact[..6].to_ascii_uppercase())
+}
+
 /// The single per-order reference every bind used before per-attempt
 /// references: Crockford base32 of the order UUID. Attempts released
 /// under it are polled by it.
@@ -1059,6 +1064,7 @@ impl PaykitClient {
                 serde_json::json!({
                     "amount_sats": amount_sats,
                     "creator": pubky_app_key(seller_pubky),
+                    "description": upstream_order_description(order_id),
                     "operation_id": upstream_operation_id(&reference, bind_attempt),
                     "payment_window_seconds": payment_window_seconds,
                     "reader": pubky_app_key(buyer_pubky),

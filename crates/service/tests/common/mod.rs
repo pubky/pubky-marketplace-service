@@ -3109,6 +3109,7 @@ async fn serve_upstream_prepare(
     let expected = [
         "amount_sats",
         "creator",
+        "description",
         "operation_id",
         "payment_window_seconds",
         "reader",
