@@ -10,7 +10,6 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use chrono::{DateTime, Utc};
 use marketplace_service::clock::Clock;
-use marketplace_service::locks::{LocksLookupOutcome, LocksRuntime, LocksTaskStatus};
 use marketplace_service::pickup::{self, PickupKeys};
 use marketplace_service::workers::{self, run_once};
 use marketplace_service::AppState;
@@ -21,20 +20,13 @@ use tower::util::ServiceExt;
 use uuid::Uuid;
 
 use common::{
-    checkout_command_with_id, count, execute, indexed_command_id, lock_resource_for,
-    lock_resource_for_payment, new_actor, order_command, register_command,
-    register_listing_command, register_locks_command, send, spawn_fake_homeserver, test_app,
-    test_app_with_pickup, test_app_with_pickup_and_locks, test_attestor, test_locks_keys,
-    FakeLocksClient, TestActor, TestApp, TEST_BUNDLE_ID,
+    checkout_command_with_id, count, execute, indexed_command_id, new_actor, order_command,
+    register_command, register_listing_command, send, spawn_fake_homeserver, test_app,
+    test_app_with_pickup, test_app_with_pickup_and_paypal, test_attestor, TestActor, TestApp,
 };
 use marketplace_service::clock::AdjustableClock;
 use marketplace_service::http::build_router;
 
-const BUNDLE_2: &str = "222G40R40M30E209185GR38E1W";
-const BUNDLE_3: &str = "333G40R40M30E209185GR38E1W";
-const BUNDLE_4: &str = "444G40R40M30E209185GR38E1W";
-const BUNDLE_5: &str = "555G40R40M30E209185GR38E1W";
-const BUNDLE_6: &str = "666G40R40M30E209185GR38E1W";
 const SPOT: &str = "Central Station, north entrance";
 const SPOT_EDITED: &str = "Harbor Pier 9, west gate";
 
@@ -46,23 +38,6 @@ fn listing_agg(seller: &str, listing_id: &str) -> String {
 fn register_pickup_listing(seller: &str, listing_id: &str, quantity: i64, n: u64) -> Value {
     let mut command = register_listing_command(seller, listing_id, quantity, n);
     command["payload"]["fulfillment_methods"] = json!(["shipping", "pickup"]);
-    command
-}
-
-/// A pickup listing that also publishes the seller-authored Locks policy, so
-/// orders on it carry exactly one snapshotted payment lock at checkout.
-fn register_pickup_listing_with_lock(
-    seller: &str,
-    listing_id: &str,
-    quantity: i64,
-    n: u64,
-    lock_amount: i64,
-) -> Value {
-    let mut command = register_pickup_listing(seller, listing_id, quantity, n);
-    command["payload"]["digital_lock"] = json!({
-        "policyUri": lock_resource_for_payment(seller, lock_amount, "USD"),
-        "criterionId": "paykit",
-    });
     command
 }
 
@@ -154,11 +129,7 @@ async fn create_pickup_order(
     register_n: u64,
     checkout_id: &str,
 ) -> PickupOrder {
-    let mut listing = register_pickup_listing(&seller.pubky, listing_id, 5, register_n);
-    listing["payload"]["digital_lock"] = json!({
-        "policyUri": lock_resource_for_payment(&seller.pubky, 12_500, "USD"),
-        "criterionId": "paykit",
-    });
+    let listing = register_pickup_listing(&seller.pubky, listing_id, 5, register_n);
     let (status, body) = execute(app, &seller.token, &listing).await;
     assert_eq!(status, StatusCode::OK, "register failed: {body}");
     let (status, body) = execute(
@@ -184,50 +155,23 @@ async fn create_pickup_order(
     }
 }
 
-/// Confirms the order's payment through the real Locks verification worker
-/// seam: registration, a completed lifecycle outcome, and one worker pass.
-/// The pinned confirming adapter is then the worker's rail (`locks`).
-async fn confirm_via_locks(
+/// Confirms the order's payment through a verified PayPal IPN, so the pinned
+/// confirming adapter is a real rail (`paypal`).
+async fn confirm_payment(
     app: &TestApp,
-    fake: &FakeLocksClient,
+    seller: &TestActor,
     buyer: &TestActor,
     order: &PickupOrder,
-    seller: &TestActor,
-    bundle_id: &str,
     n: u64,
 ) {
-    let prepare = json!({
-        "version": 1,
-        "command_id": common::indexed_command_id(0x8002, n + 10_000),
-        "aggregate_id": format!("payment:{}", order.payment_id),
-        "expected_revision": 1,
-        "issued_at": "2026-08-19T22:00:00.000Z",
-        "kind": "payment.prepare_locks",
-        "payload": { "payment_id": order.payment_id },
-    });
-    let (status, body) = execute(app, &buyer.token, &prepare).await;
-    assert_eq!(status, StatusCode::OK, "locks preparation failed: {body}");
-    let (status, body) = execute(
+    common::confirm_via_paypal(
         app,
-        &buyer.token,
-        &register_locks_command(
-            &order.payment_id,
-            2,
-            bundle_id,
-            &lock_resource_for(&seller.pubky),
-            n,
-        ),
+        seller,
+        buyer,
+        &order.order_id,
+        &format!("PICKUP-TXN-{n:08x}"),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "locks registration failed: {body}");
-    fake.set_outcome(
-        bundle_id,
-        LocksLookupOutcome::Status(LocksTaskStatus::Completed),
-    );
-    let summary = run_once(&app.state, Uuid::new_v4(), app.clock.now())
-        .await
-        .expect("worker pass runs");
-    assert_eq!(summary.locks_completions_applied, 1, "payment confirmed");
 }
 
 async fn order_row(pool: &PgPool, order_id: &str) -> (String, i64) {
@@ -266,7 +210,6 @@ async fn owner_read(app: &TestApp, token: &str, aggregate_id: &str) -> (StatusCo
 /// paid through the Locks worker.
 async fn paid_pickup_order(
     app: &TestApp,
-    fake: &FakeLocksClient,
     seller: &TestActor,
     buyer: &TestActor,
     listing_id: &str,
@@ -288,16 +231,7 @@ async fn paid_pickup_order(
     )
     .await;
     assert_eq!(status, StatusCode::OK, "set details failed: {body}");
-    confirm_via_locks(
-        app,
-        fake,
-        buyer,
-        &order,
-        seller,
-        TEST_BUNDLE_ID,
-        0x300 + seed,
-    )
-    .await;
+    confirm_payment(app, seller, buyer, &order, 0x300 + seed).await;
     order
 }
 
@@ -306,7 +240,7 @@ async fn paid_pickup_order(
 // line — and LATER EDITS never change what the reveal serves.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn reveal_requires_payment_and_serves_the_pinned_snapshot(pool: PgPool) {
-    let (app, fake) = test_app_with_pickup_and_locks(pool).await;
+    let app = test_app_with_pickup_and_paypal(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let order = create_pickup_order(
@@ -331,7 +265,7 @@ async fn reveal_requires_payment_and_serves_the_pinned_snapshot(pool: PgPool) {
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
 
-    confirm_via_locks(&app, &fake, &buyer, &order, &seller, TEST_BUNDLE_ID, 0x301).await;
+    confirm_payment(&app, &seller, &buyer, &order, 0x301).await;
 
     // Paid: the pinned snapshot per line, with read-only windows and zone.
     let (status, body) = reveal(&app, &buyer.token, &order.order_id).await;
@@ -368,7 +302,7 @@ async fn reveal_requires_payment_and_serves_the_pinned_snapshot(pool: PgPool) {
     assert_eq!(body["lines"][0]["current_version"], json!(2));
     assert_eq!(body["lines"][0]["updated_since_payment"], json!(true));
 
-    // The snapshot row exists with the worker's rail as confirming adapter,
+    // The snapshot row exists with PayPal as the confirming adapter,
     // sealed: the spot text appears nowhere in the stored ciphertext.
     let (ciphertext, adapter, pinned_version): (Vec<u8>, String, i64) = sqlx::query_as(
         "SELECT snapshot_ciphertext, confirming_adapter, version FROM pickup_line_snapshots \
@@ -378,7 +312,7 @@ async fn reveal_requires_payment_and_serves_the_pinned_snapshot(pool: PgPool) {
     .fetch_one(&app.pool)
     .await
     .expect("snapshot row exists");
-    assert_eq!(adapter, "locks");
+    assert_eq!(adapter, "paypal");
     assert_eq!(pinned_version, 1);
     assert!(!ciphertext
         .windows(SPOT.len())
@@ -395,10 +329,10 @@ async fn reveal_requires_payment_and_serves_the_pinned_snapshot(pool: PgPool) {
 // Cache-Control: no-store on both entitled reads.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn entitled_reads_are_no_store(pool: PgPool) {
-    let (app, fake) = test_app_with_pickup_and_locks(pool).await;
+    let app = test_app_with_pickup_and_paypal(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    let order = paid_pickup_order(&app, &fake, &seller, &buyer, "boots_01", 0x11).await;
+    let order = paid_pickup_order(&app, &seller, &buyer, "boots_01", 0x11).await;
 
     for uri in [
         format!("/v1/orders/{}/pickup-details", order.order_id),
@@ -438,11 +372,11 @@ async fn entitled_reads_are_no_store(pool: PgPool) {
 // handover commands reject outsiders and wrong roles.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn wrong_roles_are_rejected_everywhere(pool: PgPool) {
-    let (app, fake) = test_app_with_pickup_and_locks(pool).await;
+    let app = test_app_with_pickup_and_paypal(pool).await;
     let seller = new_actor(&app).await;
     let other_seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    let order = paid_pickup_order(&app, &fake, &seller, &buyer, "boots_01", 0x12).await;
+    let order = paid_pickup_order(&app, &seller, &buyer, "boots_01", 0x12).await;
 
     // The seller is refused on the buyer-only reveal.
     let (status, body) = reveal(&app, &seller.token, &order.order_id).await;
@@ -521,7 +455,7 @@ async fn wrong_roles_are_rejected_everywhere(pool: PgPool) {
 // refuses too.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn reveal_entitlement_ends_at_terminal_states(pool: PgPool) {
-    let (app, fake) = test_app_with_pickup_and_locks(pool).await;
+    let app = test_app_with_pickup_and_paypal(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
 
@@ -577,7 +511,7 @@ async fn reveal_entitlement_ends_at_terminal_states(pool: PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    confirm_via_locks(&app, &fake, &buyer, &ordinary, &seller, BUNDLE_2, 0x234).await;
+    confirm_payment(&app, &seller, &buyer, &ordinary, 0x234).await;
     // No reveal here: a first reveal would open the bounded withdrawal
     // window and turn the cancel into the unilateral exit. With neither
     // unilateral condition present this is the ordinary two-step cancel.
@@ -642,7 +576,7 @@ async fn reveal_entitlement_ends_at_terminal_states(pool: PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    confirm_via_locks(&app, &fake, &buyer, &unilateral, &seller, BUNDLE_3, 0x238).await;
+    confirm_payment(&app, &seller, &buyer, &unilateral, 0x238).await;
     let (status, body) = execute(
         &app,
         &seller.token,
@@ -670,7 +604,7 @@ async fn reveal_entitlement_ends_at_terminal_states(pool: PgPool) {
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
 
     // (d) Any other terminal state (here: delivered): the read refuses.
-    let delivered = paid_pickup_order(&app, &fake, &seller, &buyer, "boots_04", 0x13).await;
+    let delivered = paid_pickup_order(&app, &seller, &buyer, "boots_04", 0x13).await;
     let (_, revision) = order_row(&app.pool, &delivered.order_id).await;
     let (status, body) = execute(
         &app,
@@ -699,10 +633,10 @@ async fn reveal_entitlement_ends_at_terminal_states(pool: PgPool) {
 // redacted; the meeting point appears only in the two entitled reads.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn no_serialization_surface_leaks_the_meeting_point(pool: PgPool) {
-    let (app, fake) = test_app_with_pickup_and_locks(pool).await;
+    let app = test_app_with_pickup_and_paypal(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    let order = paid_pickup_order(&app, &fake, &seller, &buyer, "boots_01", 0x14).await;
+    let order = paid_pickup_order(&app, &seller, &buyer, "boots_01", 0x14).await;
 
     // Order projections (single + list) carry no details.
     let (status, body) = send(
@@ -1029,21 +963,16 @@ async fn sandbox_deployments_refuse_pickup_writes_and_reveals(pool: PgPool) {
     assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
 
     // The reveal is refused on the flag even for a REAL-rail payment: the
-    // same pool gets a locks-confirmed order from a durable deployment view.
-    let fake = Arc::new(FakeLocksClient::default());
+    // same pool gets a paypal-confirmed order from a durable deployment view.
     let now: DateTime<Utc> = common::NOW.parse().expect("timestamp");
     let clock = Arc::new(AdjustableClock::new(now));
-    let locks = Arc::new(LocksRuntime {
-        keys: test_locks_keys(),
-        client: fake.clone(),
-    });
     let mut config = common::config_durable();
     config.sandbox_payments_enabled = true;
     let state = AppState::new(pool.clone(), clock.clone(), config)
-        .with_locks(Some(locks))
-        .with_homeserver(Some(common::test_locks_homeserver()))
+        .with_payments(Some(common::fake_payments_runtime().await))
+        .with_homeserver(Some(Arc::new(common::CommandMirrorHomeserver)))
         .with_pickup(Some(common::test_pickup_keys()));
-    let app_locks = TestApp {
+    let app_paypal = TestApp {
         router: build_router(state.clone()),
         pool: pool.clone(),
         clock,
@@ -1051,13 +980,13 @@ async fn sandbox_deployments_refuse_pickup_writes_and_reveals(pool: PgPool) {
     };
     // Re-authenticate the same keypairs against the new router.
     let seller2 = TestActor {
-        token: common::authenticate(&app_locks, &seller.keypair).await,
+        token: common::authenticate(&app_paypal, &seller.keypair).await,
         keypair: seller.keypair,
         pubky: seller.pubky.clone(),
     };
-    let buyer = new_actor(&app_locks).await;
+    let buyer = new_actor(&app_paypal).await;
     let order = create_pickup_order(
-        &app_locks,
+        &app_paypal,
         &seller2,
         &buyer,
         "boots_02",
@@ -1066,7 +995,7 @@ async fn sandbox_deployments_refuse_pickup_writes_and_reveals(pool: PgPool) {
     )
     .await;
     let (status, body) = execute(
-        &app_locks,
+        &app_paypal,
         &seller2.token,
         &set_details(&seller2.pubky, "boots_02", 0, SPOT, 0x282),
     )
@@ -1076,8 +1005,8 @@ async fn sandbox_deployments_refuse_pickup_writes_and_reveals(pool: PgPool) {
         StatusCode::CONFLICT,
         "set is refused while the flag is on: {body}"
     );
-    confirm_via_locks(&app_locks, &fake, &buyer, &order, &seller2, BUNDLE_2, 0x283).await;
-    let (status, body) = reveal(&app_locks, &buyer.token, &order.order_id).await;
+    confirm_payment(&app_paypal, &seller2, &buyer, &order, 0x283).await;
+    let (status, body) = reveal(&app_paypal, &buyer.token, &order.order_id).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
 
     // The capability flag: on only when the key is configured AND sandbox
@@ -1099,10 +1028,10 @@ async fn sandbox_deployments_refuse_pickup_writes_and_reveals(pool: PgPool) {
 // version_at_payment. A stale expected_version conflicts.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn versions_are_monotonic_across_clear(pool: PgPool) {
-    let (app, fake) = test_app_with_pickup_and_locks(pool).await;
+    let app = test_app_with_pickup_and_paypal(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    let order = paid_pickup_order(&app, &fake, &seller, &buyer, "boots_01", 0x19).await;
+    let order = paid_pickup_order(&app, &seller, &buyer, "boots_01", 0x19).await;
 
     // v2 (edit), then clear (CAS v2), then the post-clear set continues at
     // v3 — never a restart at v1.
@@ -1197,10 +1126,10 @@ async fn versions_are_monotonic_across_clear(pool: PgPool) {
 // evidence lands.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn clear_retention_and_terminal_purge(pool: PgPool) {
-    let (app, fake) = test_app_with_pickup_and_locks(pool).await;
+    let app = test_app_with_pickup_and_paypal(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    let order = paid_pickup_order(&app, &fake, &seller, &buyer, "boots_01", 0x1a).await;
+    let order = paid_pickup_order(&app, &seller, &buyer, "boots_01", 0x1a).await;
     // A second, unreferenced version (v2) exists alongside the pinned v1.
     let (status, body) = execute(
         &app,
@@ -1327,7 +1256,7 @@ async fn clear_retention_and_terminal_purge(pool: PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    confirm_via_locks(&app, &fake, &buyer, &order2, &seller, BUNDLE_2, 0x2a6).await;
+    confirm_payment(&app, &seller, &buyer, &order2, 0x2a6).await;
     let (status, body) = execute(
         &app,
         &seller.token,
@@ -1386,11 +1315,11 @@ async fn clear_retention_and_terminal_purge(pool: PgPool) {
 // paid buyers of orders on that listing.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn edit_after_payment_notifies_exactly_the_paid_buyers(pool: PgPool) {
-    let (app, fake) = test_app_with_pickup_and_locks(pool).await;
+    let app = test_app_with_pickup_and_paypal(pool).await;
     let seller = new_actor(&app).await;
     let buyer1 = new_actor(&app).await;
     let buyer2 = new_actor(&app).await;
-    let order = paid_pickup_order(&app, &fake, &seller, &buyer1, "boots_01", 0x1c).await;
+    let order = paid_pickup_order(&app, &seller, &buyer1, "boots_01", 0x1c).await;
     // buyer2 has an UNPAID order on the same listing.
     let (listing_revision,): (i64,) =
         sqlx::query_as("SELECT server_revision FROM listings WHERE aggregate_id = $1")
@@ -1457,14 +1386,14 @@ async fn edit_after_payment_notifies_exactly_the_paid_buyers(pool: PgPool) {
 // the conditions the same command is the ordinary cancel_requested.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn unilateral_exits_and_their_window_edges(pool: PgPool) {
-    let (app, fake) = test_app_with_pickup_and_locks(pool).await;
+    let app = test_app_with_pickup_and_paypal(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
 
     // (1) Terms change (version bump after payment): cancel_request from
     // `paid` cancels immediately, emitting order.cancelled_terms_change,
     // releasing sold inventory back to available, and notifying the seller.
-    let order = paid_pickup_order(&app, &fake, &seller, &buyer, "boots_01", 0x1d).await;
+    let order = paid_pickup_order(&app, &seller, &buyer, "boots_01", 0x1d).await;
     let (status, body) = execute(
         &app,
         &seller.token,
@@ -1552,7 +1481,7 @@ async fn unilateral_exits_and_their_window_edges(pool: PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    confirm_via_locks(&app, &fake, &buyer, &order2, &seller, BUNDLE_2, 0x2c4).await;
+    confirm_payment(&app, &seller, &buyer, &order2, 0x2c4).await;
     let (status, body) = reveal(&app, &buyer.token, &order2.order_id).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (_, revision) = order_row(&app.pool, &order2.order_id).await;
@@ -1608,16 +1537,7 @@ async fn unilateral_exits_and_their_window_edges(pool: PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    confirm_via_locks(
-        &app,
-        &fake,
-        &buyer,
-        &order2b,
-        &seller,
-        BUNDLE_6,
-        0x2c6 + 0x11,
-    )
-    .await;
+    confirm_payment(&app, &seller, &buyer, &order2b, 0x2c6 + 0x11).await;
     let (_, revision) = order_row(&app.pool, &order2b.order_id).await;
     let (status, body) = execute(
         &app,
@@ -1673,7 +1593,7 @@ async fn unilateral_exits_and_their_window_edges(pool: PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    confirm_via_locks(&app, &fake, &buyer, &order3, &seller, BUNDLE_3, 0x2c8).await;
+    confirm_payment(&app, &seller, &buyer, &order3, 0x2c8).await;
     let (status, _) = reveal(&app, &buyer.token, &order3.order_id).await;
     assert_eq!(status, StatusCode::OK);
     let (_, revision) = order_row(&app.pool, &order3.order_id).await;
@@ -1726,7 +1646,7 @@ async fn unilateral_exits_and_their_window_edges(pool: PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    confirm_via_locks(&app, &fake, &buyer, &order4, &seller, BUNDLE_4, 0x2cc).await;
+    confirm_payment(&app, &seller, &buyer, &order4, 0x2cc).await;
     let (_, revision) = order_row(&app.pool, &order4.order_id).await;
     let (status, body) = execute(
         &app,
@@ -1761,7 +1681,7 @@ async fn unilateral_exits_and_their_window_edges(pool: PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    confirm_via_locks(&app, &fake, &buyer, &order5, &seller, BUNDLE_5, 0x2cf).await;
+    confirm_payment(&app, &seller, &buyer, &order5, 0x2cf).await;
     let (status, body) = execute(
         &app,
         &seller.token,
@@ -1803,12 +1723,12 @@ async fn unilateral_exits_and_their_window_edges(pool: PgPool) {
 // the pickup states.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn confirm_pickup_matrix_and_method_guards(pool: PgPool) {
-    let (app, fake) = test_app_with_pickup_and_locks(pool).await;
+    let app = test_app_with_pickup_and_paypal(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
 
     // Buyer confirms from `paid`; the handover row records buyer + instant.
-    let order1 = paid_pickup_order(&app, &fake, &seller, &buyer, "boots_01", 0x1e).await;
+    let order1 = paid_pickup_order(&app, &seller, &buyer, "boots_01", 0x1e).await;
     let (status, body) = send(
         app.router.clone(),
         "GET",
@@ -1901,7 +1821,7 @@ async fn confirm_pickup_matrix_and_method_guards(pool: PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    confirm_via_locks(&app, &fake, &buyer, &order2, &seller, BUNDLE_2, 0x2e4).await;
+    confirm_payment(&app, &seller, &buyer, &order2, 0x2e4).await;
     let (_, revision) = order_row(&app.pool, &order2.order_id).await;
     let (status, body) = execute(
         &app,
@@ -2020,7 +1940,7 @@ async fn confirm_pickup_matrix_and_method_guards(pool: PgPool) {
         "00000000-0000-4000-9000-0000000001e3",
     )
     .await;
-    confirm_via_locks(&app, &fake, &buyer, &order3, &seller, BUNDLE_3, 0x2e9).await;
+    confirm_payment(&app, &seller, &buyer, &order3, 0x2e9).await;
     let (_, revision) = order_row(&app.pool, &order3.order_id).await;
     let (status, body) = execute(
         &app,
@@ -2056,10 +1976,10 @@ async fn confirm_pickup_matrix_and_method_guards(pool: PgPool) {
 // `autoCompleteDays` captured at payment), not the configured default.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn auto_complete_uses_the_pickup_orders_own_period(pool: PgPool) {
-    let (app, fake) = test_app_with_pickup_and_locks(pool).await;
+    let app = test_app_with_pickup_and_paypal(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    let order = paid_pickup_order(&app, &fake, &seller, &buyer, "boots_01", 0x1e).await;
+    let order = paid_pickup_order(&app, &seller, &buyer, "boots_01", 0x1e).await;
     sqlx::query("UPDATE orders SET auto_complete_days = 3 WHERE id = $1::uuid")
         .bind(&order.order_id)
         .execute(&app.pool)
@@ -2098,10 +2018,10 @@ async fn auto_complete_uses_the_pickup_orders_own_period(pool: PgPool) {
 // on the same deadline as shipped orders' shipment delivered_at.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn auto_complete_coalesces_the_handover_instant(pool: PgPool) {
-    let (app, fake) = test_app_with_pickup_and_locks(pool).await;
+    let app = test_app_with_pickup_and_paypal(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    let order = paid_pickup_order(&app, &fake, &seller, &buyer, "boots_01", 0x1f).await;
+    let order = paid_pickup_order(&app, &seller, &buyer, "boots_01", 0x1f).await;
     let (_, revision) = order_row(&app.pool, &order.order_id).await;
     let (status, body) = execute(
         &app,
@@ -2152,15 +2072,10 @@ async fn auto_complete_coalesces_the_handover_instant(pool: PgPool) {
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn reputation_rules_for_pickup(pool: PgPool) {
     let now: DateTime<Utc> = common::NOW.parse().expect("timestamp");
-    let fake = Arc::new(FakeLocksClient::default());
-    let locks = Arc::new(LocksRuntime {
-        keys: test_locks_keys(),
-        client: fake.clone(),
-    });
     let clock = Arc::new(AdjustableClock::new(now));
     let state = AppState::new(pool.clone(), clock.clone(), common::config_durable())
-        .with_locks(Some(locks))
-        .with_homeserver(Some(common::test_locks_homeserver()))
+        .with_payments(Some(common::fake_payments_runtime().await))
+        .with_homeserver(Some(Arc::new(common::CommandMirrorHomeserver)))
         .with_pickup(Some(common::test_pickup_keys()))
         .with_attestor(Some(test_attestor()));
     let app = TestApp {
@@ -2176,11 +2091,7 @@ async fn reputation_rules_for_pickup(pool: PgPool) {
     let seller_a = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     // A shipped order delivered + completed (the completion baseline).
-    let mut listing_a = register_command(&seller_a.pubky, 1);
-    listing_a["payload"]["digital_lock"] = json!({
-        "policyUri": lock_resource_for(&seller_a.pubky),
-        "criterionId": "paykit",
-    });
+    let listing_a = register_command(&seller_a.pubky, 1);
     let (status, body) = execute(&app, &seller_a.token, &listing_a).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (status, body) = execute(
@@ -2194,30 +2105,7 @@ async fn reputation_rules_for_pickup(pool: PgPool) {
         .as_str()
         .expect("id")
         .to_string();
-    let shipped_payment = body["result"]["payments"][0]["id"]
-        .as_str()
-        .expect("id")
-        .to_string();
-    // Confirm through the sandbox rail? No — sandbox is off; use locks.
-    let prepare = common::prepare_locks_command(&shipped_payment, 0x300);
-    let (status, body) = execute(&app, &buyer.token, &prepare).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let registration = register_locks_command(
-        &shipped_payment,
-        2,
-        TEST_BUNDLE_ID,
-        &lock_resource_for(&seller_a.pubky),
-        0x301,
-    );
-    let (status, body) = execute(&app, &buyer.token, &registration).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    fake.set_outcome(
-        TEST_BUNDLE_ID,
-        LocksLookupOutcome::Status(LocksTaskStatus::Completed),
-    );
-    run_once(&app.state, Uuid::new_v4(), app.clock.now())
-        .await
-        .expect("worker pass");
+    common::confirm_via_paypal(&app, &seller_a, &buyer, &shipped_id, "REP-TXN-1").await;
     let (_, revision) = order_row(&app.pool, &shipped_id).await;
     let (status, body) = execute(
         &app,
@@ -2264,16 +2152,7 @@ async fn reputation_rules_for_pickup(pool: PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    confirm_via_locks(
-        &app,
-        &fake,
-        &buyer,
-        &pickup_order,
-        &seller_a,
-        BUNDLE_2,
-        0x305,
-    )
-    .await;
+    confirm_payment(&app, &seller_a, &buyer, &pickup_order, 0x305).await;
     let (status, body) = execute(
         &app,
         &seller_a.token,
@@ -2314,11 +2193,7 @@ async fn reputation_rules_for_pickup(pool: PgPool) {
     // --- Seller B: identical shape, but an ORDINARY approved cancel with
     // the same refund leg — which still counts as terminated_badly.
     let seller_b = new_actor(&app).await;
-    let mut listing_b = register_command(&seller_b.pubky, 1);
-    listing_b["payload"]["digital_lock"] = json!({
-        "policyUri": lock_resource_for(&seller_b.pubky),
-        "criterionId": "paykit",
-    });
+    let listing_b = register_command(&seller_b.pubky, 1);
     let (status, body) = execute(&app, &seller_b.token, &listing_b).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (status, body) = execute(
@@ -2332,33 +2207,7 @@ async fn reputation_rules_for_pickup(pool: PgPool) {
         .as_str()
         .expect("id")
         .to_string();
-    let b_payment = body["result"]["payments"][0]["id"]
-        .as_str()
-        .expect("id")
-        .to_string();
-    let prepare = common::prepare_locks_command(&b_payment, 0x30e);
-    let (status, body) = execute(&app, &buyer.token, &prepare).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let (status, body) = execute(
-        &app,
-        &buyer.token,
-        &register_locks_command(
-            &b_payment,
-            2,
-            BUNDLE_3,
-            &lock_resource_for(&seller_b.pubky),
-            0x309,
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    fake.set_outcome(
-        BUNDLE_3,
-        LocksLookupOutcome::Status(LocksTaskStatus::Completed),
-    );
-    run_once(&app.state, Uuid::new_v4(), app.clock.now())
-        .await
-        .expect("worker pass");
+    common::confirm_via_paypal(&app, &seller_b, &buyer, &b_shipped, "REP-TXN-2").await;
     let (_, revision) = order_row(&app.pool, &b_shipped).await;
     let (status, body) = execute(
         &app,
@@ -2398,12 +2247,7 @@ async fn reputation_rules_for_pickup(pool: PgPool) {
     // Sold out — quantity was 1. Register more stock instead.
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     let (status, body) = execute(&app, &seller_b.token, &{
-        let mut command = register_listing_command(&seller_b.pubky, "boots_02", 1, 0x207);
-        command["payload"]["digital_lock"] = json!({
-            "policyUri": lock_resource_for(&seller_b.pubky),
-            "criterionId": "paykit",
-        });
-        command
+        register_listing_command(&seller_b.pubky, "boots_02", 1, 0x207)
     })
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -2422,33 +2266,7 @@ async fn reputation_rules_for_pickup(pool: PgPool) {
         .as_str()
         .expect("id")
         .to_string();
-    let b_payment2 = body["result"]["payments"][0]["id"]
-        .as_str()
-        .expect("id")
-        .to_string();
-    let prepare = common::prepare_locks_command(&b_payment2, 0x30f);
-    let (status, body) = execute(&app, &buyer.token, &prepare).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let (status, body) = execute(
-        &app,
-        &buyer.token,
-        &register_locks_command(
-            &b_payment2,
-            2,
-            BUNDLE_4,
-            &lock_resource_for(&seller_b.pubky),
-            0x30c,
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    fake.set_outcome(
-        BUNDLE_4,
-        LocksLookupOutcome::Status(LocksTaskStatus::Completed),
-    );
-    run_once(&app.state, Uuid::new_v4(), app.clock.now())
-        .await
-        .expect("worker pass");
+    common::confirm_via_paypal(&app, &seller_b, &buyer, &b_cancelled, "REP-TXN-3").await;
     let (_, revision) = order_row(&app.pool, &b_cancelled).await;
     let (status, body) = execute(
         &app,
@@ -2533,15 +2351,10 @@ async fn reputation_rules_for_pickup(pool: PgPool) {
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn reputation_counts_pickup_completions_by_confirming_actor(pool: PgPool) {
     let now: DateTime<Utc> = common::NOW.parse().expect("timestamp");
-    let fake = Arc::new(FakeLocksClient::default());
-    let locks = Arc::new(LocksRuntime {
-        keys: test_locks_keys(),
-        client: fake.clone(),
-    });
     let clock = Arc::new(AdjustableClock::new(now));
     let state = AppState::new(pool.clone(), clock.clone(), common::config_durable())
-        .with_locks(Some(locks))
-        .with_homeserver(Some(common::test_locks_homeserver()))
+        .with_payments(Some(common::fake_payments_runtime().await))
+        .with_homeserver(Some(Arc::new(common::CommandMirrorHomeserver)))
         .with_pickup(Some(common::test_pickup_keys()))
         .with_attestor(Some(test_attestor()));
     let app = TestApp {
@@ -2610,34 +2423,8 @@ async fn reputation_counts_pickup_completions_by_confirming_actor(pool: PgPool) 
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
     }
-    for (order, bundle, n) in [
-        (&o1, TEST_BUNDLE_ID, 0x321),
-        (&o2, BUNDLE_2, 0x322),
-        (&o3, BUNDLE_3, 0x323),
-    ] {
-        let prepare = common::prepare_locks_command(&order.payment_id, n + 0x1000);
-        let (status, body) = execute(&app, &buyer.token, &prepare).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let (status, body) = execute(
-            &app,
-            &buyer.token,
-            &register_locks_command(
-                &order.payment_id,
-                2,
-                bundle,
-                &lock_resource_for(&seller.pubky),
-                n,
-            ),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        fake.set_outcome(
-            bundle,
-            LocksLookupOutcome::Status(LocksTaskStatus::Completed),
-        );
-        run_once(&app.state, Uuid::new_v4(), app.clock.now())
-            .await
-            .expect("worker pass");
+    for (order, n) in [(&o1, 0x321), (&o2, 0x322), (&o3, 0x323)] {
+        confirm_payment(&app, &seller, &buyer, order, n).await;
     }
     // o1 buyer-confirmed; o2 seller-confirmed. o3's seller-only confirm
     // happens AFTER the auto-complete sweep below, so it is delivered but
@@ -2828,16 +2615,11 @@ async fn sync_converges_methods_but_never_touches_details(pool: PgPool) {
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn key_absent_refuses_writes_and_reveals(pool: PgPool) {
     let now: DateTime<Utc> = common::NOW.parse().expect("timestamp");
-    let fake = Arc::new(FakeLocksClient::default());
-    let locks = Arc::new(LocksRuntime {
-        keys: test_locks_keys(),
-        client: fake.clone(),
-    });
     let clock = Arc::new(AdjustableClock::new(now));
-    // Sandbox OFF, locks on, pickup keys ABSENT.
+    // Sandbox OFF, payments on, pickup keys ABSENT.
     let state = AppState::new(pool.clone(), clock.clone(), common::config_durable())
-        .with_locks(Some(locks))
-        .with_homeserver(Some(common::test_locks_homeserver()));
+        .with_payments(Some(common::fake_payments_runtime().await))
+        .with_homeserver(Some(Arc::new(common::CommandMirrorHomeserver)));
     let app = TestApp {
         router: build_router(state.clone()),
         pool: pool.clone(),
@@ -2863,7 +2645,7 @@ async fn key_absent_refuses_writes_and_reveals(pool: PgPool) {
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
-    confirm_via_locks(&app, &fake, &buyer, &order, &seller, TEST_BUNDLE_ID, 0x503).await;
+    confirm_payment(&app, &seller, &buyer, &order, 0x503).await;
     let (status, body) = reveal(&app, &buyer.token, &order.order_id).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(
@@ -3211,7 +2993,7 @@ async fn boot_probe_catches_a_half_rotated_table_with_the_previous_key_dropped(p
 // path while the seller can still complete the handover.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn reveal_refuses_an_order_that_pinned_nothing(pool: PgPool) {
-    let (app, fake) = test_app_with_pickup_and_locks(pool).await;
+    let app = test_app_with_pickup_and_paypal(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
 
@@ -3219,7 +3001,7 @@ async fn reveal_refuses_an_order_that_pinned_nothing(pool: PgPool) {
     let (status, body) = execute(
         &app,
         &seller.token,
-        &register_pickup_listing_with_lock(&seller.pubky, "boots_01", 5, 0x601, 12_500),
+        &register_pickup_listing(&seller.pubky, "boots_01", 5, 0x601),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -3275,17 +3057,7 @@ async fn reveal_refuses_an_order_that_pinned_nothing(pool: PgPool) {
                 .expect("payment id")
                 .to_string(),
         };
-        let bundle = [TEST_BUNDLE_ID, BUNDLE_2][index];
-        confirm_via_locks(
-            &app,
-            &fake,
-            &buyer,
-            &order,
-            &seller,
-            bundle,
-            0x606 + index as u64,
-        )
-        .await;
+        confirm_payment(&app, &seller, &buyer, &order, 0x606 + index as u64).await;
         orders.push(order);
     }
 
@@ -3366,21 +3138,21 @@ async fn reveal_refuses_an_order_that_pinned_nothing(pool: PgPool) {
 // an edit and true after one.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn reveal_serves_the_pinned_subset_of_a_partially_detailed_order(pool: PgPool) {
-    let (app, fake) = test_app_with_pickup_and_locks(pool).await;
+    let app = test_app_with_pickup_and_paypal(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
 
     let (status, body) = execute(
         &app,
         &seller.token,
-        &register_pickup_listing_with_lock(&seller.pubky, "boots_01", 5, 0xc51, 25_000),
+        &register_pickup_listing(&seller.pubky, "boots_01", 5, 0xc51),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (status, body) = execute(
         &app,
         &seller.token,
-        &register_pickup_listing_with_lock(&seller.pubky, "boots_02", 5, 0xc52, 25_000),
+        &register_pickup_listing(&seller.pubky, "boots_02", 5, 0xc52),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -3423,7 +3195,7 @@ async fn reveal_serves_the_pinned_subset_of_a_partially_detailed_order(pool: PgP
             .expect("payment id")
             .to_string(),
     };
-    confirm_via_locks(&app, &fake, &buyer, &order, &seller, TEST_BUNDLE_ID, 0xc55).await;
+    confirm_payment(&app, &seller, &buyer, &order, 0xc55).await;
 
     // Exactly one snapshot pinned — for the boots_01 line only; the
     // boots_02 line carries no version_at_payment.
@@ -3571,12 +3343,13 @@ async fn confirm_order_fails_cleanly_on_an_unopenable_details_row(pool: PgPool) 
     );
 }
 
-// The worker path: one unopenable details row fails the pass LOUDLY (the
-// worker loop logs and continues) instead of panicking the loop dead; once
-// the row is repaired the next pass confirms the payment.
+// The PayPal IPN path: one unopenable details row fails the confirmation
+// LOUDLY (the delivery is not acknowledged, so PayPal redelivers) instead of
+// panicking the handler; once the row is repaired the redelivery confirms the
+// payment.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn worker_survives_an_unopenable_details_row(pool: PgPool) {
-    let (app, fake) = test_app_with_pickup_and_locks(pool).await;
+async fn ipn_confirmation_survives_an_unopenable_details_row(pool: PgPool) {
+    let app = test_app_with_pickup_and_paypal(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let order = create_pickup_order(
@@ -3619,35 +3392,14 @@ async fn worker_survives_an_unopenable_details_row(pool: PgPool) {
     .await
     .expect("details row");
 
-    // A completed Locks outcome arrives; the pass logs the unopenable row
-    // and continues the batch — an Err per item, NOT a panic that kills
-    // the loop and not an Err out of run_once.
-    let prepare = common::prepare_locks_command(&order.payment_id, 0x803);
-    let (status, body) = execute(&app, &buyer.token, &prepare).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let (status, body) = execute(
-        &app,
-        &buyer.token,
-        &common::register_locks_command(
-            &order.payment_id,
-            2,
-            TEST_BUNDLE_ID,
-            &lock_resource_for(&seller.pubky),
-            0x802,
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    fake.set_outcome(
-        TEST_BUNDLE_ID,
-        LocksLookupOutcome::Status(LocksTaskStatus::Completed),
-    );
-    let summary = run_once(&app.state, Uuid::new_v4(), app.clock.now())
-        .await
-        .expect("the pass logs the unopenable row instead of failing the tick");
-    assert_eq!(
-        summary.locks_completions_applied, 0,
-        "the failed item is not applied"
+    // A verified completed IPN arrives; the confirmation fails on the
+    // unopenable row without a panic and rolls back entirely.
+    let total_minor = common::bind_paypal_method(&app, &seller, &buyer, &order.order_id).await;
+    let status =
+        common::post_completed_ipn(&app, &order.order_id, "IPN-UNOPENABLE", total_minor).await;
+    assert!(
+        status.is_server_error(),
+        "the IPN is not acknowledged while the row is unopenable: {status}"
     );
     let (state,): (String,) = sqlx::query_as("SELECT state FROM orders WHERE id = $1::uuid")
         .bind(&order.order_id)
@@ -3656,8 +3408,8 @@ async fn worker_survives_an_unopenable_details_row(pool: PgPool) {
         .expect("order row");
     assert_eq!(state, "pending_payment", "the confirmation rolled back");
 
-    // Repair the row (re-seal under the configured key) and let the next
-    // pass — after the claim and lease deferrals elapse — confirm it.
+    // Repair the row (re-seal under the configured key); PayPal's redelivery
+    // of the same IPN confirms the payment.
     let repaired =
         common::test_pickup_keys().seal(&pickup::details_aad(&aggregate, 1), SPOT.as_bytes());
     sqlx::query(
@@ -3668,174 +3420,19 @@ async fn worker_survives_an_unopenable_details_row(pool: PgPool) {
     .execute(&app.pool)
     .await
     .expect("repair details row");
-    app.clock
-        .set(app.clock.now() + chrono::Duration::seconds(61));
-    let summary = run_once(&app.state, Uuid::new_v4(), app.clock.now())
-        .await
-        .expect("the worker loop continues after the failed pass");
-    assert_eq!(summary.locks_completions_applied, 1, "payment confirmed");
-    assert_eq!(
-        count(&app.pool, "SELECT COUNT(*) FROM pickup_line_snapshots").await,
-        1,
-        "the repaired row pins on the next pass"
-    );
-}
-
-// Two claimed correlations in one tick: the FIRST fails (its listing's
-// details row opens under no configured key), the SECOND still confirms in
-// the same pass — a per-item error is logged, never head-of-line for the
-// rest of the batch — and the task lease is released for the next holder.
-#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn a_failed_claimed_item_does_not_stall_the_rest_of_the_batch(pool: PgPool) {
-    let (app, fake) = test_app_with_pickup_and_locks(pool).await;
-    let seller = new_actor(&app).await;
-    let buyer = new_actor(&app).await;
-
-    // Order A on boots_01: its details row will be unopenable (seeded under
-    // an unknown key, the operator-mishap fixture).
-    let failing = create_pickup_order(
-        &app,
-        &seller,
-        &buyer,
-        "boots_01",
-        0x851,
-        "00000000-0000-4000-9000-000000000851",
-    )
-    .await;
-    let aggregate = listing_agg(&seller.pubky, "boots_01");
-    let unknown = PickupKeys::from_hex(
-        "9999999999999999999999999999999999999999999999999999999999999999",
-        None,
-    )
-    .expect("unknown key parses");
-    let ciphertext = unknown.seal(&pickup::details_aad(&aggregate, 1), SPOT.as_bytes());
-    sqlx::query(
-        "INSERT INTO listing_pickup_version_counters (aggregate_id, seller_pubky, last_version, \
-         updated_at) VALUES ($1, $2, 1, $3)",
-    )
-    .bind(&aggregate)
-    .bind(&seller.pubky)
-    .bind(app.clock.now())
-    .execute(&app.pool)
-    .await
-    .expect("counter row");
-    sqlx::query(
-        "INSERT INTO listing_pickup_details (aggregate_id, seller_pubky, version, \
-         details_ciphertext, created_at, updated_at) VALUES ($1, $2, 1, $3, $4, $4)",
-    )
-    .bind(&aggregate)
-    .bind(&seller.pubky)
-    .bind(&ciphertext)
-    .bind(app.clock.now())
-    .execute(&app.pool)
-    .await
-    .expect("details row");
-
-    // Order B on boots_02: healthy details set through the command surface.
-    let healthy = create_pickup_order(
-        &app,
-        &seller,
-        &buyer,
-        "boots_02",
-        0x852,
-        "00000000-0000-4000-9000-000000000852",
-    )
-    .await;
-    let (status, body) = execute(
-        &app,
-        &seller.token,
-        &set_details(&seller.pubky, "boots_02", 0, SPOT, 0x853),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-
-    // Both payments register Locks correlations with a completed outcome.
-    for (order, bundle, n) in [
-        (&failing, TEST_BUNDLE_ID, 0x854),
-        (&healthy, BUNDLE_2, 0x855),
-    ] {
-        let prepare = common::prepare_locks_command(&order.payment_id, n + 0x1000);
-        let (status, body) = execute(&app, &buyer.token, &prepare).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let (status, body) = execute(
-            &app,
-            &buyer.token,
-            &common::register_locks_command(
-                &order.payment_id,
-                2,
-                bundle,
-                &lock_resource_for(&seller.pubky),
-                n,
-            ),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        fake.set_outcome(
-            bundle,
-            LocksLookupOutcome::Status(LocksTaskStatus::Completed),
-        );
-    }
-    // Deterministic claim order (last_checked_at ASC): the FAILING
-    // correlation is claimed first, well past the poll interval.
-    sqlx::query(
-        "UPDATE payment_locks_correlations SET last_checked_at = $2 WHERE order_id = $1::uuid",
-    )
-    .bind(&failing.order_id)
-    .bind(app.clock.now() - chrono::Duration::seconds(3600))
-    .execute(&app.pool)
-    .await
-    .expect("age the failing claim");
-    sqlx::query(
-        "UPDATE payment_locks_correlations SET last_checked_at = $2 WHERE order_id = $1::uuid",
-    )
-    .bind(&healthy.order_id)
-    .bind(app.clock.now() - chrono::Duration::seconds(1800))
-    .execute(&app.pool)
-    .await
-    .expect("age the healthy claim");
-
-    // One tick: the first item fails, the second still processes.
-    let summary = run_once(&app.state, Uuid::new_v4(), app.clock.now())
-        .await
-        .expect("one bad item does not fail the tick");
-    assert_eq!(
-        summary.locks_completions_applied, 1,
-        "the healthy item confirms in the same tick as the failing one"
-    );
+    let status =
+        common::post_completed_ipn(&app, &order.order_id, "IPN-UNOPENABLE", total_minor).await;
+    assert_eq!(status, StatusCode::OK, "the redelivered IPN confirms");
     let (state,): (String,) = sqlx::query_as("SELECT state FROM orders WHERE id = $1::uuid")
-        .bind(&failing.order_id)
+        .bind(&order.order_id)
         .fetch_one(&app.pool)
         .await
         .expect("order row");
-    assert_eq!(
-        state, "pending_payment",
-        "the failing item's confirmation rolled back"
-    );
-    let (state,): (String,) = sqlx::query_as("SELECT state FROM orders WHERE id = $1::uuid")
-        .bind(&healthy.order_id)
-        .fetch_one(&app.pool)
-        .await
-        .expect("order row");
-    assert_eq!(state, "paid", "the healthy item confirmed");
+    assert_eq!(state, "paid", "payment confirmed");
     assert_eq!(
         count(&app.pool, "SELECT COUNT(*) FROM pickup_line_snapshots").await,
         1,
-        "the healthy order pinned its snapshot"
-    );
-
-    // The task lease was released at the end of the pass: another holder
-    // takes it immediately, without waiting out the lease window.
-    assert!(
-        workers::try_acquire_lease(
-            &app.pool,
-            workers::TASK_LOCKS_VERIFICATION,
-            Uuid::new_v4(),
-            app.clock.now(),
-            30,
-        )
-        .await
-        .expect("lease query runs"),
-        "the verification lease is free right after the pass"
+        "the repaired row pins on the redelivery"
     );
 }
 
@@ -3926,14 +3523,14 @@ async fn a_failing_reseal_task_does_not_fail_the_tick(pool: PgPool) {
 // recipient) must never collapse them.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn details_update_notifies_each_paid_order_of_the_same_buyer(pool: PgPool) {
-    let (app, fake) = test_app_with_pickup_and_locks(pool).await;
+    let app = test_app_with_pickup_and_paypal(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
 
     let (status, body) = execute(
         &app,
         &seller.token,
-        &register_pickup_listing_with_lock(&seller.pubky, "boots_01", 5, 0x901, 12_500),
+        &register_pickup_listing(&seller.pubky, "boots_01", 5, 0x901),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -3980,17 +3577,7 @@ async fn details_update_notifies_each_paid_order_of_the_same_buyer(pool: PgPool)
                 .expect("payment id")
                 .to_string(),
         };
-        let bundle = [TEST_BUNDLE_ID, BUNDLE_2][index];
-        confirm_via_locks(
-            &app,
-            &fake,
-            &buyer,
-            &order,
-            &seller,
-            bundle,
-            0x905 + index as u64,
-        )
-        .await;
+        confirm_payment(&app, &seller, &buyer, &order, 0x905 + index as u64).await;
         orders.push(order);
     }
 

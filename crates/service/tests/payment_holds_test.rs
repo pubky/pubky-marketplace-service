@@ -14,10 +14,10 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use common::{
-    checkout_command_with_id, count, create_paid_order, create_pending_order, execute,
-    indexed_command_id, listing_aggregate, lock_resource_for, new_actor, payment_command,
-    register_command, register_locks_command, send, test_app, test_app_with_locks,
-    test_app_with_payments, ts_after, TestApp, TEST_BUNDLE_ID,
+    checkout_command_with_id, count, create_paid_order, create_pending_locks_order,
+    create_pending_order, execute, indexed_command_id, listing_aggregate, lock_resource_for,
+    new_actor, payment_command, register_command, register_locks_command, send, test_app,
+    test_app_with_locks, test_app_with_payments, ts_after, TestApp, TEST_BUNDLE_ID,
 };
 
 const HOLDING_COPY: &str = "Another buyer's payment is holding this item. If it isn't completed in time, the item restocks.";
@@ -173,7 +173,7 @@ async fn register_locks_acquires_the_hold_and_arms_the_locks_window(pool: PgPool
     let (app, _fake) = test_app_with_locks(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    let order = create_pending_order(&app, &seller, &buyer).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
     assert_eq!(order_hold(&app, &order.order_id).await, (false, None));
 
     let prepare = json!({

@@ -148,3 +148,58 @@ async fn a_digital_locks_listing_cannot_be_bought_as_shipping(pool: PgPool) {
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["error"]["reason"], json!("fulfillment_not_published"));
 }
+
+// The registration invariant behind the Shop's digital-only Locks UX: a
+// listing carrying a Locks policy publishes exactly [digital]; any physical or
+// pickup method beside it (or instead of it) is refused with a clear issue and
+// registers nothing.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_locks_listing_must_publish_exactly_digital(pool: PgPool) {
+    let app = test_app(pool).await;
+    let seller = new_actor(&app).await;
+
+    for methods in [
+        json!(["shipping"]),
+        json!(["pickup"]),
+        json!(["shipping", "digital"]),
+        json!(["pickup", "digital"]),
+        json!(["shipping", "pickup", "digital"]),
+    ] {
+        let (status, body) = execute(
+            &app,
+            &seller.token,
+            &register_locks_listing(&seller.pubky, methods.clone()),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{methods}: {body}"
+        );
+        assert_eq!(body["error"]["code"], json!("INVALID_COMMAND"), "{methods}");
+        assert_eq!(
+            body["error"]["issues"][0]["path"],
+            json!("payload.fulfillment_methods"),
+            "{methods}: {body}"
+        );
+        assert!(
+            body["error"]["issues"][0]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("digital-only")),
+            "{methods}: {body}"
+        );
+        let registered: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM listings")
+            .fetch_one(&app.pool)
+            .await
+            .expect("listing count");
+        assert_eq!(registered, 0, "{methods}: nothing registered");
+    }
+
+    let (status, body) = execute(
+        &app,
+        &seller.token,
+        &register_locks_listing(&seller.pubky, json!(["digital"])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}

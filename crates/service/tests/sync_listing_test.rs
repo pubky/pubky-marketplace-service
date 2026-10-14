@@ -379,6 +379,7 @@ async fn a_malformed_digital_lock_refuses_the_sync_without_healing(pool: PgPool)
 
     // A valid record with a valid lock syncs and retains the metadata.
     let mut valid = homeserver_record(1, &[2]);
+    valid["fulfillmentMethods"] = json!(["digital"]);
     valid["digitalLock"] = json!({
         "policyUri": valid_uri,
         "criterionId": "paykit",
@@ -399,6 +400,7 @@ async fn a_malformed_digital_lock_refuses_the_sync_without_healing(pool: PgPool)
     // A new record revision whose digitalLock is present but malformed:
     // refused with the static copy, and the stored lock is NOT healed away.
     let mut malformed = homeserver_record(2, &[2]);
+    malformed["fulfillmentMethods"] = json!(["digital"]);
     malformed["digitalLock"] = json!({
         "policyUri": "https://example.com/not-a-canonical-lock",
         "criterionId": "paykit",
@@ -433,6 +435,88 @@ async fn a_malformed_digital_lock_refuses_the_sync_without_healing(pool: PgPool)
     .await;
     assert_eq!(status, StatusCode::OK, "absent-lock sync failed: {body}");
     assert_eq!(lock_columns(&app.pool, &aggregate_id).await, (None, None));
+}
+
+// A Locks record is digital end to end: a record that publishes any physical
+// or pickup method beside (or instead of) digital — or omits the methods, which
+// default to shipping — is refused at sync with a clear error, registers
+// nothing, and a digital-only record of the same listing then syncs.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn sync_refuses_a_locks_record_that_is_not_digital_only(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let aggregate_id = format!("listing:{}_{LISTING_ID}", seller.pubky);
+    let lock = json!({
+        "policyUri": format!(
+            "{}/pub/locks.app/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json",
+            seller.pubky
+        ),
+        "criterionId": "paykit",
+    });
+
+    let cases = [
+        (
+            "shipping and digital",
+            Some(json!(["physical", "shipping", "digital"])),
+        ),
+        ("pickup and digital", Some(json!(["pickup", "digital"]))),
+        ("shipping only", Some(json!(["physical", "shipping"]))),
+        ("methods omitted (default shipping)", None),
+    ];
+    for (index, (label, methods)) in cases.into_iter().enumerate() {
+        let mut record = homeserver_record(index as i64 + 1, &[2]);
+        record["digitalLock"] = lock.clone();
+        if let Some(methods) = methods {
+            record["fulfillmentMethods"] = methods;
+        }
+        homeserver.put_record(&seller.pubky, LISTING_ID, record);
+        let (status, body) = execute(
+            &app,
+            &buyer.token,
+            &sync_command(&seller.pubky, LISTING_ID, 10 + index as u64),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{label}: {body}");
+        assert_eq!(body["error"]["code"], json!("INVALID_STATE"), "{label}");
+        assert_eq!(
+            body["error"]["message"],
+            json!("The seller's listing record does not satisfy registration invariants."),
+            "{label}"
+        );
+        assert_eq!(
+            body["error"]["issues"][0]["path"],
+            json!("payload.fulfillment_methods"),
+            "{label}: {body}"
+        );
+        assert!(
+            body["error"]["issues"][0]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("digital-only")),
+            "{label}: {body}"
+        );
+        let (status, _) = read_listing(&app, &buyer.token, &aggregate_id).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{label}: nothing registered");
+    }
+
+    let mut digital = homeserver_record(9, &[2]);
+    digital["digitalLock"] = lock;
+    digital["fulfillmentMethods"] = json!(["digital"]);
+    homeserver.put_record(&seller.pubky, LISTING_ID, digital);
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &sync_command(&seller.pubky, LISTING_ID, 20),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "digital-only record syncs: {body}");
+    let methods: Vec<String> =
+        sqlx::query_scalar("SELECT fulfillment_methods FROM listings WHERE aggregate_id = $1")
+            .bind(&aggregate_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("listing row");
+    assert_eq!(methods, vec!["digital"]);
 }
 
 async fn lock_columns(pool: &PgPool, aggregate_id: &str) -> (Option<String>, Option<String>) {

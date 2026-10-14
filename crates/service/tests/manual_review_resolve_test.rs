@@ -573,7 +573,7 @@ async fn resolve_refuses_a_locks_manual_review(pool: PgPool) {
     let (app, locks) = test_app_with_locks(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    let order = create_pending_order(&app, &seller, &buyer).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
     let prepare = json!({
         "version": 1,
         "command_id": common::indexed_command_id(0x8002, 699),

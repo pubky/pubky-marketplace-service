@@ -721,7 +721,7 @@ async fn locks_payment_preparation_on_a_moderated_listing_is_refused(pool: PgPoo
     app.router = build_router(app.state.clone());
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    let order = common::create_pending_order(&app, &seller, &buyer).await;
+    let order = common::create_pending_locks_order(&app, &seller, &buyer).await;
 
     index.moderate(&seller.pubky, "boots_01");
     let command = common::prepare_locks_command(&order.payment_id, 120);

@@ -37,6 +37,22 @@ fn assert_cap_refused(status: StatusCode, body: &Value) {
     );
 }
 
+fn assert_not_digital_only_on_register(status: StatusCode, body: &Value) {
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["code"], json!("INVALID_COMMAND"), "{body}");
+    assert_eq!(
+        body["error"]["issues"][0]["path"],
+        json!("payload.fulfillment_methods"),
+        "{body}"
+    );
+    assert!(
+        body["error"]["issues"][0]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("digital-only")),
+        "{body}"
+    );
+}
+
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn register_refuses_the_unlimited_cap_on_a_listing_that_ships_or_offers_pickup(pool: PgPool) {
     let (app, _server) =
@@ -207,10 +223,12 @@ async fn send_command(app: &TestApp, token: &str, command: &Value) -> (StatusCod
 }
 
 // A Locks listing is a digital listing: at the cap it registers like any
-// other digital listing, and refuses like any other listing that ships or
-// offers pickup.
+// other digital listing, and a Locks listing that also ships or offers pickup
+// is refused as not digital-only before the cap is ever consulted.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn register_treats_a_locks_listing_at_the_cap_like_any_digital_listing(pool: PgPool) {
+async fn register_accepts_a_digital_locks_listing_at_the_cap_and_refuses_a_physical_one(
+    pool: PgPool,
+) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
     let lock = locks_lock(&seller.pubky);
@@ -245,7 +263,7 @@ async fn register_treats_a_locks_listing_at_the_cap_like_any_digital_listing(poo
             410 + index as u64,
         );
         let (status, body) = execute(&app, &seller.token, &command).await;
-        assert_cap_refused(status, &body);
+        assert_not_digital_only_on_register(status, &body);
     }
 }
 
