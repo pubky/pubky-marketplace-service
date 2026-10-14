@@ -184,6 +184,7 @@
         },
         "ok": true,
         "order": {
+          "auction_aggregate_id": null,
           "auto_complete_days": null,
           "bitcoin_payable": {
             "amount_minor": 51637,
@@ -246,6 +247,7 @@
           "next_actor": "seller",
           "paykit_activation_state": "active",
           "paykit_delivery_state": null,
+          "paykit_expires_at": "<timestamp:2>",
           "paykit_observation": {
             "amount_matched": true,
             "confirmations": 2,
@@ -277,6 +279,7 @@
             "currency": "SAT",
             "exponent": 0
           },
+          "shipping_address_required": false,
           "state": "paid",
           "stock_held": false,
           "subtotal": {

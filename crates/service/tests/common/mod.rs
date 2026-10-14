@@ -377,30 +377,129 @@ pub async fn test_app_with_pickup(pool: PgPool, sandbox: bool) -> TestApp {
     }
 }
 
-/// A test app with pickup sealing AND Locks verification (sandbox off):
-/// orders confirm through the real verification-worker seam, so their
-/// pinned adapter is the worker's rail and the buyer reveal is permitted.
-pub async fn test_app_with_pickup_and_locks(pool: PgPool) -> (TestApp, Arc<FakeLocksClient>) {
+/// A test app with pickup sealing AND the payments runtime (sandbox off):
+/// orders confirm through a verified PayPal IPN, so their pinned adapter is a
+/// real rail and the buyer reveal is permitted. Pickup orders carry no Locks
+/// policy (a Locks listing is digital-only), so PayPal is their confirmation
+/// seam.
+pub async fn test_app_with_pickup_and_paypal(pool: PgPool) -> TestApp {
     let now: DateTime<Utc> = NOW.parse().expect("valid test timestamp");
     let clock = Arc::new(AdjustableClock::new(now));
-    let fake = Arc::new(FakeLocksClient::default());
-    let locks = Arc::new(LocksRuntime {
-        keys: test_locks_keys(),
-        client: fake.clone(),
-    });
     let state = AppState::new(pool.clone(), clock.clone(), config_durable())
-        .with_locks(Some(locks))
-        .with_homeserver(Some(Arc::new(TestLocksHomeserver)))
+        .with_payments(Some(fake_payments_runtime().await))
+        .with_homeserver(Some(Arc::new(CommandMirrorHomeserver)))
         .with_pickup(Some(test_pickup_keys()));
-    (
-        TestApp {
-            router: build_router(state.clone()),
-            pool,
-            clock,
-            state,
-        },
-        fake,
+    TestApp {
+        router: build_router(state.clone()),
+        pool,
+        clock,
+        state,
+    }
+}
+
+/// The payments runtime wired to the fake PayPal IPN verifier and fake Paykit.
+pub async fn fake_payments_runtime() -> Arc<PaymentsRuntime> {
+    let ipn = spawn_fake_paypal_ipn().await;
+    let paykit = spawn_fake_paykit().await;
+    Arc::new(PaymentsRuntime {
+        secret_cipher: SellerSecretCipher::from_hex(TEST_SELLER_SECRET_KEY)
+            .expect("test seller secret key parses"),
+        paykit: Some(
+            PaykitClient::new(&paykit.base_url, TEST_PAYKIT_SIGNING_SEED)
+                .expect("fake paykit client builds")
+                .with_api(PaykitApi::Fork),
+        ),
+        paypal_ipn: PaypalIpnVerifier::new(&ipn.base_url).expect("fake ipn verifier builds"),
+    })
+}
+
+/// Binds a pending order to the PayPal method the way the buyer does: the
+/// seller's PayPal email is configured, then the buyer binds. Returns the
+/// order's exact total in minor units, the figure the IPN must report.
+pub async fn bind_paypal_method(
+    app: &TestApp,
+    seller: &TestActor,
+    buyer: &TestActor,
+    order_id: &str,
+) -> i64 {
+    let (status, body) = send(
+        app.router.clone(),
+        "PUT",
+        "/v0/sellers/me/payment-config",
+        Some(&seller.token),
+        &json!({ "bitcoin_enabled": false, "paypal_merchant_email": "merchant@example.com" }),
     )
+    .await;
+    assert_eq!(status, StatusCode::OK, "payment config failed: {body}");
+    let (status, body) = send(
+        app.router.clone(),
+        "POST",
+        &format!("/v0/orders/{order_id}/payment-method"),
+        Some(&buyer.token),
+        &json!({ "method": "paypal" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "paypal bind failed: {body}");
+    let (status, order) = send(
+        app.router.clone(),
+        "GET",
+        &format!("/v1/orders/{order_id}"),
+        Some(&buyer.token),
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "order read failed: {order}");
+    order["total"]["amount_minor"]
+        .as_i64()
+        .expect("order total")
+}
+
+/// Delivers a verified `completed.ipn` for `total_minor` and returns the
+/// HTTP status PayPal would see. `payment_txn` is the IPN's `txn_id`.
+pub async fn post_completed_ipn(
+    app: &TestApp,
+    order_id: &str,
+    payment_txn: &str,
+    total_minor: i64,
+) -> StatusCode {
+    let gross = format!("{}.{:02}", total_minor / 100, total_minor % 100);
+    let path = format!(
+        "{}/tests/fixtures/paypal_ipn/completed.ipn",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{path}: {error}"));
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    for (field, value) in url::form_urlencoded::parse(text.trim_end().as_bytes()) {
+        let value = match field.as_ref() {
+            _ if value == "{{ORDER_ID}}" => order_id.to_string(),
+            "txn_id" => payment_txn.to_string(),
+            "mc_gross" | "payment_gross" => gross.clone(),
+            _ => value.into_owned(),
+        };
+        serializer.append_pair(&field, &value);
+    }
+    let (status, _) = send_bytes(
+        app.router.clone(),
+        "POST",
+        "/v0/paypal/ipn",
+        serializer.finish().into_bytes(),
+    )
+    .await;
+    status
+}
+
+/// Confirms a pending order's payment the way PayPal does: bind the PayPal
+/// method, then a verified completed IPN for the order's exact total arrives.
+pub async fn confirm_via_paypal(
+    app: &TestApp,
+    seller: &TestActor,
+    buyer: &TestActor,
+    order_id: &str,
+    payment_txn: &str,
+) {
+    let total_minor = bind_paypal_method(app, seller, buyer, order_id).await;
+    let status = post_completed_ipn(app, order_id, payment_txn, total_minor).await;
+    assert_eq!(status, StatusCode::OK, "completed IPN was not accepted");
 }
 
 /// Programmable Lock Server lifecycle double for tests. Outcomes are keyed
@@ -591,7 +690,7 @@ fn command_mirror_records() -> &'static Mutex<HashMap<(String, String), Value>> 
     RECORDS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-struct CommandMirrorHomeserver;
+pub struct CommandMirrorHomeserver;
 
 impl HomeserverListingClient for CommandMirrorHomeserver {
     fn fetch_listing<'a>(
@@ -1438,20 +1537,16 @@ pub struct PendingOrder {
     pub payment_id: String,
 }
 
-/// Registers one unit and checks out as the buyer, leaving the order in
-/// `pending_payment` with its payment awaiting entitlement at revision 1.
-/// Ordinary checkout does **not** hold stock; the first acquire is bind,
-/// Locks registration, or sandbox first-advance.
+/// Registers one unit of an ordinary shipped listing and checks out as the
+/// buyer, leaving the order in `pending_payment` with its payment awaiting
+/// entitlement at revision 1. Ordinary checkout does **not** hold stock; the
+/// first acquire is bind, Locks registration, or sandbox first-advance.
 pub async fn create_pending_order(
     app: &TestApp,
     seller: &TestActor,
     buyer: &TestActor,
 ) -> PendingOrder {
-    let mut listing = register_command(&seller.pubky, 1);
-    listing["payload"]["digital_lock"] = json!({
-        "policyUri": lock_resource_for(&seller.pubky),
-        "criterionId": "paykit",
-    });
+    let listing = register_command(&seller.pubky, 1);
     let (status, body) = execute(app, &seller.token, &listing).await;
     assert_eq!(status, StatusCode::OK, "register fixture failed: {body}");
     let (status, body) = execute(app, &buyer.token, &checkout_command(&seller.pubky)).await;
@@ -1466,6 +1561,74 @@ pub async fn create_pending_order(
             .expect("payment id present")
             .to_string(),
     }
+}
+
+/// Registers one unit of a digital Locks listing and checks out as the buyer
+/// (no delivery address), leaving the order in `pending_payment` with its
+/// payment awaiting entitlement at revision 1.
+pub async fn create_pending_locks_order(
+    app: &TestApp,
+    seller: &TestActor,
+    buyer: &TestActor,
+) -> PendingOrder {
+    let mut listing = register_command(&seller.pubky, 1);
+    listing["payload"]["digital_lock"] = json!({
+        "policyUri": lock_resource_for(&seller.pubky),
+        "criterionId": "paykit",
+    });
+    as_digital_locks_listing(&mut listing);
+    let (status, body) = execute(app, &seller.token, &listing).await;
+    assert_eq!(status, StatusCode::OK, "register fixture failed: {body}");
+    let (status, body) = execute(
+        app,
+        &buyer.token,
+        &as_digital_checkout(checkout_command(&seller.pubky)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "checkout fixture failed: {body}");
+    PendingOrder {
+        order_id: body["result"]["orders"][0]["id"]
+            .as_str()
+            .expect("order id present")
+            .to_string(),
+        payment_id: body["result"]["payments"][0]["id"]
+            .as_str()
+            .expect("payment id present")
+            .to_string(),
+    }
+}
+
+/// Turns a `listing.register` command that already carries a `digital_lock`
+/// into the only shape the service accepts for a Locks listing: digital-only.
+/// A digital order carries no shipping, so the flat shipping charge folds into
+/// the unit price and the buyer still pays the same total.
+pub fn as_digital_locks_listing(listing: &mut Value) {
+    let payload = listing["payload"]
+        .as_object_mut()
+        .expect("register payload object");
+    let shipping = payload
+        .get("shipping_minor")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    payload.insert("fulfillment_methods".into(), json!(["digital"]));
+    payload.insert("shipping_minor".into(), json!(0));
+    if let Some(price) = payload.get_mut("unit_price") {
+        let amount = price["amount_minor"].as_i64().expect("unit price amount");
+        price["amount_minor"] = json!(amount + shipping);
+    }
+}
+
+/// The checkout a buyer sends for a digital listing: every line takes the
+/// digital method and no delivery address is collected.
+pub fn as_digital_checkout(mut checkout: Value) -> Value {
+    let payload = checkout["payload"]
+        .as_object_mut()
+        .expect("checkout payload object");
+    payload.remove("delivery_address");
+    for line in payload["lines"].as_array_mut().expect("checkout lines") {
+        line["fulfillment"] = json!("digital");
+    }
+    checkout
 }
 
 pub struct TestActor {

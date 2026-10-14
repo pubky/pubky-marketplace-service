@@ -573,7 +573,7 @@ async fn resolve_refuses_a_locks_manual_review(pool: PgPool) {
     let (app, locks) = test_app_with_locks(pool.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    let order = create_pending_order(&app, &seller, &buyer).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
     let prepare = json!({
         "version": 1,
         "command_id": common::indexed_command_id(0x8002, 699),
@@ -1840,7 +1840,13 @@ async fn auction_entries_resolve_through_the_reservation(pool: PgPool) {
         "POST",
         &format!("/v0/orders/{order_id}/payment-method"),
         Some(&winner.token),
-        &json!({ "method": "bitcoin" }),
+        &json!({
+            "method": "bitcoin",
+            "delivery_address_envelope": {
+                "key_id": TEST_DELIVERY_KEY_ID,
+                "envelope": test_envelope(7),
+            },
+        }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "bind: {body}");
@@ -1929,7 +1935,13 @@ async fn auction_entries_resolve_through_the_reservation(pool: PgPool) {
         "POST",
         &format!("/v0/orders/{order_id}/payment-method"),
         Some(&winner.token),
-        &json!({ "method": "bitcoin" }),
+        &json!({
+            "method": "bitcoin",
+            "delivery_address_envelope": {
+                "key_id": TEST_DELIVERY_KEY_ID,
+                "envelope": test_envelope(7),
+            },
+        }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "bind: {body}");
@@ -1991,7 +2003,13 @@ async fn auction_entries_resolve_through_the_reservation(pool: PgPool) {
         "POST",
         &format!("/v0/orders/{order_id}/payment-method"),
         Some(&winner.token),
-        &json!({ "method": "bitcoin" }),
+        &json!({
+            "method": "bitcoin",
+            "delivery_address_envelope": {
+                "key_id": TEST_DELIVERY_KEY_ID,
+                "envelope": test_envelope(7),
+            },
+        }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "bind: {body}");

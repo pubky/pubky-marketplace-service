@@ -1090,6 +1090,21 @@ impl OrderRow {
     /// confirms). Historical Stripe-bound orders keep reading `processor`.
     /// The provenance asymmetry is deliberate and must stay visible to both
     /// parties.
+    /// Whether the order already holds the buyer's delivery address, sealed or
+    /// plaintext. Never exposes either.
+    pub fn has_delivery_address(&self) -> bool {
+        self.delivery_address.is_some() || self.delivery_address_envelope.is_some()
+    }
+
+    /// An auction winner's order is created at close, before the buyer has
+    /// said where to ship. It cannot take a payment method until it has one.
+    pub fn needs_delivery_address(&self) -> bool {
+        self.auction_aggregate_id.is_some()
+            && self.fulfillment == "shipping"
+            && self.state == "pending_payment"
+            && !self.has_delivery_address()
+    }
+
     pub fn fiat_verification(&self) -> Value {
         match self.payment_method.as_deref() {
             Some("stripe") => json!("processor"),
@@ -1160,6 +1175,7 @@ impl OrderRow {
             "paykit_request_state": self.paykit_request_state,
             "paykit_activation_state": self.paykit_activation_state,
             "paykit_total_sats": self.paykit_total_sats,
+            "paykit_expires_at": self.paykit_expires_at.map(format_timestamp),
             "bitcoin_quote": {
                 "rate": self.bitcoin_quote_rate.as_ref().map(ToString::to_string),
                 "source": self.bitcoin_quote_source,
@@ -1176,6 +1192,8 @@ impl OrderRow {
             "updated_at": format_timestamp(self.updated_at),
         });
         view["priced_from"] = json!(self.priced_from);
+        view["auction_aggregate_id"] = json!(self.auction_aggregate_id);
+        view["shipping_address_required"] = json!(self.needs_delivery_address());
         view["delivery_assume_days"] = json!(self.delivery_assume_days);
         view["auto_complete_days"] = json!(self.auto_complete_days);
         view["paykit_delivery_state"] = json!(self.paykit_delivery_state);

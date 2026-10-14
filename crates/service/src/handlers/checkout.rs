@@ -202,7 +202,11 @@ pub async fn handle(
                 "fulfillment_not_published",
             )));
         }
-        if method == FulfillmentMethod::Digital {
+        // A Locks listing registers as digital, but the Lock Server delivers
+        // it after payment: it has no sealed deliverable, so it needs neither
+        // the digital delivery key nor a seller deliverable.
+        let locks_listing = listing.digital_lock_policy_uri.is_some();
+        if method == FulfillmentMethod::Digital && !locks_listing {
             if context.digital.is_none() {
                 return Ok(Err(crate::handlers::digital::unavailable()));
             }

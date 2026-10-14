@@ -27,8 +27,9 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use common::{
-    checkout_command_with_id, count, create_pending_order, execute, lock_document_for,
-    lock_resource_for, lock_resource_for_payment, new_actor, payment_command, register_command,
+    as_digital_checkout, as_digital_locks_listing, checkout_command_with_id, count,
+    create_pending_locks_order, execute, lock_document_for, lock_resource_for,
+    lock_resource_for_payment, new_actor, payment_command, register_command,
     register_listing_command, register_locks_command, send, test_app, test_app_with_locks,
     test_locks_keys, FakeLocksClient, PendingOrder, TestActor, TestApp, TEST_BUNDLE_ID,
     TEST_LOCK_ID,
@@ -156,8 +157,8 @@ impl HomeserverListingClient for SyncableLocksHomeserver {
 }
 
 /// A canonical camelCase listing record carrying a `digitalLock`, mirroring
-/// the registered fixture listing (same revision, price, shipping, and
-/// quantity) so an equal-revision sync heals exactly the lock fields.
+/// the registered fixture listing (same revision, price, and quantity; a
+/// Locks listing is digital, so shipping is folded into the price) so an equal-revision sync heals exactly the lock fields.
 fn listing_record_with_lock(revision: i64, policy_uri: &str) -> Value {
     json!({
         "recordType": "listing",
@@ -179,18 +180,12 @@ fn listing_record_with_lock(revision: i64, policy_uri: &str) -> Value {
             "sku": null,
             "priceOverride": null,
         }],
-        "shippingOptions": [{
-            "id": "ship_flat",
-            "pricing": "flat",
-            "label": "Seller shipping",
-            "price": { "amountMinor": 1_200, "currency": "USD", "exponent": 2 },
-            "estimatedMinDays": 2,
-            "estimatedMaxDays": 7,
-        }],
+        "fulfillmentMethods": ["digital"],
+        "shippingOptions": [],
         "sale": {
             "acceptsOffers": true,
             "format": "fixed_price",
-            "unitPrice": { "amountMinor": 12_500, "currency": "USD", "exponent": 2 },
+            "unitPrice": { "amountMinor": 13_700, "currency": "USD", "exponent": 2 },
         },
         "digitalLock": { "policyUri": policy_uri, "criterionId": "paykit" },
     })
@@ -220,7 +215,7 @@ async fn test_app_with_homeserver(
 /// A checkout envelope for the shared fixture listing at a known server
 /// revision (each payment hold bumps it).
 fn checkout_at_listing_revision(seller_pubky: &str, command_id: &str, revision: i64) -> Value {
-    let mut checkout = checkout_command_with_id(seller_pubky, command_id);
+    let mut checkout = as_digital_checkout(checkout_command_with_id(seller_pubky, command_id));
     checkout["payload"]["lines"][0]["expected_revision"] = json!(revision);
     checkout
 }
@@ -307,6 +302,7 @@ async fn a_prepared_row_survives_a_worker_pass_untouched(pool: PgPool) {
         "policyUri": lock_resource_for(&seller.pubky),
         "criterionId": "paykit",
     });
+    as_digital_locks_listing(&mut listing);
     let (status, body) = execute(&app, &seller.token, &listing).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let mut payments = Vec::new();
@@ -428,7 +424,7 @@ async fn registration_after_window_expiry_before_the_sweep_is_refused(pool: PgPo
     let holder = Uuid::new_v4();
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    let order = create_pending_order(&app, &seller, &buyer).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
     let (status, body) = execute(
         &app,
         &buyer.token,
@@ -513,7 +509,7 @@ async fn registration_after_order_cancellation_is_refused(pool: PgPool) {
     let (app, _fake) = test_app_with_locks(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    let order = create_pending_order(&app, &seller, &buyer).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
     let (status, body) = execute(
         &app,
         &buyer.token,
@@ -569,7 +565,7 @@ async fn the_prepare_result_is_sealed_at_rest_and_unsealed_on_replay(pool: PgPoo
     let (app, _fake) = test_app_with_locks(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    let order = create_pending_order(&app, &seller, &buyer).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
 
     let command = common::prepare_locks_command(&order.payment_id, 100);
     let (status, body) = execute(&app, &buyer.token, &command).await;
@@ -620,7 +616,7 @@ async fn prepare_pins_the_locks_adapter_atomically(pool: PgPool) {
     let (app, _fake) = test_app_with_locks(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    let order = create_pending_order(&app, &seller, &buyer).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
 
     let command = common::prepare_locks_command(&order.payment_id, 110);
     let (status, body) = execute(&app, &buyer.token, &command).await;
@@ -675,7 +671,7 @@ async fn prepare_captures_the_sellers_delivery_periods(pool: PgPool) {
             "autoCompleteDays": 8,
         }),
     );
-    let order = create_pending_order(&app, &seller, &buyer).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
 
     let command = common::prepare_locks_command(&order.payment_id, 120);
     let (status, body) = execute(&app, &buyer.token, &command).await;
@@ -700,7 +696,7 @@ async fn prepare_proceeds_with_defaults_when_the_shop_record_is_unreadable(pool:
     let app = common::with_shop_homeserver(app, &homeserver);
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    let order = create_pending_order(&app, &seller, &buyer).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
 
     homeserver.fail_shop_record(&seller.pubky);
     let command = common::prepare_locks_command(&order.payment_id, 120);
@@ -742,12 +738,16 @@ async fn every_designed_binding_outcome_is_recorded(pool: PgPool) {
         "policyUri": lock_resource_for(&seller.pubky),
         "criterionId": "paykit",
     });
+    as_digital_locks_listing(&mut listing);
     let (status, body) = execute(&app, &seller.token, &listing).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (status, body) = execute(
         &app,
         &buyer.token,
-        &checkout_command_with_id(&seller.pubky, "00000000-0000-4000-8000-000000004002"),
+        &as_digital_checkout(checkout_command_with_id(
+            &seller.pubky,
+            "00000000-0000-4000-8000-000000004002",
+        )),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -843,7 +843,7 @@ async fn prepare_replay_returns_the_same_reference_only_to_the_buyer(pool: PgPoo
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let outsider = new_actor(&app).await;
-    let order = create_pending_order(&app, &seller, &buyer).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
 
     let first = common::prepare_locks_command(&order.payment_id, 130);
     let (status, first_body) = execute(&app, &buyer.token, &first).await;
@@ -889,7 +889,7 @@ async fn concurrent_double_prepare_mints_exactly_one_reference(pool: PgPool) {
     let (app, _fake) = test_app_with_locks(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    let order = create_pending_order(&app, &seller, &buyer).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
 
     // Two distinct command ids race the same payment: the payment row lock
     // serializes them, the winner mints, and the loser observes the
@@ -939,7 +939,7 @@ async fn an_elapsed_preparation_is_never_replayed(pool: PgPool) {
     let holder = Uuid::new_v4();
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    let order = create_pending_order(&app, &seller, &buyer).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
     let (status, body) = execute(
         &app,
         &buyer.token,
@@ -991,7 +991,7 @@ async fn prepare_after_registration_is_a_stable_invalid_state(pool: PgPool) {
     let (app, _fake) = test_app_with_locks(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    let order = create_pending_order(&app, &seller, &buyer).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
     register_locks(&app, &buyer.token, &order, &seller.pubky).await;
 
     let (status, body) = execute(
@@ -1031,7 +1031,7 @@ async fn registration_stores_an_encrypted_bound_correlation(pool: PgPool) {
     let (app, _fake) = test_app_with_locks(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    let order = create_pending_order(&app, &seller, &buyer).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
 
     let body = register_locks(&app, &buyer.token, &order, &seller.pubky).await;
     assert_eq!(body["revision"], json!(3));
@@ -1092,7 +1092,7 @@ async fn registration_enforces_participant_state_and_creator_guards(pool: PgPool
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let outsider = new_actor(&app).await;
-    let order = create_pending_order(&app, &seller, &buyer).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
     let resource = lock_resource_for(&seller.pubky);
 
     let command = register_locks_command(&order.payment_id, 1, TEST_BUNDLE_ID, &resource, 10);
@@ -1166,19 +1166,25 @@ async fn registration_rejects_changed_replays_and_identity_reuse(pool: PgPool) {
         "policyUri": lock_resource_for(&seller.pubky),
         "criterionId": "paykit",
     });
+    as_digital_locks_listing(&mut listing);
     let (status, _) = execute(&app, &seller.token, &listing).await;
     assert_eq!(status, StatusCode::OK);
     let (status, first_checkout) = execute(
         &app,
         &buyer.token,
-        &checkout_command_with_id(&seller.pubky, "00000000-0000-4000-8000-000000001000"),
+        &as_digital_checkout(checkout_command_with_id(
+            &seller.pubky,
+            "00000000-0000-4000-8000-000000001000",
+        )),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     // Ordinary checkout does not hold or bump listing revision, so the
     // second checkout still carries expected_revision 1.
-    let mut second =
-        checkout_command_with_id(&seller.pubky, "00000000-0000-4000-8000-000000001001");
+    let mut second = as_digital_checkout(checkout_command_with_id(
+        &seller.pubky,
+        "00000000-0000-4000-8000-000000001001",
+    ));
     second["payload"]["lines"][0]["expected_revision"] = json!(1);
     let (status, second_checkout) = execute(&app, &buyer.token, &second).await;
     assert_eq!(status, StatusCode::OK, "{second_checkout}");
@@ -1244,7 +1250,7 @@ async fn sandbox_advance_is_refused_for_a_locks_correlated_payment(pool: PgPool)
     let (app, _fake) = test_app_with_locks(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    let order = create_pending_order(&app, &seller, &buyer).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
     register_locks(&app, &buyer.token, &order, &seller.pubky).await;
 
     for target in ["detected", "confirmed", "expired", "manual_review"] {
@@ -1271,7 +1277,7 @@ async fn registration_is_refused_when_locks_is_not_configured(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    let order = create_pending_order(&app, &seller, &buyer).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
 
     let (status, body) = execute(
         &app,
@@ -1304,7 +1310,7 @@ async fn worker_confirms_a_verified_completion_exactly_once(pool: PgPool) {
     let holder = Uuid::new_v4();
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    let order = create_pending_order(&app, &seller, &buyer).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
     register_locks(&app, &buyer.token, &order, &seller.pubky).await;
     fake.set_outcome(
         TEST_BUNDLE_ID,
@@ -1401,13 +1407,68 @@ async fn worker_confirms_a_verified_completion_exactly_once(pool: PgPool) {
 // Pending, in-progress, not-found, and unavailable lookups leave the
 // payment untouched and the correlation pending; polling is rate-limited by
 // the poll interval and history rows are appended only on status change.
+// A Locks listing checks out as digital, with no delivery address, and the
+// Lock Server's verified completion pays that order like any other.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_digital_locks_order_without_an_address_is_confirmed_by_the_worker(pool: PgPool) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let holder = Uuid::new_v4();
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let mut listing = register_command(&seller.pubky, 1);
+    listing["payload"]["digital_lock"] = json!({
+        "policyUri": lock_resource_for(&seller.pubky),
+        "criterionId": "paykit",
+    });
+    as_digital_locks_listing(&mut listing);
+    let (status, body) = execute(&app, &seller.token, &listing).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut checkout = as_digital_checkout(checkout_command_with_id(
+        &seller.pubky,
+        "00000000-0000-4000-8000-000000000150",
+    ));
+    checkout["payload"]
+        .as_object_mut()
+        .expect("payload object")
+        .remove("delivery_address");
+    checkout["payload"]["lines"][0]["fulfillment"] = json!("digital");
+    let (status, body) = execute(&app, &buyer.token, &checkout).await;
+    assert_eq!(status, StatusCode::OK, "digital Locks checkout: {body}");
+    let order = PendingOrder {
+        order_id: body["result"]["orders"][0]["id"]
+            .as_str()
+            .expect("order id")
+            .to_string(),
+        payment_id: body["result"]["payments"][0]["id"]
+            .as_str()
+            .expect("payment id")
+            .to_string(),
+    };
+    assert_eq!(body["result"]["orders"][0]["fulfillment"], json!("digital"));
+
+    register_locks(&app, &buyer.token, &order, &seller.pubky).await;
+    fake.set_outcome(
+        TEST_BUNDLE_ID,
+        LocksLookupOutcome::Status(LocksTaskStatus::Completed),
+    );
+    let summary = run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    assert_eq!(summary.locks_completions_applied, 1);
+
+    let (state, adapter, _) = payment_state(&app.pool, &order.payment_id).await;
+    assert_eq!((state.as_str(), adapter.as_str()), ("confirmed", "locks"));
+    assert_eq!(order_state(&app.pool, &order.order_id).await, "paid");
+    assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM receipts").await, 1);
+}
+
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn non_terminal_lifecycles_stay_pending_and_poll_boundedly(pool: PgPool) {
     let (app, fake) = test_app_with_locks(pool).await;
     let holder = Uuid::new_v4();
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    let order = create_pending_order(&app, &seller, &buyer).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
     register_locks(&app, &buyer.token, &order, &seller.pubky).await;
 
     // Not yet submitted upstream: not_found, still pending.
@@ -1482,7 +1543,7 @@ async fn upstream_failure_is_separate_from_marketplace_expiry(pool: PgPool) {
     let holder = Uuid::new_v4();
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    let order = create_pending_order(&app, &seller, &buyer).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
     register_locks(&app, &buyer.token, &order, &seller.pubky).await;
     fake.set_outcome(
         TEST_BUNDLE_ID,
@@ -1540,7 +1601,7 @@ async fn late_completion_after_window_expiry_completes_when_stock_is_free(pool: 
     let holder = Uuid::new_v4();
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    let order = create_pending_order(&app, &seller, &buyer).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
     register_locks(&app, &buyer.token, &order, &seller.pubky).await;
     fake.set_outcome(
         TEST_BUNDLE_ID,
@@ -1636,7 +1697,7 @@ async fn completion_that_cannot_confirm_the_order_goes_to_manual_review(pool: Pg
     let holder = Uuid::new_v4();
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    let order = create_pending_order(&app, &seller, &buyer).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
     register_locks(&app, &buyer.token, &order, &seller.pubky).await;
 
     let cancel = common::order_command(
@@ -1683,7 +1744,7 @@ async fn locks_verification_respects_worker_leases(pool: PgPool) {
     let instance_b = Uuid::new_v4();
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    let order = create_pending_order(&app, &seller, &buyer).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
     register_locks(&app, &buyer.token, &order, &seller.pubky).await;
     fake.set_outcome(
         TEST_BUNDLE_ID,
@@ -1742,10 +1803,15 @@ async fn terminal_checkout_snapshots_drain_boundedly_under_the_lease(pool: PgPoo
         "policyUri": lock_resource_for(&seller.pubky),
         "criterionId": "paykit",
     });
+    as_digital_locks_listing(&mut listing);
     let (status, body) = execute(&app, &seller.token, &listing).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let (status, body) =
-        execute(&app, &buyer.token, &common::checkout_command(&seller.pubky)).await;
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &as_digital_checkout(common::checkout_command(&seller.pubky)),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let order = PendingOrder {
         order_id: body["result"]["orders"][0]["id"]
@@ -1885,7 +1951,7 @@ async fn bundle_and_lock_resource_never_leave_the_correlation_store(pool: PgPool
     let holder = Uuid::new_v4();
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    let order = create_pending_order(&app, &seller, &buyer).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
     let expected_resource = lock_resource_for(&seller.pubky);
     let registration = register_locks(&app, &buyer.token, &order, &seller.pubky).await;
     fake.set_outcome(
@@ -2074,6 +2140,7 @@ async fn prepare_refuses_orders_with_zero_or_multiple_distinct_locks(pool: PgPoo
         "policyUri": lock_resource_for_payment(&seller.pubky, 13_700, "USD"),
         "criterionId": "paykit",
     });
+    as_digital_locks_listing(&mut first);
     let (status, body) = execute(&app, &seller.token, &first).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let mut second = register_listing_command(&seller.pubky, "boots_03", 1, 63);
@@ -2081,9 +2148,10 @@ async fn prepare_refuses_orders_with_zero_or_multiple_distinct_locks(pool: PgPoo
         "policyUri": lock_resource_for_payment(&seller.pubky, 12_500, "USD"),
         "criterionId": "paykit",
     });
+    as_digital_locks_listing(&mut second);
     let (status, body) = execute(&app, &seller.token, &second).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let checkout = json!({
+    let checkout = as_digital_checkout(json!({
         "version": 1,
         "command_id": "00000000-0000-4000-8000-000000002001",
         "aggregate_id": "checkout:00000000-0000-4000-8000-000000002001",
@@ -2114,7 +2182,7 @@ async fn prepare_refuses_orders_with_zero_or_multiple_distinct_locks(pool: PgPoo
             },
             "guarantee_policy_version": 1,
         },
-    });
+    }));
     let (status, body) = execute(&app, &buyer.token, &checkout).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
@@ -2166,7 +2234,7 @@ async fn prepare_refuses_a_lock_document_with_changed_bytes(pool: PgPool) {
         pubky: seller_pubky,
     };
     let buyer = new_actor(&app).await;
-    let order = create_pending_order(&app, &seller, &buyer).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
 
     let (status, body) = execute(
         &app,
@@ -2234,12 +2302,16 @@ async fn prepare_refuses_policy_invalid_documents_at_their_own_path(pool: PgPool
             "policyUri": resource,
             "criterionId": "paykit",
         });
+        as_digital_locks_listing(&mut listing);
         let (status, body) = execute(&app, &seller.token, &listing).await;
         assert_eq!(status, StatusCode::OK, "{case} listing: {body}");
         let (status, body) = execute(
             &app,
             &buyer.token,
-            &checkout_command_with_id(&seller.pubky, "00000000-0000-4000-8000-000000003000"),
+            &as_digital_checkout(checkout_command_with_id(
+                &seller.pubky,
+                "00000000-0000-4000-8000-000000003000",
+            )),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{case} checkout: {body}");
@@ -2286,12 +2358,16 @@ async fn prepare_seals_the_checkout_snapshot_not_a_post_checkout_lock_mutation(p
         "policyUri": lock_a,
         "criterionId": "paykit",
     });
+    as_digital_locks_listing(&mut listing);
     let (status, body) = execute(&app, &seller.token, &listing).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (status, body) = execute(
         &app,
         &buyer.token,
-        &checkout_command_with_id(&seller.pubky, "00000000-0000-4000-8000-000000005000"),
+        &as_digital_checkout(checkout_command_with_id(
+            &seller.pubky,
+            "00000000-0000-4000-8000-000000005000",
+        )),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -2495,7 +2571,7 @@ async fn prepare_refuses_a_payment_without_a_checkout_snapshot(pool: PgPool) {
     let (app, _fake) = test_app_with_locks(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    let order = create_pending_order(&app, &seller, &buyer).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
     // Simulate a legacy order: its checkout predates the snapshot row.
     sqlx::query("DELETE FROM payment_locks_checkout_snapshots WHERE payment_id = $1::uuid")
         .bind(&order.payment_id)
@@ -2537,7 +2613,7 @@ async fn prepare_refuses_a_payment_whose_exponent_drifts_from_the_snapshot(pool:
     let (app, _fake) = test_app_with_locks(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    let order = create_pending_order(&app, &seller, &buyer).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
     // Post-checkout, the payment's exponent no longer equals the sealed
     // checkout snapshot.
     sqlx::query("UPDATE payments SET exponent = 0 WHERE id = $1::uuid")
@@ -2578,7 +2654,7 @@ async fn prepare_refuses_a_payment_whose_asset_drifts_from_the_snapshot(pool: Pg
     let (app, _fake) = test_app_with_locks(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    let order = create_pending_order(&app, &seller, &buyer).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
     sqlx::query("UPDATE payments SET currency = 'SAT' WHERE id = $1::uuid")
         .bind(&order.payment_id)
         .execute(&app.pool)
@@ -2613,7 +2689,7 @@ async fn prepare_refuses_a_payment_prebound_to_the_bitcoin_rail(pool: PgPool) {
     let (app, _fake) = test_app_with_locks(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    let order = create_pending_order(&app, &seller, &buyer).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
     // The bitcoin rail bind (payment_methods.rs): the order is marked and
     // the payment economics are rewritten to SAT/0.
     sqlx::query("UPDATE orders SET payment_method = 'bitcoin' WHERE id = $1::uuid")
@@ -2662,7 +2738,7 @@ async fn the_prepared_correlation_copies_the_verified_snapshot_byte_for_byte(poo
     let (app, _fake) = test_app_with_locks(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    let order = create_pending_order(&app, &seller, &buyer).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
     let (status, body) = execute(
         &app,
         &buyer.token,
@@ -2753,7 +2829,7 @@ async fn prepare_refuses_a_lock_document_with_a_swapped_creator(pool: PgPool) {
         pubky: seller_pubky,
     };
     let buyer = new_actor(&app).await;
-    let order = create_pending_order(&app, &seller, &buyer).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
 
     let (status, body) = execute(
         &app,
@@ -2794,12 +2870,13 @@ async fn two_line_locks_order(
             "policyUri": resource,
             "criterionId": "paykit",
         });
+        as_digital_locks_listing(&mut listing);
         let (status, body) = execute(app, &seller.token, &listing).await;
         assert_eq!(status, StatusCode::OK, "{body}");
     }
     let listing_a = format!("listing:{}_boots_01", seller.pubky);
     let listing_b = format!("listing:{}_cap_01", seller.pubky);
-    let checkout = json!({
+    let checkout = as_digital_checkout(json!({
         "version": 1,
         "command_id": checkout_command_id,
         "aggregate_id": format!("checkout:{checkout_command_id}"),
@@ -2822,7 +2899,7 @@ async fn two_line_locks_order(
             },
             "guarantee_policy_version": 1,
         },
-    });
+    }));
     let (status, body) = execute(app, &buyer.token, &checkout).await;
     assert_eq!(status, StatusCode::OK, "two-line checkout: {body}");
     let order = PendingOrder {
@@ -2872,7 +2949,7 @@ fn two_line_checkout_json(
     rev_a: i64,
     rev_b: i64,
 ) -> Value {
-    json!({
+    as_digital_checkout(json!({
         "version": 1,
         "command_id": command_id,
         "aggregate_id": format!("checkout:{command_id}"),
@@ -2895,7 +2972,7 @@ fn two_line_checkout_json(
             },
             "guarantee_policy_version": 1,
         },
-    })
+    }))
 }
 
 async fn mark_listing_held(pool: &PgPool, aggregate_id: &str) {
@@ -2953,6 +3030,7 @@ async fn a_failed_hold_acquisition_rolls_back_every_mutation(pool: PgPool) {
             "policyUri": resource,
             "criterionId": "paykit",
         });
+        as_digital_locks_listing(&mut listing);
         let (status, body) = execute(&app, &seller.token, &listing).await;
         assert_eq!(status, StatusCode::OK, "{body}");
     }
@@ -3085,6 +3163,7 @@ async fn refused_locks_commands_need_no_second_pool_connection(pool: PgPool) {
             "policyUri": resource,
             "criterionId": "paykit",
         });
+        as_digital_locks_listing(&mut listing);
         let (status, body) = execute(&app, &seller.token, &listing).await;
         assert_eq!(status, StatusCode::OK, "{body}");
     }
@@ -3246,10 +3325,15 @@ async fn denominated_locks_order_under(
         "policyUri": resource,
         "criterionId": "paykit",
     });
+    as_digital_locks_listing(&mut listing);
     let (status, body) = execute(&app, &seller.token, &listing).await;
     assert_eq!(status, StatusCode::OK, "register fixture failed: {body}");
-    let (status, body) =
-        execute(&app, &buyer.token, &common::checkout_command(&seller.pubky)).await;
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &as_digital_checkout(common::checkout_command(&seller.pubky)),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "checkout fixture failed: {body}");
     let order = PendingOrder {
         order_id: body["result"]["orders"][0]["id"]
@@ -3475,7 +3559,7 @@ async fn prepare_refuses_a_payment_whose_price_of_record_drifts_from_the_snapsho
     let (app, _fake) = test_app_with_locks(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    let order = create_pending_order(&app, &seller, &buyer).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
     sqlx::query("UPDATE payments SET merchandise_currency = 'BTC' WHERE id = $1::uuid")
         .bind(&order.payment_id)
         .execute(&app.pool)
@@ -3526,4 +3610,211 @@ async fn checkout_snapshots_the_merchandise_denomination(pool: PgPool) {
             .await
             .expect("payment row exists");
     assert_eq!(amount, total);
+}
+
+/// One unit of a digital Locks listing `listing_id`, checked out by `buyer`
+/// without an address and registered against `bundle_id`. Every command
+/// number is derived from `n`, so several orders coexist in one test.
+async fn registered_digital_locks_order(
+    app: &TestApp,
+    seller: &TestActor,
+    buyer: &TestActor,
+    listing_id: &str,
+    bundle_id: &str,
+    n: u64,
+) -> PendingOrder {
+    let mut listing = register_listing_command(&seller.pubky, listing_id, 1, n);
+    listing["payload"]["digital_lock"] = json!({
+        "policyUri": lock_resource_for(&seller.pubky),
+        "criterionId": "paykit",
+    });
+    as_digital_locks_listing(&mut listing);
+    let (status, body) = execute(app, &seller.token, &listing).await;
+    assert_eq!(status, StatusCode::OK, "register {listing_id}: {body}");
+
+    let mut checkout = checkout_command_with_id(
+        &seller.pubky,
+        &format!("00000000-0000-4000-8000-{:012x}", 0x9000 + n),
+    );
+    checkout["payload"]["lines"][0]["listing_aggregate_id"] =
+        json!(format!("listing:{}_{listing_id}", seller.pubky));
+    let (status, body) = execute(app, &buyer.token, &as_digital_checkout(checkout)).await;
+    assert_eq!(status, StatusCode::OK, "checkout {listing_id}: {body}");
+    let order = PendingOrder {
+        order_id: body["result"]["orders"][0]["id"]
+            .as_str()
+            .expect("order id")
+            .to_string(),
+        payment_id: body["result"]["payments"][0]["id"]
+            .as_str()
+            .expect("payment id")
+            .to_string(),
+    };
+
+    let mut prepare = payment_command(&order.payment_id, 1, "prepare_locks", 0, 0x9100 + n);
+    prepare["kind"] = json!("payment.prepare_locks");
+    prepare["payload"] = json!({ "payment_id": order.payment_id });
+    let (status, body) = execute(app, &buyer.token, &prepare).await;
+    assert_eq!(status, StatusCode::OK, "prepare {listing_id}: {body}");
+    let (status, body) = execute(
+        app,
+        &buyer.token,
+        &register_locks_command(
+            &order.payment_id,
+            2,
+            bundle_id,
+            &lock_resource_for(&seller.pubky),
+            0x9200 + n,
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "register_locks {listing_id}: {body}"
+    );
+    order
+}
+
+/// Makes confirming exactly `order_id` fail inside the confirmation
+/// transaction: the receipt every confirmation issues is refused.
+async fn refuse_receipt_for(pool: &PgPool, order_id: &str) {
+    sqlx::raw_sql(&format!(
+        "CREATE FUNCTION test_refuse_receipt() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN RAISE EXCEPTION 'receipt store unavailable'; END $$; \
+         CREATE TRIGGER test_refuse_receipt BEFORE INSERT ON receipts \
+         FOR EACH ROW WHEN (NEW.order_id = '{order_id}'::uuid) \
+         EXECUTE FUNCTION test_refuse_receipt();"
+    ))
+    .execute(pool)
+    .await
+    .expect("install failing trigger");
+}
+
+async fn repair_receipt_store(pool: &PgPool) {
+    sqlx::raw_sql(
+        "DROP TRIGGER test_refuse_receipt ON receipts; DROP FUNCTION test_refuse_receipt();",
+    )
+    .execute(pool)
+    .await
+    .expect("remove failing trigger");
+}
+
+// The worker path: a confirmation that fails inside its transaction rolls the
+// whole confirmation back and fails only that item — the pass still returns
+// Ok instead of killing the worker loop. Once the fault clears, the next pass
+// (after the claim and lease deferrals elapse) confirms the payment.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn worker_survives_a_digital_locks_confirmation_that_fails(pool: PgPool) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order =
+        registered_digital_locks_order(&app, &seller, &buyer, "boots_01", TEST_BUNDLE_ID, 0x801)
+            .await;
+    refuse_receipt_for(&app.pool, &order.order_id).await;
+    fake.set_outcome(
+        TEST_BUNDLE_ID,
+        LocksLookupOutcome::Status(LocksTaskStatus::Completed),
+    );
+
+    let summary = run_once(&app.state, Uuid::new_v4(), app.clock.now())
+        .await
+        .expect("the pass logs the failed item instead of failing the tick");
+    assert_eq!(
+        summary.locks_completions_applied, 0,
+        "the failed item is not applied"
+    );
+    assert_eq!(
+        order_state(&app.pool, &order.order_id).await,
+        "pending_payment",
+        "the confirmation rolled back"
+    );
+    let (state, adapter, _) = payment_state(&app.pool, &order.payment_id).await;
+    assert_eq!(
+        (state.as_str(), adapter.as_str()),
+        ("awaiting_entitlement", "locks")
+    );
+    assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM receipts").await, 0);
+
+    repair_receipt_store(&app.pool).await;
+    app.clock.advance_seconds(61);
+    let summary = run_once(&app.state, Uuid::new_v4(), app.clock.now())
+        .await
+        .expect("the worker loop continues after the failed pass");
+    assert_eq!(summary.locks_completions_applied, 1, "payment confirmed");
+    assert_eq!(order_state(&app.pool, &order.order_id).await, "paid");
+    assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM receipts").await, 1);
+}
+
+// Two claimed correlations in one tick: the FIRST fails (its confirmation is
+// refused inside the transaction), the SECOND still confirms in the same pass
+// — a per-item error is logged, never head-of-line for the rest of the batch —
+// and the task lease is released for the next holder.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_failed_claimed_digital_locks_item_does_not_stall_the_rest_of_the_batch(pool: PgPool) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let failing =
+        registered_digital_locks_order(&app, &seller, &buyer, "boots_01", TEST_BUNDLE_ID, 0x851)
+            .await;
+    let healthy =
+        registered_digital_locks_order(&app, &seller, &buyer, "boots_02", OTHER_BUNDLE_ID, 0x852)
+            .await;
+    refuse_receipt_for(&app.pool, &failing.order_id).await;
+    for bundle in [TEST_BUNDLE_ID, OTHER_BUNDLE_ID] {
+        fake.set_outcome(
+            bundle,
+            LocksLookupOutcome::Status(LocksTaskStatus::Completed),
+        );
+    }
+    // Deterministic claim order (last_checked_at ASC): the FAILING correlation
+    // is claimed first, well past the poll interval.
+    for (order, age_seconds) in [(&failing, 3600), (&healthy, 1800)] {
+        sqlx::query(
+            "UPDATE payment_locks_correlations SET last_checked_at = $2 WHERE order_id = $1::uuid",
+        )
+        .bind(&order.order_id)
+        .bind(app.clock.now() - chrono::Duration::seconds(age_seconds))
+        .execute(&app.pool)
+        .await
+        .expect("age the claim");
+    }
+
+    let summary = run_once(&app.state, Uuid::new_v4(), app.clock.now())
+        .await
+        .expect("one bad item does not fail the tick");
+    assert_eq!(
+        summary.locks_completions_applied, 1,
+        "the healthy item confirms in the same tick as the failing one"
+    );
+    assert_eq!(
+        order_state(&app.pool, &failing.order_id).await,
+        "pending_payment",
+        "the failing item's confirmation rolled back"
+    );
+    assert_eq!(
+        order_state(&app.pool, &healthy.order_id).await,
+        "paid",
+        "the healthy item confirmed"
+    );
+    assert_eq!(
+        count(&app.pool, "SELECT COUNT(*) FROM receipts").await,
+        1,
+        "only the healthy order was issued a receipt"
+    );
+
+    assert!(
+        try_acquire_lease(
+            &app.pool,
+            workers::TASK_LOCKS_VERIFICATION,
+            Uuid::new_v4(),
+            app.clock.now(),
+            30,
+        )
+        .await
+        .expect("lease query runs"),
+        "the verification lease is free right after the pass"
+    );
 }

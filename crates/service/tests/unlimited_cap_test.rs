@@ -37,6 +37,22 @@ fn assert_cap_refused(status: StatusCode, body: &Value) {
     );
 }
 
+fn assert_not_digital_only_on_register(status: StatusCode, body: &Value) {
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["code"], json!("INVALID_COMMAND"), "{body}");
+    assert_eq!(
+        body["error"]["issues"][0]["path"],
+        json!("payload.fulfillment_methods"),
+        "{body}"
+    );
+    assert!(
+        body["error"]["issues"][0]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("digital-only")),
+        "{body}"
+    );
+}
+
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn register_refuses_the_unlimited_cap_on_a_listing_that_ships_or_offers_pickup(pool: PgPool) {
     let (app, _server) =
@@ -175,86 +191,84 @@ fn locks_lock(seller: &str) -> Value {
     json!({"policyUri": lock_resource_for(seller), "criterionId": "paykit"})
 }
 
-// Sol round 3 service P1: a Locks lock exempts the cap only when the seller's
-// record publishes digital alone. The Locks derivation registers both as
-// shipping, so the record decides.
-#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn register_decides_a_locks_listing_at_the_cap_from_the_seller_record(pool: PgPool) {
-    let app = test_app(pool).await;
-    let seller = new_actor(&app).await;
-    let lock = locks_lock(&seller.pubky);
-    let cases = [
-        (
-            "reveal_digital",
-            json!(["digital"]),
-            json!(["shipping"]),
-            true,
-        ),
-        (
-            "reveal_ship",
-            json!(["physical", "shipping", "digital"]),
-            json!(["shipping"]),
-            false,
-        ),
-        (
-            "reveal_pickup",
-            json!(["pickup", "digital"]),
-            json!(["pickup"]),
-            false,
-        ),
-    ];
-    for (index, (listing_id, published, registered, accepted)) in cases.into_iter().enumerate() {
-        put_command_mirror_record(
-            &seller.pubky,
-            listing_id,
-            locks_record(&seller.pubky, listing_id, published, &lock),
-        );
-        let mut command = register(
-            &seller.pubky,
-            listing_id,
-            registered,
-            UNLIMITED_STOCK_QUANTITY,
-            400 + index as u64,
-        );
-        command["payload"]["digital_lock"] = lock.clone();
-        // `send`, not `execute`: the record above is the seller's, not a mirror of the command.
-        let (status, body) = send(
-            app.router.clone(),
-            "POST",
-            "/v1/commands",
-            Some(&seller.token),
-            &command,
-        )
-        .await;
-        if accepted {
-            assert_eq!(status, StatusCode::OK, "{listing_id}: {body}");
-        } else {
-            assert_cap_refused(status, &body);
-        }
-    }
+async fn listing_methods(app: &TestApp, seller: &str, listing_id: &str) -> Vec<String> {
+    sqlx::query_scalar("SELECT fulfillment_methods FROM listings WHERE aggregate_id = $1")
+        .bind(format!("listing:{seller}_{listing_id}"))
+        .fetch_one(&app.pool)
+        .await
+        .expect("listing row")
+}
 
-    // A Locks register at the cap whose record cannot be read is refused, not trusted.
-    let mut missing = register(
-        &seller.pubky,
-        "reveal_missing",
-        json!(["shipping"]),
-        UNLIMITED_STOCK_QUANTITY,
-        410,
-    );
-    missing["payload"]["digital_lock"] = lock.clone();
-    let (status, body) = send(
+fn locks_register(
+    seller: &str,
+    listing_id: &str,
+    methods: Value,
+    lock: &Value,
+    index: u64,
+) -> Value {
+    let mut command = register(seller, listing_id, methods, UNLIMITED_STOCK_QUANTITY, index);
+    command["payload"]["digital_lock"] = lock.clone();
+    command
+}
+
+async fn send_command(app: &TestApp, token: &str, command: &Value) -> (StatusCode, Value) {
+    send(
         app.router.clone(),
         "POST",
         "/v1/commands",
-        Some(&seller.token),
-        &missing,
+        Some(token),
+        command,
     )
-    .await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    .await
+}
+
+// A Locks listing is a digital listing: at the cap it registers like any
+// other digital listing, and a Locks listing that also ships or offers pickup
+// is refused as not digital-only before the cap is ever consulted.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn register_accepts_a_digital_locks_listing_at_the_cap_and_refuses_a_physical_one(
+    pool: PgPool,
+) {
+    let app = test_app(pool).await;
+    let seller = new_actor(&app).await;
+    let lock = locks_lock(&seller.pubky);
+
+    let digital = locks_register(
+        &seller.pubky,
+        "locks_digital",
+        json!(["digital"]),
+        &lock,
+        400,
+    );
+    let (status, body) = execute(&app, &seller.token, &digital).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        listing_methods(&app, &seller.pubky, "locks_digital").await,
+        vec!["digital"]
+    );
+
+    for (index, methods) in [
+        json!(["shipping"]),
+        json!(["pickup"]),
+        json!(["shipping", "digital"]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let command = locks_register(
+            &seller.pubky,
+            &format!("locks_physical_{index}"),
+            methods,
+            &lock,
+            410 + index as u64,
+        );
+        let (status, body) = execute(&app, &seller.token, &command).await;
+        assert_not_digital_only_on_register(status, &body);
+    }
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn sync_decides_a_locks_listing_at_the_cap_from_the_seller_record(pool: PgPool) {
+async fn sync_registers_a_digital_locks_record_as_digital_and_refuses_a_physical_one(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
     let lock = locks_lock(&seller.pubky);
@@ -276,10 +290,10 @@ async fn sync_decides_a_locks_listing_at_the_cap_from_the_seller_record(pool: Pg
         locks_record(&seller.pubky, "reveal_digital", json!(["digital"]), &lock),
     );
     let (status, body) = execute(&app, &seller.token, &sync("reveal_digital", 1)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
-        status,
-        StatusCode::OK,
-        "digital-only Locks keeps the cap: {body}"
+        listing_methods(&app, &seller.pubky, "reveal_digital").await,
+        vec!["digital"]
     );
 
     for (index, (listing_id, published)) in [
@@ -316,123 +330,47 @@ async fn sync_decides_a_locks_listing_at_the_cap_from_the_seller_record(pool: Pg
     );
 }
 
-fn locks_register(
-    seller: &str,
-    listing_id: &str,
-    methods: Value,
-    lock: &Value,
-    index: u64,
-) -> Value {
-    let mut command = register(seller, listing_id, methods, UNLIMITED_STOCK_QUANTITY, index);
-    command["payload"]["digital_lock"] = lock.clone();
+/// The public auction record a `register_auction_command` for `listing_id`
+/// derives, so the command passes the auction's public-authority check.
+fn auction_record(seller: &str, listing_id: &str) -> Value {
+    json!({
+        "recordType": "listing",
+        "schemaVersion": 1,
+        "ownerPubky": seller,
+        "listingId": listing_id,
+        "title": "Marketplace item",
+        "revision": 1,
+        "media": [{"contentHash": "a".repeat(64)}],
+        "variants": [{
+            "id": "variant_1",
+            "enabled": true,
+            "quantity": 1,
+            "sku": null,
+            "options": []
+        }],
+        "shippingOptions": [{
+            "pricing": "flat",
+            "price": {"amountMinor": 1_200, "currency": "USD", "exponent": 2}
+        }],
+        "fulfillmentMethods": ["shipping"],
+        "sale": {
+            "format": "auction",
+            "startingPrice": {"amountMinor": 4_500, "currency": "USD", "exponent": 2},
+            "startsAt": "2026-08-19T22:00:00.000Z",
+            "endsAt": "2026-08-19T22:10:00.000Z",
+            "minimumIncrement": {"amountMinor": 500, "currency": "USD", "exponent": 2},
+            "antiSnipingWindowSeconds": 60,
+            "antiSnipingExtensionSeconds": 120
+        }
+    })
+}
+
+fn auction_register(seller: &str, listing_id: &str, index: u64) -> Value {
+    let mut command = register_auction_command(seller);
+    command["command_id"] = json!(indexed_command_id(0xca93, index));
+    command["aggregate_id"] = json!(format!("listing:{seller}_{listing_id}"));
+    command["payload"]["listing_id"] = json!(listing_id);
     command
-}
-
-async fn send_command(app: &TestApp, token: &str, command: &Value) -> (StatusCode, Value) {
-    send(
-        app.router.clone(),
-        "POST",
-        "/v1/commands",
-        Some(token),
-        command,
-    )
-    .await
-}
-
-// Sol round 4 P1: a digital-only Locks record exempts only the exact
-// registration its derivation produces (shipping, its lock, its quantity and
-// version). Any other command at the cap is refused.
-#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn register_binds_a_locks_exemption_to_the_registration_its_record_derives(pool: PgPool) {
-    let app = test_app(pool).await;
-    let seller = new_actor(&app).await;
-    let lock = locks_lock(&seller.pubky);
-    let other_lock = json!({"policyUri": lock_resource_for(&seller.pubky), "criterionId": "other"});
-    let digital_only =
-        |listing_id: &str| locks_record(&seller.pubky, listing_id, json!(["digital"]), &lock);
-
-    let mut refused: Vec<(&str, Value, Value)> = Vec::new();
-    // Service methods the derivation never produces for a digital-only Locks record.
-    refused.push((
-        "m_pickup",
-        digital_only("m_pickup"),
-        locks_register(&seller.pubky, "m_pickup", json!(["pickup"]), &lock, 500),
-    ));
-    refused.push((
-        "m_ship_pickup",
-        digital_only("m_ship_pickup"),
-        locks_register(
-            &seller.pubky,
-            "m_ship_pickup",
-            json!(["shipping", "pickup"]),
-            &lock,
-            501,
-        ),
-    ));
-    // A lock the record does not carry.
-    refused.push((
-        "m_lock",
-        digital_only("m_lock"),
-        locks_register(
-            &seller.pubky,
-            "m_lock",
-            json!(["shipping"]),
-            &other_lock,
-            502,
-        ),
-    ));
-    // A quantity the record's variants do not sum to.
-    let mut small = digital_only("m_quantity");
-    small["variants"][0]["quantity"] = json!(5);
-    refused.push((
-        "m_quantity",
-        small,
-        locks_register(&seller.pubky, "m_quantity", json!(["shipping"]), &lock, 503),
-    ));
-    // A record version the command does not register.
-    let mut newer = locks_register(&seller.pubky, "m_revision", json!(["shipping"]), &lock, 504);
-    newer["payload"]["listing_revision"] = json!(2);
-    refused.push(("m_revision", digital_only("m_revision"), newer));
-    // A digital-only record with no lock at all.
-    let mut unlocked = digital_only("m_unlocked");
-    unlocked
-        .as_object_mut()
-        .expect("record object")
-        .remove("digitalLock");
-    refused.push((
-        "m_unlocked",
-        unlocked,
-        locks_register(&seller.pubky, "m_unlocked", json!(["shipping"]), &lock, 505),
-    ));
-    // A malformed record that merely names digital.
-    refused.push((
-        "m_malformed",
-        json!({"fulfillmentMethods": ["digital"]}),
-        locks_register(
-            &seller.pubky,
-            "m_malformed",
-            json!(["shipping"]),
-            &lock,
-            506,
-        ),
-    ));
-
-    for (listing_id, record, command) in refused {
-        put_command_mirror_record(&seller.pubky, listing_id, record);
-        let (status, body) = send_command(&app, &seller.token, &command).await;
-        assert_eq!(status, StatusCode::CONFLICT, "{listing_id}: {body}");
-        assert_eq!(
-            body["error"]["reason"],
-            json!(UNLIMITED_STOCK_ON_PHYSICAL_LISTING),
-            "{listing_id}: {body}"
-        );
-    }
-
-    // The exact derivation registers.
-    put_command_mirror_record(&seller.pubky, "m_exact", digital_only("m_exact"));
-    let exact = locks_register(&seller.pubky, "m_exact", json!(["shipping"]), &lock, 507);
-    let (status, body) = send_command(&app, &seller.token, &exact).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 /// A homeserver double that counts listing fetches and, during each one,
@@ -525,15 +463,9 @@ async fn register_reads_the_record_once_after_cheap_checks_and_outside_the_comma
     let app = test_app_with_homeserver_client(pool, probe.clone()).await;
     let seller = new_actor(&app).await;
     let outsider = new_actor(&app).await;
-    let lock = locks_lock(&seller.pubky);
-    *probe.record.lock().expect("probe record") = Some(locks_record(
-        &seller.pubky,
-        "probe_01",
-        json!(["digital"]),
-        &lock,
-    ));
+    *probe.record.lock().expect("probe record") = Some(auction_record(&seller.pubky, "probe_01"));
 
-    let command = locks_register(&seller.pubky, "probe_01", json!(["shipping"]), &lock, 600);
+    let command = auction_register(&seller.pubky, "probe_01", 600);
     *probe.lock_key.lock().expect("probe key") = Some(format!(
         "{}:{}",
         seller.pubky,
@@ -553,8 +485,7 @@ async fn register_reads_the_record_once_after_cheap_checks_and_outside_the_comma
     );
 
     // Refused on cheap checks without reading the record.
-    let mut wrong_aggregate =
-        locks_register(&seller.pubky, "probe_02", json!(["shipping"]), &lock, 601);
+    let mut wrong_aggregate = auction_register(&seller.pubky, "probe_02", 601);
     wrong_aggregate["aggregate_id"] = json!(format!("listing:{}_probe_other", seller.pubky));
     let (status, body) = send_command(&app, &seller.token, &wrong_aggregate).await;
     assert_eq!(
@@ -562,7 +493,7 @@ async fn register_reads_the_record_once_after_cheap_checks_and_outside_the_comma
         json!("INVALID_COMMAND"),
         "{status}: {body}"
     );
-    let not_seller = locks_register(&seller.pubky, "probe_03", json!(["shipping"]), &lock, 602);
+    let not_seller = auction_register(&seller.pubky, "probe_03", 602);
     let (status, body) = send_command(&app, &outsider.token, &not_seller).await;
     assert_eq!(
         body["error"]["code"],
@@ -573,28 +504,6 @@ async fn register_reads_the_record_once_after_cheap_checks_and_outside_the_comma
         probe.fetches.load(Ordering::SeqCst),
         1,
         "no fetch before cheap checks"
-    );
-
-    // A Locks auction at the cap reads the record once for both its cap
-    // decision and its auction authority.
-    let mut auction = register_auction_command(&seller.pubky);
-    auction["command_id"] = json!(indexed_command_id(0xca93, 1));
-    auction["aggregate_id"] = json!(format!("listing:{}_probe_04", seller.pubky));
-    auction["payload"]["listing_id"] = json!("probe_04");
-    auction["payload"]["quantity"] = json!(UNLIMITED_STOCK_QUANTITY);
-    auction["payload"]["digital_lock"] = lock.clone();
-    *probe.record.lock().expect("probe record") = Some(locks_record(
-        &seller.pubky,
-        "probe_04",
-        json!(["digital"]),
-        &lock,
-    ));
-    *probe.lock_key.lock().expect("probe key") = None;
-    let _ = send_command(&app, &seller.token, &auction).await;
-    assert_eq!(
-        probe.fetches.load(Ordering::SeqCst),
-        2,
-        "one fetch for the auction command"
     );
 }
 
@@ -609,7 +518,6 @@ async fn register_answers_replays_conflicts_and_duplicates_without_another_recor
     let app = test_app_with_homeserver_client(pool, probe.clone()).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    let lock = locks_lock(&seller.pubky);
     let fetches = || probe.fetches.load(Ordering::SeqCst);
 
     // A fixed-price registration and a non-register command read nothing.
@@ -621,13 +529,8 @@ async fn register_answers_replays_conflicts_and_duplicates_without_another_recor
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(fetches(), 0, "no record read without a record decision");
 
-    *probe.record.lock().expect("probe record") = Some(locks_record(
-        &seller.pubky,
-        "replay_01",
-        json!(["digital"]),
-        &lock,
-    ));
-    let command = locks_register(&seller.pubky, "replay_01", json!(["shipping"]), &lock, 700);
+    *probe.record.lock().expect("probe record") = Some(auction_record(&seller.pubky, "replay_01"));
+    let command = auction_register(&seller.pubky, "replay_01", 700);
     let (status, first) = send_command(&app, &seller.token, &command).await;
     assert_eq!(status, StatusCode::OK, "{first}");
     assert_eq!(fetches(), 1, "the first submission reads the record");
@@ -648,14 +551,9 @@ async fn register_answers_replays_conflicts_and_duplicates_without_another_recor
     assert_eq!(fetches(), 1, "a conflicting reuse reads nothing");
 
     // Two identical first submissions in flight together read once.
-    *probe.record.lock().expect("probe record") = Some(locks_record(
-        &seller.pubky,
-        "twice_01",
-        json!(["digital"]),
-        &lock,
-    ));
+    *probe.record.lock().expect("probe record") = Some(auction_record(&seller.pubky, "twice_01"));
     probe.wait_for_peer.store(true, Ordering::SeqCst);
-    let duplicate = locks_register(&seller.pubky, "twice_01", json!(["shipping"]), &lock, 701);
+    let duplicate = auction_register(&seller.pubky, "twice_01", 701);
     let ((status_a, body_a), (status_b, body_b)) = tokio::join!(
         send_command(&app, &seller.token, &duplicate),
         send_command(&app, &seller.token, &duplicate),

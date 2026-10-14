@@ -39,6 +39,8 @@ An auction winner's hold is its reservation (`AUCTION_HOLD_SECONDS` from close),
 
 It persists that window and caps the shown hold at `reservation expires_at - 60 seconds`. A winner with less than `AUCTION_MIN_PAYMENT_WINDOW_SECONDS` (300) left, or no active reservation, is refused the bitcoin bind (`auction_payment_window_too_short`). The activation guard requires the active reservation and `Marketplace time + persisted window + 2 × 60 seconds <= reservation expires_at`, so activation passes for the slack after the bind, and Paykit's deadline (its activation clock, at most 60 seconds ahead, plus the window) still fits inside the shown hold and never trips the activation-bounds alert. An activation that lands later is refused and the bind voided; the reservation stays active and the winner can bind again with the time left.
 
+Order reads project the activated request's deadline as `paykit_expires_at` (null until activation, and again after a voided activation is re-bound). Marketplace Shop shows it as an auction winner's "Pay by" once present, so the shown deadline equals the wallet's; before activation it shows the reservation-based `hold_expires_at`. `paykit_expires_at` never exceeds `hold_expires_at` for an auction order.
+
 ## Activation guard and races
 
 Before each signed upstream activation, worker locks payment then order and requires all of:

@@ -17,6 +17,7 @@
       "body": {
         "ok": true,
         "order": {
+          "auction_aggregate_id": null,
           "auto_complete_days": null,
           "bitcoin_payable": {
             "amount_minor": 51637,
@@ -35,7 +36,7 @@
           },
           "buyer_pubky": "<pubky:buyer>",
           "cancellation_reason": "closed after manual review",
-          "created_at": "<timestamp:1>",
+          "created_at": "<timestamp:2>",
           "delivery_assume_days": null,
           "delivery_assumed": false,
           "drop_aggregate_id": null,
@@ -79,11 +80,12 @@
           "next_actor": null,
           "paykit_activation_state": "active",
           "paykit_delivery_state": null,
+          "paykit_expires_at": "<timestamp:1>",
           "paykit_observation": {
             "amount_matched": true,
             "confirmations": 2,
             "disappeared": false,
-            "observed_at": "<timestamp:1>",
+            "observed_at": "<timestamp:2>",
             "observed_sats": 51637,
             "txid": "9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c"
           },
@@ -109,6 +111,7 @@
             "currency": "SAT",
             "exponent": 0
           },
+          "shipping_address_required": false,
           "state": "cancelled",
           "stock_held": false,
           "subtotal": {
@@ -121,14 +124,14 @@
             "currency": "SAT",
             "exponent": 0
           },
-          "updated_at": "<timestamp:1>"
+          "updated_at": "<timestamp:2>"
         },
         "resolution": {
           "basis": "seller_attestation",
           "order_id": "<uuid:1>",
           "outcome": "abandoned",
           "resolution_id": "<uuid:3>",
-          "resolved_at": "<timestamp:1>",
+          "resolved_at": "<timestamp:2>",
           "resolved_by_pubky": "<pubky:seller>"
         }
       },
@@ -378,6 +381,7 @@
       "body": {
         "ok": true,
         "order": {
+          "auction_aggregate_id": null,
           "auto_complete_days": null,
           "bitcoin_payable": {
             "amount_minor": 51637,
@@ -396,7 +400,7 @@
           },
           "buyer_pubky": "<pubky:buyer>",
           "cancellation_reason": null,
-          "created_at": "<timestamp:1>",
+          "created_at": "<timestamp:2>",
           "delivery_assume_days": null,
           "delivery_assumed": false,
           "drop_aggregate_id": null,
@@ -440,11 +444,12 @@
           "next_actor": "seller",
           "paykit_activation_state": "active",
           "paykit_delivery_state": null,
+          "paykit_expires_at": "<timestamp:1>",
           "paykit_observation": {
             "amount_matched": true,
             "confirmations": 2,
             "disappeared": false,
-            "observed_at": "<timestamp:1>",
+            "observed_at": "<timestamp:2>",
             "observed_sats": 51637,
             "txid": "9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c"
           },
@@ -470,6 +475,7 @@
             "currency": "SAT",
             "exponent": 0
           },
+          "shipping_address_required": false,
           "state": "paid",
           "stock_held": false,
           "subtotal": {
@@ -482,14 +488,14 @@
             "currency": "SAT",
             "exponent": 0
           },
-          "updated_at": "<timestamp:1>"
+          "updated_at": "<timestamp:2>"
         },
         "resolution": {
           "basis": "seller_attestation",
           "order_id": "<uuid:4>",
           "outcome": "paid",
           "resolution_id": "<uuid:10>",
-          "resolved_at": "<timestamp:1>",
+          "resolved_at": "<timestamp:2>",
           "resolved_by_pubky": "<pubky:seller>"
         }
       },
@@ -539,6 +545,7 @@
       "body": {
         "ok": true,
         "order": {
+          "auction_aggregate_id": null,
           "auto_complete_days": null,
           "bitcoin_payable": {
             "amount_minor": 51637,
@@ -557,14 +564,14 @@
           },
           "buyer_pubky": "<pubky:buyer>",
           "cancellation_reason": "refunded by the seller after manual review",
-          "created_at": "<timestamp:1>",
+          "created_at": "<timestamp:2>",
           "delivery_assume_days": null,
           "delivery_assumed": false,
           "drop_aggregate_id": null,
           "edition": null,
           "external_refund": {
             "amount_minor": 51637,
-            "recorded_at": "<timestamp:1>",
+            "recorded_at": "<timestamp:2>",
             "transaction_id": "tx-contract-refund"
           },
           "fiat_checkout_url": null,
@@ -605,11 +612,12 @@
           "next_actor": null,
           "paykit_activation_state": "active",
           "paykit_delivery_state": null,
+          "paykit_expires_at": "<timestamp:1>",
           "paykit_observation": {
             "amount_matched": true,
             "confirmations": 2,
             "disappeared": false,
-            "observed_at": "<timestamp:1>",
+            "observed_at": "<timestamp:2>",
             "observed_sats": 51637,
             "txid": "9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c"
           },
@@ -635,6 +643,7 @@
             "currency": "SAT",
             "exponent": 0
           },
+          "shipping_address_required": false,
           "state": "refunded_external",
           "stock_held": false,
           "subtotal": {
@@ -647,14 +656,14 @@
             "currency": "SAT",
             "exponent": 0
           },
-          "updated_at": "<timestamp:1>"
+          "updated_at": "<timestamp:2>"
         },
         "resolution": {
           "basis": "seller_attestation",
           "order_id": "<uuid:12>",
           "outcome": "refunded",
           "resolution_id": "<uuid:14>",
-          "resolved_at": "<timestamp:1>",
+          "resolved_at": "<timestamp:2>",
           "resolved_by_pubky": "<pubky:seller>"
         }
       },
@@ -679,6 +688,7 @@
       "body": {
         "ok": true,
         "order": {
+          "auction_aggregate_id": null,
           "auto_complete_days": null,
           "bitcoin_payable": {
             "amount_minor": 51637,
@@ -697,7 +707,7 @@
           },
           "buyer_pubky": "<pubky:buyer>",
           "cancellation_reason": null,
-          "created_at": "<timestamp:1>",
+          "created_at": "<timestamp:2>",
           "delivery_assume_days": null,
           "delivery_assumed": false,
           "drop_aggregate_id": null,
@@ -741,11 +751,12 @@
           "next_actor": "seller",
           "paykit_activation_state": "active",
           "paykit_delivery_state": null,
+          "paykit_expires_at": "<timestamp:1>",
           "paykit_observation": {
             "amount_matched": true,
             "confirmations": 2,
             "disappeared": false,
-            "observed_at": "<timestamp:1>",
+            "observed_at": "<timestamp:2>",
             "observed_sats": 51637,
             "txid": "9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c"
           },
@@ -771,6 +782,7 @@
             "currency": "SAT",
             "exponent": 0
           },
+          "shipping_address_required": false,
           "state": "paid",
           "stock_held": false,
           "subtotal": {
@@ -783,14 +795,14 @@
             "currency": "SAT",
             "exponent": 0
           },
-          "updated_at": "<timestamp:1>"
+          "updated_at": "<timestamp:2>"
         },
         "resolution": {
           "basis": "seller_attestation",
           "order_id": "<uuid:4>",
           "outcome": "paid",
           "resolution_id": "<uuid:10>",
-          "resolved_at": "<timestamp:1>",
+          "resolved_at": "<timestamp:2>",
           "resolved_by_pubky": "<pubky:seller>"
         }
       },

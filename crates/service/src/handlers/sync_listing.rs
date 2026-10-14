@@ -99,11 +99,7 @@ pub async fn handle(
                 )))
             }
         };
-    // A Locks registration reads as shipping even for a digital-only record,
-    // so the record, not the registration, says whether it ships.
-    if registration.registers_unlimited_cap_with_physical_methods()
-        && crate::homeserver::record_publishes_physical_fulfillment(&record)
-    {
+    if registration.registers_unlimited_cap_with_physical_methods() {
         return Ok(Err(
             crate::handlers::register_listing::unlimited_cap_refusal(),
         ));

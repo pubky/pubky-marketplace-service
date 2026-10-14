@@ -985,6 +985,7 @@ and arms a bounded server-time hold window on the order
 | `payment.register_locks` | `LOCKS_PAYMENT_WINDOW_SECONDS` (default 3600) — the existing correlation window IS the hold window; one window concept, not two |
 | `POST /v0/orders/{id}/payment-method` (PayPal) | `FIAT_PAYMENT_WINDOW_SECONDS` (default 600, min 60) |
 | `POST /v0/orders/{id}/payment-method` (bitcoin) | `BITCOIN_PAYMENT_WINDOW_SECONDS` (default 1800, min 60) — equals Paykit `expires_at` |
+| An auction winner's order (`auction.close`, worker close) | The winning reservation's 30 minutes from the close. It is the order's `hold_expires_at` from creation, and a bind never moves it. A bind after the reservation ended is refused (409 `INVALID_STATE`, reason `auction_window_ended`) |
 | `payment.sandbox_advance` transitioning OUT of `awaiting_entitlement` (the first transition; gated by `SANDBOX_PAYMENTS_ENABLED` as always) | `SANDBOX_PAYMENT_WINDOW_SECONDS` (default 900, min 60) |
 
 A lock point on an order that ALREADY holds stock never double-decrements
@@ -1209,6 +1210,19 @@ approval) and sends the envelope instead of `delivery_address`:
   characters. The service checks only the shape, stores the bytes in
   `orders.delivery_address_envelope` and `orders.delivery_key_id`, and has no
   key and no code path that opens one. Refusals never echo an envelope.
+- An auction winner's order is created when the auction closes, before the
+  winner has said where to ship, so it carries no address. The winner sends
+  it with the payment method: `POST /v0/orders/{id}/payment-method` takes
+  `delivery_address_envelope: {key_id, envelope}` (or, where the deployment
+  still allows plaintext, `delivery_address`). The bind refuses an auction
+  order that has none (409 `INVALID_STATE`, reason `delivery_address_required`),
+  refuses a plaintext address when `REQUIRE_ENCRYPTED_DELIVERY_ADDRESS` is on
+  (422 `INVALID_COMMAND`, reason `encrypted_delivery_required`), and refuses an
+  address on any other order (reason `delivery_address_not_accepted`). The
+  order projection carries `auction_aggregate_id` and
+  `shipping_address_required`, true while the winner still owes the address.
+  The envelope's authenticated data names the order id, which the seller's
+  projection returns as `command_id`.
 - The seller's single-order projection returns
   `delivery_address: {format: "hpke_v1", key_id, command_id, envelope}`.
   `command_id` is the checkout command id the buyer's client bound into the
@@ -1485,6 +1499,22 @@ advance a payment (ADR-0019 §7).
   window IS the hold window. It flips the payment to the `locks` adapter,
   which permanently refuses `payment.sandbox_advance`, and does **not**
   advance the payment state.
+- **Digital delivery, no delivery address.** A Locks listing is a digital
+  listing: a record that publishes `digital` with a `digitalLock` registers
+  (`listing.register`, `listing.sync`) with the `digital` method, like any
+  other digital listing. A listing with a lock publishes **exactly**
+  `[digital]`: `listing.register` refuses a lock beside `shipping` or
+  `pickup` with an `INVALID_COMMAND` issue on `payload.fulfillment_methods`,
+  and `listing.sync` refuses such a record (or one that omits its methods,
+  which default to shipping) as `INVALID_STATE` ("does not satisfy
+  registration invariants") with the same issue; nothing is registered or
+  healed. What it sells is delivered by the Lock Server, so
+  its `checkout.create` line is `fulfillment: "digital"`: a digital order
+  with no shipping charge and no delivery address (a checkout that presents
+  one is refused `INVALID_COMMAND`). Unlike other digital listings it needs
+  neither `DIGITAL_DELIVERY_ENCRYPTION_KEY` nor a seller deliverable, and
+  its lock prices the item alone. A listing without a lock refuses
+  `digital` unless it publishes it. Auctions stay shipping-only.
 - **Lock resources.** A listing's `digitalLock.policyUri` is
   `[pubky://]<creator><prefix><LOCK_ID>.json`, where `<prefix>` is the
   fork's `/pub/locks.app/` or upstream Locks v0.1.0-rc10's

@@ -2056,6 +2056,7 @@ async fn refusal_audit_enqueue_happens_after_domain_rollback_release(pool: PgPoo
             "policyUri": resource,
             "criterionId": "paykit",
         });
+        common::as_digital_locks_listing(&mut listing);
         let (status, body) = common::execute(&app, &seller.token, &listing).await;
         assert_eq!(status, axum::http::StatusCode::OK, "{body}");
     }
@@ -2498,10 +2499,13 @@ async fn refusal_audit_real_fixture_is_invariant_across_writer_states(pool: PgPo
         common::register_listing_command(&locks_seller.pubky, "locks_01", 1, 120);
     locks_listing["payload"]["digital_lock"] =
         serde_json::json!({"policyUri":resource,"criterionId":"paykit"});
+    common::as_digital_locks_listing(&mut locks_listing);
     common::execute(&locks_app, &locks_seller.token, &locks_listing).await;
     let checkout_id = Uuid::from_u128(0xc040);
-    let mut locks_checkout =
-        common::checkout_command_with_id(&locks_seller.pubky, &checkout_id.to_string());
+    let mut locks_checkout = common::as_digital_checkout(common::checkout_command_with_id(
+        &locks_seller.pubky,
+        &checkout_id.to_string(),
+    ));
     locks_checkout["payload"]["lines"][0]["listing_aggregate_id"] =
         serde_json::json!(format!("listing:{}_locks_01", locks_seller.pubky));
     let (status, body) = common::execute(&locks_app, &locks_buyer.token, &locks_checkout).await;

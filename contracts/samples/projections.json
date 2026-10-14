@@ -20,7 +20,7 @@
             },
             "award": {
               "accepted_at": "<timestamp:1>",
-              "convert_by": "<timestamp:6>",
+              "convert_by": "<timestamp:7>",
               "converted_order_id": null,
               "fulfillment_methods": [
                 "shipping"
@@ -64,7 +64,7 @@
             },
             "buyer_pubky": "<pubky:buyer>",
             "created_at": "<timestamp:1>",
-            "expires_at": "<timestamp:5>",
+            "expires_at": "<timestamp:6>",
             "history": [
               {
                 "action": "created",
@@ -265,6 +265,7 @@
     },
     "response": {
       "body": {
+        "auction_aggregate_id": null,
         "auto_complete_days": null,
         "bitcoin_payable": {
           "amount_minor": 51637,
@@ -327,6 +328,7 @@
         "next_actor": "seller",
         "paykit_activation_state": "active",
         "paykit_delivery_state": null,
+        "paykit_expires_at": "<timestamp:4>",
         "paykit_request_reference": "<paykit-reference:1>",
         "paykit_request_state": "awaiting_seller_confirmation",
         "paykit_total_sats": 51637,
@@ -374,6 +376,7 @@
           "currency": "SAT",
           "exponent": 0
         },
+        "shipping_address_required": false,
         "state": "pending_payment",
         "stock_held": true,
         "subtotal": {
@@ -402,6 +405,7 @@
     },
     "response": {
       "body": {
+        "auction_aggregate_id": null,
         "auto_complete_days": null,
         "bitcoin_payable": {
           "amount_minor": 51637,
@@ -464,6 +468,7 @@
         "next_actor": "seller",
         "paykit_activation_state": "active",
         "paykit_delivery_state": null,
+        "paykit_expires_at": "<timestamp:4>",
         "paykit_request_reference": "<paykit-reference:2>",
         "paykit_request_state": "confirmed",
         "paykit_total_sats": 51637,
@@ -511,6 +516,7 @@
           "currency": "SAT",
           "exponent": 0
         },
+        "shipping_address_required": false,
         "state": "pending_payment",
         "stock_held": true,
         "subtotal": {
@@ -539,6 +545,7 @@
     },
     "response": {
       "body": {
+        "auction_aggregate_id": null,
         "auto_complete_days": null,
         "bitcoin_payable": {
           "amount_minor": 51637,
@@ -601,6 +608,7 @@
         "next_actor": "seller",
         "paykit_activation_state": "active",
         "paykit_delivery_state": null,
+        "paykit_expires_at": "<timestamp:4>",
         "paykit_request_reference": "<paykit-reference:3>",
         "paykit_request_state": "confirmed",
         "paykit_total_sats": 51637,
@@ -628,7 +636,7 @@
           "revision": 4,
           "seller_pubky": "<pubky:seller>",
           "state": "manual_review",
-          "updated_at": "<timestamp:4>"
+          "updated_at": "<timestamp:5>"
         },
         "payment_id": "<uuid:7>",
         "payment_method": "bitcoin",
@@ -648,6 +656,7 @@
           "currency": "SAT",
           "exponent": 0
         },
+        "shipping_address_required": false,
         "state": "cancelled",
         "stock_held": false,
         "subtotal": {
@@ -660,7 +669,7 @@
           "currency": "SAT",
           "exponent": 0
         },
-        "updated_at": "<timestamp:4>"
+        "updated_at": "<timestamp:5>"
       },
       "status": 200
     }
@@ -676,6 +685,7 @@
     },
     "response": {
       "body": {
+        "auction_aggregate_id": null,
         "auto_complete_days": null,
         "bitcoin_payable": null,
         "bitcoin_quote": {
@@ -734,6 +744,7 @@
         "next_actor": "seller",
         "paykit_activation_state": null,
         "paykit_delivery_state": null,
+        "paykit_expires_at": null,
         "paykit_request_reference": null,
         "paykit_request_state": null,
         "paykit_total_sats": null,
@@ -781,6 +792,7 @@
           "currency": "USD",
           "exponent": 2
         },
+        "shipping_address_required": false,
         "state": "paid",
         "stock_held": false,
         "subtotal": {
@@ -809,6 +821,7 @@
     },
     "response": {
       "body": {
+        "auction_aggregate_id": null,
         "auto_complete_days": null,
         "bitcoin_payable": {
           "amount_minor": 51637,
@@ -871,6 +884,7 @@
         "next_actor": "seller",
         "paykit_activation_state": "active",
         "paykit_delivery_state": null,
+        "paykit_expires_at": "<timestamp:4>",
         "paykit_observation": {
           "amount_matched": true,
           "confirmations": 2,
@@ -930,6 +944,7 @@
           "currency": "SAT",
           "exponent": 0
         },
+        "shipping_address_required": false,
         "state": "pending_payment",
         "stock_held": true,
         "subtotal": {
@@ -960,6 +975,7 @@
       "body": {
         "orders": [
           {
+            "auction_aggregate_id": null,
             "auto_complete_days": null,
             "bitcoin_payable": null,
             "bitcoin_quote": {
@@ -1018,6 +1034,7 @@
             "next_actor": "seller",
             "paykit_activation_state": null,
             "paykit_delivery_state": null,
+            "paykit_expires_at": null,
             "paykit_observation": null,
             "paykit_observed_sats": null,
             "paykit_request_reference": null,
@@ -1070,6 +1087,7 @@
               "currency": "USD",
               "exponent": 2
             },
+            "shipping_address_required": false,
             "state": "paid",
             "stock_held": false,
             "subtotal": {
@@ -1100,6 +1118,7 @@
     },
     "response": {
       "body": {
+        "auction_aggregate_id": null,
         "auto_complete_days": null,
         "bitcoin_payable": {
           "amount_minor": 51637,
@@ -1162,6 +1181,7 @@
         "next_actor": "seller",
         "paykit_activation_state": "active",
         "paykit_delivery_state": null,
+        "paykit_expires_at": "<timestamp:4>",
         "paykit_observation": {
           "amount_matched": true,
           "confirmations": 2,
@@ -1221,6 +1241,7 @@
           "currency": "SAT",
           "exponent": 0
         },
+        "shipping_address_required": false,
         "state": "pending_payment",
         "stock_held": true,
         "subtotal": {
@@ -1249,6 +1270,7 @@
     },
     "response": {
       "body": {
+        "auction_aggregate_id": null,
         "auto_complete_days": null,
         "bitcoin_payable": {
           "amount_minor": 51637,
@@ -1311,11 +1333,12 @@
         "next_actor": "seller",
         "paykit_activation_state": "active",
         "paykit_delivery_state": null,
+        "paykit_expires_at": "<timestamp:4>",
         "paykit_observation": {
           "amount_matched": true,
           "confirmations": 2,
           "disappeared": false,
-          "observed_at": "<timestamp:4>",
+          "observed_at": "<timestamp:5>",
           "observed_sats": 51637,
           "txid": "9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c"
         },
@@ -1336,7 +1359,7 @@
           "confirmations": 0,
           "created_at": "<timestamp:1>",
           "id": "<uuid:7>",
-          "manual_review_entered_at": "<timestamp:4>",
+          "manual_review_entered_at": "<timestamp:5>",
           "merchandise_amount": {
             "amount_minor": 51200,
             "currency": "SAT",
@@ -1350,7 +1373,7 @@
           "revision": 4,
           "seller_pubky": "<pubky:seller>",
           "state": "manual_review",
-          "updated_at": "<timestamp:4>"
+          "updated_at": "<timestamp:5>"
         },
         "payment_id": "<uuid:7>",
         "payment_method": "bitcoin",
@@ -1370,6 +1393,7 @@
           "currency": "SAT",
           "exponent": 0
         },
+        "shipping_address_required": false,
         "state": "cancelled",
         "stock_held": false,
         "subtotal": {
@@ -1382,7 +1406,7 @@
           "currency": "SAT",
           "exponent": 0
         },
-        "updated_at": "<timestamp:4>"
+        "updated_at": "<timestamp:5>"
       },
       "status": 200
     }
@@ -1398,6 +1422,7 @@
     },
     "response": {
       "body": {
+        "auction_aggregate_id": null,
         "auto_complete_days": null,
         "bitcoin_payable": null,
         "bitcoin_quote": {
@@ -1462,6 +1487,7 @@
         "next_actor": "seller",
         "paykit_activation_state": null,
         "paykit_delivery_state": null,
+        "paykit_expires_at": null,
         "paykit_observation": null,
         "paykit_observed_sats": null,
         "paykit_request_reference": null,
@@ -1514,6 +1540,7 @@
           "currency": "USD",
           "exponent": 2
         },
+        "shipping_address_required": false,
         "state": "paid",
         "stock_held": false,
         "subtotal": {
@@ -1542,6 +1569,7 @@
     },
     "response": {
       "body": {
+        "auction_aggregate_id": null,
         "auto_complete_days": null,
         "bitcoin_payable": null,
         "bitcoin_quote": {
@@ -1612,6 +1640,7 @@
         "next_actor": "seller",
         "paykit_activation_state": null,
         "paykit_delivery_state": null,
+        "paykit_expires_at": null,
         "paykit_observation": null,
         "paykit_observed_sats": null,
         "paykit_request_reference": null,
@@ -1664,6 +1693,7 @@
           "currency": "USD",
           "exponent": 2
         },
+        "shipping_address_required": false,
         "state": "paid",
         "stock_held": false,
         "subtotal": {

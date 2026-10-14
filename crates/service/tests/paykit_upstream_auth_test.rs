@@ -1405,6 +1405,18 @@ async fn worker_lag_past_upstream_activation_cutoff_never_publishes(pool: PgPool
     );
 }
 
+/// An auction winner's bind carries a sealed shipping address, which an
+/// auction order cannot choose a payment method without.
+fn auction_bind_body() -> serde_json::Value {
+    json!({
+        "method": "bitcoin",
+        "delivery_address_envelope": {
+            "key_id": TEST_DELIVERY_KEY_ID,
+            "envelope": test_envelope(1),
+        },
+    })
+}
+
 /// Closes an auction for a fresh winner and binds bitcoin on upstream
 /// Paykit. Returns the order id, invoice id, and auction aggregate id.
 async fn bind_upstream_auction_order(
@@ -1420,7 +1432,7 @@ async fn bind_upstream_auction_order(
         "POST",
         &format!("/v0/orders/{order_id}/payment-method"),
         Some(&winner.token),
-        &json!({"method":"bitcoin"}),
+        &auction_bind_body(),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "auction bind failed: {body}");
@@ -1467,6 +1479,83 @@ async fn upstream_auction_winner_activates_while_reservation_is_live(pool: PgPoo
     assert_eq!(activation.as_deref(), Some("active"));
     assert_eq!(method.as_deref(), Some("bitcoin"));
     assert_eq!(paykit.invoice(invoice_id).expect("invoice").state, "active");
+}
+
+/// The Shop shows an auction winner the activated request's deadline, which
+/// is the wallet's own, so the order read must carry it once activated and
+/// say nothing before (the hold is the reservation-based deadline then).
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn upstream_auction_order_reads_expose_the_activated_request_deadline(pool: PgPool) {
+    let (app, paykit) = test_app_with_upstream_paykit(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let winner = new_actor(&app).await;
+    let (order_id, _aggregate) = auction_winning_order(&app, &seller, &winner, 1).await;
+    enable_bitcoin_for_review(&app, &paykit, &seller).await;
+    let read = |token: String| {
+        let router = app.router.clone();
+        let path = format!("/v1/orders/{order_id}");
+        async move {
+            let (status, body) = send(router, "GET", &path, Some(&token), &Value::Null).await;
+            assert_eq!(status, StatusCode::OK, "order read failed: {body}");
+            body
+        }
+    };
+
+    let (status, bound) = send(
+        app.router.clone(),
+        "POST",
+        &format!("/v0/orders/{order_id}/payment-method"),
+        Some(&winner.token),
+        &auction_bind_body(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "auction bind failed: {bound}");
+    assert_eq!(
+        bound["order"]["paykit_activation_state"],
+        json!("preparing")
+    );
+    assert_eq!(bound["order"]["paykit_expires_at"], Value::Null);
+    let before = read(winner.token.clone()).await;
+    assert_eq!(before["paykit_expires_at"], Value::Null);
+    let reservation_hold = before["hold_expires_at"].clone();
+    assert!(
+        reservation_hold.is_string(),
+        "the bind shows a hold deadline"
+    );
+
+    let client = app
+        .state
+        .payments
+        .as_ref()
+        .and_then(|payments| payments.paykit.as_ref());
+    drain_outbox(&pool, client, app.clock.now(), 30)
+        .await
+        .unwrap();
+    let stored: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT paykit_expires_at FROM orders WHERE id = $1::uuid")
+            .bind(&order_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    for token in [winner.token.clone(), seller.token.clone()] {
+        let after = read(token).await;
+        assert_eq!(after["paykit_activation_state"], json!("active"));
+        let shown = after["paykit_expires_at"]
+            .as_str()
+            .expect("the activated request deadline is projected");
+        assert_eq!(
+            chrono::DateTime::parse_from_rfc3339(shown)
+                .expect("rfc3339 deadline")
+                .timestamp(),
+            stored.timestamp(),
+            "the projection is the wallet's request deadline"
+        );
+        assert!(
+            shown <= reservation_hold.as_str().expect("hold"),
+            "the wallet deadline never outlasts the reservation-based hold"
+        );
+    }
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
@@ -1552,7 +1641,7 @@ async fn upstream_auction_payment_window_is_capped_at_reservation_expiry(pool: P
         }
     };
     let bind_path = format!("/v0/orders/{order_id}/payment-method");
-    let bind_body = json!({"method":"bitcoin"});
+    let bind_body = auction_bind_body();
     let bind = || {
         send(
             app.router.clone(),
@@ -1677,7 +1766,7 @@ async fn upstream_auction_activation_past_slack_voids_and_rebinds_with_less_time
     .await
     .unwrap();
     let bind_path = format!("/v0/orders/{order_id}/payment-method");
-    let bind_body = json!({"method":"bitcoin"});
+    let bind_body = auction_bind_body();
     let windows = || {
         paykit
             .calls()

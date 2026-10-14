@@ -29,6 +29,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use chrono::{DateTime, Utc};
+use marketplace_domain::commands::{DeliveryAddress, DeliveryEnvelope};
 use marketplace_domain::{ids, ErrorCode};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -72,6 +73,50 @@ pub const AUCTION_MIN_PAYMENT_WINDOW_SECONDS: i64 = 300;
 /// failed activate and its outbox lease retry still fit before the guard
 /// refuses (`UPSTREAM_HOLD_CLOCK_SKEW_SECONDS` covers clocks, not retries).
 pub const AUCTION_ACTIVATION_SLACK_SECONDS: i64 = 180;
+
+/// Where an upstream auction bind may end inside the winner's reservation.
+/// This is the one place the arithmetic lives: the bind caps the payment
+/// window and the order's shown deadline with it, and the activation guard
+/// in `workers` checks the persisted window against the same bound.
+pub struct UpstreamAuctionWindow {
+    /// The longest payment window the winner can be given.
+    pub max_payment_window_seconds: i64,
+    /// The latest the order's hold, and the "Pay by" time shown for it, may be.
+    pub hold_deadline: DateTime<Utc>,
+}
+
+/// The window an upstream bitcoin bind may open at `now` for a winner whose
+/// reservation ends at `reservation_expires_at`: the payment window ends one
+/// skew margin before the shown hold (itself one margin before the
+/// reservation), leaving [`AUCTION_ACTIVATION_SLACK_SECONDS`] for the
+/// activation to land. `None` when less than
+/// [`AUCTION_MIN_PAYMENT_WINDOW_SECONDS`] is left.
+pub fn upstream_auction_window(
+    reservation_expires_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Option<UpstreamAuctionWindow> {
+    let remaining = (reservation_expires_at - now).num_seconds()
+        - 2 * UPSTREAM_HOLD_CLOCK_SKEW_SECONDS
+        - AUCTION_ACTIVATION_SLACK_SECONDS;
+    (remaining >= AUCTION_MIN_PAYMENT_WINDOW_SECONDS).then(|| UpstreamAuctionWindow {
+        max_payment_window_seconds: remaining,
+        hold_deadline: reservation_expires_at
+            - chrono::Duration::seconds(UPSTREAM_HOLD_CLOCK_SKEW_SECONDS),
+    })
+}
+
+/// Whether an upstream payment window of `payment_window_seconds`, started at
+/// `activation_at`, still ends inside the shown hold with Paykit's activation
+/// clock allowed one skew margin ahead.
+pub fn upstream_auction_window_fits(
+    reservation_expires_at: DateTime<Utc>,
+    activation_at: DateTime<Utc>,
+    payment_window_seconds: i64,
+) -> bool {
+    activation_at
+        + chrono::Duration::seconds(payment_window_seconds + 2 * UPSTREAM_HOLD_CLOCK_SKEW_SECONDS)
+        <= reservation_expires_at
+}
 
 #[derive(Clone)]
 struct PreparedBind {
@@ -724,10 +769,30 @@ async fn order_response(
     Ok((StatusCode::OK, Json(body)).into_response())
 }
 
-#[derive(Debug, Deserialize)]
+/// `delivery_address` or `delivery_address_envelope` is sent only by an
+/// auction winner, whose order is created at close without one; every other
+/// order took its address at checkout.
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BindPaymentMethodBody {
     method: String,
+    #[serde(default)]
+    delivery_address: Option<DeliveryAddress>,
+    #[serde(default)]
+    delivery_address_envelope: Option<DeliveryEnvelope>,
+}
+
+impl std::fmt::Debug for BindPaymentMethodBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BindPaymentMethodBody")
+            .field("method", &self.method)
+            .field("delivery_address", &self.delivery_address.is_some())
+            .field(
+                "delivery_address_envelope",
+                &self.delivery_address_envelope.is_some(),
+            )
+            .finish()
+    }
 }
 
 /// Where PayPal sends the buyer after commit or cancel: the order list of the
@@ -918,6 +983,14 @@ pub async fn bind_payment_method(
     if option == PaymentOption::PaykitUsdtArbitrumOne {
         return usdt_unavailable(&state, payments.paykit.as_ref().map(PaykitClient::api));
     }
+    let winner_delivery = match crate::handlers::delivery_envelope::match_winner_delivery(
+        body.delivery_address,
+        body.delivery_address_envelope.as_ref(),
+        state.config.require_encrypted_delivery_address,
+    ) {
+        Ok(delivery) => delivery,
+        Err(refusal) => return method_error(refusal.code, refusal.reason, refusal.message),
+    };
     // An order created before its listing was moderated is not payable: the
     // index is read before any attempt is spent or transaction opened, with
     // the same fail-open-with-ALERT semantics as the commands that sell.
@@ -1030,6 +1103,92 @@ pub async fn bind_payment_method(
             "locks_managed",
             "A Locks-correlated payment advances only by server-side verification.",
         );
+    }
+    // An auction winner's hold is the winning reservation, and its end is the
+    // order's deadline: the bind neither opens a new window nor reads the
+    // payment window as one. Upstream Paykit narrows it to the activation
+    // cutoff inside the reservation. A bind after the reservation ended is
+    // refused.
+    let auction_hold_expires_at = match &order.auction_aggregate_id {
+        Some(auction_aggregate_id) => {
+            let reservation_end: Option<DateTime<Utc>> = match sqlx::query_scalar(
+                "SELECT expires_at FROM reservations \
+                 WHERE listing_aggregate_id = $1 AND buyer_pubky = $2 AND status = 'active' \
+                 ORDER BY expires_at DESC LIMIT 1 FOR UPDATE",
+            )
+            .bind(auction_aggregate_id)
+            .bind(&order.buyer_pubky)
+            .fetch_optional(&mut *tx)
+            .await
+            {
+                Ok(end) => end,
+                Err(error) => return internal("auction reservation lookup", &error),
+            };
+            match reservation_end.filter(|end| *end > now) {
+                Some(end) => Some(end),
+                None => {
+                    return method_error(
+                        ErrorCode::InvalidState,
+                        "auction_window_ended",
+                        "Your window to pay for this auction has ended.",
+                    )
+                }
+            }
+        }
+        None => None,
+    };
+    let takes_delivery_address = order.auction_aggregate_id.is_some()
+        && order.fulfillment == "shipping"
+        && order.state == "pending_payment";
+    match (&winner_delivery, takes_delivery_address) {
+        (Some(_), false) => {
+            let refusal = crate::handlers::delivery_envelope::WinnerDeliveryRefusal::NOT_ACCEPTED;
+            return method_error(refusal.code, refusal.reason, refusal.message);
+        }
+        (None, true) if !order.has_delivery_address() => {
+            let refusal = crate::handlers::delivery_envelope::WinnerDeliveryRefusal::REQUIRED;
+            return method_error(refusal.code, refusal.reason, refusal.message);
+        }
+        _ => {}
+    }
+    if let Some(auction_hold_expires_at) = auction_hold_expires_at {
+        let stored = match &winner_delivery {
+            Some(delivery) => {
+                sqlx::query(
+                    "UPDATE orders SET hold_expires_at = $2, delivery_address = $3, \
+                     delivery_address_envelope = $4, delivery_key_id = $5, \
+                     checkout_command_id = $6 WHERE id = $1",
+                )
+                .bind(order.id)
+                .bind(auction_hold_expires_at)
+                .bind(&delivery.address)
+                .bind(
+                    delivery
+                        .envelope
+                        .as_ref()
+                        .map(|stored| stored.bytes.as_slice()),
+                )
+                .bind(
+                    delivery
+                        .envelope
+                        .as_ref()
+                        .map(|stored| stored.key_id.as_str()),
+                )
+                .bind(delivery.envelope.as_ref().map(|_| order.id))
+                .execute(&mut *tx)
+                .await
+            }
+            None => {
+                sqlx::query("UPDATE orders SET hold_expires_at = $2 WHERE id = $1")
+                    .bind(order.id)
+                    .bind(auction_hold_expires_at)
+                    .execute(&mut *tx)
+                    .await
+            }
+        };
+        if let Err(error) = stored {
+            return internal("auction winner delivery update", &error);
+        }
     }
     // Stay on this transaction. A second pool checkout while other binds
     // already hold connections can exhaust the pool (PoolTimedOut → INTERNAL
@@ -1305,21 +1464,15 @@ pub async fn bind_payment_method(
                     Ok(expires_at) => expires_at,
                     Err(error) => return internal("auction reservation", &error),
                 };
-                let remaining = reservation_expires_at.map(|deadline| {
-                    (deadline - now).num_seconds()
-                        - 2 * UPSTREAM_HOLD_CLOCK_SKEW_SECONDS
-                        - AUCTION_ACTIVATION_SLACK_SECONDS
-                });
-                match (reservation_expires_at, remaining) {
-                    (Some(deadline), Some(remaining))
-                        if remaining >= AUCTION_MIN_PAYMENT_WINDOW_SECONDS =>
-                    {
-                        payment_window_seconds = payment_window_seconds.min(remaining);
-                        auction_hold_cap = Some(
-                            deadline - chrono::Duration::seconds(UPSTREAM_HOLD_CLOCK_SKEW_SECONDS),
-                        );
+                match reservation_expires_at
+                    .and_then(|deadline| upstream_auction_window(deadline, now))
+                {
+                    Some(window) => {
+                        payment_window_seconds =
+                            payment_window_seconds.min(window.max_payment_window_seconds);
+                        auction_hold_cap = Some(window.hold_deadline);
                     }
-                    _ => {
+                    None => {
                         let _ = tx.rollback().await;
                         return method_error(
                             ErrorCode::InvalidState,
@@ -2621,5 +2774,53 @@ mod usdt_bind_tests {
             usdt_unavailable_cause(Some(PaykitApi::Upstream), btc_and_usdt),
             UsdtUnavailableCause::PrepareBitcoinOnly
         );
+    }
+}
+
+#[cfg(test)]
+mod upstream_auction_window_tests {
+    use super::*;
+
+    fn at(seconds: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(1_800_000_000 + seconds, 0).expect("timestamp")
+    }
+
+    #[test]
+    fn the_window_and_the_shown_deadline_end_inside_the_reservation() {
+        let reservation = at(1_200);
+        let window = upstream_auction_window(reservation, at(0)).expect("room to pay");
+        assert_eq!(
+            window.max_payment_window_seconds,
+            1_200 - 2 * UPSTREAM_HOLD_CLOCK_SKEW_SECONDS - AUCTION_ACTIVATION_SLACK_SECONDS
+        );
+        assert_eq!(
+            window.hold_deadline,
+            reservation - chrono::Duration::seconds(UPSTREAM_HOLD_CLOCK_SKEW_SECONDS)
+        );
+        assert!(upstream_auction_window_fits(
+            reservation,
+            at(0),
+            window.max_payment_window_seconds
+        ));
+        assert!(upstream_auction_window_fits(
+            reservation,
+            at(AUCTION_ACTIVATION_SLACK_SECONDS),
+            window.max_payment_window_seconds
+        ));
+        assert!(!upstream_auction_window_fits(
+            reservation,
+            at(AUCTION_ACTIVATION_SLACK_SECONDS + 1),
+            window.max_payment_window_seconds
+        ));
+    }
+
+    #[test]
+    fn a_reservation_with_less_than_the_minimum_window_left_offers_none() {
+        let shortest = AUCTION_MIN_PAYMENT_WINDOW_SECONDS
+            + 2 * UPSTREAM_HOLD_CLOCK_SKEW_SECONDS
+            + AUCTION_ACTIVATION_SLACK_SECONDS;
+        assert!(upstream_auction_window(at(shortest), at(0)).is_some());
+        assert!(upstream_auction_window(at(shortest - 1), at(0)).is_none());
+        assert!(upstream_auction_window(at(-10), at(0)).is_none());
     }
 }
