@@ -67,6 +67,12 @@ pub const UPSTREAM_HOLD_CLOCK_SKEW_SECONDS: i64 = 60;
 /// winner whose reservation leaves less is refused the bitcoin bind.
 pub const AUCTION_MIN_PAYMENT_WINDOW_SECONDS: i64 = 300;
 
+/// Time an auction winner's upstream activation has to land after the bind,
+/// taken off the capped payment window on top of the skew margins, so one
+/// failed activate and its outbox lease retry still fit before the guard
+/// refuses (`UPSTREAM_HOLD_CLOCK_SKEW_SECONDS` covers clocks, not retries).
+pub const AUCTION_ACTIVATION_SLACK_SECONDS: i64 = 180;
+
 #[derive(Clone)]
 struct PreparedBind {
     invoice_id: Uuid,
@@ -1279,7 +1285,8 @@ pub async fn bind_payment_method(
         // An auction order's hold is the winner's reservation, which never
         // extends (the auction deadline). Upstream fixes the window at
         // prepare and starts it at activation, so cap it to end one skew
-        // margin before the reservation, with one more margin for the
+        // margin before the shown hold (itself one margin before the
+        // reservation), leaving `AUCTION_ACTIVATION_SLACK_SECONDS` for the
         // activation to land; the activation guard enforces the same bound.
         let mut payment_window_seconds = state.config.bitcoin_payment_window_seconds;
         let mut auction_hold_cap: Option<DateTime<Utc>> = None;
@@ -1299,7 +1306,9 @@ pub async fn bind_payment_method(
                     Err(error) => return internal("auction reservation", &error),
                 };
                 let remaining = reservation_expires_at.map(|deadline| {
-                    (deadline - now).num_seconds() - 2 * UPSTREAM_HOLD_CLOCK_SKEW_SECONDS
+                    (deadline - now).num_seconds()
+                        - 2 * UPSTREAM_HOLD_CLOCK_SKEW_SECONDS
+                        - AUCTION_ACTIVATION_SLACK_SECONDS
                 });
                 match (reservation_expires_at, remaining) {
                     (Some(deadline), Some(remaining))
