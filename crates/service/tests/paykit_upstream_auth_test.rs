@@ -1614,6 +1614,159 @@ async fn upstream_auction_winner_activation_refused_after_reservation_lapses(poo
     assert_eq!(activation.as_deref(), Some("voided"));
 }
 
+/// The staging rerun of Bitkit 2.6 RC (shop #123): a winner bound and
+/// activated bitcoin, never paid, and the order sat in `pending_payment`
+/// long after the reservation hold ended, because the held-window sweep
+/// requires `stock_held` and an auction order never has it.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn upstream_auction_unpaid_order_cancels_once_the_reservation_lapses(pool: PgPool) {
+    let (app, paykit) = test_app_with_upstream_paykit(pool.clone()).await;
+    let (order_id, _invoice_id, aggregate) = bind_upstream_auction_order(&app, &paykit).await;
+    let client = app
+        .state
+        .payments
+        .as_ref()
+        .and_then(|payments| payments.paykit.as_ref());
+    drain_outbox(&pool, client, app.clock.now(), 30)
+        .await
+        .unwrap();
+
+    let reservation_expires_at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+        "SELECT expires_at FROM reservations WHERE listing_aggregate_id = $1 AND status = 'active'",
+    )
+    .bind(&aggregate)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let order_and_payment = || async {
+        sqlx::query_as::<_, (String, Option<String>, String)>(
+            "SELECT o.state, o.cancellation_reason, p.state \
+             FROM orders o JOIN payments p ON p.order_id = o.id WHERE o.id = $1",
+        )
+        .bind(order_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+    let listing_quantities = || async {
+        sqlx::query_as::<_, (i64, i64, i64)>(
+            "SELECT available_quantity, reserved_quantity, sold_quantity \
+             FROM listings WHERE aggregate_id = $1",
+        )
+        .bind(&aggregate)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+
+    let before = reservation_expires_at - chrono::Duration::seconds(1);
+    assert_eq!(
+        marketplace_service::expiry::expire_due_reservations(&pool, before)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        expire_due_payment_windows(&app.state, before)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        order_and_payment().await,
+        (
+            "pending_payment".to_string(),
+            None,
+            "awaiting_entitlement".to_string()
+        ),
+        "a live reservation keeps the order payable"
+    );
+    assert_eq!(listing_quantities().await, (0, 1, 0));
+
+    // The reservation lapses before the sweep reaches the order: no order
+    // cancels while its reservation is merely due, only once it is expired.
+    let after = reservation_expires_at + chrono::Duration::seconds(1);
+    assert_eq!(
+        expire_due_payment_windows(&app.state, after).await.unwrap(),
+        0,
+        "an active reservation is never treated as lapsed"
+    );
+    assert_eq!(
+        marketplace_service::expiry::expire_due_reservations(&pool, after)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(listing_quantities().await, (1, 0, 0));
+
+    assert_eq!(
+        expire_due_payment_windows(&app.state, after).await.unwrap(),
+        1
+    );
+    assert_eq!(
+        order_and_payment().await,
+        (
+            "cancelled".to_string(),
+            Some("payment window elapsed".to_string()),
+            "expired".to_string()
+        )
+    );
+    assert_eq!(
+        listing_quantities().await,
+        (1, 0, 0),
+        "the unit returns once: the order sweep does not release it again"
+    );
+    let cancelled_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events WHERE aggregate_id = $1 AND kind = 'order.cancelled'",
+    )
+    .bind(marketplace_domain::ids::order_aggregate_id(order_id))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(cancelled_events, 1);
+    assert_eq!(
+        expire_due_payment_windows(&app.state, after).await.unwrap(),
+        0,
+        "the sweep is idempotent"
+    );
+}
+
+/// A winner whose bind was voided (activation refused after the hold) or who
+/// never bound still has an open order after the reservation lapses: the
+/// same sweep closes it.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn upstream_auction_order_without_a_bind_cancels_once_the_reservation_lapses(pool: PgPool) {
+    let (app, _paykit) = test_app_with_upstream_paykit(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let winner = new_actor(&app).await;
+    let (order_id, aggregate) = auction_winning_order(&app, &seller, &winner, 1).await;
+    let order_id = uuid::Uuid::parse_str(&order_id).expect("order id");
+    let reservation_expires_at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+        "SELECT expires_at FROM reservations WHERE listing_aggregate_id = $1 AND status = 'active'",
+    )
+    .bind(&aggregate)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let after = reservation_expires_at + chrono::Duration::seconds(1);
+    marketplace_service::expiry::expire_due_reservations(&pool, after)
+        .await
+        .unwrap();
+    assert_eq!(
+        expire_due_payment_windows(&app.state, after).await.unwrap(),
+        1
+    );
+    let (state, reason): (String, Option<String>) =
+        sqlx::query_as("SELECT state, cancellation_reason FROM orders WHERE id = $1")
+            .bind(order_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "cancelled");
+    assert_eq!(reason.as_deref(), Some("payment window elapsed"));
+}
+
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn upstream_auction_payment_window_is_capped_at_reservation_expiry(pool: PgPool) {
     use marketplace_service::payment_methods::{
