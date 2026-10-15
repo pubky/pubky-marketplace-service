@@ -995,7 +995,9 @@ the seller enters. `POST /v1/connectors` with `{"provider":"woocommerce",
 itself), plain HTTP, an address that is not a public domain name, a site
 without pretty permalinks, a site without WooCommerce, a blocked REST API and
 a site whose WordPress address differs from the one entered. A store that
-cannot be reached answers `502 provider_unavailable`.
+cannot be reached answers `502 provider_unavailable`. A connect the provider
+refuses deletes the draft it just made, so refusals never count toward the
+seller's five connections; restarting a store that already has a draft reuses it.
 
 Two ways to finish the connection:
 
@@ -1010,7 +1012,10 @@ Two ways to finish the connection:
 * **Pasted keys**, for a site that blocks the callback:
   `PUT /v1/connectors/{id}/woocommerce/keys` with
   `{"consumer_key":"ck_...","consumer_secret":"cs_..."}` on the seller's own
-  draft. `200` is the same `connector_connected` answer as the callback.
+  draft. `PUT /v1/connectors/{id}/credentials` takes the same body for a
+  WooCommerce connection (the Shop's credentials form); a body with
+  `client_id` and `client_secret` still answers `credentials_not_supported`.
+  `200` is the same `connector_connected` answer as the callback.
   Errors: `422 invalid_keys` (wrong shape), `422 credentials_rejected` (the
   store refuses the pair), `422 keys_read_only`, `409 not_pending` (no draft
   waiting, or it expired), `409 shop_in_use`, `404 connection_not_found`,
@@ -1033,7 +1038,9 @@ variable products only, published or private. A simple product is one variant
 whose id is the product id. Prices are the store's current price in minor
 units of `woocommerce_currency`; stock is the exact count where WooCommerce
 manages it, `0` for an unmanaged product marked out of stock, and `null`
-otherwise. Descriptions are plain text, images are the product's own.
+otherwise. Descriptions are plain text, images are the product's own, `categories` are
+the store's category names, and `attributes` are the descriptive attributes
+that do not pick a variant (`options` are the ones that do).
 
 Orders: a paid Pubky order becomes `POST /orders` with `set_paid: true`,
 status `processing` (WooCommerce takes the stock), line items by product and
@@ -1047,7 +1054,19 @@ total more than the buyer paid. The merchant books VAT on Pubky sales from the
 Pubky order. The shipping address is
 set only when the buyer shared it. A cancel after the push sets the order to
 `cancelled` (WooCommerce restocks); a Pubky refund adds a refund to the order
-with `api_refund: false`, so the store's books match and no money moves.
+with `api_refund: false`, so the store's books match and no money moves. A
+refund whose unit is not the order currency is converted with the order's own
+recorded basis, which the framework reads from the order and passes as
+`RefundRecord.quote`: for `sat`, `round(sats * 10^exponent * rate / 10^8)` with
+the Bitcoin quote pinned at bind (`BTC<CCY>`, in the order currency); for
+`usdt`, `round(amount * order total / USDT paid)`. Rounding is half up to the
+currency's minor unit, the amount is capped by what is left to refund (a last
+partial that rounds one unit over is capped there, anything more is refused),
+and the refund's reason carries the basis, for example `Pubky refund r1:
+20000 sat = 11.60 CHF at BTCCHF 58000.00000000 (blocktank, 2026-10-15T12:00:00Z)`.
+Without a matching basis (no quote on the order, a quote in another
+currency) the refund is quarantined with `refund_not_in_store_currency` or
+`refund_basis_unavailable`.
 
 Webhooks are verified with the base64 HMAC-SHA256 of the raw body in
 `X-WC-Webhook-Signature`; WooCommerce's unsigned ping (`webhook_id=N`) is

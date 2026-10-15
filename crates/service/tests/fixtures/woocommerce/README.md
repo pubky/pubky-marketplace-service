@@ -12,7 +12,7 @@ replays it; nothing here needs Docker.
 | MariaDB | 11.8.9 |
 | TLS proxy | nginx 1.31.7, certificate from a local CA |
 | Shipment tracking | Advanced Shipment Tracking for WooCommerce 4.0.4 (writes `_wc_shipment_tracking_items`) |
-| Store | currency CHF, Swiss VAT 8.1% switched on with prices entered including tax (pushed orders must still total what the buyer paid), WooCommerce's own sample products (created row by row from `sample-data/sample_products.csv`) plus a variable product *Little Hodler Socks* (S, M, L, in CHF, per-variation stock 5, 3, 0, two images) and a simple *Pubky Test Item* (CHF 12.50, 10 in stock) |
+| Store | currency CHF, Swiss VAT 8.1% switched on with prices entered including tax (pushed orders must still total what the buyer paid), WooCommerce's own sample products (created row by row from `sample-data/sample_products.csv`) plus a variable product *Little Hodler Socks* (S, M, L, in CHF, per-variation stock 5, 3, 0, two images, category Socks, a Material attribute that does not pick a variant) and a simple *Pubky Test Item* (CHF 12.50, 10 in stock, category Accessories, Material Cotton) |
 
 ## What is captured
 
@@ -37,12 +37,14 @@ Scenarios (`p_` = provider only, `flow_` = through the service and PostgreSQL):
 | `p_refused` | plain permalinks (`/wp-json/` redirects to itself, `/?rest_route=/` works), WooCommerce deactivated (no `wc/v3` namespace) |
 | `p_home_mismatch` | the store answers at an address other than its WordPress address |
 | `p_catalog` | the full catalog in pages of seven, variations, stock, images |
-| `p_orders` | order create (with the opted-in address), find by id, cancel (and again), partial and full refunds recorded with `api_refund: false`, and each repeated |
+| `p_orders` | order create (with the opted-in address), find by id, cancel (and again), refunds recorded with `api_refund: false` and each repeated: a CHF partial, a sat partial and a USDT partial converted with the order's own basis, then the rest |
 | `flow_a` | connect, catalog, selection, mapping, paid order pushed, stock poll, stock webhook, completed-with-tracking webhook, ping, bad signature, disconnect |
 | `flow_b` | a cancel and a trash in the store raise one alert and refund nobody |
 | `flow_c` | a Pubky cancel cancels the store order; its webhook echo raises no alert |
 | `flow_d` | a Pubky refund is recorded in the store; its webhook echo raises no alert |
 | `flow_e` | pasted keys: wrong shape, wrong keys, another seller's connection, right keys, repeat |
+| `flow_f` | WooCommerce inactive: six refused connects leave no draft behind (the limit is five), a restart reuses its draft |
+| `flow_g` | the Shop's `PUT /credentials` form with `consumer_key` and `consumer_secret` |
 
 ## How a replay works
 

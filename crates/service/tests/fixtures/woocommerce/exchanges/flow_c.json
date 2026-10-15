@@ -112,8 +112,8 @@
      "woocommerce_update_product_variation"
     ],
     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
-    "date_created": "2026-10-15T15:07:38",
-    "date_created_gmt": "2026-10-15T15:07:38",
+    "date_created": "2026-10-15T15:13:33",
+    "date_created_gmt": "2026-10-15T15:13:33",
     "date_modified": null,
     "date_modified_gmt": null,
     "_links": {
@@ -169,8 +169,8 @@
      "woocommerce_order_refunded"
     ],
     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
-    "date_created": "2026-10-15T15:07:38",
-    "date_created_gmt": "2026-10-15T15:07:38",
+    "date_created": "2026-10-15T15:13:33",
+    "date_created_gmt": "2026-10-15T15:13:33",
     "date_modified": null,
     "date_modified_gmt": null,
     "_links": {
@@ -226,8 +226,8 @@
      "woocommerce_trash_order"
     ],
     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
-    "date_created": "2026-10-15T15:07:38",
-    "date_created_gmt": "2026-10-15T15:07:38",
+    "date_created": "2026-10-15T15:13:33",
+    "date_created_gmt": "2026-10-15T15:13:33",
     "date_modified": null,
     "date_modified_gmt": null,
     "_links": {
@@ -264,7 +264,7 @@
     "currency": "USD",
     "payment_method": "pubky",
     "payment_method_title": "Pubky",
-    "customer_note": "Pubky order 2c2db7f7-7db1-4f4f-bc45-1e3d46c9a607, paid with Pubky. Details and the buyer's messages: https://shop.test/marketplace/orders",
+    "customer_note": "Pubky order b0f5dea8-185a-4c34-9ec8-901799b6db9e, paid with Pubky. Details and the buyer's messages: https://shop.test/marketplace/orders",
     "line_items": [
      {
       "product_id": 39,
@@ -276,7 +276,7 @@
     ],
     "fee_lines": [
      {
-      "name": "Pubky order 2c2db7f7-7db1-4f4f-bc45-1e3d46c9a607",
+      "name": "Pubky order b0f5dea8-185a-4c34-9ec8-901799b6db9e",
       "total": "0.00",
       "tax_status": "none"
      }
@@ -284,7 +284,7 @@
     "meta_data": [
      {
       "key": "pubky_order_id",
-      "value": "2c2db7f7-7db1-4f4f-bc45-1e3d46c9a607"
+      "value": "b0f5dea8-185a-4c34-9ec8-901799b6db9e"
      },
      {
       "key": "pubky_payment_rail",
@@ -316,8 +316,8 @@
     "currency": "USD",
     "version": "11.2.1",
     "prices_include_tax": true,
-    "date_created": "2026-10-15T15:07:38",
-    "date_modified": "2026-10-15T15:07:38",
+    "date_created": "2026-10-15T15:13:34",
+    "date_modified": "2026-10-15T15:13:34",
     "discount_total": "0.00",
     "discount_tax": "0.00",
     "shipping_total": "12.00",
@@ -326,7 +326,7 @@
     "total": "137.00",
     "total_tax": "0.00",
     "customer_id": 0,
-    "order_key": "wc_order_SrGfMjuVWywXV",
+    "order_key": "wc_order_qpJhT6MlSrDS1",
     "billing": {
      "first_name": "",
      "last_name": "",
@@ -358,24 +358,24 @@
     "customer_ip_address": "",
     "customer_user_agent": "",
     "created_via": "rest-api",
-    "customer_note": "Pubky order 2c2db7f7-7db1-4f4f-bc45-1e3d46c9a607, paid with Pubky. Details and the buyer's messages: https://shop.test/marketplace/orders",
+    "customer_note": "Pubky order b0f5dea8-185a-4c34-9ec8-901799b6db9e, paid with Pubky. Details and the buyer's messages: https://shop.test/marketplace/orders",
     "date_completed": null,
-    "date_paid": "2026-10-15T15:07:38",
+    "date_paid": "2026-10-15T15:13:34",
     "cart_hash": "",
     "number": "45",
     "meta_data": [
      {
-      "id": 707,
+      "id": 708,
       "key": "pubky_order_id",
-      "value": "2c2db7f7-7db1-4f4f-bc45-1e3d46c9a607"
+      "value": "b0f5dea8-185a-4c34-9ec8-901799b6db9e"
      },
      {
-      "id": 708,
+      "id": 709,
       "key": "pubky_payment_rail",
       "value": "unknown"
      },
      {
-      "id": 709,
+      "id": 710,
       "key": "pubky_paid_at",
       "value": "2026-08-19T22:00:00Z"
      }
@@ -429,7 +429,7 @@
     "fee_lines": [
      {
       "id": 9,
-      "name": "Pubky order 2c2db7f7-7db1-4f4f-bc45-1e3d46c9a607",
+      "name": "Pubky order b0f5dea8-185a-4c34-9ec8-901799b6db9e",
       "tax_class": "",
       "tax_status": "none",
       "amount": "",
@@ -441,14 +441,14 @@
     ],
     "coupon_lines": [],
     "refunds": [],
-    "payment_url": "https://localhost:8443/checkout/order-pay/45/?pay_for_order=true&key=wc_order_SrGfMjuVWywXV",
+    "payment_url": "https://localhost:8443/checkout/order-pay/45/?pay_for_order=true&key=wc_order_qpJhT6MlSrDS1",
     "is_editable": false,
     "needs_payment": false,
     "needs_processing": true,
-    "date_created_gmt": "2026-10-15T15:07:38",
-    "date_modified_gmt": "2026-10-15T15:07:38",
+    "date_created_gmt": "2026-10-15T15:13:34",
+    "date_modified_gmt": "2026-10-15T15:13:34",
     "date_completed_gmt": null,
-    "date_paid_gmt": "2026-10-15T15:07:38",
+    "date_paid_gmt": "2026-10-15T15:13:34",
     "currency_symbol": "$",
     "_links": {
      "self": [
@@ -553,8 +553,8 @@
     "currency": "USD",
     "version": "11.2.1",
     "prices_include_tax": true,
-    "date_created": "2026-10-15T15:07:38",
-    "date_modified": "2026-10-15T15:07:39",
+    "date_created": "2026-10-15T15:13:34",
+    "date_modified": "2026-10-15T15:13:34",
     "discount_total": "0.00",
     "discount_tax": "0.00",
     "shipping_total": "12.00",
@@ -563,7 +563,7 @@
     "total": "137.00",
     "total_tax": "0.00",
     "customer_id": 0,
-    "order_key": "wc_order_SrGfMjuVWywXV",
+    "order_key": "wc_order_qpJhT6MlSrDS1",
     "billing": {
      "first_name": "",
      "last_name": "",
@@ -595,29 +595,29 @@
     "customer_ip_address": "",
     "customer_user_agent": "",
     "created_via": "rest-api",
-    "customer_note": "Pubky order 2c2db7f7-7db1-4f4f-bc45-1e3d46c9a607, paid with Pubky. Details and the buyer's messages: https://shop.test/marketplace/orders",
+    "customer_note": "Pubky order b0f5dea8-185a-4c34-9ec8-901799b6db9e, paid with Pubky. Details and the buyer's messages: https://shop.test/marketplace/orders",
     "date_completed": null,
-    "date_paid": "2026-10-15T15:07:38",
+    "date_paid": "2026-10-15T15:13:34",
     "cart_hash": "",
     "number": "45",
     "meta_data": [
      {
-      "id": 707,
+      "id": 708,
       "key": "pubky_order_id",
-      "value": "2c2db7f7-7db1-4f4f-bc45-1e3d46c9a607"
+      "value": "b0f5dea8-185a-4c34-9ec8-901799b6db9e"
      },
      {
-      "id": 708,
+      "id": 709,
       "key": "pubky_payment_rail",
       "value": "unknown"
      },
      {
-      "id": 709,
+      "id": 710,
       "key": "pubky_paid_at",
       "value": "2026-08-19T22:00:00Z"
      },
      {
-      "id": 712,
+      "id": 713,
       "key": "pubky_cancelled",
       "value": "The order was cancelled in Pubky."
      }
@@ -663,7 +663,7 @@
     "fee_lines": [
      {
       "id": 9,
-      "name": "Pubky order 2c2db7f7-7db1-4f4f-bc45-1e3d46c9a607",
+      "name": "Pubky order b0f5dea8-185a-4c34-9ec8-901799b6db9e",
       "tax_class": "",
       "tax_status": "none",
       "amount": "",
@@ -675,14 +675,14 @@
     ],
     "coupon_lines": [],
     "refunds": [],
-    "payment_url": "https://localhost:8443/checkout/order-pay/45/?pay_for_order=true&key=wc_order_SrGfMjuVWywXV",
+    "payment_url": "https://localhost:8443/checkout/order-pay/45/?pay_for_order=true&key=wc_order_qpJhT6MlSrDS1",
     "is_editable": false,
     "needs_payment": false,
     "needs_processing": true,
-    "date_created_gmt": "2026-10-15T15:07:38",
-    "date_modified_gmt": "2026-10-15T15:07:39",
+    "date_created_gmt": "2026-10-15T15:13:34",
+    "date_modified_gmt": "2026-10-15T15:13:34",
     "date_completed_gmt": null,
-    "date_paid_gmt": "2026-10-15T15:07:38",
+    "date_paid_gmt": "2026-10-15T15:13:34",
     "currency_symbol": "$",
     "_links": {
      "self": [

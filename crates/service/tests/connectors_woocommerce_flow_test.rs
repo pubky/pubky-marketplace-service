@@ -600,7 +600,7 @@ async fn a_refused_connect_leaves_no_draft_behind_and_never_hits_the_limit(pool:
         "POST",
         "/v1/connectors",
         Some(&seller.token),
-        &json!({ "provider": "woocommerce", "domain": "http://dezentralshop.ch" }),
+        &json!({ "provider": "woocommerce", "domain": "https://user:pass@dezentralshop.ch" }),
     )
     .await;
     assert_eq!(
@@ -611,7 +611,7 @@ async fn a_refused_connect_leaves_no_draft_behind_and_never_hits_the_limit(pool:
         body["error"]["message"]
             .as_str()
             .expect("message")
-            .contains("HTTPS"),
+            .contains("username or password"),
         "{body}"
     );
     assert_eq!(drafts(&app).await, 0);

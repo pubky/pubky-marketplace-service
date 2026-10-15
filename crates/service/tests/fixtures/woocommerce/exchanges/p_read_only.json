@@ -86,13 +86,13 @@
      "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce"
     },
     {
-     "id": 19,
-     "name": "Pubky Shop product.updated",
+     "id": 20,
+     "name": "Pubky Shop order.updated",
      "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce"
     },
     {
-     "id": 20,
-     "name": "Pubky Shop order.updated",
+     "id": 19,
+     "name": "Pubky Shop product.updated",
      "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce"
     }
    ]
