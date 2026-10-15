@@ -81,25 +81,25 @@
    "response_kind": "json",
    "response_body": [
     {
-     "id": 1,
-     "name": "Pubky Shop product.updated",
-     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce"
-    },
-    {
-     "id": 2,
+     "id": 17,
      "name": "Pubky Shop order.updated",
      "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce"
     },
     {
-     "id": 3,
+     "id": 18,
      "name": "Pubky Shop order.deleted",
+     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce"
+    },
+    {
+     "id": 16,
+     "name": "Pubky Shop product.updated",
      "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce"
     }
    ]
   },
   {
    "method": "DELETE",
-   "path": "/wp-json/wc/v3/webhooks/1",
+   "path": "/wp-json/wc/v3/webhooks/17",
    "query": [
     [
      "force",

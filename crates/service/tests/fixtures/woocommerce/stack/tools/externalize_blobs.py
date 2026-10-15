@@ -4,7 +4,8 @@
 WordPress's REST index (`GET /wp-json/`) is over a megabyte and is part of
 every scenario. Each body above the limit is written once, minified, to
 exchanges/_blobs/<id>.json and the exchange keeps {"$blob": "<id>"}. The
-replay resolves the reference. Idempotent.
+replay resolves the reference. Idempotent; blobs no exchange references are
+removed.
 
   python3 externalize_blobs.py EXCHANGES_DIR
 """
@@ -37,3 +38,14 @@ for name in sorted(os.listdir(directory)):
         with open(path, "w") as handle:
             json.dump(data, handle, indent=1, ensure_ascii=False)
             handle.write("\n")
+
+referenced = set()
+for name in os.listdir(directory):
+    if name.endswith(".json"):
+        for exchange in json.load(open(os.path.join(directory, name)))["exchanges"]:
+            body = exchange.get("response_body")
+            if isinstance(body, dict) and "$blob" in body:
+                referenced.add(body["$blob"])
+for name in os.listdir(blobs):
+    if name.endswith(".json") and name[:-5] not in referenced:
+        os.remove(os.path.join(blobs, name))
