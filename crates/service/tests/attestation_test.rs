@@ -1125,6 +1125,7 @@ async fn drop_paid_order(
     buyer: &TestActor,
     total: i64,
 ) -> PaidOrder {
+    homeserver.publish_registration(&register_command(&seller.pubky, total));
     let (status, body) = execute(app, &seller.token, &register_command(&seller.pubky, total)).await;
     assert_eq!(status, StatusCode::OK, "register fixture failed: {body}");
     homeserver.put_drop_record(

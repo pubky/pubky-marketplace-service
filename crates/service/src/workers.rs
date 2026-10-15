@@ -56,6 +56,7 @@ use crate::bitcoin_review::{apply_late_money, LateMoneyOutcome};
 use crate::handlers::auction::{close_locked_auction, parse_auction};
 use crate::handlers::payment::confirm_order;
 use crate::handlers::{fetch_order_for_update, insert_notification_intent, LISTING_COLUMNS};
+use crate::homeserver::HomeserverListingClient;
 use crate::locks::{LocksLookupOutcome, LocksRuntime, LocksTaskStatus};
 use crate::model::{ListingRow, PaymentRow};
 use crate::payment_attempt::{AcceptedAsset, OfferedAssets, PaymentAsset, PaymentTerms};
@@ -437,8 +438,14 @@ const AUCTION_INSTANT: &str = r"^[0-9]{4}-(0[1-9]|1[0-2])-([012][0-9]|3[01])T([0
 /// Each auction gets its own transaction so one corrupt row cannot roll back
 /// a peer. Dynamic errors are deliberately omitted from telemetry because
 /// they can include secret values or payload fragments.
+///
+/// With a homeserver, each due auction's seller record is read first and a
+/// removed listing closes unsold. A homeserver that cannot answer does not
+/// hold the close back: closing takes no payment, and the winner's payment
+/// start refuses a removed listing on its own, failing closed.
 pub async fn close_due_auctions(
     pool: &PgPool,
+    homeserver: Option<&dyn HomeserverListingClient>,
     now: DateTime<Utc>,
 ) -> anyhow::Result<AuctionCloseBatchSummary> {
     let due: Vec<String> = sqlx::query_scalar(
@@ -478,7 +485,7 @@ pub async fn close_due_auctions(
 
     let mut summary = AuctionCloseBatchSummary::default();
     for aggregate_id in due {
-        match close_one_due_auction(pool, &aggregate_id, now).await {
+        match close_one_due_auction(pool, homeserver, &aggregate_id, now).await {
             Ok(Some(sold)) => {
                 tracing::info!(
                     aggregate_id = %aggregate_id,
@@ -503,9 +510,43 @@ pub async fn close_due_auctions(
 
 async fn close_one_due_auction(
     pool: &PgPool,
+    homeserver: Option<&dyn HomeserverListingClient>,
     aggregate_id: &str,
     now: DateTime<Utc>,
 ) -> Result<Option<bool>, sqlx::Error> {
+    let withdrawn = match homeserver {
+        Some(homeserver) => {
+            let record: Option<(String, String)> = sqlx::query_as(
+                "SELECT seller_pubky, listing_id FROM listings \
+                 WHERE aggregate_id = $1 AND deleted_at IS NULL",
+            )
+            .bind(aggregate_id)
+            .fetch_optional(pool)
+            .await?;
+            match record {
+                Some((seller_pubky, listing_id)) => {
+                    match crate::listing_lifecycle::is_removed(
+                        homeserver,
+                        &seller_pubky,
+                        &listing_id,
+                    )
+                    .await
+                    {
+                        Some(removed) => removed,
+                        None => {
+                            tracing::warn!(
+                                aggregate_id = %aggregate_id,
+                                "auction close could not read the seller record; closing on stored state"
+                            );
+                            false
+                        }
+                    }
+                }
+                None => false,
+            }
+        }
+        None => false,
+    };
     let mut tx = pool.begin().await?;
     let listing: Option<ListingRow> = sqlx::query_as(&format!(
         "SELECT {LISTING_COLUMNS} FROM listings \
@@ -527,8 +568,16 @@ async fn close_one_due_auction(
         return Ok(None);
     }
     let seller = listing.seller_pubky.clone();
-    let outcome =
-        close_locked_auction(&mut tx, &listing, auction, &seller, Uuid::new_v4(), now).await?;
+    let outcome = close_locked_auction(
+        &mut tx,
+        &listing,
+        auction,
+        &seller,
+        Uuid::new_v4(),
+        withdrawn,
+        now,
+    )
+    .await?;
     tx.commit().await?;
     Ok(Some(outcome.sold))
 }
@@ -5043,7 +5092,7 @@ pub async fn run_once(
         summary.offers_expired = result?;
     }
     if try_acquire_lease(&state.pool, TASK_AUCTION_CLOSE, holder, now, lease_seconds).await? {
-        let result = close_due_auctions(&state.pool, now).await;
+        let result = close_due_auctions(&state.pool, state.homeserver.as_deref(), now).await;
         release_lease(&state.pool, TASK_AUCTION_CLOSE, holder, now).await?;
         let result = result?;
         summary.auctions_closed = result.closed;

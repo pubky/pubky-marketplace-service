@@ -1165,19 +1165,22 @@ pub async fn bind_payment_method(
         Ok(delivery) => delivery,
         Err(refusal) => return method_error(refusal.code, refusal.reason, refusal.message),
     };
+    let bind_listings = if state.listing_moderation.is_some() || state.homeserver.is_some() {
+        match crate::listing_moderation::listings_a_bind_sells(&state.pool, order_id, &actor.0)
+            .await
+        {
+            Ok(listings) => listings,
+            Err(error) => return internal("bind listing lookup", &error),
+        }
+    } else {
+        Vec::new()
+    };
     // An order created before its listing was moderated is not payable: the
     // index is read before any attempt is spent or transaction opened, with
     // the same fail-open-with-ALERT semantics as the commands that sell.
     if let Some(gate) = state.listing_moderation.as_deref() {
-        let listings =
-            match crate::listing_moderation::listings_a_bind_sells(&state.pool, order_id, &actor.0)
-                .await
-            {
-                Ok(listings) => listings,
-                Err(error) => return internal("bind moderation lookup", &error),
-            };
-        for (seller_pubky, listing_id) in &listings {
-            if gate.check(seller_pubky, listing_id).await
+        for listing in &bind_listings {
+            if gate.check(&listing.seller_pubky, &listing.listing_id).await
                 == crate::listing_moderation::ModerationVerdict::Moderated
             {
                 return method_error(
@@ -1186,6 +1189,29 @@ pub async fn bind_payment_method(
                     crate::listing_moderation::LISTING_MODERATED_MESSAGE,
                 );
             }
+        }
+    }
+    // A seller who removed the listing cannot fulfil the order, so no
+    // payment starts on it; a pause or an end leaves the buyer's checkout
+    // payable. Read before any attempt is spent, failing closed.
+    if let Some(homeserver) = state.homeserver.clone() {
+        let live: Vec<(String, String)> = bind_listings
+            .iter()
+            .filter(|listing| listing.live)
+            .map(|listing| (listing.seller_pubky.clone(), listing.listing_id.clone()))
+            .collect();
+        if let Some(failure) = crate::listing_lifecycle::check(
+            homeserver,
+            &live,
+            crate::listing_lifecycle::Gate::NotRemoved,
+        )
+        .await
+        {
+            return method_error(
+                failure.code(),
+                failure.reason().unwrap_or("upstream_unavailable"),
+                failure.message(),
+            );
         }
     }
     let now = state.clock.now();

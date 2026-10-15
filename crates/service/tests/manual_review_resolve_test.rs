@@ -1627,6 +1627,7 @@ async fn drop_late_paid_reacquires_or_refuses(pool: PgPool) {
         let seller = new_actor(&app).await;
         let buyer = new_actor(&app).await;
         // SAT listing under a live drop (2 units, limit 2).
+        homeserver.publish_registration(&register_sat_command(&seller.pubky, 16));
         let (status, body) = execute(
             &app,
             &seller.token,

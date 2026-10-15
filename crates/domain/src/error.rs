@@ -30,6 +30,10 @@ pub enum ErrorCode {
     /// or offered on. A 409, not a 403: clients read a 403 on a command as a
     /// session problem and ask the user to sign in again.
     ListingModerated,
+    /// The seller's current listing record is not `active` (paused, ended,
+    /// removed): it cannot be bought, bid on or offered on. `error.reason`
+    /// names the state.
+    ListingNotActive,
 }
 
 impl ErrorCode {
@@ -55,7 +59,8 @@ impl ErrorCode {
             | ErrorCode::AwardVariantMismatch
             | ErrorCode::AwardListingChanged
             | ErrorCode::AwardHoldMissing
-            | ErrorCode::ListingModerated => 409,
+            | ErrorCode::ListingModerated
+            | ErrorCode::ListingNotActive => 409,
             ErrorCode::UpstreamUnavailable => 503,
         }
     }
