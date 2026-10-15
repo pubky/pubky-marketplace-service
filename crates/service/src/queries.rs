@@ -75,7 +75,9 @@ pub const ORDER_COLUMNS: &str =
      paykit_seller_confirmation_deadline, \
      fulfillment, first_revealed_at, created_at, updated_at, offer_award_id, priced_from, \
      payment_asset, payment_network, payment_amount_minor, payment_exponent, \
-     payment_quote_basis";
+     payment_quote_basis, paykit_amount_minor, paykit_accepted_assets, \
+     paykit_payment_amounts, payment_finality, payment_finality_at, \
+     paykit_second_rail_at";
 
 pub const PAYMENT_COLUMNS: &str = "id, order_id, buyer_pubky, seller_pubky, revision, adapter, \
      state, confirmations, amount_minor, currency, exponent, \

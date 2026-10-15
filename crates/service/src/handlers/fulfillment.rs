@@ -17,6 +17,26 @@ use crate::model::OrderRow;
 use crate::queries::ORDER_COLUMNS;
 use crate::result::{CommandFailure, HandlerResult};
 
+/// Why a command that starts physical fulfilment refuses while the order's
+/// USDT payment is not final.
+pub const REASON_PAYMENT_NOT_FINAL: &str = "payment_not_final";
+
+/// A USDT payment is paid at verified inclusion, but physical fulfilment
+/// waits for the transfer to be final: shipping, marking ready and handing
+/// over are refused while its finality is `pending` or `reverted`. Orders
+/// paid any other way carry no finality and are never refused here.
+fn guard_payment_final(order: &OrderRow) -> Option<CommandFailure> {
+    match order.payment_finality.as_deref() {
+        Some("pending" | "reverted") => Some(CommandFailure::refused_with_reason(
+            crate::refusal_audit::RefusalKind::InvalidState,
+            ErrorCode::InvalidState,
+            "The USDT payment is not final yet, so this order cannot be fulfilled.",
+            REASON_PAYMENT_NOT_FINAL,
+        )),
+        _ => None,
+    }
+}
+
 pub async fn ship(
     tx: &mut Transaction<'_, Postgres>,
     actor: &str,
@@ -63,6 +83,9 @@ pub async fn ship(
             ErrorCode::InvalidState,
             "The order is not ready to ship.",
         )));
+    }
+    if let Some(failure) = guard_payment_final(&order) {
+        return Ok(Err(failure));
     }
     debug_assert!(can_transition(&order_machine(), &order.state, "shipped"));
 
@@ -224,6 +247,9 @@ pub async fn mark_ready(
             "The order is not awaiting pickup readiness.",
         )));
     }
+    if let Some(failure) = guard_payment_final(&order) {
+        return Ok(Err(failure));
+    }
     debug_assert!(can_transition(
         &order_machine(),
         &order.state,
@@ -295,6 +321,9 @@ pub async fn confirm_pickup(
             ErrorCode::InvalidState,
             "The order is not awaiting a pickup handover.",
         )));
+    }
+    if let Some(failure) = guard_payment_final(&order) {
+        return Ok(Err(failure));
     }
     let confirming_role = if actor == order.buyer_pubky {
         "buyer"

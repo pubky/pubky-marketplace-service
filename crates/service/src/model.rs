@@ -740,8 +740,23 @@ pub struct OrderRow {
     /// The amount sent, in units of `10^-payment_exponent`.
     pub payment_amount_minor: Option<i64>,
     pub payment_exponent: Option<i16>,
-    /// How the amount was derived from the price (`parity`).
+    /// How the amount was derived from the price (`parity`, `native`,
+    /// `fixed_rate`).
     pub payment_quote_basis: Option<String>,
+    /// The multi-asset request's amount in `paykit_asset`'s base units, the
+    /// assets paykit-server offered (`BTC`, `USDT`), and what each costs in
+    /// its own base units. All three are set together or all NULL (every
+    /// legacy `amount_sats` request).
+    pub paykit_amount_minor: Option<i64>,
+    pub paykit_accepted_assets: Option<Vec<String>>,
+    pub paykit_payment_amounts: Option<Value>,
+    /// A USDT payment's finality (`pending` | `final` | `reverted`) and when
+    /// it last changed; NULL for every order not paid in USDT.
+    pub payment_finality: Option<String>,
+    pub payment_finality_at: Option<DateTime<Utc>>,
+    /// When money was first seen on the rail that did not pay the order.
+    /// Never serialized.
+    pub paykit_second_rail_at: Option<DateTime<Utc>>,
 }
 
 impl std::fmt::Debug for OrderRow {
@@ -952,6 +967,12 @@ impl OrderRow {
             payment_amount_minor: None,
             payment_exponent: None,
             payment_quote_basis: None,
+            paykit_amount_minor: None,
+            paykit_accepted_assets: None,
+            paykit_payment_amounts: None,
+            payment_finality: None,
+            payment_finality_at: None,
+            paykit_second_rail_at: None,
         }
     }
 
@@ -1226,7 +1247,38 @@ impl OrderRow {
             view["payment_exponent"] = json!(exponent);
             view["payment_quote_basis"] = json!(basis);
         }
+        // An order bound through `paykit` names what its request offers and
+        // what each asset costs, in each asset's base units. Other orders
+        // keep their projection byte for byte.
+        if self.payment_method.as_deref() == Some("paykit") {
+            view["accepted_assets"] = json!(self.offered_asset_names());
+            view["payment_amounts"] = self.offered_amounts();
+        }
+        // Only a USDT payment has finality (S3).
+        if let Some(finality) = &self.payment_finality {
+            view["payment_finality"] = json!(finality);
+        }
         view
+    }
+
+    /// The assets the order's Paykit request offers: what paykit-server
+    /// derived for a multi-asset request, Bitcoin for the legacy
+    /// `amount_sats` request.
+    fn offered_asset_names(&self) -> Vec<String> {
+        match &self.paykit_accepted_assets {
+            Some(assets) => assets.clone(),
+            None => vec!["BTC".to_string()],
+        }
+    }
+
+    fn offered_amounts(&self) -> Value {
+        match &self.paykit_payment_amounts {
+            Some(amounts) => amounts.clone(),
+            None => match self.paykit_total_sats {
+                Some(sats) => json!({ "BTC": sats }),
+                None => json!({}),
+            },
+        }
     }
 }
 
@@ -1297,14 +1349,34 @@ pub(crate) fn seller_observation(observation: Option<&Value>) -> Value {
     let Some(observation) = observation else {
         return Value::Null;
     };
-    json!({
+    let view = json!({
         "txid": observation.get("txid").and_then(Value::as_str),
         "observed_sats": observation.get("observed_sats").and_then(Value::as_i64),
         "confirmations": observation.get("confirmations").and_then(Value::as_i64),
         "amount_matched": observation.get("amount_matched").and_then(Value::as_bool),
         "observed_at": observation.get("observed_at").and_then(Value::as_str),
         "disappeared": observation.get("disappeared").and_then(Value::as_bool),
-    })
+    });
+    // A USDT leg, and the other rail of an order paid on both, carry scalar
+    // facts of their own. They appear only when the document has them, so a
+    // Bitcoin observation keeps its shape.
+    let mut view = view;
+    for (key, is_number) in [
+        ("asset", false),
+        ("observed_units", true),
+        ("other_rail_asset", false),
+        ("other_rail_amount", true),
+        ("other_rail_reference", false),
+    ] {
+        let value = observation.get(key).and_then(|value| match is_number {
+            true => value.as_i64().map(|number| json!(number)),
+            false => value.as_str().map(|text| json!(text)),
+        });
+        if let Some(value) = value {
+            view[key] = value;
+        }
+    }
+    view
 }
 
 #[cfg(test)]

@@ -225,6 +225,30 @@ pub fn quote_sats(total_minor: i64, exponent: i32, rate: &Decimal) -> Result<u64
     u64::try_from(sats).map_err(|_| FxError::Overflow)
 }
 
+/// Guards the Bitcoin amount paykit-server fixed for a USD price against the
+/// service's own quote: within [`MAX_DEVIATION_BPS`] of it, and inside the
+/// same minimum and maximum a service quote must respect.
+pub fn guard_fixed_sats(fixed_sats: u64, quoted_sats: u64) -> Result<(), FxError> {
+    let fixed = u128::from(fixed_sats);
+    if fixed < MIN_QUOTE_SATS {
+        return Err(FxError::BelowMinimum);
+    }
+    if fixed > MAX_QUOTE_SATS {
+        return Err(FxError::CapExceeded);
+    }
+    let quoted = u128::from(quoted_sats);
+    let gap = fixed.abs_diff(quoted);
+    let within = gap
+        .checked_mul(10_000)
+        .zip(quoted.checked_mul(MAX_DEVIATION_BPS))
+        .is_some_and(|(gap, allowed)| gap <= allowed);
+    if within {
+        Ok(())
+    } else {
+        Err(FxError::DeviationExceeded)
+    }
+}
+
 pub fn reference_cutoff(now: DateTime<Utc>) -> DateTime<Utc> {
     now - Duration::seconds(REFERENCE_WINDOW_SECS)
 }
@@ -373,6 +397,36 @@ mod tests {
         let rate = Decimal::parse("77197").unwrap();
         assert_eq!(quote_sats(1_000, 0, &rate), Ok(1_295_388));
         assert_eq!(quote_sats(100, 3, &rate), Err(FxError::BelowMinimum));
+    }
+
+    #[test]
+    fn a_fixed_bitcoin_amount_is_guarded_by_the_quote_deviation_and_bounds() {
+        assert_eq!(guard_fixed_sats(100_000, 100_000), Ok(()));
+        assert_eq!(guard_fixed_sats(105_000, 100_000), Ok(()));
+        assert_eq!(guard_fixed_sats(95_000, 100_000), Ok(()));
+        assert_eq!(
+            guard_fixed_sats(105_001, 100_000),
+            Err(FxError::DeviationExceeded)
+        );
+        assert_eq!(
+            guard_fixed_sats(94_999, 100_000),
+            Err(FxError::DeviationExceeded)
+        );
+        assert_eq!(guard_fixed_sats(999, 1_000), Err(FxError::BelowMinimum));
+        assert_eq!(guard_fixed_sats(1_000, 1_000), Ok(()));
+        assert_eq!(
+            guard_fixed_sats(MAX_QUOTE_SATS as u64 + 1, MAX_QUOTE_SATS as u64),
+            Err(FxError::CapExceeded)
+        );
+        assert_eq!(
+            guard_fixed_sats(MAX_QUOTE_SATS as u64, MAX_QUOTE_SATS as u64),
+            Ok(())
+        );
+        assert_eq!(guard_fixed_sats(5_000, 0), Err(FxError::DeviationExceeded));
+        assert_eq!(
+            guard_fixed_sats(u64::MAX, u64::MAX),
+            Err(FxError::CapExceeded)
+        );
     }
 
     #[test]

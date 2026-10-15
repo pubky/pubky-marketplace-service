@@ -19,6 +19,8 @@ use ed25519_dalek::{Signer, SigningKey};
 use rand::RngCore;
 use serde::Deserialize;
 
+use crate::payment_attempt::{AcceptedAsset, OfferedAssets, PaymentAsset};
+
 /// Environment variable holding the 32-byte hex key sealing seller secrets
 /// (Shippo API tokens) at rest. Setting it enables the payment-methods
 /// surface. The name predates the removal of the Stripe rail and is kept so
@@ -234,12 +236,19 @@ pub const PAYKIT_STATUS_CONTRACT: &str = "paykit.bitcoin_status/v2";
 /// record — never supplied by any peer (design §B.8.8).
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct PaykitObservation {
+    /// The Bitcoin txid, or the Arbitrum transaction hash of a USDT leg.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub txid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observed_sats: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub confirmations: Option<u32>,
+    /// The rail the facts are about; absent on every Bitcoin-only status.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub asset: Option<AcceptedAsset>,
+    /// The USDT0 amount observed, in millionths (USDT legs only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_units: Option<u64>,
 }
 
 /// The validated per-poll facts: the creator's CURRENT allocation mode —
@@ -298,9 +307,62 @@ impl PaykitDeliveryState {
     }
 }
 
+/// What paykit-server reports about the USDT0 leg of one Marketplace request
+/// (the `usdt_arbitrum` object of the status). Arbitrum has no
+/// confirmation target of its own here: the transfer counts as paid once it
+/// is included in a block and verified, and fulfilment waits for
+/// `finalized`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaykitUsdtObservation {
+    pub tx_hash: String,
+    /// The USDT0 amount observed, in millionths, when the status carries it.
+    pub observed_units: Option<u64>,
+    pub confirmations: u32,
+    pub amount_matched: bool,
+    pub paid_on_time: bool,
+    pub finalized: bool,
+}
+
+impl PaykitUsdtObservation {
+    /// Verified inclusion: the transfer sits in a block.
+    pub fn included(&self) -> bool {
+        self.confirmations >= 1
+    }
+
+    /// Included, for the requested amount, inside the payment window: the
+    /// payment the order settles on.
+    pub fn paid(&self) -> bool {
+        self.included() && self.amount_matched && self.paid_on_time
+    }
+
+    /// The observation as the shared observation facts carry it.
+    pub fn as_observation(&self) -> PaykitObservation {
+        PaykitObservation {
+            txid: Some(self.tx_hash.clone()),
+            observed_sats: None,
+            confirmations: Some(self.confirmations),
+            asset: Some(AcceptedAsset::Usdt),
+            observed_units: self.observed_units,
+        }
+    }
+}
+
 /// Paykit payment-request status as this service consumes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaykitStatusOutcome {
+    /// The status carries a USDT0 observation. `bitcoin` is what the same
+    /// status says about the Bitcoin leg, mapped exactly as a Bitcoin-only
+    /// status is (`ActiveUndetected` when the status has no Bitcoin
+    /// observation). A status without a USDT observation never takes this
+    /// shape, so every Bitcoin-only body maps as it always did.
+    UsdtObserved {
+        usdt: PaykitUsdtObservation,
+        bitcoin: Box<PaykitStatusOutcome>,
+        payment_deadline: chrono::DateTime<chrono::Utc>,
+        /// The rail paykit-server names as paid (the earliest whose
+        /// observation matched on time), when it names one.
+        paid_asset: Option<AcceptedAsset>,
+    },
     Undetected,
     /// Upstream Marketplace invoice is active without a Bitcoin observation.
     /// Its producer-owned deadline must survive lost-activation recovery so
@@ -343,6 +405,18 @@ struct MarketplaceBitcoinStatus {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct MarketplaceUsdtStatus {
+    tx_hash: String,
+    #[serde(default, alias = "observed_amount", alias = "observed_usdt_units")]
+    observed_units: Option<serde_json::Value>,
+    confirmations: u32,
+    amount_matched: bool,
+    paid_on_time: bool,
+    finalized: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MarketplaceStatusBody {
     invoice_id: uuid::Uuid,
     state: String,
@@ -352,8 +426,58 @@ struct MarketplaceStatusBody {
     activated_at: Option<chrono::DateTime<chrono::Utc>>,
     payment_deadline: Option<chrono::DateTime<chrono::Utc>>,
     bitcoin: Option<MarketplaceBitcoinStatus>,
+    /// The multi-asset contract's additions. All four are absent from a
+    /// Bitcoin-only paykit-server, which keeps its bodies parsing unchanged.
+    #[serde(default)]
+    usdt_arbitrum: Option<MarketplaceUsdtStatus>,
+    #[serde(default)]
+    accepted_assets: Option<Vec<String>>,
+    #[serde(default)]
+    payment_amounts: Option<serde_json::Map<String, serde_json::Value>>,
+    #[serde(default)]
+    paid_asset: Option<String>,
     outcome: Option<String>,
     resolved_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// A whole, positive base-unit amount from a JSON number or digit string.
+fn wire_units(value: &serde_json::Value) -> Option<u64> {
+    let units = match value {
+        serde_json::Value::Number(number) => number.as_u64()?,
+        serde_json::Value::String(text)
+            if !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            text.parse().ok()?
+        }
+        _ => return None,
+    };
+    (units > 0).then_some(units)
+}
+
+/// The assets a request offers and what each costs, from the `accepted_assets`
+/// list and `payment_amounts` map paykit-server echoes: a non-empty,
+/// duplicate-free list of known assets, with exactly one whole positive
+/// amount per listed asset. `None` for anything else.
+pub fn offered_assets_from_wire(
+    accepted: &[String],
+    amounts: &serde_json::Map<String, serde_json::Value>,
+) -> Option<OfferedAssets> {
+    if accepted.is_empty() || accepted.len() != amounts.len() {
+        return None;
+    }
+    let mut offered = OfferedAssets::default();
+    for name in accepted {
+        let asset = AcceptedAsset::from_wire(name)?;
+        let amount = wire_units(amounts.get(name)?)?;
+        let slot = match asset {
+            AcceptedAsset::Btc => &mut offered.btc_sats,
+            AcceptedAsset::Usdt => &mut offered.usdt_units,
+        };
+        if slot.replace(amount).is_some() {
+            return None;
+        }
+    }
+    Some(offered)
 }
 
 #[derive(Debug, Deserialize)]
@@ -427,6 +551,12 @@ pub enum PaykitRequestError {
     Unavailable,
 }
 
+/// The USDT leg a status carries, once its multi-asset fields agree.
+struct StatusEcho {
+    usdt: Option<PaykitUsdtObservation>,
+    paid_asset: Option<AcceptedAsset>,
+}
+
 /// One prepared invoice, with API-specific fields kept closed instead of
 /// manufacturing fork pins for upstream invoices.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -469,6 +599,71 @@ struct UpstreamPrepared {
     state: String,
     total_sats: u64,
     prepare_expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// The terms of a multi-asset Marketplace request: the denomination and
+/// amount, and the narrowing the caller wants.
+///
+/// `only` is a subset filter, never an extension: paykit-server derives every
+/// asset the seller can receive, and `only` can only remove from that set.
+/// `None` offers everything the seller set up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarketplaceRequestTerms {
+    pub denomination: PaymentAsset,
+    /// The amount in the denomination's base units (satoshis, US cents).
+    pub amount_minor: u64,
+    pub only: Option<Vec<AcceptedAsset>>,
+}
+
+/// One prepared multi-asset invoice: the terms echoed back and what each
+/// offered asset costs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaykitAssetsPrepared {
+    pub invoice_id: uuid::Uuid,
+    pub prepare_expires_at: chrono::DateTime<chrono::Utc>,
+    pub offered: OfferedAssets,
+}
+
+/// What a multi-asset activation must echo: the persisted request terms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivationTerms {
+    pub denomination: PaymentAsset,
+    pub amount_minor: u64,
+    pub offered: OfferedAssets,
+}
+
+/// The multi-asset activation 200 body, once it echoed the persisted terms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaykitAssetsActivated {
+    pub invoice_id: uuid::Uuid,
+    pub activated_at: chrono::DateTime<chrono::Utc>,
+    pub payment_deadline: chrono::DateTime<chrono::Utc>,
+}
+
+/// The prepare and activate 200 bodies of the multi-asset contract share one
+/// echo of the request. Fields beyond these (fixed conversion rates) are
+/// informational and not read.
+#[derive(Debug, Deserialize)]
+struct AssetsEcho {
+    invoice_id: uuid::Uuid,
+    state: String,
+    amount: serde_json::Value,
+    asset: String,
+    accepted_assets: Vec<String>,
+    payment_amounts: serde_json::Map<String, serde_json::Value>,
+    #[serde(default)]
+    prepare_expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    activated_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    payment_deadline: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl AssetsEcho {
+    /// Whether the echo repeats the sent denomination and amount.
+    fn repeats(&self, denomination: PaymentAsset, amount_minor: u64) -> bool {
+        self.asset == denomination.as_str() && wire_units(&self.amount) == Some(amount_minor)
+    }
 }
 
 /// The phase-2 activation 200 body (`state` is `"observing"`).
@@ -1169,6 +1364,202 @@ impl PaykitClient {
         }
     }
 
+    /// Phase 1 of the multi-asset contract: prepares (or idempotently
+    /// replays) the Marketplace request for `terms`, offering the assets
+    /// paykit-server derives from the seller's setup, narrowed by
+    /// `terms.only`. The body carries the denomination and amount in base
+    /// units, never an amount per asset: paykit-server fixes any Bitcoin
+    /// conversion rate at this call.
+    ///
+    /// The 200 body must repeat the denomination and amount, list a
+    /// non-empty subset of the asked assets (when narrowed) with one whole
+    /// amount each; anything else is a hard refusal. Upstream only.
+    pub async fn prepare_marketplace_request(
+        &self,
+        seller_pubky: &str,
+        buyer_pubky: &str,
+        order_id: uuid::Uuid,
+        bind_attempt: i32,
+        terms: &MarketplaceRequestTerms,
+        payment_window_seconds: i64,
+    ) -> Result<PaykitAssetsPrepared, PaykitRequestError> {
+        if self.api != PaykitApi::Upstream {
+            return Err(PaykitRequestError::Rejected);
+        }
+        let reference = upstream_attempt_reference(order_id, bind_attempt);
+        let url = format!("{}/marketplace/payment-requests/prepare", self.base_url);
+        let mut request = serde_json::json!({
+            "amount": terms.amount_minor.to_string(),
+            "asset": terms.denomination.as_str(),
+            "creator": pubky_app_key(seller_pubky),
+            "operation_id": upstream_operation_id(&reference, bind_attempt),
+            "payment_window_seconds": payment_window_seconds,
+            "reader": pubky_app_key(buyer_pubky),
+            "reference": reference,
+        });
+        if let Some(only) = &terms.only {
+            request["accepted_assets"] =
+                serde_json::json!(only.iter().map(|asset| asset.as_str()).collect::<Vec<_>>());
+        }
+        let (body, signature) = self
+            .signed_body(&url, &request)
+            .map_err(|_| PaykitRequestError::Rejected)?;
+        let response = self
+            .http
+            .post(url)
+            .header("x-paykit-signature", signature)
+            .body(body)
+            .send()
+            .await
+            .map_err(|_| PaykitRequestError::Unavailable)?;
+        let status = response.status();
+        if status.is_success() {
+            if status != reqwest::StatusCode::OK {
+                tracing::error!(
+                    status = %status,
+                    "paykit phase 1 answered a bodyless success; refusing the bind"
+                );
+                return Err(PaykitRequestError::Rejected);
+            }
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|_| PaykitRequestError::Rejected)?;
+            let prepared = serde_json::from_slice::<AssetsEcho>(&bytes)
+                .ok()
+                .filter(|echo| echo.state == "prepared")
+                .filter(|echo| echo.repeats(terms.denomination, terms.amount_minor))
+                .and_then(|echo| {
+                    let offered =
+                        offered_assets_from_wire(&echo.accepted_assets, &echo.payment_amounts)?;
+                    let narrowed = terms.only.as_ref().is_none_or(|only| {
+                        offered.assets().iter().all(|asset| only.contains(asset))
+                    });
+                    narrowed.then_some(PaykitAssetsPrepared {
+                        invoice_id: echo.invoice_id,
+                        prepare_expires_at: echo.prepare_expires_at?,
+                        offered,
+                    })
+                });
+            return prepared.ok_or_else(|| {
+                tracing::error!(
+                    "paykit phase 1 returned a body violating the multi-asset prepared shape"
+                );
+                PaykitRequestError::Rejected
+            });
+        }
+        let code = response
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(|body| body["error"]["code"].as_str().map(str::to_owned))
+            .unwrap_or_default();
+        match (status, code.as_str()) {
+            (_, "creator_session_invalid" | "seller_setup_pending") => {
+                Err(PaykitRequestError::SellerAccountUnavailable)
+            }
+            (_, "reader_not_payable") => Err(PaykitRequestError::ReaderNotPayable),
+            (_, "reader_setup_pending") => Err(PaykitRequestError::ReaderSetupPending),
+            (_, "operation_conflict") => {
+                tracing::error!(
+                    %status,
+                    %code,
+                    %order_id,
+                    "ALERT upstream paykit refused a marketplace-derived prepare request"
+                );
+                Err(PaykitRequestError::Rejected)
+            }
+            (_, "invalid_signature") => {
+                tracing::error!(
+                    %status,
+                    %code,
+                    %order_id,
+                    "ALERT upstream paykit rejected the Marketplace signing identity"
+                );
+                Err(PaykitRequestError::Unavailable)
+            }
+            // The deployment says it runs the multi-asset contract, yet the
+            // server cannot carry what it asks for: a configuration fault,
+            // never the buyer's.
+            (_, "asset_unsupported" | "payment_window_exceeds_cap") => {
+                tracing::error!(
+                    %status,
+                    %code,
+                    %order_id,
+                    "ALERT upstream paykit cannot prepare the requested assets or window; \
+                     check PAYKIT_MARKETPLACE_ASSETS and the payment window"
+                );
+                Err(PaykitRequestError::Unavailable)
+            }
+            (_, "invalid_request" | "invoice_conflict") | (reqwest::StatusCode::CONFLICT, _) => {
+                Err(PaykitRequestError::Rejected)
+            }
+            (_, "dependency_timeout") => Err(PaykitRequestError::Unavailable),
+            _ => Err(PaykitRequestError::Unavailable),
+        }
+    }
+
+    /// Phase 2 of the multi-asset contract: activates a prepared invoice,
+    /// idempotently, naming the persisted denomination and amount. The 200
+    /// body must echo them and the persisted offer; a disagreement is
+    /// [`PaykitCommandError::ActivationTotalMismatch`], like a legacy total
+    /// that differs. Upstream only.
+    pub async fn activate_marketplace_request(
+        &self,
+        target: &PaykitLifecycleTarget,
+        invoice_id: uuid::Uuid,
+        terms: &ActivationTerms,
+    ) -> Result<PaykitAssetsActivated, PaykitCommandError> {
+        let PaykitLifecycleTarget::Upstream { creator } = target else {
+            return Err(PaykitCommandError::UnexpectedRejection(
+                "multi-asset activation needs the upstream API".to_string(),
+            ));
+        };
+        let response = self
+            .post_signed_to(
+                PaykitApi::Upstream,
+                self.base_url.as_str(),
+                "/marketplace/payment-requests/activate",
+                serde_json::json!({
+                    "amount": terms.amount_minor.to_string(),
+                    "asset": terms.denomination.as_str(),
+                    "creator": pubky_app_key(creator),
+                    "invoice_id": invoice_id,
+                }),
+            )
+            .await?;
+        let status = response.status();
+        if status.is_success() {
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|_| PaykitCommandError::Unavailable)?;
+            let echo = serde_json::from_slice::<AssetsEcho>(&bytes)
+                .ok()
+                .filter(|echo| echo.invoice_id == invoice_id && echo.state == "active")
+                .ok_or(PaykitCommandError::Unavailable)?;
+            let (Some(activated_at), Some(payment_deadline)) =
+                (echo.activated_at, echo.payment_deadline)
+            else {
+                return Err(PaykitCommandError::Unavailable);
+            };
+            let echoes_terms = echo.repeats(terms.denomination, terms.amount_minor)
+                && offered_assets_from_wire(&echo.accepted_assets, &echo.payment_amounts)
+                    == Some(terms.offered);
+            return if echoes_terms {
+                Ok(PaykitAssetsActivated {
+                    invoice_id,
+                    activated_at,
+                    payment_deadline,
+                })
+            } else {
+                Err(PaykitCommandError::ActivationTotalMismatch)
+            };
+        }
+        let (status, code) = Self::error_code(response).await;
+        Err(PaykitCommandError::from_status(status, code))
+    }
+
     /// One signed POST to an explicit endpoint (the persisted per-order
     /// stack endpoint, which may predate the configured base URL).
     async fn post_signed_to(
@@ -1546,6 +1937,10 @@ impl PaykitClient {
             body.payment_deadline
                 .is_some_and(|actual| actual.timestamp_micros() == expected.timestamp_micros())
         });
+        let multi_asset = match self.multi_asset_echo(&body) {
+            Ok(echo) => echo,
+            Err(()) => return (PaykitStatusOutcome::Unavailable, delivery),
+        };
         if body.state != "active"
             || body.activated_at.is_none()
             || body.payment_deadline.is_none()
@@ -1559,70 +1954,156 @@ impl PaykitClient {
                 && body.activated_at.is_none()
                 && body.payment_deadline.is_none()
                 && body.bitcoin.is_none()
+                && body.usdt_arbitrum.is_none()
+                && body.paid_asset.is_none()
             {
                 (PaykitStatusOutcome::Undetected, None)
             } else {
                 (PaykitStatusOutcome::Unavailable, None)
             };
         }
+        let payment_deadline = body
+            .payment_deadline
+            .expect("active status requires a payment deadline");
         let safe_request = matches!(
             body.request_state.as_deref(),
             Some("accepted" | "proof_submitted" | "active_recurring")
         );
-        let Some(bitcoin) = body.bitcoin else {
-            return match body.payment_state.as_deref() {
-                Some("undetected" | "expired") => (
-                    PaykitStatusOutcome::ActiveUndetected {
-                        payment_deadline: body
-                            .payment_deadline
-                            .expect("active status requires a payment deadline"),
+        let usdt = multi_asset.usdt;
+        let bitcoin_outcome = match body.bitcoin {
+            None if usdt.is_some() => PaykitStatusOutcome::ActiveUndetected { payment_deadline },
+            None => {
+                return match body.payment_state.as_deref() {
+                    Some("undetected" | "expired") => (
+                        PaykitStatusOutcome::ActiveUndetected { payment_deadline },
+                        delivery,
+                    ),
+                    _ => (PaykitStatusOutcome::Unavailable, delivery),
+                };
+            }
+            Some(bitcoin) => {
+                // With a USDT leg in the status the payment state can speak
+                // for either rail, so a Bitcoin leg confirms only on its own
+                // confirmations.
+                let payment_state = match body.payment_state.as_deref() {
+                    Some("confirmed") if usdt.is_some() && bitcoin.confirmations == 0 => {
+                        Some("detected")
+                    }
+                    other => other,
+                };
+                let facts = PaykitStatusFacts {
+                    allocation_mode: "exclusive".to_string(),
+                    late_settlement: !bitcoin.paid_on_time
+                        || !safe_request
+                        || payment_state == Some("expired"),
+                    payment_deadline: body.payment_deadline,
+                    observation: PaykitObservation {
+                        txid: Some(bitcoin.txid),
+                        observed_sats: Some(bitcoin.observed_sats),
+                        confirmations: Some(bitcoin.confirmations),
+                        ..PaykitObservation::default()
                     },
-                    delivery,
-                ),
-                _ => (PaykitStatusOutcome::Unavailable, delivery),
-            };
+                };
+                if bitcoin.amount_matched
+                    && matches!(body.request_state.as_deref(), None | Some("proposed"))
+                {
+                    PaykitStatusOutcome::AcceptancePending { facts }
+                } else if bitcoin.amount_matched
+                    && (!safe_request || payment_state == Some("expired"))
+                {
+                    PaykitStatusOutcome::Confirmed {
+                        amount_matched: true,
+                        facts,
+                    }
+                } else {
+                    match payment_state {
+                        Some("confirmed") => PaykitStatusOutcome::Confirmed {
+                            amount_matched: bitcoin.amount_matched,
+                            facts,
+                        },
+                        Some("detected") => PaykitStatusOutcome::Detected { facts },
+                        Some("undetected" | "expired") => {
+                            PaykitStatusOutcome::ActiveUndetected { payment_deadline }
+                        }
+                        _ => PaykitStatusOutcome::Unavailable,
+                    }
+                }
+            }
         };
-        let facts = PaykitStatusFacts {
-            allocation_mode: "exclusive".to_string(),
-            late_settlement: !bitcoin.paid_on_time
-                || !safe_request
-                || body.payment_state.as_deref() == Some("expired"),
-            payment_deadline: body.payment_deadline,
-            observation: PaykitObservation {
-                txid: Some(bitcoin.txid),
-                observed_sats: Some(bitcoin.observed_sats),
-                confirmations: Some(bitcoin.confirmations),
+        let outcome = match usdt {
+            Some(usdt) => PaykitStatusOutcome::UsdtObserved {
+                usdt,
+                bitcoin: Box::new(bitcoin_outcome),
+                payment_deadline,
+                paid_asset: multi_asset.paid_asset,
             },
-        };
-
-        if bitcoin.amount_matched
-            && matches!(body.request_state.as_deref(), None | Some("proposed"))
-        {
-            return (PaykitStatusOutcome::AcceptancePending { facts }, delivery);
-        }
-        let outcome = if bitcoin.amount_matched
-            && (!safe_request || body.payment_state.as_deref() == Some("expired"))
-        {
-            PaykitStatusOutcome::Confirmed {
-                amount_matched: true,
-                facts,
-            }
-        } else {
-            match body.payment_state.as_deref() {
-                Some("confirmed") => PaykitStatusOutcome::Confirmed {
-                    amount_matched: bitcoin.amount_matched,
-                    facts,
-                },
-                Some("detected") => PaykitStatusOutcome::Detected { facts },
-                Some("undetected" | "expired") => PaykitStatusOutcome::ActiveUndetected {
-                    payment_deadline: body
-                        .payment_deadline
-                        .expect("active status requires a payment deadline"),
-                },
-                _ => PaykitStatusOutcome::Unavailable,
-            }
+            None => bitcoin_outcome,
         };
         (outcome, delivery)
+    }
+
+    /// Checks the multi-asset additions of a status against each other and
+    /// returns the USDT observation they carry. A Bitcoin-only status has
+    /// none of them and answers an empty echo. Any disagreement fails the
+    /// whole status closed: the echoed offer must parse, a USDT observation
+    /// needs USDT in the offer, and `paid_asset` must name a rail whose own
+    /// object is a verified, matched, on-time payment.
+    fn multi_asset_echo(&self, body: &MarketplaceStatusBody) -> Result<StatusEcho, ()> {
+        match (&body.accepted_assets, &body.payment_amounts) {
+            (None, None) => {}
+            (Some(accepted), Some(amounts)) => {
+                let offered = offered_assets_from_wire(accepted, amounts).ok_or(())?;
+                if body.usdt_arbitrum.is_some() && offered.usdt_units.is_none() {
+                    return Err(());
+                }
+                if body.bitcoin.is_some() && offered.btc_sats.is_none() {
+                    return Err(());
+                }
+            }
+            _ => return Err(()),
+        }
+        let usdt = body
+            .usdt_arbitrum
+            .as_ref()
+            .map(|usdt| {
+                if usdt.tx_hash.is_empty() {
+                    return Err(());
+                }
+                let observed_units = match &usdt.observed_units {
+                    None | Some(serde_json::Value::Null) => None,
+                    Some(value) => Some(wire_units(value).ok_or(())?),
+                };
+                Ok(PaykitUsdtObservation {
+                    tx_hash: usdt.tx_hash.clone(),
+                    observed_units,
+                    confirmations: usdt.confirmations,
+                    amount_matched: usdt.amount_matched,
+                    paid_on_time: usdt.paid_on_time,
+                    finalized: usdt.finalized,
+                })
+            })
+            .transpose()?;
+        if usdt
+            .as_ref()
+            .is_some_and(|usdt| usdt.finalized && !usdt.included())
+        {
+            return Err(());
+        }
+        match body.paid_asset.as_deref() {
+            None => {}
+            Some("USDT") if usdt.as_ref().is_some_and(PaykitUsdtObservation::paid) => {}
+            Some("BTC")
+                if body
+                    .bitcoin
+                    .as_ref()
+                    .is_some_and(|bitcoin| bitcoin.amount_matched && bitcoin.paid_on_time) => {}
+            Some(_) => return Err(()),
+        }
+        let paid_asset = body
+            .paid_asset
+            .as_deref()
+            .and_then(AcceptedAsset::from_wire);
+        Ok(StatusEcho { usdt, paid_asset })
     }
 
     /// Polls the payment status for one order reference against the strict
@@ -1755,6 +2236,7 @@ impl PaykitClient {
                 txid: body.txid,
                 observed_sats: body.observed_sats,
                 confirmations: body.confirmations,
+                ..PaykitObservation::default()
             },
         };
         let outcome = match body.status.as_deref() {
@@ -1948,6 +2430,73 @@ mod tests {
     use super::*;
 
     const KEY: &str = "3333333333333333333333333333333333333333333333333333333333333333";
+
+    fn amounts(value: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        value.as_object().expect("object").clone()
+    }
+
+    fn names(assets: &[&str]) -> Vec<String> {
+        assets.iter().map(|asset| asset.to_string()).collect()
+    }
+
+    #[test]
+    fn an_echoed_offer_is_a_known_duplicate_free_list_with_one_whole_amount_each() {
+        let both = offered_assets_from_wire(
+            &names(&["BTC", "USDT"]),
+            &amounts(serde_json::json!({ "BTC": 51_637, "USDT": "137000000" })),
+        );
+        assert_eq!(
+            both,
+            Some(OfferedAssets {
+                btc_sats: Some(51_637),
+                usdt_units: Some(137_000_000),
+            })
+        );
+        for (accepted, map) in [
+            (names(&[]), serde_json::json!({})),
+            (names(&["BTC"]), serde_json::json!({})),
+            (names(&["BTC"]), serde_json::json!({ "BTC": 1, "USDT": 2 })),
+            (names(&["BTC", "BTC"]), serde_json::json!({ "BTC": 1 })),
+            (names(&["DAI"]), serde_json::json!({ "DAI": 1 })),
+            (names(&["btc"]), serde_json::json!({ "btc": 1 })),
+            (names(&["BTC"]), serde_json::json!({ "BTC": 0 })),
+            (names(&["BTC"]), serde_json::json!({ "BTC": -5 })),
+            (names(&["BTC"]), serde_json::json!({ "BTC": "5.5" })),
+            (names(&["BTC"]), serde_json::json!({ "BTC": "" })),
+            (names(&["BTC"]), serde_json::json!({ "BTC": 1.5 })),
+            (names(&["BTC"]), serde_json::json!({ "BTC": null })),
+            (names(&["BTC"]), serde_json::json!({ "USDT": 1 })),
+        ] {
+            assert_eq!(
+                offered_assets_from_wire(&accepted, &amounts(map.clone())),
+                None,
+                "{accepted:?} {map}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_usdt_observation_is_paid_only_when_included_matched_and_on_time() {
+        let observation = |confirmations, amount_matched, paid_on_time| PaykitUsdtObservation {
+            tx_hash: "0xab".to_string(),
+            observed_units: Some(5),
+            confirmations,
+            amount_matched,
+            paid_on_time,
+            finalized: false,
+        };
+        assert!(observation(1, true, true).paid());
+        assert!(!observation(0, true, true).paid());
+        assert!(!observation(1, false, true).paid());
+        assert!(!observation(1, true, false).paid());
+        assert!(observation(1, false, false).included());
+        assert!(!observation(0, true, true).included());
+        let facts = observation(3, true, true).as_observation();
+        assert_eq!(facts.txid.as_deref(), Some("0xab"));
+        assert_eq!(facts.asset, Some(AcceptedAsset::Usdt));
+        assert_eq!(facts.observed_units, Some(5));
+        assert_eq!(facts.observed_sats, None);
+    }
 
     /// The signing seed of `paykit-server/tests/setup_status.rs`
     /// (`SigningKey::from_bytes(&[7; 32])`).

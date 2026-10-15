@@ -9,8 +9,10 @@
 //! wallet, and records the Arbitrum transaction hash. Nothing here verifies
 //! the refund on Arbitrum: it is a record of what the seller said they did.
 //!
-//! Everything in this module applies to orders paid with the `usdt` method
-//! only; an order of any other method never reads or writes it.
+//! Everything in this module applies to orders paid in USDT only: the legacy
+//! `usdt` method, and an order bound through `paykit` whose payment settled
+//! on the USDT rail (`payment_asset`). An order paid any other way never
+//! reads or writes it, so a refund always follows the rail that was paid.
 
 use std::collections::HashMap;
 
@@ -32,9 +34,11 @@ pub const REFUND_NETWORK: &str = "arbitrum-one";
 /// The only address source today: the buyer typed it.
 pub const SOURCE_BUYER_ENTERED: &str = "buyer_entered";
 
-/// Whether the order was paid with USDT.
+/// Whether the order was paid with USDT: bound to the legacy `usdt` method,
+/// or settled on the USDT rail of a Paykit request.
 pub fn is_usdt_order(order: &OrderRow) -> bool {
     order.payment_method.as_deref() == Some(USDT_PAYMENT_METHOD)
+        || order.payment_asset.as_deref() == Some(REFUND_ASSET)
 }
 
 fn hex_body(address: &str) -> Option<&str> {
@@ -202,6 +206,9 @@ pub async fn attach_to_views(
 /// USD order): what a refund of the whole payment is. `None` when the order
 /// carries no USDT terms or the quote is not a whole number of order units.
 pub fn quoted_refund_amount_minor(order: &OrderRow) -> Option<i64> {
+    if order.currency != "USD" {
+        return None;
+    }
     let sent = order.payment_amount_minor?;
     let sent_exponent = i32::from(order.payment_exponent?);
     let steps = u32::try_from(sent_exponent.checked_sub(order.exponent)?).ok()?;
