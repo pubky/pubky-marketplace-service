@@ -32,6 +32,7 @@ Contents:
 - [Webhooks](#webhooks)
 - [Operational endpoints](#operational-endpoints)
 - [Grant-flow routes (Shop BFF)](#grant-flow-routes-shop-bff)
+- [Grant sessions](#grant-sessions)
 - [OpenAPI](#openapi)
 
 ## Conventions
@@ -70,6 +71,7 @@ promise. No consumer other than the Shop SDK is known.
 | Event `type` values | Experimental | The set is open and grows with the domain (see [Event feed](#event-feed)). Consumers must ignore unknown types. |
 | Session `label` / `metadata` | Experimental | Informational only. |
 | Grant-flow routes (`/v1/auth/grant-flows/*`) | Experimental, Shop-BFF internal | Not a public contract; see [below](#grant-flow-routes-shop-bff). |
+| `POST /v1/auth/grant-sessions` | Experimental | Off unless `MARKETPLACE_GRANT_SESSION_ENABLED`; covered by `grant_session` tests. See [Grant sessions](#grant-sessions). |
 | `/v0/*` routes | Experimental | The `v0` prefix is deliberate: payment, shipping and address routes can change. |
 
 ## Route table
@@ -87,6 +89,7 @@ and write. "Automation" means the inventory capability plus the
 | GET | `/ready` | [Operational endpoints](#operational-endpoints) |
 | POST | `/v1/auth/sessions` | Exchange an AuthToken for a bearer. |
 | GET | `/v1/auth/sessions` | Needs a bearer with the inventory capability (checked in the handler); consumes the `session.admin` rate limit. |
+| POST | `/v1/auth/grant-sessions` | Mint a bearer from a Shop sign-in grant and a custom proof. `404 grant_session_unavailable` unless `MARKETPLACE_GRANT_SESSION_ENABLED`. See [Grant sessions](#grant-sessions). |
 | POST | `/v1/auth/grant-flows` | Grant-flow (Shop BFF). Only mounted when `MARKETPLACE_GRANT_FLOW_ENABLED` is set. |
 | GET | `/v1/auth/grant-flows/{flow_id}` | Grant-flow (Shop BFF). |
 | POST | `/v1/auth/grant-flows/{flow_id}/cancel` | Grant-flow (Shop BFF). |
@@ -376,6 +379,7 @@ A token bucket per `(actor pubky, endpoint class)`, stored in
   | Class | Matches |
   | --- | --- |
   | `session.admin` | Paths starting with `/v1/auth/sessions` (including `GET /v1/auth/sessions`, which spends the token in its handler) |
+  | `grant_session.mint` | `POST /v1/auth/grant-sessions`, keyed by the grant's pubky after the proof verifies |
   | `listing.sync_many` | `/v1/listings/sync-many` |
   | `webhook.admin` | `/v1/webhooks...` |
   | `export.orders` | Paths ending in `/orders` |
@@ -998,6 +1002,60 @@ and only used during rotation): `GRANT_FLOW_ENCRYPTION_KEY_B64` with
 `GRANT_RESULT_HMAC_KEY_EPOCH`, `GRANT_RESULT_HMAC_PREVIOUS_ROOT_B64` with
 `GRANT_RESULT_HMAC_PREVIOUS_KEY_EPOCH`, `SHOP_GRANT_ASSERTION_VERIFYING_KEYS_JSON`
 and `SHOP_BFF_REQUEST_VERIFYING_KEYS_JSON`.
+
+## Grant sessions
+
+`POST /v1/auth/grant-sessions` mints a marketplace bearer from the grant the
+seller already approved when signing in to the Shop, so no second signer
+approval is needed. The browser holds the grant's client key; the root key
+never leaves the signer.
+
+The browser first writes a proof document with its live homeserver session,
+then signs a pubky custom proof (`session.grant.createCustomPop(data)`) and
+posts the result:
+
+1. `PUT /pub/pubky.app/marketplace/v1/session-proofs/{challenge_id}` on its own
+   homeserver, body exactly
+   `{"aud": <service origin>, "challenge_id": <uuid>, "domain": "marketplace-service/grant-session-proof/v1", "pubky": <z32>}`.
+   `challenge_id` is a fresh random UUID in canonical lowercase form.
+2. `createCustomPop({"aud": <service origin>, "challenge_id": <uuid>, "purpose": "marketplace-service/grant-session/v1"})`.
+3. `POST /v1/auth/grant-sessions` with `{"grant": <grant JWS>, "pop": <proof JWS>}`.
+
+The service verifies both signatures offline (`verify_custom_grant_pop`,
+30 s clock skew), then requires: the signed data to be exactly those three
+fields with `aud` equal to the origin of `PUBLIC_SERVICE_ORIGIN`; the proof to
+be at most `MARKETPLACE_GRANT_SESSION_MAX_PROOF_AGE_SECONDS` old; the grant's
+`client_id` to be listed in `MARKETPLACE_GRANT_SESSION_CLIENT_IDS`; the grant
+to cover `/pub/pubky.app/marketplace-service/v1/` with read and write; and the
+proof document, read through `HOMESERVER_URL` with `pubky-host` set to the
+grant's issuer, to equal the expected body. Only a live homeserver session can
+write that document, so a grant revoked at the homeserver cannot mint. The
+challenge id is then burned and the session inserted in one transaction.
+
+The session's capabilities are the grant's narrowed to the marketplace scopes:
+`/pub/pubky.app/marketplace-service/v1/:rw`, plus `/priv/pubky.app/:rw` when the
+grant covers it. It expires at the earlier of `AUTH_SESSION_TTL_SECONDS` and
+the grant's expiry, and records `source_grant_id` and `source_client_id`.
+The `201` body is the same as `POST /v1/auth/sessions`.
+
+| Status | `error` | Meaning |
+| --- | --- | --- |
+| 400 | `invalid_request` | Body is not `{"grant", "pop"}` JSON |
+| 401 | `grant_session_invalid` | Signatures, binding, audience, purpose, challenge id or proof age |
+| 401 | `grant_expired` | The grant expired or is not yet valid |
+| 401 | `homeserver_proof_invalid` | No proof document, or a different one |
+| 401 | `grant_session_replayed` | The challenge id was already used |
+| 403 | `grant_client_not_allowed` | The grant's `client_id` is not listed |
+| 403 | `capability_required` | The grant does not cover the marketplace scope |
+| 404 | `grant_session_unavailable` | The feature is off |
+| 429 | `retry_later` | `grant_session.mint` rate limit, with `Retry-After` |
+| 503 | `homeserver_unavailable` | The homeserver could not be read; retry with a new proof |
+
+Configuration: `MARKETPLACE_GRANT_SESSION_ENABLED` (`false`);
+`MARKETPLACE_GRANT_SESSION_CLIENT_IDS` (comma-separated grant client ids,
+required when enabled); `MARKETPLACE_GRANT_SESSION_MAX_PROOF_AGE_SECONDS`
+(120, 1..600). `PUBLIC_SERVICE_ORIGIN` is required when enabled. The service
+refuses to start if an enabled configuration is incomplete.
 
 ## OpenAPI
 

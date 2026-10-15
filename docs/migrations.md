@@ -139,6 +139,14 @@ additive. Orders and payments bound to Stripe are not touched.
 binary from before 0059 ignores the new columns and its inserts take their
 defaults, so a rolling replacement is safe.
 
+0060 (grant sessions) creates `grant_session_challenges` with its primary key
+and a plain index on `used_at` (a new, empty table), adds the nullable
+`auth_sessions.source_grant_id` and `source_client_id` columns, and widens the
+`automation_rate_limits` endpoint-class CHECK with `grant_session.mint` as
+`NOT VALID`. It builds no index on an existing table and sets `lock_timeout`
+like 0050. A binary from before 0060 never reads the new table and its session
+inserts leave the new columns NULL.
+
 ## Numbers claimed by open pull requests
 
 `main` has 0001 to 0054 and 0056 to 0059; 0055 is #92, so the catalog is
