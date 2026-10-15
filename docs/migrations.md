@@ -240,6 +240,13 @@ overlap an old replica refuses only those listings. Roll forward rather than
 back once a listing tracks variants: a binary that predates 0070 would refuse
 every sale of it.
 
+The backfill gives every existing listing one implicit row, because a
+migration cannot read the seller's homeserver record. A listing whose record
+lists two or more enabled variants becomes variant-tracked at its next sync.
+After the deploy, run `sync-many` over the live listings that have several
+variants so they convert at once (a listing with open holds, or with sales that
+do not attribute to the record's variants, converts at a later sync).
+
 `crates/service/tests/migration_0070_test.rs` (serial: it replays 0032 on a
 scratch database) pins the backfill on a database migrated through 0069, the
 rerun, each trigger, the old-binary write, and the table's checks.
