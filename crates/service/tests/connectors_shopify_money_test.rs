@@ -70,9 +70,11 @@ async fn pushed(pool: PgPool) -> Shop {
     shop(pool, None).await
 }
 
-/// The same, with the store selling in `currency` when given (the order is
-/// then refused rather than pushed).
-async fn shop(pool: PgPool, currency: Option<&str>) -> Shop {
+type Prepare = Box<dyn FnOnce(&FakeShopify)>;
+
+/// The same, but `prepare` sets up the fake store before the first push
+/// attempt, and the push is then not expected to have created the order.
+async fn shop(pool: PgPool, prepare: Option<Prepare>) -> Shop {
     let fake = FakeShopify::start().await;
     fake.expect_client_secret(APP_SECRET);
     let provider = Arc::new(ShopifyProvider::with_origin(Origin::Fixed(
@@ -128,11 +130,12 @@ async fn shop(pool: PgPool, currency: Option<&str>) -> Shop {
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
     let order = create_paid_order(&app, &seller, &buyer).await;
     map_listing(&app, &seller, connection, "boots_01", PRODUCT, VARIANT).await;
-    if let Some(currency) = currency {
-        fake.lock().shop_currency = currency.to_string();
+    let expect_created = prepare.is_none();
+    if let Some(prepare) = prepare {
+        prepare(&fake);
     }
     worker::run_pass(&app.state).await.expect("pass");
-    if currency.is_none() {
+    if expect_created {
         assert_eq!(push_state(&app.pool, &order.order_id).await.0, "created");
     }
     Shop {
@@ -816,7 +819,11 @@ async fn a_claim_that_is_still_open_on_a_push_makes_a_second_worker_move_on(pool
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_store_in_another_currency_tells_the_seller_why_and_what_to_do(pool: PgPool) {
-    let s = shop(pool, Some("EUR")).await;
+    let s = shop(
+        pool,
+        Some(Box::new(|fake| fake.lock().shop_currency = "EUR".into())),
+    )
+    .await;
     let (state, _, reason, _) = push_state(&s.app.pool, &s.order_id).await;
     assert_eq!(state, "quarantined");
     assert!(reason.is_some());
@@ -915,4 +922,64 @@ async fn asking_for_split_mode_on_a_connection_with_a_shared_listing_is_a_confli
         "the answer is the refusal, not a silent downgrade"
     );
     let _ = s.connection;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_busy_store_whose_search_lags_is_never_pushed_to_twice(pool: PgPool) {
+    let s = shop(
+        pool,
+        Some(Box::new(|fake| {
+            fake.lock().search_lags = true;
+            fake.fault("OrderCreate", vec![Fault::AppliedThenServerError]);
+        })),
+    )
+    .await;
+    assert_eq!(
+        s.fake.orders().len(),
+        1,
+        "the store applied the push whose answer was lost"
+    );
+    assert_ne!(push_state(&s.app.pool, &s.order_id).await.0, "created");
+    // Meanwhile the store takes more orders than one scan can read.
+    s.fake.add_other_orders(520);
+    s.app.clock.advance_seconds(700);
+    s.pass().await;
+    let (state, _, _, _) = push_state(&s.app.pool, &s.order_id).await;
+    assert_ne!(
+        state, "created",
+        "the lookup could not rule the order out, so it did not guess"
+    );
+    assert_ne!(state, "quarantined");
+    assert_eq!(
+        s.fake
+            .orders()
+            .iter()
+            .filter(|order| order
+                .tags()
+                .iter()
+                .any(|tag| tag.starts_with("pubky-order-")))
+            .count(),
+        1,
+        "no second copy"
+    );
+    // The search index catches up: the next attempt finds the order.
+    s.fake.lock().search_lags = false;
+    s.app.clock.advance_seconds(700);
+    s.pass().await;
+    let (state, external, _, _) = push_state(&s.app.pool, &s.order_id).await;
+    assert_eq!(state, "created");
+    let first = s
+        .fake
+        .orders()
+        .into_iter()
+        .find(|order| {
+            order
+                .tags()
+                .iter()
+                .any(|tag| tag.starts_with("pubky-order-"))
+        })
+        .expect("our order");
+    assert_eq!(external.as_deref(), Some(first.id.as_str()));
+    assert_eq!(s.fake.calls("OrderCreate").len(), 1, "orderCreate ran once");
+    s.fake.assert_clean();
 }
