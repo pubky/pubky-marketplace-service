@@ -79,20 +79,20 @@ async fn migration_0032_applies_after_already_applied_0033(pool: PgPool) {
     ALL_MIGRATIONS
         .run(&pool)
         .await
-        .expect("missing 0032 and pending 0034..=0059 apply after already-applied 0033");
+        .expect("missing 0032 and pending 0034..=0061 apply after already-applied 0033");
 
     let finally_applied: Vec<i64> =
         sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
             .fetch_all(&pool)
             .await
             .expect("final migration versions");
-    // 0060 and up belong to lanes that land separately (0062 to 0064 are the
-    // connectors'); this test is about 0001..=0059.
-    let through_0059: Vec<i64> = finally_applied
+    // 0062 and up belong to the connectors' lane (0062 to 0069); this test is
+    // about 0001..=0061.
+    let through_0061: Vec<i64> = finally_applied
         .into_iter()
-        .filter(|version| *version <= 59)
+        .filter(|version| *version <= 61)
         .collect();
-    assert_eq!(through_0059, (1..=59).collect::<Vec<_>>());
+    assert_eq!(through_0061, (1..=61).collect::<Vec<_>>());
 }
 
 fn aggregate_id(seller: &str, listing_id: &str) -> String {

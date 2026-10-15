@@ -1103,6 +1103,31 @@ per-variant inventory (`inventory.adjust` with `variant`), and skipped
 (`CONNECTOR_STOCK_POLL_SECONDS`) reads the catalog for mapped products because
 WordPress cron is unreliable.
 
+### Mirror leases and the refund difference
+
+Cancel and refund mirrors of one store order run one at a time, across every
+worker replica: a mirror is claimed only when no other mirror of that push is
+`sending` with an unexpired lease. A refund mirror reads the store's refunded
+total and then writes only the difference. The lease must exceed twice the
+provider timeout (`CONNECTOR_PUSH_LEASE_SECONDS` against
+`CONNECTOR_PROVIDER_TIMEOUT_SECONDS`, enforced at start-up in
+`connectors/config.rs`), because a refund mirror makes two timed provider
+calls, so a live worker cannot outlive its lease. After a crash a successor
+claims the order only once the lease has lapsed, and re-reads the store's
+refunded total before it writes; a refund that reached the store before the
+crash is then seen and not written again. Shopify also dedupes on the
+`@idempotent` key of `refundCreate`. WooCommerce has no idempotency key either, so its
+provider makes one: every refund it creates carries the marker
+`[pubky:<action key>]` (in the refund's reason and as refund meta), the order's
+refunds are listed before any create or retry, and one that carries this
+action's marker means the action is already applied (the store applied it late,
+after our client gave up), so nothing is written and the refunded total already
+counts it. After a write the list is read again and a second refund with the
+same marker is deleted, so the store holds exactly one. An order create is
+checked the same way by the Pubky order id on the order (a late-applied attempt
+and its retry: the newer is cancelled, and `find_pushed_order` resolves to the
+oldest uncancelled order).
+
 ## Operational endpoints
 
 All three are unauthenticated, uncached and safe to poll.

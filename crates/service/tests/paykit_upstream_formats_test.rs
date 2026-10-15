@@ -166,6 +166,7 @@ async fn fork_status_v2_bodies_parse_unchanged() {
                         txid: None,
                         observed_sats: None,
                         confirmations: Some(2),
+                        ..PaykitObservation::default()
                     },
                 },
             },
@@ -188,6 +189,7 @@ async fn fork_status_v2_bodies_parse_unchanged() {
                     txid: None,
                     observed_sats: None,
                     confirmations: Some(0),
+                    ..PaykitObservation::default()
                 },
             },
         }

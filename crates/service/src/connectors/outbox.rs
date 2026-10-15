@@ -216,6 +216,21 @@ async fn on_payment_confirmed(
     Ok(queued)
 }
 
+/// `currency, exponent, total_minor, payment_method, payment_asset,
+/// payment_exponent, usd_conversion_pair, usd_conversion_cents,
+/// external_refund`.
+type RefundOrderRow = (
+    String,
+    i32,
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<i16>,
+    Option<String>,
+    Option<i64>,
+    Option<serde_json::Value>,
+);
+
 async fn on_refund_recorded(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     now: DateTime<Utc>,
@@ -237,21 +252,41 @@ async fn mirror_current_refund(
     if !ledger::has_mirrorable_push(tx, order_id).await? {
         return Ok(());
     }
-    // The whole row as JSON: the conversion columns of the order's recorded
-    // quote exist only once migration 0061 has run, and are read as optional
-    // keys (`refund::OrderBasis`).
-    let row: Option<serde_json::Value> =
-        sqlx::query_scalar("SELECT to_jsonb(o) FROM orders o WHERE o.id = $1")
-            .bind(order_id)
-            .fetch_optional(&mut **tx)
-            .await?;
-    let Some(row) = row else {
+    let row: Option<RefundOrderRow> = sqlx::query_as(
+        "SELECT currency, exponent, total_minor, payment_method, payment_asset, \
+                payment_exponent, usd_conversion_pair, usd_conversion_cents, external_refund \
+         FROM orders WHERE id = $1",
+    )
+    .bind(order_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((
+        currency,
+        exponent,
+        total_minor,
+        payment_method,
+        payment_asset,
+        payment_exponent,
+        conversion_pair,
+        conversion_cents,
+        external_refund,
+    )) = row
+    else {
         return Ok(());
     };
-    let Some(basis) = refund::OrderBasis::from_row(&row) else {
-        return Ok(());
+    let basis = refund::OrderBasis {
+        currency,
+        exponent,
+        total_minor,
+        payment_method,
+        payment_asset,
+        payment_exponent: payment_exponent.map(i32::from),
+        conversion: match (conversion_pair, conversion_cents) {
+            (Some(pair), Some(cents)) if cents > 0 => Some(refund::UsdConversion { pair, cents }),
+            _ => None,
+        },
     };
-    let external_refund = row.get("external_refund").filter(|value| !value.is_null());
+    let external_refund = external_refund.as_ref();
     // The refund is read as the order holds it now. A refund reversed since
     // the event left none, and there is nothing to mirror.
     let Some(recorded) = external_refund
