@@ -68,6 +68,11 @@ struct Published {
 }
 
 async fn published_key(app: &TestApp, seller: &str) -> Published {
+    published_key_for(app, seller, SHOP).await
+}
+
+/// The recipient key the seller's public status publishes for one store.
+async fn published_key_for(app: &TestApp, seller: &str, domain: &str) -> Published {
     let (_, status) = api(
         app,
         "GET",
@@ -76,7 +81,13 @@ async fn published_key(app: &TestApp, seller: &str) -> Published {
         &json!(null),
     )
     .await;
-    let key = &status["stores"][0]["address_sharing"]["recipient_key"];
+    let store = status["stores"]
+        .as_array()
+        .expect("stores")
+        .iter()
+        .find(|store| store["domain"] == domain)
+        .unwrap_or_else(|| panic!("a published store for {domain}: {status}"));
+    let key = &store["address_sharing"]["recipient_key"];
     Published {
         key_id: key["key_id"].as_str().expect("key id").to_string(),
         public_key: URL_SAFE_NO_PAD
@@ -514,4 +525,138 @@ async fn the_address_is_never_logged_or_projected_to_the_provider_debug_output(p
     for needle in ["Market Street", "Alice Buyer", "8001"] {
         assert!(!logs.contains(needle), "{needle} reached the logs");
     }
+}
+
+const WOO_SHOP: &str = "woo.test-store.example";
+
+/// One order, one buyer opt-in for the Shopify store, and a push to each of
+/// the seller's two stores. `chosen_first` picks which push lands first.
+async fn two_stores_one_envelope(pool: PgPool, chosen_first: bool) {
+    let (app, stores) = connector_app_full(pool, test_keys(), test_settings()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let shopify = connect_shop(&app, &seller, SHOP).await;
+    let woo = connect_woo_shop(&app, &seller, WOO_SHOP).await;
+    let (status, body) = execute(&app, &seller.token, &register_command(&seller.pubky, 3)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    map_listing(&app, &seller, shopify, "boots_01", "prod-1", "var-1").await;
+    map_listing(&app, &seller, woo, "boots_01", "woo-prod-1", "woo-var-1").await;
+    let key = published_key_for(&app, &seller.pubky, SHOP).await;
+    assert_ne!(
+        key.key_id,
+        published_key_for(&app, &seller.pubky, WOO_SHOP)
+            .await
+            .key_id,
+        "each store has its own recipient key"
+    );
+    let command = sealed_with_share(&seller, &buyer, &key, SHOP, &buyer.pubky);
+    let (status, body, order) = checkout(&app, &buyer, command).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let order = order.expect("order");
+    pay(&app, &buyer, &order).await;
+    worker::consume_events(&app.state).await.expect("consume");
+    assert_eq!(
+        common::count(&app.pool, "SELECT COUNT(*) FROM connector_order_push").await,
+        2
+    );
+
+    let (first, second) = if chosen_first {
+        ("shopify", "woocommerce")
+    } else {
+        ("woocommerce", "shopify")
+    };
+    let defer = |provider: &'static str, at: &'static str| {
+        let pool = app.pool.clone();
+        async move {
+            sqlx::query(&format!(
+                "UPDATE connector_order_push SET next_attempt_at = '{at}'::timestamptz \
+                 WHERE provider = $1"
+            ))
+            .bind(provider)
+            .execute(&pool)
+            .await
+            .expect("reschedule");
+        }
+    };
+    defer(second, "2100-01-01").await;
+    assert_eq!(
+        worker::drive_pushes(&app.state, 10).await.expect("first"),
+        1
+    );
+    let state_of = |provider: &'static str| {
+        let pool = app.pool.clone();
+        let order_id = order.order_id.clone();
+        async move {
+            sqlx::query_scalar::<_, String>(
+                "SELECT state FROM connector_order_push \
+                 WHERE pubky_order_id = $1::uuid AND provider = $2",
+            )
+            .bind(order_id)
+            .bind(provider)
+            .fetch_one(&pool)
+            .await
+            .expect("push state")
+        }
+    };
+    assert_eq!(state_of(first).await, "created");
+    assert_eq!(state_of(second).await, "pending");
+    assert_eq!(
+        columns(&app, &order.order_id).await.3,
+        !chosen_first,
+        "only the push to the store the buyer chose deletes the envelope"
+    );
+
+    defer(second, "2000-01-01").await;
+    assert_eq!(
+        worker::drive_pushes(&app.state, 10).await.expect("second"),
+        1
+    );
+    assert_eq!(state_of(second).await, "created");
+    assert!(
+        !columns(&app, &order.order_id).await.3,
+        "the chosen store's push has deleted it"
+    );
+
+    let to_shopify = stores
+        .shopify
+        .last_order_push
+        .lock()
+        .expect("lock")
+        .clone()
+        .expect("a push to the Shopify store");
+    let to_woo = stores
+        .woocommerce
+        .last_order_push
+        .lock()
+        .expect("lock")
+        .clone()
+        .expect("a push to the WooCommerce store");
+    assert_eq!(
+        to_shopify
+            .shipping_address
+            .expect("the store the buyer chose receives the address")
+            .city,
+        "Zurich"
+    );
+    assert!(
+        to_woo.shipping_address.is_none(),
+        "the other store never receives it"
+    );
+    assert_eq!(
+        columns(&app, &order.order_id).await.0.as_deref(),
+        Some(SHOP),
+        "the consent record stays"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_push_to_the_other_store_first_leaves_the_envelope_for_the_chosen_store(pool: PgPool) {
+    two_stores_one_envelope(pool, false).await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_push_to_the_chosen_store_first_deletes_the_envelope_and_the_other_store_gets_none(
+    pool: PgPool,
+) {
+    two_stores_one_envelope(pool, true).await;
 }

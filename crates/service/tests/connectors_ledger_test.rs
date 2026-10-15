@@ -920,3 +920,445 @@ async fn two_consumers_do_not_read_the_feed_at_once(pool: PgPool) {
         .expect("batch");
     assert!(!free.busy);
 }
+
+// === A quarantined push and the mirrors queued behind it =====================
+
+async fn cancel_order(s: &Scenario) {
+    let order_id = s.order.order_id.as_str();
+    for (token, kind, revision, payload, number) in [
+        (
+            &s.buyer.token,
+            "order.cancel_request",
+            2,
+            json!({ "reason": "changed my mind" }),
+            1_401,
+        ),
+        (&s.seller.token, "order.cancel_approve", 3, json!({}), 1_402),
+    ] {
+        let (status, body) = execute(
+            &s.app,
+            token,
+            &order_command(kind, order_id, revision, payload, number),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{kind}: {body}");
+    }
+}
+
+/// The seller records an external refund, through the return flow.
+async fn refund_order(s: &Scenario) {
+    let order_id = s.order.order_id.as_str();
+    for (seller, kind, revision, payload, number) in [
+        (
+            true,
+            "fulfillment.ship",
+            2,
+            json!({ "carrier": "Sandbox Post", "tracking_number": "T-1" }),
+            1_210,
+        ),
+        (false, "fulfillment.confirm_delivery", 3, json!({}), 1_211),
+        (
+            false,
+            "return.request",
+            4,
+            json!({ "reason": "wrong size", "requested_amount_minor": s.order.total_minor }),
+            1_212,
+        ),
+        (true, "return.approve", 5, json!({}), 1_213),
+        (true, "return.receive", 6, json!({}), 1_214),
+        (
+            true,
+            "refund.record_external",
+            7,
+            json!({ "amount_minor": s.order.total_minor, "transaction_id": "bitcoin-tx-1" }),
+            1_215,
+        ),
+    ] {
+        let token = if seller {
+            &s.seller.token
+        } else {
+            &s.buyer.token
+        };
+        let (status, body) = execute(
+            &s.app,
+            token,
+            &order_command(kind, order_id, revision, payload, number),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{kind}: {body}");
+    }
+}
+
+async fn actions(s: &Scenario) -> Vec<(String, String, Option<String>)> {
+    sqlx::query_as(
+        "SELECT kind, state, quarantine_reason FROM connector_order_actions \
+         ORDER BY kind, action_key",
+    )
+    .fetch_all(&s.app.pool)
+    .await
+    .expect("actions")
+}
+
+fn parked(kind: &str) -> (String, String, Option<String>) {
+    (
+        kind.to_string(),
+        "quarantined".to_string(),
+        Some("push_quarantined".to_string()),
+    )
+}
+
+fn waiting(kind: &str) -> (String, String, Option<String>) {
+    (kind.to_string(), "pending".to_string(), None)
+}
+
+/// The store rejects the push while it is in flight, so the push ends
+/// quarantined. `meanwhile` runs between the push being claimed and the
+/// store's answer, with the push `sending`.
+async fn reject_a_push_in_flight<F, Fut>(s: &Scenario, meanwhile: F)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    worker::consume_events(&s.app.state).await.expect("consume");
+    s.store.script(PushScript::Rejected("validation"));
+    let gate = s.store.open_gate();
+    let task = {
+        let state = s.app.state.clone();
+        tokio::spawn(async move { worker::drive_pushes(&state, 5).await.expect("worker") })
+    };
+    gate.entered.notified().await;
+    assert_eq!(s.push().await.0, "sending");
+    meanwhile().await;
+    gate.release.notify_one();
+    assert_eq!(task.await.expect("worker task"), 1);
+    let (state, _, reason, _) = s.push().await;
+    assert_eq!(state, "quarantined");
+    assert_eq!(reason.as_deref(), Some("validation"));
+}
+
+async fn quarantine_a_push(s: &Scenario) {
+    s.store.script(PushScript::Rejected("validation"));
+    s.pass().await;
+    let (state, _, reason, _) = s.push().await;
+    assert_eq!(state, "quarantined");
+    assert_eq!(reason.as_deref(), Some("validation"));
+}
+
+/// The seller's retry. The earlier attempt in truth reached the store, so
+/// the lookup before the push finds the order.
+async fn retry_after_the_store_took_the_order(s: &Scenario) -> serde_json::Value {
+    s.store
+        .plant_order(s.order.order_id.parse().expect("order id"), "ext-planted");
+    let (status, queued) = api(
+        &s.app,
+        "POST",
+        &format!(
+            "/v1/connectors/{}/pushes/{}/retry",
+            s.connection, s.order.order_id
+        ),
+        Some(&s.seller.token),
+        &json!(null),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{queued}");
+    queued
+}
+
+async fn pushes_view(s: &Scenario) -> serde_json::Value {
+    let (status, pushes) = api(
+        &s.app,
+        "GET",
+        &format!("/v1/connectors/{}/pushes", s.connection),
+        Some(&s.seller.token),
+        &json!(null),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    pushes
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_cancel_queued_while_the_push_is_in_flight_is_parked_by_its_quarantine_and_runs_after_a_retry(
+    pool: PgPool,
+) {
+    let s = scenario(pool).await;
+    reject_a_push_in_flight(&s, || async {
+        cancel_order(&s).await;
+        worker::consume_events(&s.app.state).await.expect("consume");
+        assert_eq!(actions(&s).await, vec![waiting("cancel")]);
+    })
+    .await;
+
+    assert_eq!(
+        actions(&s).await,
+        vec![parked("cancel")],
+        "the cancel does not stay queued behind a push that can no longer create"
+    );
+    let view = pushes_view(&s).await;
+    assert_eq!(view["pushes"][0]["actions"][0]["state"], "quarantined");
+    assert_eq!(
+        view["pushes"][0]["actions"][0]["quarantine_reason"],
+        "push_quarantined"
+    );
+    assert_eq!(
+        worker::drive_actions(&s.app.state, 5).await.expect("drive"),
+        0
+    );
+    assert_eq!(s.store.cancel_calls.load(Ordering::SeqCst), 0);
+
+    let queued = retry_after_the_store_took_the_order(&s).await;
+    assert_eq!(queued["push"]["actions"][0]["state"], "pending");
+    assert_eq!(actions(&s).await, vec![waiting("cancel")]);
+    s.pass().await;
+    let (state, external, _, _) = s.push().await;
+    assert_eq!(
+        (state.as_str(), external.as_deref()),
+        ("created", Some("ext-planted"))
+    );
+    assert_eq!(s.store.cancel_calls.load(Ordering::SeqCst), 1);
+    assert!(s.store.remote_orders()[0].cancelled);
+    assert_eq!(
+        actions(&s).await,
+        vec![("cancel".to_string(), "done".to_string(), None)]
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_refund_recorded_while_the_push_is_in_flight_is_parked_by_its_quarantine_and_runs_after_a_retry(
+    pool: PgPool,
+) {
+    let s = scenario(pool).await;
+    reject_a_push_in_flight(&s, || async {
+        refund_order(&s).await;
+        worker::consume_events(&s.app.state).await.expect("consume");
+        assert_eq!(actions(&s).await, vec![waiting("refund")]);
+    })
+    .await;
+
+    assert_eq!(actions(&s).await, vec![parked("refund")]);
+    assert_eq!(s.store.refund_calls.load(Ordering::SeqCst), 0);
+
+    retry_after_the_store_took_the_order(&s).await;
+    s.pass().await;
+    assert_eq!(s.push().await.0, "created");
+    assert_eq!(s.store.refund_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        actions(&s).await,
+        vec![("refund".to_string(), "done".to_string(), None)]
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_cancel_recorded_on_a_quarantined_push_waits_for_the_retry(pool: PgPool) {
+    let s = scenario(pool).await;
+    quarantine_a_push(&s).await;
+    cancel_order(&s).await;
+    s.pass().await;
+    assert_eq!(actions(&s).await, vec![parked("cancel")]);
+    assert_eq!(s.store.cancel_calls.load(Ordering::SeqCst), 0);
+
+    retry_after_the_store_took_the_order(&s).await;
+    s.pass().await;
+    assert_eq!(s.push().await.0, "created");
+    assert_eq!(s.store.cancel_calls.load(Ordering::SeqCst), 1);
+    assert!(s.store.remote_orders()[0].cancelled);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_refund_recorded_on_a_quarantined_push_waits_for_the_retry(pool: PgPool) {
+    let s = scenario(pool).await;
+    quarantine_a_push(&s).await;
+    refund_order(&s).await;
+    s.pass().await;
+    assert_eq!(actions(&s).await, vec![parked("refund")]);
+    assert_eq!(s.store.refund_calls.load(Ordering::SeqCst), 0);
+
+    retry_after_the_store_took_the_order(&s).await;
+    s.pass().await;
+    assert_eq!(s.push().await.0, "created");
+    assert_eq!(s.store.refund_calls.load(Ordering::SeqCst), 1);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_retry_that_finds_no_store_order_for_a_refunded_order_withholds_it_and_leaves_no_action(
+    pool: PgPool,
+) {
+    let s = scenario(pool).await;
+    quarantine_a_push(&s).await;
+    refund_order(&s).await;
+    s.pass().await;
+    assert_eq!(actions(&s).await, vec![parked("refund")]);
+
+    let (status, _) = api(
+        &s.app,
+        "POST",
+        &format!(
+            "/v1/connectors/{}/pushes/{}/retry",
+            s.connection, s.order.order_id
+        ),
+        Some(&s.seller.token),
+        &json!(null),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    s.pass().await;
+    let (state, _, reason, _) = s.push().await;
+    assert_eq!(state, "quarantined");
+    assert_eq!(reason.as_deref(), Some("order_cancelled_before_push"));
+    assert_eq!(
+        actions(&s).await,
+        Vec::<(String, String, Option<String>)>::new(),
+        "no store order exists, so there is nothing to mirror"
+    );
+    assert_eq!(s.store.refund_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        s.store.pushes(),
+        1,
+        "the refunded order is not pushed again"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_refund_recorded_while_the_push_is_pending_never_leaves_an_action_behind(pool: PgPool) {
+    let s = scenario(pool).await;
+    worker::consume_events(&s.app.state).await.expect("consume");
+    assert_eq!(s.push().await.0, "pending");
+    refund_order(&s).await;
+    worker::consume_events(&s.app.state).await.expect("consume");
+    assert_eq!(
+        actions(&s).await,
+        vec![waiting("refund")],
+        "a refund seen before the push starts is queued, not dropped"
+    );
+
+    s.pass().await;
+    let (state, _, reason, _) = s.push().await;
+    assert_eq!(state, "quarantined");
+    assert_eq!(reason.as_deref(), Some("order_cancelled_before_push"));
+    assert_eq!(
+        actions(&s).await,
+        Vec::<(String, String, Option<String>)>::new()
+    );
+    assert_eq!(s.store.pushes(), 0);
+    assert_eq!(s.store.refund_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        common::count(&s.app.pool, "SELECT COUNT(*) FROM connector_alerts").await,
+        0
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_cancel_and_a_refund_recorded_before_the_push_start_leave_no_action(pool: PgPool) {
+    let s = scenario(pool).await;
+    worker::consume_events(&s.app.state).await.expect("consume");
+    cancel_order(&s).await;
+    let (status, body) = execute(
+        &s.app,
+        &s.seller.token,
+        &order_command(
+            "refund.record_external",
+            &s.order.order_id,
+            4,
+            json!({ "amount_minor": s.order.total_minor, "transaction_id": "bitcoin-tx-2" }),
+            1_403,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    s.pass().await;
+    let (state, _, reason, _) = s.push().await;
+    assert_eq!(state, "quarantined");
+    assert_eq!(reason.as_deref(), Some("order_cancelled_before_push"));
+    assert_eq!(
+        actions(&s).await,
+        Vec::<(String, String, Option<String>)>::new()
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_refund_queued_on_a_pending_push_is_applied_once_the_push_creates_the_order(
+    pool: PgPool,
+) {
+    let s = scenario(pool).await;
+    worker::consume_events(&s.app.state).await.expect("consume");
+    assert_eq!(s.push().await.0, "pending");
+    let order_id: Uuid = s.order.order_id.parse().expect("order id");
+    let mut tx = s.app.pool.begin().await.expect("tx");
+    assert!(ledger::has_mirrorable_push(&mut tx, order_id)
+        .await
+        .expect("mirrorable"));
+    ledger::on_refund_recorded(
+        &mut tx,
+        s.app.clock.now(),
+        order_id,
+        "refund-1",
+        &json!({
+            "amount_minor": 1_000,
+            "amount_unit": "sat",
+            "transaction_id": "bitcoin-tx-9",
+            "order_total_minor": s.order.total_minor,
+            "order_currency": "USD",
+            "order_exponent": 2,
+            "full": false,
+        }),
+        Uuid::new_v4(),
+    )
+    .await
+    .expect("queue the refund");
+    tx.commit().await.expect("commit");
+    assert_eq!(actions(&s).await, vec![waiting("refund")]);
+    assert_eq!(
+        worker::drive_actions(&s.app.state, 5).await.expect("drive"),
+        0,
+        "the refund waits for the store order"
+    );
+
+    s.pass().await;
+    assert_eq!(s.push().await.0, "created");
+    assert_eq!(s.store.refund_calls.load(Ordering::SeqCst), 1);
+    let refund = s
+        .store
+        .last_refund
+        .lock()
+        .expect("refund lock")
+        .clone()
+        .expect("a refund was recorded");
+    assert_eq!(refund.amount_minor, Some(1_000));
+    assert_eq!(refund.transaction_id.as_deref(), Some("bitcoin-tx-9"));
+    assert!(!refund.full);
+    assert_eq!(
+        actions(&s).await,
+        vec![("refund".to_string(), "done".to_string(), None)]
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_cancel_of_a_pending_push_drops_the_mirror_already_queued_for_it(pool: PgPool) {
+    let s = scenario(pool).await;
+    worker::consume_events(&s.app.state).await.expect("consume");
+    let order_id: Uuid = s.order.order_id.parse().expect("order id");
+    let now = s.app.clock.now();
+    let mut tx = s.app.pool.begin().await.expect("tx");
+    ledger::on_refund_recorded(
+        &mut tx,
+        now,
+        order_id,
+        "refund-1",
+        &json!({ "amount_minor": 1_000 }),
+        Uuid::new_v4(),
+    )
+    .await
+    .expect("queue the refund");
+    ledger::on_order_cancelled(&mut tx, now, order_id, "cancelled", Uuid::new_v4())
+        .await
+        .expect("cancel");
+    tx.commit().await.expect("commit");
+    let (state, _, reason, _) = s.push().await;
+    assert_eq!(state, "quarantined");
+    assert_eq!(reason.as_deref(), Some("order_cancelled_before_push"));
+    assert_eq!(
+        actions(&s).await,
+        Vec::<(String, String, Option<String>)>::new(),
+        "a push set aside for good leaves no queued mirror"
+    );
+}

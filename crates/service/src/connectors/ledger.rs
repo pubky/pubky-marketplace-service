@@ -22,8 +22,15 @@
 //!   worker asks the store whether the order exists before it pushes.
 //! * `SELECT ... FOR UPDATE SKIP LOCKED` hands one row to one worker.
 //! * Recording `created` also deletes the order's connector address
-//!   envelope, in the same transaction: once the store order exists the
-//!   service has no further use for the address.
+//!   envelope, in the same transaction, but only when the buyer shared it
+//!   with this push's own store: one order can push to two stores, and the
+//!   push to the other store must leave the envelope for the store that was
+//!   chosen.
+//! * A quarantined push takes its pending cancel and refund mirrors with it,
+//!   in the same transaction (`settle_actions_of_quarantined_push`): they are
+//!   set aside as `push_quarantined` and a seller retry of the push puts them
+//!   back, or, when the order was cancelled before any push, dropped, because
+//!   no store order can ever exist for them.
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -90,6 +97,17 @@ pub mod reason {
     pub const PROVIDER_REJECTED: &str = "provider_rejected";
     pub const MAX_ATTEMPTS_EXCEEDED: &str = "max_attempts_exceeded";
 }
+
+/// The `quarantine_reason` of a mirror action set aside because its push is
+/// quarantined. A seller retry of the push puts these actions back.
+pub const ACTION_PUSH_QUARANTINED: &str = "push_quarantined";
+
+/// A push that a cancel or refund can still be mirrored onto: one that has
+/// created, or may yet create, a store order. A push set aside because the
+/// order was cancelled before it was sent is not: no store order exists and a
+/// retry is withheld again. Expects the push aliased as `p`.
+const MIRRORABLE_PUSH: &str = "(p.state IN ('pending', 'sending', 'created') \
+     OR (p.state = 'quarantined' AND p.quarantine_reason <> 'order_cancelled_before_push'))";
 
 /// Adds the ledger row for an order, once. Returns whether this call
 /// created it; a duplicate delivery of the same event creates nothing.
@@ -166,8 +184,8 @@ pub async fn claim_next_push(
 }
 
 /// The attempt succeeded: the store holds the order. The order's connector
-/// address envelope, if the buyer shared one, is deleted in the same
-/// transaction.
+/// address envelope is deleted in the same transaction when the buyer shared
+/// it with this push's store.
 pub async fn mark_created(
     pool: &PgPool,
     claim: &PushRow,
@@ -188,26 +206,36 @@ pub async fn mark_created(
     .await?
     .rows_affected();
     if changed == 1 {
-        delete_address_envelope(&mut *tx, claim.pubky_order_id).await?;
+        delete_address_envelope(&mut *tx, claim.pubky_order_id, claim.connection_id).await?;
     }
     tx.commit().await?;
     Ok(changed == 1)
 }
 
-/// Clears the connector address envelope of an order. The consent columns
-/// stay: they are the record that the buyer opted in.
+/// Clears the connector address envelope of an order, only when it was shared
+/// with `connection_id`'s store: the order's share domain is the connection's
+/// shop and the envelope is sealed to the connection's recipient key. A push
+/// to any other store of the same order neither opens nor deletes it. The
+/// consent columns stay: they are the record that the buyer opted in.
 pub async fn delete_address_envelope<'e, E>(
     executor: E,
     pubky_order_id: Uuid,
+    connection_id: Uuid,
 ) -> Result<u64, sqlx::Error>
 where
     E: sqlx::Executor<'e, Database = Postgres>,
 {
     Ok(sqlx::query(
         "UPDATE orders SET connector_address_envelope = NULL, connector_key_id = NULL \
-         WHERE id = $1 AND connector_address_envelope IS NOT NULL",
+         WHERE id = $1 AND connector_address_envelope IS NOT NULL \
+           AND EXISTS ( \
+               SELECT 1 FROM connector_connections c \
+               JOIN connector_recipient_keys k ON k.connection_id = c.id \
+               WHERE c.id = $2 AND c.shop = orders.connector_share_domain \
+                 AND k.key_id = orders.connector_key_id)",
     )
     .bind(pubky_order_id)
+    .bind(connection_id)
     .execute(executor)
     .await?
     .rows_affected())
@@ -237,6 +265,9 @@ pub async fn quarantine_push(
     .execute(&mut *tx)
     .await?
     .rows_affected();
+    if changed == 1 {
+        settle_actions_of_quarantined_push(&mut tx, claim.id, reason, now).await?;
+    }
     if changed == 1 && !reason_is_informational(reason) {
         raise_alert(
             &mut *tx,
@@ -251,6 +282,52 @@ pub async fn quarantine_push(
     }
     tx.commit().await?;
     Ok(changed == 1)
+}
+
+/// Resolves the pending mirror actions of a push that was just quarantined,
+/// in the quarantine's transaction. None of them can run: the worker claims an
+/// action only once its push is `created`.
+///
+/// * The order was cancelled before any push: no store order exists or can,
+///   so there is nothing to mirror and the actions are dropped.
+/// * Any other reason: the actions are set aside as `push_quarantined`, which
+///   the seller sees on the push next to its own quarantine, and `retry_push`
+///   puts them back. A retry may find the order already in the store, and the
+///   cancel or refund must then reach it.
+async fn settle_actions_of_quarantined_push<'c>(
+    tx: &mut sqlx::Transaction<'c, Postgres>,
+    push_id: Uuid,
+    reason: &str,
+    now: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    if reason == self::reason::ORDER_CANCELLED_BEFORE_PUSH {
+        drop_actions_of_pushes(tx, &[push_id]).await
+    } else {
+        sqlx::query(
+            "UPDATE connector_order_actions SET state = 'quarantined', quarantine_reason = $2, \
+             lease_until = NULL, updated_at = $3 \
+             WHERE push_id = $1 AND state = 'pending'",
+        )
+        .bind(push_id)
+        .bind(ACTION_PUSH_QUARANTINED)
+        .bind(now)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+}
+
+async fn drop_actions_of_pushes<'c>(
+    tx: &mut sqlx::Transaction<'c, Postgres>,
+    push_ids: &[Uuid],
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "DELETE FROM connector_order_actions WHERE push_id = ANY($1) AND state = 'pending'",
+    )
+    .bind(push_ids)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 /// The store did not apply the request (rate limited): try again later,
@@ -320,6 +397,7 @@ pub async fn retry_push(
     pubky_order_id: Uuid,
     now: DateTime<Utc>,
 ) -> Result<RetryOutcome, sqlx::Error> {
+    let mut tx = pool.begin().await?;
     let queued: Option<PushRow> = sqlx::query_as(&format!(
         "UPDATE connector_order_push SET state = 'sending', quarantine_reason = NULL, \
          attempts = 0, lease_until = $3, next_attempt_at = $3, last_error = NULL, updated_at = $3 \
@@ -329,8 +407,21 @@ pub async fn retry_push(
     .bind(connection_id)
     .bind(pubky_order_id)
     .bind(now)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
+    if let Some(row) = &queued {
+        sqlx::query(
+            "UPDATE connector_order_actions SET state = 'pending', quarantine_reason = NULL, \
+             attempts = 0, next_attempt_at = $3, last_error = NULL, updated_at = $3 \
+             WHERE push_id = $1 AND state = 'quarantined' AND quarantine_reason = $2",
+        )
+        .bind(row.id)
+        .bind(ACTION_PUSH_QUARANTINED)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
     if let Some(row) = queued {
         let view = PushView::from_row(pool, row).await?;
         return Ok(RetryOutcome::Queued(Box::new(view)));
@@ -349,8 +440,11 @@ pub async fn retry_push(
 }
 
 /// A new event cancelled the order. A push that has not started is set
-/// aside, a created push gets a cancel action, and a push in flight gets the
-/// cancel action too, which runs once the push resolves to `created`.
+/// aside, and any mirror already queued for it is dropped: no store order
+/// exists. A created push gets a cancel action; so does a push in flight,
+/// which runs once the push resolves to `created`, and a quarantined one,
+/// which the cancel waits on until a seller retry (the retry may find the
+/// order in the store).
 pub async fn on_order_cancelled<'c>(
     tx: &mut sqlx::Transaction<'c, Postgres>,
     now: DateTime<Utc>,
@@ -358,37 +452,58 @@ pub async fn on_order_cancelled<'c>(
     reason: &str,
     source_event_id: Uuid,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
+    let set_aside: Vec<Uuid> = sqlx::query_scalar(
         "UPDATE connector_order_push SET state = 'quarantined', quarantine_reason = $2, \
          last_error = NULL, updated_at = $3 \
-         WHERE pubky_order_id = $1 AND state = 'pending'",
+         WHERE pubky_order_id = $1 AND state = 'pending' RETURNING id",
     )
     .bind(pubky_order_id)
     .bind(self::reason::ORDER_CANCELLED_BEFORE_PUSH)
     .bind(now)
-    .execute(&mut **tx)
+    .fetch_all(&mut **tx)
     .await?;
-    sqlx::query(
+    drop_actions_of_pushes(tx, &set_aside).await?;
+    sqlx::query(&format!(
         "INSERT INTO connector_order_actions \
-         (id, push_id, kind, action_key, state, payload, attempts, next_attempt_at, \
-          source_event_id, created_at, updated_at) \
-         SELECT md5(p.id::text || '|cancel|cancel')::uuid, p.id, 'cancel', 'cancel', 'pending', \
+         (id, push_id, kind, action_key, state, quarantine_reason, payload, attempts, \
+          next_attempt_at, source_event_id, created_at, updated_at) \
+         SELECT md5(p.id::text || '|cancel|cancel')::uuid, p.id, 'cancel', 'cancel', \
+                CASE WHEN p.state = 'quarantined' THEN 'quarantined' ELSE 'pending' END, \
+                CASE WHEN p.state = 'quarantined' THEN $5::text END, \
                 $2, 0, $3, $4, $3, $3 \
          FROM connector_order_push p \
-         WHERE p.pubky_order_id = $1 AND p.state IN ('created', 'sending') \
-         ON CONFLICT (push_id, kind, action_key) DO NOTHING",
-    )
+         WHERE p.pubky_order_id = $1 AND p.state IN ('created', 'sending', 'quarantined') \
+           AND {MIRRORABLE_PUSH} \
+         ON CONFLICT (push_id, kind, action_key) DO NOTHING"
+    ))
     .bind(pubky_order_id)
     .bind(serde_json::json!({ "reason": reason }))
     .bind(now)
     .bind(source_event_id)
+    .bind(ACTION_PUSH_QUARANTINED)
     .execute(&mut **tx)
     .await?;
     Ok(())
 }
 
+/// Whether a refund recorded on the order has a push to be mirrored onto.
+pub async fn has_mirrorable_push<'c>(
+    tx: &mut sqlx::Transaction<'c, Postgres>,
+    pubky_order_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(&format!(
+        "SELECT EXISTS (SELECT 1 FROM connector_order_push p \
+         WHERE p.pubky_order_id = $1 AND {MIRRORABLE_PUSH})"
+    ))
+    .bind(pubky_order_id)
+    .fetch_one(&mut **tx)
+    .await
+}
+
 /// A refund was recorded on the Pubky order: mirror it, once per refund
-/// event, onto every push that created or may create a store order.
+/// event, onto every push that created or may create a store order: one
+/// still `pending` or in flight queues it for after the creation, one
+/// quarantined holds it set aside until a seller retry.
 pub async fn on_refund_recorded<'c>(
     tx: &mut sqlx::Transaction<'c, Postgres>,
     now: DateTime<Utc>,
@@ -397,21 +512,24 @@ pub async fn on_refund_recorded<'c>(
     payload: &Value,
     source_event_id: Uuid,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
+    sqlx::query(&format!(
         "INSERT INTO connector_order_actions \
-         (id, push_id, kind, action_key, state, payload, attempts, next_attempt_at, \
-          source_event_id, created_at, updated_at) \
-         SELECT md5(p.id::text || '|refund|' || $2::text)::uuid, p.id, 'refund', $2, 'pending', \
+         (id, push_id, kind, action_key, state, quarantine_reason, payload, attempts, \
+          next_attempt_at, source_event_id, created_at, updated_at) \
+         SELECT md5(p.id::text || '|refund|' || $2::text)::uuid, p.id, 'refund', $2, \
+                CASE WHEN p.state = 'quarantined' THEN 'quarantined' ELSE 'pending' END, \
+                CASE WHEN p.state = 'quarantined' THEN $6::text END, \
                 $3, 0, $4, $5, $4, $4 \
          FROM connector_order_push p \
-         WHERE p.pubky_order_id = $1 AND p.state IN ('created', 'sending') \
-         ON CONFLICT (push_id, kind, action_key) DO NOTHING",
-    )
+         WHERE p.pubky_order_id = $1 AND {MIRRORABLE_PUSH} \
+         ON CONFLICT (push_id, kind, action_key) DO NOTHING"
+    ))
     .bind(pubky_order_id)
     .bind(refund_key)
     .bind(payload)
     .bind(now)
     .bind(source_event_id)
+    .bind(ACTION_PUSH_QUARANTINED)
     .execute(&mut **tx)
     .await?;
     Ok(())
