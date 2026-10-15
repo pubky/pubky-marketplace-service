@@ -1992,6 +1992,19 @@ fn validate_ship_order(
     let mut issues = Vec::new();
     validate_trimmed("payload.carrier", &mut payload.carrier, 1, 100, &mut issues);
     validate_printable("payload.carrier", &payload.carrier, &mut issues);
+    // Blank means "no tracking", but the length bound still applies to what
+    // the caller sent: a blank value over the bound is refused, not read as
+    // an absent number.
+    if payload
+        .tracking_number
+        .as_deref()
+        .is_some_and(|number| number.chars().count() > 200 && number.trim().is_empty())
+    {
+        issues.push(issue(
+            "payload.tracking_number",
+            "Expected between 1 and 200 characters",
+        ));
+    }
     if let Some(number) = payload.tracking_number.as_mut() {
         *number = number.trim().to_string();
     }
@@ -1999,6 +2012,7 @@ fn validate_ship_order(
         .tracking_number
         .as_deref()
         .is_some_and(|number| number.is_empty())
+        && issues.is_empty()
     {
         payload.tracking_number = None;
     }
@@ -3426,6 +3440,45 @@ mod tests {
             json!({ "order_id": order_id }),
         ))
         .is_err());
+    }
+
+    #[test]
+    fn blank_tracking_over_the_length_bound_is_refused_not_read_as_none() {
+        let order_id = "00000000-0000-4000-8000-00000000aaaa";
+        for blank in [" ".repeat(201), "\t".repeat(500), " ".repeat(10_000)] {
+            for kind in ["fulfillment.ship", "fulfillment.update_tracking"] {
+                let issues = parse_command(&order_command_json(
+                    kind,
+                    json!({ "order_id": order_id, "carrier": "Other", "tracking_number": blank }),
+                ))
+                .expect_err("over-length blank tracking is invalid");
+                assert!(
+                    issues.iter().any(|i| i.path == "payload.tracking_number"),
+                    "{kind}: {issues:?}"
+                );
+            }
+        }
+        // Exactly at the bound a blank value is still "no tracking" on ship.
+        let command = parse_command(&order_command_json(
+            "fulfillment.ship",
+            json!({ "order_id": order_id, "carrier": "Other", "tracking_number": " ".repeat(200) }),
+        ))
+        .expect("200 blanks ship without tracking");
+        let CommandPayload::ShipOrder(ship) = &command.payload else {
+            panic!("expected ship payload");
+        };
+        assert_eq!(ship.tracking_number, None);
+        // A real number padded past the bound is trimmed first, as before.
+        let padded = format!("{}T-1{}", " ".repeat(150), " ".repeat(150));
+        let command = parse_command(&order_command_json(
+            "fulfillment.ship",
+            json!({ "order_id": order_id, "carrier": "Other", "tracking_number": padded }),
+        ))
+        .expect("padded number is valid");
+        let CommandPayload::ShipOrder(ship) = &command.payload else {
+            panic!("expected ship payload");
+        };
+        assert_eq!(ship.tracking_number.as_deref(), Some("T-1"));
     }
 
     #[test]
