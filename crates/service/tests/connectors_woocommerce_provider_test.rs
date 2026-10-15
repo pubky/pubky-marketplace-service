@@ -1210,7 +1210,7 @@ async fn an_order_applied_late_after_the_client_gave_up_is_never_pushed_twice() 
         assert_eq!(body["status"], "cancelled");
         assert_eq!(body["meta_data"][0]["value"], "duplicate push");
         assert!(
-            cancelled[0].path.ends_with(&format!("/{}", kept.id)) == false,
+            !cancelled[0].path.ends_with(&format!("/{}", kept.id)),
             "not the kept order"
         );
         replay.assert_no_misses();
