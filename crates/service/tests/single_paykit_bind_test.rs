@@ -21,7 +21,7 @@ use common::*;
 use marketplace_service::clock::Clock;
 use marketplace_service::config::Config;
 use marketplace_service::payment_attempt::{MarketplaceAssets, MarketplaceContract};
-use marketplace_service::payments::PaykitApi;
+use marketplace_service::payments::{attempt_reference, PaykitApi};
 use marketplace_service::workers::drain_outbox;
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -2206,6 +2206,107 @@ async fn a_review_row_without_a_satoshi_total_lists_through_the_query_and_the_ad
     assert_eq!(row["order_id"], json!(order_id));
     assert!(row["total_sats"].is_null(), "{row}");
     assert_eq!(row["review_reason"], json!("other_rail"));
+}
+
+/// A writer that keeps every log line for the test to read.
+#[derive(Clone, Default)]
+struct LogBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogBuffer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log lock").extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
+    type Writer = LogBuffer;
+    fn make_writer(&self) -> LogBuffer {
+        self.clone()
+    }
+}
+
+impl LogBuffer {
+    fn capture() -> (Self, tracing::subscriber::DefaultGuard) {
+        let buffer = Self::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buffer.clone())
+            .with_ansi(false)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (buffer, guard)
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8(self.0.lock().expect("log lock").clone()).expect("utf-8 log")
+    }
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_fork_paykit_settlement_logs_no_alert_but_an_unknown_denomination_does(pool: PgPool) {
+    let (logs, _guard) = LogBuffer::capture();
+    let f = fixture(
+        pool.clone(),
+        Setup {
+            api: PaykitApi::Fork,
+            multi_asset: false,
+            usdt_listed: false,
+            usdt_flag: false,
+            consent: false,
+            usd_listing: false,
+            ..Setup::both()
+        },
+    )
+    .await;
+    enable_bitcoin(&f.app, &f.paykit, &f.seller).await;
+    let order = create_sat_order(&f.app, &f.seller, &f.buyer).await;
+    let order_id = uuid(&order.order_id);
+    let (status, body) = bind(&f, &order.order_id, "paykit").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    drain(&f).await;
+    f.paykit.set_status(
+        &attempt_reference(order_id, 1),
+        common::paykit_review::status_confirmed("exclusive", true, 2),
+    );
+    assert_eq!(poll_now(&f.app, f.app.clock.now()).await, 1);
+    assert_eq!(facts(&pool, &order.order_id).await.state, "paid");
+    assert!(
+        !logs.text().contains("ALERT"),
+        "a routine fork settlement is quiet:\n{}",
+        logs.text()
+    );
+
+    // An upstream order whose denomination is unknown and not NULL is a
+    // real fault and is alerted.
+    let g = fixture(pool.clone(), Setup::both()).await;
+    let active = active_order(&g).await;
+    sqlx::query("UPDATE orders SET paykit_asset = 'EUR' WHERE id = $1")
+        .bind(uuid(&active.order.order_id))
+        .execute(&pool)
+        .await
+        .expect("denomination");
+    g.paykit.set_marketplace_status(
+        active.invoice,
+        usdt_status(
+            active.invoice,
+            active.deadline,
+            usdt_leg(1, true, true, false),
+        ),
+    );
+    poll_now(&g.app, at(1)).await;
+    assert!(
+        logs.text()
+            .contains("ALERT paykit order carries a denomination this build does not know"),
+        "{}",
+        logs.text()
+    );
+    assert_eq!(
+        facts(&pool, &active.order.order_id).await.payment_asset,
+        None
+    );
 }
 
 // ---------------------------------------------------------------------------

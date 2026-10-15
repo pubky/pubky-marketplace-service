@@ -2063,6 +2063,11 @@ async fn record_settlement_rail(
         return Ok(());
     }
     let asset = observation.asset.unwrap_or(AcceptedAsset::Btc);
+    // A `paykit` order bound through the fork carries no denomination and no
+    // request terms by design: its rail is Bitcoin and nothing is recorded.
+    if order.paykit_asset.is_none() && order.paykit_amount_minor.is_none() {
+        return Ok(());
+    }
     let Some(denomination) = order
         .paykit_asset
         .as_deref()
