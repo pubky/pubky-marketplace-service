@@ -548,14 +548,16 @@ async fn migration_0023_adds_the_shared_manual_resolution_schema() {
 /// refund destinations 0054, owner-held priv data key custody releases 0055,
 /// per-order delivery terms 0056, sealed delivery addresses 0057, the purge of
 /// retired Stripe values 0058, listing deletion follower backoff 0059, and
-/// the single Paykit bind 0060, and multi-currency FX 0061.
+/// the single Paykit bind 0060, multi-currency FX 0061, and the update-tracking
+/// command kind 0071, and per-variant inventory 0070 (0062 to 0069 are the
+/// connectors', claimed by other open branches).
 fn sorted_migration_catalog(mut numbers: Vec<u32>) -> Vec<u32> {
     numbers.sort_unstable();
     numbers
 }
 
 #[test]
-fn migration_catalog_is_gapless_through_0061() {
+fn migration_catalog_is_gapless_through_0061_then_0071() {
     let numbers: Vec<u32> = std::fs::read_dir(MIGRATIONS_DIR)
         .expect("migrations dir")
         .filter_map(|entry| {
@@ -565,18 +567,12 @@ fn migration_catalog_is_gapless_through_0061() {
                 .and_then(|prefix| prefix.parse::<u32>().ok())
         })
         .collect();
-    // 0062 and later are claimed by lanes that land separately (0062 to 0069
-    // are the connectors', 0070 is per-variant inventory), so the rule is:
-    // 0001..=0061 gapless, then only later numbers.
-    let (base, later): (Vec<u32>, Vec<u32>) = sorted_migration_catalog(numbers)
-        .into_iter()
-        .partition(|number| *number <= 61);
+    let expected = (1..=61).chain([70, 71]).collect::<Vec<_>>();
     assert_eq!(
-        base,
-        (1..=61).collect::<Vec<_>>(),
-        "the raw catalog starts 0001..=0061, gapless"
+        sorted_migration_catalog(numbers),
+        expected,
+        "the raw catalog is 0001..=0061, gapless, then 0070 and 0071"
     );
-    assert!(later.iter().all(|number| *number >= 62));
 }
 
 #[test]
