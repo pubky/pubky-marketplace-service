@@ -1965,11 +1965,11 @@ async fn claim_due_paykit_orders(
                       AND o.paykit_expires_at + INTERVAL '24 hours' > $1) \
                   OR (p.state = 'confirmed' AND o.paykit_request_state = 'confirmed' \
                       AND o.payment_method = 'paykit' AND o.paykit_api = 'upstream' \
-                      AND o.paykit_second_rail_at IS NULL \
                       AND (o.payment_finality = 'pending' \
                            OR (o.payment_finality = 'reverted' \
                                AND o.payment_finality_at + INTERVAL '7 days' > $1) \
-                           OR (o.paykit_expires_at IS NOT NULL \
+                           OR (o.paykit_second_rail_at IS NULL \
+                               AND o.paykit_expires_at IS NOT NULL \
                                AND o.paykit_expires_at + INTERVAL '24 hours' > $1)))) \
              AND o.paykit_request_reference IS NOT NULL \
              AND (o.paykit_last_checked_at IS NULL OR o.paykit_last_checked_at <= $2) \

@@ -1201,6 +1201,67 @@ async fn money_on_both_rails_goes_to_manual_review_and_is_never_refunded(pool: P
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_both_rails_order_resolved_paid_on_usdt_still_waits_for_finality(pool: PgPool) {
+    let f = fixture(pool.clone(), Setup::both()).await;
+    let active = active_order(&f).await;
+    let order_id = active.order.order_id.clone();
+    let both = |finalized: bool, confirmations: u32| {
+        status_body(
+            active.invoice,
+            active.deadline,
+            StatusSpec {
+                payment_state: "confirmed",
+                bitcoin: Some(bitcoin_leg(3, true)),
+                usdt: Some(usdt_leg(confirmations, true, true, finalized)),
+                paid_asset: Some("USDT"),
+            },
+        )
+    };
+    f.paykit
+        .set_marketplace_status(active.invoice, both(false, 1));
+    assert_eq!(poll_now(&f.app, at(1)).await, 1);
+    let stored = facts(&pool, &order_id).await;
+    assert_eq!(stored.payment_asset.as_deref(), Some("USDT"));
+    assert_eq!(stored.payment_finality.as_deref(), Some("pending"));
+    assert_eq!(payment_row(&pool, &order_id).await.0, "manual_review");
+
+    let (status, body) = resolve_call(
+        &f.app,
+        &f.seller.token,
+        &order_id,
+        Some(Uuid::new_v4()),
+        &json!({ "outcome": "paid", "reason": "returned the Bitcoin payment" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "resolve failed: {body}");
+    let stored = facts(&pool, &order_id).await;
+    assert_eq!(stored.state, "paid");
+    let (status, body) = execute(
+        &f.app,
+        &f.seller.token,
+        &ship(&order_id, stored.revision, 21),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["reason"], json!("payment_not_final"));
+
+    // The paid order keeps polling for finality although a second rail was
+    // already recorded.
+    f.paykit
+        .set_marketplace_status(active.invoice, both(true, 400));
+    assert_eq!(poll_now(&f.app, at(2)).await, 1);
+    let stored = facts(&pool, &order_id).await;
+    assert_eq!(stored.payment_finality.as_deref(), Some("final"));
+    let (status, body) = execute(
+        &f.app,
+        &f.seller.token,
+        &ship(&order_id, stored.revision, 22),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "ship once final: {body}");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn money_on_the_other_rail_after_settlement_is_held_for_an_operator_once(pool: PgPool) {
     let f = fixture(pool.clone(), Setup::both()).await;
     let active = active_order(&f).await;
