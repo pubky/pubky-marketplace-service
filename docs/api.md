@@ -328,8 +328,10 @@ request failed, so clients should branch on HTTP status first, and parse
    current homeserver record for a listing is not `active`. `reason` is
    `listing_paused`, `listing_ended` or `listing_removed` (also used when the
    homeserver no longer has the record), or `listing_not_active` for any other
-   state. When the homeserver cannot answer, those commands are refused with
-   `UPSTREAM_UNAVAILABLE` instead (see
+   state. `offer.checkout`, the first `payment.prepare_locks`, `auction.close`
+   and `POST /v0/orders/{id}/payment-method` are refused only for
+   `listing_removed`. When the homeserver cannot answer, those commands are
+   refused with `UPSTREAM_UNAVAILABLE` instead (see
    [Listing lifecycle](../README.md#listing-lifecycle)).
 
 ### Automation error codes
