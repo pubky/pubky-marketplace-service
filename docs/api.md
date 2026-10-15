@@ -1008,8 +1008,10 @@ authorize page; after a verified callback it exchanges the code for an offline
 access token (sealed per connection) and then subscribes `inventory_levels/update`,
 `fulfillments/create`, `orders/cancelled`, `refunds/create` and `app/uninstalled`
 to the connection's webhooks URL through `webhookSubscriptionCreate`. A repeat
-install subscribes nothing twice and removes stale subscriptions this service made
-for another address. Webhooks are verified with the base64 HMAC-SHA256 of the raw
+install reads the subscription list page by page, subscribes nothing twice (a
+create that loses a race to a concurrent install is confirmed by re-reading the
+list, not by interpreting the message) and removes stale subscriptions this
+service made for another address. Webhooks are verified with the base64 HMAC-SHA256 of the raw
 body under the connection's app secret (`X-Shopify-Hmac-Sha256`), and deduplicated
 on `X-Shopify-Event-Id`.
 
@@ -1021,18 +1023,38 @@ on `X-Shopify-Event-Id`.
   one manual `SALE` transaction named `Pubky <rail>`, tags `pubky` and
   `pubky-order-{id}`, the `pubky_order_id` attribute, inventory decremented
   ignoring the store's oversell policy, no receipt and no customer. A shipping
-  address is attached only when the buyer opted in. The order currency must be the
-  store's currency and lines plus shipping must equal the total, else the push is
-  refused (`currency_mismatch`, `total_mismatch`). `orderCreate` has no
-  idempotency key, so after an unknown outcome the order is looked up by its tag
-  (search, then the most recent orders, since search lags a create) before any
-  second push.
+  address is attached only when the buyer opted in. Amounts are formatted with the
+  currency's own exponent, and an order whose exponent differs is refused
+  (`exponent_mismatch`). The order currency must be the store's currency (else
+  `currency_mismatch`: the push is quarantined and the seller alert says why and
+  what to do; Pubky never converts) and lines plus shipping must equal the total
+  (`total_mismatch`). `orderCreate` has no idempotency key, so after an unknown
+  outcome the order is looked up by its tag before any second push: the tag
+  search first, then, because search lags a create, the store's orders created in
+  the last 24 hours newest first, up to 10 pages of 50. If that bound is reached
+  with orders still inside the 24 hours unread, the lookup answers "cannot tell"
+  (an unknown outcome the worker retries) instead of "not found", so a busy store
+  never gets a second copy on a guess.
 - **Cancel and refund.** A Pubky cancel is `orderCancel` with `restock: true`, no
   refund and no customer email; a store order already cancelled is left alone. A
   Pubky refund is `refundCreate` with a manual `REFUND` transaction against the
-  order's sale, under an `@idempotent` key derived from the Pubky refund id. A
-  partial refund that is not in the order currency (sats, USDT) cannot be stated
-  in the store's books and is refused (`refund_amount_unconvertible`).
+  order's sale. The recorded amount (`refund.record_external`) is validated
+  against the order total, so it is in the order currency's minor units on every
+  rail, Bitcoin and USDT included; no conversion happens, and the store refund's
+  note says so, adds how the order was paid (the order's own Bitcoin quote or
+  USDT basis, and its USD conversion when it has one) and ends with a mark
+  `pubky-refund:{refund id}:{minor}:{CUR}`. The recorded amount is the Pubky
+  books' refunded **total**, so the store gets only the difference to what it
+  already shows refunded (`totalRefundedSet`): a larger record after a partial
+  one refunds the rest, a repeat or an already covered record sends nothing, and
+  the total never exceeds the payment (`refund_exceeds_payment` if Pubky claims
+  more). The `@idempotent` key covers the Pubky refund id and that difference.
+  The refund must be in the store order's currency (`currency_mismatch`) and a
+  unit other than the order currency, or no amount, is refused
+  (`refund_amount_unconvertible`, `refund_amount_missing`). A cancel the store
+  refuses is judged by reading the order, not the message: cancelled means done,
+  otherwise it is retried. Actions of one push (a cancel and refunds) run one at
+  a time.
 - **Rate limits.** The cost-based throttle is tracked per shop; a throttled or
   429 answer is retried a couple of times inside the call, then handed to the
   worker's own backoff. A throttled call applied nothing, so even a mutation is
@@ -1043,8 +1065,18 @@ on `X-Shopify-Event-Id`.
   `order.cancel_approve` once the buyer has asked to cancel,
   `refund.record_external` for a cancelled, returned or digital order with no
   refund recorded; otherwise it is `null`. Cancels and refunds Pubky itself
-  mirrored to the store come back as webhooks and raise no alert.
-- **Variants.** `PUT /v1/connectors/{id}/settings` with
+  mirrored to the store come back as webhooks; one is recognised as that echo,
+  and raises no alert, only if the mirror was **applied** (`done`), finished at
+  most 6 hours before the webhook arrived and existed before it, and, for a
+  refund, the webhook's note carries the Pubky refund mark of that mirror with
+  the same amount. A mirror still running makes the webhook wait and be looked at
+  again; a mirror that never reached the store (pending, quarantined), a refund
+  without the mark, a mark with another amount and a webhook later than the
+  window all raise the alert. Refund amounts are summed per currency and a
+  refund in a currency other than the order's, or in several, says so in the
+  alert.
+- **Variants.** `PUT /v1/connectors/{id}/settings` (or `variant_mode` on
+  `POST /v1/connectors`, which answers `409 mappings_conflict` the same way) with
   `{"variant_mode": "native" | "split"}` (default `native`). In `native` mode
   several store variants may map to one Pubky listing's variants; their stock is
   applied per variant through the service's per-variant inventory, and skipped
