@@ -339,6 +339,25 @@ async fn on_refund_reversed(
     ledger::on_refund_reversed(tx, now, order_id, current.as_deref()).await
 }
 
+/// `rate, currency, exponent, quoted_sats, source, fetched_at`.
+type BitcoinQuoteRow = (
+    Option<String>,
+    Option<String>,
+    Option<i16>,
+    Option<i64>,
+    Option<String>,
+    Option<DateTime<Utc>>,
+);
+
+/// `asset, network, paid_minor, paid_exponent, basis`.
+type AssetQuoteRow = (
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<i16>,
+    Option<String>,
+);
+
 /// How the order converts a refund in `unit` to its own currency: the Bitcoin
 /// quote pinned at bind for `sat`, the USDT payment terms for `usdt`.
 async fn refund_quote(
@@ -349,14 +368,7 @@ async fn refund_quote(
     use super::provider::RefundQuote;
     match unit {
         "sat" => {
-            let row: Option<(
-                Option<String>,
-                Option<String>,
-                Option<i16>,
-                Option<i64>,
-                Option<String>,
-                Option<DateTime<Utc>>,
-            )> = sqlx::query_as(
+            let row: Option<BitcoinQuoteRow> = sqlx::query_as(
                 "SELECT bitcoin_quote_rate::text, bitcoin_quote_currency, bitcoin_quote_exponent, \
                  bitcoin_quoted_sats, bitcoin_quote_source, bitcoin_quote_fetched_at \
                  FROM orders WHERE id = $1",
@@ -378,13 +390,7 @@ async fn refund_quote(
             ))
         }
         "usdt" => {
-            let row: Option<(
-                Option<String>,
-                Option<String>,
-                Option<i64>,
-                Option<i16>,
-                Option<String>,
-            )> = sqlx::query_as(
+            let row: Option<AssetQuoteRow> = sqlx::query_as(
                 "SELECT payment_asset, payment_network, payment_amount_minor, payment_exponent, \
                  payment_quote_basis FROM orders WHERE id = $1",
             )
