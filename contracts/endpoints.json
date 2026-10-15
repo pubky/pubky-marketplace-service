@@ -63,7 +63,9 @@
       "resolution_not_applicable",
       "stock_unavailable",
       "refund_required",
-      "refund_destination_required"
+      "refund_destination_required",
+      "refund_rail_unknown",
+      "refund_amount_unrecordable"
     ],
     "request_schema": {
       "$schema": "http://json-schema.org/draft-07/schema#",

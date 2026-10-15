@@ -61,3 +61,25 @@ Historical captures under `tests/fixtures/paykit-server-67-75` predate provider
 description support and intentionally retain six-field prepare bodies. Current
 consumer tests use a signature-verifying producer double until new provider
 captures are available at a fixed reviewed provider revision.
+
+## The multi-asset prepare (`PAYKIT_MARKETPLACE_CONTRACT=multi_asset`)
+
+Once the deployment says the target paykit-server speaks the multi-asset
+Marketplace contract, new attempts of the `paykit` and `bitcoin` binds send
+this body instead (the legacy body above is unchanged and is still what the
+fork, an rc16 upstream and any deployment that has not set the contract send):
+
+| Member                   | Value                                                                   |
+| ------------------------ | ----------------------------------------------------------------------- |
+| `amount`                 | The request amount in base units as a digit string (cents or satoshis). |
+| `asset`                  | The denomination: `USD`, or `BTC` for a satoshi price.                  |
+| `accepted_assets`        | Optional narrowing, a subset of `BTC`, `USDT`; never an extension.      |
+| `creator`, `description`, `operation_id`, `payment_window_seconds`, `reader`, `reference` | As above. |
+
+The response must repeat `amount` and `asset` and carry `accepted_assets` and
+`payment_amounts` (one whole positive base-unit amount per offered asset);
+anything else is refused. Activation sends `{amount, asset, creator,
+invoice_id}` and the response must echo the persisted terms. The service
+records `paykit_amount_minor`, `paykit_accepted_assets` and
+`paykit_payment_amounts` on the order and checks the offer against the order
+price before it records anything (README, "The single Paykit bind").

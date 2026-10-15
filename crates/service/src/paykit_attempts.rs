@@ -79,7 +79,7 @@ pub(crate) async fn record_released_attempt(
          bitcoin_quoted_sats, bitcoin_quote_expires_at, bitcoin_quote_currency, \
          bitcoin_quote_exponent, bitcoin_quote_spread_bps, $2 FROM orders \
          WHERE id = $1 AND paykit_invoice_id IS NOT NULL AND paykit_api IS NOT NULL \
-         AND paykit_total_sats > 0 \
+         AND (paykit_total_sats > 0 OR paykit_amount_minor > 0) \
          AND ((paykit_api = 'fork' AND paykit_stack_id IS NOT NULL AND paykit_stack_endpoint IS NOT NULL) \
               OR (paykit_api = 'upstream' AND paykit_stack_id IS NULL AND paykit_stack_endpoint IS NULL)) \
          ON CONFLICT (order_id, invoice_id) DO NOTHING",
@@ -233,12 +233,17 @@ async fn apply_attempt_status(
         PaykitStatusOutcome::Confirmed { facts, .. }
         | PaykitStatusOutcome::AcceptancePending { facts }
         | PaykitStatusOutcome::Detected { facts } => facts.payment_deadline,
+        PaykitStatusOutcome::UsdtObserved {
+            payment_deadline, ..
+        } => Some(*payment_deadline),
         _ => None,
     };
     if attempt.paykit_api == "upstream" && attempt.expires_at.is_none() {
         if let Some(deadline) = recovered_deadline {
             sqlx::query(
-                "UPDATE paykit_superseded_attempts SET expires_at = $3 \
+                "UPDATE paykit_superseded_attempts SET expires_at = $3, \
+                 bitcoin_quote_expires_at = CASE \
+                     WHEN bitcoin_quote_rate IS NULL THEN NULL ELSE $3 END \
                  WHERE order_id = $1 AND invoice_id = $2 AND expires_at IS NULL",
             )
             .bind(attempt.order_id)
@@ -248,7 +253,23 @@ async fn apply_attempt_status(
             .await?;
         }
     }
+    // USDT money on a released attempt is never routed automatically: the
+    // released path restores Bitcoin pins and settles in satoshis. A USDT
+    // transfer in a block waits for an operator; one that is not in a block
+    // yet leaves the Bitcoin leg to decide.
+    let outcome = match outcome {
+        PaykitStatusOutcome::UsdtObserved { usdt, bitcoin, .. } => {
+            if usdt.included() {
+                return hold_released_usdt_for_review(state, attempt, &usdt, now).await;
+            }
+            *bitcoin
+        }
+        other => other,
+    };
     match outcome {
+        PaykitStatusOutcome::UsdtObserved { .. } => {
+            unreachable!("a USDT observation was unwrapped above")
+        }
         PaykitStatusOutcome::Confirmed {
             amount_matched,
             facts,
@@ -329,6 +350,42 @@ async fn apply_attempt_status(
     }
 }
 
+/// USDT money on a released attempt, held for an operator with the attempt
+/// and order untouched.
+async fn hold_released_usdt_for_review(
+    state: &AppState,
+    attempt: &WatchedAttempt,
+    usdt: &crate::payments::PaykitUsdtObservation,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    let details = serde_json::json!({
+        "status": "usdt_on_released_attempt",
+        "observed_at": now,
+        "observation": usdt.as_observation(),
+        "finalized": usdt.finalized,
+    });
+    let updated = sqlx::query(
+        "UPDATE paykit_superseded_attempts SET state = 'needs_review', \
+         review_reason = 'other_rail', observation = $3, closed_at = $4 \
+         WHERE order_id = $1 AND invoice_id = $2 AND state = 'watching'",
+    )
+    .bind(attempt.order_id)
+    .bind(attempt.invoice_id)
+    .bind(&details)
+    .bind(now)
+    .execute(&state.pool)
+    .await?;
+    if updated.rows_affected() == 1 {
+        tracing::error!(
+            order_id = %attempt.order_id,
+            invoice_id = %attempt.invoice_id,
+            code = "paykit_released_attempt_paid_in_usdt",
+            "ALERT a USDT transfer is included on a released paykit attempt; held for review"
+        );
+    }
+    Ok(updated.rows_affected() == 1)
+}
+
 /// The released attempt's pins and bind-time quote, read under the row lock.
 #[derive(Debug, sqlx::FromRow)]
 struct ReleasedPins {
@@ -341,7 +398,7 @@ struct ReleasedPins {
     operation_id: Option<String>,
     payment_window_seconds: Option<i32>,
     asset: Option<String>,
-    total_sats: i64,
+    total_sats: Option<i64>,
     expires_at: Option<DateTime<Utc>>,
     prepare_expires_at: Option<DateTime<Utc>>,
     allocation_mode: Option<String>,
@@ -503,6 +560,28 @@ async fn route_released_settlement(
         return Ok(false);
     }
     let frozen = observation_json("confirmed", amount_matched, observation, now, false);
+    // Only a Bitcoin amount can be restored: an attempt that offered no
+    // Bitcoin cannot have Bitcoin confirmed on it.
+    let Some(pinned_total_sats) = pins.total_sats else {
+        close_attempt(
+            &mut tx,
+            attempt,
+            "needs_review",
+            Some("upstream_inconsistent"),
+            &frozen,
+            now,
+        )
+        .await?;
+        tx.commit().await?;
+        tracing::error!(
+            order_id = %attempt.order_id,
+            invoice_id = %attempt.invoice_id,
+            code = "paykit_released_attempt_bitcoin_not_offered",
+            "ALERT Bitcoin confirmed on a released paykit attempt that offered none; \
+             held for review"
+        );
+        return Ok(true);
+    };
 
     // Another rail owns the payment: a fiat method, or an adapter other
     // than paykit (bitcoin) or sandbox (unbound). Locks pins `adapter`
@@ -510,7 +589,7 @@ async fn route_released_settlement(
     let other_rail = order
         .payment_method
         .as_deref()
-        .is_some_and(|method| method != "bitcoin")
+        .is_some_and(|method| !matches!(method, "bitcoin" | "paykit"))
         || !matches!(payment.adapter.as_str(), "paykit" | "sandbox");
     // An order waiting for its seller is settling on its current attempt:
     // only the seller or the seller-window reaper may move it, so money on
@@ -550,7 +629,9 @@ async fn route_released_settlement(
         }
     }
     sqlx::query(
-        "UPDATE orders SET payment_method = 'bitcoin', paykit_invoice_id = $2, paykit_api = $22, \
+        "UPDATE orders SET \
+         payment_method = CASE WHEN payment_method = 'paykit' THEN 'paykit' ELSE 'bitcoin' END, \
+         paykit_invoice_id = $2, paykit_api = $22, \
          paykit_request_reference = $3, paykit_stack_id = $4, paykit_stack_endpoint = $5, \
          paykit_total_sats = $6, paykit_expires_at = $7, paykit_prepare_expires_at = $8, \
          paykit_allocation_mode = $9, paykit_address_fingerprint = $10, \
@@ -562,6 +643,8 @@ async fn route_released_settlement(
          paykit_observation = $19, \
          paykit_observed_sats = $20, paykit_payment_reference = $23, \
          paykit_operation_id = $24, paykit_payment_window_seconds = $25, paykit_asset = $26, \
+         paykit_amount_minor = NULL, paykit_accepted_assets = NULL, \
+         paykit_payment_amounts = NULL, \
          paykit_seller_confirmation_entered_at = NULL, \
          paykit_seller_confirmation_deadline = NULL, updated_at = $21 WHERE id = $1",
     )
@@ -570,7 +653,7 @@ async fn route_released_settlement(
     .bind(pins.reference.unwrap_or_else(|| attempt.reference()))
     .bind(&identity.stack_id)
     .bind(&identity.stack_endpoint)
-    .bind(pins.total_sats)
+    .bind(pinned_total_sats)
     .bind(pins.expires_at)
     .bind(pins.prepare_expires_at)
     .bind(&pins.allocation_mode)
@@ -598,7 +681,7 @@ async fn route_released_settlement(
          currency = 'SAT', exponent = 0, updated_at = $3 WHERE id = $1",
     )
     .bind(payment.id)
-    .bind(pins.total_sats)
+    .bind(pinned_total_sats)
     .bind(now)
     .execute(&mut *tx)
     .await?;
@@ -716,7 +799,9 @@ pub struct NeedsReview {
     pub seller_pubky: String,
     pub buyer_pubky: String,
     pub review_reason: String,
-    pub total_sats: i64,
+    /// The satoshi total the attempt asked for; NULL when it offered no
+    /// Bitcoin (a USDT-only request).
+    pub total_sats: Option<i64>,
     pub observation: Option<serde_json::Value>,
     pub closed_at: DateTime<Utc>,
 }
@@ -739,10 +824,13 @@ pub enum ReviewOutcome {
     /// The buyer's money was returned; the note is the external refund
     /// reference. Allowed for every review reason.
     Refunded,
-    /// No money was confirmed, so no refund is due; the note is the reason.
-    /// Allowed only when no money was confirmed: `detected_unconfirmed` or
-    /// `upstream_inconsistent`. Confirmed money (`payment_settled`,
-    /// `other_rail`) is closed only by a refund.
+    /// No refund is due; the note is the reason. Allowed for
+    /// `detected_unconfirmed` and `upstream_inconsistent` only: a detection
+    /// that never confirmed, a lifecycle error, or, for a live USDT order held
+    /// at its finality bound (`observation.status` `usdt_finality_pending` or
+    /// `usdt_finality_reverted`), an operator who checked the Arbitrum
+    /// transfer and found nothing to refund. Money that was confirmed and
+    /// taken (`payment_settled`, `other_rail`) is closed only by a refund.
     Dismissed,
 }
 

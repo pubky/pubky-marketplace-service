@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use axum::http::HeaderValue;
 use url::Url;
 
-use crate::payment_attempt::MarketplaceAssets;
+use crate::payment_attempt::{MarketplaceAssets, MarketplaceContract};
 use crate::payments::{PaykitApi, ENV_PAYKIT_SERVER_API};
 use crate::refusal_audit::AuditKeys;
 
@@ -210,10 +210,17 @@ pub struct Config {
     /// lookups. It never gates polling, settlement, review or refunds of an
     /// order that already carries USDT terms.
     pub usdt_payments_enabled: bool,
-    /// The assets the deployed paykit-server's Marketplace prepare accepts
+    /// The assets the deployed paykit-server's Marketplace prepare can carry
     /// (`PAYKIT_MARKETPLACE_ASSETS`, default `BTC`). `USDT` is allowed only
-    /// with `PAYKIT_SERVER_API=upstream`.
+    /// with `PAYKIT_SERVER_API=upstream`, and is offered only when
+    /// `paykit_marketplace_contract` is `multi_asset` too.
     pub paykit_marketplace_assets: MarketplaceAssets,
+    /// Which request body the service sends to paykit-server's Marketplace
+    /// prepare and activate (`PAYKIT_MARKETPLACE_CONTRACT`, default
+    /// `legacy`). `multi_asset` needs `PAYKIT_SERVER_API=upstream` and is
+    /// independent of USDT: it is set once the deployed paykit-server speaks
+    /// the multi-asset contract, whether or not USDT is offered.
+    pub paykit_marketplace_contract: MarketplaceContract,
 }
 
 impl Config {
@@ -381,6 +388,10 @@ impl Config {
             std::env::var("PAYKIT_MARKETPLACE_ASSETS").ok().as_deref(),
             paykit_api,
         )?;
+        let paykit_marketplace_contract = MarketplaceContract::parse(
+            std::env::var("PAYKIT_MARKETPLACE_CONTRACT").ok().as_deref(),
+            paykit_api,
+        )?;
         Ok(Self {
             bind_addr,
             database_url,
@@ -434,6 +445,7 @@ impl Config {
             paypal_checkout_url,
             usdt_payments_enabled,
             paykit_marketplace_assets,
+            paykit_marketplace_contract,
         })
     }
 
@@ -499,6 +511,7 @@ impl Config {
             paypal_checkout_url: DEFAULT_PAYPAL_CHECKOUT_URL.to_string(),
             usdt_payments_enabled: false,
             paykit_marketplace_assets: MarketplaceAssets::BTC_ONLY,
+            paykit_marketplace_contract: MarketplaceContract::Legacy,
         }
     }
 }
@@ -754,7 +767,7 @@ mod tests {
         validate_postgres_url, Config, AUTOMATION_RATE_LIMIT_MAX_TOKENS,
         DEFAULT_AUTO_COMPLETE_DAYS, DEFAULT_DELIVERY_ASSUME_DAYS, DEFAULT_PAYPAL_CHECKOUT_URL,
     };
-    use crate::payment_attempt::MarketplaceAssets;
+    use crate::payment_attempt::{MarketplaceAssets, MarketplaceContract};
 
     /// Serializes the environment-mutating test (env is process-global).
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1170,6 +1183,7 @@ mod tests {
             ("REFUSAL_AUDIT_RESIDUAL_RISK_ACCEPTED", Some("true")),
             ("USDT_PAYMENTS_ENABLED", None),
             ("PAYKIT_MARKETPLACE_ASSETS", None),
+            ("PAYKIT_MARKETPLACE_CONTRACT", None),
             ("PAYKIT_SERVER_API", None),
         ];
         vars.extend_from_slice(extra);
@@ -1249,6 +1263,39 @@ mod tests {
             refused.to_string().contains("must include BTC"),
             "{refused}"
         );
+    }
+
+    #[test]
+    fn the_marketplace_contract_is_its_own_setting_and_defaults_to_legacy() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let config = from_env_with(&[]).expect("defaults parse");
+        assert_eq!(
+            config.paykit_marketplace_contract,
+            MarketplaceContract::Legacy
+        );
+        let config = from_env_with(&[
+            ("PAYKIT_SERVER_API", Some("upstream")),
+            ("PAYKIT_MARKETPLACE_CONTRACT", Some("multi_asset")),
+        ])
+        .expect("upstream takes the multi-asset contract with USDT off");
+        assert_eq!(
+            config.paykit_marketplace_contract,
+            MarketplaceContract::MultiAsset
+        );
+        assert!(!config.usdt_payments_enabled);
+        assert!(!config.paykit_marketplace_assets.includes_usdt());
+        for api in [None, Some("fork"), Some("not-an-api")] {
+            let refused = from_env_with(&[
+                ("PAYKIT_SERVER_API", api),
+                ("PAYKIT_MARKETPLACE_CONTRACT", Some("multi_asset")),
+            ])
+            .expect_err("the multi-asset contract needs upstream");
+            assert!(
+                refused.to_string().contains("PAYKIT_MARKETPLACE_CONTRACT"),
+                "{api:?}: {refused}"
+            );
+        }
+        assert!(from_env_with(&[("PAYKIT_MARKETPLACE_CONTRACT", Some("both"))]).is_err());
     }
 
     #[test]

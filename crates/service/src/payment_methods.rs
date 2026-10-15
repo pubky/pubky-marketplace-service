@@ -2,6 +2,11 @@
 //! (`/v0/sellers/*/payment-config`, `/v0/orders/{id}/payment-method`,
 //! `/v0/orders/{id}/fiat/*`).
 //!
+//! The one Paykit method is `paykit`: its request carries every asset the
+//! seller accepts (Bitcoin and USDT) and the order settles on the rail the
+//! buyer actually paid. `bitcoin` is the legacy Bitcoin-only Paykit bind and
+//! `usdt` the legacy USDT bind, which stays refused.
+//!
 //! Money-state rules:
 //! - Binding is one-shot per order: re-binding the SAME method is an
 //!   idempotent no-op; a different method is refused once one is bound
@@ -46,11 +51,13 @@ use crate::handlers::{
     order_json_with_reviews,
 };
 use crate::model::{OrderRow, PaymentRow};
-use crate::payment_attempt::{MarketplaceAssets, PaymentAsset, PaymentOption};
+use crate::payment_attempt::{
+    AcceptedAsset, MarketplaceAssets, OfferedAssets, PaymentAsset, PaymentOption,
+};
 use crate::payments::{
     attempt_reference, upstream_attempt_reference, upstream_operation_id, validate_paypal_email,
-    PaykitApi, PaykitClient, PaykitLifecycleTarget, PaykitPrepared, PaykitRequestError,
-    PaymentsRuntime, SetupAsset, SetupStatus,
+    MarketplaceRequestTerms, PaykitApi, PaykitAssetsPrepared, PaykitClient, PaykitLifecycleTarget,
+    PaykitPrepared, PaykitRequestError, PaymentsRuntime, SetupAsset, SetupStatus,
 };
 use crate::queries::PAYMENT_COLUMNS;
 use crate::AppState;
@@ -604,10 +611,24 @@ fn public_config_view(
         "bitcoin_offer_available": bitcoin_offer_available,
         "paypal_available": paypal_available,
     });
-    // Only while the USDT flag is on: the key is absent otherwise, so the
-    // body is byte-identical to a build without USDT.
+    // Only while the USDT flag is on: the keys are absent otherwise, so the
+    // body is byte-identical to a build without USDT. `paykit_available` is
+    // the one Paykit method the buyer is offered: the seller can receive
+    // Bitcoin or USDT through it. `accepted_assets` names which, so checkout
+    // can say "Bitcoin or USDT in Bitkit"; the order names what its request
+    // offered. A seller who takes only USDT is offered `["USDT"]`.
     if let Some(usdt_available) = usdt_available {
         view["usdt_available"] = json!(usdt_available);
+        let assets: Vec<&str> = [
+            (bitcoin_available, AcceptedAsset::Btc),
+            (usdt_available, AcceptedAsset::Usdt),
+        ]
+        .into_iter()
+        .filter(|(available, _)| *available)
+        .map(|(_, asset)| asset.as_str())
+        .collect();
+        view["paykit_available"] = json!(!assets.is_empty());
+        view["accepted_assets"] = json!(assets);
     }
     (StatusCode::OK, Json(view)).into_response()
 }
@@ -621,6 +642,9 @@ fn public_config_view(
 /// `bitcoin_offer_available` is the cached rail-wide Paykit gate. Older
 /// paykit-server responses without that field derive it from `status`.
 /// `paypal_available` is a stored merchant email.
+/// While the flag is on the body also carries `paykit_available` and
+/// `accepted_assets`: the one Paykit method the buyer is offered and the
+/// assets it can pay in (see [`public_config_view`]).
 /// `usdt_available` exists only while `USDT_PAYMENTS_ENABLED` is on and is
 /// true only when every one of these holds: the deployment speaks to upstream
 /// paykit-server, `PAYKIT_MARKETPLACE_ASSETS` lists USDT (the bind's own
@@ -711,7 +735,9 @@ pub async fn get_payment_config(
 /// neither a deployment that cannot prepare USDT nor a seller who never opted
 /// in costs a Paykit lookup.
 async fn seller_usdt_available(state: &AppState, seller_pubky: &str) -> Result<bool, sqlx::Error> {
-    if !state.config.paykit_marketplace_assets.includes_usdt() {
+    if !state.config.paykit_marketplace_assets.includes_usdt()
+        || !state.config.paykit_marketplace_contract.is_multi_asset()
+    {
         return Ok(false);
     }
     if !usdt_option_enabled(&state.pool, seller_pubky).await? {
@@ -888,9 +914,10 @@ enum UsdtUnavailableCause {
     PaykitNotUpstream,
     /// `PAYKIT_MARKETPLACE_ASSETS` does not list USDT.
     AssetNotAdvertised,
-    /// The upstream Marketplace prepare body is Bitcoin-only
-    /// (`amount_sats`), so it cannot carry a USDT request yet.
-    PrepareBitcoinOnly,
+    /// The deployment can carry USDT, but not through this method: USDT is
+    /// paid through the one `paykit` method, so a separate `usdt` bind has
+    /// nothing to bind and stays refused.
+    BindThroughPaykit,
 }
 
 fn usdt_unavailable_cause(
@@ -902,13 +929,13 @@ fn usdt_unavailable_cause(
     } else if !assets.includes_usdt() {
         UsdtUnavailableCause::AssetNotAdvertised
     } else {
-        UsdtUnavailableCause::PrepareBitcoinOnly
+        UsdtUnavailableCause::BindThroughPaykit
     }
 }
 
-/// The refusal of a `usdt` bind while the flag is on. The model, the flag
-/// and the columns exist, but the upstream prepare cannot carry USDT, so
-/// every USDT bind is refused until it can.
+/// The refusal of a legacy `usdt` bind while the flag is on. USDT is paid
+/// through the single `paykit` method, whose request carries every asset the
+/// seller accepts, so the separate `usdt` method is always refused.
 fn usdt_unavailable(state: &AppState, paykit_api: Option<PaykitApi>) -> Response {
     let cause = usdt_unavailable_cause(paykit_api, state.config.paykit_marketplace_assets);
     tracing::info!(cause = ?cause, "usdt bind refused");
@@ -951,6 +978,154 @@ fn fx_error_response(error: crate::fx::FxError) -> Response {
     method_error(ErrorCode::InvalidState, reason, message)
 }
 
+/// The payment methods a buyer may bind. `paykit` is the one Paykit method:
+/// its request carries every asset the seller accepts and the order settles
+/// on the rail the buyer actually paid. `bitcoin` is the legacy Bitcoin-only
+/// Paykit bind, kept so a Shop that predates `paykit` keeps working; `usdt`
+/// is the legacy separate USDT bind, which stays refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BindMethod {
+    Paykit,
+    Bitcoin,
+    Usdt,
+    Paypal,
+}
+
+impl BindMethod {
+    fn parse(value: &str, usdt_enabled: bool) -> Option<Self> {
+        match value {
+            "paykit" => Some(Self::Paykit),
+            "bitcoin" => Some(Self::Bitcoin),
+            "usdt" if usdt_enabled => Some(Self::Usdt),
+            "paypal" => Some(Self::Paypal),
+            _ => None,
+        }
+    }
+
+    /// Whether the bind creates a Paykit payment request.
+    fn is_paykit(self) -> bool {
+        matches!(self, Self::Paykit | Self::Bitcoin)
+    }
+}
+
+/// How a Paykit bind asks the upstream to price the request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RequestPlan {
+    /// The legacy `amount_sats` request: the satoshi amount the service
+    /// quoted. The fork and every deployment whose paykit-server has not
+    /// moved to the multi-asset contract
+    /// (`PAYKIT_MARKETPLACE_CONTRACT`) speak only this.
+    LegacySats,
+    /// The multi-asset request: the denomination and amount, with the assets
+    /// paykit-server derives from the seller's setup narrowed by
+    /// `terms.only`.
+    Assets {
+        terms: MarketplaceRequestTerms,
+        /// The service's own Bitcoin quote for a USD price: the guard on the
+        /// Bitcoin amount paykit-server fixes. `None` when no Bitcoin leg
+        /// is wanted or the quote could not be taken.
+        guard_sats: Option<u64>,
+        /// What a USDT amount is checked against; `None` when USDT is not
+        /// wanted.
+        usdt_check: Option<UsdtCheck>,
+    },
+}
+
+/// What the USDT amount of an offer is checked against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UsdtCheck {
+    /// A USD price: exactly the order total in cents at parity.
+    Parity { cents: i64 },
+    /// A satoshi price: within the FX deviation of what the price is worth
+    /// at the service's own rate.
+    Rate { sats: u64, rate: crate::fx::Decimal },
+}
+
+/// Why an offer paykit-server prepared is not accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OfferRefusal {
+    /// An amount or asset that the order price does not allow.
+    Inconsistent,
+    /// An amount strays from the service's own rate or its bounds.
+    Fx(crate::fx::FxError),
+}
+
+/// The phase-1 answer of either request.
+enum Phase1 {
+    Legacy(PaykitPrepared),
+    Assets(PaykitAssetsPrepared),
+}
+
+impl RequestPlan {
+    fn assets(
+        denomination: PaymentAsset,
+        amount_minor: u64,
+        only: Option<Vec<AcceptedAsset>>,
+        guard_sats: Option<u64>,
+        usdt_check: Option<UsdtCheck>,
+    ) -> Self {
+        Self::Assets {
+            terms: MarketplaceRequestTerms {
+                denomination,
+                amount_minor,
+                only,
+            },
+            guard_sats,
+            usdt_check,
+        }
+    }
+
+    /// Checks what paykit-server offered against what the order's price
+    /// allows, before the bind records anything:
+    ///
+    /// - a satoshi-denominated request has no Bitcoin conversion, so its
+    ///   Bitcoin amount is exactly the amount sent, and its USDT amount
+    ///   must sit within the FX deviation of the service's own rate;
+    /// - a USD request offers USDT at exact parity with the order total and
+    ///   Bitcoin within the service quote's deviation and bounds;
+    /// - an asset that was not wanted is never accepted.
+    fn check_offer(&self, offered: OfferedAssets) -> Result<(), OfferRefusal> {
+        let Self::Assets {
+            terms,
+            guard_sats,
+            usdt_check,
+        } = self
+        else {
+            return Ok(());
+        };
+        match (terms.denomination, offered.usdt_units, usdt_check) {
+            (_, None, _) => {}
+            (PaymentAsset::Usd, Some(units), Some(UsdtCheck::Parity { cents })) => {
+                let parity = crate::payment_attempt::PaymentTerms::usdt_at_parity("USD", 2, *cents)
+                    .ok()
+                    .map(|terms| u64::try_from(terms.amount_minor).unwrap_or_default());
+                if parity != Some(units) {
+                    return Err(OfferRefusal::Inconsistent);
+                }
+            }
+            (PaymentAsset::Btc, Some(units), Some(UsdtCheck::Rate { sats, rate })) => {
+                crate::fx::guard_fixed_usdt_units(units, *sats, rate).map_err(OfferRefusal::Fx)?;
+            }
+            _ => return Err(OfferRefusal::Inconsistent),
+        }
+        match (terms.denomination, offered.btc_sats) {
+            (_, None) => {}
+            (PaymentAsset::Btc, Some(sats)) => {
+                if sats != terms.amount_minor {
+                    return Err(OfferRefusal::Inconsistent);
+                }
+            }
+            (PaymentAsset::Usd, Some(sats)) => {
+                let Some(quoted) = *guard_sats else {
+                    return Err(OfferRefusal::Inconsistent);
+                };
+                crate::fx::guard_fixed_sats(sats, quoted).map_err(OfferRefusal::Fx)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// `POST /v0/orders/{id}/payment-method` (buyer session): binds exactly one
 /// available method to a pending order. Bitcoin binding creates the Paykit
 /// payment request inside the same transaction: if paykit-server refuses,
@@ -967,22 +1142,21 @@ pub async fn bind_payment_method(
     };
     let method = body.method.as_str();
     let usdt_enabled = state.config.usdt_payments_enabled;
-    let Some(option) = PaymentOption::from_method(method)
-        .filter(|option| usdt_enabled || !option.requires_usdt_flag())
-    else {
+    let Some(bind) = BindMethod::parse(method, usdt_enabled) else {
         return method_error(
             ErrorCode::InvalidCommand,
             "invalid_method",
             if usdt_enabled {
-                "The payment method must be bitcoin, usdt, or paypal."
+                "The payment method must be paykit, bitcoin, usdt, or paypal."
             } else {
-                "The payment method must be bitcoin or paypal."
+                "The payment method must be paykit, bitcoin, or paypal."
             },
         );
     };
-    if option == PaymentOption::PaykitUsdtArbitrumOne {
+    if bind == BindMethod::Usdt {
         return usdt_unavailable(&state, payments.paykit.as_ref().map(PaykitClient::api));
     }
+    let on_paykit = bind.is_paykit();
     let winner_delivery = match crate::handlers::delivery_envelope::match_winner_delivery(
         body.delivery_address,
         body.delivery_address_envelope.as_ref(),
@@ -1046,7 +1220,7 @@ pub async fn bind_payment_method(
     // paykit prepared (and courtesy-voided) its invoice has still used that
     // attempt, so the retry prepares a new reference instead of replaying
     // the voided one. Concurrent binds on one order reserve distinct numbers.
-    let reserved_attempt: Option<i32> = if method == "bitcoin" {
+    let reserved_attempt: Option<i32> = if on_paykit {
         match sqlx::query_scalar(
             "UPDATE orders SET paykit_bind_attempt = paykit_bind_attempt + 1 \
              WHERE id = $1 AND buyer_pubky = $2 RETURNING paykit_bind_attempt",
@@ -1224,12 +1398,44 @@ pub async fn bind_payment_method(
         Err(error) => return internal("payment config read", &error),
     };
 
-    let bitcoin_quote = if method == "bitcoin" {
-        if !config.as_ref().is_some_and(|config| config.bitcoin_enabled) {
+    // How the upstream request is priced. The legacy `amount_sats` request
+    // (the fork, and every deployment whose paykit-server has not moved to
+    // the multi-asset contract, `PAYKIT_MARKETPLACE_CONTRACT`) carries the
+    // satoshi amount the service quoted. The multi-asset request carries the
+    // denomination and amount and lets paykit-server derive and price every
+    // asset the seller can receive; the service quote then only guards
+    // paykit-server's fixed amounts. USDT rides only the multi-asset request,
+    // and only where the deployment lists it.
+    let multi_contract = payments
+        .paykit
+        .as_ref()
+        .is_some_and(|paykit| paykit.api() == PaykitApi::Upstream)
+        && state.config.paykit_marketplace_contract.is_multi_asset();
+    let usdt_deployed = multi_contract && state.config.paykit_marketplace_assets.includes_usdt();
+    let mut plan = RequestPlan::LegacySats;
+    let bitcoin_quote = if on_paykit {
+        let bitcoin_enabled = config.as_ref().is_some_and(|config| config.bitcoin_enabled);
+        // USDT rides the `paykit` method of a deployment that lists it, on
+        // every order the service can convert (USD/2, SAT/0, BTC/8), for a
+        // seller who consented. It does not need the seller's Bitcoin rail
+        // switch: a seller who takes only USDT is offered a USDT-only
+        // request.
+        let usdt_wanted = usdt_deployed
+            && bind == BindMethod::Paykit
+            && state.config.usdt_payments_enabled
+            && match usdt_option_enabled(&mut *tx, &order.seller_pubky).await {
+                Ok(enabled) => enabled,
+                Err(error) => return internal("usdt consent read", &error),
+            };
+        if !bitcoin_enabled && !usdt_wanted {
             return method_error(
                 ErrorCode::InvalidState,
                 "method_unavailable",
-                "The seller does not accept Bitcoin.",
+                if bind == BindMethod::Paykit {
+                    "The seller does not accept Paykit payments."
+                } else {
+                    "The seller does not accept Bitcoin."
+                },
             );
         }
         if payments.paykit.is_none() {
@@ -1243,33 +1449,125 @@ pub async fn bind_payment_method(
             (order.currency.as_str(), order.exponent),
             ("SAT", 0) | ("BTC", 8)
         ) {
-            Some((
-                None,
-                match bitcoin_amount_sats(&order) {
-                    Some(sats) => sats,
-                    None => {
+            let sats = match bitcoin_amount_sats(&order) {
+                Some(sats) => sats,
+                None => {
+                    return method_error(
+                        ErrorCode::InvalidState,
+                        "invalid_sats",
+                        "The Bitcoin amount must be a positive satoshi amount.",
+                    )
+                }
+            };
+            if multi_contract {
+                // The Bitcoin amount is the price itself. A USDT amount is
+                // paykit-server's rate, which the service checks against its
+                // own; without a readable rate USDT cannot be checked, so the
+                // request narrows to Bitcoin (or, for a seller who takes only
+                // USDT, the bind is refused like any unreadable feed).
+                let (only, usdt_check) = if usdt_wanted {
+                    match crate::fx::reference_rate(&mut *tx, &state.config.fx_feed_url, now).await
+                    {
+                        Ok((rate, _sample)) => (
+                            if bitcoin_enabled {
+                                None
+                            } else {
+                                Some(vec![AcceptedAsset::Usdt])
+                            },
+                            Some(UsdtCheck::Rate { sats, rate }),
+                        ),
+                        Err(error) if bitcoin_enabled => {
+                            tracing::warn!(
+                                order_id = %order.id,
+                                ?error,
+                                "FX rate unavailable; offering Bitcoin only"
+                            );
+                            (Some(vec![AcceptedAsset::Btc]), None)
+                        }
+                        Err(error) => return fx_error_response(error),
+                    }
+                } else {
+                    (Some(vec![AcceptedAsset::Btc]), None)
+                };
+                plan = RequestPlan::assets(PaymentAsset::Btc, sats, only, None, usdt_check);
+            }
+            bitcoin_enabled.then_some((None, sats))
+        } else if order.currency == "USD" && order.exponent == 2 {
+            if multi_contract && bind == BindMethod::Paykit {
+                let total_cents = u64::try_from(order.total_minor).unwrap_or_default();
+                // Bitcoin is offered only while the seller takes it and the
+                // service quote can guard paykit-server's fixed amount; with
+                // USDT available a feed that cannot be read narrows the
+                // request instead of refusing the bind.
+                let quoted = if bitcoin_enabled {
+                    Some(
+                        crate::fx::quote_usd(
+                            &mut *tx,
+                            &state.config.fx_feed_url,
+                            order.total_minor,
+                            order.exponent,
+                            now,
+                        )
+                        .await,
+                    )
+                } else {
+                    None
+                };
+                let (quote, only) = match (quoted, usdt_wanted) {
+                    (Some(Ok(quote)), true) => (Some(quote), None),
+                    (Some(Ok(quote)), false) => (Some(quote), Some(vec![AcceptedAsset::Btc])),
+                    (Some(Err(error)), true) => {
+                        tracing::warn!(
+                            order_id = %order.id,
+                            ?error,
+                            "FX quote unavailable; offering USDT only"
+                        );
+                        (None, Some(vec![AcceptedAsset::Usdt]))
+                    }
+                    (None, true) => (None, Some(vec![AcceptedAsset::Usdt])),
+                    (Some(Err(error)), false) => return fx_error_response(error),
+                    (None, false) => {
                         return method_error(
                             ErrorCode::InvalidState,
-                            "invalid_sats",
-                            "The Bitcoin amount must be a positive satoshi amount.",
+                            "method_unavailable",
+                            "The seller does not accept Paykit payments.",
                         )
                     }
-                },
-            ))
-        } else if order.currency == "USD" && order.exponent == 2 {
-            let (rate, sample, sats) = match crate::fx::quote_usd(
-                &mut *tx,
-                &state.config.fx_feed_url,
-                order.total_minor,
-                order.exponent,
-                now,
-            )
-            .await
-            {
-                Ok(quote) => quote,
-                Err(error) => return fx_error_response(error),
-            };
-            Some((Some((rate, sample)), sats))
+                };
+                plan = RequestPlan::assets(
+                    PaymentAsset::Usd,
+                    total_cents,
+                    only,
+                    quote.as_ref().map(|(_, _, sats)| *sats),
+                    usdt_wanted.then_some(UsdtCheck::Parity {
+                        cents: order.total_minor,
+                    }),
+                );
+                quote.map(|(rate, sample, sats)| (Some((rate, sample)), sats))
+            } else {
+                let (rate, sample, sats) = match crate::fx::quote_usd(
+                    &mut *tx,
+                    &state.config.fx_feed_url,
+                    order.total_minor,
+                    order.exponent,
+                    now,
+                )
+                .await
+                {
+                    Ok(quote) => quote,
+                    Err(error) => return fx_error_response(error),
+                };
+                if multi_contract {
+                    plan = RequestPlan::assets(
+                        PaymentAsset::Btc,
+                        sats,
+                        Some(vec![AcceptedAsset::Btc]),
+                        None,
+                        None,
+                    );
+                }
+                Some((Some((rate, sample)), sats))
+            }
         } else {
             return method_error(
                 ErrorCode::InvalidState,
@@ -1284,7 +1582,7 @@ pub async fn bind_payment_method(
     // The bind lock point: first ordinary acquire (or a re-arm when a drop
     // claim / prior lock point already holds). Fiat uses the 10-minute
     // listing hold; bitcoin uses the invoice window the buyer is shown.
-    let bind_window = if method == "bitcoin" {
+    let bind_window = if on_paykit {
         state.config.bitcoin_payment_window_seconds
     } else {
         state.config.fiat_payment_window_seconds
@@ -1326,8 +1624,8 @@ pub async fn bind_payment_method(
     };
 
     let (fiat_checkout_url, paykit_reference, adapter): (Option<String>, Option<String>, &str) =
-        match method {
-            "bitcoin" => {
+        match bind {
+            BindMethod::Bitcoin | BindMethod::Paykit => {
                 // Reached only by the order's buyer, whose reservation
                 // above therefore returned a row.
                 let Some(attempt) = reserved_attempt else {
@@ -1340,7 +1638,7 @@ pub async fn bind_payment_method(
                 };
                 (None, Some(reference), "paykit")
             }
-            "paypal" => {
+            BindMethod::Paypal => {
                 let Some(email) = config
                     .as_ref()
                     .and_then(|config| config.paypal_merchant_email.clone())
@@ -1375,7 +1673,7 @@ pub async fn bind_payment_method(
                     }
                 }
             }
-            _ => unreachable!("method validated above"),
+            BindMethod::Usdt => unreachable!("a usdt bind is refused above"),
         };
 
     // Pins still on an unbound order belong to a released attempt; they are
@@ -1394,6 +1692,9 @@ pub async fn bind_payment_method(
          paykit_request_state = CASE WHEN $4::text IS NULL THEN NULL ELSE 'preparing' END, \
          paykit_delivery_state = NULL, paykit_api = NULL, paykit_payment_reference = NULL, \
          paykit_operation_id = NULL, paykit_payment_window_seconds = NULL, paykit_asset = NULL, \
+         paykit_amount_minor = NULL, paykit_accepted_assets = NULL, \
+         paykit_payment_amounts = NULL, payment_finality = NULL, payment_finality_at = NULL, \
+         paykit_second_rail_at = NULL, \
          updated_at = $5 WHERE id = $1 RETURNING {}",
         crate::queries::ORDER_COLUMNS
     ))
@@ -1463,10 +1764,9 @@ pub async fn bind_payment_method(
     let mut bind_reference: Option<String> = None;
     if let (Some(reference), Some(attempt)) = (&paykit_reference, reserved_attempt) {
         let paykit = payments.paykit.as_ref().expect("checked above");
-        let amount_sats = bitcoin_quote
-            .as_ref()
-            .map(|(_, sats)| *sats)
-            .expect("checked above");
+        // The legacy request is priced by the service quote. A multi-asset
+        // request has no satoshi amount of its own to send.
+        let amount_sats = bitcoin_quote.as_ref().map(|(_, sats)| *sats);
         // An auction order's hold is the winner's reservation, which never
         // extends (the auction deadline). Upstream fixes the window at
         // prepare and starts it at activation, so cap it to end one skew
@@ -1512,17 +1812,31 @@ pub async fn bind_payment_method(
         let expires_at = updated_order
             .hold_expires_at
             .unwrap_or_else(|| now + chrono::Duration::seconds(payment_window_seconds));
-        let phase1 = paykit
-            .create_payment_request(
-                &order.seller_pubky,
-                &order.buyer_pubky,
-                order.id,
-                attempt,
-                amount_sats,
-                expires_at,
-                payment_window_seconds,
-            )
-            .await;
+        let phase1 = match &plan {
+            RequestPlan::LegacySats => paykit
+                .create_payment_request(
+                    &order.seller_pubky,
+                    &order.buyer_pubky,
+                    order.id,
+                    attempt,
+                    amount_sats.expect("a legacy request is priced by the service quote"),
+                    expires_at,
+                    payment_window_seconds,
+                )
+                .await
+                .map(Phase1::Legacy),
+            RequestPlan::Assets { terms, .. } => paykit
+                .prepare_marketplace_request(
+                    &order.seller_pubky,
+                    &order.buyer_pubky,
+                    order.id,
+                    attempt,
+                    terms,
+                    payment_window_seconds,
+                )
+                .await
+                .map(Phase1::Assets),
+        };
         let phase1 = match phase1 {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -1563,6 +1877,10 @@ pub async fn bind_payment_method(
                 };
             }
         };
+        // What a legacy request asked for; the multi-asset request has no
+        // satoshi amount and is checked against its plan below.
+        let legacy_amount_sats = amount_sats.unwrap_or_default();
+        let mut offered_assets: Option<OfferedAssets> = None;
         let (
             invoice_id,
             total_sats,
@@ -1574,7 +1892,49 @@ pub async fn bind_payment_method(
             address_fingerprint,
             target,
         ) = match phase1 {
-            PaykitPrepared::Fork {
+            Phase1::Assets(PaykitAssetsPrepared {
+                invoice_id,
+                prepare_expires_at,
+                offered,
+            }) => {
+                let target = PaykitLifecycleTarget::Upstream {
+                    creator: order.seller_pubky.clone(),
+                };
+                prepared = Some(PreparedBind {
+                    invoice_id,
+                    target: target.clone(),
+                });
+                if let Err(refusal) = plan.check_offer(offered) {
+                    tracing::error!(
+                        order_id = %order.id,
+                        ?refusal,
+                        "ALERT upstream paykit prepared an offer that disagrees with the order price"
+                    );
+                    let _ = tx.rollback().await;
+                    spawn_courtesy_void(&payments, &prepared, "marketplace_bind_rolled_back");
+                    return match refusal {
+                        OfferRefusal::Inconsistent => method_error(
+                            ErrorCode::InvalidState,
+                            "paykit_total_inconsistent",
+                            "The Paykit server returned an inconsistent payment total.",
+                        ),
+                        OfferRefusal::Fx(error) => fx_error_response(error),
+                    };
+                }
+                offered_assets = Some(offered);
+                (
+                    invoice_id,
+                    offered.btc_sats,
+                    prepare_expires_at,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    target,
+                )
+            }
+            Phase1::Legacy(PaykitPrepared::Fork {
                 invoice_id,
                 stack_id,
                 allocation_mode,
@@ -1583,8 +1943,8 @@ pub async fn bind_payment_method(
                 expires_at: echoed_expires_at,
                 prepare_expires_at,
                 derived_address_fingerprint,
-            } => {
-                if total_sats != amount_sats + nonce_sats {
+            }) => {
+                if total_sats != legacy_amount_sats + nonce_sats {
                     tracing::error!(
                         order_id = %order.id,
                         "ALERT paykit phase 1 total_sats != amount_sats + nonce_sats"
@@ -1621,7 +1981,7 @@ pub async fn bind_payment_method(
                 };
                 (
                     invoice_id,
-                    total_sats,
+                    Some(total_sats),
                     prepare_expires_at,
                     Some(expires_at),
                     Some(stack_id),
@@ -1631,12 +1991,12 @@ pub async fn bind_payment_method(
                     target,
                 )
             }
-            PaykitPrepared::Upstream {
+            Phase1::Legacy(PaykitPrepared::Upstream {
                 invoice_id,
                 total_sats,
                 prepare_expires_at,
-            } => {
-                if total_sats != amount_sats {
+            }) => {
+                if total_sats != legacy_amount_sats {
                     tracing::error!(order_id = %order.id, "ALERT upstream paykit changed requested total");
                     let _ = tx.rollback().await;
                     return method_error(
@@ -1647,7 +2007,7 @@ pub async fn bind_payment_method(
                 }
                 (
                     invoice_id,
-                    total_sats,
+                    Some(total_sats),
                     prepare_expires_at,
                     None,
                     None,
@@ -1665,7 +2025,7 @@ pub async fn bind_payment_method(
             target: target.clone(),
         });
         bind_reference = Some(reference.clone());
-        if total_sats == 0 {
+        if total_sats == Some(0) {
             tracing::error!(
                 order_id = %order.id,
                 "ALERT paykit phase 1 returned a zero total; refusing the bind"
@@ -1753,13 +2113,42 @@ pub async fn bind_payment_method(
                 "total_sats": total_sats,
                 "activation_attempt": 0,
             }),
-            PaykitLifecycleTarget::Upstream { .. } => json!({
-                "invoice_id": invoice_id,
-                "order_id": order.id,
-                "paykit_api": paykit.api().as_str(),
-                "total_sats": total_sats,
-                "activation_attempt": 0,
-            }),
+            PaykitLifecycleTarget::Upstream { .. } => match &plan {
+                RequestPlan::LegacySats => json!({
+                    "invoice_id": invoice_id,
+                    "order_id": order.id,
+                    "paykit_api": paykit.api().as_str(),
+                    "total_sats": total_sats,
+                    "activation_attempt": 0,
+                }),
+                RequestPlan::Assets { terms, .. } => json!({
+                    "invoice_id": invoice_id,
+                    "order_id": order.id,
+                    "paykit_api": paykit.api().as_str(),
+                    "paykit_asset": terms.denomination.as_str(),
+                    "paykit_amount_minor": terms.amount_minor,
+                    "activation_attempt": 0,
+                }),
+            },
+        };
+        // Bitcoin pins only exist when Bitcoin is offered: a service quote
+        // that no payment can settle on is not recorded.
+        let quote_pin = if total_sats.is_some() {
+            bitcoin_quote.as_ref()
+        } else {
+            None
+        };
+        let assets_terms = match (&plan, offered_assets) {
+            (RequestPlan::Assets { terms, .. }, Some(offered)) => Some((
+                i64::try_from(terms.amount_minor).expect("order amount fits i64"),
+                offered
+                    .assets()
+                    .into_iter()
+                    .map(|asset| asset.as_str().to_string())
+                    .collect::<Vec<_>>(),
+                offered.to_json(),
+            )),
+            _ => None,
         };
         let persisted = async {
             sqlx::query(
@@ -1773,67 +2162,54 @@ pub async fn bind_payment_method(
                  bitcoin_quote_exponent = $16, bitcoin_quote_spread_bps = $17, \
                  hold_expires_at = COALESCE($20, hold_expires_at), \
                  paykit_payment_reference = $21, paykit_operation_id = $22, \
-                 paykit_payment_window_seconds = $23, paykit_asset = $24 \
+                 paykit_payment_window_seconds = $23, paykit_asset = $24, \
+                 paykit_amount_minor = $25, paykit_accepted_assets = $26, \
+                 paykit_payment_amounts = $27 \
                  WHERE id = $1",
             )
             .bind(order.id)
             .bind(invoice_id)
             .bind(&stack_id)
             .bind(&stack_endpoint)
-            .bind(i64::try_from(total_sats).expect("total_sats fits i64"))
+            .bind(total_sats.map(|sats| i64::try_from(sats).expect("total_sats fits i64")))
             .bind(paykit_expires_at)
             .bind(prepare_expires_at)
             .bind(&allocation_mode)
             .bind(&address_fingerprint)
             .bind(now)
             .bind(
-                bitcoin_quote
-                    .as_ref()
+                quote_pin
                     .and_then(|(quote, _)| quote.as_ref())
                     .map(|(rate, _)| {
                         sqlx::types::BigDecimal::from_str(&rate.to_string_value())
                             .expect("FX rate is a valid decimal")
                     }),
             )
+            .bind(quote_pin.and_then(|(quote, _)| quote.as_ref().map(|_| crate::fx::FX_SOURCE)))
             .bind(
-                bitcoin_quote
-                    .as_ref()
-                    .and_then(|(quote, _)| quote.as_ref().map(|_| crate::fx::FX_SOURCE)),
-            )
-            .bind(
-                bitcoin_quote
-                    .as_ref()
+                quote_pin
                     .and_then(|(quote, _)| quote.as_ref().map(|(_, sample)| sample.fetched_at)),
             )
             .bind(
-                bitcoin_quote
-                    .as_ref()
+                quote_pin
                     .and_then(|(quote, sats)| quote.as_ref().map(|_| *sats))
                     .map(i64::try_from)
                     .transpose()
                     .expect("quote sats fit i64"),
             )
             .bind(
-                bitcoin_quote
-                    .as_ref()
+                quote_pin
                     .and_then(|(quote, _)| quote.as_ref())
                     .map(|_| order.currency.as_str()),
             )
             .bind(
-                bitcoin_quote
-                    .as_ref()
+                quote_pin
                     .and_then(|(quote, _)| quote.as_ref())
                     .map(|_| i16::try_from(order.exponent).expect("exponent fits i16")),
             )
+            .bind(quote_pin.and_then(|(quote, _)| quote.as_ref()).map(|_| 0_i32))
             .bind(
-                bitcoin_quote
-                    .as_ref()
-                    .and_then(|(quote, _)| quote.as_ref())
-                    .map(|_| 0_i32),
-            )
-            .bind(
-                bitcoin_quote
-                    .as_ref()
+                quote_pin
                     .and_then(|(quote, _)| quote.as_ref())
                     .map(|_| expires_at),
             )
@@ -1858,21 +2234,39 @@ pub async fn bind_payment_method(
                 None
             })
             .bind(if paykit.api() == PaykitApi::Upstream {
-                Some(PaymentAsset::Btc.as_str())
+                Some(
+                    match &plan {
+                        RequestPlan::Assets { terms, .. } => terms.denomination,
+                        RequestPlan::LegacySats => PaymentAsset::Btc,
+                    }
+                    .as_str(),
+                )
             } else {
                 None
             })
+            .bind(assets_terms.as_ref().map(|(amount, _, _)| *amount))
+            .bind(assets_terms.as_ref().map(|(_, accepted, _)| accepted.clone()))
+            .bind(assets_terms.as_ref().map(|(_, _, amounts)| amounts.clone()))
             .execute(&mut *tx)
             .await?;
-            // Bitcoin settlement is typed as SAT/0. Merchandise terms stay
-            // in the dedicated merchandise columns.
+            // The payment is typed in the asset it is settled in: satoshis
+            // when Bitcoin is offered (SAT/0), otherwise USDT0 millionths.
+            // It is retyped to the rail that actually paid when it settles.
+            // Merchandise terms stay in the dedicated merchandise columns.
+            let (payable, currency, exponent) = match (total_sats, offered_assets) {
+                (Some(sats), _) => (sats, "SAT", 0_i32),
+                (None, Some(offered)) => (offered.usdt_units.unwrap_or_default(), "USDT", 6_i32),
+                (None, None) => unreachable!("a request without a satoshi total is multi-asset"),
+            };
             sqlx::query(
-                "UPDATE payments SET amount_minor = $2, currency = 'SAT', exponent = 0, \
+                "UPDATE payments SET amount_minor = $2, currency = $4, exponent = $5, \
                  updated_at = $3 WHERE id = $1",
             )
             .bind(payment.id)
-            .bind(i64::try_from(total_sats).expect("total_sats fits i64"))
+            .bind(i64::try_from(payable).expect("payable amount fits i64"))
             .bind(now)
+            .bind(currency)
+            .bind(exponent)
             .execute(&mut *tx)
             .await?;
             sqlx::query(
@@ -2805,7 +3199,158 @@ mod usdt_bind_tests {
         );
         assert_eq!(
             usdt_unavailable_cause(Some(PaykitApi::Upstream), btc_and_usdt),
-            UsdtUnavailableCause::PrepareBitcoinOnly
+            UsdtUnavailableCause::BindThroughPaykit
+        );
+    }
+}
+
+#[cfg(test)]
+mod single_paykit_bind_tests {
+    use super::*;
+
+    fn usd_plan(guard_sats: Option<u64>, parity_cents: Option<i64>) -> RequestPlan {
+        RequestPlan::assets(
+            PaymentAsset::Usd,
+            13_700,
+            None,
+            guard_sats,
+            parity_cents.map(|cents| UsdtCheck::Parity { cents }),
+        )
+    }
+
+    fn offered(btc_sats: Option<u64>, usdt_units: Option<u64>) -> OfferedAssets {
+        OfferedAssets {
+            btc_sats,
+            usdt_units,
+        }
+    }
+
+    #[test]
+    fn the_paykit_method_is_always_known_and_usdt_only_with_the_flag() {
+        assert_eq!(BindMethod::parse("paykit", false), Some(BindMethod::Paykit));
+        assert_eq!(BindMethod::parse("paykit", true), Some(BindMethod::Paykit));
+        assert_eq!(
+            BindMethod::parse("bitcoin", false),
+            Some(BindMethod::Bitcoin)
+        );
+        assert_eq!(BindMethod::parse("paypal", false), Some(BindMethod::Paypal));
+        assert_eq!(BindMethod::parse("usdt", false), None);
+        assert_eq!(BindMethod::parse("usdt", true), Some(BindMethod::Usdt));
+        for unknown in ["", "Paykit", "PAYKIT", "lightning", "stripe"] {
+            assert_eq!(BindMethod::parse(unknown, true), None, "{unknown:?}");
+        }
+        assert!(BindMethod::Paykit.is_paykit() && BindMethod::Bitcoin.is_paykit());
+        assert!(!BindMethod::Usdt.is_paykit() && !BindMethod::Paypal.is_paykit());
+    }
+
+    #[test]
+    fn a_legacy_request_accepts_any_offer() {
+        assert_eq!(
+            RequestPlan::LegacySats.check_offer(offered(Some(1), Some(1))),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_usd_offer_needs_usdt_at_exact_parity() {
+        let plan = usd_plan(None, Some(13_700));
+        assert_eq!(plan.check_offer(offered(None, Some(137_000_000))), Ok(()));
+        for wrong in [137_000_001, 136_999_999, 1, 1_370_000_000] {
+            assert_eq!(
+                plan.check_offer(offered(None, Some(wrong))),
+                Err(OfferRefusal::Inconsistent),
+                "{wrong}"
+            );
+        }
+        // USDT that was never wanted is never accepted.
+        assert_eq!(
+            usd_plan(None, None).check_offer(offered(None, Some(137_000_000))),
+            Err(OfferRefusal::Inconsistent)
+        );
+    }
+
+    #[test]
+    fn a_usd_offers_bitcoin_must_sit_inside_the_service_quote_guard() {
+        let quote = 17_747;
+        let plan = usd_plan(Some(quote), None);
+        for fixed in [quote, quote + 887, quote - 887] {
+            assert_eq!(
+                plan.check_offer(offered(Some(fixed), None)),
+                Ok(()),
+                "{fixed}"
+            );
+        }
+        for fixed in [quote + 889, quote - 889, 2 * quote] {
+            assert_eq!(
+                plan.check_offer(offered(Some(fixed), None)),
+                Err(OfferRefusal::Fx(crate::fx::FxError::DeviationExceeded)),
+                "{fixed}"
+            );
+        }
+        assert_eq!(
+            usd_plan(Some(900), None).check_offer(offered(Some(999), None)),
+            Err(OfferRefusal::Fx(crate::fx::FxError::BelowMinimum))
+        );
+        // No quote to guard against: Bitcoin is never accepted.
+        assert_eq!(
+            usd_plan(None, None).check_offer(offered(Some(quote), None)),
+            Err(OfferRefusal::Inconsistent)
+        );
+        // Both assets offered: each is checked.
+        let both = usd_plan(Some(quote), Some(13_700));
+        assert_eq!(
+            both.check_offer(offered(Some(quote), Some(137_000_000))),
+            Ok(())
+        );
+        assert_eq!(
+            both.check_offer(offered(Some(quote), Some(137_000_001))),
+            Err(OfferRefusal::Inconsistent)
+        );
+    }
+
+    #[test]
+    fn a_bitcoin_denominated_offer_is_exactly_the_amount_sent() {
+        let plan = RequestPlan::assets(
+            PaymentAsset::Btc,
+            50_000,
+            Some(vec![AcceptedAsset::Btc]),
+            None,
+            None,
+        );
+        assert_eq!(plan.check_offer(offered(Some(50_000), None)), Ok(()));
+        for wrong in [
+            offered(Some(50_001), None),
+            offered(Some(50_000), Some(1)),
+            offered(None, Some(1)),
+        ] {
+            assert_eq!(plan.check_offer(wrong), Err(OfferRefusal::Inconsistent));
+        }
+    }
+
+    #[test]
+    fn a_bitcoin_denominated_usdt_amount_must_match_the_service_rate() {
+        let rate = crate::fx::Decimal::parse("81000").expect("rate");
+        let plan = RequestPlan::assets(
+            PaymentAsset::Btc,
+            50_000,
+            None,
+            None,
+            Some(UsdtCheck::Rate { sats: 50_000, rate }),
+        );
+        // 50,000 sats at 81,000 USD per BTC is 40.5 USDT0.
+        assert_eq!(
+            plan.check_offer(offered(Some(50_000), Some(40_500_000))),
+            Ok(())
+        );
+        assert_eq!(plan.check_offer(offered(None, Some(40_500_000))), Ok(()));
+        assert_eq!(
+            plan.check_offer(offered(Some(50_000), Some(20_000_000))),
+            Err(OfferRefusal::Fx(crate::fx::FxError::DeviationExceeded))
+        );
+        assert_eq!(
+            plan.check_offer(offered(Some(50_001), Some(40_500_000))),
+            Err(OfferRefusal::Inconsistent),
+            "the Bitcoin amount is still exactly the price"
         );
     }
 }
