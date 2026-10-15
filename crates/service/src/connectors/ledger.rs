@@ -31,6 +31,10 @@
 //!   set aside as `push_quarantined` and a seller retry of the push puts them
 //!   back, or, when the order was cancelled before any push, dropped, because
 //!   no store order can ever exist for them.
+//!   The event handlers that queue a mirror lock the push rows they read
+//!   (`FOR NO KEY UPDATE`), so each serialises with a quarantine or a retry of
+//!   the same push: a mirror is never parked behind a push that has since
+//!   moved on, and never left pending behind one that has been quarantined.
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -474,6 +478,7 @@ pub async fn on_order_cancelled<'c>(
          FROM connector_order_push p \
          WHERE p.pubky_order_id = $1 AND p.state IN ('created', 'sending', 'quarantined') \
            AND {MIRRORABLE_PUSH} \
+         FOR NO KEY UPDATE OF p \
          ON CONFLICT (push_id, kind, action_key) DO NOTHING"
     ))
     .bind(pubky_order_id)
@@ -522,6 +527,7 @@ pub async fn on_refund_recorded<'c>(
                 $3, 0, $4, $5, $4, $4 \
          FROM connector_order_push p \
          WHERE p.pubky_order_id = $1 AND {MIRRORABLE_PUSH} \
+         FOR NO KEY UPDATE OF p \
          ON CONFLICT (push_id, kind, action_key) DO NOTHING"
     ))
     .bind(pubky_order_id)
