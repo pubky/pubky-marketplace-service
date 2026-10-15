@@ -1300,3 +1300,110 @@ async fn a_tracking_update_racing_a_buyer_delivery_is_judged_on_the_orders_revis
         ("ignored", Some("order_not_shippable"))
     );
 }
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_order_found_by_the_lookup_gets_the_same_total_check(pool: PgPool) {
+    // The first push creates the order (the store adds tax) but its answer is
+    // lost; the retry finds the order by lookup instead of creating it again.
+    let s = shop(
+        pool,
+        Some(Box::new(|fake| {
+            fake.lock().forced_tax_bps = 800;
+            fake.fault("OrderCreate", vec![Fault::AppliedThenServerError]);
+        })),
+    )
+    .await;
+    assert_ne!(push_state(&s.app.pool, &s.order_id).await.0, "created");
+    assert!(s.alerts().await.is_empty(), "nothing is known yet");
+    s.app.clock.advance_seconds(700);
+    s.pass().await;
+    let (state, external, _, _) = push_state(&s.app.pool, &s.order_id).await;
+    assert_eq!(state, "created");
+    assert_eq!(external.as_deref(), Some(s.fake.orders()[0].id.as_str()));
+    assert_eq!(
+        s.fake.calls("OrderCreate").len(),
+        1,
+        "found, not created twice"
+    );
+    let alerts = s.alerts().await;
+    assert_eq!(alerts.len(), 1, "{alerts:?}");
+    assert_eq!(alerts[0]["kind"], "push_total_mismatch");
+    assert!(alerts[0]["detail"]
+        .as_str()
+        .expect("detail")
+        .contains("tax"));
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_free_push_is_claimed_however_many_actions_a_busy_push_has_queued_first(pool: PgPool) {
+    let mut s = pushed(pool).await;
+    s.record_refund(5_000).await;
+    worker::consume_events(&s.app.state).await.expect("consume");
+    let now = s.app.clock.now();
+    // Push A has one action in flight (live lease) and many more due ahead of
+    // anything on push B.
+    for round in 0..25 {
+        s.queue_cumulative_refund(&format!("busy-{round}"), 5_001 + round)
+            .await;
+    }
+    let push_a: Uuid = sqlx::query_scalar("SELECT id FROM connector_order_push LIMIT 1")
+        .fetch_one(&s.app.pool)
+        .await
+        .expect("push");
+    sqlx::query(
+        "UPDATE connector_order_actions SET next_attempt_at = $2 WHERE push_id = $1 AND state = 'pending'",
+    )
+    .bind(push_a)
+    .bind(now - chrono::Duration::seconds(500))
+    .execute(&s.app.pool)
+    .await
+    .expect("older");
+    sqlx::query(
+        "UPDATE connector_order_actions SET state = 'sending', lease_until = $2, attempts = 1 \
+         WHERE id = (SELECT id FROM connector_order_actions WHERE push_id = $1 \
+                     ORDER BY next_attempt_at, id LIMIT 1)",
+    )
+    .bind(push_a)
+    .bind(now + chrono::Duration::seconds(300))
+    .execute(&s.app.pool)
+    .await
+    .expect("in flight");
+    // Push B: another store order of the same connection, due later.
+    let push_b = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO connector_order_push \
+         (id, connection_id, seller_pubky, pubky_order_id, provider, state, external_id, attempts, \
+          next_attempt_at, created_at, updated_at) \
+         SELECT $2, connection_id, seller_pubky, $3, provider, 'created', 'gid://shopify/Order/9', 1, \
+                next_attempt_at, created_at, updated_at \
+         FROM connector_order_push WHERE id = $1",
+    )
+    .bind(push_a)
+    .bind(push_b)
+    .bind(Uuid::new_v4())
+    .execute(&s.app.pool)
+    .await
+    .expect("second push");
+    let wanted = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO connector_order_actions \
+         (id, push_id, kind, action_key, state, payload, attempts, next_attempt_at, created_at, updated_at) \
+         VALUES ($1, $2, 'cancel', 'cancel-b', 'pending', '{}'::jsonb, 0, $3, $3, $3)",
+    )
+    .bind(wanted)
+    .bind(push_b)
+    .bind(now - chrono::Duration::seconds(1))
+    .execute(&s.app.pool)
+    .await
+    .expect("action on the free push");
+    let claimed = ledger::claim_next_action(
+        &s.app.pool,
+        now,
+        std::time::Duration::from_secs(60),
+        &["shopify".to_string()],
+    )
+    .await
+    .expect("claim")
+    .expect("the free push's action is not starved by the busy push's queue");
+    assert_eq!(claimed.0.id, wanted);
+}

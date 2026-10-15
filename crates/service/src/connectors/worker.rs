@@ -252,7 +252,21 @@ async fn process_push(
         .await;
         match found {
             Ok(Some(existing)) => {
-                ledger::mark_created(pool, row, &existing.id, state.clock.now()).await?;
+                if ledger::mark_created(pool, row, &existing.id, state.clock.now()).await? {
+                    // The order an earlier attempt created gets the same
+                    // read-back as one created now: a store that added tax is
+                    // reported on this path too.
+                    verify_found_order(
+                        state,
+                        runtime,
+                        provider.as_ref(),
+                        &context,
+                        &connection,
+                        row,
+                        &existing,
+                    )
+                    .await?;
+                }
                 return Ok(());
             }
             Ok(None) => {}
@@ -312,6 +326,37 @@ async fn process_push(
         }
         Err(error) => push_failed(state, runtime, &connection, &claim, error, false).await,
     }
+}
+
+/// The total check for an order a lookup found (an earlier attempt created it
+/// and the answer was lost). The push is rebuilt only to know what the buyer
+/// paid; a push that can no longer be built (the order was cancelled, a
+/// mapping was removed) has nothing to compare and is skipped.
+async fn verify_found_order(
+    state: &AppState,
+    runtime: &ConnectorRuntime,
+    provider: &dyn ConnectorProvider,
+    context: &ConnectionContext,
+    connection: &ConnectionRow,
+    row: &ledger::PushRow,
+    existing: &ExternalOrder,
+) -> Result<(), sqlx::Error> {
+    let pool = &state.pool;
+    let Some(order) = order_push::load_order(pool, row.pubky_order_id).await? else {
+        return Ok(());
+    };
+    let paid_at = order_push::paid_at(pool, order.id)
+        .await?
+        .unwrap_or(order.created_at);
+    let Ok(pushed) =
+        order_push::build_push(pool, &runtime.keys, connection, &order, paid_at).await?
+    else {
+        return Ok(());
+    };
+    check_pushed_total(
+        state, runtime, provider, context, connection, row, existing, &pushed,
+    )
+    .await
 }
 
 /// Asks the provider whether the order it just created is what the buyer paid,
