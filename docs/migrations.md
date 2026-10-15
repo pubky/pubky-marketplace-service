@@ -5,6 +5,18 @@ migration, and are directly rerunnable unless a rule below says otherwise.
 An applied file is immutable: sqlx checksums every applied migration, so a
 changed byte stops the next start.
 
+## A ledger ahead of the build
+
+Startup tolerates applied versions that are newer than every migration in the
+running build: a newer image, or a branch image on staging, migrated first.
+The build logs them (`database has migrations newer than this build`) and
+starts, so rolling an image back across an additive migration works without
+editing `_sqlx_migrations`. An applied version the build lacks at or below its
+newest migration means a file was removed or renumbered, and startup is
+refused as before. Checksums of the versions the build knows are always
+verified, so a branch migration that later lands under the same number with
+different bytes still stops startup; delete that branch row first.
+
 ## Index builds on existing tables
 
 A plain `CREATE INDEX` holds a `SHARE` lock on its table for the whole
