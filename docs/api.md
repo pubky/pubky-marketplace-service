@@ -1048,32 +1048,46 @@ variation id with the Pubky prices, the Pubky order id as order meta
 `pubky_order_id` and in a zero-value fee line (WooCommerce's order search
 matches item names but not custom meta), a customer note with the order id and
 a link to the Shop orders page, and no billing details. Lines use the
-`zero-rate` tax class: WooCommerce adds tax on top of API totals by the store's
-rates, whatever "prices include tax" says, so without this the order would
-total more than the buyer paid. The merchant books VAT on Pubky sales from the
-Pubky order. The shipping address is
+`zero-rate` tax class, and shipping and any adjustment are fee lines with
+`tax_status: none`: WooCommerce adds tax on top of API totals by the store's
+rates, whatever "prices include tax" says, and taxes a shipping line by the
+store's "shipping tax class" even when every item is zero-rated, so without
+this the order would total more than the buyer paid. The order total equals the
+Pubky total under any tax configuration (the fixture store has Swiss VAT on and
+the shipping tax class set to Standard). No tax is split out and none is
+raised as an alert. The merchant books VAT on Pubky sales from the Pubky
+order. The shipping address is
 set only when the buyer shared it. A cancel after the push sets the order to
 `cancelled` (WooCommerce restocks); a Pubky refund adds a refund to the order
-with `api_refund: false`, so the store's books match and no money moves. A
-refund whose unit is not the order currency is converted with the order's own
-recorded basis, which the framework reads from the order and passes as
-`RefundRecord.quote`: for `sat`, `round(sats * 10^exponent * rate / 10^8)` with
-the Bitcoin quote pinned at bind (`BTC<CCY>`, in the order currency); for
-`usdt`, `round(amount * order total / USDT paid)`. Rounding is half up to the
-currency's minor unit, the amount is capped by what is left to refund (a last
-partial that rounds one unit over is capped there, anything more is refused),
-and the refund's reason carries the basis, for example `Pubky refund r1:
-20000 sat = 11.60 CHF at BTCCHF 58000.00000000 (blocktank, 2026-10-15T12:00:00Z)`.
-Without a matching basis (no quote on the order, a quote in another
-currency) the refund is quarantined with `refund_not_in_store_currency` or
-`refund_basis_unavailable`.
+with `api_refund: false`, so the store's books match and no money moves. The
+refund amount is the refund total Pubky recorded, in the order currency's minor
+units (the framework converts anything else before a provider is called; the
+provider never converts). What is added to the store order is the difference:
+the recorded total, capped at the payment, minus what the store already shows
+refunded (ours from an earlier record, or the merchant's own). A repeat, a
+smaller later record or a merchant who already refunded as much adds nothing,
+and a later, larger record adds only the difference, so the order is never
+refunded above the payment. A refund already written for the same Pubky refund
+id is never written twice.
 
 Webhooks are verified with the base64 HMAC-SHA256 of the raw body in
 `X-WC-Webhook-Signature`; WooCommerce's unsigned ping (`webhook_id=N`) is
-acknowledged. A completed order with a tracking number in the common
-shipment-tracking meta (`_wc_shipment_tracking_items`, the AfterShip and
-`_tracking_number` keys) ships the Pubky order; a store-side cancel, trash or
-refund raises a seller alert and never refunds. The 15-minute poll
+acknowledged. A completed order ships the Pubky order: with the tracking number when the
+common shipment-tracking meta has one (`_wc_shipment_tracking_items`, the
+AfterShip and `_tracking_number` keys; the newest item counts), and without one,
+carrier `Other`, when it has none. Tracking added or changed later arrives as
+another `order.updated` and is applied with `fulfillment.update_tracking`; the
+same number again changes nothing. A service without optional tracking and
+`fulfillment.update_tracking` refuses those commands as `INVALID_COMMAND`, which
+the connector ignores quietly (`tracking_optional_not_supported`,
+`tracking_update_not_supported`) instead of retrying or alerting: the shipment
+is then applied once it has a number. A store-side cancel, trash or
+refund raises a seller alert and never refunds. A WooCommerce variation maps one to one to a Pubky variant
+(`PUT /v1/connectors/{id}/mappings` with the listing's `variant_id` and the
+variation id as `provider_variant_id`); stock of a listing mapped to several
+variations is applied to each variant's own quantity through the service's
+per-variant inventory (`inventory.adjust` with `variant`), and skipped
+(`multi_variant_listing`) on a build without it. The 15-minute poll
 (`CONNECTOR_STOCK_POLL_SECONDS`) reads the catalog for mapped products because
 WordPress cron is unreliable.
 
