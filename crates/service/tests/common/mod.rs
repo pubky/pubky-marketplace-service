@@ -3263,6 +3263,7 @@ fn serve_multi_asset_prepare(
         "amount",
         "asset",
         "creator",
+        "description",
         "operation_id",
         "payment_window_seconds",
         "reader",

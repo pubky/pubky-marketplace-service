@@ -2,6 +2,11 @@
 //! (`/v0/sellers/*/payment-config`, `/v0/orders/{id}/payment-method`,
 //! `/v0/orders/{id}/fiat/*`).
 //!
+//! The one Paykit method is `paykit`: its request carries every asset the
+//! seller accepts (Bitcoin and USDT) and the order settles on the rail the
+//! buyer actually paid. `bitcoin` is the legacy Bitcoin-only Paykit bind and
+//! `usdt` the legacy USDT bind, which stays refused.
+//!
 //! Money-state rules:
 //! - Binding is one-shot per order: re-binding the SAME method is an
 //!   idempotent no-op; a different method is refused once one is bound
@@ -638,6 +643,9 @@ fn public_config_view(
 /// `bitcoin_offer_available` is the cached rail-wide Paykit gate. Older
 /// paykit-server responses without that field derive it from `status`.
 /// `paypal_available` is a stored merchant email.
+/// While the flag is on the body also carries `paykit_available` and
+/// `accepted_assets`: the one Paykit method the buyer is offered and the
+/// assets it can pay in (see [`public_config_view`]).
 /// `usdt_available` exists only while `USDT_PAYMENTS_ENABLED` is on and is
 /// true only when every one of these holds: the deployment speaks to upstream
 /// paykit-server, `PAYKIT_MARKETPLACE_ASSETS` lists USDT (the bind's own

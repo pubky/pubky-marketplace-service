@@ -1392,6 +1392,7 @@ impl PaykitClient {
             "amount": terms.amount_minor.to_string(),
             "asset": terms.denomination.as_str(),
             "creator": pubky_app_key(seller_pubky),
+            "description": upstream_order_description(order_id),
             "operation_id": upstream_operation_id(&reference, bind_attempt),
             "payment_window_seconds": payment_window_seconds,
             "reader": pubky_app_key(buyer_pubky),

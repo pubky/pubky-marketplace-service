@@ -397,6 +397,15 @@ async fn the_paykit_bind_sends_the_denomination_and_records_every_offered_asset(
     let prepare = prepare_body(&f.paykit);
     assert_eq!(prepare["amount"], json!(TOTAL_CENTS.to_string()));
     assert_eq!(prepare["asset"], json!("USD"));
+    let compact = uuid(&order.order_id).simple().to_string();
+    assert_eq!(
+        prepare["description"],
+        json!(format!(
+            "Pubky Shop order {}",
+            compact[..6].to_ascii_uppercase()
+        )),
+        "the multi-asset request is labelled like the legacy one"
+    );
     assert!(
         prepare.get("accepted_assets").is_none(),
         "a seller that takes both assets is never narrowed: {prepare}"
@@ -1368,6 +1377,213 @@ async fn usdt_on_a_released_attempt_is_held_for_review_not_routed(pool: PgPool) 
         payment_row(&pool, &order_id).await.0,
         "awaiting_entitlement"
     );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_pickup_order_paid_in_usdt_waits_for_finality_before_handover(pool: PgPool) {
+    let f = fixture(pool.clone(), Setup::both()).await;
+    let active = active_order(&f).await;
+    let order_id = active.order.order_id.clone();
+    f.paykit.set_marketplace_status(
+        active.invoice,
+        usdt_status(
+            active.invoice,
+            active.deadline,
+            usdt_leg(1, true, true, false),
+        ),
+    );
+    poll_now(&f.app, at(1)).await;
+    // The same guard covers the pickup commands; the order is flipped to a
+    // pickup order directly so the fixture needs no pickup listing.
+    sqlx::query("UPDATE orders SET fulfillment = 'pickup' WHERE id = $1")
+        .bind(uuid(&order_id))
+        .execute(&pool)
+        .await
+        .expect("pickup order");
+    for (kind, actor, number) in [
+        ("fulfillment.mark_ready", &f.seller, 11_u64),
+        ("fulfillment.confirm_pickup", &f.seller, 12),
+        ("fulfillment.confirm_pickup", &f.buyer, 13),
+    ] {
+        let revision = facts(&pool, &order_id).await.revision;
+        let (status, body) = execute(
+            &f.app,
+            &actor.token,
+            &order_command(kind, &order_id, revision, json!({}), number),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{kind}: {body}");
+        assert_eq!(
+            body["error"]["reason"],
+            json!("payment_not_final"),
+            "{kind}"
+        );
+    }
+    f.paykit.set_marketplace_status(
+        active.invoice,
+        usdt_status(
+            active.invoice,
+            active.deadline,
+            usdt_leg(90, true, true, true),
+        ),
+    );
+    poll_now(&f.app, at(2)).await;
+    let revision = facts(&pool, &order_id).await.revision;
+    let (status, body) = execute(
+        &f.app,
+        &f.seller.token,
+        &order_command("fulfillment.mark_ready", &order_id, revision, json!({}), 14),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "ready once final: {body}");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_usdt_payment_in_review_is_refunded_to_the_buyers_arbitrum_address(pool: PgPool) {
+    let f = fixture(pool.clone(), Setup::both()).await;
+    let active = active_order(&f).await;
+    let order_id = active.order.order_id.clone();
+    f.paykit.set_marketplace_status(
+        active.invoice,
+        status_body(
+            active.invoice,
+            active.deadline,
+            StatusSpec {
+                payment_state: "confirmed",
+                bitcoin: None,
+                usdt: Some(usdt_leg(1, false, true, false)),
+                paid_asset: None,
+            },
+        ),
+    );
+    poll_now(&f.app, at(1)).await;
+    let (state, _, _, _, reason) = payment_row(&pool, &order_id).await;
+    assert_eq!(
+        (state.as_str(), reason.as_deref()),
+        ("manual_review", Some("amount_mismatch"))
+    );
+
+    let reference = format!("0x{}", "ab12".repeat(16));
+    let (status, body) = resolve_call(
+        &f.app,
+        &f.seller.token,
+        &order_id,
+        Some(Uuid::new_v4()),
+        &json!({ "outcome": "refunded", "external_refund_reference": reference }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "no address confirmed yet: {body}"
+    );
+    assert_eq!(
+        body["error"]["reason"],
+        json!("refund_destination_required")
+    );
+
+    let address = "0xd8da6bf26964af9d7eed9e03e53415d37aa96045";
+    let revision = facts(&pool, &order_id).await.revision;
+    let (status, body) = execute(
+        &f.app,
+        &f.buyer.token,
+        &order_command(
+            "refund.confirm_destination",
+            &order_id,
+            revision,
+            json!({ "address": address }),
+            15,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "address confirmed: {body}");
+    let (status, body) = resolve_call(
+        &f.app,
+        &f.seller.token,
+        &order_id,
+        Some(Uuid::new_v4()),
+        &json!({ "outcome": "refunded", "external_refund_reference": reference }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "refund recorded: {body}");
+    let view = read_order(&f, &f.buyer.token, &order_id).await;
+    assert_eq!(view["state"], json!("refunded_external"));
+    assert_eq!(
+        view["external_refund"]["destination_address"],
+        json!(address)
+    );
+    assert_eq!(view["external_refund"]["transaction_id"], json!(reference));
+    assert_eq!(view["external_refund"]["amount_minor"], json!(TOTAL_CENTS));
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn bitcoin_on_a_released_paykit_attempt_takes_the_late_money_path(pool: PgPool) {
+    let f = fixture(pool.clone(), Setup::both()).await;
+    let order = checkout_usd(&f).await;
+    let order_id = order.order_id.clone();
+    let (status, body) = bind(&f, &order_id, "paykit").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let first = facts(&pool, &order_id)
+        .await
+        .paykit_invoice_id
+        .expect("invoice");
+    f.paykit.fail_commands_with(409, "invoice_finalized");
+    drain(&f).await;
+    f.paykit.clear_command_failure();
+    assert_eq!(facts(&pool, &order_id).await.payment_method, None);
+    let (status, body) = bind(&f, &order_id, "paykit").await;
+    assert_eq!(status, StatusCode::OK, "the buyer pays again: {body}");
+    drain(&f).await;
+    let second = facts(&pool, &order_id)
+        .await
+        .paykit_invoice_id
+        .expect("invoice");
+    assert_ne!(first, second);
+
+    // The first attempt's request was in fact live: Bitcoin lands on it.
+    let deadline = Utc::now() + Duration::minutes(30);
+    f.paykit.set_marketplace_status(
+        first,
+        status_body(
+            first,
+            deadline,
+            StatusSpec {
+                payment_state: "confirmed",
+                bitcoin: Some(bitcoin_leg(3, true)),
+                usdt: None,
+                paid_asset: Some("BTC"),
+            },
+        ),
+    );
+    let client = f
+        .app
+        .state
+        .payments
+        .as_ref()
+        .and_then(|payments| payments.paykit.as_ref())
+        .expect("client");
+    let routed = marketplace_service::paykit_attempts::verify_due_released_attempts(
+        &f.app.state,
+        client,
+        at(1),
+    )
+    .await
+    .expect("released attempts poll");
+    assert_eq!(routed, 1, "the paid released attempt is routed");
+    // Attempt 2 still holds the stock, so the late money takes the existing
+    // late-money path: the paid attempt becomes the attempt of record and a
+    // human decides.
+    let (state, _, _, _, reason) = payment_row(&pool, &order_id).await;
+    assert_eq!(
+        (state.as_str(), reason.as_deref()),
+        ("manual_review", Some("late_settlement"))
+    );
+    let stored = facts(&pool, &order_id).await;
+    assert_eq!(stored.paykit_invoice_id, Some(first));
+    assert_eq!(stored.payment_method.as_deref(), Some("paykit"));
+    let view = read_order(&f, &f.buyer.token, &order_id).await;
+    assert_eq!(view["accepted_assets"], json!(["BTC"]));
+    assert_eq!(view["payment_amounts"], json!({ "BTC": quoted_sats() }));
 }
 
 // ---------------------------------------------------------------------------

@@ -241,7 +241,9 @@ async fn apply_attempt_status(
     if attempt.paykit_api == "upstream" && attempt.expires_at.is_none() {
         if let Some(deadline) = recovered_deadline {
             sqlx::query(
-                "UPDATE paykit_superseded_attempts SET expires_at = $3 \
+                "UPDATE paykit_superseded_attempts SET expires_at = $3, \
+                 bitcoin_quote_expires_at = CASE \
+                     WHEN bitcoin_quote_rate IS NULL THEN NULL ELSE $3 END \
                  WHERE order_id = $1 AND invoice_id = $2 AND expires_at IS NULL",
             )
             .bind(attempt.order_id)

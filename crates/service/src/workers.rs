@@ -1986,6 +1986,32 @@ async fn claim_due_paykit_orders(
     .await
 }
 
+/// What one confirmed observation says about the money: whether the amount
+/// matched, what was observed, whether paykit-server marked it late, and the
+/// USDT leg when the observation is one.
+#[derive(Clone, Copy)]
+struct Settlement<'a> {
+    amount_matched: bool,
+    observation: &'a crate::payments::PaykitObservation,
+    late_settlement: bool,
+    usdt: Option<&'a PaykitUsdtObservation>,
+}
+
+impl<'a> Settlement<'a> {
+    fn bitcoin(
+        amount_matched: bool,
+        observation: &'a crate::payments::PaykitObservation,
+        late_settlement: bool,
+    ) -> Self {
+        Self {
+            amount_matched,
+            observation,
+            late_settlement,
+            usdt: None,
+        }
+    }
+}
+
 /// Records the rail that paid an order bound through `paykit`: the S1 asset
 /// terms (`payment_asset`, network, amount, exponent, basis), the payment
 /// row retyped to that asset, and, for USDT, the finality of the transfer.
@@ -2046,7 +2072,7 @@ async fn record_settlement_rail(
     let Some(terms) = PaymentTerms::settled(denomination, asset, amount) else {
         return Ok(());
     };
-    if terms.store(&mut **tx, order_id).await? && asset == AcceptedAsset::Usdt {
+    if terms.store(tx, order_id).await? && asset == AcceptedAsset::Usdt {
         sqlx::query(
             "UPDATE payments SET amount_minor = $2, currency = 'USDT', exponent = 6, \
              updated_at = $3 WHERE order_id = $1",
@@ -2150,13 +2176,16 @@ async fn freeze_paykit_observation(
 async fn apply_confirmed_paykit_payment(
     pool: &PgPool,
     row: &ClaimedPaykitOrder,
-    amount_matched: bool,
-    observation: &crate::payments::PaykitObservation,
+    facts: Settlement<'_>,
     keys: crate::ConfirmKeys<'_>,
     now: DateTime<Utc>,
-    late_settlement: bool,
-    usdt: Option<&PaykitUsdtObservation>,
 ) -> anyhow::Result<bool> {
+    let Settlement {
+        amount_matched,
+        observation,
+        late_settlement,
+        usdt,
+    } = facts;
     let resolution_pins_present = match row.paykit_api.as_str() {
         "fork" => row.paykit_stack_id.is_some() && row.paykit_stack_endpoint.is_some(),
         "upstream" => row.paykit_stack_id.is_none() && row.paykit_stack_endpoint.is_none(),
@@ -2655,12 +2684,9 @@ async fn apply_shared_manual_observation(
             return apply_confirmed_paykit_payment(
                 pool,
                 row,
-                amount_matched,
-                observation,
+                Settlement::bitcoin(amount_matched, observation, false),
                 keys,
                 now,
-                false,
-                None,
             )
             .await;
         }
@@ -3072,12 +3098,9 @@ async fn apply_status_outcome(
                 return apply_confirmed_paykit_payment(
                     &state.pool,
                     row,
-                    amount_matched,
-                    &facts.observation,
+                    Settlement::bitcoin(amount_matched, &facts.observation, true),
                     state.confirm_keys(),
                     now,
-                    true,
-                    None,
                 )
                 .await;
             }
@@ -3102,12 +3125,9 @@ async fn apply_status_outcome(
                     apply_confirmed_paykit_payment(
                         &state.pool,
                         row,
-                        amount_matched,
-                        &facts.observation,
+                        Settlement::bitcoin(amount_matched, &facts.observation, false),
                         state.confirm_keys(),
                         now,
-                        false,
-                        None,
                     )
                     .await
                 }
@@ -3136,12 +3156,9 @@ async fn apply_status_outcome(
                 apply_confirmed_paykit_payment(
                     &state.pool,
                     row,
-                    true,
-                    &facts.observation,
+                    Settlement::bitcoin(true, &facts.observation, true),
                     state.confirm_keys(),
                     now,
-                    true,
-                    None,
                 )
                 .await
             } else {
@@ -3221,12 +3238,14 @@ async fn apply_usdt_observation(
         return apply_confirmed_paykit_payment(
             &state.pool,
             row,
-            usdt.amount_matched,
-            &usdt.as_observation(),
+            Settlement {
+                amount_matched: usdt.amount_matched,
+                observation: &usdt.as_observation(),
+                late_settlement: !usdt.paid_on_time,
+                usdt: Some(usdt),
+            },
             state.confirm_keys(),
             now,
-            !usdt.paid_on_time,
-            Some(usdt),
         )
         .await;
     }
