@@ -1,35 +1,34 @@
-//! Seller lifecycle gate for the commands that open a new commitment on a
-//! listing.
+//! Seller lifecycle gate for the commands that sell a listing.
 //!
 //! The seller pauses, ends or removes a listing by rewriting its record on
 //! their homeserver (`state` in
 //! `/pub/pubky.app/marketplace/v1/listings/{listing_id}`). The listing
-//! aggregate tracks stock only, so before the service accepts
-//! `checkout.create`, `offer.create`, `offer.counter`, `offer.accept` or
-//! `auction.place_bid` it reads each listing's current record and refuses
-//! with `LISTING_NOT_ACTIVE` unless the record says `active`. The `reason` is
-//! `listing_paused`, `listing_ended` or `listing_removed` for those states
-//! (a record the homeserver no longer has is `listing_removed`) and
-//! `listing_not_active` for any other value.
+//! aggregate tracks stock only, so before the service accepts a command that
+//! sells a listing it reads each listing's current record. The `reason` of a
+//! `LISTING_NOT_ACTIVE` refusal is `listing_paused`, `listing_ended` or
+//! `listing_removed` for those states (a record the homeserver no longer has
+//! is `listing_removed`) and `listing_not_active` for any other value. A
+//! record without a `state` field predates the field and is on sale.
 //!
-//! The record is the seller's own authority over whether the listing is on
-//! sale, so the gate fails closed: a homeserver that cannot answer refuses
-//! with the retriable `UPSTREAM_UNAVAILABLE` rather than selling something
-//! the seller may have withdrawn. Nothing is written by a refused command,
-//! and the buyer can retry once the homeserver recovers.
+//! [`Gate::OnSale`] guards a new commitment (`checkout.create`,
+//! `offer.create`, `offer.counter`, `offer.accept`, `auction.place_bid`):
+//! anything but `active` refuses. [`Gate::NotRemoved`] guards a continuation
+//! of a commitment made while the listing was on sale (`offer.checkout`,
+//! the first `payment.prepare_locks`, `auction.close` and the payment-method
+//! bind): only a removal refuses, because a seller who removed the listing
+//! cannot fulfil it and no payment may start, while a pause or an end does
+//! not strand a buyer already checking out.
 //!
-//! A record without a `state` field predates the field and is on sale.
-//!
-//! `offer.checkout`, the payment-method bind and `payment.prepare_locks`
-//! continue a commitment made while the listing was on sale, so they are not
-//! gated: a seller who pauses a listing to stop new buyers does not strand
-//! the buyer already checking out.
+//! The record is the seller's own authority, so the gate fails closed: a
+//! homeserver that cannot answer refuses with the retriable
+//! `UPSTREAM_UNAVAILABLE`. Nothing is written by a refused command.
 
 use std::sync::Arc;
 
 use marketplace_domain::commands::CommandPayload;
 use marketplace_domain::ErrorCode;
 use serde_json::Value;
+use sqlx::PgPool;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
@@ -43,7 +42,7 @@ pub const REASON_ENDED: &str = "listing_ended";
 pub const REASON_REMOVED: &str = "listing_removed";
 pub const REASON_NOT_ACTIVE: &str = "listing_not_active";
 
-const UNAVAILABLE_MESSAGE: &str =
+pub const UNAVAILABLE_MESSAGE: &str =
     "The seller's homeserver could not be reached. Try again shortly.";
 
 /// A checkout carries at most 50 lines; this bounds how many record reads
@@ -58,6 +57,25 @@ pub enum ListingLifecycle {
     Inactive(&'static str),
     /// The homeserver gave no usable answer.
     Unavailable,
+}
+
+/// Which records refuse a command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gate {
+    /// A new commitment: anything but an `active` record refuses.
+    OnSale,
+    /// A continuation of an existing commitment: only a removed record
+    /// refuses.
+    NotRemoved,
+}
+
+impl Gate {
+    fn refuses(self, reason: &str) -> bool {
+        match self {
+            Gate::OnSale => true,
+            Gate::NotRemoved => reason == REASON_REMOVED,
+        }
+    }
 }
 
 /// Reads the `state` of a fetched listing record.
@@ -86,16 +104,34 @@ pub fn lifecycle_of_fetch(outcome: &HomeserverFetchOutcome) -> ListingLifecycle 
     }
 }
 
-/// The commands that open a new commitment on a listing.
-pub fn opens_a_commitment(payload: &CommandPayload) -> bool {
-    matches!(
-        payload,
+/// The gate a command passes, or `None` for a command that sells nothing.
+pub fn gate_for(payload: &CommandPayload) -> Option<Gate> {
+    match payload {
         CommandPayload::CreateCheckout(_)
-            | CommandPayload::CreateOffer(_)
-            | CommandPayload::CounterOffer(_)
-            | CommandPayload::AcceptOffer(_)
-            | CommandPayload::PlaceBid(_)
+        | CommandPayload::CreateOffer(_)
+        | CommandPayload::CounterOffer(_)
+        | CommandPayload::AcceptOffer(_)
+        | CommandPayload::PlaceBid(_) => Some(Gate::OnSale),
+        CommandPayload::OfferCheckout(_)
+        | CommandPayload::PrepareLocks(_)
+        | CommandPayload::CloseAuction(_) => Some(Gate::NotRemoved),
+        _ => None,
+    }
+}
+
+/// The live auction an `auction.close` command addresses, as
+/// `(seller_pubky, listing_id)`; empty for anything else.
+pub async fn auction_being_closed(
+    pool: &PgPool,
+    aggregate_id: &str,
+) -> Result<Vec<(String, String)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT seller_pubky, listing_id FROM listings \
+         WHERE aggregate_id = $1 AND sale_format = 'auction' AND deleted_at IS NULL",
     )
+    .bind(aggregate_id)
+    .fetch_all(pool)
+    .await
 }
 
 pub fn not_active(reason: &'static str) -> CommandFailure {
@@ -115,16 +151,20 @@ fn unavailable() -> CommandFailure {
     )
 }
 
-/// Reads every listing's record and returns the refusal, if any. A listing
-/// that is not on sale wins over an unreachable one (it is definitive), and
+/// Reads every listing's record and returns the refusal, if any. A
+/// refusing record wins over an unreachable one (it is definitive), and
 /// among those the first listing in `listings` order decides the reason.
 pub async fn check(
     homeserver: Arc<dyn HomeserverListingClient>,
     listings: &[(String, String)],
+    gate: Gate,
 ) -> Option<CommandFailure> {
+    if listings.is_empty() {
+        return None;
+    }
     let lifecycles = read_lifecycles(homeserver, listings).await;
     if let Some(reason) = lifecycles.iter().find_map(|lifecycle| match lifecycle {
-        ListingLifecycle::Inactive(reason) => Some(*reason),
+        ListingLifecycle::Inactive(reason) if gate.refuses(reason) => Some(*reason),
         _ => None,
     }) {
         return Some(not_active(reason));
@@ -133,6 +173,20 @@ pub async fn check(
         return Some(unavailable());
     }
     None
+}
+
+/// Whether one listing's record says the seller removed it; `None` when the
+/// homeserver gave no usable answer.
+pub async fn is_removed(
+    homeserver: &dyn HomeserverListingClient,
+    seller_pubky: &str,
+    listing_id: &str,
+) -> Option<bool> {
+    let outcome = homeserver.fetch_listing(seller_pubky, listing_id).await;
+    match lifecycle_of_fetch(&outcome) {
+        ListingLifecycle::Unavailable => None,
+        lifecycle => Some(lifecycle == ListingLifecycle::Inactive(REASON_REMOVED)),
+    }
 }
 
 async fn read_lifecycles(
@@ -172,6 +226,7 @@ mod tests {
     use std::collections::HashMap;
     use std::future::Future;
     use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn only_an_active_or_stateless_record_is_on_sale() {
@@ -217,7 +272,23 @@ mod tests {
         );
     }
 
-    struct Records(HashMap<String, HomeserverFetchOutcome>);
+    /// Answers listing ids from the map, counts reads, and never answers
+    /// the ids in `hung`.
+    #[derive(Default)]
+    struct Records {
+        records: HashMap<String, HomeserverFetchOutcome>,
+        hung: Vec<String>,
+        reads: AtomicUsize,
+    }
+
+    impl Records {
+        fn new(records: HashMap<String, HomeserverFetchOutcome>) -> Self {
+            Self {
+                records,
+                ..Self::default()
+            }
+        }
+    }
 
     impl HomeserverListingClient for Records {
         fn fetch_listing<'a>(
@@ -226,7 +297,11 @@ mod tests {
             listing_id: &'a str,
         ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
             Box::pin(async move {
-                self.0
+                self.reads.fetch_add(1, Ordering::SeqCst);
+                if self.hung.iter().any(|id| id == listing_id) {
+                    std::future::pending::<()>().await;
+                }
+                self.records
                     .get(listing_id)
                     .cloned()
                     .unwrap_or(HomeserverFetchOutcome::NotFound)
@@ -243,7 +318,7 @@ mod tests {
     }
 
     fn records(entries: &[(&str, HomeserverFetchOutcome)]) -> Arc<dyn HomeserverListingClient> {
-        Arc::new(Records(
+        Arc::new(Records::new(
             entries
                 .iter()
                 .map(|(id, outcome)| (id.to_string(), outcome.clone()))
@@ -268,8 +343,12 @@ mod tests {
     #[tokio::test]
     async fn active_listings_pass() {
         let homeserver = records(&[("a", found("active")), ("b", found("active"))]);
-        assert!(check(homeserver.clone(), &listings(&["a"])).await.is_none());
-        assert!(check(homeserver, &listings(&["a", "b"])).await.is_none());
+        assert!(check(homeserver.clone(), &listings(&["a"]), Gate::OnSale)
+            .await
+            .is_none());
+        assert!(check(homeserver, &listings(&["a", "b"]), Gate::OnSale)
+            .await
+            .is_none());
     }
 
     #[tokio::test]
@@ -280,7 +359,7 @@ mod tests {
             ("c", found("ended")),
             ("d", found("paused")),
         ]);
-        let failure = check(homeserver, &listings(&["a", "b", "c", "d"]))
+        let failure = check(homeserver, &listings(&["a", "b", "c", "d"]), Gate::OnSale)
             .await
             .expect("an inactive listing refuses");
         assert_eq!(failure.code(), ErrorCode::ListingNotActive);
@@ -294,7 +373,7 @@ mod tests {
             ("a", found("active")),
             ("b", HomeserverFetchOutcome::Unavailable),
         ]);
-        let failure = check(homeserver, &listings(&["a", "b"]))
+        let failure = check(homeserver, &listings(&["a", "b"]), Gate::OnSale)
             .await
             .expect("an outage refuses");
         assert_eq!(failure.code(), ErrorCode::UpstreamUnavailable);
@@ -308,15 +387,44 @@ mod tests {
             .collect();
         entries[49].1 = found("paused");
         let homeserver: Arc<dyn HomeserverListingClient> =
-            Arc::new(Records(entries.iter().cloned().collect()));
+            Arc::new(Records::new(entries.iter().cloned().collect()));
         let ids: Vec<String> = entries.iter().map(|(id, _)| id.clone()).collect();
         let cart: Vec<(String, String)> = ids
             .iter()
             .map(|id| ("seller".to_string(), id.clone()))
             .collect();
-        let failure = check(homeserver, &cart)
+        let failure = check(homeserver, &cart, Gate::OnSale)
             .await
             .expect("the last line refuses");
         assert_eq!(reason(&failure), json!(REASON_PAUSED));
+    }
+
+    #[tokio::test]
+    async fn a_continuation_refuses_only_a_removal() {
+        let homeserver = records(&[
+            ("paused", found("paused")),
+            ("ended", found("ended")),
+            ("draft", found("draft")),
+            ("removed", found("removed")),
+        ]);
+        assert!(check(
+            homeserver.clone(),
+            &listings(&["paused", "ended", "draft"]),
+            Gate::NotRemoved
+        )
+        .await
+        .is_none());
+        for ids in [&["paused", "removed"][..], &["missing"][..]] {
+            let failure = check(homeserver.clone(), &listings(ids), Gate::NotRemoved)
+                .await
+                .expect("a removal refuses");
+            assert_eq!(failure.code(), ErrorCode::ListingNotActive);
+            assert_eq!(reason(&failure), json!(REASON_REMOVED));
+        }
+        let outage = records(&[("a", HomeserverFetchOutcome::Unavailable)]);
+        let failure = check(outage, &listings(&["a"]), Gate::NotRemoved)
+            .await
+            .expect("an outage refuses a continuation too");
+        assert_eq!(failure.code(), ErrorCode::UpstreamUnavailable);
     }
 }

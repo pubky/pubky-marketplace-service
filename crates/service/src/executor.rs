@@ -52,21 +52,33 @@ pub async fn execute(
     let request_hash = command.request_hash();
 
     // A command that sells a listing is refused when the index says the
-    // listing, or its seller, is moderated, and a command that opens a new
-    // commitment on a listing is refused unless the seller's current record
-    // says it is on sale. Both are read before the transaction, so a slow
-    // index or homeserver never holds a domain connection. A command id that
-    // already has a stored result is a replay and is answered from it.
+    // listing, or its seller, is moderated, and when the seller's current
+    // record says it is not for sale (any non-active state for a new
+    // commitment, a removal for a continuation). Both are read before the
+    // transaction, so a slow index or homeserver never holds a domain
+    // connection. A command id that already has a stored result is a replay
+    // and is answered from it.
     let moderation = state.listing_moderation.as_deref();
-    let lifecycle = state
-        .homeserver
-        .clone()
-        .filter(|_| crate::listing_lifecycle::opens_a_commitment(&command.payload));
+    let lifecycle = state.homeserver.clone().and_then(|homeserver| {
+        crate::listing_lifecycle::gate_for(&command.payload).map(|gate| (homeserver, gate))
+    });
     if moderation.is_some() || lifecycle.is_some() {
         let listings =
             crate::listing_moderation::listings_a_command_sells(&state.pool, actor, &command)
                 .await?;
-        if !listings.is_empty()
+        let lifecycle_listings: Vec<(String, String)> = match (&lifecycle, &command.payload) {
+            (None, _) => Vec::new(),
+            (Some(_), CommandPayload::CloseAuction(_)) => {
+                crate::listing_lifecycle::auction_being_closed(&state.pool, &command.aggregate_id)
+                    .await?
+            }
+            (Some(_), _) => listings
+                .iter()
+                .filter(|listing| listing.live)
+                .map(|listing| (listing.seller_pubky.clone(), listing.listing_id.clone()))
+                .collect(),
+        };
+        if (!listings.is_empty() || !lifecycle_listings.is_empty())
             && stored_command_result(&state.pool, actor, command.command_id)
                 .await?
                 .is_none()
@@ -88,12 +100,8 @@ pub async fn execute(
                     None
                 },
                 async {
-                    let live: Vec<(String, String)> = listings
-                        .iter()
-                        .filter(|listing| listing.live)
-                        .map(|listing| (listing.seller_pubky.clone(), listing.listing_id.clone()))
-                        .collect();
-                    crate::listing_lifecycle::check(lifecycle?, &live).await
+                    let (homeserver, gate) = lifecycle?;
+                    crate::listing_lifecycle::check(homeserver, &lifecycle_listings, gate).await
                 },
             );
             if let Some(failure) = moderated.or(not_on_sale) {
