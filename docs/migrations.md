@@ -157,8 +157,19 @@ defaults, so a rolling replacement is safe.
 ## Store connectors (0062 to 0064, 0066)
 
 The connector framework uses 0062 to 0064 and 0066 of the 0062 to 0069 range reserved
-for connectors (0065 is the Shopify provider's). None depends on 0060 or 0061, so they apply cleanly whether
-or not those have landed. All are additive and rerunnable.
+for connectors (0065 is the Shopify provider's). They follow 0061 (multi-currency
+FX, merged) and read two of its `orders` columns only as optional values
+(`usd_conversion_pair`, `usd_conversion_cents`). All are additive and
+rerunnable.
+
+No connector row exists on any deployment before these migrations run: the
+connector tables are created only by 0062 and 0063, which are in this pull
+request and unmerged, and `CONNECTORS_ENABLED` defaults off, so the worker
+never writes or reads one until it is switched on. A refund mirror queued with
+an older payload shape (an `amount_unit` of `sat` or `usdt`) therefore cannot
+exist, and the worker reads only the payload `connectors::outbox` writes today
+(amounts in the order currency, `blocked_code` when a refund cannot be
+converted).
 
 - 0062 creates `connector_connections` (one row per seller, provider and
   shop: a `draft` that expires after 24 hours, then `connected`,
