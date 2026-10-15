@@ -1362,3 +1362,327 @@ async fn a_cancel_of_a_pending_push_drops_the_mirror_already_queued_for_it(pool:
         "a push set aside for good leaves no queued mirror"
     );
 }
+
+// === Events racing a retry or a quarantine of the push they mirror onto ======
+//
+// Two transactions are held in the interleaving that used to lose or strand a
+// mirror: one reads the push as it was, the other is changing it. The
+// handlers lock the push rows they read, so the later transaction waits for
+// the earlier one and then sees what it did.
+
+#[derive(Clone, Copy)]
+enum Mirror {
+    Cancel,
+    Refund,
+}
+
+impl Mirror {
+    fn kind(self) -> &'static str {
+        match self {
+            Mirror::Cancel => "cancel",
+            Mirror::Refund => "refund",
+        }
+    }
+
+    fn other(self) -> Mirror {
+        match self {
+            Mirror::Cancel => Mirror::Refund,
+            Mirror::Refund => Mirror::Cancel,
+        }
+    }
+
+    /// The Pubky event itself, through the command path, not yet consumed.
+    async fn happens(self, s: &Scenario) {
+        match self {
+            Mirror::Cancel => cancel_order(s).await,
+            Mirror::Refund => refund_order(s).await,
+        }
+    }
+
+    /// The event consumer's handler, in a transaction the caller holds open.
+    async fn queue_in(self, s: &Scenario, tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) {
+        let order_id: Uuid = s.order.order_id.parse().expect("order id");
+        let now = s.app.clock.now();
+        match self {
+            Mirror::Cancel => {
+                ledger::on_order_cancelled(tx, now, order_id, "cancelled", Uuid::new_v4())
+                    .await
+                    .expect("cancel handler")
+            }
+            Mirror::Refund => ledger::on_refund_recorded(
+                tx,
+                now,
+                order_id,
+                &Uuid::new_v4().to_string(),
+                &json!({ "amount_minor": 1_000 }),
+                Uuid::new_v4(),
+            )
+            .await
+            .expect("refund handler"),
+        }
+    }
+
+    async fn queue(self, s: &Scenario) {
+        let mut tx = s.app.pool.begin().await.expect("tx");
+        self.queue_in(s, &mut tx).await;
+        tx.commit().await.expect("commit");
+    }
+}
+
+async fn waiting_backends(pool: &PgPool) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_stat_activity \
+         WHERE datname = current_database() AND wait_event_type = 'Lock'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("waiting backends")
+}
+
+async fn wait_for_waiters(pool: &PgPool, count: i64) {
+    for _ in 0..200 {
+        if waiting_backends(pool).await >= count {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("expected {count} backends waiting on a lock");
+}
+
+/// Holds the row lock of a mirror, so a statement that updates it waits.
+async fn hold_the_mirror(pool: &PgPool, kind: &str) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let mut tx = pool.begin().await.expect("tx");
+    sqlx::query("SELECT id FROM connector_order_actions WHERE kind = $1 FOR UPDATE")
+        .bind(kind)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("lock the mirror");
+    tx
+}
+
+/// Gives the task a chance to finish. A task that does not finish in this
+/// time is waiting on a lock.
+async fn finishes_unaided<T>(task: &mut tokio::task::JoinHandle<T>) -> bool {
+    tokio::time::timeout(Duration::from_millis(1_500), task)
+        .await
+        .is_ok()
+}
+
+fn retry_task(s: &Scenario) -> tokio::task::JoinHandle<()> {
+    let pool = s.app.pool.clone();
+    let connection = s.connection;
+    let order_id: Uuid = s.order.order_id.parse().expect("order id");
+    let now = s.app.clock.now();
+    tokio::spawn(async move {
+        let outcome = ledger::retry_push(&pool, connection, order_id, now)
+            .await
+            .expect("retry");
+        assert!(matches!(outcome, ledger::RetryOutcome::Queued(_)));
+    })
+}
+
+/// The retry has run, and every mirror was queued behind the push waiting for
+/// it: the push resolves to `created` and each mirror reaches the store.
+async fn both_mirrors_run_after_the_retry(s: &Scenario) {
+    assert_eq!(s.push().await.0, "sending");
+    assert_eq!(
+        actions(s).await,
+        vec![waiting("cancel"), waiting("refund")],
+        "no mirror is parked behind a push that is on its way to created"
+    );
+    s.store
+        .plant_order(s.order.order_id.parse().expect("order id"), "ext-planted");
+    s.pass().await;
+    assert_eq!(s.push().await.0, "created");
+    assert_eq!(s.store.cancel_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(s.store.refund_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        actions(s).await,
+        vec![
+            ("cancel".to_string(), "done".to_string(), None),
+            ("refund".to_string(), "done".to_string(), None)
+        ]
+    );
+}
+
+/// A retry holding the push, stalled on another mirror, while the event is
+/// consumed.
+async fn a_retry_under_way_when_the_event_is_consumed(pool: PgPool, event: Mirror) {
+    let s = scenario(pool).await;
+    quarantine_a_push(&s).await;
+    event.other().queue(&s).await;
+    assert_eq!(actions(&s).await, vec![parked(event.other().kind())]);
+    event.happens(&s).await;
+
+    let anchor = hold_the_mirror(&s.app.pool, event.other().kind()).await;
+    let retry = retry_task(&s);
+    wait_for_waiters(&s.app.pool, 1).await;
+    let mut consume = {
+        let state = s.app.state.clone();
+        tokio::spawn(async move { worker::consume_events(&state).await.expect("consume") })
+    };
+    if !finishes_unaided(&mut consume).await {
+        wait_for_waiters(&s.app.pool, 2).await;
+    }
+    anchor.commit().await.expect("release");
+    retry.await.expect("retry task");
+    consume.await.expect("consume task");
+    both_mirrors_run_after_the_retry(&s).await;
+}
+
+/// The event handler holding the push, uncommitted, when the retry arrives.
+async fn an_event_under_way_when_the_retry_arrives(pool: PgPool, event: Mirror) {
+    let s = scenario(pool).await;
+    quarantine_a_push(&s).await;
+    event.other().queue(&s).await;
+
+    let mut tx = s.app.pool.begin().await.expect("tx");
+    event.queue_in(&s, &mut tx).await;
+    let mut retry = retry_task(&s);
+    finishes_unaided(&mut retry).await;
+    tx.commit().await.expect("commit");
+    retry.await.expect("retry task");
+    both_mirrors_run_after_the_retry(&s).await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_cancel_consumed_while_a_retry_is_under_way_is_queued_behind_the_new_attempt(
+    pool: PgPool,
+) {
+    a_retry_under_way_when_the_event_is_consumed(pool, Mirror::Cancel).await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_refund_consumed_while_a_retry_is_under_way_is_queued_behind_the_new_attempt(
+    pool: PgPool,
+) {
+    a_retry_under_way_when_the_event_is_consumed(pool, Mirror::Refund).await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_retry_that_arrives_while_a_cancel_is_being_queued_re_queues_it(pool: PgPool) {
+    an_event_under_way_when_the_retry_arrives(pool, Mirror::Cancel).await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_retry_that_arrives_while_a_refund_is_being_queued_re_queues_it(pool: PgPool) {
+    an_event_under_way_when_the_retry_arrives(pool, Mirror::Refund).await;
+}
+
+fn both_parked() -> Vec<(String, String, Option<String>)> {
+    vec![parked("cancel"), parked("refund")]
+}
+
+/// The claimed push, with a pending refund queued behind it.
+async fn a_push_in_flight_with_a_mirror(s: &Scenario) -> ledger::ClaimedPush {
+    worker::consume_events(&s.app.state).await.expect("consume");
+    let claim = ledger::claim_next_push(
+        &s.app.pool,
+        s.app.clock.now(),
+        Duration::from_secs(60),
+        &["shopify".to_string()],
+    )
+    .await
+    .expect("claim")
+    .expect("a due push");
+    Mirror::Refund.queue(s).await;
+    assert_eq!(actions(s).await, vec![waiting("refund")]);
+    claim
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_cancel_consumed_while_the_push_is_being_quarantined_is_parked_with_the_rest(
+    pool: PgPool,
+) {
+    let s = scenario(pool).await;
+    let claim = a_push_in_flight_with_a_mirror(&s).await;
+    cancel_order(&s).await;
+
+    let anchor = hold_the_mirror(&s.app.pool, "refund").await;
+    let quarantining = {
+        let pool = s.app.pool.clone();
+        let row = claim.row.clone();
+        let now = s.app.clock.now();
+        tokio::spawn(async move {
+            let connection = marketplace_service::connectors::store::get(&pool, row.connection_id)
+                .await
+                .expect("connection read")
+                .expect("connection");
+            ledger::quarantine_push(&pool, &row, &connection, "validation", "refused", now)
+                .await
+                .expect("quarantine")
+        })
+    };
+    wait_for_waiters(&s.app.pool, 1).await;
+    let mut consume = {
+        let state = s.app.state.clone();
+        tokio::spawn(async move { worker::consume_events(&state).await.expect("consume") })
+    };
+    if !finishes_unaided(&mut consume).await {
+        wait_for_waiters(&s.app.pool, 2).await;
+    }
+    anchor.commit().await.expect("release");
+    assert!(quarantining.await.expect("quarantine task"));
+    consume.await.expect("consume task");
+
+    assert_eq!(s.push().await.0, "quarantined");
+    assert_eq!(
+        actions(&s).await,
+        both_parked(),
+        "no mirror is left pending behind a quarantined push"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_quarantine_that_arrives_while_a_cancel_is_being_queued_parks_it(pool: PgPool) {
+    let s = scenario(pool).await;
+    let claim = a_push_in_flight_with_a_mirror(&s).await;
+
+    let mut tx = s.app.pool.begin().await.expect("tx");
+    Mirror::Cancel.queue_in(&s, &mut tx).await;
+    let mut quarantining = {
+        let pool = s.app.pool.clone();
+        let row = claim.row.clone();
+        let now = s.app.clock.now();
+        tokio::spawn(async move {
+            let connection = marketplace_service::connectors::store::get(&pool, row.connection_id)
+                .await
+                .expect("connection read")
+                .expect("connection");
+            ledger::quarantine_push(&pool, &row, &connection, "validation", "refused", now)
+                .await
+                .expect("quarantine")
+        })
+    };
+    finishes_unaided(&mut quarantining).await;
+    tx.commit().await.expect("commit");
+    assert!(quarantining.await.expect("quarantine task"));
+
+    assert_eq!(s.push().await.0, "quarantined");
+    assert_eq!(actions(&s).await, both_parked());
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_refund_reversed_before_its_event_is_consumed_mirrors_nothing(pool: PgPool) {
+    let s = scenario(pool).await;
+    worker::consume_events(&s.app.state).await.expect("consume");
+    assert_eq!(s.push().await.0, "pending");
+    refund_order(&s).await;
+    sqlx::query(
+        "UPDATE orders SET state = 'return_received', external_refund = NULL \
+         WHERE id = $1::uuid",
+    )
+    .bind(&s.order.order_id)
+    .execute(&s.app.pool)
+    .await
+    .expect("the refund is reversed and the order reopened");
+
+    s.pass().await;
+    assert_eq!(
+        actions(&s).await,
+        Vec::<(String, String, Option<String>)>::new(),
+        "a refund the order no longer holds has nothing to mirror"
+    );
+    assert_eq!(s.push().await.0, "created", "the reopened order is pushed");
+    assert_eq!(s.store.refund_calls.load(Ordering::SeqCst), 0);
+}
