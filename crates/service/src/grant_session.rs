@@ -411,12 +411,8 @@ fn parse_request(
             "grant_session_unavailable",
         )));
     };
-    if body.len() > MAX_REQUEST_BYTES {
-        return Err(Box::new(error_response(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "invalid_request",
-        )));
-    }
+    // Bodies over MAX_REQUEST_BYTES never get here: the router's
+    // DefaultBodyLimit answers them with a plain-text 413.
     let request = serde_json::from_slice::<GrantSessionRequest>(body)
         .map_err(|_| Box::new(error_response(StatusCode::BAD_REQUEST, "invalid_request")))?;
     Ok((config, request))
@@ -439,6 +435,19 @@ pub async fn create_challenge(State(state): State<AppState>, body: Bytes) -> Res
         Ok(verified) => verified,
         Err(refusal) => return refused(refusal),
     };
+    // A pubky at its live cap gets 429 without spending a rate token, so a
+    // client waiting for a slot cannot lock itself out of the bucket.
+    // `issue_challenge` re-checks under the per-pubky lock.
+    match live_challenges(&state, &verified.pubky, now).await {
+        Ok(live) if live >= MAX_LIVE_CHALLENGES => {
+            return error_response(StatusCode::TOO_MANY_REQUESTS, "too_many_challenges");
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::error!(error = %error, "grant session challenge count failed");
+            return internal_error();
+        }
+    }
     match crate::automation::consume_automation_rate(&state, &verified.pubky, RATE_CLASS).await {
         Ok(None) => {}
         Ok(Some(retry_after)) => return rate_limited(retry_after),
@@ -464,6 +473,17 @@ pub async fn create_challenge(State(state): State<AppState>, body: Bytes) -> Res
             internal_error()
         }
     }
+}
+
+async fn live_challenges(state: &AppState, pubky: &str, now: DateTime<Utc>) -> sqlx::Result<i64> {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM grant_session_challenges \
+         WHERE pubky = $1 AND used_at IS NULL AND expires_at > $2",
+    )
+    .bind(pubky)
+    .bind(now)
+    .fetch_one(&state.pool)
+    .await
 }
 
 /// Stores a fresh challenge for `pubky`, valid for one proof age. `None`

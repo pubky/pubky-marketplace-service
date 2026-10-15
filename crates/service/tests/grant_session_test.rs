@@ -171,13 +171,21 @@ impl ShopGrant {
 }
 
 async fn grant_session_app(pool: PgPool, enabled: bool) -> (TestApp, Arc<ProofHomeserver>) {
+    grant_session_app_with(pool, enabled, Config::for_tests()).await
+}
+
+async fn grant_session_app_with(
+    pool: PgPool,
+    enabled: bool,
+    service_config: Config,
+) -> (TestApp, Arc<ProofHomeserver>) {
     let homeserver = Arc::new(ProofHomeserver::default());
     // Grant validity is checked against system time by the SDK.
     let clock = Arc::new(AdjustableClock::new(Utc::now()));
     let config = enabled.then(|| {
         Arc::new(GrantSessionConfig::new(AUDIENCE, CLIENT_ID, 120).expect("grant session config"))
     });
-    let state = AppState::new(pool.clone(), clock.clone(), Config::for_tests())
+    let state = AppState::new(pool.clone(), clock.clone(), service_config)
         .with_homeserver(Some(homeserver.clone()))
         .with_grant_session(config);
     (
@@ -631,4 +639,135 @@ async fn sign_out_revokes_a_grant_session(pool: PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// Kimi delta P3-3(a): issuers racing for the last live slot of one pubky
+/// are serialized by the per-pubky lock, so exactly one wins.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn racing_issuers_cannot_exceed_the_live_cap(pool: PgPool) {
+    let (app, _) = grant_session_app(pool, true).await;
+    let grant = ShopGrant::new(Duration::hours(1));
+    for _ in 0..MAX_LIVE_CHALLENGES - 1 {
+        let (status, _) = request_challenge(&app, &grant).await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        let router = app.router.clone();
+        let body = grant.challenge_request_at(app.clock.now());
+        tasks.spawn(async move {
+            send(
+                router,
+                "POST",
+                "/v1/auth/grant-session-challenges",
+                None,
+                &body,
+            )
+            .await
+        });
+    }
+    let results = tasks.join_all().await;
+
+    let created = results
+        .iter()
+        .filter(|(status, _)| *status == StatusCode::CREATED)
+        .count();
+    assert_eq!(created, 1, "{results:?}");
+    assert!(results
+        .iter()
+        .all(|(status, body)| *status == StatusCode::CREATED
+            || (*status == StatusCode::TOO_MANY_REQUESTS
+                && *body == json!({"error": "too_many_challenges"}))));
+    let live: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM grant_session_challenges WHERE used_at IS NULL")
+            .fetch_one(&app.pool)
+            .await
+            .expect("live challenges");
+    assert_eq!(live, MAX_LIVE_CHALLENGES);
+}
+
+/// Kimi delta P3-3(b): issuing a challenge spends the `grant_session.mint`
+/// bucket and answers `429 retry_later` with `Retry-After` when it is empty.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn challenge_issue_spends_the_rate_bucket(pool: PgPool) {
+    let mut config = Config::for_tests();
+    config.automation_rate_limit_per_minute = 1;
+    config.automation_rate_limit_burst_multiplier = 1;
+    let (app, _) = grant_session_app_with(pool, true, config).await;
+    let grant = ShopGrant::new(Duration::hours(1));
+
+    let (first, _) = request_challenge(&app, &grant).await;
+    let (status, headers, body) = common::send_with_headers(
+        app.router.clone(),
+        "POST",
+        "/v1/auth/grant-session-challenges",
+        None,
+        &grant.challenge_request_at(app.clock.now()),
+    )
+    .await;
+
+    assert_eq!(first, StatusCode::CREATED);
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(body, json!({"error": "retry_later"}));
+    assert!(headers.get("retry-after").is_some());
+}
+
+/// Kimi delta P3-2: a refusal at the live cap does not spend a rate token,
+/// so a client waiting for a slot cannot drain its own bucket.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_refusal_at_the_live_cap_spends_no_rate_token(pool: PgPool) {
+    let (app, _) = grant_session_app(pool, true).await;
+    let grant = ShopGrant::new(Duration::hours(1));
+    for _ in 0..MAX_LIVE_CHALLENGES {
+        let (status, _) = request_challenge(&app, &grant).await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+    let tokens = || async {
+        sqlx::query_scalar::<_, f64>(
+            "SELECT tokens FROM automation_rate_limits \
+             WHERE seller_pubky = $1 AND endpoint_class = 'grant_session.mint'",
+        )
+        .bind(grant.pubky())
+        .fetch_one(&app.pool)
+        .await
+        .expect("bucket")
+    };
+    let before = tokens().await;
+
+    for _ in 0..3 {
+        let (status, body) = request_challenge(&app, &grant).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body, json!({"error": "too_many_challenges"}));
+    }
+
+    assert_eq!(tokens().await, before);
+}
+
+/// Kimi delta P3-3(c): a challenge is live strictly before `expires_at`.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_mint_at_the_exact_expiry_instant_is_refused(pool: PgPool) {
+    let (app, homeserver) = grant_session_app(pool, true).await;
+    let grant = ShopGrant::new(Duration::days(1));
+    let issued_at = app.clock.now() - Duration::seconds(120);
+    app.clock.set(issued_at);
+    let at_expiry = issue(&app, &homeserver, &grant).await;
+    let just_before = issue(&app, &homeserver, &grant).await;
+
+    app.clock.set(issued_at + Duration::seconds(120));
+    let (status, body) = post(
+        &app,
+        &grant.signed_at(proof_data(AUDIENCE, at_expiry), app.clock.now()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body, json!({"error": "grant_session_challenge_invalid"}));
+
+    app.clock.set(issued_at + Duration::seconds(119));
+    let (status, body) = post(
+        &app,
+        &grant.signed_at(proof_data(AUDIENCE, just_before), app.clock.now()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
 }
