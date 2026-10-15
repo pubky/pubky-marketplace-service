@@ -567,13 +567,15 @@ fn migration_catalog_is_gapless_through_0061_then_0071() {
                 .and_then(|prefix| prefix.parse::<u32>().ok())
         })
         .collect();
-    // 0001..=0061 gapless, then the connectors' 0062..=0064 and 0066, then
+    // 0001..=0061 gapless, then the connectors' 0062..=0067, then
     // the tracking command kind 0071.
-    let expected = (1..=61).chain([62, 63, 64, 66, 71]).collect::<Vec<_>>();
+    let expected = (1..=61)
+        .chain([62, 63, 64, 65, 66, 67, 71])
+        .collect::<Vec<_>>();
     assert_eq!(
         sorted_migration_catalog(numbers),
         expected,
-        "the raw catalog is 0001..=0061, gapless, then 0062..=0064, 0066 and 0071"
+        "the raw catalog is 0001..=0061, gapless, then 0062..=0067 and 0071"
     );
 }
 
