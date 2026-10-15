@@ -402,12 +402,9 @@ async fn resolve_order(
 /// shipped has its tracking added or changed with
 /// `fulfillment.update_tracking`; the same values again change nothing.
 ///
-/// Both commands are newer than the rest of the service. A service without
-/// them refuses the command as `INVALID_COMMAND` (an unknown kind, or a
-/// `fulfillment.ship` without a tracking number), and that refusal is final and
-/// quiet: the event is ignored with a stable reason, never retried and never
-/// an alert, so the connector works the same whether or not the service has
-/// them yet.
+/// Any refusal other than a revision conflict (retried) is final and raises a
+/// seller alert: the store says the order shipped and Pubky would not record
+/// it.
 async fn ship(
     state: &AppState,
     connection: &ConnectionRow,
@@ -492,16 +489,32 @@ async fn ship(
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default()
         .to_ascii_lowercase();
-    Ok(match code.as_str() {
-        "revision_conflict" => Handled::Retry("revision_conflict".to_string()),
-        "invalid_state" => Handled::Ignored("order_not_shippable".to_string()),
-        "invalid_command" if already_shipped => {
-            Handled::Ignored("tracking_update_not_supported".to_string())
-        }
-        "invalid_command" if tracking.is_empty() => {
-            Handled::Ignored("tracking_optional_not_supported".to_string())
-        }
-        "" => Handled::Retry(format!("status_{}", status.as_u16())),
-        other => Handled::Ignored(format!("refused_{other}")),
-    })
+    if code == "revision_conflict" {
+        return Ok(Handled::Retry("revision_conflict".to_string()));
+    }
+    if code.is_empty() {
+        return Ok(Handled::Retry(format!("status_{}", status.as_u16())));
+    }
+    // Any other refusal is final, and it is not quiet: the store says the order
+    // shipped and the marketplace would not record it, which the seller has to
+    // see.
+    let outcome = match code.as_str() {
+        "invalid_state" => "order_not_shippable".to_string(),
+        other => format!("refused_{other}"),
+    };
+    let now = state.clock.now();
+    store::raise_alert(
+        &state.pool,
+        now,
+        connection,
+        AlertKind::InboundFailed,
+        Some(order_id),
+        &format!(
+            "The store reports this order as shipped, but the marketplace refused to record \
+             it ({code}). Mark the order shipped here yourself."
+        ),
+        &format!("inbound|{}", due.id),
+    )
+    .await?;
+    Ok(Handled::Ignored(outcome))
 }
