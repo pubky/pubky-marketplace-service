@@ -6,29 +6,32 @@
 //! asked to do, in two steps no provider repeats:
 //!
 //! 1. **Unit.** The queued mirror carries the recorded total in the order
-//!    currency. The one exception is a USDT-paid order priced in anything but
-//!    USD, which records the refund in USDT0 units (the paid asset's own, see
-//!    `refund_destination::refund_cap_minor`). [`order_currency_amount`]
-//!    converts that to the order currency with the order's own recorded
-//!    conversion, in exact integer arithmetic, rounded half up to the minor
-//!    unit, and describes the basis for the store refund's note. An order
-//!    with no recorded conversion cannot be converted: the mirror is queued
-//!    as blocked and surfaces as a quarantined action for the seller to
-//!    record by hand, as a provider would have refused it.
+//!    currency. The one exception is the one `refund_destination` makes: a
+//!    USDT-paid order (`payment_method = 'usdt'` or `payment_asset = 'USDT'`)
+//!    priced in anything but USD records its refund in USDT0 units, the paid
+//!    asset's own (`refund_destination::refund_cap_minor` and
+//!    `quoted_refund_amount_minor`, from the multi-currency change, #133).
+//!    [`OrderBasis::recorded_unit`] applies that same rule.
+//!    [`order_currency_amount`] converts such a refund to the order currency
+//!    with the order's own recorded conversion (`orders.usd_conversion_pair`
+//!    and `usd_conversion_cents`, migration 0061: what the order's total
+//!    converted to when its USDT request was bound), in exact integer
+//!    arithmetic, rounded half up to the minor unit, and describes the basis
+//!    for the store refund's note. An order with no recorded conversion, or
+//!    with no USDT terms to read the unit from, cannot be converted: the
+//!    mirror is queued as blocked and surfaces as a quarantined action for the
+//!    seller to record by hand.
 //! 2. **Difference.** When the action runs, [`amount_to_mirror`] compares the
 //!    recorded total with what the store already shows refunded
 //!    ([`StoreRefundTotals`](super::provider::StoreRefundTotals), read from
 //!    the provider fresh) and yields only the amount still to mirror, never
 //!    taking the store's refunds above its payment.
 //!
-//! The conversion reads the order through `to_jsonb(orders)` rather than a
-//! column list, so a database that does not have the conversion columns yet
-//! (they arrive with migration 0061) has no conversion to read: the same code
-//! compiles and runs, and an order with a recorded unit it cannot convert is
-//! blocked as above. Nothing here names a column that only 0061 creates other
-//! than as an optional JSON key.
-
-use serde_json::Value;
+//! Every connector table is created by migrations 0062 and later of the
+//! connector PRs and `CONNECTORS_ENABLED` defaults off, so no mirror queued
+//! under an older refund shape (an amount in sats or USDT with an
+//! `amount_unit` label) can exist on any database: the payload written here
+//! is the only one the worker has ever read.
 
 use super::provider::{ProviderError, StoreRefundTotals};
 
@@ -44,11 +47,14 @@ pub const REFUND_EXCEEDS_PAYMENT: &str = "refund_exceeds_payment";
 pub enum RecordedUnit {
     /// The order currency's minor units.
     OrderCurrency,
-    /// USDT0 base units, `10^-exponent` of a USDT each.
-    Usdt0 { exponent: i32 },
+    /// USDT0 base units, `10^-exponent` of a USDT each. The exponent is the
+    /// order's `payment_exponent`; it is `None` when the order carries no
+    /// USDT terms to read it from.
+    Usdt0 { exponent: Option<i32> },
 }
 
-/// The order facts a refund is recorded and converted against.
+/// The order facts a refund is recorded and converted against, as the
+/// `orders` columns hold them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrderBasis {
     pub currency: String,
@@ -57,8 +63,8 @@ pub struct OrderBasis {
     pub payment_method: Option<String>,
     pub payment_asset: Option<String>,
     pub payment_exponent: Option<i32>,
-    /// The order's recorded conversion to USD cents (migration 0061), when
-    /// the column set exists and the order carries one.
+    /// The order's recorded conversion to USD cents (`orders.usd_conversion_*`,
+    /// migration 0061); `None` for every order bound without one.
     pub conversion: Option<UsdConversion>,
 }
 
@@ -72,38 +78,19 @@ pub struct UsdConversion {
 }
 
 impl OrderBasis {
-    /// Reads the order from its `to_jsonb(orders)` form. `None` when the row
-    /// lacks a field every order has.
-    pub fn from_row(row: &Value) -> Option<Self> {
-        let text = |key: &str| row.get(key).and_then(Value::as_str).map(str::to_string);
-        let number = |key: &str| row.get(key).and_then(Value::as_i64);
-        let conversion = match (text("usd_conversion_pair"), number("usd_conversion_cents")) {
-            (Some(pair), Some(cents)) if cents > 0 => Some(UsdConversion { pair, cents }),
-            _ => None,
-        };
-        Some(Self {
-            currency: text("currency")?,
-            exponent: i32::try_from(number("exponent")?).ok()?,
-            total_minor: number("total_minor")?,
-            payment_method: text("payment_method"),
-            payment_asset: text("payment_asset"),
-            payment_exponent: number("payment_exponent")
-                .and_then(|value| i32::try_from(value).ok()),
-            conversion,
-        })
-    }
-
     /// The unit `refund.record_external` records this order's refunds in:
-    /// USDT0 units for a USDT-paid order priced in anything but USD, the
-    /// order currency otherwise (the rule `refund_cap_minor` applies).
+    /// exactly `refund_destination::refund_cap_minor`'s rule, USDT0 units for
+    /// a USDT-paid order priced in anything but USD, the order currency
+    /// otherwise.
     pub fn recorded_unit(&self) -> RecordedUnit {
         let usdt_paid = self.payment_method.as_deref() == Some("usdt")
             || self.payment_asset.as_deref() == Some("USDT");
-        match self.payment_exponent {
-            Some(exponent) if usdt_paid && self.currency != "USD" => {
-                RecordedUnit::Usdt0 { exponent }
+        if usdt_paid && self.currency != "USD" {
+            RecordedUnit::Usdt0 {
+                exponent: self.payment_exponent,
             }
-            _ => RecordedUnit::OrderCurrency,
+        } else {
+            RecordedUnit::OrderCurrency
         }
     }
 }
@@ -137,12 +124,13 @@ pub fn order_currency_amount(
             basis: None,
         }),
         RecordedUnit::Usdt0 { exponent } => {
-            let Some(conversion) = &order.conversion else {
+            let (Some(conversion), Some(exponent)) = (&order.conversion, exponent) else {
                 return Err(Blocked {
                     code: REFUND_AMOUNT_UNCONVERTIBLE,
                     detail: format!(
                         "The refund is recorded in USDT0 units and the order, priced in {}, has \
-                         no recorded conversion to convert it with; record it in the store by hand.",
+                         no recorded conversion or USDT terms to convert it with; record it in the \
+                         store by hand.",
                         order.currency
                     ),
                 });
@@ -259,15 +247,38 @@ fn rejected(code: &str, message: impl Into<String>) -> ProviderError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+
+    fn order(
+        currency: &str,
+        total_minor: i64,
+        method: Option<&str>,
+        asset: Option<&str>,
+        exponent: Option<i32>,
+        conversion: Option<(&str, i64)>,
+    ) -> OrderBasis {
+        OrderBasis {
+            currency: currency.into(),
+            exponent: 2,
+            total_minor,
+            payment_method: method.map(str::to_string),
+            payment_asset: asset.map(str::to_string),
+            payment_exponent: exponent,
+            conversion: conversion.map(|(pair, cents)| UsdConversion {
+                pair: pair.into(),
+                cents,
+            }),
+        }
+    }
 
     fn eur_usdt_order() -> OrderBasis {
-        OrderBasis::from_row(&json!({
-            "currency": "EUR", "exponent": 2, "total_minor": 13_700,
-            "payment_method": "paykit", "payment_asset": "USDT", "payment_exponent": 6,
-            "usd_conversion_pair": "EURUSD", "usd_conversion_cents": 14_854,
-        }))
-        .expect("order")
+        order(
+            "EUR",
+            13_700,
+            Some("paykit"),
+            Some("USDT"),
+            Some(6),
+            Some(("EURUSD", 14_854)),
+        )
     }
 
     fn store(paid: i64, refunded: i64) -> StoreRefundTotals {
@@ -280,14 +291,10 @@ mod tests {
 
     #[test]
     fn an_order_in_its_own_currency_records_in_it() {
-        let order = OrderBasis::from_row(&json!({
-            "currency": "USD", "exponent": 2, "total_minor": 5_000,
-            "payment_method": "usdt", "payment_asset": "USDT", "payment_exponent": 6,
-        }))
-        .expect("order");
-        assert_eq!(order.recorded_unit(), RecordedUnit::OrderCurrency);
+        let usd = order("USD", 5_000, Some("usdt"), Some("USDT"), Some(6), None);
+        assert_eq!(usd.recorded_unit(), RecordedUnit::OrderCurrency);
         assert_eq!(
-            order_currency_amount(&order, 1_234).expect("amount"),
+            order_currency_amount(&usd, 1_234).expect("amount"),
             OrderCurrencyAmount {
                 amount_minor: 1_234,
                 basis: None
@@ -296,17 +303,28 @@ mod tests {
     }
 
     #[test]
-    fn a_usdt_paid_non_usd_order_records_in_usdt0_units() {
+    fn the_unit_rule_is_the_one_refund_cap_minor_applies() {
+        // A USDT-paid order priced in anything but USD: by the legacy method,
+        // or by the asset a Paykit request settled on.
+        let by_method = order("EUR", 100, Some("usdt"), None, None, None);
+        let by_asset = order("EUR", 100, Some("paykit"), Some("USDT"), Some(6), None);
         assert_eq!(
-            eur_usdt_order().recorded_unit(),
-            RecordedUnit::Usdt0 { exponent: 6 }
+            by_method.recorded_unit(),
+            RecordedUnit::Usdt0 { exponent: None }
         );
-        let bitcoin = OrderBasis::from_row(&json!({
-            "currency": "EUR", "exponent": 2, "total_minor": 13_700,
-            "payment_method": "bitcoin",
-        }))
-        .expect("order");
-        assert_eq!(bitcoin.recorded_unit(), RecordedUnit::OrderCurrency);
+        assert_eq!(
+            by_asset.recorded_unit(),
+            RecordedUnit::Usdt0 { exponent: Some(6) }
+        );
+        // Any other rail, or a USD price, records in the order currency.
+        for other in [
+            order("EUR", 100, Some("bitcoin"), None, None, None),
+            order("EUR", 100, Some("paypal"), None, None, None),
+            order("EUR", 100, None, None, None, None),
+            order("USD", 100, Some("usdt"), Some("USDT"), Some(6), None),
+        ] {
+            assert_eq!(other.recorded_unit(), RecordedUnit::OrderCurrency);
+        }
     }
 
     #[test]
@@ -322,26 +340,28 @@ mod tests {
 
     #[test]
     fn a_partial_usdt0_refund_rounds_half_up_to_the_minor_unit() {
-        let order = eur_usdt_order();
+        let eur = eur_usdt_order();
         // 74.270000 USDT0 is exactly half: 68.50 EUR.
         assert_eq!(
-            order_currency_amount(&order, 74_270_000)
+            order_currency_amount(&eur, 74_270_000)
                 .expect("half")
                 .amount_minor,
             6_850
         );
         // 1.000000 USDT0 is 92.23 order units: 92.
-        let one = order_currency_amount(&order, 1_000_000).expect("one");
+        let one = order_currency_amount(&eur, 1_000_000).expect("one");
         assert_eq!(one.amount_minor, 92);
         // 1.00 EUR = 2.00 USD, so one order unit is 0.020000 USDT0: half of
         // it, 0.010000 USDT0, is exactly 0.5 units and rounds up to 1, and a
         // millionth less rounds down to 0.
-        let tie = OrderBasis::from_row(&json!({
-            "currency": "EUR", "exponent": 2, "total_minor": 100,
-            "payment_method": "usdt", "payment_exponent": 6,
-            "usd_conversion_pair": "EURUSD", "usd_conversion_cents": 200,
-        }))
-        .expect("order");
+        let tie = order(
+            "EUR",
+            100,
+            Some("usdt"),
+            None,
+            Some(6),
+            Some(("EURUSD", 200)),
+        );
         assert_eq!(
             order_currency_amount(&tie, 10_000)
                 .expect("tie")
@@ -368,15 +388,21 @@ mod tests {
     }
 
     #[test]
-    fn an_order_with_no_recorded_conversion_is_blocked() {
-        let order = OrderBasis::from_row(&json!({
-            "currency": "EUR", "exponent": 2, "total_minor": 13_700,
-            "payment_method": "usdt", "payment_exponent": 6,
-        }))
-        .expect("order");
-        let blocked = order_currency_amount(&order, 1_000_000).expect_err("blocked");
-        assert_eq!(blocked.code, REFUND_AMOUNT_UNCONVERTIBLE);
-        assert!(blocked.detail.contains("by hand"));
+    fn an_order_with_no_recorded_conversion_or_no_usdt_terms_is_blocked() {
+        let no_conversion = order("EUR", 13_700, Some("usdt"), None, Some(6), None);
+        let no_terms = order(
+            "EUR",
+            13_700,
+            Some("usdt"),
+            None,
+            None,
+            Some(("EURUSD", 14_854)),
+        );
+        for unconvertible in [no_conversion, no_terms] {
+            let blocked = order_currency_amount(&unconvertible, 1_000_000).expect_err("blocked");
+            assert_eq!(blocked.code, REFUND_AMOUNT_UNCONVERTIBLE);
+            assert!(blocked.detail.contains("by hand"));
+        }
     }
 
     #[test]

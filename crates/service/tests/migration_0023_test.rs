@@ -547,14 +547,15 @@ async fn migration_0023_adds_the_shared_manual_resolution_schema() {
 /// 0051, upstream Paykit lifecycle identity 0052, payment assets 0053,
 /// refund destinations 0054, owner-held priv data key custody releases 0055,
 /// per-order delivery terms 0056, sealed delivery addresses 0057, the purge of
-/// retired Stripe values 0058, and listing deletion follower backoff 0059.
+/// retired Stripe values 0058, listing deletion follower backoff 0059, and
+/// the single Paykit bind 0060, and multi-currency FX 0061.
 fn sorted_migration_catalog(mut numbers: Vec<u32>) -> Vec<u32> {
     numbers.sort_unstable();
     numbers
 }
 
 #[test]
-fn migration_catalog_is_gapless_through_0059() {
+fn migration_catalog_is_gapless_through_0061() {
     let numbers: Vec<u32> = std::fs::read_dir(MIGRATIONS_DIR)
         .expect("migrations dir")
         .filter_map(|entry| {
@@ -564,18 +565,17 @@ fn migration_catalog_is_gapless_through_0059() {
                 .and_then(|prefix| prefix.parse::<u32>().ok())
         })
         .collect();
-    // 0060 and later are claimed by lanes that land separately (0062 to 0069
-    // are the connectors'), so the rule is: 0001..=0059 gapless, then only
-    // later numbers.
+    // 0062 and later are the connectors' (0062 to 0069), landing with their
+    // own PR, so the rule is: 0001..=0061 gapless, then only later numbers.
     let (base, later): (Vec<u32>, Vec<u32>) = sorted_migration_catalog(numbers)
         .into_iter()
-        .partition(|number| *number <= 59);
+        .partition(|number| *number <= 61);
     assert_eq!(
         base,
-        (1..=59).collect::<Vec<_>>(),
-        "the raw catalog starts 0001..=0059, gapless"
+        (1..=61).collect::<Vec<_>>(),
+        "the raw catalog starts 0001..=0061, gapless"
     );
-    assert!(later.iter().all(|number| *number >= 60));
+    assert!(later.iter().all(|number| *number >= 62));
 }
 
 #[test]
@@ -641,9 +641,10 @@ fn every_manual_review_writer_stamps_the_entry_time() {
     }
     // The enumerated set: Locks apply_manual_review (1 in bitcoin_review),
     // apply_late_money still-held (1 in bitcoin_review), the paykit worker
-    // (5: amount mismatch, observed-amount-vs-quote mismatch, confirm-failure,
-    // upstream lifecycle inconsistency, seller-window reaper — late settlement
-    // now goes through apply_late_money),
+    // (6: amount mismatch, observed-amount-vs-quote mismatch, confirm-failure,
+    // upstream lifecycle inconsistency, seller-window reaper, money confirmed
+    // on both rails of one request — late settlement now goes through
+    // apply_late_money),
     // the fiat apply_fiat_paid confirm-failure (1; expired uses apply_late_money),
     // the sandbox transition (1), and a released Paykit attempt settling with a
     // different amount (1 in paykit_attempts). Any NEW writer fails here until it is
@@ -659,7 +660,7 @@ fn every_manual_review_writer_stamps_the_entry_time() {
             ("payment.rs".to_string(), 1),
             ("paykit_attempts.rs".to_string(), 1),
             ("payment_methods.rs".to_string(), 1),
-            ("workers.rs".to_string(), 5),
+            ("workers.rs".to_string(), 6),
         ]),
         "the manual_review writer set drifted; stamp and enumerate the new writer"
     );

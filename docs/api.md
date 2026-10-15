@@ -1134,6 +1134,26 @@ Environment names: `CONNECTORS_ENABLED`, `CONNECTOR_PUBLIC_BASE_URL`,
 are not read yet. The worker is the `connector-worker` binary of the same
 image.
 
+### Mirror leases and the refund difference
+
+Cancel and refund mirrors of one store order run one at a time, across every
+worker replica: a mirror is claimed only when no other mirror of that push is
+`sending` with an unexpired lease. A refund mirror reads the store's refunded
+total and then writes only the difference. The lease must exceed twice the
+provider timeout (`CONNECTOR_PUSH_LEASE_SECONDS` against
+`CONNECTOR_PROVIDER_TIMEOUT_SECONDS`, enforced at start-up in
+`connectors/config.rs`), because a refund mirror makes two timed provider
+calls, so a live worker cannot outlive its lease. After a crash a successor
+claims the order only once the lease has lapsed, and re-reads the store's
+refunded total before it writes; a refund that reached the store before the
+crash is then seen and not written again. Shopify also dedupes on the
+`@idempotent` key of `refundCreate`. WooCommerce has no idempotency key, so its
+residual is a store that applies a refund more than the lease minus the
+timeout after our client gave up on the call: that refund is not in the total
+the successor read, and the difference is written a second time. The window is
+bounded by the configured lease; the defaults are 300 seconds against a 30
+second timeout.
+
 ## Operational endpoints
 
 All three are unauthenticated, uncached and safe to poll.
