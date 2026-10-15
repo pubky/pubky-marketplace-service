@@ -280,7 +280,9 @@ async fn refund_basis(
             parts.push(format!(
                 "Order quote: BTC{} {rate} from {} at {}.",
                 quote_currency.trim_end(),
-                row.bitcoin_quote_source.as_deref().unwrap_or("unknown source"),
+                row.bitcoin_quote_source
+                    .as_deref()
+                    .unwrap_or("unknown source"),
                 row.bitcoin_quote_fetched_at
                     .map(crate::clock::format_timestamp)
                     .unwrap_or_else(|| "unknown time".to_string()),

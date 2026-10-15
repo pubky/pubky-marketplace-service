@@ -497,7 +497,9 @@ async fn mirror_echo(
                 ..
             } => {
                 amounts.len() == 1
-                    && amounts[0].currency.eq_ignore_ascii_case(&mark.amount.currency)
+                    && amounts[0]
+                        .currency
+                        .eq_ignore_ascii_case(&mark.amount.currency)
                     && amounts[0].amount_minor == mark.amount.amount_minor
             }
             EchoOf::Refund {

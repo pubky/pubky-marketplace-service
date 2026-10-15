@@ -421,9 +421,15 @@ async fn a_refund_is_recorded_once_per_pubky_refund_with_a_manual_transaction() 
         .expect("parent")
         .contains("OrderTransaction"));
     assert_eq!(input["notify"], false);
-    assert!(input.get("refundLineItems").is_none(), "a Pubky refund does not restock");
+    assert!(
+        input.get("refundLineItems").is_none(),
+        "a Pubky refund does not restock"
+    );
     let note = input["note"].as_str().expect("note");
-    assert!(note.contains("no currency conversion") && note.contains("BTCUSD 98123.45"), "{note}");
+    assert!(
+        note.contains("no currency conversion") && note.contains("BTCUSD 98123.45"),
+        "{note}"
+    );
     assert!(note.ends_with("pubky-refund:refund-a:5000:USD"), "{note}");
     fake.assert_clean();
 }
@@ -446,11 +452,24 @@ async fn a_full_refund_after_a_partial_one_refunds_only_the_difference() {
     let refunds = fake.orders()[0].refunds.clone();
     assert_eq!(refunds.len(), 2);
     assert_eq!(refunds[1]["transactions"][0]["amount"], "212.00");
-    assert_eq!(fake.orders()[0].refunded_minor(), 26200, "the store never shows more than was paid");
+    assert_eq!(
+        fake.orders()[0].refunded_minor(),
+        26200,
+        "the store never shows more than was paid"
+    );
     let keys: Vec<String> = fake
         .calls("RefundCreate")
         .iter()
-        .map(|call| call.document.split("@idempotent(key: \"").nth(1).expect("key").split('"').next().expect("key").to_string())
+        .map(|call| {
+            call.document
+                .split("@idempotent(key: \"")
+                .nth(1)
+                .expect("key")
+                .split('"')
+                .next()
+                .expect("key")
+                .to_string()
+        })
         .collect();
     assert_eq!(keys.len(), 2);
     assert_ne!(keys[0], keys[1]);
@@ -484,7 +503,11 @@ async fn a_refund_the_merchant_already_made_in_the_store_is_not_made_twice() {
         .record_refund(&connection, &order, &refund("refund-c", Some(20000), "usd"))
         .await
         .expect("already covered");
-    assert_eq!(fake.calls("RefundCreate").len(), 1, "a record the store already covers sends nothing");
+    assert_eq!(
+        fake.calls("RefundCreate").len(),
+        1,
+        "a record the store already covers sends nothing"
+    );
     fake.assert_clean();
 }
 
@@ -496,9 +519,15 @@ async fn a_refund_that_cannot_be_stated_in_the_store_currency_is_refused() {
         .await
         .expect("pushed");
     for (record, wanted) in [
-        (refund("refund-sat", Some(40_000), "sat"), "refund_amount_unconvertible"),
+        (
+            refund("refund-sat", Some(40_000), "sat"),
+            "refund_amount_unconvertible",
+        ),
         (refund("refund-none", None, "usd"), "refund_amount_missing"),
-        (refund("refund-big", Some(99_999), "usd"), "refund_exceeds_payment"),
+        (
+            refund("refund-big", Some(99_999), "usd"),
+            "refund_exceeds_payment",
+        ),
     ] {
         let error = provider
             .record_refund(&connection, &order, &record)
@@ -703,7 +732,10 @@ async fn the_recent_order_scan_pages_until_it_finds_the_order_or_leaves_the_hori
         .iter()
         .map(|call| call.variables["after"].clone())
         .collect();
-    assert_eq!(pages, [Value::Null, json!("recent-50"), json!("recent-100")]);
+    assert_eq!(
+        pages,
+        [Value::Null, json!("recent-50"), json!("recent-100")]
+    );
 
     // An order that is not there ends the scan at the first order older than
     // the horizon, not at the end of the store's history.

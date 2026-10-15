@@ -296,7 +296,9 @@ pub async fn find(
         if let Some(id) = find_in(&page, &tag) {
             return Ok(Some(ExternalOrder { id }));
         }
-        let has_next = page.pointer("/orders/pageInfo/hasNextPage").and_then(Value::as_bool)
+        let has_next = page
+            .pointer("/orders/pageInfo/hasNextPage")
+            .and_then(Value::as_bool)
             == Some(true);
         if !has_next || page_is_past_horizon(&page, Utc::now()) {
             return Ok(None);
@@ -406,7 +408,10 @@ pub fn refund_target_minor(refund: &RefundRecord) -> Result<i64, ProviderError> 
             "The recorded refund has no amount to mirror.",
         ));
     };
-    if !refund.amount_unit.eq_ignore_ascii_case(&refund.order_currency) {
+    if !refund
+        .amount_unit
+        .eq_ignore_ascii_case(&refund.order_currency)
+    {
         return Err(rejected(
             "refund_amount_unconvertible",
             format!(
@@ -430,7 +435,10 @@ const NOTE_BASIS_MAX: usize = 400;
 /// colons. The refund webhook carries the note back, so the connector can tell
 /// this refund from one the merchant made, and check its amount.
 pub fn refund_mark(refund_id: &str, delta_minor: i64, currency: &str) -> String {
-    format!("{MARK_PREFIX}{refund_id}:{delta_minor}:{}", currency.to_ascii_uppercase())
+    format!(
+        "{MARK_PREFIX}{refund_id}:{delta_minor}:{}",
+        currency.to_ascii_uppercase()
+    )
 }
 
 /// Reads a mark back out of a refund note.
@@ -441,7 +449,10 @@ pub fn parse_refund_mark(note: &str) -> Option<(String, i64, String)> {
     let refund_id = parts.next().filter(|id| !id.is_empty())?.to_string();
     let amount = parts.next()?.parse::<i64>().ok()?;
     let currency = parts.next().filter(|c| !c.is_empty())?.to_ascii_uppercase();
-    parts.next().is_none().then_some((refund_id, amount, currency))
+    parts
+        .next()
+        .is_none()
+        .then_some((refund_id, amount, currency))
 }
 
 fn refund_note(refund: &RefundRecord, delta_minor: i64, currency: &str) -> String {
@@ -547,7 +558,8 @@ pub async fn refund(
     if delta <= 0 {
         return Ok(());
     }
-    let document = documents::REFUND_CREATE.replace("{{KEY}}", &refund_key(&refund.refund_id, delta));
+    let document =
+        documents::REFUND_CREATE.replace("{{KEY}}", &refund_key(&refund.refund_id, delta));
     let data = client
         .execute(
             shop,
@@ -724,7 +736,10 @@ mod tests {
             2500
         );
         for (record, code) in [
-            (refund_record(Some(2500), "sat"), "refund_amount_unconvertible"),
+            (
+                refund_record(Some(2500), "sat"),
+                "refund_amount_unconvertible",
+            ),
             (refund_record(None, "usd"), "refund_amount_missing"),
             (refund_record(Some(0), "usd"), "refund_amount_missing"),
         ] {
@@ -751,7 +766,11 @@ mod tests {
         let note = format!("Pubky refund for order x. Amount recorded in USD. {mark}");
         assert_eq!(
             parse_refund_mark(&note),
-            Some(("7d9c0e0e-1111-4222-8333-444455556666".into(), 8700, "USD".into()))
+            Some((
+                "7d9c0e0e-1111-4222-8333-444455556666".into(),
+                8700,
+                "USD".into()
+            ))
         );
         for bad in [
             "no mark here",
@@ -781,7 +800,10 @@ mod tests {
         };
         assert!(!page_is_past_horizon(&page(2), now));
         assert!(page_is_past_horizon(&page(30), now));
-        assert!(!page_is_past_horizon(&json!({"orders": {"nodes": []}}), now));
+        assert!(!page_is_past_horizon(
+            &json!({"orders": {"nodes": []}}),
+            now
+        ));
     }
 
     #[test]

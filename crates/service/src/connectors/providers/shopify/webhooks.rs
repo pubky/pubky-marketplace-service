@@ -86,7 +86,11 @@ async fn subscriptions(
                 node.get("uri")?.as_str()?.to_string(),
             ))
         }));
-        if page.pointer("/pageInfo/hasNextPage").and_then(Value::as_bool) != Some(true) {
+        if page
+            .pointer("/pageInfo/hasNextPage")
+            .and_then(Value::as_bool)
+            != Some(true)
+        {
             return Ok(found);
         }
         after = page
@@ -514,13 +518,23 @@ mod tests {
             {"kind":"refund","status":"success","amount":"500","currency":"jpy"},
             {"kind":"sale","status":"success","amount":"7.00","currency":"usd"}]}"#;
         match parse(&webhook("refunds/create"), body).expect("event") {
-            InboundEvent::StoreRefund { order, amounts, mark } => {
+            InboundEvent::StoreRefund {
+                order,
+                amounts,
+                mark,
+            } => {
                 assert_eq!(order.external_order_id, "gid://shopify/Order/77");
                 assert_eq!(
                     amounts,
                     vec![
-                        RefundAmount { currency: "JPY".into(), amount_minor: 500 },
-                        RefundAmount { currency: "USD".into(), amount_minor: 1250 },
+                        RefundAmount {
+                            currency: "JPY".into(),
+                            amount_minor: 500
+                        },
+                        RefundAmount {
+                            currency: "USD".into(),
+                            amount_minor: 1250
+                        },
                     ],
                     "currencies are never added together"
                 );
@@ -547,14 +561,18 @@ mod tests {
                     mark,
                     Some(PubkyRefundMark {
                         refund_id: "7d9c0e0e-1111-4222-8333-444455556666".into(),
-                        amount: RefundAmount { currency: "USD".into(), amount_minor: 8700 },
+                        amount: RefundAmount {
+                            currency: "USD".into(),
+                            amount_minor: 8700
+                        },
                     })
                 );
                 assert_eq!(amounts[0].amount_minor, 8700);
             }
             other => panic!("{other:?}"),
         }
-        let merchants = br#"{"order_id":77,"note":"customer returned the boots","transactions":[]}"#;
+        let merchants =
+            br#"{"order_id":77,"note":"customer returned the boots","transactions":[]}"#;
         match parse(&webhook("refunds/create"), merchants).expect("event") {
             InboundEvent::StoreRefund { mark, .. } => assert_eq!(mark, None),
             other => panic!("{other:?}"),

@@ -664,7 +664,9 @@ fn run(inner: &mut Inner, name: &str, document: &str, variables: &Value) -> Resu
             let input = &variables["input"];
             let id = input["orderId"].as_str().unwrap_or_default().to_string();
             if let Some(refund) = inner.refund_keys.get(&key) {
-                return Ok(json!({ "data": { "refundCreate": { "refund": { "id": refund }, "userErrors": [] } } }));
+                return Ok(
+                    json!({ "data": { "refundCreate": { "refund": { "id": refund }, "userErrors": [] } } }),
+                );
             }
             inner.next_id += 1;
             let refund_id = gid("Refund", inner.next_id);
@@ -683,7 +685,9 @@ fn run(inner: &mut Inner, name: &str, document: &str, variables: &Value) -> Resu
             }
             order.refunds.push(input.clone());
             inner.refund_keys.insert(key, refund_id.clone());
-            Ok(json!({ "data": { "refundCreate": { "refund": { "id": refund_id }, "userErrors": [] } } }))
+            Ok(
+                json!({ "data": { "refundCreate": { "refund": { "id": refund_id }, "userErrors": [] } } }),
+            )
         }
         "WebhookSubscriptions" => {
             let start = variables["after"]
