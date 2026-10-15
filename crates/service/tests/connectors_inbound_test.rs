@@ -373,12 +373,21 @@ async fn a_fulfillment_webhook_ships_the_pubky_order_with_its_tracking(pool: PgP
     worker::drive_inbound(&s.app.state, 10)
         .await
         .expect("drive");
+    // A second shipment with another number is a tracking change. A service
+    // with `fulfillment.update_tracking` applies it; one without refuses the
+    // command and the connector ignores that quietly, the number unchanged.
+    let has_update_tracking = include_str!("../../../contracts/state-machines.json")
+        .contains("fulfillment.update_tracking");
     assert_eq!(
         inbound(&s.app, "evt-ship-2").await,
-        (
-            "ignored".to_string(),
-            Some("order_not_shippable".to_string())
-        )
+        if has_update_tracking {
+            ("applied".to_string(), Some("tracking_updated".to_string()))
+        } else {
+            (
+                "ignored".to_string(),
+                Some("tracking_update_not_supported".to_string()),
+            )
+        }
     );
     let tracking: String =
         sqlx::query_scalar("SELECT shipment->>'tracking_number' FROM orders WHERE id = $1::uuid")
@@ -386,7 +395,14 @@ async fn a_fulfillment_webhook_ships_the_pubky_order_with_its_tracking(pool: PgP
             .fetch_one(&s.app.pool)
             .await
             .expect("tracking");
-    assert_eq!(tracking, "JD0146000");
+    assert_eq!(
+        tracking,
+        if has_update_tracking {
+            "1Z999"
+        } else {
+            "JD0146000"
+        }
+    );
 
     webhook(
         &s.app,
