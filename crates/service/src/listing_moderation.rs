@@ -157,9 +157,18 @@ pub fn client_from_env() -> anyhow::Result<HttpListingModerationClient> {
 pub const LISTING_MODERATED_MESSAGE: &str =
     "This listing was removed by moderation and cannot be bought, bid on or offered on.";
 
-/// The `(seller_pubky, listing_id)` of every listing a command would sell,
-/// bid on or offer on; empty for any other command and for a listing that is
-/// not registered (the handler refuses those itself).
+/// One listing a command would sell, bid on or offer on.
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct SoldListing {
+    pub seller_pubky: String,
+    pub listing_id: String,
+    /// False for a tombstoned listing, whose handler answers `NOT_FOUND`.
+    pub live: bool,
+}
+
+/// Every listing a command would sell, bid on or offer on; empty for any
+/// other command and for a listing that is not registered (the handler
+/// refuses those itself).
 ///
 /// The commands are `checkout.create`, `offer.checkout`, `offer.create`,
 /// `offer.counter`, `offer.accept`, `auction.place_bid`, and
@@ -173,7 +182,7 @@ pub async fn listings_a_command_sells(
     pool: &PgPool,
     actor: &str,
     command: &Command,
-) -> Result<Vec<(String, String)>, sqlx::Error> {
+) -> Result<Vec<SoldListing>, sqlx::Error> {
     match &command.payload {
         CommandPayload::CreateCheckout(payload) => {
             let aggregate_ids: Vec<&str> = payload
@@ -182,7 +191,7 @@ pub async fn listings_a_command_sells(
                 .map(|line| line.listing_aggregate_id.as_str())
                 .collect();
             sqlx::query_as(
-                "SELECT seller_pubky, listing_id FROM listings \
+                "SELECT seller_pubky, listing_id, deleted_at IS NULL AS live FROM listings \
                  WHERE aggregate_id = ANY($1) ORDER BY aggregate_id",
             )
             .bind(&aggregate_ids)
@@ -190,16 +199,19 @@ pub async fn listings_a_command_sells(
             .await
         }
         CommandPayload::CreateOffer(_) | CommandPayload::PlaceBid(_) => {
-            sqlx::query_as("SELECT seller_pubky, listing_id FROM listings WHERE aggregate_id = $1")
-                .bind(&command.aggregate_id)
-                .fetch_all(pool)
-                .await
+            sqlx::query_as(
+                "SELECT seller_pubky, listing_id, deleted_at IS NULL AS live FROM listings \
+                 WHERE aggregate_id = $1",
+            )
+            .bind(&command.aggregate_id)
+            .fetch_all(pool)
+            .await
         }
         CommandPayload::CounterOffer(_)
         | CommandPayload::AcceptOffer(_)
         | CommandPayload::OfferCheckout(_) => {
             sqlx::query_as(
-                "SELECT l.seller_pubky, l.listing_id FROM offers o \
+                "SELECT l.seller_pubky, l.listing_id, l.deleted_at IS NULL AS live FROM offers o \
                  JOIN listings l ON l.aggregate_id = o.listing_aggregate_id \
                  WHERE o.aggregate_id = $1",
             )
@@ -209,7 +221,7 @@ pub async fn listings_a_command_sells(
         }
         CommandPayload::PrepareLocks(payload) => {
             sqlx::query_as(
-                "SELECT DISTINCT l.seller_pubky, l.listing_id \
+                "SELECT DISTINCT l.seller_pubky, l.listing_id, l.deleted_at IS NULL AS live \
                  FROM payments p \
                  JOIN orders o ON o.id = p.order_id \
                  CROSS JOIN LATERAL jsonb_array_elements(o.lines) AS line \
@@ -227,8 +239,8 @@ pub async fn listings_a_command_sells(
     }
 }
 
-/// The `(seller_pubky, listing_id)` of every listing on an order that is
-/// about to have a payment method bound, for the buyer's own order only.
+/// Every listing on an order that is about to have a payment method bound,
+/// for the buyer's own order only.
 /// Empty when the order is not the buyer's, is no longer awaiting a payment
 /// method, or already has one (a re-bind of the bound method sells nothing
 /// new), so the existing bind answers those cases itself.
@@ -236,9 +248,9 @@ pub async fn listings_a_bind_sells(
     pool: &PgPool,
     order_id: Uuid,
     buyer_pubky: &str,
-) -> Result<Vec<(String, String)>, sqlx::Error> {
+) -> Result<Vec<SoldListing>, sqlx::Error> {
     sqlx::query_as(
-        "SELECT DISTINCT l.seller_pubky, l.listing_id \
+        "SELECT DISTINCT l.seller_pubky, l.listing_id, l.deleted_at IS NULL AS live \
          FROM orders o \
          CROSS JOIN LATERAL jsonb_array_elements(o.lines) AS line \
          JOIN listings l ON l.aggregate_id = line ->> 'listing_aggregate_id' \

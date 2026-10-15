@@ -36,7 +36,8 @@ use common::{
 };
 
 /// A content-lock homeserver double serving exactly the documents the test
-/// scripts, keyed by `(creator, content path)`; every other fetch is a clean
+/// scripts, keyed by `(creator, content path)`, and the listing records
+/// registered through the command mirror; every other fetch is a clean
 /// not-found. It exists so identity-validation negatives can serve tampered
 /// or foreign documents at the seller-authoritative resource path.
 struct ScriptedLocksHomeserver {
@@ -46,10 +47,10 @@ struct ScriptedLocksHomeserver {
 impl HomeserverListingClient for ScriptedLocksHomeserver {
     fn fetch_listing<'a>(
         &'a self,
-        _seller_pubky: &'a str,
-        _listing_id: &'a str,
+        seller_pubky: &'a str,
+        listing_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
-        Box::pin(async { HomeserverFetchOutcome::NotFound })
+        common::CommandMirrorHomeserver.fetch_listing(seller_pubky, listing_id)
     }
 
     fn fetch_drop<'a>(
@@ -2359,6 +2360,11 @@ async fn prepare_seals_the_checkout_snapshot_not_a_post_checkout_lock_mutation(p
         "criterionId": "paykit",
     });
     as_digital_locks_listing(&mut listing);
+    homeserver.put_record(
+        &seller.pubky,
+        "boots_01",
+        listing_record_with_lock(1, &lock_a),
+    );
     let (status, body) = execute(&app, &seller.token, &listing).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (status, body) = execute(

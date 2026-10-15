@@ -149,7 +149,23 @@ async fn seed_production_shaped_legacy_auction(
     .execute(pool)
     .await
     .expect("Wave 1-shaped pre-0033 auction seeds");
+    publish_active_record(seller, listing_id);
     aggregate_id
+}
+
+/// The seller's published listing record, which bids are checked against.
+fn publish_active_record(seller: &str, listing_id: &str) {
+    common::put_command_mirror_record(
+        seller,
+        listing_id,
+        json!({
+            "recordType": "listing",
+            "schemaVersion": 1,
+            "ownerPubky": seller,
+            "listingId": listing_id,
+            "state": "active",
+        }),
+    );
 }
 
 fn bid_command(aggregate_id: &str, index: u64, expected_revision: i64) -> Value {
@@ -200,6 +216,7 @@ async fn seed_listing(pool: &PgPool, aggregate_id: &str) {
     .execute(pool)
     .await
     .expect("auction listing seeds");
+    publish_active_record(&"y".repeat(52), &aggregate_id.replace(':', "_"));
 }
 
 async fn overwrite_auction(pool: &PgPool, aggregate_id: &str, auction: Value) {
@@ -267,9 +284,13 @@ async fn legacy_auction_migrates_to_no_reserve_then_bids_and_closes_sold(pool: P
     assert_eq!(status, StatusCode::OK, "{bid}");
 
     app.clock.advance_seconds(200_000);
-    let closed = marketplace_service::workers::close_due_auctions(&app.pool, app.clock.now())
-        .await
-        .expect("worker closes migrated auction");
+    let closed = marketplace_service::workers::close_due_auctions(
+        &app.pool,
+        app.state.homeserver.as_deref(),
+        app.clock.now(),
+    )
+    .await
+    .expect("worker closes migrated auction");
     assert_eq!(
         closed,
         AuctionCloseBatchSummary {
@@ -411,9 +432,13 @@ async fn malformed_auction_documents_are_isolated_from_a_due_peer(pool: PgPool) 
 
     let app = test_app(pool).await;
     app.clock.advance_seconds(2_772_480);
-    let summary = marketplace_service::workers::close_due_auctions(&app.pool, app.clock.now())
-        .await
-        .expect("malformed rows do not abort the bounded batch");
+    let summary = marketplace_service::workers::close_due_auctions(
+        &app.pool,
+        app.state.homeserver.as_deref(),
+        app.clock.now(),
+    )
+    .await
+    .expect("malformed rows do not abort the bounded batch");
     assert_eq!(
         summary,
         AuctionCloseBatchSummary {
@@ -523,9 +548,13 @@ async fn calendar_invalid_timestamps_cannot_starve_a_due_peer(pool: PgPool) {
 
     let app = test_app(pool).await;
     app.clock.advance_seconds(2_772_480);
-    let summary = marketplace_service::workers::close_due_auctions(&app.pool, app.clock.now())
-        .await
-        .expect("calendar-invalid rows cannot abort or starve the bounded batch");
+    let summary = marketplace_service::workers::close_due_auctions(
+        &app.pool,
+        app.state.homeserver.as_deref(),
+        app.clock.now(),
+    )
+    .await
+    .expect("calendar-invalid rows cannot abort or starve the bounded batch");
     assert_eq!(
         summary,
         AuctionCloseBatchSummary {
@@ -598,9 +627,13 @@ async fn due_auction_selection_is_bounded_and_drains_oldest_first(pool: PgPool) 
 
     let app = test_app(pool).await;
     app.clock.advance_seconds(2_772_480);
-    let first = marketplace_service::workers::close_due_auctions(&app.pool, app.clock.now())
-        .await
-        .expect("first bounded close batch runs");
+    let first = marketplace_service::workers::close_due_auctions(
+        &app.pool,
+        app.state.homeserver.as_deref(),
+        app.clock.now(),
+    )
+    .await
+    .expect("first bounded close batch runs");
     assert_eq!(
         first,
         AuctionCloseBatchSummary {
@@ -631,9 +664,13 @@ async fn due_auction_selection_is_bounded_and_drains_oldest_first(pool: PgPool) 
     .expect("last ordered due auction reads");
     assert_eq!(last_status, "active");
 
-    let second = marketplace_service::workers::close_due_auctions(&app.pool, app.clock.now())
-        .await
-        .expect("remaining due auction drains next pass");
+    let second = marketplace_service::workers::close_due_auctions(
+        &app.pool,
+        app.state.homeserver.as_deref(),
+        app.clock.now(),
+    )
+    .await
+    .expect("remaining due auction drains next pass");
     assert_eq!(
         second,
         AuctionCloseBatchSummary {

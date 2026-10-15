@@ -306,7 +306,7 @@ pub async fn close(
     }
 
     let outcome =
-        close_locked_auction(tx, &listing, auction, actor, command.command_id, now).await?;
+        close_locked_auction(tx, &listing, auction, actor, command.command_id, false, now).await?;
     Ok(Ok(HandlerSuccess {
         revision: outcome.listing.server_revision,
         event_ids: outcome.event_ids.clone(),
@@ -355,24 +355,27 @@ impl AuctionCloseOutcome {
 /// (the seller command and the server-time worker) must have verified the
 /// auction is active and its end time has passed. Sold auctions get exactly
 /// one winning reservation, order, and sandbox payment.
+/// `withdrawn` is true when the seller's record says the listing was
+/// removed; like a deleted auction, it then closes unsold.
 pub async fn close_locked_auction(
     tx: &mut Transaction<'_, Postgres>,
     listing: &ListingRow,
     auction: AuctionState,
     actor: &str,
     command_id: Uuid,
+    withdrawn: bool,
     now: DateTime<Utc>,
 ) -> Result<AuctionCloseOutcome, sqlx::Error> {
     let reserve = fetch_auction_reserve_for_update(tx, &listing.aggregate_id)
         .await?
         .ok_or_else(|| sqlx::Error::Protocol("auction reserve authority is missing".to_string()))?;
     let reserve_satisfied = reserve_satisfied(listing, &auction, &reserve)?;
-    // A deleted auction closes unsold: its leader never becomes a buyer of a
-    // listing the seller withdrew.
+    // A deleted or removed auction closes unsold: its leader never becomes a
+    // buyer of a listing the seller withdrew.
     let winner = auction
         .leader_pubky
         .clone()
-        .filter(|_| reserve_satisfied && !listing.is_deleted());
+        .filter(|_| reserve_satisfied && !listing.is_deleted() && !withdrawn);
     let sold = winner.is_some();
     let auction_status = if sold { "sold" } else { "unsold" };
     debug_assert!(can_transition(&auction_machine(), "active", auction_status));
