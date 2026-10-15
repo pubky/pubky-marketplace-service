@@ -1,0 +1,13 @@
+{
+  "_provenance": "spec-derived: shape of the ShopOverview document against the 2026-10 schema; not a capture",
+  "data": {
+    "shop": { "name": "Dezentral Goods", "currencyCode": "USD" },
+    "locations": { "nodes": [
+      { "id": "gid://shopify/Location/1001", "isActive": true },
+      { "id": "gid://shopify/Location/1002", "isActive": false }
+    ] },
+    "currentAppInstallation": { "accessScopes": [] }
+  },
+  "extensions": { "cost": { "requestedQueryCost": 8, "actualQueryCost": 6,
+    "throttleStatus": { "maximumAvailable": 2000.0, "currentlyAvailable": 1994, "restoreRate": 100.0 } } }
+}

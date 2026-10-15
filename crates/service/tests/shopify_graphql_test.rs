@@ -30,7 +30,9 @@ fn every_document_is_valid_against_the_published_schema() {
     for (name, document) in documents::ALL {
         let text = document.replace("{{KEY}}", "00000000-0000-8000-8000-000000000000");
         ExecutableDocument::parse_and_validate(&schema, text, format!("{name}.graphql"))
-            .unwrap_or_else(|errors| panic!("{name}.graphql is invalid for {API_VERSION}:\n{errors}"));
+            .unwrap_or_else(|errors| {
+                panic!("{name}.graphql is invalid for {API_VERSION}:\n{errors}")
+            });
     }
 }
 
@@ -50,7 +52,10 @@ fn no_document_file_escapes_validation() {
         })
         .collect();
     on_disk.sort();
-    let mut listed: Vec<String> = documents::ALL.iter().map(|(name, _)| name.to_string()).collect();
+    let mut listed: Vec<String> = documents::ALL
+        .iter()
+        .map(|(name, _)| name.to_string())
+        .collect();
     listed.sort();
     assert_eq!(on_disk, listed, "every .graphql file is in documents::ALL");
 }

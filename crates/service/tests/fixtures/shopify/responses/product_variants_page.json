@@ -1,0 +1,23 @@
+{
+  "_provenance": "spec-derived: shape of the ProductVariantsPage document against the 2026-10 schema; not a capture",
+  "data": {
+    "product": {
+      "id": "gid://shopify/Product/9001",
+      "variants": {
+        "pageInfo": { "hasNextPage": false, "endCursor": "variants-cursor-2" },
+        "nodes": [
+          {
+            "id": "gid://shopify/ProductVariant/50003",
+            "title": "42", "sku": "BOOT-42", "price": "129.99",
+            "selectedOptions": [ { "name": "Size", "value": "42" } ],
+            "image": null,
+            "inventoryQuantity": 3,
+            "inventoryItem": { "tracked": true }
+          }
+        ]
+      }
+    }
+  },
+  "extensions": { "cost": { "requestedQueryCost": 54, "actualQueryCost": 6,
+    "throttleStatus": { "maximumAvailable": 2000.0, "currentlyAvailable": 1994, "restoreRate": 100.0 } } }
+}
