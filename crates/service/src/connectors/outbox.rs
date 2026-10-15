@@ -138,7 +138,7 @@ async fn apply(
             let Some(order_id) = order_id_of(&event.aggregate_id) else {
                 return Ok(0);
             };
-            on_refund_reversed(tx, now, order_id).await?;
+            on_refund_reversed(tx, now, event, order_id).await?;
             Ok(0)
         }
         _ => Ok(0),
@@ -231,6 +231,18 @@ async fn on_refund_recorded(
     event: &EventRow,
     order_id: Uuid,
 ) -> Result<(), sqlx::Error> {
+    mirror_current_refund(tx, now, order_id, event.id).await
+}
+
+/// Queues the mirror of the refund the order holds now, keyed on that record.
+/// Idempotent: a refund already queued or mirrored under the same key is left
+/// as it is.
+async fn mirror_current_refund(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    now: DateTime<Utc>,
+    order_id: Uuid,
+    source_event_id: Uuid,
+) -> Result<(), sqlx::Error> {
     let has_push = ledger::has_mirrorable_push(tx, order_id).await?;
     if !has_push {
         return Ok(());
@@ -279,7 +291,7 @@ async fn on_refund_recorded(
         "full": state == "refunded_external",
         "quote": quote,
     });
-    ledger::on_refund_recorded(tx, now, order_id, &key, &payload, event.id).await
+    ledger::on_refund_recorded(tx, now, order_id, &key, &payload, source_event_id).await
 }
 
 /// The identity of a recorded refund: a digest of the amount, transaction id
@@ -321,10 +333,16 @@ async fn refund_key(
 }
 
 /// A reversal was cancelled: the order's refund is now what it holds, if
-/// anything. Earlier refund mirrors are settled against it.
+/// anything. Mirrors of earlier refunds are settled against it. When a refund
+/// still stands under a record of its own and every earlier mirror was only
+/// queued, it replaces them, so it is mirrored once. When an earlier mirror
+/// was already sent the store holds that amount, and a second mirror would
+/// add to it; the seller is alerted instead. A standing refund that was never
+/// mirrored (only a full refund is) stays unmirrored.
 async fn on_refund_reversed(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     now: DateTime<Utc>,
+    event: &EventRow,
     order_id: Uuid,
 ) -> Result<(), sqlx::Error> {
     let external_refund: Option<Option<serde_json::Value>> =
@@ -336,7 +354,11 @@ async fn on_refund_reversed(
         return Ok(());
     };
     let current = refund_key(tx, external_refund.as_ref()).await?;
-    ledger::on_refund_reversed(tx, now, order_id, current.as_deref()).await
+    let outcome = ledger::on_refund_reversed(tx, now, order_id, current.as_deref()).await?;
+    if current.is_some() && outcome.dropped > 0 && outcome.flagged == 0 {
+        mirror_current_refund(tx, now, order_id, event.id).await?;
+    }
+    Ok(())
 }
 
 /// `rate, currency, exponent, quoted_sats, source, fetched_at`.
