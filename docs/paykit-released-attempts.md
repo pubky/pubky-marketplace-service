@@ -22,7 +22,7 @@ A released invoice can still receive money, for example when an activation commi
 
 - `payment_settled`: money confirmed on a released attempt after the order's payment was already confirmed, resolved, or under review. The buyer paid twice.
 - `other_rail`: money confirmed on a released Bitcoin attempt while another rail owns the payment: the order is bound to PayPal (or, for an order that predates the Stripe removal, Stripe), or the payment is managed by Locks (or any adapter other than `paykit` or `sandbox`). The order and payment are left untouched.
-- `detected_unconfirmed`: money was detected on the released attempt but did not confirm within 7 days. A row can also be written for a live USDT order (`observation.status` is `usdt_finality_pending`): the transfer was included, the order is paid, but paykit-server never reported it finalized within 7 days of inclusion. Polling of that order has stopped and fulfilment stays blocked (`payment_not_final`); check the transfer on Arbitrum before releasing the order.
+- `detected_unconfirmed`: money was detected on the released attempt but did not confirm within 7 days. A row can also be written for a live USDT order, at the 7-day finality bound: `observation.status` is `usdt_finality_pending` (the transfer was included but never finalized) or `usdt_finality_reverted` (it was reorganised away and never came back). The order is paid, polling of it has stopped and fulfilment stays blocked (`payment_not_final`). Expected close: check the transfer on Arbitrum. If it is final on chain, the money is real: dismiss the row with that finding (`resolve ... dismissed '<finding>'`; `dismissed` is allowed for this reason, no refund is due) and the order ships under the seller's own process. If it is gone, the buyer was not paid: refund nothing, and handle the paid order as the seller sees fit. If money must be returned, resolve as `refunded` with the Arbitrum transaction hash.
 - `upstream_inconsistent`: upstream reported a recovery-required or invalid lifecycle instead of a Bitcoin observation. No settlement is inferred; the order and payment are left untouched.
 
 ## Polling cadence
@@ -34,7 +34,8 @@ A released attempt is first checked on the next Paykit poll pass. After each che
 - `ALERT money detected on a released paykit attempt`: a detection was recorded. No action yet.
 - `ALERT money confirmed on a released paykit attempt …` (`code=paykit_released_attempt_paid_after_settlement`): a `payment_settled` or `other_rail` entry was created.
 - `ALERT money detected on a released paykit attempt never confirmed` (`code=paykit_released_attempt_detected_unconfirmed`).
-- `ALERT a USDT payment was included but never finalized within the polling bound` (`code=usdt_finality_pending_too_long`): the `detected_unconfirmed` row above.
+- `ALERT a USDT payment was included but never finalized (or was reorganised away and never returned) within the polling bound` (`code=usdt_finality_pending_too_long`): the `detected_unconfirmed` row above.
+- `ALERT a USDT payment past its finality polling bound could not be held for review` (`code=usdt_finality_escalation_not_recorded`): no review row could be written (the order lacks complete request terms), so nothing is listed and the order is no longer polled. It repeats on every pass until fixed; inspect the order directly.
 - `ALERT released paykit attempt has an invalid upstream lifecycle` (`code=paykit_released_attempt_upstream_inconsistent`).
 
 ## Operator path

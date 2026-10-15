@@ -824,10 +824,13 @@ pub enum ReviewOutcome {
     /// The buyer's money was returned; the note is the external refund
     /// reference. Allowed for every review reason.
     Refunded,
-    /// No money was confirmed, so no refund is due; the note is the reason.
-    /// Allowed only when no money was confirmed: `detected_unconfirmed` or
-    /// `upstream_inconsistent`. Confirmed money (`payment_settled`,
-    /// `other_rail`) is closed only by a refund.
+    /// No refund is due; the note is the reason. Allowed for
+    /// `detected_unconfirmed` and `upstream_inconsistent` only: a detection
+    /// that never confirmed, a lifecycle error, or, for a live USDT order held
+    /// at its finality bound (`observation.status` `usdt_finality_pending` or
+    /// `usdt_finality_reverted`), an operator who checked the Arbitrum
+    /// transfer and found nothing to refund. Money that was confirmed and
+    /// taken (`payment_settled`, `other_rail`) is closed only by a refund.
     Dismissed,
 }
 
