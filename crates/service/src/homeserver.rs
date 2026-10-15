@@ -686,6 +686,59 @@ impl HttpHomeserverClient {
     }
 }
 
+/// A grant-session proof document is about 200 bytes; anything far larger is
+/// not one and is read no further.
+const GRANT_SESSION_PROOF_MAX_BYTES: usize = 8 * 1024;
+
+impl HttpHomeserverClient {
+    /// A small JSON record, streamed with a running byte cap so a body without
+    /// a `Content-Length` cannot be buffered past `max_bytes`. 404 is
+    /// `NotFound`; any other failure, an oversized body or invalid JSON is
+    /// `Unavailable`.
+    async fn fetch_small_json(
+        &self,
+        pubky: &str,
+        path: &str,
+        max_bytes: usize,
+    ) -> HomeserverFetchOutcome {
+        let Ok(mut response) = self
+            .http
+            .get(format!("{}{path}", self.base_url))
+            .header("pubky-host", pubky)
+            .send()
+            .await
+        else {
+            return HomeserverFetchOutcome::Unavailable;
+        };
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return HomeserverFetchOutcome::NotFound;
+        }
+        if !response.status().is_success()
+            || response
+                .content_length()
+                .is_some_and(|length| length > max_bytes as u64)
+        {
+            return HomeserverFetchOutcome::Unavailable;
+        }
+        let mut body = Vec::new();
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    if body.len() + chunk.len() > max_bytes {
+                        return HomeserverFetchOutcome::Unavailable;
+                    }
+                    body.extend_from_slice(&chunk);
+                }
+                Ok(None) => break,
+                Err(_) => return HomeserverFetchOutcome::Unavailable,
+            }
+        }
+        serde_json::from_slice(&body)
+            .map(HomeserverFetchOutcome::Found)
+            .unwrap_or(HomeserverFetchOutcome::Unavailable)
+    }
+}
+
 /// The delay a response's `Retry-After` header asks for (delay-seconds or
 /// HTTP-date); `None` when it is absent or unreadable.
 fn retry_after_from(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
@@ -710,12 +763,13 @@ impl HomeserverListingClient for HttpHomeserverClient {
         challenge_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
         Box::pin(async move {
-            self.fetch_inner_bytes(
+            self.fetch_small_json(
                 pubky,
                 &format!(
                     "{}{challenge_id}",
                     crate::grant_session::PROOF_DOCUMENTS_PATH
                 ),
+                GRANT_SESSION_PROOF_MAX_BYTES,
             )
             .await
         })
