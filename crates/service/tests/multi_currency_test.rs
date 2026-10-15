@@ -1475,3 +1475,72 @@ async fn concurrent_binds_of_different_currencies_each_quote_their_own_ticker(po
     }
     assert_eq!(fixture.paykit.requests().len(), 7);
 }
+
+// ---------------------------------------------------------------------------
+// Listing lifecycle gates and the currency registry
+// ---------------------------------------------------------------------------
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_legacy_bind_on_a_removed_listing_never_reads_the_feed(pool: PgPool) {
+    let fixture = fixture(pool.clone()).await;
+    seed_all_references(&pool, fixture.app.clock.now()).await;
+    let buyer = new_actor(&fixture.app).await;
+    let seller = seller_in(&fixture, "JPY").await;
+    let order_id = checkout(&fixture.app, &seller, &buyer).await;
+    set_command_mirror_record_state(&seller.pubky, "boots_01", "removed");
+    let (status, body) = bind(&fixture.app, &buyer.token, &order_id, "bitcoin").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], json!("LISTING_NOT_ACTIVE"));
+    assert_eq!(body["error"]["reason"], json!("listing_removed"));
+    assert_eq!(fixture.fx.fetch_count(), 0, "no snapshot was fetched");
+    assert_unbound_without_side_effects(&facts(&pool, &order_id).await, &fixture.paykit, "JPY");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn the_currency_registry_refuses_before_the_listing_lifecycle_is_read(pool: PgPool) {
+    let (app, _paykit) = test_app_with_payments(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let bidder = new_actor(&app).await;
+    let mut auction = register_auction_command(&seller.pubky);
+    auction["payload"]["unit_price"]["currency"] = json!("EUR");
+    auction["payload"]["auction_terms"]["minimum_increment"]["currency"] = json!("EUR");
+    auction["payload"]["auction_reserve"]["reserve_price"]["currency"] = json!("EUR");
+    let (status, body) = execute(&app, &seller.token, &auction).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    for state in ["paused", "removed"] {
+        set_command_mirror_record_state(&seller.pubky, "boots_01", state);
+        // A bid outside the registry is an invalid command (422) whatever
+        // the listing's state; the lifecycle gate is never reached.
+        let mut sek = place_bid_command(&seller.pubky, 70, 10_000, 1);
+        sek["payload"]["maximum_amount"]["currency"] = json!("SEK");
+        let (status, body) = execute(&app, &bidder.token, &sek).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{state}: {body}");
+        assert_eq!(body["error"]["code"], json!("INVALID_COMMAND"));
+        assert_eq!(body["error"]["reason"], json!("currency_unsupported"));
+
+        let mut jpy = place_bid_command(&seller.pubky, 71, 10_000, 1);
+        jpy["payload"]["maximum_amount"] =
+            json!({ "amount_minor": 10_000, "currency": "JPY", "exponent": 2 });
+        let (status, body) = execute(&app, &bidder.token, &jpy).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{state}: {body}");
+        assert_eq!(body["error"]["reason"], json!("currency_exponent_mismatch"));
+
+        // A valid EUR bid on the same listing reaches the lifecycle gate.
+        let mut eur = place_bid_command(&seller.pubky, 72, 10_000, 1);
+        eur["payload"]["maximum_amount"]["currency"] = json!("EUR");
+        let (status, body) = execute(&app, &bidder.token, &eur).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{state}: {body}");
+        assert_eq!(body["error"]["code"], json!("LISTING_NOT_ACTIVE"));
+        assert_eq!(
+            body["error"]["reason"],
+            json!(format!("listing_{state}")),
+            "{state}"
+        );
+    }
+    let bids: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM bids")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(bids, 0, "nothing was recorded");
+}

@@ -849,3 +849,58 @@ async fn a_non_usd_usdt_payment_stuck_at_its_finality_bound_is_held_with_its_con
         assert_eq!(view["total"]["currency"], json!("EUR"));
     }
 }
+
+#[derive(Debug, sqlx::FromRow)]
+struct Untouched {
+    paykit_bind_attempt: i32,
+    stock_held: bool,
+    payment_method: Option<String>,
+    bitcoin_quote_rate: Option<String>,
+    usd_conversion_pair: Option<String>,
+}
+
+async fn untouched(pool: &PgPool, order_id: &str) -> Untouched {
+    sqlx::query_as(
+        "SELECT paykit_bind_attempt, stock_held, payment_method, bitcoin_quote_rate::text, \
+         usd_conversion_pair FROM orders WHERE id = $1",
+    )
+    .bind(uuid(order_id))
+    .fetch_one(pool)
+    .await
+    .expect("order row")
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_removed_listing_is_refused_before_any_quote_and_a_paused_one_still_binds(pool: PgPool) {
+    for code in ["EUR", "JPY"] {
+        let f = fixture(pool.clone(), Setup::both(code)).await;
+        let removed = checkout(&f).await;
+        let paused = checkout(&f).await;
+
+        // A removal refuses the bind before the feed is read, an attempt is
+        // spent or Paykit is called: no hold, no quote, no conversion pin.
+        set_command_mirror_record_state(&f.seller.pubky, "boots_01", "removed");
+        let (status, body) = bind(&f, &removed.order_id, "paykit").await;
+        assert_eq!(status, StatusCode::CONFLICT, "{code}: {body}");
+        assert_eq!(body["error"]["code"], json!("LISTING_NOT_ACTIVE"));
+        assert_eq!(body["error"]["reason"], json!("listing_removed"));
+        assert_eq!(f.fx.fetch_count(), 0, "{code}: no snapshot was fetched");
+        assert!(
+            marketplace_call(&f.paykit, "/marketplace/payment-requests/prepare").is_none(),
+            "{code}: paykit was never asked"
+        );
+        let stored = untouched(&pool, &removed.order_id).await;
+        assert_eq!(stored.paykit_bind_attempt, 0, "{code}: no attempt spent");
+        assert!(!stored.stock_held, "{code}");
+        assert_eq!(stored.payment_method, None);
+        assert_eq!(stored.bitcoin_quote_rate, None);
+        assert_eq!(stored.usd_conversion_pair, None);
+
+        // A pause leaves the checkout payable, converted as usual.
+        set_command_mirror_record_state(&f.seller.pubky, "boots_01", "paused");
+        let (status, body) = bind(&f, &paused.order_id, "paykit").await;
+        assert_eq!(status, StatusCode::OK, "{code}: {body}");
+        assert_eq!(f.fx.fetch_count(), 1, "{code}");
+        assert!(body["order"]["fx_conversion"].is_object(), "{code}");
+    }
+}
