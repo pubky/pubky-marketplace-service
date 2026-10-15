@@ -13,7 +13,7 @@
    },
    "response_kind": "json",
    "response_body": {
-    "$blob": "7747843dcc2965bd"
+    "$blob": "212ba14bc01d72fc"
    }
   },
   {
@@ -58,56 +58,15 @@
    }
   },
   {
-   "method": "GET",
-   "path": "/wp-json/wc/v3/webhooks",
-   "query": [
-    [
-     "per_page",
-     "100"
-    ],
-    [
-     "_fields",
-     "id,name,delivery_url"
-    ]
-   ],
-   "auth": "basic",
-   "request_body": null,
-   "status": 200,
-   "response_headers": {
-    "content-type": "application/json; charset=UTF-8",
-    "x-wp-total": "3",
-    "x-wp-totalpages": "1"
-   },
-   "response_kind": "json",
-   "response_body": [
-    {
-     "id": 39,
-     "name": "Pubky Shop order.deleted",
-     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce"
-    },
-    {
-     "id": 38,
-     "name": "Pubky Shop order.updated",
-     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce"
-    },
-    {
-     "id": 37,
-     "name": "Pubky Shop product.updated",
-     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce"
-    }
-   ]
-  },
-  {
    "method": "POST",
    "path": "/wp-json/wc/v3/webhooks",
    "query": [],
    "auth": "basic",
    "request_body": {
-    "name": "Pubky Shop product.updated",
-    "topic": "product.updated",
-    "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
-    "secret": "<secret>",
-    "status": "active"
+    "name": "Pubky Shop access check",
+    "topic": "pubky.access_check",
+    "delivery_url": "https://pubky.invalid/access-check",
+    "status": "disabled"
    },
    "status": 401,
    "response_headers": {

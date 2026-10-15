@@ -116,7 +116,14 @@ pub async fn connect_with_keys(
     )
     .await
     {
-        Ok(connected) => connected_json(state, runtime, &connected).await,
+        Ok(connected) => {
+            // Stored; now the store's webhooks, at this connection's own URL.
+            let url = runtime.settings.woocommerce_webhook_url(connected.id);
+            match register_webhooks(state, runtime, provider, &connected, &url).await {
+                Ok(connected) => connected_json(state, runtime, &connected).await,
+                Err(response) => response,
+            }
+        }
         Err(CompleteError::ShopInUse) => error(
             StatusCode::CONFLICT,
             "shop_in_use",
@@ -132,11 +139,12 @@ pub async fn connect_with_keys(
 }
 
 /// Verifies a key pair against the connection's store, exactly as connecting
-/// does (the read that decides Basic or query-string auth, the webhooks
-/// registered with a fresh per-connection secret), and returns the credential to
-/// seal. `rotate` adds the storefront probe: the store must still answer at the
-/// address the connection is for. A refusal is typed and nothing was changed on
-/// our side.
+/// does (the read that decides Basic or query-string auth, the write-access
+/// check, a fresh per-connection webhook secret), and returns the credential to
+/// seal. Nothing is changed on the store or on our side: the webhooks are
+/// registered after the credential is stored. `rotate` adds the storefront
+/// probe: the store must still answer at the address the connection is for. A
+/// refusal is typed.
 async fn verify_keys(
     runtime: &std::sync::Arc<ConnectorRuntime>,
     row: &ConnectionRow,
@@ -165,7 +173,7 @@ async fn verify_keys(
             body,
             ..CallbackParams::default()
         },
-        webhook_url: runtime.settings.woocommerce_webhook_url(),
+        webhook_url: runtime.settings.woocommerce_webhook_url(row.id),
     };
     match call(runtime, provider.complete_connect(&complete)).await {
         Ok(completed) => Ok(completed),
@@ -194,18 +202,26 @@ async fn verify_keys(
 }
 
 /// "Replace credentials" on a connected (or needs-attention, or rejected)
-/// store: verify the new pair, then swap it for the old one in one
-/// transaction.
+/// store, in three steps and no lock held while the store is called:
 ///
-/// The connection's row is locked for the whole call, so two replacements of
-/// the same store run one after the other and the webhooks the store ends up
-/// with always match the secret that is stored. A refusal (wrong keys, keys
-/// for another store, a read-only key, the store unreachable) returns before
-/// anything is written and leaves the old keys, secret and status as they were;
-/// the webhooks are swapped create-first, so even a failure while registering
-/// leaves the old ones working. The old key pair is not revoked on the store
-/// (WooCommerce has no call for it): the merchant deletes it under WooCommerce
-/// > Settings > Advanced > REST API.
+/// 1. the connection's stored credential is read (no lock);
+/// 2. the new pair is verified against the store (probe, auth read, write
+///    check), which changes nothing;
+/// 3. one short transaction locks the connection, checks it is still live and
+///    that the credential is still the one read in step 1, and swaps it.
+///
+/// If the connection was disconnected or its credential replaced by someone
+/// else in between, step 3 writes nothing and answers 409: a disconnected
+/// connection never gets keys back, and two replacements never both apply.
+/// Only after the swap are the store's webhooks registered at the connection's
+/// own URL with the new secret (and settled against the database, see
+/// `register_webhooks`). A refusal at steps 1 or 2 (wrong keys, keys for
+/// another store, a read-only key, the store unreachable) leaves the old keys,
+/// secret, webhooks and status as they were. A failure at the last step leaves
+/// the connection `needs_attention` (`webhook_registration_failed`) with the
+/// new keys; replacing the keys again repeats it. The old key pair is not
+/// revoked on the store (WooCommerce has no call for it): the merchant deletes
+/// it under WooCommerce > Settings > Advanced > REST API.
 async fn replace_keys(
     state: &AppState,
     runtime: &std::sync::Arc<ConnectorRuntime>,
@@ -216,28 +232,25 @@ async fn replace_keys(
         .providers
         .get(ProviderKind::Woocommerce)
         .expect("checked by the caller");
-    let mut tx = match state.pool.begin().await {
-        Ok(tx) => tx,
-        Err(cause) => return internal("credential replacement", &cause),
-    };
-    let locked: Option<(String,)> = match sqlx::query_as(
-        "SELECT status FROM connector_connections \
-         WHERE id = $1 AND status IN ('connected', 'needs_attention', 'error') FOR UPDATE",
+    let held: Result<Option<(Vec<u8>,)>, sqlx::Error> = sqlx::query_as(
+        "SELECT k.sealed FROM connector_credentials k \
+         JOIN connector_connections c ON c.id = k.connection_id \
+         WHERE c.id = $1 AND c.status IN ('connected', 'needs_attention', 'error')",
     )
     .bind(row.id)
-    .fetch_optional(&mut *tx)
-    .await
-    {
-        Ok(locked) => locked,
+    .fetch_optional(&state.pool)
+    .await;
+    let held = match held {
+        Ok(Some((sealed,))) => sealed,
+        Ok(None) => {
+            return error(
+                StatusCode::CONFLICT,
+                "not_pending",
+                "This connection is no longer connected.",
+            )
+        }
         Err(cause) => return internal("credential replacement", &cause),
     };
-    if locked.is_none() {
-        return error(
-            StatusCode::CONFLICT,
-            "not_pending",
-            "This connection is no longer connected.",
-        );
-    }
     let completed = match verify_keys(runtime, &row, &keys, true).await {
         Ok(completed) => completed,
         Err(response) => return response,
@@ -250,19 +263,48 @@ async fn replace_keys(
     let now = state.clock.now();
     let aad = crate::connectors::keys::credential_aad(&row.seller_pubky, &row.provider, &row.shop);
     let sealed = runtime.keys.seal(&aad, completed.credentials.expose());
-    let written = sqlx::query(
-        "INSERT INTO connector_credentials (connection_id, sealed, created_at, updated_at) \
-         VALUES ($1, $2, $3, $3) \
-         ON CONFLICT (connection_id) DO UPDATE SET sealed = EXCLUDED.sealed, \
-             updated_at = EXCLUDED.updated_at",
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(cause) => return internal("credential replacement", &cause),
+    };
+    let locked: Result<Option<(String,)>, sqlx::Error> = sqlx::query_as(
+        "SELECT status FROM connector_connections \
+         WHERE id = $1 AND status IN ('connected', 'needs_attention', 'error') FOR UPDATE",
+    )
+    .bind(row.id)
+    .fetch_optional(&mut *tx)
+    .await;
+    match locked {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return error(
+                StatusCode::CONFLICT,
+                "not_pending",
+                "This connection is no longer connected.",
+            )
+        }
+        Err(cause) => return internal("credential replacement", &cause),
+    }
+    let swapped = sqlx::query(
+        "UPDATE connector_credentials SET sealed = $2, updated_at = $3 \
+         WHERE connection_id = $1 AND sealed = $4",
     )
     .bind(row.id)
     .bind(&sealed)
     .bind(now)
+    .bind(&held)
     .execute(&mut *tx)
     .await;
-    if let Err(cause) = written {
-        return internal("credential replacement", &cause);
+    match swapped {
+        Ok(done) if done.rows_affected() == 1 => {}
+        Ok(_) => {
+            return error(
+                StatusCode::CONFLICT,
+                "credentials_changed",
+                "The connection's keys were replaced while these were being checked. Check the connection and try again.",
+            )
+        }
+        Err(cause) => return internal("credential replacement", &cause),
     }
     let updated: Result<ConnectionRow, sqlx::Error> = sqlx::query_as(&format!(
         "UPDATE connector_connections SET status = $4, scopes = $2, missing_scopes = $3, \
@@ -288,5 +330,9 @@ async fn replace_keys(
     if let Err(cause) = tx.commit().await {
         return internal("credential replacement", &cause);
     }
-    connected_json(state, runtime, &connected).await
+    let url = runtime.settings.woocommerce_webhook_url(connected.id);
+    match register_webhooks(state, runtime, provider, &connected, &url).await {
+        Ok(connected) => connected_json(state, runtime, &connected).await,
+        Err(response) => response,
+    }
 }

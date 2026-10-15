@@ -739,6 +739,15 @@ pub async fn disconnect(
     retain_app_secret_until: DateTime<Utc>,
 ) -> Result<bool, sqlx::Error> {
     let mut tx = pool.begin().await?;
+    // The connection row first: anything that swaps the credential holds this
+    // lock while it does, so a swap either completes before the delete below
+    // or finds the connection disconnected.
+    let installed: Option<bool> = sqlx::query_scalar(
+        "SELECT connected_at IS NOT NULL FROM connector_connections WHERE id = $1 FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
     for table in [
         "connector_credentials",
         "connector_recipient_keys",
@@ -750,12 +759,6 @@ pub async fn disconnect(
             .execute(&mut *tx)
             .await?;
     }
-    let installed: Option<bool> = sqlx::query_scalar(
-        "SELECT connected_at IS NOT NULL FROM connector_connections WHERE id = $1 FOR UPDATE",
-    )
-    .bind(id)
-    .fetch_optional(&mut *tx)
-    .await?;
     if installed == Some(true) {
         sqlx::query(
             "UPDATE connector_app_credentials SET \

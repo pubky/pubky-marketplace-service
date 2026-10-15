@@ -188,7 +188,7 @@ async fn a_merchant_connects_picks_products_and_gets_paid_orders_stock_and_track
     let (status, _, bytes) = raw(
         app.router.clone(),
         "POST",
-        woocommerce_support::WEBHOOK_PATH,
+        &woocommerce_support::webhook_path(connection),
         &[("content-type", "application/x-www-form-urlencoded")],
         b"webhook_id=3".to_vec(),
     )
@@ -205,6 +205,14 @@ async fn a_merchant_connects_picks_products_and_gets_paid_orders_stock_and_track
         .headers
         .insert("x-wc-webhook-signature".into(), "AAAA".into());
     let (status, body) = post_delivery(&app, &forged).await;
+    assert_eq!(
+        (status, body["error"]["code"].as_str()),
+        (StatusCode::UNAUTHORIZED, Some("invalid_webhook"))
+    );
+    // A delivery is only good at its own connection's URL: the same signed
+    // delivery posted to another connection's URL is refused.
+    let (status, body) =
+        woocommerce_support::post_delivery_to(&app, uuid::Uuid::new_v4(), &stock).await;
     assert_eq!(
         (status, body["error"]["code"].as_str()),
         (StatusCode::UNAUTHORIZED, Some("invalid_webhook"))
@@ -737,14 +745,6 @@ async fn the_shops_credentials_form_connects_a_woocommerce_store_with_its_key_pa
     }
 }
 
-/// Whether this build of the service has `fulfillment.update_tracking` (and a
-/// `fulfillment.ship` without a tracking number). The connector works on a
-/// build without them: the store's shipment is then applied only once it has a
-/// number, and a later change of the number is ignored with a stable reason.
-fn service_has_optional_tracking() -> bool {
-    include_str!("../../../contracts/state-machines.json").contains("fulfillment.update_tracking")
-}
-
 fn tracking_numbers(body: &Value) -> Vec<String> {
     body["meta_data"]
         .as_array()
@@ -776,7 +776,6 @@ async fn last_outcome(shop: &Shop) -> (String, Option<String>) {
 async fn completed_without_tracking_ships_as_other_and_later_tracking_follows(pool: PgPool) {
     let shop = pushed_shop(pool, "flow_h").await;
     let external = shop.external.clone();
-    let supported = service_has_optional_tracking();
 
     // Completed in the store with no tracking.
     let completed = shop
@@ -806,24 +805,10 @@ async fn completed_without_tracking_ships_as_other_and_later_tracking_follows(po
     let (status, _) = deliver_and_apply(&shop, &completed).await;
     assert_eq!(status, StatusCode::OK);
     let (state, shipment) = shipment_of(&shop).await;
-    if supported {
-        assert_eq!(state, "shipped");
-        assert_eq!(shipment["carrier"], "Other");
-        assert!(shipment["tracking_number"].is_null());
-        assert_eq!(last_outcome(&shop).await.1.as_deref(), Some("shipped"));
-    } else {
-        assert_eq!(
-            state, "paid",
-            "this service cannot ship without a number yet"
-        );
-        assert_eq!(
-            last_outcome(&shop).await,
-            (
-                "ignored".to_string(),
-                Some("tracking_optional_not_supported".to_string())
-            )
-        );
-    }
+    assert_eq!(state, "shipped");
+    assert_eq!(shipment["carrier"], "Other");
+    assert!(shipment["tracking_number"].is_null());
+    assert_eq!(last_outcome(&shop).await.1.as_deref(), Some("shipped"));
 
     // A tracking plugin adds a number later: the same order, updated.
     let added = shop
@@ -857,11 +842,7 @@ async fn completed_without_tracking_ships_as_other_and_later_tracking_follows(po
     assert_eq!(shipment["carrier"], "swiss-post");
     assert_eq!(
         last_outcome(&shop).await.1.as_deref(),
-        Some(if supported {
-            "tracking_updated"
-        } else {
-            "shipped"
-        })
+        Some("tracking_updated")
     );
 
     // The same delivery again changes nothing.
@@ -901,36 +882,22 @@ async fn completed_without_tracking_ships_as_other_and_later_tracking_follows(po
     assert_eq!(status, StatusCode::OK);
     let (state, shipment) = shipment_of(&shop).await;
     assert_eq!(state, "shipped");
-    if supported {
-        assert_eq!(shipment["tracking_number"], "JD0146000555");
-        assert_eq!(
-            shipment["carrier"]
-                .as_str()
-                .map(str::to_lowercase)
-                .as_deref(),
-            Some("dhl")
-        );
-        assert_eq!(
-            shipment["tracking_history"].as_array().map(Vec::len),
-            Some(2)
-        );
-        assert_eq!(
-            last_outcome(&shop).await.1.as_deref(),
-            Some("tracking_updated")
-        );
-    } else {
-        assert_eq!(
-            shipment["tracking_number"], "99.60.123456.12345678",
-            "this service cannot change a number yet"
-        );
-        assert_eq!(
-            last_outcome(&shop).await,
-            (
-                "ignored".to_string(),
-                Some("tracking_update_not_supported".to_string())
-            )
-        );
-    }
+    assert_eq!(shipment["tracking_number"], "JD0146000555");
+    assert_eq!(
+        shipment["carrier"]
+            .as_str()
+            .map(str::to_lowercase)
+            .as_deref(),
+        Some("dhl")
+    );
+    assert_eq!(
+        shipment["tracking_history"].as_array().map(Vec::len),
+        Some(2)
+    );
+    assert_eq!(
+        last_outcome(&shop).await.1.as_deref(),
+        Some("tracking_updated")
+    );
     assert!(
         alerts(&shop).await.is_empty(),
         "a shipment is never an alert"
@@ -1087,7 +1054,7 @@ async fn replacing_the_keys_of_a_connected_store_swaps_them_or_changes_nothing(p
             .as_array()
             .expect("hooks")
             .iter()
-            .filter(|hook| hook["delivery_url"] == woocommerce_support::WEBHOOK_URL)
+            .filter(|hook| hook["delivery_url"] == woocommerce_support::webhook_url(connection))
             .count();
         assert_eq!(ours, 3, "the old webhooks are gone, the new ones are there");
     }
@@ -1125,5 +1092,356 @@ async fn replacing_the_keys_of_a_connected_store_swaps_them_or_changes_nothing(p
     );
     if let Some(replay) = &side.replay {
         replay.assert_no_misses();
+    }
+}
+
+/// The webhooks a live store holds: `(id, delivery_url, secret)`.
+async fn live_hooks(side: &StoreSide) -> Vec<(i64, String, String)> {
+    side.live()
+        .rest("GET", "/wc/v3/webhooks?per_page=100", None)
+        .await
+        .as_array()
+        .expect("hooks")
+        .iter()
+        .map(|hook| {
+            (
+                hook["id"].as_i64().expect("id"),
+                hook["delivery_url"].as_str().expect("url").to_string(),
+                hook["secret"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
+fn hooks_at(
+    hooks: &[(i64, String, String)],
+    connection: uuid::Uuid,
+) -> Vec<&(i64, String, String)> {
+    let url = woocommerce_support::webhook_url(connection);
+    hooks.iter().filter(|(_, hook, _)| *hook == url).collect()
+}
+
+/// Webhook creates the replay saw that were registrations (not the write check),
+/// and webhook deletes.
+fn replayed_webhook_writes(side: &StoreSide) -> (usize, usize) {
+    let replay = side.replay.as_ref().expect("replay");
+    let created = replay
+        .matched()
+        .iter()
+        .filter(|seen| {
+            seen.method == "POST"
+                && seen.path == "/wp-json/wc/v3/webhooks"
+                && seen
+                    .body
+                    .as_ref()
+                    .is_some_and(|body| body["topic"] != "pubky.access_check")
+        })
+        .count();
+    let deleted = replay
+        .matched()
+        .iter()
+        .filter(|seen| seen.method == "DELETE" && seen.path.starts_with("/wp-json/wc/v3/webhooks/"))
+        .count();
+    (created, deleted)
+}
+
+async fn webhook_status_at(
+    side: &StoreSide,
+    app: &common::TestApp,
+    connection: uuid::Uuid,
+    secret: &str,
+) -> StatusCode {
+    let source = if side.is_live() {
+        "https://localhost:8443/".to_string()
+    } else {
+        format!("http://{}/", side.site())
+    };
+    let delivery = woocommerce_support::resign(
+        &woocommerce_support::replay::Delivery::load("flow_a.stock_changed"),
+        secret,
+        &source,
+    );
+    woocommerce_support::post_delivery_to(app, connection, &delivery)
+        .await
+        .0
+}
+
+fn spawn_replace(
+    app: &common::TestApp,
+    token: &str,
+    connection: uuid::Uuid,
+    keys: &Value,
+) -> tokio::task::JoinHandle<(StatusCode, Value)> {
+    let router = app.router.clone();
+    let token = token.to_string();
+    let keys = keys.clone();
+    tokio::spawn(async move {
+        common::send(
+            router,
+            "PUT",
+            &format!("/v1/connectors/{connection}/credentials"),
+            Some(&token),
+            &keys,
+        )
+        .await
+    })
+}
+
+async fn credential_rows(app: &common::TestApp, connection: uuid::Uuid) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM connector_credentials WHERE connection_id = $1")
+        .bind(connection)
+        .fetch_one(&app.pool)
+        .await
+        .expect("count")
+}
+
+async fn status_of(app: &common::TestApp, connection: uuid::Uuid) -> String {
+    store::get(&app.pool, connection)
+        .await
+        .expect("lookup")
+        .expect("connection")
+        .status
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_competing_connect_for_a_connected_store_cannot_touch_its_webhooks(pool: PgPool) {
+    let side = StoreSide::open("flow_j").await;
+    let app = woo_app(pool, side.provider(7)).await;
+    let owner = new_actor(&app).await;
+    let rival = new_actor(&app).await;
+    let (connection, secret) = connect_via_routes(&app, &owner, &side).await;
+
+    // Registered after the credential was stored, at this connection's own URL.
+    if side.is_live() {
+        let hooks = live_hooks(&side).await;
+        assert_eq!(hooks.len(), 3);
+        assert_eq!(hooks_at(&hooks, connection).len(), 3);
+    } else {
+        assert_eq!(replayed_webhook_writes(&side), (3, 0));
+    }
+
+    // Another seller approves keys for the same store. It is refused after the
+    // keys were verified, and nothing of the first connection was touched.
+    let (status, body) = api(
+        &app,
+        "POST",
+        "/v1/connectors",
+        Some(&rival.token),
+        &json!({ "provider": "woocommerce", "domain": side.site() }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let rival_connection: uuid::Uuid = body["connection"]["id"]
+        .as_str()
+        .expect("id")
+        .parse()
+        .expect("uuid");
+    let callback = side.approve(
+        body["authorize_url"].as_str().expect("url"),
+        "callback_rival",
+    );
+    let (status, _, bytes) = raw(
+        app.router.clone(),
+        "POST",
+        "/v1/connectors/woocommerce/oauth/callback",
+        &[("content-type", "application/json;charset=UTF-8")],
+        callback,
+    )
+    .await;
+    let refused = as_json(&bytes);
+    assert_eq!(
+        (status, refused["error"]["code"].as_str()),
+        (StatusCode::CONFLICT, Some("shop_in_use")),
+        "{refused}"
+    );
+    assert_eq!(status_of(&app, rival_connection).await, "draft");
+    assert_eq!(credential_rows(&app, rival_connection).await, 0);
+    assert_eq!(status_of(&app, connection).await, "connected");
+    assert_eq!(webhook_secret(&app, connection).await, secret);
+    assert_eq!(
+        webhook_status_at(&side, &app, connection, &secret).await,
+        StatusCode::OK,
+        "the first connection's webhooks still verify"
+    );
+    if side.is_live() {
+        let hooks = live_hooks(&side).await;
+        assert_eq!(
+            hooks.len(),
+            3,
+            "the rival's attempt created and removed nothing"
+        );
+        assert_eq!(hooks_at(&hooks, connection).len(), 3);
+        assert!(hooks_at(&hooks, rival_connection).is_empty());
+    } else {
+        assert_eq!(
+            replayed_webhook_writes(&side),
+            (3, 0),
+            "the rival created and deleted no webhook"
+        );
+        side.replay.as_ref().expect("replay").assert_no_misses();
+    }
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_disconnect_while_keys_are_being_replaced_wins_and_the_keys_are_not_stored(pool: PgPool) {
+    let side = StoreSide::open("flow_k").await;
+    let app = woo_app(pool, side.provider(7)).await;
+    let seller = new_actor(&app).await;
+    let (connection, _) = connect_via_routes(&app, &seller, &side).await;
+    let good = minted(&side, "read_write", "keys_new");
+
+    // The store is slow to answer the new keys' write check.
+    side.delay_next("probe", std::time::Duration::from_secs(4));
+    let replacing = spawn_replace(&app, &seller.token, connection, &good);
+    side.wait_until_held("probe", 2).await;
+
+    // The replacement holds no lock on the connection while it waits, so the
+    // disconnect goes straight through.
+    let started = std::time::Instant::now();
+    let (status, _) = api(
+        &app,
+        "DELETE",
+        &format!("/v1/connectors/{connection}"),
+        Some(&seller.token),
+        &json!(null),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "the disconnect was not blocked by the replacement: {:?}",
+        started.elapsed()
+    );
+
+    // The replacement then finds the connection gone and stores nothing.
+    let (status, body) = replacing.await.expect("replace finished");
+    assert_eq!(
+        (status, body["error"]["code"].as_str()),
+        (StatusCode::CONFLICT, Some("not_pending")),
+        "{body}"
+    );
+    assert_eq!(status_of(&app, connection).await, "disconnected");
+    assert_eq!(credential_rows(&app, connection).await, 0);
+    if side.is_live() {
+        assert!(
+            hooks_at(&live_hooks(&side).await, connection).is_empty(),
+            "no webhook is left"
+        );
+    } else {
+        assert_eq!(
+            replayed_webhook_writes(&side),
+            (3, 3),
+            "only the connect's three were created, and the disconnect removed them"
+        );
+        side.replay.as_ref().expect("replay").assert_no_misses();
+    }
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_disconnect_between_the_swap_and_the_registration_leaves_no_keys_and_no_webhooks(
+    pool: PgPool,
+) {
+    let side = StoreSide::open("flow_l").await;
+    let app = woo_app(pool, side.provider(7)).await;
+    let seller = new_actor(&app).await;
+    let (connection, _) = connect_via_routes(&app, &seller, &side).await;
+    let before = sealed_credential(&app, connection).await;
+    let good = minted(&side, "read_write", "keys_new");
+
+    // The keys verify and are swapped in; the store is slow to create the first
+    // of the new webhooks, and the seller disconnects meanwhile.
+    side.delay_next("register", std::time::Duration::from_secs(4));
+    let replacing = spawn_replace(&app, &seller.token, connection, &good);
+    side.wait_until_held("register", 2).await;
+    assert_ne!(
+        sealed_credential(&app, connection).await,
+        before,
+        "the swap had happened"
+    );
+    let (status, _) = api(
+        &app,
+        "DELETE",
+        &format!("/v1/connectors/{connection}"),
+        Some(&seller.token),
+        &json!(null),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // The registration lands after the disconnect removed the webhooks; it sees
+    // that and removes what it created.
+    let (status, body) = replacing.await.expect("replace finished");
+    assert_eq!(
+        (status, body["error"]["code"].as_str()),
+        (StatusCode::CONFLICT, Some("not_pending")),
+        "{body}"
+    );
+    assert_eq!(status_of(&app, connection).await, "disconnected");
+    assert_eq!(credential_rows(&app, connection).await, 0);
+    if side.is_live() {
+        assert!(
+            hooks_at(&live_hooks(&side).await, connection).is_empty(),
+            "no webhook of the disconnected connection is left"
+        );
+    } else {
+        assert_eq!(
+            replayed_webhook_writes(&side),
+            (6, 6),
+            "three at connect and three by the late registration, all removed"
+        );
+        side.replay.as_ref().expect("replay").assert_no_misses();
+    }
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn two_replacements_of_the_same_keys_never_both_apply(pool: PgPool) {
+    let side = StoreSide::open("flow_m").await;
+    let app = woo_app(pool, side.provider(7)).await;
+    let seller = new_actor(&app).await;
+    let (connection, first_secret) = connect_via_routes(&app, &seller, &side).await;
+    let slow = minted(&side, "read_write", "keys_slow");
+    let quick = minted(&side, "read_write", "keys_quick");
+    let path = format!("/v1/connectors/{connection}/credentials");
+
+    side.delay_next("probe", std::time::Duration::from_secs(5));
+    let slow_one = spawn_replace(&app, &seller.token, connection, &slow);
+    side.wait_until_held("probe", 2).await;
+
+    let (status, body) = api(&app, "PUT", &path, Some(&seller.token), &quick).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let winner_secret = webhook_secret(&app, connection).await;
+    assert_ne!(winner_secret, first_secret);
+
+    // The slow one verified its keys against the credential it read at the start;
+    // that is no longer the stored one, so it writes nothing.
+    let (status, body) = slow_one.await.expect("replace finished");
+    assert_eq!(
+        (status, body["error"]["code"].as_str()),
+        (StatusCode::CONFLICT, Some("credentials_changed")),
+        "{body}"
+    );
+    assert_eq!(webhook_secret(&app, connection).await, winner_secret);
+    assert_eq!(
+        webhook_status_at(&side, &app, connection, &winner_secret).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        webhook_status_at(&side, &app, connection, &first_secret).await,
+        StatusCode::UNAUTHORIZED
+    );
+    if side.is_live() {
+        let hooks = live_hooks(&side).await;
+        let ours = hooks_at(&hooks, connection);
+        assert_eq!(ours.len(), 3);
+        for (id, _, _) in &ours {
+            assert_eq!(
+                side.live().webhook_secret(*id),
+                winner_secret,
+                "the store's webhooks carry the stored secret"
+            );
+        }
+    } else {
+        assert_eq!(replayed_webhook_writes(&side), (6, 3));
+        side.replay.as_ref().expect("replay").assert_no_misses();
     }
 }

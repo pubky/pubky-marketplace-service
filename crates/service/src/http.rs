@@ -147,7 +147,7 @@ pub fn build_router(state: AppState) -> Router {
     // fixed: merchants' provider apps point at them.
     let connector_ingress = Router::new()
         .route(
-            "/v1/connectors/webhooks/woocommerce",
+            "/v1/connectors/webhooks/woocommerce/c/{connection_id}",
             post(crate::connectors::routes::receive_woocommerce_webhook),
         )
         .route(

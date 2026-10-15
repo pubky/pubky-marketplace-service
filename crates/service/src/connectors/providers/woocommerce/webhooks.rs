@@ -32,64 +32,84 @@ use super::site::{Site, SitePolicy};
 
 pub const TOPICS: [&str; 3] = ["product.updated", "order.updated", "order.deleted"];
 pub const WEBHOOK_NAME_PREFIX: &str = "Pubky Shop";
-const WEBHOOK_PATH: &str = "/v1/connectors/webhooks/woocommerce";
+/// Each connection's webhooks are delivered to `{WEBHOOK_PATH}/{connection_id}`.
+pub const WEBHOOK_PATH: &str = "/v1/connectors/webhooks/woocommerce/c";
 
 fn invalid(message: &str) -> ProviderError {
     ProviderError::Invalid(message.to_string())
 }
 
-/// The ids of our webhooks on the store whose delivery URL `matches_url`.
-async fn list_ours(
-    api: &Api<'_>,
-    matches_url: impl Fn(&str) -> bool,
-) -> Result<Vec<i64>, ProviderError> {
-    let listed = api
-        .get(
+/// Whether `url` is this connection's delivery URL: its path is the
+/// connection's own, whatever the host (a base URL that changed since the
+/// webhook was registered is still this connection's webhook).
+fn is_delivery_url_of(url: &str, connection_id: Uuid) -> bool {
+    url::Url::parse(url).is_ok_and(|url| url.path() == format!("{WEBHOOK_PATH}/{connection_id}"))
+}
+
+/// The ids of the webhooks on the store that belong to this connection: ours
+/// by name and delivering to the connection's own URL. A webhook is never
+/// matched by topic or name alone, so another connection of the same store, or
+/// one the merchant made, is never touched.
+async fn list_ours(api: &Api<'_>, connection_id: Uuid) -> Result<Vec<i64>, ProviderError> {
+    Ok(api
+        .list_all(
             "/webhooks",
             &[
-                ("per_page", "100".into()),
+                ("orderby", "id".into()),
+                ("order", "asc".into()),
                 ("_fields", "id,name,delivery_url".into()),
             ],
         )
         .await?
-        .json()?;
-    Ok(listed
-        .as_array()
-        .into_iter()
-        .flatten()
+        .iter()
         .filter(|hook| {
             let name = hook.get("name").and_then(Value::as_str).unwrap_or_default();
             let url = hook
                 .get("delivery_url")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            name.starts_with(WEBHOOK_NAME_PREFIX) && matches_url(url)
+            name.starts_with(WEBHOOK_NAME_PREFIX) && is_delivery_url_of(url, connection_id)
         })
         .filter_map(id_of)
         .collect())
 }
 
-async fn delete_ids(api: &Api<'_>, ids: &[i64]) -> Result<(), ProviderError> {
-    for id in ids {
-        api.delete(&format!("/webhooks/{id}"), &[("force", "true".into())])
-            .await?;
+/// Deletes this connection's webhooks: all of them, or only those among
+/// `only` (the ones a failed registration created). Already gone is fine.
+async fn delete_ours(
+    api: &Api<'_>,
+    connection_id: Uuid,
+    only: Option<&[i64]>,
+) -> Result<u32, ProviderError> {
+    let mut removed = 0;
+    for id in list_ours(api, connection_id).await? {
+        if only.is_some_and(|only| !only.contains(&id)) {
+            continue;
+        }
+        if api
+            .delete_if_present(&format!("/webhooks/{id}"), &[("force", "true".into())])
+            .await?
+        {
+            removed += 1;
+        }
     }
-    Ok(())
+    Ok(removed)
 }
 
-/// Registers the three topics at `delivery_url` with `secret`, replacing ours
-/// from an earlier connection or an earlier key. The new webhooks are created
-/// first and the old ones deleted after, so a failure part way (a key without
-/// write access, the store going away) leaves the old webhooks working with
-/// the old secret, which is still the one stored; what was created is removed
-/// again. A key without write access is the usual failure, and is reported as
-/// such.
+/// Registers the three topics at `delivery_url` (the connection's own URL)
+/// with `secret`, then removes the connection's earlier webhooks. The new ones
+/// are created first, so a failure part way (a key without write access, the
+/// store going away) leaves the earlier webhooks in place, and what this call
+/// created is removed again, by id and only if it is at this connection's
+/// URL. A key without write access is the usual failure, and is reported as
+/// such. This is called only after the credential is stored, and only touches
+/// webhooks at this connection's own URL.
 pub async fn register(
     api: &Api<'_>,
+    connection_id: Uuid,
     delivery_url: &str,
     secret: &str,
 ) -> Result<(), ProviderError> {
-    let earlier = list_ours(api, |url| url == delivery_url).await?;
     let mut created_ids: Vec<i64> = Vec::new();
     for topic in TOPICS {
         let created = api
@@ -111,7 +131,7 @@ pub async fn register(
                 }
             }
             Err(error) => {
-                let _ = delete_ids(api, &created_ids).await;
+                let _ = delete_ours(api, connection_id, Some(&created_ids)).await;
                 return Err(match error {
                     ProviderError::Rejected { code, .. }
                         if code == "forbidden" || code == "cannot_create" =>
@@ -126,22 +146,61 @@ pub async fn register(
             }
         }
     }
-    delete_ids(api, &earlier).await
+    for earlier in list_ours(api, connection_id).await? {
+        if !created_ids.contains(&earlier) {
+            api.delete_if_present(&format!("/webhooks/{earlier}"), &[("force", "true".into())])
+                .await?;
+        }
+    }
+    Ok(())
 }
 
-/// Deletes our webhooks from the store, best effort (the caller deletes its
-/// own copy of the credential whatever happens here).
+/// Deletes this connection's webhooks from the store, best effort (the caller
+/// deletes its own copy of the credential whatever happens here).
 pub async fn unregister(
     session: &Session,
     http: &super::http::WooHttp,
+    connection_id: Uuid,
 ) -> Result<u32, ProviderError> {
-    let api = session.api(http);
-    let ids = list_ours(&api, |url| {
-        url.ends_with(WEBHOOK_PATH) || url.contains(&format!("{WEBHOOK_PATH}?"))
-    })
-    .await?;
-    delete_ids(&api, &ids).await?;
-    Ok(ids.len() as u32)
+    delete_ours(&session.api(http), connection_id, None).await
+}
+
+/// Whether the key can create webhooks, found without creating one: a create
+/// with a topic WooCommerce does not know is refused after the permission
+/// check and before anything is saved. A read-only key is refused by the
+/// permission check (a typed `keys_read_only`); a read/write key reaches the
+/// validation and is refused there.
+pub async fn probe_write_access(api: &Api<'_>) -> Result<(), ProviderError> {
+    match api
+        .post(
+            "/webhooks",
+            &json!({
+                "name": format!("{WEBHOOK_NAME_PREFIX} access check"),
+                "topic": "pubky.access_check",
+                "delivery_url": "https://pubky.invalid/access-check",
+                "status": "disabled",
+            }),
+        )
+        .await
+    {
+        Err(ProviderError::Rejected { code, message }) if code == "keys_read_only" => {
+            Err(ProviderError::Rejected {
+                code: "keys_read_only".into(),
+                message,
+            })
+        }
+        Err(ProviderError::Rejected { code, .. }) if code == "shop_webhook_invalid_topic" => Ok(()),
+        Err(other) => Err(other),
+        Ok(created) => {
+            // A store that accepted it (not expected) must not keep it.
+            if let Some(id) = created.json().ok().as_ref().and_then(id_of) {
+                let _ = api
+                    .delete_if_present(&format!("/webhooks/{id}"), &[("force", "true".into())])
+                    .await;
+            }
+            Ok(())
+        }
+    }
 }
 
 fn is_ping(body: &[u8]) -> bool {

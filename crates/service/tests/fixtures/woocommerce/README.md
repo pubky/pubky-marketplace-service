@@ -30,7 +30,11 @@ Scenarios (`p_` = provider only, `flow_` = through the service and PostgreSQL):
 
 | Scenario | What it shows |
 |---|---|
-| `p_connect` | probe, wc-auth callback, auth-mode check, webhook registration, a second connect replacing the first's webhooks, disconnect |
+| `p_connect` | probe, wc-auth callback, auth-mode check and write check (nothing is created by connecting), webhook registration at the connection's own URL, a second registration replacing that connection's earlier webhooks, disconnect |
+| `p_webhook_isolation` | two connections of one store and a failed registration: replacing, a failed registration and disconnecting one connection never delete the other's webhooks |
+| `p_webhook_pages` | the webhook list read across pages of two |
+| `p_refund_pages` | an order's refunds read across pages of two: a repeated refund finds its marker on the last page and writes nothing |
+| `p_duplicate_retry` | a duplicate order whose cancel fails once is cancelled by the next lookup; the order search read across pages of one |
 | `p_stripped_header` | the proxy drops `Authorization`: Basic gets 401, the query string works |
 | `p_bad_keys` | a key pair the store does not know: both ways answer 401 |
 | `p_read_only` | a `scope=read` key: WooCommerce's 401 "does not have write permissions" |
@@ -47,6 +51,10 @@ Scenarios (`p_` = provider only, `flow_` = through the service and PostgreSQL):
 | `flow_f` | WooCommerce inactive: six refused connects leave no draft behind (the limit is five), a restart reuses its draft |
 | `flow_i` | replace credentials on a connected store: wrong shape, unknown keys, a read-only key and another seller change nothing; a new pair swaps keys, secret and webhooks; a store needing attention is recovered; a disconnected one is refused |
 | `flow_h` | completed without tracking, tracking added later, tracking changed (the newest item counts), a repeat |
+| `flow_j` | a second seller approving keys for a connected store is refused (`shop_in_use`) and creates and deletes no webhook |
+| `flow_k` | a disconnect while new keys are being verified goes through at once; the keys are not stored; no webhook is left |
+| `flow_l` | a disconnect between the credential swap and the webhook registration: the late registration removes what it created |
+| `flow_m` | two replacements of the keys: the slow one writes nothing (`credentials_changed`) and the store's webhooks carry the winner's secret |
 | `flow_g` | the Shop's `PUT /credentials` form with `consumer_key` and `consumer_secret` |
 
 ## How a replay works
@@ -61,6 +69,8 @@ both sides and nowhere else:
 
 * the origin (`https://localhost:8443` becomes the replay server);
 * the webhook secret in a registration body (random per connection);
+* the connection id in a webhook's delivery URL, learned from the requests that
+  carry it and applied to every later answer (a webhook list names it);
 * UUIDs and RFC 3339 instants in request bodies and queries (the Pubky order
   id and clock of the test); a recorded UUID in an answer is replaced by the one
   the request carried;

@@ -23,8 +23,11 @@
 //!
 //! The sealed credential is a small JSON document ([`creds`]) holding the key
 //! pair, the auth mode and the per-connection webhook secret, which is
-//! generated here and registered with the store's three webhooks
-//! (`product.updated`, `order.updated`, `order.deleted`) at connect time.
+//! generated here. Connecting changes nothing on the store: once the
+//! credential is stored, the framework calls `register_webhooks`, which creates
+//! the three webhooks (`product.updated`, `order.updated`, `order.deleted`)
+//! delivering to this connection's own URL
+//! (`/v1/connectors/webhooks/woocommerce/c/{connection_id}`) with its secret.
 
 pub mod api;
 pub mod catalog;
@@ -283,13 +286,15 @@ impl WooCommerceProvider {
         ))
     }
 
-    /// Verifies a key pair against the store, registers our webhooks with a
-    /// fresh secret and returns the credential to seal. Shared by the
-    /// `wc-auth` callback and the pasted-keys route.
+    /// Verifies a key pair against the store (it is accepted, and it can write)
+    /// and returns the credential to seal, with a fresh per-connection webhook
+    /// secret. Nothing is changed on the store: the webhooks are registered
+    /// afterwards ([`ConnectorProvider::register_webhooks`]), once the
+    /// credential is stored. Shared by the `wc-auth` callback and the
+    /// pasted-keys route.
     pub async fn adopt_keys(
         &self,
         shop: &str,
-        webhook_url: &str,
         keys: ApiKeys,
     ) -> Result<ConnectCompleted, ProviderError> {
         let site = self.site(shop)?;
@@ -303,12 +308,7 @@ impl WooCommerceProvider {
             mode,
             webhook_secret,
         };
-        webhooks::register(
-            &session.api(&self.http),
-            webhook_url,
-            &session.webhook_secret,
-        )
-        .await?;
+        webhooks::probe_write_access(&session.api(&self.http)).await?;
         let stored = StoredCredentials::new(
             session.keys.key.clone(),
             session.keys.secret.clone(),
@@ -479,13 +479,29 @@ impl ConnectorProvider for WooCommerceProvider {
             self.check_storefront(&self.site(&request.pending.shop)?, true)
                 .await?;
         }
-        self.adopt_keys(&request.pending.shop, &request.webhook_url, keys)
-            .await
+        self.adopt_keys(&request.pending.shop, keys).await
+    }
+
+    async fn register_webhooks(
+        &self,
+        connection: &ConnectionContext,
+        webhook_url: &str,
+    ) -> Result<(), ProviderError> {
+        let session = Session::open(self, connection)?;
+        webhooks::register(
+            &session.api(&self.http),
+            connection.connection_id,
+            webhook_url,
+            &session.webhook_secret,
+        )
+        .await
     }
 
     async fn disconnect(&self, connection: &ConnectionContext) -> Result<(), ProviderError> {
         let session = Session::open(self, connection)?;
-        webhooks::unregister(&session, &self.http).await.map(|_| ())
+        webhooks::unregister(&session, &self.http, connection.connection_id)
+            .await
+            .map(|_| ())
     }
 
     async fn list_catalog(

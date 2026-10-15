@@ -160,7 +160,8 @@ impl ConnectorSettings {
         )
     }
 
-    /// WooCommerce's fixed callback and webhook URLs.
+    /// WooCommerce's fixed callback URL (one for the deployment: the draft is
+    /// found by the nonce in `user_id`) and each connection's own webhook URL.
     pub fn woocommerce_callback_url(&self) -> String {
         format!(
             "{}/v1/connectors/woocommerce/oauth/callback",
@@ -168,9 +169,9 @@ impl ConnectorSettings {
         )
     }
 
-    pub fn woocommerce_webhook_url(&self) -> String {
+    pub fn woocommerce_webhook_url(&self, connection_id: Uuid) -> String {
         format!(
-            "{}/v1/connectors/webhooks/woocommerce",
+            "{}/v1/connectors/webhooks/woocommerce/c/{connection_id}",
             self.public_base_url
         )
     }
@@ -251,8 +252,8 @@ mod tests {
             "https://service.example/v1/connectors/woocommerce/oauth/callback"
         );
         assert_eq!(
-            settings.woocommerce_webhook_url(),
-            "https://service.example/v1/connectors/webhooks/woocommerce"
+            settings.woocommerce_webhook_url(id),
+            "https://service.example/v1/connectors/webhooks/woocommerce/c/00000000-0000-0000-0000-000000000000"
         );
     }
 

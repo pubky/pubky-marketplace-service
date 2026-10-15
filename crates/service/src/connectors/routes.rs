@@ -16,7 +16,7 @@
 //! GET  /v1/connectors/shopify/c/{connection_id}/oauth/callback
 //! POST /v1/connectors/shopify/c/{connection_id}/webhooks
 //! POST /v1/connectors/woocommerce/oauth/callback
-//! POST /v1/connectors/webhooks/woocommerce
+//! POST /v1/connectors/webhooks/woocommerce/c/{connection_id}
 //! ```
 //!
 //! No response carries a credential, and no handler logs one: the plaintext
@@ -270,7 +270,7 @@ fn urls_json(runtime: &ConnectorRuntime, row: &ConnectionRow) -> Value {
         }),
         _ => json!({
             "oauth_callback": runtime.settings.woocommerce_callback_url(),
-            "webhooks": runtime.settings.woocommerce_webhook_url(),
+            "webhooks": runtime.settings.woocommerce_webhook_url(row.id),
         }),
     }
 }
@@ -563,7 +563,7 @@ pub async fn start_connect(
         ),
         ProviderKind::Woocommerce => (
             runtime.settings.woocommerce_callback_url(),
-            runtime.settings.woocommerce_webhook_url(),
+            runtime.settings.woocommerce_webhook_url(row.id),
         ),
     };
     let connect = ConnectRequest {
@@ -725,26 +725,34 @@ pub async fn disconnect(
         Ok(row) => row,
         Err(response) => return response,
     };
-    if let Some(provider) = row
+    // The credential is read first, then the connection is flipped to
+    // `disconnected` (which deletes the stored credential), and only then does
+    // the provider revoke at the store with the credential still in memory. A
+    // concurrent change of credentials or webhooks (WooCommerce's "replace
+    // keys") finds the connection no longer live and writes nothing, and one
+    // already past that check removes what it registered once it sees the flip.
+    let provider = row
         .provider_kind()
-        .and_then(|kind| runtime.providers.get(kind))
-    {
-        if let Ok(context) = runtime.open(&state.pool, &row).await {
-            if let Err(failure) = call(runtime, provider.disconnect(&context)).await {
-                tracing::warn!(
-                    connection_id = %row.id,
-                    error = %failure,
-                    "provider could not revoke a connector credential; deleting ours anyway"
-                );
-            }
-        }
-    }
+        .and_then(|kind| runtime.providers.get(kind));
+    let context = match &provider {
+        Some(_) => runtime.open(&state.pool, &row).await.ok(),
+        None => None,
+    };
     let now = state.clock.now();
     let retain_until = now + chrono::Duration::seconds(APP_SECRET_RETENTION_SECONDS);
-    match store::disconnect(&state.pool, row.id, now, retain_until).await {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(cause) => internal("disconnect", &cause),
+    if let Err(cause) = store::disconnect(&state.pool, row.id, now, retain_until).await {
+        return internal("disconnect", &cause);
     }
+    if let (Some(provider), Some(context)) = (provider, context) {
+        if let Err(failure) = call(runtime, provider.disconnect(&context)).await {
+            tracing::warn!(
+                connection_id = %row.id,
+                error = %failure,
+                "provider could not revoke a connector credential; ours is deleted anyway"
+            );
+        }
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -1355,12 +1363,17 @@ fn invalid_webhook() -> Response {
     )
 }
 
-/// `POST /v1/connectors/webhooks/woocommerce`: a WooCommerce store's webhook,
-/// found by the shop it names and verified with the store's own secret.
-/// Unknown store, bad signature and unreadable credential all answer the
-/// same 401, so the route does not reveal which stores are connected.
+/// `POST /v1/connectors/webhooks/woocommerce/c/{connection_id}`: a webhook of
+/// one WooCommerce connection, registered at its own URL and verified with
+/// that connection's own secret. The connection must be live and the store the
+/// webhook names must be the connection's store. Unknown connection, other
+/// store, bad signature and unreadable credential all answer the same 401, so
+/// the route does not reveal which stores are connected. The one request that
+/// needs no connection is WooCommerce's unsigned ping, which it repeats until
+/// answered 200; the provider recognises it.
 pub async fn receive_woocommerce_webhook(
     State(state): State<AppState>,
+    Path(connection_id): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -1376,27 +1389,33 @@ pub async fn receive_woocommerce_webhook(
     let Ok(shop) = provider.webhook_shop(&headers, &body) else {
         return invalid_webhook();
     };
-    let connection = match store::live_for_shop(&state.pool, kind, &shop).await {
-        Ok(Some(connection)) => connection,
-        Ok(None) => {
-            // No connected store by that name. The one request that is still
-            // welcome is one that needs no store: WooCommerce's unsigned ping,
-            // which it repeats until answered 200. The provider decides.
+    let connection = match Uuid::parse_str(&connection_id) {
+        Ok(id) if !shop.is_empty() => match store::get(&state.pool, id).await {
+            Ok(row) => row.filter(|row| {
+                row.provider_kind() == Some(kind) && row.is_live() && row.shop == shop
+            }),
+            Err(cause) => return internal("webhook connection lookup", &cause),
+        },
+        _ => None,
+    };
+    match connection {
+        Some(connection) => {
+            accept_webhook(&state, runtime, provider, connection, &headers, &body).await
+        }
+        None => {
             let unconnected = WebhookContext {
                 app: None,
                 connection: None,
             };
-            return match provider.verify_webhook(&unconnected, &body, &headers) {
+            match provider.verify_webhook(&unconnected, &body, &headers) {
                 Ok(_) => respond(
                     StatusCode::OK,
                     json!({ "schema_version": 1, "status": "ignored" }),
                 ),
                 Err(_) => invalid_webhook(),
-            };
+            }
         }
-        Err(cause) => return internal("webhook connection lookup", &cause),
-    };
-    accept_webhook(&state, runtime, provider, connection, &headers, &body).await
+    }
 }
 
 /// `POST /v1/connectors/shopify/c/{connection_id}/webhooks`: a webhook from
@@ -1808,7 +1827,7 @@ async fn complete_callback(
     }
     let webhook_url = match kind {
         ProviderKind::Shopify => runtime.settings.shopify_webhook_url(pending.id),
-        ProviderKind::Woocommerce => runtime.settings.woocommerce_webhook_url(),
+        ProviderKind::Woocommerce => runtime.settings.woocommerce_webhook_url(pending.id),
     };
     let request = CompleteRequest {
         pending: PendingConnection {
@@ -1900,6 +1919,19 @@ async fn complete_callback(
     connected_json(state, runtime, &connected).await
 }
 
+/// Times the registration chases a credential that was replaced while it ran.
+const WEBHOOK_SETTLE_ROUNDS: usize = 4;
+
+/// Subscribes the store's webhooks after the credential is committed.
+///
+/// For a provider whose webhooks are bound to the credential (WooCommerce:
+/// each carries the connection's secret) the registration is settled against
+/// the database afterwards, without holding a lock while the store is called:
+/// if the connection was disconnected meanwhile, what was just registered is
+/// removed again; if the credential was replaced meanwhile, the registration
+/// is repeated for the current one. Whichever caller finishes last therefore
+/// leaves the webhooks matching the stored credential, or none for a
+/// disconnected connection.
 async fn register_webhooks(
     state: &AppState,
     runtime: &ConnectorRuntime,
@@ -1907,14 +1939,15 @@ async fn register_webhooks(
     connected: &ConnectionRow,
     webhook_url: &str,
 ) -> Result<ConnectionRow, Response> {
-    let context = match runtime.open(&state.pool, connected).await {
+    let mut context = match runtime.open(&state.pool, connected).await {
         Ok(context) => context,
         Err(OpenError::Database(cause)) => return Err(internal("webhook registration", &cause)),
         Err(_) => return Ok(connected.clone()),
     };
-    match call(runtime, provider.register_webhooks(&context, webhook_url)).await {
-        Ok(()) => Ok(connected.clone()),
-        Err(failure) => {
+    let follows_credential = provider.kind() == ProviderKind::Woocommerce;
+    for _ in 0..WEBHOOK_SETTLE_ROUNDS {
+        if let Err(failure) = call(runtime, provider.register_webhooks(&context, webhook_url)).await
+        {
             tracing::warn!(
                 connection_id = %connected.id,
                 error = %failure,
@@ -1928,12 +1961,64 @@ async fn register_webhooks(
             )
             .await
             .map_err(|cause| internal("webhook registration", &cause))?;
-            store::get(&state.pool, connected.id)
+            return store::get(&state.pool, connected.id)
                 .await
                 .map_err(|cause| internal("webhook registration", &cause))?
-                .ok_or_else(not_found)
+                .ok_or_else(not_found);
+        }
+        if !follows_credential {
+            return Ok(connected.clone());
+        }
+        let current = store::get(&state.pool, connected.id)
+            .await
+            .map_err(|cause| internal("webhook registration", &cause))?
+            .filter(ConnectionRow::is_live);
+        let next = match &current {
+            Some(row) => match runtime.open(&state.pool, row).await {
+                Ok(next) => Some(next),
+                Err(OpenError::Database(cause)) => {
+                    return Err(internal("webhook registration", &cause))
+                }
+                Err(OpenError::Unreadable) => return Ok(row.clone()),
+                Err(OpenError::Unavailable) => None,
+            },
+            None => None,
+        };
+        match (current, next) {
+            (Some(row), Some(next))
+                if next.credentials.expose() == context.credentials.expose() =>
+            {
+                return Ok(row)
+            }
+            (Some(_), Some(next)) => context = next,
+            _ => {
+                if let Err(failure) = call(runtime, provider.disconnect(&context)).await {
+                    tracing::warn!(
+                        connection_id = %connected.id,
+                        error = %failure,
+                        "webhooks registered for a connection disconnected meanwhile could not be removed"
+                    );
+                }
+                return Err(error(
+                    StatusCode::CONFLICT,
+                    "not_pending",
+                    "This connection was disconnected.",
+                ));
+            }
         }
     }
+    store::set_attention(
+        &state.pool,
+        connected.id,
+        "webhook_registration_failed",
+        state.clock.now(),
+    )
+    .await
+    .map_err(|cause| internal("webhook registration", &cause))?;
+    store::get(&state.pool, connected.id)
+        .await
+        .map_err(|cause| internal("webhook registration", &cause))?
+        .ok_or_else(not_found)
 }
 
 async fn connected_json(

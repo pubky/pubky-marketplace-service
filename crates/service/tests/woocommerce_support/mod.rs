@@ -36,9 +36,17 @@ pub const RETURN_URL: &str = "https://shop.test/marketplace/connections";
 pub const PUBLIC_BASE: &str = "https://host.docker.internal:18443";
 pub const CALLBACK_URL: &str =
     "https://host.docker.internal:18443/v1/connectors/woocommerce/oauth/callback";
-pub const WEBHOOK_URL: &str =
-    "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce";
-pub const WEBHOOK_PATH: &str = "/v1/connectors/webhooks/woocommerce";
+pub const WEBHOOK_PATH_BASE: &str = "/v1/connectors/webhooks/woocommerce/c";
+
+/// Each connection's own webhook URL, as the service builds it from the public
+/// base.
+pub fn webhook_url(connection_id: Uuid) -> String {
+    format!("{PUBLIC_BASE}{WEBHOOK_PATH_BASE}/{connection_id}")
+}
+
+pub fn webhook_path(connection_id: Uuid) -> String {
+    format!("{WEBHOOK_PATH_BASE}/{connection_id}")
+}
 
 /// Where the store side of a scenario comes from: the live Docker store (when
 /// recording) or the replay of what it answered.
@@ -62,6 +70,7 @@ impl StoreSide {
         match LiveStack::from_env() {
             Some(live) => {
                 live.label(scenario).await;
+                live.wipe_webhooks().await;
                 Self {
                     scenario: scenario.to_string(),
                     replay: None,
@@ -112,9 +121,11 @@ impl StoreSide {
         WooCommerceProvider::with_options(options, Some(RETURN_URL.to_string()))
     }
 
-    /// The store answers the next order (`kind` `order`) or refund (`refund`)
-    /// create only after `delay`, applying it late: live through the test
-    /// WordPress plugin, replayed by holding the recorded answer.
+    /// The store answers the next create of `kind` only after `delay`,
+    /// applying it late: `order`, `refund`, `probe` (the write-access check a
+    /// connect makes) or `register` (the first of our webhooks being created).
+    /// Live through the test WordPress plugin, replayed by holding the
+    /// recorded answer.
     pub fn delay_next(&self, kind: &str, delay: Duration) {
         match (&self.live, &self.replay) {
             (Some(live), _) => {
@@ -125,15 +136,70 @@ impl StoreSide {
                     &delay.as_secs().to_string(),
                 ]);
             }
-            (_, Some(replay)) => {
-                let path = if kind == "refund" {
-                    "/refunds"
-                } else {
-                    "/wc/v3/orders"
-                };
-                replay.hold_next("POST", path, delay);
-            }
+            (_, Some(replay)) => match kind {
+                "refund" => replay.hold_next("POST", "/refunds", delay),
+                "probe" => replay.hold_next_with(
+                    "POST",
+                    "/wc/v3/webhooks",
+                    Some("pubky.access_check"),
+                    delay,
+                ),
+                "register" => {
+                    replay.hold_next_with("POST", "/wc/v3/webhooks", Some("product.updated"), delay)
+                }
+                _ => replay.hold_next("POST", "/wc/v3/orders", delay),
+            },
             _ => unreachable!("a side is live or replayed"),
+        }
+    }
+
+    /// Waits until a request held by [`Self::delay_next`] has reached the
+    /// store (`kind` as there). Replayed, that is the `nth` request of its kind
+    /// seen so far.
+    pub async fn wait_until_held(&self, kind: &str, nth: usize) {
+        for _ in 0..200 {
+            let started = match (&self.live, &self.replay) {
+                (Some(live), _) => {
+                    live.rest("GET", &format!("/pubky-test/v1/delay/{kind}"), None)
+                        .await
+                        == json!(0)
+                }
+                (_, Some(replay)) => {
+                    let topic = if kind == "probe" {
+                        "pubky.access_check"
+                    } else {
+                        "product.updated"
+                    };
+                    replay
+                        .seen()
+                        .iter()
+                        .filter(|seen| {
+                            seen.method == "POST"
+                                && seen.path == "/wp-json/wc/v3/webhooks"
+                                && seen
+                                    .body
+                                    .as_ref()
+                                    .is_some_and(|body| body["topic"] == topic)
+                        })
+                        .count()
+                        >= nth
+                }
+                _ => unreachable!("a side is live or replayed"),
+            };
+            if started {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("the held {kind} request never reached the store");
+    }
+
+    /// The store refuses the next order cancellation with a server error, once
+    /// (live through the test plugin; replayed because the recorded answer is
+    /// the 500).
+    pub fn fail_next_cancel(&self) {
+        if let Some(live) = &self.live {
+            live.wp(&["option", "update", "pubky_test_cancel_fail", "1"]);
         }
     }
 
@@ -196,6 +262,9 @@ impl StoreSide {
                     .into_iter()
                     .rev()
                     .find(|delivery| {
+                        if !signed_with(delivery, secret) {
+                            return false;
+                        }
                         let topic = delivery
                             .headers
                             .get("x-wc-webhook-topic")
@@ -241,6 +310,19 @@ pub async fn woo_app(pool: PgPool, provider: WooCommerceProvider) -> TestApp {
     rebuild(base, state)
 }
 
+/// Whether the store signed this delivery with `secret`, that is, whether it
+/// was sent by one of this connection's webhooks.
+fn signed_with(delivery: &Delivery, secret: &str) -> bool {
+    use base64::Engine;
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("hmac");
+    mac.update(&delivery.body());
+    let expected = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+    delivery
+        .headers
+        .get("x-wc-webhook-signature")
+        .is_some_and(|signature| *signature == expected)
+}
+
 /// A recorded delivery made ready to post to this run: addressed from this
 /// replay's store (the `X-WC-Webhook-Source` the connection is found by) and
 /// signed again with the secret this run registered, because the recorded
@@ -260,8 +342,26 @@ pub fn resign(delivery: &Delivery, secret: &str, source: &str) -> Delivery {
     resigned
 }
 
-/// Posts a delivery to the webhook route as the store would.
+/// Posts a delivery to the newest live WooCommerce connection's webhook route
+/// as its store would.
 pub async fn post_delivery(app: &TestApp, delivery: &Delivery) -> (StatusCode, Value) {
+    let connection: Uuid = sqlx::query_scalar(
+        "SELECT id FROM connector_connections WHERE provider = 'woocommerce' \
+         AND status IN ('connected', 'needs_attention', 'error') \
+         ORDER BY connected_at DESC LIMIT 1",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .expect("a live WooCommerce connection");
+    post_delivery_to(app, connection, delivery).await
+}
+
+/// Posts a delivery to one connection's webhook route.
+pub async fn post_delivery_to(
+    app: &TestApp,
+    connection: Uuid,
+    delivery: &Delivery,
+) -> (StatusCode, Value) {
     let pairs: Vec<(&str, &str)> = delivery
         .headers
         .iter()
@@ -271,7 +371,7 @@ pub async fn post_delivery(app: &TestApp, delivery: &Delivery) -> (StatusCode, V
     let (status, _, body) = raw(
         app.router.clone(),
         "POST",
-        WEBHOOK_PATH,
+        &webhook_path(connection),
         &pairs,
         delivery.body(),
     )
@@ -287,14 +387,15 @@ pub async fn connect_context(
     name: &str,
 ) -> (ConnectionContext, String) {
     let nonce = format!("nonce-{}", Uuid::new_v4().simple());
+    let request_id = Uuid::new_v4();
     let request = ConnectRequest {
-        connection_id: Uuid::new_v4(),
+        connection_id: request_id,
         seller_pubky: "seller".into(),
         shop: provider.normalize_shop(&side.site()).expect("shop"),
         state: nonce,
         app: None,
         callback_url: CALLBACK_URL.into(),
-        webhook_url: WEBHOOK_URL.into(),
+        webhook_url: webhook_url(request_id),
         params: json!({}),
     };
     let started = provider.connect(&request).await.expect("connect");
@@ -315,22 +416,25 @@ pub async fn connect_context(
                 body,
                 ..CallbackParams::default()
             },
-            webhook_url: WEBHOOK_URL.into(),
+            webhook_url: webhook_url(request_id),
         })
         .await
         .expect("complete connect");
     let secret = secret_of(&completed.credentials);
-    (
-        ConnectionContext {
-            connection_id: request.connection_id,
-            seller_pubky: request.seller_pubky,
-            shop: request.shop,
-            scopes: completed.scopes,
-            credentials: completed.credentials,
-            app: None,
-        },
-        secret,
-    )
+    let context = ConnectionContext {
+        connection_id: request.connection_id,
+        seller_pubky: request.seller_pubky,
+        shop: request.shop,
+        scopes: completed.scopes,
+        credentials: completed.credentials,
+        app: None,
+    };
+    // What the framework does once the credential is stored.
+    provider
+        .register_webhooks(&context, &webhook_url(request_id))
+        .await
+        .expect("register webhooks");
+    (context, secret)
 }
 
 pub fn secret_of(credentials: &CredentialSecret) -> String {

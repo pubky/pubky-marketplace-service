@@ -2,14 +2,14 @@
   "headers": {
     "content-type": "application/json",
     "user-agent": "WooCommerce/11.2.1 Hookshot (WordPress/7.1.3)",
-    "x-wc-webhook-delivery-id": "18386db90e395b4449a38fe5f9fe2919",
+    "x-wc-webhook-delivery-id": "a81d709298f4efab7f745acbe848dc05",
     "x-wc-webhook-event": "deleted",
     "x-wc-webhook-id": "3",
     "x-wc-webhook-resource": "order",
-    "x-wc-webhook-signature": "MPREaf2Nk/UoTuYwJRA1Q5XuOdb6zQbyBGHORfddAmw=",
+    "x-wc-webhook-signature": "qQQlckw/s6d7a+n9dP3XtdyVPtQHX6ySTTH6s279SBw=",
     "x-wc-webhook-source": "https://localhost:8443/",
     "x-wc-webhook-topic": "order.deleted"
   },
   "body_base64": "eyJpZCI6NDN9",
-  "webhook_secret": "49945ed04787852674610322196e1e90aa0fd0d568cc834b3eb30178ef136582"
+  "webhook_secret": "2577120ff59f744d0c85c072713770a2aa292ae931932436366b0024229ac5ac"
 }

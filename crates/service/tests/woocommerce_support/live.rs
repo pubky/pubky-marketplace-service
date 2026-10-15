@@ -120,6 +120,25 @@ impl LiveStack {
         self.wp(&["action-scheduler", "run"]);
     }
 
+    /// Removes every webhook from the store, so a scenario starts with only the
+    /// webhooks it registers itself (earlier scenarios leave theirs behind, and
+    /// the store would deliver to those too).
+    pub async fn wipe_webhooks(&self) {
+        let listed = self.rest("GET", "/wc/v3/webhooks?per_page=100", None).await;
+        for hook in listed.as_array().expect("hooks") {
+            let id = hook["id"].as_i64().expect("id");
+            self.rest("DELETE", &format!("/wc/v3/webhooks/{id}?force=true"), None)
+                .await;
+        }
+    }
+
+    /// The secret the store holds for a webhook (the REST API never returns it).
+    pub fn webhook_secret(&self, id: i64) -> String {
+        self.wp(&["eval", &format!("echo wc_get_webhook({id})->get_secret();")])
+            .trim()
+            .to_string()
+    }
+
     pub async fn rest(&self, method: &str, path: &str, body: Option<Value>) -> Value {
         let mut request = self
             .direct

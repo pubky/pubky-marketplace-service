@@ -91,7 +91,10 @@ async fn connectors_are_off_by_default(pool: PgPool) {
             "POST",
             "/v1/connectors/shopify/c/00000000-0000-4000-8000-000000000001/webhooks",
         ),
-        ("POST", "/v1/connectors/webhooks/woocommerce"),
+        (
+            "POST",
+            "/v1/connectors/webhooks/woocommerce/c/00000000-0000-4000-8000-000000000001",
+        ),
         (
             "GET",
             "/v1/connectors/shopify/c/00000000-0000-4000-8000-000000000001/launch",
@@ -901,10 +904,6 @@ async fn woocommerce_uses_the_same_draft_connection_and_signs_with_a_store_secre
         started["connection"]["urls"]["oauth_callback"],
         "https://service.test/v1/connectors/woocommerce/oauth/callback"
     );
-    assert_eq!(
-        started["connection"]["urls"]["webhooks"],
-        "https://service.test/v1/connectors/webhooks/woocommerce"
-    );
     assert!(started["connection"]["urls"].get("launch").is_none());
     let authorize = started["authorize_url"].as_str().expect("wc-auth url");
     assert!(authorize.contains("/wc-auth/v1/authorize"));
@@ -918,6 +917,9 @@ async fn woocommerce_uses_the_same_draft_connection_and_signs_with_a_store_secre
         .expect("id")
         .parse()
         .expect("uuid");
+    let woo_webhook_url =
+        format!("https://service.test/v1/connectors/webhooks/woocommerce/c/{connection}");
+    assert_eq!(started["connection"]["urls"]["webhooks"], woo_webhook_url);
 
     let post = |user_id: String| {
         let router = app.router.clone();
@@ -949,7 +951,7 @@ async fn woocommerce_uses_the_same_draft_connection_and_signs_with_a_store_secre
             .lock()
             .expect("lock")
             .clone(),
-        vec!["https://service.test/v1/connectors/webhooks/woocommerce".to_string()]
+        vec![woo_webhook_url.clone()]
     );
     let (status, _, _) = post(nonce).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "the nonce is single use");
@@ -964,9 +966,10 @@ async fn woocommerce_uses_the_same_draft_connection_and_signs_with_a_store_secre
         &json!({ "type": "stock", "product": "p", "variant": "", "available": 3 }),
     )
     .expect("body");
+    let woo_path = format!("/v1/connectors/webhooks/woocommerce/c/{connection}");
     let (status, accepted) = post_signed(
         &app,
-        "/v1/connectors/webhooks/woocommerce",
+        &woo_path,
         woo_shop,
         "woo-evt-1",
         "product.updated",
@@ -976,9 +979,21 @@ async fn woocommerce_uses_the_same_draft_connection_and_signs_with_a_store_secre
     .await;
     assert_eq!(status, StatusCode::OK, "{accepted}");
     assert_eq!(accepted["status"], "accepted");
+    // The same signed webhook at another connection's URL is refused.
     let (status, _) = post_signed(
         &app,
-        "/v1/connectors/webhooks/woocommerce",
+        &format!("/v1/connectors/webhooks/woocommerce/c/{}", Uuid::new_v4()),
+        woo_shop,
+        "woo-evt-3",
+        "product.updated",
+        body.clone(),
+        TEST_WEBHOOK_SECRET,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = post_signed(
+        &app,
+        &woo_path,
         woo_shop,
         "woo-evt-2",
         "product.updated",

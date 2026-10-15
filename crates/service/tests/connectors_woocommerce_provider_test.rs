@@ -20,17 +20,18 @@ use uuid::Uuid;
 use woocommerce_support::flows::*;
 use woocommerce_support::live::RestoreStore;
 use woocommerce_support::replay::Delivery;
-use woocommerce_support::{connect_context, StoreSide, CALLBACK_URL, RETURN_URL, WEBHOOK_URL};
+use woocommerce_support::{connect_context, webhook_url, StoreSide, CALLBACK_URL, RETURN_URL};
 
 fn request(side_site: &str, provider: &WooCommerceProvider) -> ConnectRequest {
+    let connection_id = Uuid::new_v4();
     ConnectRequest {
-        connection_id: Uuid::new_v4(),
+        connection_id,
         seller_pubky: "seller".into(),
         shop: provider.normalize_shop(side_site).expect("shop"),
         state: format!("nonce-{}", Uuid::new_v4().simple()),
         app: None,
         callback_url: CALLBACK_URL.into(),
-        webhook_url: WEBHOOK_URL.into(),
+        webhook_url: webhook_url(connection_id),
         params: json!({}),
     }
 }
@@ -52,27 +53,107 @@ fn webhook_posts(side: &StoreSide) -> Vec<Value> {
         .collect()
 }
 
+/// Our webhooks on a live store: `(id, delivery_url)`.
+async fn live_webhooks(side: &StoreSide) -> Vec<(i64, String)> {
+    side.live()
+        .rest("GET", "/wc/v3/webhooks?per_page=100", None)
+        .await
+        .as_array()
+        .expect("hooks")
+        .iter()
+        .map(|hook| {
+            (
+                hook["id"].as_i64().expect("id"),
+                hook["delivery_url"].as_str().expect("url").to_string(),
+            )
+        })
+        .collect()
+}
+
+fn at_url(hooks: &[(i64, String)], url: &str) -> Vec<i64> {
+    hooks
+        .iter()
+        .filter(|(_, hook)| hook == url)
+        .map(|(id, _)| *id)
+        .collect()
+}
+
+fn webhook_deletes(side: &StoreSide) -> usize {
+    side.replay
+        .as_ref()
+        .expect("replay")
+        .matched()
+        .iter()
+        .filter(|seen| seen.method == "DELETE" && seen.path.starts_with("/wp-json/wc/v3/webhooks/"))
+        .count()
+}
+
 #[tokio::test]
-async fn connecting_registers_our_webhooks_and_replaces_an_earlier_connection() {
+async fn connecting_changes_nothing_on_the_store_and_registering_adds_our_webhooks() {
     let side = StoreSide::open("p_connect").await;
     let provider = side.provider(7);
-    let (first, first_secret) = connect_context(&side, &provider, "callback").await;
-    let stored = StoredCredentials::open(&first.credentials).expect("credentials");
-    assert_eq!(stored.auth, AuthMode::Basic);
-    assert_eq!(first.scopes, vec!["read_write"]);
-    assert_eq!(first_secret.len(), 64);
-
-    // Connecting again (new keys) removes the old webhooks before adding new ones.
-    let (second, second_secret) = connect_context(&side, &provider, "callback2").await;
-    assert_ne!(
-        first_secret, second_secret,
-        "a fresh webhook secret per connection"
-    );
-
+    let request = request(&side.site(), &provider);
+    let started = provider.connect(&request).await.expect("connect");
+    let body = side.approve(&started.authorize_url.expect("url"), "callback");
+    let completed = provider
+        .complete_connect(&CompleteRequest {
+            pending: PendingConnection {
+                connection_id: request.connection_id,
+                seller_pubky: "seller".into(),
+                shop: request.shop.clone(),
+                state: request.state.clone(),
+            },
+            app: None,
+            callback: CallbackParams {
+                body,
+                ..CallbackParams::default()
+            },
+            webhook_url: request.webhook_url.clone(),
+        })
+        .await
+        .expect("complete connect");
+    assert_eq!(completed.scopes, vec!["read_write"]);
+    // Verifying the keys (reads, and a write check that saves nothing) created no
+    // webhook: that waits until the credential is stored.
     if let Some(replay) = &side.replay {
-        let posts = webhook_posts(&side);
-        assert_eq!(posts.len(), 6);
-        let topics: Vec<&str> = posts[..3]
+        let created: Vec<Value> = webhook_posts(&side)
+            .into_iter()
+            .filter(|post| post["topic"] != "pubky.access_check")
+            .collect();
+        assert!(
+            created.is_empty(),
+            "no webhook before the credential is stored"
+        );
+        assert_eq!(webhook_deletes(&side), 0);
+        let _ = replay;
+    } else {
+        assert!(at_url(&live_webhooks(&side).await, &request.webhook_url).is_empty());
+    }
+    let context = ConnectionContext {
+        connection_id: request.connection_id,
+        seller_pubky: "seller".into(),
+        shop: request.shop.clone(),
+        scopes: completed.scopes,
+        credentials: completed.credentials,
+        app: None,
+    };
+    let stored = StoredCredentials::open(&context.credentials).expect("credentials");
+    assert_eq!(stored.auth, AuthMode::Basic);
+    assert_eq!(stored.webhook_secret.len(), 64);
+
+    // The framework's post-commit hook registers them at this connection's URL.
+    provider
+        .register_webhooks(&context, &request.webhook_url)
+        .await
+        .expect("register");
+    let own_url = webhook_url(request.connection_id);
+    if let Some(replay) = &side.replay {
+        let created: Vec<Value> = webhook_posts(&side)
+            .into_iter()
+            .filter(|post| post["topic"] != "pubky.access_check")
+            .collect();
+        assert_eq!(created.len(), 3);
+        let topics: Vec<&str> = created
             .iter()
             .map(|p| p["topic"].as_str().expect("topic"))
             .collect();
@@ -80,8 +161,8 @@ async fn connecting_registers_our_webhooks_and_replaces_an_earlier_connection() 
             topics,
             ["product.updated", "order.updated", "order.deleted"]
         );
-        for post in &posts {
-            assert_eq!(post["delivery_url"], WEBHOOK_URL);
+        for post in &created {
+            assert_eq!(post["delivery_url"], own_url);
             assert_eq!(post["status"], "active");
             assert_eq!(post["secret"].as_str().expect("secret").len(), 64);
             assert!(post["name"]
@@ -89,42 +170,203 @@ async fn connecting_registers_our_webhooks_and_replaces_an_earlier_connection() 
                 .expect("name")
                 .starts_with("Pubky Shop"));
         }
-        let deleted = replay
-            .matched()
-            .iter()
-            .filter(|seen| {
-                seen.method == "DELETE" && seen.path.starts_with("/wp-json/wc/v3/webhooks/")
-            })
-            .count();
-        assert!(
-            deleted >= 3,
-            "the earlier connection's webhooks are removed first: {deleted}"
-        );
         assert!(replay
             .matched()
             .iter()
             .all(|seen| seen.auth == "basic" || seen.auth == "none"));
+    } else {
+        assert_eq!(at_url(&live_webhooks(&side).await, &own_url).len(), 3);
     }
 
-    // Disconnecting takes our webhooks off the store.
-    provider.disconnect(&second).await.expect("disconnect");
+    // Registering again (replaced keys) swaps them: three new, the earlier three gone.
+    provider
+        .register_webhooks(&context, &request.webhook_url)
+        .await
+        .expect("register again");
     if side.is_live() {
-        let hooks = side
-            .live()
-            .rest("GET", "/wc/v3/webhooks?per_page=100", None)
-            .await;
-        assert!(
-            hooks
-                .as_array()
-                .expect("hooks")
-                .iter()
-                .all(|hook| hook["delivery_url"] != WEBHOOK_URL),
-            "no webhook of ours is left"
-        );
+        assert_eq!(at_url(&live_webhooks(&side).await, &own_url).len(), 3);
+    } else {
+        assert_eq!(webhook_deletes(&side), 3, "the earlier three are removed");
     }
-    let _ = first;
+
+    // Disconnecting takes this connection's webhooks off the store.
+    provider.disconnect(&context).await.expect("disconnect");
+    if side.is_live() {
+        assert!(at_url(&live_webhooks(&side).await, &own_url).is_empty());
+    }
     if let Some(replay) = &side.replay {
         replay.assert_no_misses();
+    }
+}
+
+#[tokio::test]
+async fn one_connections_webhooks_are_never_touched_by_another_connection() {
+    let side = StoreSide::open("p_webhook_isolation").await;
+    let provider = side.provider(7);
+    let (first, _) = connect_context(&side, &provider, "callback").await;
+    let (second, _) = connect_context(&side, &provider, "callback2").await;
+    let first_url = webhook_url(first.connection_id);
+    let second_url = webhook_url(second.connection_id);
+    let ours_at = |hooks: &[(i64, String)], url: &str| {
+        hooks
+            .iter()
+            .filter(|(_, hook)| hook == url)
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>()
+    };
+    let mut before = Vec::new();
+    if side.is_live() {
+        let hooks = live_webhooks(&side).await;
+        assert_eq!(ours_at(&hooks, &first_url).len(), 3);
+        assert_eq!(ours_at(&hooks, &second_url).len(), 3);
+        before = ours_at(&hooks, &second_url);
+    }
+    let deletes_at_start = if side.is_live() {
+        0
+    } else {
+        webhook_deletes(&side)
+    };
+    assert_eq!(deletes_at_start, 0, "connecting twice deletes nothing");
+
+    // A registration that fails (a read-only key cannot create webhooks) removes
+    // nothing of either connection.
+    let read_only_body = {
+        let started = provider
+            .connect(&request(&side.site(), &provider))
+            .await
+            .expect("connect");
+        let mut authorize = url::Url::parse(&started.authorize_url.expect("url")).expect("url");
+        let kept: Vec<(String, String)> = authorize
+            .query_pairs()
+            .map(|(k, v)| {
+                let value = if k == "scope" {
+                    "read".to_string()
+                } else {
+                    v.into_owned()
+                };
+                (k.into_owned(), value)
+            })
+            .collect();
+        authorize.query_pairs_mut().clear().extend_pairs(kept);
+        side.approve(authorize.as_str(), "callback_read")
+    };
+    let keys: Value = serde_json::from_slice(&read_only_body).expect("keys");
+    let read_only = ConnectionContext {
+        connection_id: Uuid::new_v4(),
+        seller_pubky: "seller".into(),
+        shop: first.shop.clone(),
+        scopes: vec![],
+        credentials: StoredCredentials::new(
+            keys["consumer_key"].as_str().expect("key").to_string(),
+            keys["consumer_secret"]
+                .as_str()
+                .expect("secret")
+                .to_string(),
+            AuthMode::Basic,
+            "a".repeat(64),
+        )
+        .into_secret(),
+        app: None,
+    };
+    let refused = provider
+        .register_webhooks(&read_only, &webhook_url(read_only.connection_id))
+        .await;
+    assert!(
+        matches!(refused, Err(ProviderError::Rejected { ref code, .. }) if code == "keys_read_only"),
+        "{refused:?}"
+    );
+    let read_only_disconnect = provider.disconnect(&read_only).await;
+    let _ = read_only_disconnect;
+    if side.is_live() {
+        let hooks = live_webhooks(&side).await;
+        assert_eq!(ours_at(&hooks, &first_url).len(), 3);
+        assert_eq!(ours_at(&hooks, &second_url), before);
+    } else {
+        assert_eq!(
+            webhook_deletes(&side),
+            0,
+            "a failed registration deleted nothing"
+        );
+    }
+
+    // Replacing the first connection's webhooks leaves the second's as they were.
+    provider
+        .register_webhooks(&first, &first_url)
+        .await
+        .expect("replace the first's");
+    if side.is_live() {
+        let hooks = live_webhooks(&side).await;
+        assert_eq!(ours_at(&hooks, &first_url).len(), 3);
+        assert_eq!(ours_at(&hooks, &second_url), before);
+    } else {
+        assert_eq!(
+            webhook_deletes(&side),
+            3,
+            "only the first's earlier three go"
+        );
+    }
+
+    // Disconnecting the first leaves the second's.
+    provider.disconnect(&first).await.expect("disconnect first");
+    if side.is_live() {
+        let hooks = live_webhooks(&side).await;
+        assert!(ours_at(&hooks, &first_url).is_empty());
+        assert_eq!(ours_at(&hooks, &second_url), before);
+    } else {
+        assert_eq!(webhook_deletes(&side), 6);
+    }
+    provider
+        .disconnect(&second)
+        .await
+        .expect("disconnect second");
+    if let Some(replay) = &side.replay {
+        replay.assert_no_misses();
+    }
+}
+
+#[tokio::test]
+async fn webhook_lists_are_read_in_full_across_pages() {
+    let side = StoreSide::open("p_webhook_pages").await;
+    let provider = WooCommerceProvider::with_options(
+        if side.is_live() {
+            WooOptions::local_testing(false, vec![woocommerce_support::live::ca_certificate()])
+        } else {
+            WooOptions::local_testing(true, Vec::new())
+        }
+        .with_list_page_size(2),
+        Some(RETURN_URL.to_string()),
+    );
+    let (context, _) = connect_context(&side, &provider, "callback").await;
+    // Three webhooks over pages of two: registering again must find all three to
+    // replace, and disconnecting must remove all three.
+    provider
+        .register_webhooks(&context, &webhook_url(context.connection_id))
+        .await
+        .expect("register again");
+    let own_url = webhook_url(context.connection_id);
+    if side.is_live() {
+        assert_eq!(at_url(&live_webhooks(&side).await, &own_url).len(), 3);
+    } else {
+        assert_eq!(webhook_deletes(&side), 3);
+    }
+    provider.disconnect(&context).await.expect("disconnect");
+    if side.is_live() {
+        assert!(at_url(&live_webhooks(&side).await, &own_url).is_empty());
+    } else {
+        assert_eq!(webhook_deletes(&side), 6);
+        let listed = side
+            .replay
+            .as_ref()
+            .expect("replay")
+            .requests("GET", "/wp-json/wc/v3/webhooks");
+        assert!(
+            listed.iter().any(|seen| seen
+                .query
+                .iter()
+                .any(|(name, value)| name == "page" && value == "2")),
+            "the second page was read"
+        );
+        side.replay.as_ref().expect("replay").assert_no_misses();
     }
 }
 
@@ -197,7 +439,7 @@ async fn keys_the_store_does_not_accept_are_rejected_after_both_ways_fail() {
                 .expect("json"),
                 ..CallbackParams::default()
             },
-            webhook_url: WEBHOOK_URL.into(),
+            webhook_url: webhook_url(Uuid::nil()),
         })
         .await;
     assert!(
@@ -250,7 +492,7 @@ async fn a_read_only_key_cannot_connect() {
                 body: body.clone(),
                 ..CallbackParams::default()
             },
-            webhook_url: WEBHOOK_URL.into(),
+            webhook_url: webhook_url(Uuid::nil()),
         })
         .await;
     assert!(
@@ -271,7 +513,7 @@ async fn a_read_only_key_cannot_connect() {
                 body: serde_json::to_vec(&pasted).expect("json"),
                 ..CallbackParams::default()
             },
-            webhook_url: WEBHOOK_URL.into(),
+            webhook_url: webhook_url(Uuid::nil()),
         })
         .await;
     assert!(
@@ -581,6 +823,8 @@ const ORDER_TWO: &str = "11111111-2222-8333-9444-555555555552";
 const ORDER_THREE: &str = "11111111-2222-8333-9444-555555555553";
 const ORDER_FOUR: &str = "11111111-2222-8333-9444-555555555554";
 const ORDER_FIVE: &str = "11111111-2222-8333-9444-555555555555";
+const ORDER_SIX: &str = "11111111-2222-8333-9444-555555555556";
+const ORDER_SEVEN: &str = "11111111-2222-8333-9444-555555555557";
 const ORDER_UNKNOWN: &str = "11111111-2222-8333-9444-5555555555ff";
 
 #[tokio::test]
@@ -998,7 +1242,7 @@ async fn replacing_keys_for_a_store_that_answers_at_another_address_is_refused()
                 body: serde_json::to_vec(&keys).expect("json"),
                 ..CallbackParams::default()
             },
-            webhook_url: WEBHOOK_URL.into(),
+            webhook_url: webhook_url(Uuid::nil()),
         })
         .await;
     match refused {
@@ -1146,8 +1390,8 @@ async fn an_order_applied_late_after_the_client_gave_up_is_never_pushed_twice() 
     let (context, _) = connect_context(&side, &provider, "callback").await;
     let push = order(ORDER_FIVE, false);
 
-    // The first push is applied three seconds late; the client gave up at one.
-    let delay = Duration::from_secs(3);
+    // The first push is applied five seconds late; the client gave up at one.
+    let delay = Duration::from_secs(5);
     side.delay_next("order", delay);
     let first = patient.push_order(&context, &push).await;
     assert!(matches!(first, Err(ProviderError::Unknown(_))), "{first:?}");
@@ -1212,6 +1456,161 @@ async fn an_order_applied_late_after_the_client_gave_up_is_never_pushed_twice() 
         assert!(
             !cancelled[0].path.ends_with(&format!("/{}", kept.id)),
             "not the kept order"
+        );
+        replay.assert_no_misses();
+    }
+}
+
+fn paged_provider(side: &StoreSide, per_page: u32) -> WooCommerceProvider {
+    let options = if side.is_live() {
+        WooOptions::local_testing(false, vec![woocommerce_support::live::ca_certificate()])
+    } else {
+        WooOptions::local_testing(true, Vec::new())
+    }
+    .with_catalog_page_size(7)
+    .with_list_page_size(per_page);
+    WooCommerceProvider::with_options(options, Some(RETURN_URL.to_string()))
+}
+
+#[tokio::test]
+async fn an_orders_refunds_are_read_in_full_across_pages_before_deciding_to_write() {
+    let side = StoreSide::open("p_refund_pages").await;
+    if side.is_live() {
+        reset_store(side.live()).await;
+    }
+    let provider = paged_provider(&side, 2);
+    let (context, _) = connect_context(&side, &provider, "callback").await;
+    let push = order(ORDER_SIX, false);
+    let created = provider.push_order(&context, &push).await.expect("push");
+
+    // Three refunds over pages of two; the oldest is on the second page.
+    for (id, amount) in [("refund-a", 1000), ("refund-b", 500), ("refund-c", 300)] {
+        let record = RefundRecord {
+            amount_minor: amount,
+            ..refund_record(id, &push, amount)
+        };
+        provider
+            .record_refund(&context, &created, &record)
+            .await
+            .expect("record");
+    }
+    // The same action again must find its marker on the last page and write nothing.
+    let again = RefundRecord {
+        amount_minor: 1000,
+        ..refund_record("refund-a", &push, 1000)
+    };
+    provider
+        .record_refund(&context, &created, &again)
+        .await
+        .expect("found, not written");
+    if side.is_live() {
+        let refunds = side
+            .live()
+            .rest(
+                "GET",
+                &format!("/wc/v3/orders/{}/refunds", created.id),
+                None,
+            )
+            .await;
+        assert_eq!(refunds.as_array().expect("refunds").len(), 3);
+    } else {
+        let replay = side.replay.as_ref().expect("replay");
+        let posts = replay.requests(
+            "POST",
+            &format!("/wp-json/wc/v3/orders/{}/refunds", created.id),
+        );
+        assert_eq!(posts.len(), 3, "the repeated refund was not written again");
+        let listed = replay.requests(
+            "GET",
+            &format!("/wp-json/wc/v3/orders/{}/refunds", created.id),
+        );
+        assert!(
+            listed.iter().any(|seen| seen
+                .query
+                .iter()
+                .any(|(name, value)| name == "page" && value == "2")),
+            "the second page was read"
+        );
+        replay.assert_no_misses();
+    }
+}
+
+#[tokio::test]
+async fn a_duplicate_order_that_could_not_be_cancelled_is_cancelled_by_the_next_lookup() {
+    let side = StoreSide::open("p_duplicate_retry").await;
+    if side.is_live() {
+        reset_store(side.live()).await;
+    }
+    let provider = paged_provider(&side, 1);
+    let (context, _) = connect_context(&side, &provider, "callback").await;
+    let push = order(ORDER_SEVEN, false);
+    let kept = provider.push_order(&context, &push).await.expect("push");
+
+    // A second order for the same Pubky order (a late apply that landed after
+    // the first push), made behind the connector's back.
+    if side.is_live() {
+        let body = marketplace_service::connectors::providers::woocommerce::orders::order_body(
+            &push, None,
+        )
+        .expect("body");
+        side.live().rest("POST", "/wc/v3/orders", Some(body)).await;
+    }
+
+    // Cancelling it fails once. The lookup fails with it, so whoever retries
+    // is the one that settles it: the duplicate is never abandoned.
+    side.fail_next_cancel();
+    let first = provider
+        .find_pushed_order(&context, push.pubky_order_id)
+        .await;
+    assert!(matches!(first, Err(ProviderError::Unknown(_))), "{first:?}");
+    let retried = provider
+        .find_pushed_order(&context, push.pubky_order_id)
+        .await
+        .expect("the retry settles it");
+    assert_eq!(
+        retried.as_ref(),
+        Some(&kept),
+        "the oldest order is the push"
+    );
+    if side.is_live() {
+        let orders = side
+            .live()
+            .rest(
+                "GET",
+                &format!("/wc/v3/orders?search={}", push.pubky_order_id),
+                None,
+            )
+            .await;
+        let mut states: Vec<(i64, String)> = orders
+            .as_array()
+            .expect("orders")
+            .iter()
+            .map(|o| {
+                (
+                    o["id"].as_i64().expect("id"),
+                    o["status"].as_str().expect("status").to_string(),
+                )
+            })
+            .collect();
+        states.sort();
+        assert_eq!(states.len(), 2);
+        assert_eq!(states[0].1, "processing");
+        assert_eq!(states[1].1, "cancelled");
+    } else {
+        let replay = side.replay.as_ref().expect("replay");
+        let puts: Vec<_> = replay
+            .matched()
+            .into_iter()
+            .filter(|seen| seen.method == "PUT" && seen.path.starts_with("/wp-json/wc/v3/orders/"))
+            .collect();
+        assert_eq!(puts.len(), 2, "one failed cancel and the retry that worked");
+        let searches = replay.requests("GET", "/wp-json/wc/v3/orders");
+        assert!(
+            searches.iter().any(|seen| seen
+                .query
+                .iter()
+                .any(|(name, value)| name == "page" && value == "2")),
+            "the second page of the search was read"
         );
         replay.assert_no_misses();
     }

@@ -97,7 +97,7 @@ and write. "Automation" means the inventory capability plus the
 | POST | `/v1/auth/grant-flows/{flow_id}/claim` | Grant-flow (Shop BFF). |
 | GET | `/v0/sellers/{pubky}/payment-config` | Public payment configuration of a seller. |
 | GET | `/v0/sellers/{pubky}/connector-status` | The stores a buyer may share an address with and each store's recipient public key. Public; answers an empty list while connectors are off. See [Store connectors](#store-connectors). |
-| POST | `/v1/connectors/webhooks/woocommerce` | WooCommerce store webhook. Authenticity is the store's own signature. See [Store connectors](#store-connectors). |
+| POST | `/v1/connectors/webhooks/woocommerce/c/{connection_id}` | A WooCommerce connection's own webhooks. Authenticity is the store's signature under that connection's secret. See [Store connectors](#store-connectors). |
 | POST | `/v1/connectors/shopify/c/{connection_id}/webhooks` | Webhook from a merchant's own Shopify app, including the privacy topics; verified with that connection's app secret. |
 | GET | `/v1/connectors/shopify/c/{connection_id}/launch` | The connection's App URL: verified with its app secret, then redirects to authorize. |
 | GET | `/v1/connectors/shopify/c/{connection_id}/oauth/callback` | The connection's OAuth callback. |
@@ -1142,15 +1142,26 @@ Two ways to finish the connection:
   `client_id` and `client_secret` still answers `credentials_not_supported`.
   `200` is the same `connector_connected` answer as the callback.
   The same body on a **connected**, `needs_attention` or rejected (`error`)
-  WooCommerce connection replaces its keys ("Replace credentials"): the new
-  pair is verified like a connect (the authenticated read, the store still
-  answering at the address the connection is for, our webhooks created with a
-  fresh per-connection secret and the old ones deleted after), then sealed over
-  the old pair in one transaction under a lock on the connection, which also
-  clears a `needs_attention` or `error` state. A refusal changes nothing (old
-  keys, secret, webhooks and status stay) and is typed: `invalid_keys`,
-  `credentials_rejected`, `keys_read_only`, `wrong_store` (the store at this
-  address reports another WordPress address), or `502 provider_unavailable`.
+  WooCommerce connection replaces its keys ("Replace credentials"). No lock is
+  held while the store is called: the stored credential is read, the new pair
+  is verified like a connect (the authenticated read, the store still answering
+  at the address the connection is for, a write-access check that saves nothing,
+  a fresh per-connection webhook secret), and only then does one short
+  transaction lock the connection, check that it is still live and that its
+  credential is still the one read at the start, and swap the sealed pair
+  (which also clears a `needs_attention` or `error` state). The store's webhooks
+  are registered after the swap, at the connection's own URL with the new secret
+  (see below). A refusal before the swap changes nothing (old keys, secret,
+  webhooks and status stay) and is typed: `invalid_keys`, `credentials_rejected`,
+  `keys_read_only`, `wrong_store` (the store at this address reports another
+  WordPress address), or `502 provider_unavailable`. If the connection was
+  disconnected meanwhile the answer is `409 not_pending` and nothing is stored
+  (a disconnected connection never gets keys back); if another replacement won,
+  `409 credentials_changed`. Until the registration after the swap has finished,
+  the store's webhooks still carry the old secret and their deliveries are
+  refused (the store retries them); if the registration fails the connection is
+  `needs_attention` (`webhook_registration_failed`) with the new keys, and
+  replacing the keys again repeats it.
   The old key pair is not revoked on the store (WooCommerce has no call for it):
   the merchant deletes it under WooCommerce > Settings > Advanced > REST API.
   Errors: `422 invalid_keys` (wrong shape), `422 credentials_rejected` (the
@@ -1158,17 +1169,40 @@ Two ways to finish the connection:
   waiting, or it expired), `409 shop_in_use`, `404 connection_not_found`,
   `502 provider_unavailable`.
 
-Either way the pair is checked against the store before anything is stored.
-A harmless authenticated read decides how it is sent: HTTP Basic (the normal
-way) or, when the host drops the `Authorization` header and Basic is refused
-while the same pair works in the query string, `consumer_key` and
-`consumer_secret` query parameters (WooCommerce accepts them over HTTPS). The
-choice is recorded with the credential. The webhook secret, generated per
-connection, is sealed with the key pair, and `product.updated`,
-`order.updated` and `order.deleted` webhooks named `Pubky Shop ...` are
-registered at `/v1/connectors/webhooks/woocommerce`, replacing ones left by an
-earlier connection. A connection that cannot register them is not connected.
-Disconnecting deletes them from the store.
+Either way the pair is checked against the store before anything is stored,
+and checking changes nothing on the store. A harmless authenticated read decides
+how it is sent: HTTP Basic (the normal way) or, when the host drops the
+`Authorization` header and Basic is refused while the same pair works in the
+query string, `consumer_key` and `consumer_secret` query parameters (WooCommerce
+accepts them over HTTPS). The choice is recorded with the credential, with a
+per-connection webhook secret sealed alongside the key pair. A key that cannot
+write is refused (`keys_read_only`) by a webhook create with a topic the store
+rejects, which the store refuses after its permission check and before saving
+anything.
+
+Webhooks are per connection. Once the credential is stored, the service creates
+`product.updated`, `order.updated` and `order.deleted` webhooks named
+`Pubky Shop ...` delivering to `/v1/connectors/webhooks/woocommerce/c/{connection_id}`
+(`urls.webhooks` of the connection) with that connection's secret, and then
+removes that connection's earlier webhooks. A webhook is only ever matched by its
+name together with that connection's own delivery URL, never by topic or name
+alone, so another connection of the same store, or a webhook the merchant made,
+is never touched, and a failed or refused connect (which registers nothing)
+cannot delete anything. There is no shared WooCommerce webhook route. A
+delivery is verified with the secret of the connection named in its URL, and the
+store it names must be that connection's store. The registration is settled
+against the database after it is made, without holding a lock: if the connection
+was disconnected meanwhile, what it just created is removed again, and if the
+keys were replaced meanwhile it is repeated for the current ones. A connection
+that cannot register them is `needs_attention`
+(`webhook_registration_failed`). Disconnecting flips the connection first (which
+deletes the stored credential), then removes its webhooks from the store with
+the credential that was read before; if the store cannot be reached then, the
+webhooks stay on the store, deliver to a URL that now answers 401, and can be
+deleted under WooCommerce > Settings > Advanced > Webhooks. Every list the
+provider reads in full (webhooks, an order's refunds, the search for an order)
+follows the store's pages, and refuses a list of more than 50 pages
+(`list_too_long`) instead of acting on part of it.
 
 Catalog: products are read in pages of 50 with their variations; simple and
 variable products only, published or private. A simple product is one variant
@@ -1214,11 +1248,10 @@ common shipment-tracking meta has one (`_wc_shipment_tracking_items`, the
 AfterShip and `_tracking_number` keys; the newest item counts), and without one,
 carrier `Other`, when it has none. Tracking added or changed later arrives as
 another `order.updated` and is applied with `fulfillment.update_tracking`; the
-same number again changes nothing. A service without optional tracking and
-`fulfillment.update_tracking` refuses those commands as `INVALID_COMMAND`, which
-the connector ignores quietly (`tracking_optional_not_supported`,
-`tracking_update_not_supported`) instead of retrying or alerting: the shipment
-is then applied once it has a number. A store-side cancel, trash or
+same number again changes nothing. If the service refuses the command (a
+revision conflict is retried; any other refusal is final) the seller gets an
+`inbound_failed` alert saying the store reports the order shipped and Pubky would
+not record it. A store-side cancel, trash or
 refund raises a seller alert and never refunds. A WooCommerce variation maps one to one to a Pubky variant
 (`PUT /v1/connectors/{id}/mappings` with the listing's `variant_id` and the
 variation id as `provider_variant_id`); stock of a listing mapped to several
@@ -1244,14 +1277,28 @@ crash is then seen and not written again. Shopify also dedupes on the
 `@idempotent` key of `refundCreate`. WooCommerce has no idempotency key either, so its
 provider makes one: every refund it creates carries the marker
 `[pubky:<action key>]` (in the refund's reason and as refund meta), the order's
-refunds are listed before any create or retry, and one that carries this
-action's marker means the action is already applied (the store applied it late,
-after our client gave up), so nothing is written and the refunded total already
-counts it. After a write the list is read again and a second refund with the
-same marker is deleted, so the store holds exactly one. An order create is
-checked the same way by the Pubky order id on the order (a late-applied attempt
-and its retry: the newer is cancelled, and `find_pushed_order` resolves to the
-oldest uncancelled order).
+refunds (every page) are listed before any create or retry, and one that carries
+this action's marker means the action is already applied (the store applied it
+late, after our client gave up), so nothing is written and the refunded total
+already counts it. After a write the list is read again and a second refund with
+the same marker is deleted, so the store holds exactly one. An order create is
+checked the same way by the Pubky order id on the order: after a create the
+search is repeated (every page), the oldest order is the push, and any newer open
+order for the same Pubky order id is cancelled. If cancelling fails the push
+fails, and its retry begins with `find_pushed_order`, which settles duplicates
+the same way, so a duplicate is retried until it is cancelled.
+
+Residuals, exactly. These guarantees hold against a store request that is applied
+before our second read. (1) Refunds: a timed-out refund create that the store
+applies only after our post-write list leaves two refunds carrying one marker and
+nothing deletes the extra one; the order's refunded total then exceeds what Pubky
+recorded by one refund, the framework never writes more on top of it, and the
+merchant removes the extra refund in the store. (2) Orders: a timed-out order
+create applied only after the search that follows our own create leaves a second
+open order for the same Pubky order id; the push is complete by then and nothing
+looks again, so the merchant cancels the extra order (it holds stock). Both need
+the store to apply a request after its client gave up and after the following
+read, that is, longer than the interval between two of our requests.
 
 ## Operational endpoints
 

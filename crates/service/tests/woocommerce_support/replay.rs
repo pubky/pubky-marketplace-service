@@ -92,6 +92,7 @@ pub struct Seen {
 struct Hold {
     method: String,
     path_contains: String,
+    body_contains: Option<String>,
     delay: std::time::Duration,
     used: bool,
 }
@@ -102,6 +103,10 @@ struct Shared {
     used: Vec<usize>,
     seen: Vec<Seen>,
     origin: String,
+    /// Ids the test generated (a connection id in a webhook's delivery URL)
+    /// against the ones recorded, learned from every request so far and applied
+    /// to every answer, so a later list that mentions them reads as it should.
+    uuid_map: BTreeMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -228,6 +233,7 @@ impl Replay {
             used: vec![0; exchanges.len()],
             exchanges,
             seen: Vec::new(),
+            uuid_map: BTreeMap::new(),
             origin: if rewrite_origin {
                 format!("http://{addr}")
             } else {
@@ -245,9 +251,22 @@ impl Replay {
     /// sent, so a client with a shorter timeout gives up first. The recording
     /// holds the real store the same way (`pubky-test-delay.php`).
     pub fn hold_next(&self, method: &str, path_contains: &str, delay: std::time::Duration) {
+        self.hold_next_with(method, path_contains, None, delay);
+    }
+
+    /// Like [`Self::hold_next`], for the next request whose body also contains
+    /// `body_contains` (a webhook create with a given topic).
+    pub fn hold_next_with(
+        &self,
+        method: &str,
+        path_contains: &str,
+        body_contains: Option<&str>,
+        delay: std::time::Duration,
+    ) {
         self.shared.lock().expect("replay lock").holds.push(Hold {
             method: method.to_string(),
             path_contains: path_contains.to_string(),
+            body_contains: body_contains.map(str::to_string),
             delay,
             used: false,
         });
@@ -404,7 +423,13 @@ fn answer(
         .holds
         .iter_mut()
         .find(|hold| {
-            !hold.used && hold.method == method.as_str() && uri.path().contains(&hold.path_contains)
+            !hold.used
+                && hold.method == method.as_str()
+                && uri.path().contains(&hold.path_contains)
+                && hold
+                    .body_contains
+                    .as_ref()
+                    .is_none_or(|needle| String::from_utf8_lossy(&body).contains(needle.as_str()))
         })
         .map(|hold| {
             hold.used = true;
@@ -435,7 +460,10 @@ fn answer(
         &shared.origin.replace('/', "\\/"),
     );
     payload = payload.replace(RECORDED_ORIGIN, &shared.origin);
-    for (recorded, actual) in &swaps {
+    for (recorded, actual) in swaps {
+        shared.uuid_map.insert(recorded, actual);
+    }
+    for (recorded, actual) in &shared.uuid_map {
         payload = payload.replace(recorded, actual);
     }
     let mut response = Response::new(axum::body::Body::from(payload));
