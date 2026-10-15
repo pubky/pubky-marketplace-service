@@ -9,6 +9,7 @@ mod common;
 mod woocommerce_support;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use marketplace_service::connectors::provider::*;
@@ -578,6 +579,8 @@ async fn mirror(
 const ORDER_ONE: &str = "11111111-2222-8333-9444-555555555551";
 const ORDER_TWO: &str = "11111111-2222-8333-9444-555555555552";
 const ORDER_THREE: &str = "11111111-2222-8333-9444-555555555553";
+const ORDER_FOUR: &str = "11111111-2222-8333-9444-555555555554";
+const ORDER_FIVE: &str = "11111111-2222-8333-9444-555555555555";
 const ORDER_UNKNOWN: &str = "11111111-2222-8333-9444-5555555555ff";
 
 #[tokio::test]
@@ -812,6 +815,14 @@ async fn orders_are_pushed_found_cancelled_and_refunded_without_ever_doing_a_thi
             )
             .await;
     }
+    let by_hand = provider
+        .refunded_total(&context, &third)
+        .await
+        .expect("what the store shows");
+    assert_eq!(
+        by_hand.refunded_minor, 400,
+        "a refund made by hand, with no marker of ours, counts"
+    );
     assert!(
         mirror(&provider, &context, &third, &three, "refund-7", 1000)
             .await
@@ -1001,6 +1012,206 @@ async fn replacing_keys_for_a_store_that_answers_at_another_address_is_refused()
         assert!(
             replay.matched().iter().all(|seen| seen.auth == "none"),
             "no key was sent to a store that is not the connection's"
+        );
+        replay.assert_no_misses();
+    }
+}
+
+#[tokio::test]
+async fn a_refund_applied_late_after_the_client_gave_up_is_found_and_never_written_twice() {
+    let side = StoreSide::open("p_refund_late_apply").await;
+    if side.is_live() {
+        reset_store(side.live()).await;
+    }
+    let provider = Arc::new(side.provider(7));
+    let patient = side.provider_with_timeout(Duration::from_millis(1200));
+    let (context, _) = connect_context(&side, &provider, "callback").await;
+    let order = order(ORDER_FOUR, false);
+    let created = provider.push_order(&context, &order).await.expect("push");
+
+    // The first attempt: the store takes the refund but answers three seconds
+    // late, and the client has given up after about one.
+    let delay = Duration::from_secs(3);
+    side.delay_next("refund", delay);
+    let first = mirror(&patient, &context, &created, &order, "refund-late", 1000).await;
+    assert!(matches!(first, Err(ProviderError::Unknown(_))), "{first:?}");
+    side.let_it_land(delay).await;
+
+    // A successor that read the store's total before the refund landed (so it
+    // still thinks 10.00 is to be written) finds the marker and writes nothing.
+    let stale = refund_record("refund-late", &order, 1000);
+    provider
+        .record_refund(&context, &created, &stale)
+        .await
+        .expect("the earlier attempt is found");
+    // One that reads it afterwards has nothing left to mirror.
+    assert!(
+        !mirror(&provider, &context, &created, &order, "refund-late", 1000)
+            .await
+            .expect("the store already shows it")
+    );
+    if side.is_live() {
+        let live = side
+            .live()
+            .rest(
+                "GET",
+                &format!("/wc/v3/orders/{}/refunds", created.id),
+                None,
+            )
+            .await;
+        let refunds = live.as_array().expect("refunds");
+        assert_eq!(refunds.len(), 1, "exactly one refund in the store");
+        assert_eq!(refunds[0]["amount"], "10.00");
+        assert!(refunds[0]["reason"]
+            .as_str()
+            .expect("reason")
+            .ends_with("[pubky:refund-late]"));
+        assert!(refunds[0]["meta_data"]
+            .as_array()
+            .expect("meta")
+            .iter()
+            .any(|m| m["key"] == "pubky_refund_id" && m["value"] == "refund-late"));
+    }
+    if let Some(replay) = &side.replay {
+        let refunds = replay.requests(
+            "POST",
+            &format!("/wp-json/wc/v3/orders/{}/refunds", created.id),
+        );
+        assert_eq!(refunds.len(), 1, "the successor wrote nothing");
+    }
+
+    // A second refund with the same marker (a late apply landing between a
+    // successor's read and its write) is settled back to one.
+    if side.is_live() {
+        side.live()
+            .rest(
+                "POST",
+                &format!("/wc/v3/orders/{}/refunds", created.id),
+                Some(json!({
+                    "amount": "10.00",
+                    "reason": "Pubky refund [pubky:refund-late]",
+                    "api_refund": false,
+                    "meta_data": [{"key": "pubky_refund_id", "value": "refund-late"}],
+                })),
+            )
+            .await;
+    }
+    provider
+        .record_refund(&context, &created, &stale)
+        .await
+        .expect("the duplicate is removed");
+    // And a refund the merchant made by hand counts.
+    if side.is_live() {
+        let live = side
+            .live()
+            .rest(
+                "GET",
+                &format!("/wc/v3/orders/{}/refunds", created.id),
+                None,
+            )
+            .await;
+        assert_eq!(live.as_array().expect("refunds").len(), 1, "settled to one");
+        side.live()
+            .rest(
+                "POST",
+                &format!("/wc/v3/orders/{}/refunds", created.id),
+                Some(json!({"amount": "2.00", "reason": "By hand", "api_refund": false})),
+            )
+            .await;
+    }
+    let shown = provider
+        .refunded_total(&context, &created)
+        .await
+        .expect("what the store shows");
+    assert_eq!(shown.refunded_minor, 1200, "ours and the one made by hand");
+    if let Some(replay) = &side.replay {
+        let deleted = replay
+            .matched()
+            .iter()
+            .filter(|seen| seen.method == "DELETE" && seen.path.contains("/refunds/"))
+            .count();
+        assert_eq!(deleted, 1);
+        replay.assert_no_misses();
+    }
+}
+
+#[tokio::test]
+async fn an_order_applied_late_after_the_client_gave_up_is_never_pushed_twice() {
+    let side = StoreSide::open("p_push_late_apply").await;
+    if side.is_live() {
+        reset_store(side.live()).await;
+    }
+    let provider = Arc::new(side.provider(7));
+    let patient = side.provider_with_timeout(Duration::from_millis(1200));
+    let (context, _) = connect_context(&side, &provider, "callback").await;
+    let push = order(ORDER_FIVE, false);
+
+    // The first push is applied three seconds late; the client gave up at one.
+    let delay = Duration::from_secs(3);
+    side.delay_next("order", delay);
+    let first = patient.push_order(&context, &push).await;
+    assert!(matches!(first, Err(ProviderError::Unknown(_))), "{first:?}");
+
+    // The successor looks at the wrong moment: the store has not applied it yet.
+    let early = provider
+        .find_pushed_order(&context, push.pubky_order_id)
+        .await
+        .expect("lookup");
+    assert_eq!(early, None);
+    side.let_it_land(delay).await;
+
+    // It then pushes (as the framework does after finding nothing). The late
+    // order now exists, so this one is the duplicate: it is cancelled and the
+    // push resolves to the older order.
+    let kept = provider.push_order(&context, &push).await.expect("push");
+    let found = provider
+        .find_pushed_order(&context, push.pubky_order_id)
+        .await
+        .expect("lookup");
+    assert_eq!(found.as_ref(), Some(&kept), "the push is the oldest order");
+    if side.is_live() {
+        let orders = side
+            .live()
+            .rest(
+                "GET",
+                &format!("/wc/v3/orders?search={}", push.pubky_order_id),
+                None,
+            )
+            .await;
+        let orders = orders.as_array().expect("orders");
+        assert_eq!(orders.len(), 2);
+        let mut by_id: Vec<(i64, String)> = orders
+            .iter()
+            .map(|o| {
+                (
+                    o["id"].as_i64().expect("id"),
+                    o["status"].as_str().expect("status").to_string(),
+                )
+            })
+            .collect();
+        by_id.sort();
+        assert_eq!(by_id[0].0.to_string(), kept.id, "the late one is the push");
+        assert_eq!(by_id[0].1, "processing");
+        assert_eq!(by_id[1].1, "cancelled", "the duplicate is cancelled");
+        let item = side
+            .live()
+            .rest("GET", &format!("/wc/v3/products/{TEST_PRODUCT}"), None)
+            .await;
+        assert_eq!(item["stock_quantity"], 8, "stock was taken once");
+    }
+    if let Some(replay) = &side.replay {
+        let cancelled = replay.matched();
+        let cancelled: Vec<_> = cancelled
+            .iter()
+            .filter(|seen| seen.method == "PUT" && seen.path.starts_with("/wp-json/wc/v3/orders/"))
+            .collect();
+        assert_eq!(cancelled.len(), 1, "one duplicate cancelled");
+        let body = cancelled[0].body.as_ref().expect("body");
+        assert_eq!(body["status"], "cancelled");
+        assert_eq!(body["meta_data"][0]["value"], "duplicate push");
+        assert!(
+            cancelled[0].path.ends_with(&format!("/{}", kept.id)) == false,
+            "not the kept order"
         );
         replay.assert_no_misses();
     }

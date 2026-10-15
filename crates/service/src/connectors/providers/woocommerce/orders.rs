@@ -192,7 +192,52 @@ pub async fn push(
     let id = id_of(&created).ok_or_else(|| {
         ProviderError::Unknown("the store created an order but did not return its id".into())
     })?;
-    Ok(ExternalOrder { id: id.to_string() })
+    // An earlier attempt that timed out may have been applied late and landed
+    // between the caller's lookup and this create. The Pubky order id is on
+    // every order we make, so look again: the oldest order is the push, any
+    // other is a duplicate and is cancelled (the store puts its stock back).
+    let all = matching_orders(api, order.pubky_order_id).await?;
+    let Some(&kept) = all.iter().min() else {
+        return Ok(ExternalOrder { id: id.to_string() });
+    };
+    for duplicate in all.iter().filter(|other| **other != kept) {
+        api.put(
+            &format!("/orders/{duplicate}"),
+            &json!({
+                "status": "cancelled",
+                "meta_data": [{"key": META_CANCELLED, "value": "duplicate push"}],
+            }),
+        )
+        .await?;
+    }
+    Ok(ExternalOrder {
+        id: kept.to_string(),
+    })
+}
+
+/// The ids of every store order carrying this Pubky order id, found by the
+/// item-name search and checked against the order meta.
+async fn matching_orders(api: &Api<'_>, pubky_order_id: Uuid) -> Result<Vec<i64>, ProviderError> {
+    let wanted = pubky_order_id.to_string();
+    let searched = api
+        .get(
+            "/orders",
+            &[
+                ("search", wanted.clone()),
+                ("per_page", "20".into()),
+                ("_fields", "id,status,meta_data".into()),
+            ],
+        )
+        .await?
+        .json()?;
+    Ok(searched
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|order| has_order_meta(order, &wanted))
+        .filter(|order| order.get("status").and_then(Value::as_str) != Some("cancelled"))
+        .filter_map(id_of)
+        .collect())
 }
 
 fn has_order_meta(order: &Value, pubky_order_id: &str) -> bool {
@@ -213,13 +258,23 @@ pub async fn find(
     pubky_order_id: Uuid,
 ) -> Result<Option<ExternalOrder>, ProviderError> {
     let wanted = pubky_order_id.to_string();
+    // The order that is the push: the oldest one carrying the id that was not
+    // cancelled as a duplicate (a late-applied attempt and its retry can both
+    // exist for a moment, see [`push`]).
     let hit = |orders: &Value| -> Option<ExternalOrder> {
-        orders
+        let matches: Vec<(bool, i64)> = orders
             .as_array()?
             .iter()
-            .find(|order| has_order_meta(order, &wanted))
-            .and_then(id_of)
-            .map(|id| ExternalOrder { id: id.to_string() })
+            .filter(|order| has_order_meta(order, &wanted))
+            .filter_map(|order| {
+                let cancelled = order.get("status").and_then(Value::as_str) == Some("cancelled");
+                id_of(order).map(|id| (cancelled, id))
+            })
+            .collect();
+        matches
+            .iter()
+            .min()
+            .map(|(_, id)| ExternalOrder { id: id.to_string() })
     };
     let searched = api
         .get(
@@ -350,11 +405,73 @@ pub async fn refunded_total(
     })
 }
 
+/// The marker every refund we create carries, naming the action that made it.
+/// WooCommerce refunds have no idempotency key, so this is the key: a client
+/// that timed out may have been applied late, and whoever retries finds the
+/// marker instead of writing the refund again.
+pub fn refund_marker(action_key: &str) -> String {
+    format!("[pubky:{action_key}]")
+}
+
+/// Whether a refund of the store carries our marker for this action: in its
+/// meta, or (if the meta was dropped) in its reason.
+fn carries_marker(refund: &Value, action_key: &str) -> bool {
+    let in_meta = refund
+        .get("meta_data")
+        .and_then(Value::as_array)
+        .is_some_and(|meta| {
+            meta.iter().any(|item| {
+                item.get("key").and_then(Value::as_str) == Some(META_REFUND_ID)
+                    && item.get("value").and_then(Value::as_str) == Some(action_key)
+            })
+        });
+    in_meta
+        || refund
+            .get("reason")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| reason.contains(&refund_marker(action_key)))
+}
+
+/// The ids of the order's refunds that carry our marker for this action,
+/// oldest first.
+async fn marked_refunds(
+    api: &Api<'_>,
+    order_id: u64,
+    action_key: &str,
+) -> Result<Vec<i64>, ProviderError> {
+    let listed = api
+        .get(
+            &format!("/orders/{order_id}/refunds"),
+            &[
+                ("per_page", "100".into()),
+                ("_fields", "id,reason,meta_data".into()),
+            ],
+        )
+        .await?
+        .json()?;
+    let mut ids: Vec<i64> = listed
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|refund| carries_marker(refund, action_key))
+        .filter_map(id_of)
+        .collect();
+    ids.sort_unstable();
+    Ok(ids)
+}
+
 /// Writes the refund the framework decided on, without moving money
 /// (`api_refund: false`). `refund.amount_minor` is the amount still to mirror,
 /// in the order currency, already the difference from what the store shows
-/// and never above its payment. A refund already written for this Pubky refund
-/// id is never written twice, so a retry after an unknown outcome is safe.
+/// and never above its payment.
+///
+/// Every refund carries the marker of its action (meta and reason). Before
+/// writing, the order's refunds are listed: one carrying this action's marker
+/// means an earlier attempt was applied (perhaps late, after its client gave
+/// up), so nothing is written and `refunded_total` already counts it. After
+/// writing, the list is read again, and if a second refund with the same
+/// marker appeared in between (a late apply landing between the first read and
+/// the write) the newer ones are deleted, so the store holds exactly one.
 pub async fn record_refund(
     api: &Api<'_>,
     order: &ExternalOrder,
@@ -364,39 +481,17 @@ pub async fn record_refund(
     if refund.amount_minor <= 0 {
         return Ok(());
     }
-    let existing = api
-        .get(
-            &format!("/orders/{id}/refunds"),
-            &[
-                ("per_page", "100".into()),
-                ("_fields", "id,meta_data".into()),
-            ],
-        )
-        .await?
-        .json()?;
-    let written = existing.as_array().is_some_and(|refunds| {
-        refunds.iter().any(|entry| {
-            entry
-                .get("meta_data")
-                .and_then(Value::as_array)
-                .is_some_and(|meta| {
-                    meta.iter().any(|item| {
-                        item.get("key").and_then(Value::as_str) == Some(META_REFUND_ID)
-                            && item.get("value").and_then(Value::as_str) == Some(&refund.refund_id)
-                    })
-                })
-        })
-    });
-    if written {
-        return Ok(());
+    let marked = marked_refunds(api, id, &refund.refund_id).await?;
+    if !marked.is_empty() {
+        return settle_refunds(api, id, &marked).await;
     }
-    let reason: String = match &refund.basis {
-        Some(basis) => format!("{REFUND_REASON_PREFIX} {}: {basis}", refund.refund_id),
-        None => format!("{REFUND_REASON_PREFIX} {}", refund.refund_id),
-    }
-    .chars()
-    .take(200)
-    .collect();
+    let marker = refund_marker(&refund.refund_id);
+    let note = match &refund.basis {
+        Some(basis) => format!("{REFUND_REASON_PREFIX}: {basis}"),
+        None => REFUND_REASON_PREFIX.to_string(),
+    };
+    let room = 200usize.saturating_sub(marker.chars().count() + 1);
+    let reason = format!("{} {marker}", note.chars().take(room).collect::<String>());
     api.post(
         &format!("/orders/{id}/refunds"),
         &json!({
@@ -407,6 +502,20 @@ pub async fn record_refund(
         }),
     )
     .await?;
+    let after = marked_refunds(api, id, &refund.refund_id).await?;
+    settle_refunds(api, id, &after).await
+}
+
+/// Keeps the oldest refund of an action and deletes the rest (restoring the
+/// order's refunded total).
+async fn settle_refunds(api: &Api<'_>, order_id: u64, marked: &[i64]) -> Result<(), ProviderError> {
+    for extra in marked.iter().skip(1) {
+        api.delete(
+            &format!("/orders/{order_id}/refunds/{extra}"),
+            &[("force", "true".into())],
+        )
+        .await?;
+    }
     Ok(())
 }
 

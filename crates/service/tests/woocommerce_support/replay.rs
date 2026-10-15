@@ -89,7 +89,15 @@ pub struct Seen {
     pub matched: bool,
 }
 
+struct Hold {
+    method: String,
+    path_contains: String,
+    delay: std::time::Duration,
+    used: bool,
+}
+
 struct Shared {
+    holds: Vec<Hold>,
     exchanges: Vec<Exchange>,
     used: Vec<usize>,
     seen: Vec<Seen>,
@@ -216,6 +224,7 @@ impl Replay {
             .expect("bind replay");
         let addr = listener.local_addr().expect("replay address");
         let shared = Arc::new(Mutex::new(Shared {
+            holds: Vec::new(),
             used: vec![0; exchanges.len()],
             exchanges,
             seen: Vec::new(),
@@ -230,6 +239,18 @@ impl Replay {
             axum::serve(listener, app).await.expect("replay serves");
         });
         Self { addr, shared }
+    }
+
+    /// Holds the answer to the next matching request for `delay` before it is
+    /// sent, so a client with a shorter timeout gives up first. The recording
+    /// holds the real store the same way (`pubky-test-delay.php`).
+    pub fn hold_next(&self, method: &str, path_contains: &str, delay: std::time::Duration) {
+        self.shared.lock().expect("replay lock").holds.push(Hold {
+            method: method.to_string(),
+            path_contains: path_contains.to_string(),
+            delay,
+            used: false,
+        });
     }
 
     /// The store address to connect: `127.0.0.1:port`.
@@ -293,6 +314,20 @@ async fn handle(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let (response, delay) = answer(&shared, method, uri, headers, body);
+    if let Some(delay) = delay {
+        tokio::time::sleep(delay).await;
+    }
+    response
+}
+
+fn answer(
+    shared: &Arc<Mutex<Shared>>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> (Response, Option<std::time::Duration>) {
     let raw_query: Vec<(String, String)> =
         url::form_urlencoded::parse(uri.query().unwrap_or("").as_bytes())
             .map(|(k, v)| (k.into_owned(), v.into_owned()))
@@ -340,25 +375,41 @@ async fn handle(
     let Some(index) = chosen else {
         shared.seen.push(seen(false));
         return (
-            StatusCode::from_u16(599).expect("status"),
-            format!("replay: no recorded answer for {method} {uri} (body {body_key})"),
-        )
-            .into_response();
+            (
+                StatusCode::from_u16(599).expect("status"),
+                format!("replay: no recorded answer for {method} {uri} (body {body_key})"),
+            )
+                .into_response(),
+            None,
+        );
     };
     shared.used[index] += 1;
     let exchange = shared.exchanges[index].clone();
     if exchange.auth != auth {
         shared.seen.push(seen(false));
         return (
-            StatusCode::from_u16(599).expect("status"),
-            format!(
-                "replay: {method} {} was recorded with auth {:?} but arrived with {auth:?}",
-                exchange.path, exchange.auth
-            ),
-        )
-            .into_response();
+            (
+                StatusCode::from_u16(599).expect("status"),
+                format!(
+                    "replay: {method} {} was recorded with auth {:?} but arrived with {auth:?}",
+                    exchange.path, exchange.auth
+                ),
+            )
+                .into_response(),
+            None,
+        );
     }
     shared.seen.push(seen(true));
+    let delay = shared
+        .holds
+        .iter_mut()
+        .find(|hold| {
+            !hold.used && hold.method == method.as_str() && uri.path().contains(&hold.path_contains)
+        })
+        .map(|hold| {
+            hold.used = true;
+            hold.delay
+        });
 
     let mut swaps: Vec<(String, String)> = Vec::new();
     let recorded_uuids: Vec<String> = canonical_query(&exchange.query)
@@ -398,7 +449,7 @@ async fn handle(
             response.headers_mut().insert(name, value);
         }
     }
-    response
+    (response, delay)
 }
 
 /// A captured webhook delivery or the wc-auth callback, as the receiver wrote

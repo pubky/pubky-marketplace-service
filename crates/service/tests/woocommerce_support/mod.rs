@@ -99,6 +99,51 @@ impl StoreSide {
         WooCommerceProvider::with_options(options, Some(RETURN_URL.to_string()))
     }
 
+    /// A provider whose requests give up after `timeout`, to be held up by
+    /// [`Self::delay_next`].
+    pub fn provider_with_timeout(&self, timeout: Duration) -> WooCommerceProvider {
+        let mut options = if self.is_live() {
+            WooOptions::local_testing(false, vec![ca_certificate()])
+        } else {
+            WooOptions::local_testing(true, Vec::new())
+        }
+        .with_catalog_page_size(7);
+        options.request_timeout = timeout;
+        WooCommerceProvider::with_options(options, Some(RETURN_URL.to_string()))
+    }
+
+    /// The store answers the next order (`kind` `order`) or refund (`refund`)
+    /// create only after `delay`, applying it late: live through the test
+    /// WordPress plugin, replayed by holding the recorded answer.
+    pub fn delay_next(&self, kind: &str, delay: Duration) {
+        match (&self.live, &self.replay) {
+            (Some(live), _) => {
+                live.wp(&[
+                    "option",
+                    "update",
+                    &format!("pubky_test_{kind}_delay"),
+                    &delay.as_secs().to_string(),
+                ]);
+            }
+            (_, Some(replay)) => {
+                let path = if kind == "refund" {
+                    "/refunds"
+                } else {
+                    "/wc/v3/orders"
+                };
+                replay.hold_next("POST", path, delay);
+            }
+            _ => unreachable!("a side is live or replayed"),
+        }
+    }
+
+    /// Lets the held request land. Live: waits it out. Replay: nothing to wait for.
+    pub async fn let_it_land(&self, delay: Duration) {
+        if self.is_live() {
+            tokio::time::sleep(delay + Duration::from_secs(1)).await;
+        }
+    }
+
     pub fn live(&self) -> &LiveStack {
         self.live
             .as_ref()
