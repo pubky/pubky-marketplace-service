@@ -975,8 +975,8 @@ pub async fn get_public_listing_availability(
         );
         return response;
     }
-    let row: Result<Option<(String, String)>, sqlx::Error> = sqlx::query_as(
-        "SELECT aggregate_id, state FROM listings \
+    let row: Result<Option<(String, String, Option<Value>)>, sqlx::Error> = sqlx::query_as(
+        "SELECT aggregate_id, state, variant_availability FROM listings \
          WHERE seller_pubky = $1 AND listing_id = $2 AND deleted_at IS NULL",
     )
     .bind(&seller_pubky)
@@ -984,16 +984,28 @@ pub async fn get_public_listing_availability(
     .fetch_optional(&state.pool)
     .await;
     match row {
-        Ok(Some((aggregate_id, listing_state))) => {
-            let mut response = (
-                StatusCode::OK,
-                Json(json!({
-                    "aggregate_id": aggregate_id,
-                    "state": listing_state,
-                    "server_time": format_timestamp(now),
-                })),
-            )
-                .into_response();
+        Ok(Some((aggregate_id, listing_state, variant_availability))) => {
+            let mut body = json!({
+                "aggregate_id": aggregate_id,
+                "state": listing_state,
+                "server_time": format_timestamp(now),
+            });
+            // A listing that tracks stock per variant says which variants
+            // are sold out, never how many units are left.
+            if let Some(Value::Array(variants)) = variant_availability {
+                body["variants"] = Value::Array(
+                    variants
+                        .iter()
+                        .map(|variant| {
+                            json!({
+                                "variant_id": variant["variant_id"],
+                                "sold_out": variant["sold_out"],
+                            })
+                        })
+                        .collect(),
+                );
+            }
+            let mut response = (StatusCode::OK, Json(body)).into_response();
             response.headers_mut().insert(
                 axum::http::header::CACHE_CONTROL,
                 axum::http::HeaderValue::from_static(

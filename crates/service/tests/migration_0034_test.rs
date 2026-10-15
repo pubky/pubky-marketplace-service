@@ -254,5 +254,8 @@ fn migration_catalog_is_contiguous_through_0061() {
         })
         .collect();
     numbers.sort_unstable();
-    assert_eq!(numbers, (1..=61).collect::<Vec<_>>());
+    // Later lanes add 0062 and up (0062 to 0069 are the connectors', 0070 is
+    // per-variant inventory); the catalog is contiguous through 0061.
+    let base: Vec<u32> = numbers.into_iter().filter(|number| *number <= 61).collect();
+    assert_eq!(base, (1..=61).collect::<Vec<_>>());
 }

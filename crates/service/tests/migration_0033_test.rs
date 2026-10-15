@@ -86,7 +86,13 @@ async fn migration_0032_applies_after_already_applied_0033(pool: PgPool) {
             .fetch_all(&pool)
             .await
             .expect("final migration versions");
-    assert_eq!(finally_applied, (1..=61).collect::<Vec<_>>());
+    // 0062 and up belong to lanes that land separately (0070 is per-variant
+    // inventory); this test is about 0001..=0061.
+    let through_0061: Vec<i64> = finally_applied
+        .into_iter()
+        .filter(|version| *version <= 61)
+        .collect();
+    assert_eq!(through_0061, (1..=61).collect::<Vec<_>>());
 }
 
 fn aggregate_id(seller: &str, listing_id: &str) -> String {

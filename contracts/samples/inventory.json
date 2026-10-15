@@ -183,12 +183,8 @@
   "projection_schema": {
     "$schema": "http://json-schema.org/draft-07/schema#",
     "definitions": {
-      "StockView": {
+      "ListingTotalView": {
         "properties": {
-          "authority": {
-            "pattern": "^listing_total$",
-            "type": "string"
-          },
           "available": {
             "format": "int64",
             "minimum": 0.0,
@@ -211,11 +207,125 @@
           }
         },
         "required": [
+          "available",
+          "reserved",
+          "sold",
+          "total"
+        ],
+        "type": "object"
+      },
+      "StockView": {
+        "description": "`listing_total` for a listing that sells one variant (the numbers are the listing's). `variant` for a listing that tracks stock per variant: the numbers are the addressed variant's, `variant_id` names it, and `listing_total` carries the listing's sums.",
+        "properties": {
+          "authority": {
+            "pattern": "^(listing_total|variant)$",
+            "type": "string"
+          },
+          "available": {
+            "format": "int64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "listing_total": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/ListingTotalView"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reserved": {
+            "format": "int64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "sku": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sold": {
+            "format": "int64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "variant_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9_.-]+$",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
           "authority",
           "available",
           "reserved",
           "sold",
           "total"
+        ],
+        "type": "object"
+      },
+      "VariantStockView": {
+        "description": "One variant row of a listing that tracks stock per variant.",
+        "properties": {
+          "available": {
+            "format": "int64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "reserved": {
+            "format": "int64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "sku": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sold": {
+            "format": "int64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "sold_out": {
+            "type": "boolean"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "variant_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9_.-]+$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "available",
+          "enabled",
+          "reserved",
+          "sold",
+          "sold_out",
+          "total",
+          "variant_id"
         ],
         "type": "object"
       }
@@ -254,6 +364,16 @@
       },
       "stock": {
         "$ref": "#/definitions/StockView"
+      },
+      "variants": {
+        "description": "Present only for a listing that tracks stock per variant.",
+        "items": {
+          "$ref": "#/definitions/VariantStockView"
+        },
+        "type": [
+          "array",
+          "null"
+        ]
       }
     },
     "required": [

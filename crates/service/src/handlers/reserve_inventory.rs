@@ -87,7 +87,10 @@ pub async fn handle(
         Ok(row) => row,
         Err(refusal) => return Ok(Err(refusal.failure())),
     };
-    if crate::variant_stock::shortfall(row, payload.quantity).is_some() {
+    // A listing that sells one variant keeps its compare-and-swap below as the
+    // arbiter (a buyer who lost the race sees a revision conflict, as before);
+    // a variant listing refuses the exhausted variant here.
+    if keyed && crate::variant_stock::shortfall(row, payload.quantity).is_some() {
         return Ok(Err(CommandFailure::refused_with_revision(
             crate::refusal_audit::RefusalKind::InsufficientInventory,
             ErrorCode::InsufficientInventory,

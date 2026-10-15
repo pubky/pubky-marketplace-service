@@ -30,6 +30,7 @@ SERIAL=(
   migration_0033_test
   migration_0035_test
   migration_0037_test
+  migration_0070_test
   rolling_overlap_test
   manual_review_resolve_test
 )

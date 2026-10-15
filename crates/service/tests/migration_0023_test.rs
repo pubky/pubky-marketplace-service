@@ -565,12 +565,18 @@ fn migration_catalog_is_gapless_through_0061() {
                 .and_then(|prefix| prefix.parse::<u32>().ok())
         })
         .collect();
-    let expected = (1..=61).collect::<Vec<_>>();
+    // 0062 and later are claimed by lanes that land separately (0062 to 0069
+    // are the connectors', 0070 is per-variant inventory), so the rule is:
+    // 0001..=0061 gapless, then only later numbers.
+    let (base, later): (Vec<u32>, Vec<u32>) = sorted_migration_catalog(numbers)
+        .into_iter()
+        .partition(|number| *number <= 61);
     assert_eq!(
-        sorted_migration_catalog(numbers),
-        expected,
-        "the raw catalog is 0001..=0061, gapless"
+        base,
+        (1..=61).collect::<Vec<_>>(),
+        "the raw catalog starts 0001..=0061, gapless"
     );
+    assert!(later.iter().all(|number| *number >= 62));
 }
 
 #[test]
