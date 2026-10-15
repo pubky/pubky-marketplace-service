@@ -1965,9 +1965,8 @@ async fn claim_due_paykit_orders(
                       AND o.paykit_expires_at + INTERVAL '24 hours' > $1) \
                   OR (p.state = 'confirmed' AND o.paykit_request_state = 'confirmed' \
                       AND o.payment_method = 'paykit' AND o.paykit_api = 'upstream' \
-                      AND (o.payment_finality = 'pending' \
-                           OR (o.payment_finality = 'reverted' \
-                               AND o.payment_finality_at + INTERVAL '7 days' > $1) \
+                      AND ((o.payment_finality IN ('pending', 'reverted') \
+                            AND o.payment_finality_at + INTERVAL '7 days' > $1) \
                            OR (o.paykit_second_rail_at IS NULL \
                                AND o.paykit_expires_at IS NOT NULL \
                                AND o.paykit_expires_at + INTERVAL '24 hours' > $1)))) \
@@ -3420,6 +3419,86 @@ async fn apply_dual_rail_review(
     Ok(true)
 }
 
+/// How long a USDT payment is polled while its finality is `pending` or
+/// `reverted`. Past it the order is no longer polled.
+const USDT_FINALITY_POLL_DAYS: i64 = 7;
+
+/// Escalates USDT payments whose finality stayed `pending` for
+/// [`USDT_FINALITY_POLL_DAYS`]: polling stops (the claim bounds it), and one
+/// durable operator row is written (`needs_review`, `detected_unconfirmed`:
+/// an inclusion that never finalized), listed by `paykit-attempts-admin list`.
+/// The order stays paid and its finality stays `pending`, so physical
+/// fulfilment stays blocked until an operator has checked the transfer.
+/// Idempotent: an order that already has a held row for its invoice is left
+/// alone. Returns how many orders were escalated.
+pub async fn escalate_stale_usdt_finality(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+) -> anyhow::Result<u64> {
+    let stale: Vec<(Uuid,)> = sqlx::query_as(
+        "SELECT o.id FROM orders o JOIN payments p ON p.order_id = o.id \
+         WHERE o.payment_method = 'paykit' AND o.payment_finality = 'pending' \
+         AND o.payment_finality_at + make_interval(days => $2) <= $1 \
+         AND p.state = 'confirmed' AND o.paykit_invoice_id IS NOT NULL \
+         AND NOT EXISTS (SELECT 1 FROM paykit_superseded_attempts h \
+                         WHERE h.order_id = o.id AND h.invoice_id = o.paykit_invoice_id) \
+         ORDER BY o.payment_finality_at LIMIT 50",
+    )
+    .bind(now)
+    .bind(i32::try_from(USDT_FINALITY_POLL_DAYS)?)
+    .fetch_all(pool)
+    .await?;
+    let mut escalated = 0u64;
+    for (order_id,) in stale {
+        let mut tx = pool.begin().await?;
+        lock_order_payment(&mut tx, order_id).await?;
+        let Some(order) = fetch_order_for_update(&mut tx, order_id).await? else {
+            tx.rollback().await?;
+            continue;
+        };
+        let (Some(invoice_id), Some(since)) = (order.paykit_invoice_id, order.payment_finality_at)
+        else {
+            tx.rollback().await?;
+            continue;
+        };
+        if order.payment_finality.as_deref() != Some("pending")
+            || since + chrono::Duration::days(USDT_FINALITY_POLL_DAYS) > now
+        {
+            tx.rollback().await?;
+            continue;
+        }
+        crate::paykit_attempts::record_released_attempt(&mut tx, order_id, now).await?;
+        let held = sqlx::query(
+            "UPDATE paykit_superseded_attempts SET state = 'needs_review', \
+             review_reason = 'detected_unconfirmed', observation = $3, closed_at = $4 \
+             WHERE order_id = $1 AND invoice_id = $2 AND state = 'watching'",
+        )
+        .bind(order_id)
+        .bind(invoice_id)
+        .bind(serde_json::json!({
+            "status": "usdt_finality_pending",
+            "paid_asset": order.payment_asset,
+            "finality_pending_since": since,
+            "observed_at": now,
+        }))
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        if held.rows_affected() == 1 {
+            escalated += 1;
+            tracing::error!(
+                order_id = %order_id,
+                invoice_id = %invoice_id,
+                code = "usdt_finality_pending_too_long",
+                "ALERT a USDT payment was included but never finalized within the polling bound; \
+                 held for review, fulfilment stays blocked"
+            );
+        }
+    }
+    Ok(escalated)
+}
+
 /// Applies one status to an order bound through `paykit` whose payment is
 /// already settled. It keeps two facts current and never un-pays the order:
 ///
@@ -3588,6 +3667,9 @@ pub async fn verify_due_paykit_payments(
     source: &dyn PaykitStatusSource,
     now: DateTime<Utc>,
 ) -> anyhow::Result<u64> {
+    if let Err(error) = escalate_stale_usdt_finality(&state.pool, now).await {
+        tracing::error!(error = %error, "USDT finality escalation pass failed");
+    }
     let claimed =
         claim_due_paykit_orders(&state.pool, now, state.config.paykit_poll_seconds).await?;
     let mut applied = 0u64;

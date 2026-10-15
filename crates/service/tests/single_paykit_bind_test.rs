@@ -2447,6 +2447,67 @@ async fn a_usdt_refund_with_an_amount_that_is_not_whole_cents_is_a_typed_refusal
     assert_eq!(status, StatusCode::OK, "{body}");
 }
 
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn usdt_finality_that_stays_pending_for_seven_days_goes_to_an_operator(pool: PgPool) {
+    let f = fixture(pool.clone(), Setup::both()).await;
+    let active = active_order(&f).await;
+    let order_id = active.order.order_id.clone();
+    f.paykit.set_marketplace_status(
+        active.invoice,
+        usdt_status(
+            active.invoice,
+            active.deadline,
+            usdt_leg(1, true, true, false),
+        ),
+    );
+    poll_now(&f.app, at(1)).await;
+    assert_eq!(
+        facts(&pool, &order_id).await.payment_finality.as_deref(),
+        Some("pending")
+    );
+    let status_reads = || {
+        f.paykit
+            .calls()
+            .iter()
+            .filter(|call| call.path == "/marketplace/payment-requests/status")
+            .count()
+    };
+    let day = |days: i64| Utc::now() + Duration::days(days);
+
+    // Inside the bound it keeps polling and nothing is escalated.
+    let before = status_reads();
+    poll_now(&f.app, day(6)).await;
+    assert!(status_reads() > before, "still polled on day 6");
+    assert!(marketplace_service::paykit_attempts::list_needs_review(&pool)
+        .await
+        .expect("queue")
+        .is_empty());
+
+    // Past it, one durable operator row is written and polling stops.
+    poll_now(&f.app, day(8)).await;
+    let queue = marketplace_service::paykit_attempts::list_needs_review(&pool)
+        .await
+        .expect("queue");
+    assert_eq!(queue.len(), 1);
+    assert_eq!(queue[0].order_id, uuid(&order_id));
+    assert_eq!(queue[0].review_reason, "detected_unconfirmed");
+    let after = status_reads();
+    poll_now(&f.app, day(9)).await;
+    poll_now(&f.app, day(10)).await;
+    assert_eq!(status_reads(), after, "no longer polled after the bound");
+    assert_eq!(
+        marketplace_service::paykit_attempts::list_needs_review(&pool)
+            .await
+            .expect("queue")
+            .len(),
+        1,
+        "escalated once"
+    );
+    let stored = facts(&pool, &order_id).await;
+    assert_eq!(stored.state, "paid", "the order stays paid");
+    assert_eq!(stored.payment_finality.as_deref(), Some("pending"));
+}
+
 // ---------------------------------------------------------------------------
 // Money path: concurrent polls of one order
 // ---------------------------------------------------------------------------
