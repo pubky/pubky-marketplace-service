@@ -499,6 +499,7 @@ struct LedgerRow {
     amount_minor: i64,
     from_state: Option<String>,
     from_return_state: Option<String>,
+    recorded_at: DateTime<Utc>,
 }
 
 #[derive(Default)]
@@ -527,6 +528,19 @@ impl Totals {
     }
 }
 
+/// What the order's refund amounted to just after the ledger row `txn` was
+/// recorded: the amount the record written for that row carried.
+fn refund_total_after(ledger: &[LedgerRow], txn: &str) -> i64 {
+    let mut totals = Totals::default();
+    for row in ledger {
+        totals.add(&row.payment_status, row.amount_minor);
+        if row.refund_txn_id == txn {
+            break;
+        }
+    }
+    totals.effective()
+}
+
 /// Records one notification on its order under the order row lock, in every
 /// order state: ledger row, running amount, reversal fields, state move or
 /// review flag, event, and notifications.
@@ -540,7 +554,8 @@ async fn record_on_order(
         return Ok(Disposition::Inbox("unknown_parent"));
     };
     let ledger: Vec<LedgerRow> = sqlx::query_as(
-        "SELECT refund_txn_id, payment_status, amount_minor, from_state, from_return_state \
+        "SELECT refund_txn_id, payment_status, amount_minor, from_state, from_return_state, \
+                recorded_at \
          FROM order_gateway_refunds WHERE order_id = $1 ORDER BY recorded_at, refund_txn_id",
     )
     .bind(order.id)
@@ -593,12 +608,12 @@ async fn record_on_order(
     .await?;
 
     let effective = after.effective();
-    let running_refund = |txn: &str| {
+    let running_refund = |txn: &str, recorded_at: DateTime<Utc>| {
         (effective > 0).then(|| {
             json!({
                 "amount_minor": effective.min(order.total_minor),
                 "transaction_id": txn,
-                "recorded_at": format_timestamp(now),
+                "recorded_at": format_timestamp(recorded_at),
             })
         })
     };
@@ -616,7 +631,7 @@ async fn record_on_order(
             let transition =
                 full && !manual_external && FULL_REFUND_SOURCES.contains(&order.state.as_str());
             if !manual_external {
-                next.external_refund = running_refund(record.txn_id);
+                next.external_refund = running_refund(record.txn_id, now);
             }
             if record.status == GatewayStatus::Reversed {
                 // A `Canceled_Reversal` delivered before its `Reversed` nets
@@ -672,10 +687,18 @@ async fn record_on_order(
                             .iter()
                             .rev()
                             .find(|row| row.payment_status == "Reversed")
-                    })
-                    .map(|row| row.refund_txn_id.as_str())
-                    .unwrap_or(record.txn_id);
-                next.external_refund = running_refund(latest);
+                    });
+                // A refund that stands unchanged keeps the identity it was
+                // recorded with (transaction id, amount, `recorded_at`):
+                // consumers key what they did for it on that record, and a
+                // restore must not read as another refund.
+                let recorded_at = latest
+                    .filter(|row| refund_total_after(&ledger, &row.refund_txn_id) == effective)
+                    .map_or(now, |row| row.recorded_at);
+                next.external_refund = running_refund(
+                    latest.map_or(record.txn_id, |row| row.refund_txn_id.as_str()),
+                    recorded_at,
+                );
             }
             let replaced = ledger.iter().rev().find(|row| row.from_state.is_some());
             let reopen = order.state == "refunded_external" && effective < order.total_minor;

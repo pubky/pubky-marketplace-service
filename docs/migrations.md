@@ -139,11 +139,11 @@ additive. Orders and payments bound to Stripe are not touched.
 binary from before 0059 ignores the new columns and its inserts take their
 defaults, so a rolling replacement is safe.
 
-## Store connectors (0062 to 0065)
+## Store connectors (0062 to 0066)
 
-The connector framework uses 0062 to 0065 of the 0062 to 0069 range reserved
-for connectors. None depends on 0060 or 0061, so they apply cleanly whether
-or not those have landed. All three are additive and rerunnable.
+The connector framework uses 0062 to 0064 and 0066 of the 0062 to 0069 range reserved
+for connectors (0065 is the Shopify provider's). None depends on 0060 or 0061, so they apply cleanly whether
+or not those have landed. All are additive and rerunnable.
 
 - 0062 creates `connector_connections` (one row per seller, provider and
   shop: a `draft` that expires after 24 hours, then `connected`,
@@ -170,6 +170,11 @@ or not those have landed. All three are additive and rerunnable.
   sets `lock_timeout` like 0053. A binary from before 0064 ignores the columns.
   The envelope is deleted when the store order exists or when the order
   reaches a final state; the consent columns stay.
+- 0066 widens the `connector_alerts` kind check from 0063 by one value,
+  `refund_reversed_after_mirror` (a refund already mirrored to a store was
+  reversed or reduced in Pubky). The table is small and new; the constraint is
+  dropped and re-added under a short `lock_timeout`. A binary from before 0066
+  never writes the value.
 
 - 0065 adds `connector_connections.variant_mode` (`native` or `split`, default
   `native`, a CHECK on the two values). A constant default needs no table rewrite;

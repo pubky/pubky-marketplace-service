@@ -1820,12 +1820,12 @@ async fn a_refund_already_mirrored_when_it_is_reversed_is_flagged_and_the_new_on
         &json!(null),
     )
     .await;
-    assert_eq!(alerts["alerts"][0]["kind"], "action_quarantined");
+    assert_eq!(alerts["alerts"][0]["kind"], "refund_reversed_after_mirror");
     assert_eq!(alerts["alerts"][0]["pubky_order_id"], s.order.order_id);
     assert!(alerts["alerts"][0]["detail"]
         .as_str()
         .expect("detail")
-        .starts_with("refund_reversed"));
+        .contains("reversed or reduced"));
     let states: Vec<String> = refund_actions(&s)
         .await
         .into_iter()
@@ -1856,4 +1856,48 @@ async fn a_refund_reversed_before_it_reached_the_store_is_dropped_without_an_ale
     assert!(refund_amounts(&s).is_empty());
     assert_eq!(s.store.refund_calls.load(Ordering::SeqCst), 0);
     assert_eq!(reversal_alerts(&s.app.pool).await, 0);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_retry_and_a_reversal_over_the_same_parked_mirrors_lock_them_in_one_order(pool: PgPool) {
+    let s = scenario(pool).await;
+    quarantine_a_push(&s).await;
+    Mirror::Refund.queue(&s).await;
+    Mirror::Refund.queue(&s).await;
+    let ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM connector_order_actions ORDER BY id")
+        .fetch_all(&s.app.pool)
+        .await
+        .expect("mirror ids");
+    assert_eq!(ids.len(), 2);
+    reverse_the_refund(&s).await;
+
+    // Another transaction holds the mirror that sorts last. The retry takes
+    // the first and waits for the last; the reversal then wants the first.
+    // Were the two to take the pair in different orders, each would hold the
+    // row the other waits for as soon as the last is released.
+    let mut holder = s.app.pool.begin().await.expect("tx");
+    sqlx::query("SELECT id FROM connector_order_actions WHERE id = $1 FOR UPDATE")
+        .bind(ids[1])
+        .fetch_one(&mut *holder)
+        .await
+        .expect("hold the last mirror");
+    let retry = retry_task(&s);
+    wait_for_waiters(&s.app.pool, 1).await;
+    let consume = {
+        let state = s.app.state.clone();
+        tokio::spawn(async move { worker::consume_events(&state).await.expect("consume") })
+    };
+    wait_for_waiters(&s.app.pool, 2).await;
+    holder.commit().await.expect("release");
+    retry.await.expect("the retry is not a deadlock victim");
+    consume
+        .await
+        .expect("the reversal is not a deadlock victim");
+
+    assert_eq!(s.push().await.0, "sending");
+    assert_eq!(
+        actions(&s).await,
+        Vec::<(String, String, Option<String>)>::new(),
+        "the reversal drops the mirrors the retry had re-queued"
+    );
 }

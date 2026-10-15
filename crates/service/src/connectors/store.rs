@@ -1130,6 +1130,10 @@ pub enum AlertKind {
     StoreUninstalled,
     CredentialsRejected,
     InboundFailed,
+    /// A refund already mirrored to the store was reversed or reduced in
+    /// Pubky. Informational: the seller corrects the store; there is nothing
+    /// to retry.
+    RefundReversedAfterMirror,
 }
 
 impl AlertKind {
@@ -1142,6 +1146,7 @@ impl AlertKind {
             AlertKind::StoreUninstalled => "store_uninstalled",
             AlertKind::CredentialsRejected => "credentials_rejected",
             AlertKind::InboundFailed => "inbound_failed",
+            AlertKind::RefundReversedAfterMirror => "refund_reversed_after_mirror",
         }
     }
 }

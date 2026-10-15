@@ -605,6 +605,16 @@ pub async fn connector_app_full(
     keys: Arc<ConnectorKeys>,
     settings: ConnectorSettings,
 ) -> (TestApp, Stores) {
+    with_connectors(super::test_app(pool).await, keys, settings)
+}
+
+/// Connectors, with both provider kinds registered, on an app built
+/// elsewhere (for one with payment rails configured, for instance).
+pub fn with_connectors(
+    base: TestApp,
+    keys: Arc<ConnectorKeys>,
+    settings: ConnectorSettings,
+) -> (TestApp, Stores) {
     let shopify = Arc::new(TestProvider::new(ProviderKind::Shopify));
     let woocommerce = Arc::new(TestProvider::new(ProviderKind::Woocommerce));
     let stores = Stores {
@@ -616,7 +626,6 @@ pub async fn connector_app_full(
         ProviderRegistry::new().with(shopify).with(woocommerce),
         settings,
     ));
-    let base = super::test_app(pool).await;
     let state = base.state.clone().with_connectors(Some(runtime));
     (rebuild(base, state), stores)
 }
