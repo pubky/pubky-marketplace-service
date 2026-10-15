@@ -40,6 +40,9 @@
 //!   once with its own amount. When a reversal is cancelled (`on_refund_reversed`)
 //!   mirrors of earlier refunds that have not been sent are dropped, and ones
 //!   that were sent raise a seller alert: no provider can retract a refund.
+//! * Statements that change several actions at once lock them in id order
+//!   (`LOCK_ACTIONS`), and the handlers lock a push's siblings in id order,
+//!   so concurrent retry, quarantine and reversal never deadlock.
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -110,6 +113,13 @@ pub mod reason {
 /// The `quarantine_reason` of a mirror action set aside because its push is
 /// quarantined. A seller retry of the push puts these actions back.
 pub const ACTION_PUSH_QUARANTINED: &str = "push_quarantined";
+
+/// How a statement that changes several mirror actions at once takes their
+/// row locks: in id order, in a CTE named `locked` that the statement then
+/// joins on `a.id`. Every such statement (`settle_actions_of_quarantined_push`,
+/// `drop_actions_of_pushes`, `retry_push`, `on_refund_reversed`) uses it, so
+/// two of them can never each hold a row the other wants.
+const LOCK_ACTIONS: &str = "ORDER BY a.id FOR UPDATE OF a";
 
 /// A push that a cancel or refund can still be mirrored onto: one that has
 /// created, or may yet create, a store order. A push set aside because the
@@ -312,11 +322,14 @@ async fn settle_actions_of_quarantined_push<'c>(
     if reason == self::reason::ORDER_CANCELLED_BEFORE_PUSH {
         drop_actions_of_pushes(tx, &[push_id]).await
     } else {
-        sqlx::query(
-            "UPDATE connector_order_actions SET state = 'quarantined', quarantine_reason = $2, \
-             lease_until = NULL, updated_at = $3 \
-             WHERE push_id = $1 AND state = 'pending'",
-        )
+        sqlx::query(&format!(
+            "WITH locked AS ( \
+                 SELECT a.id FROM connector_order_actions a \
+                 WHERE a.push_id = $1 AND a.state = 'pending' {LOCK_ACTIONS}) \
+             UPDATE connector_order_actions a SET state = 'quarantined', \
+                 quarantine_reason = $2, lease_until = NULL, updated_at = $3 \
+             FROM locked WHERE a.id = locked.id AND a.state = 'pending'"
+        ))
         .bind(push_id)
         .bind(ACTION_PUSH_QUARANTINED)
         .bind(now)
@@ -330,9 +343,13 @@ async fn drop_actions_of_pushes<'c>(
     tx: &mut sqlx::Transaction<'c, Postgres>,
     push_ids: &[Uuid],
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "DELETE FROM connector_order_actions WHERE push_id = ANY($1) AND state = 'pending'",
-    )
+    sqlx::query(&format!(
+        "WITH locked AS ( \
+             SELECT a.id FROM connector_order_actions a \
+             WHERE a.push_id = ANY($1) AND a.state = 'pending' {LOCK_ACTIONS}) \
+         DELETE FROM connector_order_actions a USING locked \
+         WHERE a.id = locked.id AND a.state = 'pending'"
+    ))
     .bind(push_ids)
     .execute(&mut **tx)
     .await?;
@@ -419,11 +436,15 @@ pub async fn retry_push(
     .fetch_optional(&mut *tx)
     .await?;
     if let Some(row) = &queued {
-        sqlx::query(
-            "UPDATE connector_order_actions SET state = 'pending', quarantine_reason = NULL, \
-             attempts = 0, next_attempt_at = $3, last_error = NULL, updated_at = $3 \
-             WHERE push_id = $1 AND state = 'quarantined' AND quarantine_reason = $2",
-        )
+        sqlx::query(&format!(
+            "WITH locked AS ( \
+                 SELECT a.id FROM connector_order_actions a \
+                 WHERE a.push_id = $1 AND a.state = 'quarantined' \
+                   AND a.quarantine_reason = $2 {LOCK_ACTIONS}) \
+             UPDATE connector_order_actions a SET state = 'pending', quarantine_reason = NULL, \
+                 attempts = 0, next_attempt_at = $3, last_error = NULL, updated_at = $3 \
+             FROM locked WHERE a.id = locked.id AND a.state = 'quarantined'"
+        ))
         .bind(row.id)
         .bind(ACTION_PUSH_QUARANTINED)
         .bind(now)
@@ -483,7 +504,7 @@ pub async fn on_order_cancelled<'c>(
          FROM connector_order_push p \
          WHERE p.pubky_order_id = $1 AND p.state IN ('created', 'sending', 'quarantined') \
            AND {MIRRORABLE_PUSH} \
-         FOR NO KEY UPDATE OF p \
+         ORDER BY p.id FOR NO KEY UPDATE OF p \
          ON CONFLICT (push_id, kind, action_key) DO NOTHING"
     ))
     .bind(pubky_order_id)
@@ -532,7 +553,7 @@ pub async fn on_refund_recorded<'c>(
                 $3, 0, $4, $5, $4, $4 \
          FROM connector_order_push p \
          WHERE p.pubky_order_id = $1 AND {MIRRORABLE_PUSH} \
-         FOR NO KEY UPDATE OF p \
+         ORDER BY p.id FOR NO KEY UPDATE OF p \
          ON CONFLICT (push_id, kind, action_key) DO NOTHING"
     ))
     .bind(pubky_order_id)
@@ -546,31 +567,48 @@ pub async fn on_refund_recorded<'c>(
     Ok(())
 }
 
+/// What `on_refund_reversed` did with the mirrors of earlier refunds.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ReversalOutcome {
+    /// Mirrors that had not been sent and were dropped.
+    pub dropped: u64,
+    /// Mirrors sent or in flight, each now with a seller alert.
+    pub flagged: u64,
+}
+
 /// A refund Pubky had recorded was reversed or reduced: the order's current
 /// refund (`current_key`, `None` when it holds none) replaces the ones
 /// before it. A mirror of an earlier refund that has not reached the store is
 /// dropped. One that has, or may have, cannot be unwound (no provider can
-/// retract a recorded refund), so the seller gets an alert to correct the
-/// store's books. A mirror quarantined for its own reason was never applied
-/// and keeps its own alert.
+/// retract a recorded refund), so the seller gets a `refund_reversed_after_mirror`
+/// alert to correct the store's books. A mirror quarantined for its own reason
+/// was never applied and keeps its own alert.
 pub async fn on_refund_reversed<'c>(
     tx: &mut sqlx::Transaction<'c, Postgres>,
     now: DateTime<Utc>,
     pubky_order_id: Uuid,
     current_key: Option<&str>,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "DELETE FROM connector_order_actions a USING connector_order_push p \
-         WHERE a.push_id = p.id AND p.pubky_order_id = $1 AND a.kind = 'refund' \
-           AND ($2::text IS NULL OR a.action_key <> $2) \
+) -> Result<ReversalOutcome, sqlx::Error> {
+    let dropped = sqlx::query(&format!(
+        "WITH locked AS ( \
+             SELECT a.id FROM connector_order_actions a \
+             JOIN connector_order_push p ON p.id = a.push_id \
+             WHERE p.pubky_order_id = $1 AND a.kind = 'refund' \
+               AND ($2::text IS NULL OR a.action_key <> $2) \
+               AND (a.state = 'pending' \
+                    OR (a.state = 'quarantined' AND a.quarantine_reason = $3)) \
+             {LOCK_ACTIONS}) \
+         DELETE FROM connector_order_actions a USING locked \
+         WHERE a.id = locked.id \
            AND (a.state = 'pending' \
-                OR (a.state = 'quarantined' AND a.quarantine_reason = $3))",
-    )
+                OR (a.state = 'quarantined' AND a.quarantine_reason = $3))"
+    ))
     .bind(pubky_order_id)
     .bind(current_key)
     .bind(ACTION_PUSH_QUARANTINED)
     .execute(&mut **tx)
-    .await?;
+    .await?
+    .rows_affected();
     let applied: Vec<(Uuid, Uuid)> = sqlx::query_as(
         "SELECT a.id, p.connection_id FROM connector_order_actions a \
          JOIN connector_order_push p ON p.id = a.push_id \
@@ -583,6 +621,7 @@ pub async fn on_refund_reversed<'c>(
     .bind(current_key)
     .fetch_all(&mut **tx)
     .await?;
+    let flagged = applied.len() as u64;
     for (action_id, connection_id) in applied {
         let connection: Option<ConnectionRow> = sqlx::query_as(&format!(
             "SELECT {} FROM connector_connections WHERE id = $1",
@@ -598,15 +637,15 @@ pub async fn on_refund_reversed<'c>(
             &mut **tx,
             now,
             &connection,
-            AlertKind::ActionQuarantined,
+            AlertKind::RefundReversedAfterMirror,
             Some(pubky_order_id),
-            "refund_reversed: a refund Pubky mirrored to the store was reversed or reduced \
-             in Pubky. The store may still show it; correct it there.",
+            "A refund Pubky mirrored to the store was reversed or reduced in Pubky. \
+             The store may still show the earlier amount; correct it there.",
             &format!("refund_reversed|{action_id}"),
         )
         .await?;
     }
-    Ok(())
+    Ok(ReversalOutcome { dropped, flagged })
 }
 
 // === Order actions (cancel and refund mirrors) ===============================
