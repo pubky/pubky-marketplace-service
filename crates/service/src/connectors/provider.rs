@@ -1,0 +1,598 @@
+//! The provider contract the Shopify and WooCommerce providers plug into.
+//!
+//! The framework (ledger, outbox consumer, routes, sealing) never knows a
+//! store system. A provider turns the normalised types below into its own
+//! API calls and back. Providers hold no state of their own: every call that
+//! needs the merchant's secret receives it in a [`ConnectionContext`], opened
+//! by the framework from `connector_credentials` for that one call, and every
+//! call that needs the provider app's identity receives an [`AppContext`]
+//! resolved from the deployment's configured apps (`SHOPIFY_APPS`).
+//!
+//! Outcome rules every implementation must honour (the ledger relies on
+//! them):
+//!
+//! * [`ProviderError::Rejected`] and [`ProviderError::RateLimited`] mean the
+//!   store did **not** apply the request. The framework may retry (rate
+//!   limit) or quarantine (rejection) without looking the order up.
+//! * [`ProviderError::Unknown`] means the request may or may not have been
+//!   applied (timeout, connection reset, 5xx). Before the framework pushes
+//!   the same order again it calls [`ConnectorProvider::find_pushed_order`],
+//!   which must therefore be reliable (it may not answer from a search index
+//!   that lags a create).
+//! * `cancel_order` and `record_refund` are retried after an unknown outcome
+//!   without a lookup, so they must be idempotent in the store (a
+//!   deterministic idempotency key derived from the Pubky ids they receive,
+//!   or a lookup of their own).
+//! * No method may log, return or store the credential bytes or an app
+//!   secret.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderKind {
+    Shopify,
+    Woocommerce,
+}
+
+impl ProviderKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProviderKind::Shopify => "shopify",
+            ProviderKind::Woocommerce => "woocommerce",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "shopify" => Some(ProviderKind::Shopify),
+            "woocommerce" => Some(ProviderKind::Woocommerce),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for ProviderKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// A secret (an OAuth token, an API key pair, an app secret) as bytes or
+/// text. Opaque to the framework, never serialised, never printed, zeroed
+/// when dropped.
+pub struct CredentialSecret(Vec<u8>);
+
+impl CredentialSecret {
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    pub fn expose(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for CredentialSecret {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("CredentialSecret(<redacted>)")
+    }
+}
+
+impl Drop for CredentialSecret {
+    fn drop(&mut self) {
+        self.0.fill(0);
+    }
+}
+
+/// One configured provider app: `SHOPIFY_APPS=john` with
+/// `SHOPIFY_APP_JOHN_CLIENT_ID` and `SHOPIFY_APP_JOHN_CLIENT_SECRET`. The
+/// secret verifies launch, callback and webhook signatures for stores that
+/// installed this app.
+pub struct AppContext {
+    pub app_key: String,
+    pub client_id: String,
+    pub client_secret: CredentialSecret,
+}
+
+impl std::fmt::Debug for AppContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AppContext")
+            .field("app_key", &self.app_key)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"<redacted>")
+            .finish()
+    }
+}
+
+/// One connected store, with its opened credential, for the duration of a
+/// provider call.
+#[derive(Debug)]
+pub struct ConnectionContext {
+    pub connection_id: Uuid,
+    pub seller_pubky: String,
+    /// Canonical shop identifier ([`ConnectorProvider::normalize_shop`]).
+    pub shop: String,
+    pub scopes: Vec<String>,
+    pub credentials: CredentialSecret,
+    /// The provider app the store installed; `None` for a provider without
+    /// apps (WooCommerce).
+    pub app: Option<AppContext>,
+}
+
+/// Input of [`ConnectorProvider::connect`].
+#[derive(Debug)]
+pub struct ConnectRequest {
+    pub connection_id: Uuid,
+    pub seller_pubky: String,
+    pub shop: String,
+    /// The single-use nonce of the pending connect. A provider that sends the
+    /// merchant straight to the store (WooCommerce) puts it in `user_id`; the
+    /// framework stores only its hash.
+    pub state: String,
+    /// The app the seller named, if any and configured.
+    pub app: Option<AppContext>,
+    pub callback_url: String,
+    pub webhook_url: String,
+    /// Provider-specific fields the Shop sent with the connect request.
+    pub params: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConnectStart {
+    /// Where the merchant's browser goes to approve the connection. `None`
+    /// when the merchant installs from the store's side (Shopify: the app's
+    /// App URL starts the authorization).
+    pub authorize_url: Option<String>,
+}
+
+/// What a launch, callback or other browser/server request carried, as
+/// received.
+#[derive(Debug, Default)]
+pub struct CallbackParams {
+    pub raw_query: String,
+    pub query: BTreeMap<String, String>,
+    pub headers: WebhookHeaders,
+    pub body: Vec<u8>,
+}
+
+/// The pending connection a callback completes.
+#[derive(Debug)]
+pub struct PendingConnection {
+    pub connection_id: Uuid,
+    pub seller_pubky: String,
+    pub shop: String,
+    pub state: String,
+}
+
+#[derive(Debug)]
+pub struct CompleteRequest {
+    pub pending: PendingConnection,
+    pub app: Option<AppContext>,
+    pub callback: CallbackParams,
+    pub webhook_url: String,
+}
+
+/// Input of [`ConnectorProvider::authorize_url`], after a verified launch.
+#[derive(Debug)]
+pub struct AuthorizeRequest {
+    pub app: AppContext,
+    pub shop: String,
+    /// A fresh single-use value for the OAuth `state`.
+    pub state: String,
+    pub callback_url: String,
+}
+
+#[derive(Debug)]
+pub struct ConnectCompleted {
+    pub credentials: CredentialSecret,
+    pub scopes: Vec<String>,
+}
+
+/// Headers of an inbound request, names lower-cased.
+#[derive(Debug, Default, Clone)]
+pub struct WebhookHeaders(BTreeMap<String, String>);
+
+impl WebhookHeaders {
+    pub fn from_pairs<I, K, V>(pairs: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: Into<String>,
+    {
+        Self(
+            pairs
+                .into_iter()
+                .map(|(name, value)| (name.as_ref().to_ascii_lowercase(), value.into()))
+                .collect(),
+        )
+    }
+
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.0.get(&name.to_ascii_lowercase()).map(String::as_str)
+    }
+}
+
+/// What a provider may use to verify a webhook: the app (Shopify signs with
+/// the app's secret) and, while the store is connected, its opened
+/// credential (WooCommerce signs with a per-store secret). A store that
+/// already disconnected has no credential, but Shopify's compliance webhooks
+/// still arrive for it.
+#[derive(Debug)]
+pub struct WebhookContext {
+    pub app: Option<AppContext>,
+    pub connection: Option<ConnectionContext>,
+}
+
+/// A webhook whose signature the provider verified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedWebhook {
+    /// The provider's own delivery or event id. The inbound table is unique
+    /// on it per connection, which is the webhook dedupe.
+    pub event_id: String,
+    pub topic: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Price {
+    pub amount_minor: i64,
+    pub currency: String,
+    pub exponent: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogOption {
+    pub name: String,
+    pub values: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogOptionValue {
+    pub name: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogVariant {
+    pub provider_variant_id: String,
+    pub sku: Option<String>,
+    pub title: Option<String>,
+    pub option_values: Vec<CatalogOptionValue>,
+    pub price: Price,
+    /// Units the store can sell; `None` when the store does not track stock
+    /// for this variant.
+    pub stock: Option<i64>,
+    pub image_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogProduct {
+    pub provider_product_id: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub url: Option<String>,
+    pub options: Vec<CatalogOption>,
+    pub image_urls: Vec<String>,
+    pub variants: Vec<CatalogVariant>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogPage {
+    pub products: Vec<CatalogProduct>,
+    /// Opaque cursor for the next page; `None` on the last page.
+    pub next_page: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderPushLine {
+    pub provider_product_id: String,
+    pub provider_variant_id: String,
+    pub sku: Option<String>,
+    pub title: String,
+    pub quantity: i64,
+    pub unit_price_minor: i64,
+}
+
+/// The delivery address a buyer chose to share with the store. Same fields as
+/// the sealed delivery address. Held in memory for one push and never logged
+/// (the `Debug` form hides it).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShippingAddress {
+    pub name: String,
+    pub line1: String,
+    #[serde(default)]
+    pub line2: String,
+    pub city: String,
+    #[serde(default)]
+    pub region: String,
+    #[serde(rename = "postalCode", alias = "postal_code")]
+    pub postal_code: String,
+    #[serde(rename = "countryCode", alias = "country_code")]
+    pub country_code: String,
+}
+
+impl std::fmt::Debug for ShippingAddress {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ShippingAddress(<hidden>)")
+    }
+}
+
+/// A paid Pubky order as the store sees it. Carries no buyer identity. It
+/// carries a delivery address only when the buyer opted in at checkout to
+/// share it with this store (`shipping_address`); otherwise the store order
+/// names only the Pubky order id and the merchant copies the address from
+/// the Shop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderPush {
+    pub pubky_order_id: Uuid,
+    pub currency: String,
+    pub exponent: i32,
+    pub lines: Vec<OrderPushLine>,
+    pub subtotal_minor: i64,
+    pub shipping_minor: i64,
+    pub total_minor: i64,
+    /// The rail the buyer paid on (`bitcoin`, `paykit`, `usdt`, `paypal`,
+    /// `sandbox`, or `unknown`), for the store's manual payment record.
+    pub payment_method: String,
+    pub paid_at: DateTime<Utc>,
+    pub shipping_address: Option<ShippingAddress>,
+}
+
+/// The store-side order a push created.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalOrder {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CancelOrder {
+    pub pubky_order_id: Uuid,
+    pub reason: String,
+}
+
+/// A refund Pubky recorded. `amount_minor` is in `amount_unit` as recorded
+/// on the Pubky order, which is not always the order currency (`sat` for
+/// Bitcoin, `usdt` for USDT minor units, the order currency for a fiat rail).
+/// `full` is true when the whole order was refunded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefundRecord {
+    /// Deterministic per Pubky refund; the provider derives its idempotency
+    /// key from it.
+    pub refund_id: String,
+    pub pubky_order_id: Uuid,
+    pub amount_minor: Option<i64>,
+    pub amount_unit: String,
+    pub transaction_id: Option<String>,
+    pub order_total_minor: i64,
+    pub order_currency: String,
+    pub order_exponent: i32,
+    pub full: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrderRef {
+    pub external_order_id: String,
+    /// Present when the store order itself names the Pubky order (a tag or a
+    /// note attribute the push wrote).
+    pub pubky_order_id: Option<Uuid>,
+}
+
+/// Shopify's mandatory privacy webhooks. The service keeps no store customer
+/// data, so a data request or a customer redaction has nothing to return or
+/// erase; a shop redaction deletes whatever connector data remains for the
+/// store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComplianceTopic {
+    CustomerDataRequest,
+    CustomerRedact,
+    ShopRedact,
+}
+
+/// What an inbound webhook means to Pubky.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum InboundEvent {
+    /// The store's sellable stock for a variant. Applied only to mapped
+    /// variants, through `inventory.adjust`.
+    StockLevel {
+        provider_product_id: String,
+        provider_variant_id: String,
+        available: i64,
+    },
+    /// A shipment with tracking for an order the push created.
+    Fulfillment {
+        order: OrderRef,
+        carrier: String,
+        tracking_number: String,
+    },
+    /// The merchant cancelled the order in the store. Raises a seller alert,
+    /// never a refund.
+    OrderCancelled {
+        order: OrderRef,
+        reason: Option<String>,
+    },
+    /// The merchant refunded the order in the store. Raises a seller alert,
+    /// never a refund.
+    Refund {
+        order: OrderRef,
+        amount_minor: Option<i64>,
+        currency: Option<String>,
+    },
+    /// The merchant removed the app. The credential is deleted.
+    AppUninstalled,
+    /// One of the provider's mandatory privacy topics.
+    Compliance { topic: ComplianceTopic },
+    /// A topic the connector does not act on.
+    Ignored { reason: String },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ProviderError {
+    /// The store refused the request; nothing was applied. `code` is a short
+    /// machine value the Shop can show (`unmapped_variant`, `out_of_stock`,
+    /// `validation`, ...).
+    #[error("provider rejected the request: {code}")]
+    Rejected { code: String, message: String },
+    /// The store is throttling; nothing was applied.
+    #[error("provider is rate limiting")]
+    RateLimited { retry_after: Option<Duration> },
+    /// The store no longer accepts the credential (revoked, expired,
+    /// uninstalled).
+    #[error("provider rejected the credential")]
+    Unauthorized,
+    /// The request may or may not have been applied.
+    #[error("provider outcome unknown: {0}")]
+    Unknown(String),
+    /// The input to the provider was invalid (a bad shop, a bad signature, a
+    /// body that does not parse). Nothing was sent.
+    #[error("invalid input: {0}")]
+    Invalid(String),
+}
+
+#[async_trait]
+pub trait ConnectorProvider: Send + Sync + 'static {
+    fn kind(&self) -> ProviderKind;
+
+    /// Validates a merchant-entered shop (a `*.myshopify.com` domain, a site
+    /// URL) and returns the canonical form used as the connection key and in
+    /// the credential's associated data. Must never contain `|`.
+    fn normalize_shop(&self, raw: &str) -> Result<String, ProviderError>;
+
+    /// Starts a connection after the seller's connect request. Returns where
+    /// the merchant approves it, or `None` when the install starts from the
+    /// store (see [`Self::verify_launch`]).
+    async fn connect(&self, request: &ConnectRequest) -> Result<ConnectStart, ProviderError>;
+
+    /// Verifies the signature of the store's launch request to the app's App
+    /// URL (`GET /v1/connectors/shopify/apps/{app_key}/launch`) with the app's
+    /// secret, and returns the canonical shop it names. Providers without an
+    /// install-from-store flow keep the default.
+    fn verify_launch(
+        &self,
+        _app: &AppContext,
+        _launch: &CallbackParams,
+    ) -> Result<String, ProviderError> {
+        Err(ProviderError::Invalid(
+            "this provider has no launch flow".into(),
+        ))
+    }
+
+    /// The URL the merchant's browser is sent to after a verified launch that
+    /// matched a pending connect.
+    fn authorize_url(&self, _request: &AuthorizeRequest) -> Result<String, ProviderError> {
+        Err(ProviderError::Invalid(
+            "this provider has no launch flow".into(),
+        ))
+    }
+
+    /// Extracts the single-use `state` value from a callback so the
+    /// framework can find the pending connection. No authentication happens
+    /// here.
+    fn callback_state(&self, callback: &CallbackParams) -> Result<String, ProviderError>;
+
+    /// Finishes a connection from the provider's callback: verifies it and
+    /// obtains the credential. The framework seals and stores the result.
+    async fn complete_connect(
+        &self,
+        request: &CompleteRequest,
+    ) -> Result<ConnectCompleted, ProviderError>;
+
+    /// Revokes the credential at the store, best effort. The framework
+    /// deletes its own copy whatever this returns.
+    async fn disconnect(&self, connection: &ConnectionContext) -> Result<(), ProviderError>;
+
+    /// One page of the store's catalog, normalised.
+    async fn list_catalog(
+        &self,
+        connection: &ConnectionContext,
+        page: Option<&str>,
+    ) -> Result<CatalogPage, ProviderError>;
+
+    /// Creates the store order. Called only after the ledger row is
+    /// `sending`.
+    async fn push_order(
+        &self,
+        connection: &ConnectionContext,
+        order: &OrderPush,
+    ) -> Result<ExternalOrder, ProviderError>;
+
+    /// Looks up an order a push may already have created, by the Pubky order
+    /// id the push stamped on it.
+    async fn find_pushed_order(
+        &self,
+        connection: &ConnectionContext,
+        pubky_order_id: Uuid,
+    ) -> Result<Option<ExternalOrder>, ProviderError>;
+
+    /// Cancels a pushed order. The money never moved through the store, so
+    /// no store refund is made.
+    async fn cancel_order(
+        &self,
+        connection: &ConnectionContext,
+        order: &ExternalOrder,
+        cancel: &CancelOrder,
+    ) -> Result<(), ProviderError>;
+
+    /// Records a refund Pubky made so the store's books match.
+    async fn record_refund(
+        &self,
+        connection: &ConnectionContext,
+        order: &ExternalOrder,
+        refund: &RefundRecord,
+    ) -> Result<(), ProviderError>;
+
+    /// Reads which shop an inbound webhook claims to come from, so the
+    /// framework can find that connection. The claim is not trusted until
+    /// [`Self::verify_webhook`] accepts the request.
+    fn webhook_shop(&self, headers: &WebhookHeaders, body: &[u8]) -> Result<String, ProviderError>;
+
+    /// Verifies the webhook's signature over the raw body, in constant time.
+    fn verify_webhook(
+        &self,
+        context: &WebhookContext,
+        body: &[u8],
+        headers: &WebhookHeaders,
+    ) -> Result<VerifiedWebhook, ProviderError>;
+
+    /// Turns a verified webhook into what it means to Pubky.
+    fn parse_inbound(
+        &self,
+        webhook: &VerifiedWebhook,
+        body: &[u8],
+    ) -> Result<InboundEvent, ProviderError>;
+}
+
+/// The providers a process has configured. Empty when none is configured:
+/// every connector route then answers `provider_unavailable`.
+#[derive(Clone, Default)]
+pub struct ProviderRegistry {
+    providers: BTreeMap<ProviderKind, Arc<dyn ConnectorProvider>>,
+}
+
+impl ProviderRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with(mut self, provider: Arc<dyn ConnectorProvider>) -> Self {
+        self.providers.insert(provider.kind(), provider);
+        self
+    }
+
+    pub fn get(&self, kind: ProviderKind) -> Option<&Arc<dyn ConnectorProvider>> {
+        self.providers.get(&kind)
+    }
+
+    pub fn kinds(&self) -> Vec<ProviderKind> {
+        self.providers.keys().copied().collect()
+    }
+}

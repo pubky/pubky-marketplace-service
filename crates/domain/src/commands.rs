@@ -516,6 +516,39 @@ impl SellerDeliveryEnvelope {
     }
 }
 
+/// A buyer's opt-in to share their delivery address with one seller's
+/// connected store (Shopify, WooCommerce). The address is sealed a second
+/// time, to the connection's recipient key published in the seller's
+/// connector status, with the delivery envelope's construction. The service
+/// stores the bytes and the consent (shop domain, consent copy version, time
+/// of the checkout) on the order, opens the envelope only when it pushes the
+/// order to the store, and deletes it once the store order exists.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SellerConnectorShare {
+    pub seller_pubky: String,
+    /// The store the buyer agreed to share with, as the seller's connector
+    /// status names it.
+    pub shop_domain: String,
+    /// The version of the consent copy the buyer saw.
+    pub consent_version: String,
+    /// The connection's recipient key the envelope is sealed to.
+    pub key_id: String,
+    pub envelope: String,
+}
+
+impl std::fmt::Debug for SellerConnectorShare {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SellerConnectorShare")
+            .field("seller_pubky", &self.seller_pubky)
+            .field("shop_domain", &self.shop_domain)
+            .field("consent_version", &self.consent_version)
+            .field("key_id", &self.key_id)
+            .field("envelope", &"<sealed>")
+            .finish()
+    }
+}
+
 /// Decodes an envelope that already passed [`validate_delivery_envelope`]
 /// into its 2,096 bytes. `None` if the text is not canonical unpadded
 /// base64url of exactly that length.
@@ -589,6 +622,12 @@ pub struct CreateCheckoutPayload {
     /// The service cannot open it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery_address_envelopes: Option<Vec<SellerDeliveryEnvelope>>,
+    /// The buyer's opt-in to share the address with a seller's connected
+    /// store, one entry per opted-in seller. Only with
+    /// `delivery_address_envelopes`: the service never takes a plaintext
+    /// address for a store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connector_shares: Option<Vec<SellerConnectorShare>>,
     /// Where the seller of an email-kind digital line sends the purchase
     /// (digital delivery design §4.3). Required exactly when a line is
     /// email-kind; the handler refuses it otherwise.
@@ -2506,6 +2545,71 @@ fn validate_create_checkout(
             validate_delivery_envelope(&path, &sealed.key_id, &sealed.envelope, &mut issues);
         }
     }
+    if let Some(shares) = &payload.connector_shares {
+        let envelope_sellers: std::collections::HashSet<&str> = payload
+            .delivery_address_envelopes
+            .iter()
+            .flatten()
+            .map(|sealed| sealed.seller_pubky.as_str())
+            .collect();
+        if payload.delivery_address_envelopes.is_none() {
+            issues.push(issue(
+                "payload.connector_shares",
+                "Sharing an address with a store needs the sealed delivery envelopes",
+            ));
+        }
+        if shares.is_empty() || shares.len() > payload.lines.len() {
+            issues.push(issue(
+                "payload.connector_shares",
+                "Expected one entry per opted-in seller",
+            ));
+        }
+        let mut sellers = std::collections::HashSet::new();
+        for (index, share) in shares.iter().enumerate() {
+            let path = format!("payload.connector_shares.{index}");
+            if !is_valid_pubky(&share.seller_pubky) {
+                issues.push(issue(
+                    &format!("{path}.seller_pubky"),
+                    "Expected a 52-character z-base-32 Pubky",
+                ));
+            } else if !sellers.insert(share.seller_pubky.as_str()) {
+                issues.push(issue(
+                    &format!("{path}.seller_pubky"),
+                    "Expected one entry per seller",
+                ));
+            } else if !envelope_sellers.contains(share.seller_pubky.as_str()) {
+                issues.push(issue(
+                    &format!("{path}.seller_pubky"),
+                    "Expected a seller that also has a delivery envelope",
+                ));
+            }
+            if share.shop_domain.is_empty()
+                || share.shop_domain.chars().count() > 255
+                || share
+                    .shop_domain
+                    .chars()
+                    .any(|c| c.is_control() || c == '|')
+            {
+                issues.push(issue(
+                    &format!("{path}.shop_domain"),
+                    "Expected the store domain, 1 to 255 characters",
+                ));
+            }
+            if share.consent_version.is_empty()
+                || share.consent_version.len() > 32
+                || !share
+                    .consent_version
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            {
+                issues.push(issue(
+                    &format!("{path}.consent_version"),
+                    "Expected a consent version of 1 to 32 characters (letters, digits, . _ -)",
+                ));
+            }
+            validate_delivery_envelope(&path, &share.key_id, &share.envelope, &mut issues);
+        }
+    }
     match (
         &mut payload.delivery_address,
         any_shipping,
@@ -3833,6 +3937,69 @@ mod tests {
         let debug = format!("{:?}", command.payload);
         assert!(debug.contains("<sealed>"));
         assert!(!debug.contains(&sealed_envelope()));
+    }
+
+    fn shared_checkout_json() -> Value {
+        let mut raw = sealed_checkout_json();
+        raw["payload"]["connector_shares"] = json!([{
+            "seller_pubky": SELLER_ONE,
+            "shop_domain": "dezentral.myshopify.com",
+            "consent_version": "2026-10-a",
+            "key_id": "fedcba9876543210fedcba9876543210",
+            "envelope": sealed_envelope(),
+        }]);
+        raw
+    }
+
+    #[test]
+    fn checkout_accepts_an_opt_in_to_share_the_address_with_a_store() {
+        let command = parse_command(&shared_checkout_json()).expect("opt-in parses");
+        let CommandPayload::CreateCheckout(payload) = &command.payload else {
+            panic!("expected checkout payload");
+        };
+        let shares = payload.connector_shares.as_ref().expect("shares present");
+        assert_eq!(shares[0].shop_domain, "dezentral.myshopify.com");
+        let debug = format!("{:?}", command.payload);
+        assert!(!debug.contains(&sealed_envelope()));
+    }
+
+    #[test]
+    fn an_opt_in_needs_sealed_envelopes_and_a_well_formed_entry() {
+        let mut plaintext = shared_checkout_json();
+        plaintext["payload"]
+            .as_object_mut()
+            .expect("payload object")
+            .remove("delivery_address_envelopes");
+        plaintext["payload"]["delivery_address"] =
+            checkout_command_json()["payload"]["delivery_address"].clone();
+        assert!(envelope_issue_paths(&plaintext).contains(&"payload.connector_shares".to_string()));
+
+        let mut other_seller = shared_checkout_json();
+        other_seller["payload"]["connector_shares"][0]["seller_pubky"] = json!(SELLER_TWO);
+        assert!(envelope_issue_paths(&other_seller)
+            .contains(&"payload.connector_shares.0.seller_pubky".to_string()));
+
+        for (field, value) in [
+            ("shop_domain", json!("bad|shop")),
+            ("shop_domain", json!("")),
+            ("consent_version", json!("has space")),
+            ("consent_version", json!("")),
+            ("key_id", json!("short")),
+            ("envelope", json!("A")),
+        ] {
+            let mut raw = shared_checkout_json();
+            raw["payload"]["connector_shares"][0][field] = value;
+            assert!(
+                envelope_issue_paths(&raw).contains(&format!("payload.connector_shares.0.{field}")),
+                "{field}"
+            );
+        }
+
+        let mut twice = shared_checkout_json();
+        let entry = twice["payload"]["connector_shares"][0].clone();
+        twice["payload"]["connector_shares"] = json!([entry.clone(), entry]);
+        assert!(envelope_issue_paths(&twice)
+            .contains(&"payload.connector_shares.1.seller_pubky".to_string()));
     }
 
     #[test]
