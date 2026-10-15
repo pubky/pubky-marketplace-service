@@ -25,6 +25,7 @@ use super::outbox;
 use super::provider::{
     CancelOrder, ConnectionContext, ConnectorProvider, ExternalOrder, ProviderError, RefundRecord,
 };
+use super::refund;
 use super::stock::{self, StockOutcome};
 use super::store::{self, AlertKind, ConnectionRow, OpenError};
 use super::{ConnectorRuntime, MAX_CATALOG_PAGES_PER_POLL};
@@ -540,6 +541,19 @@ async fn run_action(
         }
         "refund" => {
             let payload = &action.payload;
+            if let Some(code) = payload
+                .get("blocked_code")
+                .and_then(serde_json::Value::as_str)
+            {
+                return Err(ProviderError::Rejected {
+                    code: code.to_string(),
+                    message: payload
+                        .get("blocked_detail")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("The refund cannot be mirrored as recorded.")
+                        .to_string(),
+                });
+            }
             let text = |name: &str| {
                 payload
                     .get(name)
@@ -547,13 +561,22 @@ async fn run_action(
                     .unwrap_or_default()
                     .to_string()
             };
+            let recorded_total_minor = payload
+                .get("amount_minor")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or_default();
+            let order_currency = text("order_currency");
+            let store = with_timeout(timeout, provider.refunded_total(context, order)).await?;
+            let Some(amount_minor) =
+                refund::amount_to_mirror(recorded_total_minor, &order_currency, &store)?
+            else {
+                return Ok(());
+            };
             let refund = RefundRecord {
                 refund_id: action.action_key.clone(),
                 pubky_order_id: push.pubky_order_id,
-                amount_minor: payload
-                    .get("amount_minor")
-                    .and_then(serde_json::Value::as_i64),
-                amount_unit: text("amount_unit"),
+                amount_minor,
+                recorded_total_minor,
                 transaction_id: payload
                     .get("transaction_id")
                     .and_then(serde_json::Value::as_str)
@@ -562,7 +585,7 @@ async fn run_action(
                     .get("order_total_minor")
                     .and_then(serde_json::Value::as_i64)
                     .unwrap_or_default(),
-                order_currency: text("order_currency"),
+                order_currency,
                 order_exponent: payload
                     .get("order_exponent")
                     .and_then(serde_json::Value::as_i64)
@@ -571,6 +594,10 @@ async fn run_action(
                     .get("full")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false),
+                basis: payload
+                    .get("basis")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
             };
             with_timeout(timeout, provider.record_refund(context, order, &refund)).await
         }
