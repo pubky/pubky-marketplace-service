@@ -20,10 +20,12 @@
 //! not strand a buyer already checking out.
 //!
 //! The record is the seller's own authority, so the gate fails closed: a
-//! homeserver that cannot answer refuses with the retriable
+//! homeserver that cannot answer, or does not answer within
+//! [`CHECK_TIMEOUT`] for the whole command, refuses with the retriable
 //! `UPSTREAM_UNAVAILABLE`. Nothing is written by a refused command.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use marketplace_domain::commands::CommandPayload;
 use marketplace_domain::ErrorCode;
@@ -48,6 +50,11 @@ pub const UNAVAILABLE_MESSAGE: &str =
 /// A checkout carries at most 50 lines; this bounds how many record reads
 /// one command has in flight against the homeserver at once.
 const MAX_CONCURRENT_RECORD_READS: usize = 8;
+
+/// The longest one command waits for all of its record reads, so a
+/// homeserver that accepts connections and never answers cannot hold a
+/// checkout for several per-request timeouts in a row.
+pub const CHECK_TIMEOUT: Duration = Duration::from_secs(12);
 
 /// What the seller's current record says about selling the listing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,7 +158,7 @@ fn unavailable() -> CommandFailure {
     )
 }
 
-/// Reads every listing's record and returns the refusal, if any. A
+/// Reads every distinct listing's record and returns the refusal, if any. A
 /// refusing record wins over an unreachable one (it is definitive), and
 /// among those the first listing in `listings` order decides the reason.
 pub async fn check(
@@ -159,10 +166,24 @@ pub async fn check(
     listings: &[(String, String)],
     gate: Gate,
 ) -> Option<CommandFailure> {
-    if listings.is_empty() {
+    let mut distinct: Vec<(String, String)> = Vec::with_capacity(listings.len());
+    for listing in listings {
+        if !distinct.contains(listing) {
+            distinct.push(listing.clone());
+        }
+    }
+    if distinct.is_empty() {
         return None;
     }
-    let lifecycles = read_lifecycles(homeserver, listings).await;
+    let Ok(lifecycles) =
+        tokio::time::timeout(CHECK_TIMEOUT, read_lifecycles(homeserver, &distinct)).await
+    else {
+        tracing::warn!(
+            listings = distinct.len(),
+            "listing lifecycle record reads timed out"
+        );
+        return Some(unavailable());
+    };
     if let Some(reason) = lifecycles.iter().find_map(|lifecycle| match lifecycle {
         ListingLifecycle::Inactive(reason) if gate.refuses(reason) => Some(*reason),
         _ => None,
@@ -175,14 +196,19 @@ pub async fn check(
     None
 }
 
-/// Whether one listing's record says the seller removed it; `None` when the
-/// homeserver gave no usable answer.
+/// Whether one listing's record says the seller removed it, within
+/// [`CHECK_TIMEOUT`]; `None` when the homeserver gave no usable answer.
 pub async fn is_removed(
     homeserver: &dyn HomeserverListingClient,
     seller_pubky: &str,
     listing_id: &str,
 ) -> Option<bool> {
-    let outcome = homeserver.fetch_listing(seller_pubky, listing_id).await;
+    let outcome = tokio::time::timeout(
+        CHECK_TIMEOUT,
+        homeserver.fetch_listing(seller_pubky, listing_id),
+    )
+    .await
+    .ok()?;
     match lifecycle_of_fetch(&outcome) {
         ListingLifecycle::Unavailable => None,
         lifecycle => Some(lifecycle == ListingLifecycle::Inactive(REASON_REMOVED)),
@@ -426,5 +452,58 @@ mod tests {
             .await
             .expect("an outage refuses a continuation too");
         assert_eq!(failure.code(), ErrorCode::UpstreamUnavailable);
+    }
+
+    #[tokio::test]
+    async fn each_listing_is_read_once() {
+        let homeserver = Arc::new(Records::new(
+            [("a", found("active")), ("b", found("active"))]
+                .into_iter()
+                .map(|(id, outcome)| (id.to_string(), outcome))
+                .collect(),
+        ));
+        let cart = listings(&["a", "b", "a", "a", "b"]);
+        assert!(check(homeserver.clone(), &cart, Gate::OnSale)
+            .await
+            .is_none());
+        assert_eq!(homeserver.reads.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_homeserver_is_cut_off_by_the_overall_timeout() {
+        let homeserver = Arc::new(Records {
+            records: [("a".to_string(), found("active"))].into_iter().collect(),
+            hung: vec!["b".to_string()],
+            ..Records::default()
+        });
+        let started = tokio::time::Instant::now();
+        let failure = check(homeserver, &listings(&["a", "b"]), Gate::OnSale)
+            .await
+            .expect("a hung read refuses");
+        assert_eq!(failure.code(), ErrorCode::UpstreamUnavailable);
+        assert_eq!(failure.http_status(), 503);
+        assert_eq!(started.elapsed(), CHECK_TIMEOUT);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_removal_read_that_hangs_is_unknown() {
+        let homeserver = Records {
+            hung: vec!["a".to_string()],
+            ..Records::default()
+        };
+        assert_eq!(is_removed(&homeserver, "seller", "a").await, None);
+        let homeserver = records(&[("a", found("removed")), ("b", found("paused"))]);
+        assert_eq!(
+            is_removed(homeserver.as_ref(), "seller", "a").await,
+            Some(true)
+        );
+        assert_eq!(
+            is_removed(homeserver.as_ref(), "seller", "b").await,
+            Some(false)
+        );
+        assert_eq!(
+            is_removed(homeserver.as_ref(), "seller", "gone").await,
+            Some(true)
+        );
     }
 }
