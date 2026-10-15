@@ -154,13 +154,14 @@ additive. Orders and payments bound to Stripe are not touched.
 binary from before 0059 ignores the new columns and its inserts take their
 defaults, so a rolling replacement is safe.
 
-0072 (grant sessions) creates `grant_session_challenges` with its primary key
-and a plain index on `used_at` (a new, empty table), adds the nullable
-`auth_sessions.source_grant_id` and `source_client_id` columns, and widens the
-`automation_rate_limits` endpoint-class CHECK with `grant_session.mint` as
-`NOT VALID`. It builds no index on an existing table and sets `lock_timeout`
-like 0050. A binary from before 0072 never reads the new table and its session
-inserts leave the new columns NULL.
+0072 (grant sessions) creates `grant_session_challenges` with its primary key,
+two CHECKs, and plain indexes on `expires_at` and on `pubky` for unused rows
+(a new, empty table), adds the nullable `auth_sessions.source_grant_id` and
+`source_client_id` columns, and widens the `automation_rate_limits`
+endpoint-class CHECK with `grant_session.mint` as `NOT VALID`. It builds no
+index on an existing table and sets `lock_timeout` like 0050. A binary from
+before 0072 never reads the new table and its session inserts leave the new
+columns NULL.
 
 ## Numbers claimed by open pull requests
 

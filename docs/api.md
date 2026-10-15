@@ -89,7 +89,8 @@ and write. "Automation" means the inventory capability plus the
 | GET | `/ready` | [Operational endpoints](#operational-endpoints) |
 | POST | `/v1/auth/sessions` | Exchange an AuthToken for a bearer. |
 | GET | `/v1/auth/sessions` | Needs a bearer with the inventory capability (checked in the handler); consumes the `session.admin` rate limit. |
-| POST | `/v1/auth/grant-sessions` | Mint a bearer from a Shop sign-in grant and a custom proof. `404 grant_session_unavailable` unless `MARKETPLACE_GRANT_SESSION_ENABLED`. See [Grant sessions](#grant-sessions). |
+| POST | `/v1/auth/grant-session-challenges` | Issue a short-lived challenge for a grant session. `404 grant_session_unavailable` unless `MARKETPLACE_GRANT_SESSION_ENABLED`. See [Grant sessions](#grant-sessions). |
+| POST | `/v1/auth/grant-sessions` | Mint a bearer from a Shop sign-in grant, an issued challenge and a custom proof. `404 grant_session_unavailable` unless `MARKETPLACE_GRANT_SESSION_ENABLED`. See [Grant sessions](#grant-sessions). |
 | POST | `/v1/auth/grant-flows` | Grant-flow (Shop BFF). Only mounted when `MARKETPLACE_GRANT_FLOW_ENABLED` is set. |
 | GET | `/v1/auth/grant-flows/{flow_id}` | Grant-flow (Shop BFF). |
 | POST | `/v1/auth/grant-flows/{flow_id}/cancel` | Grant-flow (Shop BFF). |
@@ -379,7 +380,7 @@ A token bucket per `(actor pubky, endpoint class)`, stored in
   | Class | Matches |
   | --- | --- |
   | `session.admin` | Paths starting with `/v1/auth/sessions` (including `GET /v1/auth/sessions`, which spends the token in its handler) |
-  | `grant_session.mint` | `POST /v1/auth/grant-sessions`, keyed by the grant's pubky after the proof verifies |
+  | `grant_session.mint` | `POST /v1/auth/grant-session-challenges`, keyed by the grant's pubky after the proof verifies (a mint needs an issued challenge, so this bounds mints too) |
   | `listing.sync_many` | `/v1/listings/sync-many` |
   | `webhook.admin` | `/v1/webhooks...` |
   | `export.orders` | Paths ending in `/orders` |
@@ -1010,27 +1011,43 @@ seller already approved when signing in to the Shop, so no second signer
 approval is needed. The browser holds the grant's client key; the root key
 never leaves the signer.
 
-The browser first writes a proof document with its live homeserver session,
-then signs a pubky custom proof (`session.grant.createCustomPop(data)`) and
-posts the result:
-
-1. `PUT /pub/pubky.app/marketplace/v1/session-proofs/{challenge_id}` on its own
-   homeserver, body exactly
+1. The browser signs a pubky custom proof (`session.grant.createCustomPop`)
+   over exactly `{"aud": <service origin>, "purpose": "marketplace-service/grant-session-challenge/v1"}`
+   and posts `{"grant": <grant JWS>, "pop": <proof JWS>}` to
+   `POST /v1/auth/grant-session-challenges`. After the same proof checks as a
+   mint (below, minus the challenge), the service stores a random
+   `challenge_id` for the grant's pubky and answers
+   `201 {"challenge_id", "expires_at"}`. A challenge lives
+   `MARKETPLACE_GRANT_SESSION_MAX_PROOF_AGE_SECONDS`; a pubky holds at most 5
+   unused, unexpired challenges (`429 too_many_challenges` beyond that).
+2. With its live homeserver session it writes
+   `PUT /pub/pubky.app/marketplace/v1/session-proofs/{challenge_id}`, body
+   exactly
    `{"aud": <service origin>, "challenge_id": <uuid>, "domain": "marketplace-service/grant-session-proof/v1", "pubky": <z32>}`.
-   `challenge_id` is a fresh random UUID in canonical lowercase form.
-2. `createCustomPop({"aud": <service origin>, "challenge_id": <uuid>, "purpose": "marketplace-service/grant-session/v1"})`.
-3. `POST /v1/auth/grant-sessions` with `{"grant": <grant JWS>, "pop": <proof JWS>}`.
+3. It signs `{"aud": <service origin>, "challenge_id": <uuid>, "purpose": "marketplace-service/grant-session/v1"}`
+   and posts `{"grant", "pop"}` to `POST /v1/auth/grant-sessions`.
 
-The service verifies both signatures offline (`verify_custom_grant_pop`,
-30 s clock skew), then requires: the signed data to be exactly those three
-fields with `aud` equal to the origin of `PUBLIC_SERVICE_ORIGIN`; the proof to
-be at most `MARKETPLACE_GRANT_SESSION_MAX_PROOF_AGE_SECONDS` old; the grant's
-`client_id` to be listed in `MARKETPLACE_GRANT_SESSION_CLIENT_IDS`; the grant
-to cover `/pub/pubky.app/marketplace-service/v1/` with read and write; and the
-proof document, read through `HOMESERVER_URL` with `pubky-host` set to the
-grant's issuer, to equal the expected body. Only a live homeserver session can
-write that document, so a grant revoked at the homeserver cannot mint. The
-challenge id is then burned and the session inserted in one transaction.
+For both requests the service verifies the signatures offline
+(`verify_custom_grant_pop`, 30 s clock skew) and requires: the signed data to
+be exactly the fields above, with `aud` equal to the origin of
+`PUBLIC_SERVICE_ORIGIN`; the proof to be at most
+`MARKETPLACE_GRANT_SESSION_MAX_PROOF_AGE_SECONDS` old; the grant's
+`client_id` to be listed in `MARKETPLACE_GRANT_SESSION_CLIENT_IDS`; and the
+grant to cover `/pub/pubky.app/marketplace-service/v1/` with read and write.
+A mint further requires the challenge to have been issued to the grant's
+pubky, unused and unexpired, and the proof document, read through
+`HOMESERVER_URL` with `pubky-host` set to the grant's issuer (body capped at
+8 KB), to equal the expected body. The challenge is then burned and the
+session inserted in one transaction.
+
+Because the challenge exists only from step 1, a document cannot be staged
+while the grant is live and used after it is revoked, beyond one challenge
+lifetime. Only a live homeserver session can write the document, so a revoked
+grant cannot mint by itself. Two limits remain: a document written by another
+live session of the same user also passes, and revoking a grant does not
+revoke sessions already minted from it; they live until they expire. Sellers
+whose homeserver is not `HOMESERVER_URL` cannot pass the document read and
+keep the approval flow.
 
 The session's capabilities are the grant's narrowed to the marketplace scopes:
 `/pub/pubky.app/marketplace-service/v1/:rw`, plus `/priv/pubky.app/:rw` when the
@@ -1041,21 +1058,25 @@ The `201` body is the same as `POST /v1/auth/sessions`.
 | Status | `error` | Meaning |
 | --- | --- | --- |
 | 400 | `invalid_request` | Body is not `{"grant", "pop"}` JSON |
-| 401 | `grant_session_invalid` | Signatures, binding, audience, purpose, challenge id or proof age |
+| 401 | `grant_session_invalid` | Signatures, binding, audience, purpose, challenge id format or proof age |
 | 401 | `grant_expired` | The grant expired or is not yet valid |
-| 401 | `homeserver_proof_invalid` | No proof document, or a different one |
-| 401 | `grant_session_replayed` | The challenge id was already used |
+| 401 | `grant_session_challenge_invalid` | Mint only: the challenge was not issued to this pubky, expired, or was already used |
+| 401 | `homeserver_proof_invalid` | Mint only: no proof document, or a different one |
 | 403 | `grant_client_not_allowed` | The grant's `client_id` is not listed |
 | 403 | `capability_required` | The grant does not cover the marketplace scope |
 | 404 | `grant_session_unavailable` | The feature is off |
-| 429 | `retry_later` | `grant_session.mint` rate limit, with `Retry-After` |
-| 503 | `homeserver_unavailable` | The homeserver could not be read; retry with a new proof |
+| 413 | `invalid_request` | Body over 16 KB (larger bodies are cut off by the router with a plain-text 413) |
+| 429 | `retry_later` | Challenge only: `grant_session.mint` rate limit, with `Retry-After` |
+| 429 | `too_many_challenges` | Challenge only: 5 live challenges already |
+| 500 | `session_unavailable` | Database failure |
+| 503 | `homeserver_unavailable` | Mint only: the homeserver could not be read; nothing was burned, so the same proof can be retried while young |
 
 Configuration: `MARKETPLACE_GRANT_SESSION_ENABLED` (`false`);
 `MARKETPLACE_GRANT_SESSION_CLIENT_IDS` (comma-separated grant client ids,
 required when enabled); `MARKETPLACE_GRANT_SESSION_MAX_PROOF_AGE_SECONDS`
-(120, 1..600). `PUBLIC_SERVICE_ORIGIN` is required when enabled. The service
-refuses to start if an enabled configuration is incomplete.
+(120, 1..600; also the challenge lifetime). `PUBLIC_SERVICE_ORIGIN` is
+required when enabled. The service refuses to start if an enabled
+configuration is incomplete.
 
 ## OpenAPI
 
