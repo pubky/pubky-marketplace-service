@@ -243,7 +243,7 @@ async fn an_opted_in_address_reaches_the_store_once_and_is_then_deleted(pool: Pg
     assert!(!orders.to_string().contains("connector"));
 
     pay(&app, &buyer, &order).await;
-    worker::run_pass(&app.state).await.expect("pass");
+    settled_pass(&app).await;
 
     let pushed = store
         .last_order_push
@@ -294,7 +294,7 @@ async fn the_envelope_survives_a_failed_push_and_goes_with_the_one_that_succeeds
     pay(&app, &buyer, &order).await;
 
     store.script(PushScript::Rejected("validation"));
-    worker::run_pass(&app.state).await.expect("pass");
+    settled_pass(&app).await;
     assert_eq!(
         push_state(&app.pool, &order.order_id).await.0,
         "quarantined"
@@ -323,7 +323,7 @@ async fn the_envelope_survives_a_failed_push_and_goes_with_the_one_that_succeeds
     )
     .await;
     assert_eq!(status, StatusCode::ACCEPTED);
-    worker::run_pass(&app.state).await.expect("pass");
+    settled_pass(&app).await;
     assert_eq!(push_state(&app.pool, &order.order_id).await.0, "created");
     let retried = store
         .last_order_push
@@ -350,7 +350,7 @@ async fn without_an_opt_in_no_address_is_stored_or_sent(pool: PgPool) {
         (None, None, false, false, None)
     );
     pay(&app, &buyer, &order).await;
-    worker::run_pass(&app.state).await.expect("pass");
+    settled_pass(&app).await;
     let pushed = store
         .last_order_push
         .lock()
@@ -461,7 +461,7 @@ async fn an_envelope_bound_to_another_buyer_does_not_open_and_the_order_still_sh
     assert_eq!(status, StatusCode::OK, "{body}");
     let order = order.expect("order");
     pay(&app, &buyer, &order).await;
-    worker::run_pass(&app.state).await.expect("pass");
+    settled_pass(&app).await;
     assert_eq!(push_state(&app.pool, &order.order_id).await.0, "created");
     let pushed = store
         .last_order_push
@@ -535,7 +535,7 @@ async fn the_address_is_never_logged_or_projected_to_the_provider_debug_output(p
     let (_, _, order) = checkout(&app, &buyer, command).await;
     let order = order.expect("order");
     pay(&app, &buyer, &order).await;
-    worker::run_pass(&app.state).await.expect("pass");
+    settled_pass(&app).await;
     let pushed = store
         .last_order_push
         .lock()
@@ -585,7 +585,7 @@ async fn two_stores_one_envelope(pool: PgPool, chosen_first: bool) {
     assert_eq!(status, StatusCode::OK, "{body}");
     let order = order.expect("order");
     pay(&app, &buyer, &order).await;
-    worker::consume_events(&app.state).await.expect("consume");
+    settled_consume(&app).await;
     assert_eq!(
         common::count(&app.pool, "SELECT COUNT(*) FROM connector_order_push").await,
         2

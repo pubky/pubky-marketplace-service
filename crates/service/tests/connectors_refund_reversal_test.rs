@@ -8,7 +8,6 @@ mod common;
 use axum::http::StatusCode;
 use common::connector_provider::*;
 use common::*;
-use marketplace_service::connectors::worker;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 
@@ -113,7 +112,7 @@ async fn paid_paypal_order_in_a_connected_store(pool: PgPool) -> World {
     assert_eq!(status, StatusCode::OK, "bind failed: {body}");
     map_listing(&app, &seller, connection, "boots_01", "prod-1", "var-1").await;
     post_ipn(&app, &fixture("completed.ipn", &order.order_id)).await;
-    worker::run_pass(&app.state).await.expect("pass");
+    settled_pass(&app).await;
     let state: String = sqlx::query_scalar(
         "SELECT state FROM connector_order_push WHERE pubky_order_id = $1::uuid",
     )
@@ -138,13 +137,11 @@ impl World {
     }
 
     async fn pass(&self) {
-        worker::run_pass(&self.app.state).await.expect("pass");
+        settled_pass(&self.app).await;
     }
 
     async fn consume(&self) {
-        worker::consume_events(&self.app.state)
-            .await
-            .expect("consume");
+        settled_consume(&self.app).await;
     }
 
     async fn external_refund(&self) -> Value {
