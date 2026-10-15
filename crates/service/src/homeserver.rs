@@ -522,6 +522,19 @@ pub trait HomeserverListingClient: Send + Sync + 'static {
         Box::pin(async { HomeserverFetchOutcome::NotFound })
     }
 
+    /// Fetches the grant-session proof document the Shop wrote at
+    /// [`crate::grant_session::PROOF_DOCUMENTS_PATH`]. Only a live session of
+    /// `pubky` can have written it. The default answers `Unavailable`, so a
+    /// client without it refuses every grant session (fail closed).
+    fn fetch_grant_session_proof<'a>(
+        &'a self,
+        pubky: &'a str,
+        challenge_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
+        let _ = (pubky, challenge_id);
+        Box::pin(async { HomeserverFetchOutcome::Unavailable })
+    }
+
     /// Fetches the seller's public content-lock document. This mirrors
     /// `pubky/locks@ba49a777:locks-sdk/src/discovery.rs:13-52`: the request
     /// is addressed through the creator's homeserver identity and callers
@@ -691,6 +704,23 @@ fn pubky_host_prefix(seller_pubky: &str) -> &str {
 }
 
 impl HomeserverListingClient for HttpHomeserverClient {
+    fn fetch_grant_session_proof<'a>(
+        &'a self,
+        pubky: &'a str,
+        challenge_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
+        Box::pin(async move {
+            self.fetch_inner_bytes(
+                pubky,
+                &format!(
+                    "{}{challenge_id}",
+                    crate::grant_session::PROOF_DOCUMENTS_PATH
+                ),
+            )
+            .await
+        })
+    }
+
     fn fetch_listing<'a>(
         &'a self,
         seller_pubky: &'a str,
