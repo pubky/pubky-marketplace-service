@@ -243,6 +243,11 @@ async fn on_refund_recorded(
         .as_ref()
         .and_then(|refund| refund.get("amount_minor"))
         .and_then(serde_json::Value::as_i64);
+    // The refund is read as the order holds it now. A refund reversed since
+    // the event left none, and there is nothing to mirror.
+    let Some(recorded) = recorded else {
+        return Ok(());
+    };
     let transaction_id = external_refund
         .as_ref()
         .and_then(|refund| refund.get("transaction_id"))
