@@ -386,7 +386,10 @@ fn mapping_json(mapping: &MappingRow) -> Value {
 /// their own yet). The Shop links `command` on `order_id`; nothing here is
 /// ever done automatically.
 fn alert_action(alert: &AlertRow) -> Option<Value> {
-    if !matches!(alert.kind.as_str(), "merchant_cancelled" | "merchant_refunded") {
+    if !matches!(
+        alert.kind.as_str(),
+        "merchant_cancelled" | "merchant_refunded"
+    ) {
         return None;
     }
     let order_id = alert.pubky_order_id?;

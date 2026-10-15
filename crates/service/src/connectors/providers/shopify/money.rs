@@ -42,8 +42,7 @@ pub fn decimal_to_minor(text: &str, exponent: i32) -> Option<i64> {
     if whole.is_empty() && fraction.is_empty() {
         return None;
     }
-    if !whole.bytes().all(|b| b.is_ascii_digit()) || !fraction.bytes().all(|b| b.is_ascii_digit())
-    {
+    if !whole.bytes().all(|b| b.is_ascii_digit()) || !fraction.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     let exponent = exponent.max(0) as usize;

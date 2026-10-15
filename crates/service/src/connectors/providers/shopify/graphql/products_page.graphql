@@ -16,12 +16,12 @@ query ProductsPage($first: Int!, $after: String) {
         name
         values
       }
-      images(first: 10) {
+      images(first: 5) {
         nodes {
           url
         }
       }
-      variants(first: 50) {
+      variants(first: 25) {
         pageInfo {
           hasNextPage
           endCursor

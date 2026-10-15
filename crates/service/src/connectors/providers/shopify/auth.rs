@@ -37,7 +37,10 @@ pub fn normalize_shop(raw: &str) -> Result<String, ProviderError> {
     }
     let host_and_path = text.trim_end_matches('/').to_string();
     let handle = if let Some(rest) = host_and_path.strip_prefix("admin.shopify.com/store/") {
-        rest.split(['/', '?', '#']).next().unwrap_or_default().to_string()
+        rest.split(['/', '?', '#'])
+            .next()
+            .unwrap_or_default()
+            .to_string()
     } else {
         let host = host_and_path
             .split(['/', '?', '#'])
@@ -132,8 +135,14 @@ mod tests {
     fn shop_addresses_are_myshopify_hosts_only() {
         for (raw, canonical) in [
             ("Dezentral.myshopify.com", "dezentral.myshopify.com"),
-            ("  https://dezentral.myshopify.com/admin ", "dezentral.myshopify.com"),
-            ("https://admin.shopify.com/store/dezentral/apps", "dezentral.myshopify.com"),
+            (
+                "  https://dezentral.myshopify.com/admin ",
+                "dezentral.myshopify.com",
+            ),
+            (
+                "https://admin.shopify.com/store/dezentral/apps",
+                "dezentral.myshopify.com",
+            ),
             ("shop-1.myshopify.com/", "shop-1.myshopify.com"),
         ] {
             assert_eq!(normalize_shop(raw).expect(raw), canonical);
@@ -168,11 +177,20 @@ mod tests {
 
     #[test]
     fn a_launch_signature_verifies_only_under_its_secret_and_unaltered() {
-        let query = signed("secret", "shop=a.myshopify.com&timestamp=1700000000&host=YWJj");
+        let query = signed(
+            "secret",
+            "shop=a.myshopify.com&timestamp=1700000000&host=YWJj",
+        );
         assert!(verify_query_hmac(b"secret", &query));
         assert!(!verify_query_hmac(b"other", &query));
-        assert!(!verify_query_hmac(b"secret", &query.replace("a.myshopify", "b.myshopify")));
-        assert!(!verify_query_hmac(b"secret", "shop=a.myshopify.com&timestamp=1"));
+        assert!(!verify_query_hmac(
+            b"secret",
+            &query.replace("a.myshopify", "b.myshopify")
+        ));
+        assert!(!verify_query_hmac(
+            b"secret",
+            "shop=a.myshopify.com&timestamp=1"
+        ));
         assert!(!verify_query_hmac(b"secret", "shop=a&hmac=not-hex"));
     }
 

@@ -126,10 +126,10 @@ pub fn runtime_from_env(
 
 /// The providers this build knows, configured from the environment. This is
 /// the one place a provider registers itself: the service and the worker both
-/// call it, so they always serve the same set. No provider is built in yet, so
-/// every connector route answers `provider_unavailable` until one is added.
+/// call it, so they always serve the same set. Shopify needs no deployment
+/// configuration: each connection carries its own app credentials.
 pub fn providers_from_env() -> anyhow::Result<ProviderRegistry> {
-    Ok(ProviderRegistry::new())
+    Ok(ProviderRegistry::new().with(Arc::new(providers::shopify::ShopifyProvider::new())))
 }
 
 /// A strictly valid version 8 UUID derived from a seed: the same seed gives
