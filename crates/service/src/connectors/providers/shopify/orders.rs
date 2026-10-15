@@ -45,6 +45,7 @@ use super::money::{decimal_to_minor, exponent, minor_to_decimal};
 use crate::connectors::deterministic_uuid;
 use crate::connectors::provider::{
     CancelOrder, ExternalOrder, OrderPush, ProviderError, RefundRecord, ShippingAddress,
+    StoreRefundTotals,
 };
 
 pub const TAG_PUBKY: &str = "pubky";
@@ -459,32 +460,6 @@ async fn order_is_cancelled(
     }
 }
 
-/// The recorded refund total, in the order currency's minor units, that the
-/// store should show refunded. `refund.amount_minor` is the Pubky books'
-/// refunded total in the order currency on every rail; a record in any other
-/// unit, or with no amount, cannot be mirrored.
-pub fn refund_target_minor(refund: &RefundRecord) -> Result<i64, ProviderError> {
-    let Some(amount) = refund.amount_minor.filter(|amount| *amount > 0) else {
-        return Err(rejected(
-            "refund_amount_missing",
-            "The recorded refund has no amount to mirror.",
-        ));
-    };
-    if !refund
-        .amount_unit
-        .eq_ignore_ascii_case(&refund.order_currency)
-    {
-        return Err(rejected(
-            "refund_amount_unconvertible",
-            format!(
-                "The refund is recorded in {} and the order is in {}; record it in the store by hand.",
-                refund.amount_unit, refund.order_currency
-            ),
-        ));
-    }
-    Ok(amount)
-}
-
 pub fn refund_key(refund_id: &str, delta_minor: i64) -> String {
     deterministic_uuid(&format!("shopify-refund|{refund_id}|{delta_minor}")).to_string()
 }
@@ -532,64 +507,19 @@ fn refund_note(refund: &RefundRecord, delta_minor: i64, currency: &str) -> Strin
     )
 }
 
-pub async fn refund(
+/// What the store order was paid and has already refunded, read fresh from the
+/// store (a refund the merchant made there counts). The framework works out
+/// from this how much of a Pubky refund is still to mirror.
+pub async fn refunded_total(
     client: &Client,
     shop: &str,
     token: &str,
     order: &ExternalOrder,
-    refund: &RefundRecord,
-) -> Result<(), ProviderError> {
-    let target = refund_target_minor(refund)?;
-    let current = client
-        .execute(
-            shop,
-            token,
-            documents::ORDER_TRANSACTIONS,
-            json!({ "id": order.id }),
-        )
-        .await?;
-    let found = current
-        .get("order")
-        .filter(|found| !found.is_null())
-        .ok_or_else(|| rejected("order_not_found", "The store has no such order."))?;
-    let currency = found
-        .get("currencyCode")
-        .and_then(Value::as_str)
-        .ok_or_else(|| malformed("order"))?
-        .to_string();
-    if !currency.eq_ignore_ascii_case(&refund.order_currency) {
-        return Err(rejected(
-            "currency_mismatch",
-            format!(
-                "The store order is in {currency} but the Pubky refund is in {}; record it in the store by hand.",
-                refund.order_currency
-            ),
-        ));
-    }
+) -> Result<StoreRefundTotals, ProviderError> {
+    let found = fetch_order(client, shop, token, order).await?;
+    let currency = order_currency(&found)?;
     let exp = exponent(&currency);
-    let sale = found
-        .get("transactions")
-        .and_then(Value::as_array)
-        .and_then(|list| {
-            list.iter().find(|transaction| {
-                transaction.get("kind").and_then(Value::as_str) == Some("SALE")
-                    && transaction.get("status").and_then(Value::as_str) == Some("SUCCESS")
-            })
-        })
-        .ok_or_else(|| {
-            rejected(
-                "no_sale_transaction",
-                "The store order has no successful payment to refund against.",
-            )
-        })?;
-    let sale_id = sale
-        .get("id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| malformed("transaction"))?;
-    let gateway = sale
-        .get("gateway")
-        .and_then(Value::as_str)
-        .unwrap_or("Pubky");
+    let sale = successful_sale(&found)?;
     let paid = sale
         .pointer("/amountSet/shopMoney/amount")
         .and_then(Value::as_str)
@@ -610,18 +540,95 @@ pub async fn refund(
         .and_then(Value::as_str)
         .and_then(|amount| decimal_to_minor(amount, exp))
         .ok_or_else(|| malformed("order refunds"))?;
-    if target > paid {
+    Ok(StoreRefundTotals {
+        currency,
+        paid_minor: paid,
+        refunded_minor: refunded,
+    })
+}
+
+async fn fetch_order(
+    client: &Client,
+    shop: &str,
+    token: &str,
+    order: &ExternalOrder,
+) -> Result<Value, ProviderError> {
+    let current = client
+        .execute(
+            shop,
+            token,
+            documents::ORDER_TRANSACTIONS,
+            json!({ "id": order.id }),
+        )
+        .await?;
+    current
+        .get("order")
+        .filter(|found| !found.is_null())
+        .cloned()
+        .ok_or_else(|| rejected("order_not_found", "The store has no such order."))
+}
+
+fn order_currency(found: &Value) -> Result<String, ProviderError> {
+    found
+        .get("currencyCode")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| malformed("order"))
+}
+
+fn successful_sale(found: &Value) -> Result<&Value, ProviderError> {
+    found
+        .get("transactions")
+        .and_then(Value::as_array)
+        .and_then(|list| {
+            list.iter().find(|transaction| {
+                transaction.get("kind").and_then(Value::as_str) == Some("SALE")
+                    && transaction.get("status").and_then(Value::as_str) == Some("SUCCESS")
+            })
+        })
+        .ok_or_else(|| {
+            rejected(
+                "no_sale_transaction",
+                "The store order has no successful payment to refund against.",
+            )
+        })
+}
+
+/// Records the amount still to mirror (`refund.amount_minor`, decided by the
+/// framework from [`refunded_total`]) as a manual refund against the order's
+/// sale. The store refuses a refund above what is refundable, so a concurrent
+/// refund cannot push it over the payment.
+pub async fn refund(
+    client: &Client,
+    shop: &str,
+    token: &str,
+    order: &ExternalOrder,
+    refund: &RefundRecord,
+) -> Result<(), ProviderError> {
+    let found = fetch_order(client, shop, token, order).await?;
+    let currency = order_currency(&found)?;
+    if !currency.eq_ignore_ascii_case(&refund.order_currency) {
         return Err(rejected(
-            "refund_exceeds_payment",
-            "The refund is larger than the payment recorded on the store order.",
+            "currency_mismatch",
+            format!(
+                "The store order is in {currency} but the Pubky refund is in {}; record it in the store by hand.",
+                refund.order_currency
+            ),
         ));
     }
-    let delta = target - refunded;
-    if delta <= 0 {
-        return Ok(());
-    }
+    let exp = exponent(&currency);
+    let sale = successful_sale(&found)?;
+    let sale_id = sale
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| malformed("transaction"))?;
+    let gateway = sale
+        .get("gateway")
+        .and_then(Value::as_str)
+        .unwrap_or("Pubky");
+    let amount = refund.amount_minor;
     let document =
-        documents::REFUND_CREATE.replace("{{KEY}}", &refund_key(&refund.refund_id, delta));
+        documents::REFUND_CREATE.replace("{{KEY}}", &refund_key(&refund.refund_id, amount));
     let data = client
         .execute(
             shop,
@@ -630,13 +637,13 @@ pub async fn refund(
             json!({ "input": {
                 "orderId": order.id,
                 "notify": false,
-                "note": refund_note(refund, delta, &currency),
+                "note": refund_note(refund, amount, &currency),
                 "transactions": [{
                     "orderId": order.id,
                     "parentId": sale_id,
                     "gateway": gateway,
                     "kind": "REFUND",
-                    "amount": minor_to_decimal(delta, exp),
+                    "amount": minor_to_decimal(amount, exp),
                 }],
             }}),
         )
@@ -774,42 +781,6 @@ mod tests {
             vars["order"]["transactions"][0]["amountSet"]["shopMoney"]["amount"],
             "10700"
         );
-    }
-
-    fn refund_record(amount: Option<i64>, unit: &str) -> RefundRecord {
-        RefundRecord {
-            refund_id: "refund-1".into(),
-            pubky_order_id: Uuid::nil(),
-            amount_minor: amount,
-            amount_unit: unit.into(),
-            transaction_id: None,
-            order_total_minor: 10700,
-            order_currency: "USD".into(),
-            order_exponent: 2,
-            full: false,
-            basis: None,
-        }
-    }
-
-    #[test]
-    fn a_refund_target_is_the_recorded_total_in_the_order_currency_or_refused() {
-        assert_eq!(
-            refund_target_minor(&refund_record(Some(2500), "usd")).expect("fiat"),
-            2500
-        );
-        for (record, code) in [
-            (
-                refund_record(Some(2500), "sat"),
-                "refund_amount_unconvertible",
-            ),
-            (refund_record(None, "usd"), "refund_amount_missing"),
-            (refund_record(Some(0), "usd"), "refund_amount_missing"),
-        ] {
-            assert!(matches!(
-                refund_target_minor(&record),
-                Err(ProviderError::Rejected { code: found, .. }) if found == code
-            ));
-        }
     }
 
     #[test]

@@ -35,8 +35,8 @@ use crate::connectors::provider::{
     AppContext, AppKind, AuthorizeRequest, CallbackParams, CancelOrder, CatalogPage,
     CompleteRequest, ConnectCompleted, ConnectRequest, ConnectStart, ConnectionCheck,
     ConnectionContext, ConnectorProvider, CredentialSecret, ExternalOrder, InboundEvent, OrderPush,
-    ProviderError, ProviderKind, RefundRecord, ResolvedStock, VerifiedWebhook, WebhookContext,
-    WebhookHeaders,
+    ProviderError, ProviderKind, RefundRecord, ResolvedStock, StoreRefundTotals, VerifiedWebhook,
+    WebhookContext, WebhookHeaders,
 };
 use client::{Client, Origin};
 
@@ -402,6 +402,14 @@ impl ConnectorProvider for ShopifyProvider {
             cancel,
         )
         .await
+    }
+
+    async fn refunded_total(
+        &self,
+        connection: &ConnectionContext,
+        order: &ExternalOrder,
+    ) -> Result<StoreRefundTotals, ProviderError> {
+        orders::refunded_total(&self.client, &connection.shop, token(connection)?, order).await
     }
 
     async fn record_refund(

@@ -35,6 +35,11 @@ fn product(id: &str, variant: &str, stock: Option<i64>) -> CatalogProduct {
             values: vec!["42".to_string()],
         }],
         image_urls: vec![format!("https://cdn.{SHOP}/{id}.jpg")],
+        categories: vec!["Boots".to_string()],
+        attributes: vec![CatalogOption {
+            name: "Material".to_string(),
+            values: vec!["Leather".to_string()],
+        }],
         variants: vec![CatalogVariant {
             provider_variant_id: variant.to_string(),
             sku: Some("BOOT-42".to_string()),

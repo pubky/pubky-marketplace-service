@@ -67,20 +67,23 @@ fn push(total_extra: i64) -> OrderPush {
     }
 }
 
-/// A Pubky refund record: `amount` is what the Pubky books show refunded in
-/// total, in the order currency's minor units.
-fn refund(id: &str, amount: Option<i64>, unit: &str) -> RefundRecord {
+/// A refund as the framework hands it to the provider: `amount` is what is
+/// still to mirror (in the order currency's minor units); the framework has
+/// already compared the recorded total with the store's own refunds.
+fn refund(id: &str, amount: i64, recorded_total: i64) -> RefundRecord {
     RefundRecord {
         refund_id: id.into(),
         pubky_order_id: order_id(),
         amount_minor: amount,
-        amount_unit: unit.into(),
+        recorded_total_minor: recorded_total,
         transaction_id: None,
         order_total_minor: 26200,
         order_currency: "USD".into(),
         order_exponent: 2,
-        full: amount == Some(26200),
-        basis: Some("Amount recorded in USD, the order currency; no currency conversion. Paid with Bitcoin. Order quote: BTCUSD 98123.45 from feed-x at 2026-10-15T08:00:00.000Z.".into()),
+        full: recorded_total >= 26200,
+        basis: Some(
+            "Refunded 140.00 USDT0, converted to USD at the order's own conversion.".into(),
+        ),
     }
 }
 
@@ -112,6 +115,13 @@ async fn the_catalog_is_paged_with_whole_products_and_normalised() {
         ],
         "the variants that did not fit the first page are read before the page is returned"
     );
+    assert_eq!(
+        boots.categories,
+        ["Apparel & Accessories > Shoes > Boots", "Footwear"],
+        "the taxonomy category and the product type, each once"
+    );
+    assert_eq!(boots.attributes[0].name, "Vendor");
+    assert_eq!(boots.attributes[0].values, ["Dezentral Goods"]);
     assert_eq!(boots.variants[0].price.amount_minor, 12500);
     assert_eq!(boots.variants[0].stock, Some(7));
     assert_eq!(boots.variants[1].stock, Some(0));
@@ -129,6 +139,10 @@ async fn the_catalog_is_paged_with_whole_products_and_normalised() {
         .expect("page 2");
     assert_eq!(second.next_page, None);
     let mug = &second.products[0];
+    assert!(
+        mug.categories.is_empty(),
+        "no category and an empty product type"
+    );
     assert!(
         mug.options.is_empty(),
         "the Default Title placeholder is not an option"
@@ -392,13 +406,52 @@ async fn a_cancel_restocks_never_refunds_and_is_safe_to_repeat() {
 }
 
 #[tokio::test]
+async fn the_store_reports_what_it_was_paid_and_has_refunded_including_the_merchants_own_refunds() {
+    let (fake, provider, connection) = setup().await;
+    let order = provider
+        .push_order(&connection, &push(0))
+        .await
+        .expect("pushed");
+    let totals = provider
+        .refunded_total(&connection, &order)
+        .await
+        .expect("totals");
+    assert_eq!(
+        (
+            totals.currency.as_str(),
+            totals.paid_minor,
+            totals.refunded_minor
+        ),
+        ("USD", 26_200, 0)
+    );
+    provider
+        .record_refund(&connection, &order, &refund("refund-a", 5_000, 5_000))
+        .await
+        .expect("refund");
+    fake.merchant_refund(&order.id, 1_000);
+    let totals = provider
+        .refunded_total(&connection, &order)
+        .await
+        .expect("totals");
+    assert_eq!(totals.refunded_minor, 6_000, "ours and the merchant's");
+    let missing = ExternalOrder {
+        id: "gid://shopify/Order/1".into(),
+    };
+    assert!(matches!(
+        provider.refunded_total(&connection, &missing).await,
+        Err(ProviderError::Rejected { code, .. }) if code == "order_not_found"
+    ));
+    fake.assert_clean();
+}
+
+#[tokio::test]
 async fn a_refund_is_recorded_once_per_pubky_refund_with_a_manual_transaction() {
     let (fake, provider, connection) = setup().await;
     let order = provider
         .push_order(&connection, &push(0))
         .await
         .expect("pushed");
-    let partial = refund("refund-a", Some(5000), "usd");
+    let partial = refund("refund-a", 5_000, 5_000);
     provider
         .record_refund(&connection, &order, &partial)
         .await
@@ -410,7 +463,7 @@ async fn a_refund_is_recorded_once_per_pubky_refund_with_a_manual_transaction() 
     assert_eq!(
         fake.orders()[0].refunds.len(),
         1,
-        "a replay finds the refund already in the store and sends nothing"
+        "the idempotency key makes a replay of the same refund a no-op"
     );
     let input = &fake.orders()[0].refunds[0];
     assert_eq!(input["transactions"][0]["kind"], "REFUND");
@@ -427,36 +480,19 @@ async fn a_refund_is_recorded_once_per_pubky_refund_with_a_manual_transaction() 
     );
     let note = input["note"].as_str().expect("note");
     assert!(
-        note.contains("no currency conversion") && note.contains("BTCUSD 98123.45"),
-        "{note}"
+        note.contains("USDT0"),
+        "the framework's conversion basis is in the note: {note}"
     );
     assert!(note.ends_with("pubky-refund:refund-a:5000:USD"), "{note}");
-    fake.assert_clean();
-}
 
-#[tokio::test]
-async fn a_full_refund_after_a_partial_one_refunds_only_the_difference() {
-    let (fake, provider, connection) = setup().await;
-    let order = provider
-        .push_order(&connection, &push(0))
-        .await
-        .expect("pushed");
+    // A different amount under another refund id is another store refund; the
+    // key covers the id and the amount.
     provider
-        .record_refund(&connection, &order, &refund("refund-a", Some(5000), "usd"))
+        .record_refund(&connection, &order, &refund("refund-b", 8_700, 13_700))
         .await
-        .expect("partial");
-    provider
-        .record_refund(&connection, &order, &refund("refund-b", Some(26200), "usd"))
-        .await
-        .expect("full after partial");
-    let refunds = fake.orders()[0].refunds.clone();
-    assert_eq!(refunds.len(), 2);
-    assert_eq!(refunds[1]["transactions"][0]["amount"], "212.00");
-    assert_eq!(
-        fake.orders()[0].refunded_minor(),
-        26200,
-        "the store never shows more than was paid"
-    );
+        .expect("second refund");
+    assert_eq!(fake.orders()[0].refunds.len(), 2);
+    assert_eq!(fake.orders()[0].refunded_minor(), 13_700);
     let keys: Vec<String> = fake
         .calls("RefundCreate")
         .iter()
@@ -471,81 +507,43 @@ async fn a_full_refund_after_a_partial_one_refunds_only_the_difference() {
                 .to_string()
         })
         .collect();
-    assert_eq!(keys.len(), 2);
-    assert_ne!(keys[0], keys[1]);
-    // The same full record again is already reflected: nothing is sent.
-    provider
-        .record_refund(&connection, &order, &refund("refund-b", Some(26200), "usd"))
-        .await
-        .expect("replayed full");
-    assert_eq!(fake.calls("RefundCreate").len(), 2);
+    assert_ne!(keys[0], keys[2]);
+    assert_eq!(keys[0], keys[1]);
     fake.assert_clean();
 }
 
 #[tokio::test]
-async fn a_refund_the_merchant_already_made_in_the_store_is_not_made_twice() {
+async fn the_store_refuses_a_refund_above_the_payment_and_a_foreign_currency_is_refused_unsent() {
     let (fake, provider, connection) = setup().await;
     let order = provider
         .push_order(&connection, &push(0))
         .await
         .expect("pushed");
-    fake.merchant_refund(&order.id, 10000);
     provider
-        .record_refund(&connection, &order, &refund("refund-a", Some(26200), "usd"))
+        .record_refund(&connection, &order, &refund("refund-a", 20_000, 20_000))
         .await
-        .expect("difference");
-    assert_eq!(fake.orders()[0].refunded_minor(), 26200);
-    assert_eq!(
-        fake.orders()[0].refunds[1]["transactions"][0]["amount"],
-        "162.00"
-    );
-    provider
-        .record_refund(&connection, &order, &refund("refund-c", Some(20000), "usd"))
+        .expect("refund");
+    // Two workers that both believed nothing was refunded yet: the store's own
+    // limit stops the second.
+    let error = provider
+        .record_refund(&connection, &order, &refund("refund-b", 20_000, 20_000))
         .await
-        .expect("already covered");
-    assert_eq!(
-        fake.calls("RefundCreate").len(),
-        1,
-        "a record the store already covers sends nothing"
+        .expect_err("above the payment");
+    assert!(
+        matches!(&error, ProviderError::Rejected { code, .. } if code == "refund_refused"),
+        "{error:?}"
     );
-    fake.assert_clean();
-}
+    assert_eq!(fake.orders()[0].refunded_minor(), 20_000);
 
-#[tokio::test]
-async fn a_refund_that_cannot_be_stated_in_the_store_currency_is_refused() {
-    let (fake, provider, connection) = setup().await;
-    let order = provider
-        .push_order(&connection, &push(0))
-        .await
-        .expect("pushed");
-    for (record, wanted) in [
-        (
-            refund("refund-sat", Some(40_000), "sat"),
-            "refund_amount_unconvertible",
-        ),
-        (refund("refund-none", None, "usd"), "refund_amount_missing"),
-        (
-            refund("refund-big", Some(99_999), "usd"),
-            "refund_exceeds_payment",
-        ),
-    ] {
-        let error = provider
-            .record_refund(&connection, &order, &record)
-            .await
-            .expect_err("refused");
-        assert!(
-            matches!(&error, ProviderError::Rejected { code, .. } if code == wanted),
-            "{wanted}: {error:?}"
-        );
-    }
-    let mut euro = refund("refund-eur", Some(1000), "eur");
+    let mut euro = refund("refund-eur", 1_000, 1_000);
     euro.order_currency = "EUR".into();
+    let calls = fake.calls("RefundCreate").len();
     let error = provider
         .record_refund(&connection, &order, &euro)
         .await
         .expect_err("the store order is in USD");
     assert!(matches!(error, ProviderError::Rejected { code, .. } if code == "currency_mismatch"));
-    assert!(fake.calls("RefundCreate").is_empty());
+    assert_eq!(fake.calls("RefundCreate").len(), calls);
     fake.assert_clean();
 }
 

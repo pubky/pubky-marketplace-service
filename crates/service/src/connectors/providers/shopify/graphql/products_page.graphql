@@ -12,6 +12,11 @@ query ProductsPage($first: Int!, $after: String) {
       title
       description
       onlineStoreUrl
+      productType
+      vendor
+      category {
+        fullName
+      }
       options {
         name
         values

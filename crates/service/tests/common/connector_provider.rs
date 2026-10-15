@@ -63,6 +63,10 @@ pub struct RemoteOrder {
     pub payment_method: String,
     pub cancelled: bool,
     pub refunds: Vec<String>,
+    /// The order's currency, as the push named it.
+    pub currency: String,
+    /// What the store shows refunded, in total, in minor units.
+    pub refunded_minor: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -98,7 +102,7 @@ pub struct TestStore {
     pub last_order_push: Mutex<Option<OrderPush>>,
     pub last_refund: Mutex<Option<RefundRecord>>,
     /// The amount of every refund the store was asked to record, in order.
-    pub refund_amounts: Mutex<Vec<Option<i64>>>,
+    pub refund_amounts: Mutex<Vec<i64>>,
     /// The client id of the app the last provider call carried.
     pub last_app: Mutex<Option<String>>,
     pub webhook_registrations: Mutex<Vec<String>>,
@@ -125,17 +129,41 @@ impl TestStore {
     }
 
     /// An order that exists in the store as if an earlier, unacknowledged
-    /// push had created it.
+    /// push had created it. Its payment covers any refund (`i64::MAX / 2`
+    /// minor units, in USD).
     pub fn plant_order(&self, pubky_order_id: Uuid, external_id: &str) {
+        self.plant_order_paid(pubky_order_id, external_id, i64::MAX / 2, "USD");
+    }
+
+    /// [`Self::plant_order`] with the payment the store order holds.
+    pub fn plant_order_paid(
+        &self,
+        pubky_order_id: Uuid,
+        external_id: &str,
+        paid_minor: i64,
+        currency: &str,
+    ) {
         self.orders.lock().expect("orders lock").push(RemoteOrder {
             id: external_id.to_string(),
             pubky_order_id,
             line_count: 1,
-            total_minor: 0,
+            total_minor: paid_minor,
             payment_method: "planted".to_string(),
             cancelled: false,
             refunds: Vec::new(),
+            currency: currency.to_string(),
+            refunded_minor: 0,
         });
+    }
+
+    /// A refund the merchant made in the store itself.
+    pub fn refund_in_store(&self, external_id: &str, amount_minor: i64) {
+        let mut orders = self.orders.lock().expect("orders lock");
+        let remote = orders
+            .iter_mut()
+            .find(|remote| remote.id == external_id)
+            .expect("a store order to refund");
+        remote.refunded_minor += amount_minor;
     }
 
     pub fn set_catalog(&self, products: Vec<CatalogProduct>) {
@@ -153,6 +181,8 @@ impl TestStore {
             payment_method: order.payment_method.clone(),
             cancelled: false,
             refunds: Vec::new(),
+            currency: order.currency.to_uppercase(),
+            refunded_minor: 0,
         });
         ExternalOrder { id }
     }
@@ -466,9 +496,31 @@ impl ConnectorProvider for TestProvider {
         if let Some(remote) = orders.iter_mut().find(|remote| remote.id == order.id) {
             if !remote.refunds.contains(&refund.refund_id) {
                 remote.refunds.push(refund.refund_id.clone());
+                remote.refunded_minor += refund.amount_minor;
             }
         }
         Ok(())
+    }
+
+    async fn refunded_total(
+        &self,
+        connection: &ConnectionContext,
+        order: &ExternalOrder,
+    ) -> Result<StoreRefundTotals, ProviderError> {
+        blob(connection)?;
+        let orders = self.store.orders.lock().expect("orders lock");
+        let remote = orders
+            .iter()
+            .find(|remote| remote.id == order.id)
+            .ok_or_else(|| ProviderError::Rejected {
+                code: "order_not_found".into(),
+                message: "The store has no such order.".into(),
+            })?;
+        Ok(StoreRefundTotals {
+            currency: remote.currency.clone(),
+            paid_minor: remote.total_minor,
+            refunded_minor: remote.refunded_minor,
+        })
     }
 
     fn webhook_shop(

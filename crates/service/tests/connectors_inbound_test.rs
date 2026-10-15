@@ -800,6 +800,8 @@ async fn the_stock_poll_applies_catalog_stock_to_mapped_variants(pool: PgPool) {
         url: None,
         options: Vec::<CatalogOption>::new(),
         image_urls: vec![],
+        categories: vec![],
+        attributes: vec![],
         variants,
     };
     s.store.set_catalog(vec![

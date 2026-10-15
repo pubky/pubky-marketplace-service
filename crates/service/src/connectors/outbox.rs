@@ -27,6 +27,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::ledger;
+use super::refund;
 use super::store::{self, ConnectionRow};
 
 pub const CURSOR_NAME: &str = "events";
@@ -215,104 +216,6 @@ async fn on_payment_confirmed(
     Ok(queued)
 }
 
-/// `state, external_refund, total_minor, currency, exponent, payment_method`.
-type RefundOrderRow = (
-    String,
-    Option<serde_json::Value>,
-    i64,
-    String,
-    i32,
-    Option<String>,
-);
-
-/// What the order records about how it was paid, as plain columns plus the
-/// optional USD-conversion columns that only exist once the multi-currency
-/// migration has run (read through `to_jsonb`, so this file compiles and runs
-/// with or without them).
-#[derive(sqlx::FromRow)]
-struct PaymentBasisRow {
-    bitcoin_quote_rate: Option<String>,
-    bitcoin_quote_source: Option<String>,
-    bitcoin_quote_fetched_at: Option<DateTime<Utc>>,
-    bitcoin_quote_currency: Option<String>,
-    payment_asset: Option<String>,
-    payment_quote_basis: Option<String>,
-    usd_conversion_pair: Option<String>,
-    usd_conversion_source: Option<String>,
-    usd_conversion_usd_rate: Option<String>,
-    usd_conversion_currency_rate: Option<String>,
-    usd_conversion_fetched_at: Option<String>,
-}
-
-const BASIS_MAX_CHARS: usize = 500;
-
-/// The refund note's statement of how the recorded amount relates to the
-/// payment. `refund.record_external` validates the amount against the order
-/// total, so it is in the order currency on every rail and nothing is
-/// converted; the note says so and names the order's own recorded quote
-/// (Bitcoin rate, USDT basis, USD conversion) so the merchant can reconcile
-/// what the buyer actually sent.
-async fn refund_basis(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    order_id: Uuid,
-    payment_method: Option<&str>,
-    currency: &str,
-) -> Result<String, sqlx::Error> {
-    let row: Option<PaymentBasisRow> = sqlx::query_as(
-        "SELECT bitcoin_quote_rate::text AS bitcoin_quote_rate, bitcoin_quote_source, \
-                bitcoin_quote_fetched_at, bitcoin_quote_currency, payment_asset, \
-                payment_quote_basis, \
-                to_jsonb(o)->>'usd_conversion_pair' AS usd_conversion_pair, \
-                to_jsonb(o)->>'usd_conversion_source' AS usd_conversion_source, \
-                to_jsonb(o)->>'usd_conversion_usd_rate' AS usd_conversion_usd_rate, \
-                to_jsonb(o)->>'usd_conversion_currency_rate' AS usd_conversion_currency_rate, \
-                to_jsonb(o)->>'usd_conversion_fetched_at' AS usd_conversion_fetched_at \
-         FROM orders o WHERE id = $1",
-    )
-    .bind(order_id)
-    .fetch_optional(&mut **tx)
-    .await?;
-    let mut parts = vec![format!(
-        "Amount recorded in {currency}, the order currency; no currency conversion."
-    )];
-    if let Some(row) = row {
-        match payment_method {
-            Some("bitcoin" | "paykit") => parts.push("Paid with Bitcoin.".to_string()),
-            Some("usdt") => parts.push("Paid with USDT.".to_string()),
-            _ => {}
-        }
-        if let (Some(rate), Some(quote_currency)) =
-            (&row.bitcoin_quote_rate, &row.bitcoin_quote_currency)
-        {
-            parts.push(format!(
-                "Order quote: BTC{} {rate} from {} at {}.",
-                quote_currency.trim_end(),
-                row.bitcoin_quote_source
-                    .as_deref()
-                    .unwrap_or("unknown source"),
-                row.bitcoin_quote_fetched_at
-                    .map(crate::clock::format_timestamp)
-                    .unwrap_or_else(|| "unknown time".to_string()),
-            ));
-        }
-        if let (Some(asset), Some(basis)) = (&row.payment_asset, &row.payment_quote_basis) {
-            parts.push(format!("{asset} amount basis: {basis}."));
-        }
-        if let (Some(pair), Some(source), Some(usd_rate), Some(currency_rate), Some(at)) = (
-            &row.usd_conversion_pair,
-            &row.usd_conversion_source,
-            &row.usd_conversion_usd_rate,
-            &row.usd_conversion_currency_rate,
-            &row.usd_conversion_fetched_at,
-        ) {
-            parts.push(format!(
-                "Price converted to USD for the payment request: {pair} (USD rate {usd_rate}, {currency} rate {currency_rate}) from {source} at {at}."
-            ));
-        }
-    }
-    Ok(parts.join(" ").chars().take(BASIS_MAX_CHARS).collect())
-}
-
 async fn on_refund_recorded(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     now: DateTime<Utc>,
@@ -331,49 +234,56 @@ async fn mirror_current_refund(
     order_id: Uuid,
     source_event_id: Uuid,
 ) -> Result<(), sqlx::Error> {
-    let has_push = ledger::has_mirrorable_push(tx, order_id).await?;
-    if !has_push {
+    if !ledger::has_mirrorable_push(tx, order_id).await? {
         return Ok(());
     }
-    let order: Option<RefundOrderRow> = sqlx::query_as(
-        "SELECT state, external_refund, total_minor, currency, exponent, payment_method \
-             FROM orders WHERE id = $1",
-    )
-    .bind(order_id)
-    .fetch_optional(&mut **tx)
-    .await?;
-    let Some((_state, external_refund, total_minor, currency, exponent, payment_method)) = order
-    else {
+    // The whole row as JSON: the conversion columns of the order's recorded
+    // quote exist only once migration 0061 has run, and are read as optional
+    // keys (`refund::OrderBasis`).
+    let row: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT to_jsonb(o) FROM orders o WHERE o.id = $1")
+            .bind(order_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    let Some(row) = row else {
         return Ok(());
     };
-    // The payload is read at consume time. A refund that was reversed before
-    // this event was consumed leaves no record, and there is nothing to mirror.
+    let Some(basis) = refund::OrderBasis::from_row(&row) else {
+        return Ok(());
+    };
+    let external_refund = row.get("external_refund").filter(|value| !value.is_null());
+    // The refund is read as the order holds it now. A refund reversed since
+    // the event left none, and there is nothing to mirror.
     let Some(recorded) = external_refund
-        .as_ref()
         .and_then(|refund| refund.get("amount_minor"))
         .and_then(serde_json::Value::as_i64)
     else {
         return Ok(());
     };
+    let Some(key) = refund_key(tx, external_refund).await? else {
+        return Ok(());
+    };
     let transaction_id = external_refund
-        .as_ref()
         .and_then(|refund| refund.get("transaction_id"))
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
-    let basis = refund_basis(tx, order_id, payment_method.as_deref(), &currency).await?;
-    let Some(key) = refund_key(tx, external_refund.as_ref()).await? else {
-        return Ok(());
-    };
-    let payload = json!({
-        "amount_minor": recorded,
-        "amount_unit": currency.to_lowercase(),
+    let mut payload = json!({
         "transaction_id": transaction_id,
-        "order_total_minor": total_minor,
-        "order_currency": currency,
-        "order_exponent": exponent,
-        "full": recorded >= total_minor,
-        "basis": basis,
+        "order_total_minor": basis.total_minor,
+        "order_currency": basis.currency,
+        "order_exponent": basis.exponent,
     });
+    match refund::order_currency_amount(&basis, recorded) {
+        Ok(converted) => {
+            payload["amount_minor"] = json!(converted.amount_minor);
+            payload["full"] = json!(converted.amount_minor >= basis.total_minor);
+            payload["basis"] = json!(converted.basis);
+        }
+        Err(blocked) => {
+            payload["blocked_code"] = json!(blocked.code);
+            payload["blocked_detail"] = json!(blocked.detail);
+        }
+    }
     ledger::on_refund_recorded(tx, now, order_id, &key, &payload, source_event_id).await
 }
 

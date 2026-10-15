@@ -165,7 +165,7 @@ impl World {
         .expect("refund mirrors")
     }
 
-    fn refunds_at_the_store(&self) -> Vec<Option<i64>> {
+    fn refunds_at_the_store(&self) -> Vec<i64> {
         self.store.refund_amounts.lock().expect("amounts").clone()
     }
 
@@ -232,7 +232,7 @@ async fn a_restored_refund_that_stands_keeps_its_unsent_mirror(pool: PgPool) {
         "the queued mirror is neither dropped nor replaced"
     );
     world.pass().await;
-    assert_eq!(world.refunds_at_the_store(), vec![Some(TOTAL_MINOR)]);
+    assert_eq!(world.refunds_at_the_store(), vec![TOTAL_MINOR]);
     assert!(world.alerts().await.is_empty());
 }
 
@@ -241,7 +241,7 @@ async fn a_restored_refund_that_stands_does_not_alert_for_its_sent_mirror(pool: 
     let world = paid_paypal_order_in_a_connected_store(pool).await;
     a_full_refund_is_recorded(&world).await;
     world.pass().await;
-    assert_eq!(world.refunds_at_the_store(), vec![Some(TOTAL_MINOR)]);
+    assert_eq!(world.refunds_at_the_store(), vec![TOTAL_MINOR]);
 
     world.app.clock.advance_seconds(600);
     world
@@ -254,7 +254,7 @@ async fn a_restored_refund_that_stands_does_not_alert_for_its_sent_mirror(pool: 
     world.pass().await;
     assert_eq!(
         world.refunds_at_the_store(),
-        vec![Some(TOTAL_MINOR)],
+        vec![TOTAL_MINOR],
         "the store still has the one refund"
     );
     assert!(
@@ -308,7 +308,7 @@ async fn a_partial_reversal_replaces_the_unsent_mirror_with_the_refund_that_stan
     world.pass().await;
     assert_eq!(
         world.refunds_at_the_store(),
-        vec![Some(4_000)],
+        vec![4_000],
         "the refund that stands reaches the store once"
     );
     assert!(world.alerts().await.is_empty());
@@ -321,7 +321,7 @@ async fn a_partial_reversal_after_the_mirror_was_sent_alerts_and_adds_no_second_
     let world = paid_paypal_order_in_a_connected_store(pool).await;
     partial_refund_with_a_cancelled_chargeback(&world).await;
     world.pass().await;
-    assert_eq!(world.refunds_at_the_store(), vec![Some(TOTAL_MINOR)]);
+    assert_eq!(world.refunds_at_the_store(), vec![TOTAL_MINOR]);
 
     world.app.clock.advance_seconds(600);
     world
@@ -330,7 +330,7 @@ async fn a_partial_reversal_after_the_mirror_was_sent_alerts_and_adds_no_second_
     world.pass().await;
     assert_eq!(
         world.refunds_at_the_store(),
-        vec![Some(TOTAL_MINOR)],
+        vec![TOTAL_MINOR],
         "a second record would add to what the store already holds"
     );
     let alerts = world.alerts().await;

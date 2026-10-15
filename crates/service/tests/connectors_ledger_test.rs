@@ -817,7 +817,7 @@ async fn a_pubky_refund_is_mirrored_to_the_store_once(pool: PgPool) {
         .expect("refund lock")
         .clone()
         .expect("a refund was recorded");
-    assert_eq!(refund.amount_minor, Some(s.order.total_minor));
+    assert_eq!(refund.amount_minor, s.order.total_minor);
     assert_eq!(refund.transaction_id.as_deref(), Some("bitcoin-tx-1"));
     assert!(refund.full);
     assert_eq!(refund.pubky_order_id.to_string(), s.order.order_id);
@@ -945,8 +945,15 @@ async fn cancel_order(s: &Scenario) {
     }
 }
 
-/// The seller records an external refund, through the return flow.
+/// The seller records an external refund of the whole order, through the
+/// return flow.
 async fn refund_order(s: &Scenario) {
+    refund_order_of(s, s.order.total_minor).await;
+}
+
+/// The seller records an external refund of `amount_minor`, through the
+/// return flow.
+async fn refund_order_of(s: &Scenario, amount_minor: i64) {
     let order_id = s.order.order_id.as_str();
     for (seller, kind, revision, payload, number) in [
         (
@@ -970,7 +977,7 @@ async fn refund_order(s: &Scenario) {
             true,
             "refund.record_external",
             7,
-            json!({ "amount_minor": s.order.total_minor, "transaction_id": "bitcoin-tx-1" }),
+            json!({ "amount_minor": amount_minor, "transaction_id": "bitcoin-tx-1" }),
             1_215,
         ),
     ] {
@@ -1294,7 +1301,6 @@ async fn a_refund_queued_on_a_pending_push_is_applied_once_the_push_creates_the_
         "refund-1",
         &json!({
             "amount_minor": 1_000,
-            "amount_unit": "sat",
             "transaction_id": "bitcoin-tx-9",
             "order_total_minor": s.order.total_minor,
             "order_currency": "USD",
@@ -1323,7 +1329,7 @@ async fn a_refund_queued_on_a_pending_push_is_applied_once_the_push_creates_the_
         .expect("refund lock")
         .clone()
         .expect("a refund was recorded");
-    assert_eq!(refund.amount_minor, Some(1_000));
+    assert_eq!(refund.amount_minor, 1_000);
     assert_eq!(refund.transaction_id.as_deref(), Some("bitcoin-tx-9"));
     assert!(!refund.full);
     assert_eq!(
@@ -1414,7 +1420,12 @@ impl Mirror {
                 now,
                 order_id,
                 &Uuid::new_v4().to_string(),
-                &json!({ "amount_minor": 1_000 }),
+                &json!({
+                    "amount_minor": 1_000,
+                    "order_currency": "USD",
+                    "order_total_minor": s.order.total_minor,
+                    "order_exponent": 2,
+                }),
                 Uuid::new_v4(),
             )
             .await
@@ -1732,7 +1743,7 @@ async fn record_the_refund_again(s: &Scenario, revision: i64, amount_minor: i64,
     assert_eq!(status, StatusCode::OK, "{body}");
 }
 
-fn refund_amounts(s: &Scenario) -> Vec<Option<i64>> {
+fn refund_amounts(s: &Scenario) -> Vec<i64> {
     s.store
         .refund_amounts
         .lock()
@@ -1773,7 +1784,7 @@ async fn a_refund_recorded_again_after_a_reversal_reaches_the_store_once_with_it
     s.pass().await;
     assert_eq!(
         refund_amounts(&s),
-        vec![Some(second)],
+        vec![second],
         "the store gets the second amount, once"
     );
     let actions = refund_actions(&s).await;
@@ -1787,18 +1798,18 @@ async fn a_refund_recorded_again_after_a_reversal_reaches_the_store_once_with_it
         .expect("rewind");
     s.after(700);
     s.pass().await;
-    assert_eq!(refund_amounts(&s), vec![Some(second)], "a replay adds none");
+    assert_eq!(refund_amounts(&s), vec![second], "a replay adds none");
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn a_refund_already_mirrored_when_it_is_reversed_is_flagged_and_the_new_one_mirrors_once(
+async fn a_refund_already_mirrored_when_it_is_reversed_is_flagged_and_a_smaller_new_one_adds_nothing(
     pool: PgPool,
 ) {
     let s = scenario(pool).await;
     s.pass().await;
     refund_order(&s).await;
     s.pass().await;
-    assert_eq!(refund_amounts(&s), vec![Some(s.order.total_minor)]);
+    assert_eq!(refund_amounts(&s), vec![s.order.total_minor]);
 
     let revision = reverse_the_refund(&s).await;
     s.pass().await;
@@ -1808,8 +1819,8 @@ async fn a_refund_already_mirrored_when_it_is_reversed_is_flagged_and_the_new_on
     s.pass().await;
     assert_eq!(
         refund_amounts(&s),
-        vec![Some(s.order.total_minor), Some(second)],
-        "the first refund cannot be unwound; the second is mirrored once with its amount"
+        vec![s.order.total_minor],
+        "the store already shows the first refund, which is the larger: the second adds nothing"
     );
     assert_eq!(reversal_alerts(&s.app.pool).await, 1);
     let (_, alerts) = api(
@@ -1900,4 +1911,332 @@ async fn a_retry_and_a_reversal_over_the_same_parked_mirrors_lock_them_in_one_or
         Vec::<(String, String, Option<String>)>::new(),
         "the reversal drops the mirrors the retry had re-queued"
     );
+}
+
+// === The refund model: unit, difference, full ===============================
+
+fn refund_payload(s: &Scenario, amount_minor: i64) -> serde_json::Value {
+    json!({
+        "amount_minor": amount_minor,
+        "transaction_id": "bitcoin-tx-9",
+        "order_total_minor": s.order.total_minor,
+        "order_currency": "USD",
+        "order_exponent": 2,
+        "full": amount_minor >= s.order.total_minor,
+    })
+}
+
+async fn queue_refund(s: &Scenario, key: &str, amount_minor: i64) {
+    let mut tx = s.app.pool.begin().await.expect("tx");
+    ledger::on_refund_recorded(
+        &mut tx,
+        s.app.clock.now(),
+        s.order.order_id.parse().expect("order id"),
+        key,
+        &refund_payload(s, amount_minor),
+        Uuid::new_v4(),
+    )
+    .await
+    .expect("queue the refund");
+    tx.commit().await.expect("commit");
+}
+
+fn last_refund(s: &Scenario) -> marketplace_service::connectors::provider::RefundRecord {
+    s.store
+        .last_refund
+        .lock()
+        .expect("refund lock")
+        .clone()
+        .expect("a refund was recorded")
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_partial_refund_is_recorded_in_the_order_currency_and_is_not_full(pool: PgPool) {
+    let s = scenario(pool).await;
+    s.pass().await;
+    let half = s.order.total_minor / 2;
+    refund_order_of(&s, half).await;
+    s.pass().await;
+    let refund = last_refund(&s);
+    assert_eq!(refund.amount_minor, half);
+    assert_eq!(refund.recorded_total_minor, half);
+    assert_eq!(refund.order_total_minor, s.order.total_minor);
+    assert_eq!(refund.order_currency, "USD");
+    assert!(!refund.full, "half of the order is not a full refund");
+    assert_eq!(refund.basis, None);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_refund_of_the_whole_order_is_full(pool: PgPool) {
+    let s = scenario(pool).await;
+    s.pass().await;
+    refund_order(&s).await;
+    s.pass().await;
+    let refund = last_refund(&s);
+    assert_eq!(refund.amount_minor, s.order.total_minor);
+    assert!(refund.full);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_later_larger_refund_mirrors_only_the_difference(pool: PgPool) {
+    let s = scenario(pool).await;
+    s.pass().await;
+    queue_refund(&s, "refund-a", 3_000).await;
+    s.pass().await;
+    assert_eq!(
+        s.store.refund_amounts.lock().expect("amounts").clone(),
+        vec![3_000]
+    );
+
+    queue_refund(&s, "refund-b", 8_000).await;
+    s.pass().await;
+    assert_eq!(
+        s.store.refund_amounts.lock().expect("amounts").clone(),
+        vec![3_000, 5_000],
+        "the store is told the 5,000 still to mirror, not the 8,000 total"
+    );
+    let refund = last_refund(&s);
+    assert_eq!(refund.recorded_total_minor, 8_000);
+
+    queue_refund(&s, "refund-c", 8_000).await;
+    queue_refund(&s, "refund-d", 6_000).await;
+    s.pass().await;
+    assert_eq!(
+        s.store.refund_amounts.lock().expect("amounts").len(),
+        2,
+        "a repeat, or a smaller total, adds nothing"
+    );
+    assert!(actions(&s)
+        .await
+        .iter()
+        .all(|(_, state, _)| state == "done"));
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_refund_the_merchant_already_made_in_the_store_counts(pool: PgPool) {
+    let s = scenario(pool).await;
+    s.pass().await;
+    s.store.refund_in_store("ext-1", 2_000);
+    queue_refund(&s, "refund-a", 5_000).await;
+    s.pass().await;
+    assert_eq!(
+        s.store.refund_amounts.lock().expect("amounts").clone(),
+        vec![3_000],
+        "the store already shows 2,000 refunded"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_refund_above_the_payment_is_quarantined_and_never_sent(pool: PgPool) {
+    let s = scenario(pool).await;
+    s.pass().await;
+    queue_refund(&s, "refund-a", s.order.total_minor + 1).await;
+    s.pass().await;
+    assert_eq!(s.store.refund_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        actions(&s).await,
+        vec![(
+            "refund".to_string(),
+            "quarantined".to_string(),
+            Some("refund_exceeds_payment".to_string())
+        )]
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_store_order_in_another_currency_is_never_refunded_against(pool: PgPool) {
+    let s = scenario(pool).await;
+    s.pass().await;
+    sqlx::query("UPDATE connector_order_push SET external_id = 'ext-other'")
+        .execute(&s.app.pool)
+        .await
+        .expect("repoint");
+    s.store.plant_order_paid(
+        s.order.order_id.parse().expect("order id"),
+        "ext-other",
+        1_000_000,
+        "CHF",
+    );
+    queue_refund(&s, "refund-a", 1_000).await;
+    s.pass().await;
+    assert_eq!(s.store.refund_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        actions(&s).await,
+        vec![(
+            "refund".to_string(),
+            "quarantined".to_string(),
+            Some("currency_mismatch".to_string())
+        )]
+    );
+}
+
+/// The columns migration 0061 (#133) adds to `orders`, exactly as it names
+/// them. Added here by the test only because 0061 is not on this branch;
+/// `IF NOT EXISTS` makes this a no-op once it is.
+async fn add_the_conversion_columns(pool: &PgPool) {
+    sqlx::query(
+        "ALTER TABLE orders \
+         ADD COLUMN IF NOT EXISTS usd_conversion_pair TEXT, \
+         ADD COLUMN IF NOT EXISTS usd_conversion_source TEXT, \
+         ADD COLUMN IF NOT EXISTS usd_conversion_usd_rate NUMERIC, \
+         ADD COLUMN IF NOT EXISTS usd_conversion_currency_rate NUMERIC, \
+         ADD COLUMN IF NOT EXISTS usd_conversion_fetched_at TIMESTAMPTZ, \
+         ADD COLUMN IF NOT EXISTS usd_conversion_cents BIGINT",
+    )
+    .execute(pool)
+    .await
+    .expect("conversion columns");
+}
+
+/// Reprices the paid, unpushed order in EUR and records that it was paid with
+/// USDT (`payment_amount_minor` USDT0 millionths for `cents` USD cents).
+async fn paid_in_usdt0_for_a_eur_order(s: &Scenario, cents: Option<i64>) -> i64 {
+    let payment_millionths = cents.unwrap_or(2 * s.order.total_minor) * 10_000;
+    sqlx::query(
+        "UPDATE orders SET currency = 'EUR', payment_method = 'usdt', payment_asset = 'USDT', \
+         payment_network = 'arbitrum-one', payment_amount_minor = $2, payment_exponent = 6, \
+         payment_quote_basis = 'usd-parity', paykit_total_sats = $2 WHERE id = $1::uuid",
+    )
+    .bind(&s.order.order_id)
+    .bind(payment_millionths)
+    .execute(&s.app.pool)
+    .await
+    .expect("pay in USDT");
+    if let Some(cents) = cents {
+        sqlx::query(
+            "UPDATE orders SET usd_conversion_pair = 'EURUSD', usd_conversion_source = 'blocktank', \
+             usd_conversion_usd_rate = 100000, usd_conversion_currency_rate = 92000, \
+             usd_conversion_fetched_at = now(), usd_conversion_cents = $2 WHERE id = $1::uuid",
+        )
+        .bind(&s.order.order_id)
+        .bind(cents)
+        .execute(&s.app.pool)
+        .await
+        .expect("record the conversion");
+    }
+    payment_millionths
+}
+
+/// What `refund.record_external` leaves on a USDT-paid non-USD order: the
+/// refund in USDT0 units, the order refunded, and the event.
+async fn record_a_usdt0_refund(s: &Scenario, millionths: i64) {
+    let revision: i64 = sqlx::query_scalar(
+        "UPDATE orders SET state = 'refunded_external', revision = revision + 1, \
+         external_refund = jsonb_build_object('amount_minor', $2::bigint, \
+             'transaction_id', '0x' || repeat('ab', 32), 'recorded_at', '2026-10-15T12:00:00.000Z') \
+         WHERE id = $1::uuid RETURNING revision",
+    )
+    .bind(&s.order.order_id)
+    .bind(millionths)
+    .fetch_one(&s.app.pool)
+    .await
+    .expect("record the refund");
+    sqlx::query(
+        "INSERT INTO events (id, command_id, aggregate_id, revision, actor_pubky, kind, \
+         occurred_at) VALUES ($1, $2, $3, $4, $5, 'refund.recorded_external', $6)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .bind(format!("order:{}", s.order.order_id))
+    .bind(revision)
+    .bind(&s.seller.pubky)
+    .bind(s.app.clock.now())
+    .execute(&s.app.pool)
+    .await
+    .expect("refund event");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_usdt0_refund_of_a_non_usd_order_is_converted_with_the_orders_own_conversion(
+    pool: PgPool,
+) {
+    let s = scenario(pool).await;
+    add_the_conversion_columns(&s.app.pool).await;
+    let total = s.order.total_minor;
+    let payment = paid_in_usdt0_for_a_eur_order(&s, Some(2 * total)).await;
+    s.pass().await;
+    assert_eq!(s.push().await.0, "created");
+    assert_eq!(
+        s.store.remote_orders()[0].currency,
+        "EUR",
+        "the store order is in the order currency"
+    );
+
+    // A quarter of the payment, in USDT0 millionths.
+    record_a_usdt0_refund(&s, payment / 4).await;
+    s.pass().await;
+    let expected = (total + 2) / 4;
+    let refund = last_refund(&s);
+    assert_eq!(
+        refund.amount_minor, expected,
+        "a quarter of the order, rounded half up, in the order currency"
+    );
+    assert_eq!(refund.recorded_total_minor, expected);
+    assert_eq!(refund.order_currency, "EUR");
+    assert!(!refund.full);
+    let basis = refund.basis.expect("the basis is recorded for the note");
+    assert!(basis.contains("USDT0"), "{basis}");
+    assert!(basis.contains("EURUSD"), "{basis}");
+    assert!(basis.contains("rounded half up"), "{basis}");
+    assert_eq!(s.store.refund_calls.load(Ordering::SeqCst), 1);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_usdt0_refund_of_the_whole_payment_is_the_whole_order(pool: PgPool) {
+    let s = scenario(pool).await;
+    add_the_conversion_columns(&s.app.pool).await;
+    let total = s.order.total_minor;
+    let payment = paid_in_usdt0_for_a_eur_order(&s, Some(2 * total)).await;
+    s.pass().await;
+    record_a_usdt0_refund(&s, payment).await;
+    s.pass().await;
+    let refund = last_refund(&s);
+    assert_eq!(refund.amount_minor, total);
+    assert!(refund.full);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_usdt0_refund_with_no_recorded_conversion_is_quarantined_not_sent(pool: PgPool) {
+    // No conversion columns at all: the database as it is without #133.
+    let s = scenario(pool).await;
+    let payment = paid_in_usdt0_for_a_eur_order(&s, None).await;
+    s.pass().await;
+    assert_eq!(s.push().await.0, "created");
+    record_a_usdt0_refund(&s, payment / 4).await;
+    s.pass().await;
+    assert_eq!(s.store.refund_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        actions(&s).await,
+        vec![(
+            "refund".to_string(),
+            "quarantined".to_string(),
+            Some("refund_amount_unconvertible".to_string())
+        )]
+    );
+    let (_, alerts) = api(
+        &s.app,
+        "GET",
+        "/v1/connectors/alerts?unresolved=true",
+        Some(&s.seller.token),
+        &json!(null),
+    )
+    .await;
+    assert_eq!(alerts["alerts"][0]["kind"], "action_quarantined");
+    assert!(alerts["alerts"][0]["detail"]
+        .as_str()
+        .expect("detail")
+        .contains("by hand"));
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_order_without_usdt_terms_is_unaffected_by_the_conversion_columns(pool: PgPool) {
+    let s = scenario(pool).await;
+    add_the_conversion_columns(&s.app.pool).await;
+    s.pass().await;
+    let half = s.order.total_minor / 2;
+    refund_order_of(&s, half).await;
+    s.pass().await;
+    let refund = last_refund(&s);
+    assert_eq!(refund.amount_minor, half);
+    assert_eq!(refund.basis, None);
 }

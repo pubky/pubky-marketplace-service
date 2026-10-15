@@ -321,6 +321,13 @@ pub struct CatalogProduct {
     pub options: Vec<CatalogOption>,
     pub image_urls: Vec<String>,
     pub variants: Vec<CatalogVariant>,
+    /// The store's category names for the product, plain text.
+    #[serde(default)]
+    pub categories: Vec<String>,
+    /// Descriptive attributes that do not pick a variant (material, brand),
+    /// as name and values. The variant-picking ones are `options`.
+    #[serde(default)]
+    pub attributes: Vec<CatalogOption>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -397,32 +404,52 @@ pub struct CancelOrder {
     pub reason: String,
 }
 
-/// A refund Pubky recorded. `amount_minor` is what the Pubky order's books
-/// show refunded **in total** so far (`refund.record_external` validates it
-/// against the order total, so it is in the order currency's minor units on
-/// every rail, Bitcoin and USDT included; `amount_unit` names that unit and
-/// equals the order currency). A provider mirrors the difference to what the
-/// store already shows refunded, so a repeat or a later, larger record never
-/// refunds the same money twice. `full` is true when the whole order was
-/// refunded.
+/// A refund Pubky recorded, as the framework hands it to a provider: the
+/// amount **still to mirror**.
+///
+/// Every amount is in the order currency's minor units (`order_currency`,
+/// `order_exponent`), whatever rail the buyer paid on; the framework has
+/// already converted a refund recorded in another unit (see
+/// `connectors::refund`) and a provider never converts. The framework also
+/// compares the recorded refund total with what the store already shows
+/// refunded ([`ConnectorProvider::refunded_total`]) and calls
+/// `record_refund` only with the difference, never taking the store's refunds
+/// above its payment, so a repeat or a later, larger record never refunds the
+/// same money twice and the provider does no arithmetic of its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefundRecord {
     /// Deterministic per Pubky refund; the provider derives its idempotency
-    /// key from it.
+    /// key from it (and the amount).
     pub refund_id: String,
     pub pubky_order_id: Uuid,
-    pub amount_minor: Option<i64>,
-    pub amount_unit: String,
+    /// The amount to record in the store now: the recorded refund total minus
+    /// what the store already shows refunded. Always positive.
+    pub amount_minor: i64,
+    /// What Pubky's books show refunded in total, in the same units.
+    pub recorded_total_minor: i64,
     pub transaction_id: Option<String>,
     pub order_total_minor: i64,
     pub order_currency: String,
     pub order_exponent: i32,
-    /// True when the recorded amount covers the whole order.
+    /// True when the recorded total covers the whole order
+    /// (`recorded_total_minor >= order_total_minor`).
     pub full: bool,
-    /// How the amount relates to what the buyer paid (rail, the order's own
-    /// quote), for the store refund's note. The amount itself is always in
-    /// `order_currency`; no conversion happens.
+    /// How the recorded amount relates to what the buyer paid (the
+    /// conversion the order's own quote gave, when the refund was recorded in
+    /// another unit), for the note a provider puts on the store refund.
     pub basis: Option<String>,
+}
+
+/// What a store shows for an order's payment and refunds, in one currency's
+/// minor units.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreRefundTotals {
+    /// The store order's currency code.
+    pub currency: String,
+    /// What the store order was paid.
+    pub paid_minor: i64,
+    /// What the store already shows refunded, in total.
+    pub refunded_minor: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -726,7 +753,18 @@ pub trait ConnectorProvider: Send + Sync + 'static {
         cancel: &CancelOrder,
     ) -> Result<(), ProviderError>;
 
-    /// Records a refund Pubky made so the store's books match.
+    /// What the store shows for the order's payment and refunds, read fresh
+    /// from the store (a refund the merchant made there counts). The
+    /// framework works out how much of a Pubky refund is still to mirror from
+    /// this; it never asks a provider to refund more than the payment.
+    async fn refunded_total(
+        &self,
+        connection: &ConnectionContext,
+        order: &ExternalOrder,
+    ) -> Result<StoreRefundTotals, ProviderError>;
+
+    /// Records a refund Pubky made so the store's books match. `refund`
+    /// carries only the amount still to mirror (see [`RefundRecord`]).
     async fn record_refund(
         &self,
         connection: &ConnectionContext,

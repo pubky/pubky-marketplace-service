@@ -336,13 +336,16 @@ type PageInfo {
   hasNextPage: Boolean!
 }
 type Product {
+  category: TaxonomyCategory
   description(truncateAt: Int): String!
   id: ID!
   images(first: Int, after: String, last: Int, before: String, reverse: Boolean, sortKey: ProductImageSortKeys): ImageConnection!
   onlineStoreUrl: URL
   options(first: Int): [ProductOption!]!
+  productType: String!
   title: String!
   variants(first: Int, after: String, last: Int, before: String, reverse: Boolean, sortKey: ProductVariantSortKeys): ProductVariantConnection!
+  vendor: String!
 }
 type ProductConnection {
   nodes: [Product!]!
@@ -432,6 +435,9 @@ type Shop {
 input StoreCreditRefundInput {
   amount: MoneyInput!
   expiresAt: DateTime
+}
+type TaxonomyCategory {
+  fullName: String!
 }
 scalar URL
 type UserError {

@@ -32,6 +32,7 @@ pub mod outbox;
 pub mod provider;
 pub mod providers;
 pub mod recipient;
+pub mod refund;
 pub mod routes;
 pub mod stock;
 pub mod store;

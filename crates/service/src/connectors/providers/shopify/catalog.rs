@@ -183,7 +183,41 @@ fn product(
             })
             .unwrap_or_default(),
         variants,
+        categories: categories(node),
+        attributes: attributes(node),
     })
+}
+
+/// The store's own classification of the product: its taxonomy category's full
+/// name and its product type, each once.
+fn categories(node: &Value) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for name in [
+        node.pointer("/category/fullName")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        text(node, "productType"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// Descriptive attributes that do not pick a variant: the vendor.
+fn attributes(node: &Value) -> Vec<CatalogOption> {
+    text(node, "vendor")
+        .map(|vendor| {
+            vec![CatalogOption {
+                name: "Vendor".to_string(),
+                values: vec![vendor],
+            }]
+        })
+        .unwrap_or_default()
 }
 
 fn catalog_variant(

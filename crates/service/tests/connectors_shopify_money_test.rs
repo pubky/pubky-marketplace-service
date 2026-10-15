@@ -577,9 +577,10 @@ async fn partial_refund_on_rail(pool: PgPool, rail: &str) {
     s.pass().await;
     let actions = s.refund_actions().await;
     assert_eq!(
-        actions[0].2["amount_unit"], "usd",
-        "the unit is the order currency on every rail"
+        actions[0].2["amount_minor"], 5_000,
+        "the recorded amount is already in the order currency on every rail"
     );
+    assert!(actions[0].2.get("blocked_code").is_none());
     assert_eq!(
         actions[0].2["full"], false,
         "a partial amount is not a full refund"
@@ -592,14 +593,10 @@ async fn partial_refund_on_rail(pool: PgPool, rail: &str) {
         "exactly the recorded amount, never the order total"
     );
     let note = refunds[0]["note"].as_str().expect("note");
-    assert!(note.contains("no currency conversion"), "{note}");
-    if rail == "bitcoin" {
-        assert!(note.contains("Paid with Bitcoin"), "{note}");
-        assert!(note.contains("BTCUSD 98123.45 from blocktank"), "{note}");
-    } else {
-        assert!(note.contains("Paid with USDT"), "{note}");
-        assert!(note.contains("USDT amount basis: parity"), "{note}");
-    }
+    assert!(
+        note.ends_with(&format!("pubky-refund:{}:5000:USD", actions[0].0)),
+        "the note carries the Pubky mark: {note}"
+    );
     assert_eq!(s.fake.orders()[0].refunded_minor(), 5_000);
 
     // The seller later records a larger total (a partial followed by a full
