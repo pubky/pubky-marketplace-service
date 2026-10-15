@@ -20,7 +20,6 @@ use common::connector_provider::{
 use common::shopify_fake::{FakeShopify, Fault, ACCESS_TOKEN, GOOD_CODE};
 use common::{create_paid_order, execute, new_actor, order_command, TestActor, TestApp};
 use hmac::{Hmac, Mac};
-use marketplace_service::clock::Clock;
 use marketplace_service::connectors::provider::ProviderRegistry;
 use marketplace_service::connectors::providers::shopify::client::Origin;
 use marketplace_service::connectors::providers::shopify::ShopifyProvider;
@@ -955,9 +954,12 @@ async fn split_mode_maps_each_store_variant_to_its_own_listing(pool: PgPool) {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
 }
 
+/// listing, Pubky variant, available, event id
+type Seen = (String, String, i64, Option<String>);
+
 #[derive(Default)]
 struct Recording {
-    seen: Mutex<Vec<(String, String, i64, Option<String>)>>,
+    seen: Mutex<Vec<Seen>>,
 }
 
 #[async_trait]
