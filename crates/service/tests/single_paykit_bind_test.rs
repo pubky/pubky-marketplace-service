@@ -2124,6 +2124,91 @@ async fn captured_bitcoin_and_cross_rail_bodies_settle_and_review_end_to_end(poo
 }
 
 // ---------------------------------------------------------------------------
+// Review findings (Kimi, PR #129 at 7f067ac)
+// ---------------------------------------------------------------------------
+
+/// The database URL of the test's own database, for the admin binary.
+fn test_database_url(pool: &PgPool) -> String {
+    let mut url = url::Url::parse(&std::env::var("DATABASE_URL").expect("DATABASE_URL"))
+        .expect("database url");
+    let database = pool
+        .connect_options()
+        .get_database()
+        .expect("test database name")
+        .to_string();
+    url.set_path(&format!("/{database}"));
+    url.to_string()
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_review_row_without_a_satoshi_total_lists_through_the_query_and_the_admin_binary(
+    pool: PgPool,
+) {
+    // The FX quote is unreadable, so the request offers USDT only and its
+    // released attempt has no satoshi total.
+    let f = fixture(pool.clone(), Setup::both()).await;
+    f.fx.set_status(500);
+    let order = checkout_usd(&f).await;
+    let order_id = order.order_id.clone();
+    let (status, body) = bind(&f, &order_id, "paykit").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["order"]["paykit_total_sats"].is_null());
+    let invoice = facts(&pool, &order_id)
+        .await
+        .paykit_invoice_id
+        .expect("invoice");
+    f.paykit.fail_commands_with(409, "invoice_finalized");
+    drain(&f).await;
+    f.paykit.clear_command_failure();
+    let deadline = Utc::now() + Duration::minutes(30);
+    f.paykit.set_marketplace_status(
+        invoice,
+        usdt_status(invoice, deadline, usdt_leg(1, true, true, false)),
+    );
+    let client = f
+        .app
+        .state
+        .payments
+        .as_ref()
+        .and_then(|payments| payments.paykit.as_ref())
+        .expect("client");
+    marketplace_service::paykit_attempts::verify_due_released_attempts(&f.app.state, client, at(1))
+        .await
+        .expect("released attempts poll");
+    let total: Option<i64> = sqlx::query_scalar(
+        "SELECT total_sats FROM paykit_superseded_attempts WHERE order_id = $1",
+    )
+    .bind(uuid(&order_id))
+    .fetch_one(&pool)
+    .await
+    .expect("held row");
+    assert_eq!(total, None, "a USDT-only attempt has no satoshi total");
+
+    let listed = marketplace_service::paykit_attempts::list_needs_review(&pool)
+        .await
+        .expect("the operator queue lists a row without a total");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].total_sats, None);
+    assert_eq!(listed[0].review_reason, "other_rail");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_paykit-attempts-admin"))
+        .arg("list")
+        .env("DATABASE_URL", test_database_url(&pool))
+        .output()
+        .expect("admin binary runs");
+    assert!(
+        output.status.success(),
+        "admin list failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let line = String::from_utf8(output.stdout).expect("utf-8");
+    let row: Value = serde_json::from_str(line.trim()).expect("one JSON row");
+    assert_eq!(row["order_id"], json!(order_id));
+    assert!(row["total_sats"].is_null(), "{row}");
+    assert_eq!(row["review_reason"], json!("other_rail"));
+}
+
+// ---------------------------------------------------------------------------
 // Money path: concurrent polls of one order
 // ---------------------------------------------------------------------------
 

@@ -799,7 +799,9 @@ pub struct NeedsReview {
     pub seller_pubky: String,
     pub buyer_pubky: String,
     pub review_reason: String,
-    pub total_sats: i64,
+    /// The satoshi total the attempt asked for; NULL when it offered no
+    /// Bitcoin (a USDT-only request).
+    pub total_sats: Option<i64>,
     pub observation: Option<serde_json::Value>,
     pub closed_at: DateTime<Utc>,
 }
