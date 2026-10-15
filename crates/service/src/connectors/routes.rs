@@ -1354,7 +1354,22 @@ pub async fn receive_woocommerce_webhook(
     };
     let connection = match store::live_for_shop(&state.pool, kind, &shop).await {
         Ok(Some(connection)) => connection,
-        Ok(None) => return invalid_webhook(),
+        Ok(None) => {
+            // No connected store by that name. The one request that is still
+            // welcome is one that needs no store: WooCommerce's unsigned ping,
+            // which it repeats until answered 200. The provider decides.
+            let unconnected = WebhookContext {
+                app: None,
+                connection: None,
+            };
+            return match provider.verify_webhook(&unconnected, &body, &headers) {
+                Ok(_) => respond(
+                    StatusCode::OK,
+                    json!({ "schema_version": 1, "status": "ignored" }),
+                ),
+                Err(_) => invalid_webhook(),
+            };
+        }
         Err(cause) => return internal("webhook connection lookup", &cause),
     };
     accept_webhook(&state, runtime, provider, connection, &headers, &body).await

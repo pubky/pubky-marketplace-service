@@ -614,7 +614,10 @@ mod tests {
             .return_url_for(&json!({"return_url": "https://elsewhere.example/"}))
             .unwrap();
         assert_eq!(url, "https://shop.pubky.app/marketplace/connections");
-        assert_eq!(configured.shop_origin().as_deref(), Some("https://shop.pubky.app"));
+        assert_eq!(
+            configured.shop_origin().as_deref(),
+            Some("https://shop.pubky.app")
+        );
     }
 
     #[test]
@@ -626,8 +629,15 @@ mod tests {
             "https://shop.pubky.app/connections"
         );
         assert_eq!(open.shop_origin(), None);
-        for bad in [json!({}), json!({"return_url": "javascript:alert(1)"}), json!({"return_url": "nonsense"})] {
-            assert!(matches!(open.return_url_for(&bad), Err(ProviderError::Invalid(_))), "{bad}");
+        for bad in [
+            json!({}),
+            json!({"return_url": "javascript:alert(1)"}),
+            json!({"return_url": "nonsense"}),
+        ] {
+            assert!(
+                matches!(open.return_url_for(&bad), Err(ProviderError::Invalid(_))),
+                "{bad}"
+            );
         }
     }
 
@@ -650,12 +660,16 @@ mod tests {
         assert_eq!(field(&fields, "key_id").as_deref(), Some("7"));
 
         let query = CallbackParams {
-            query: [("user_id".to_string(), "n3".to_string())].into_iter().collect(),
+            query: [("user_id".to_string(), "n3".to_string())]
+                .into_iter()
+                .collect(),
             ..CallbackParams::default()
         };
         assert_eq!(provider(None).callback_state(&query).unwrap(), "n3");
 
-        assert!(provider(None).callback_state(&CallbackParams::default()).is_err());
+        assert!(provider(None)
+            .callback_state(&CallbackParams::default())
+            .is_err());
         let blank = CallbackParams {
             body: serde_json::to_vec(&json!({"user_id": ""})).unwrap(),
             ..CallbackParams::default()
