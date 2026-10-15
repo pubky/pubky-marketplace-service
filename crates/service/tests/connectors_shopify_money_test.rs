@@ -983,3 +983,44 @@ async fn a_busy_store_whose_search_lags_is_never_pushed_to_twice(pool: PgPool) {
     assert_eq!(s.fake.calls("OrderCreate").len(), 1, "orderCreate ran once");
     s.fake.assert_clean();
 }
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_store_that_adds_tax_gets_the_order_and_the_seller_gets_an_alert(pool: PgPool) {
+    let s = shop(
+        pool,
+        Some(Box::new(|fake| fake.lock().forced_tax_bps = 800)),
+    )
+    .await;
+    let (state, external, _, _) = push_state(&s.app.pool, &s.order_id).await;
+    assert_eq!(state, "created", "the order exists in the store");
+    assert_eq!(external.as_deref(), Some(s.fake.orders()[0].id.as_str()));
+    let alerts = s.alerts().await;
+    assert_eq!(alerts.len(), 1, "{alerts:?}");
+    assert_eq!(alerts[0]["kind"], "push_total_mismatch");
+    assert_eq!(alerts[0]["pubky_order_id"], s.order_id);
+    let detail = alerts[0]["detail"].as_str().expect("detail");
+    assert!(
+        detail.contains("tax") && detail.contains("buyer paid"),
+        "{detail}"
+    );
+    assert_eq!(s.fake.calls("OrderCreate").len(), 1);
+    s.fake.assert_clean();
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_pushed_order_whose_total_matches_raises_no_alert(pool: PgPool) {
+    let s = pushed(pool).await;
+    assert!(s.alerts().await.is_empty());
+    let sent = &s.fake.orders()[0].input;
+    assert_eq!(sent["taxesIncluded"], false);
+    assert_eq!(sent["taxLines"], json!([]));
+    let paid = sent["transactions"][0]["amountSet"]["shopMoney"]["amount"]
+        .as_str()
+        .expect("paid")
+        .to_string();
+    assert_eq!(
+        paid,
+        minor_text(s.total_minor),
+        "the store order total is what the buyer paid"
+    );
+}

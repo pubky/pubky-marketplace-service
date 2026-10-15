@@ -5,6 +5,7 @@ pub const APP_UNINSTALL: &str = include_str!("graphql/app_uninstall.graphql");
 pub const INVENTORY_ITEM: &str = include_str!("graphql/inventory_item.graphql");
 pub const ORDER_CANCEL: &str = include_str!("graphql/order_cancel.graphql");
 pub const ORDER_CREATE: &str = include_str!("graphql/order_create.graphql");
+pub const ORDER_TOTALS: &str = include_str!("graphql/order_totals.graphql");
 pub const ORDER_TRANSACTIONS: &str = include_str!("graphql/order_transactions.graphql");
 pub const ORDERS_BY_TAG: &str = include_str!("graphql/orders_by_tag.graphql");
 pub const PRODUCT_VARIANTS_PAGE: &str = include_str!("graphql/product_variants_page.graphql");
@@ -20,11 +21,12 @@ pub const WEBHOOK_SUBSCRIPTION_DELETE: &str =
 pub const WEBHOOK_SUBSCRIPTIONS: &str = include_str!("graphql/webhook_subscriptions.graphql");
 
 /// Every document with its file name, for the schema validation test.
-pub const ALL: [(&str, &str); 15] = [
+pub const ALL: [(&str, &str); 16] = [
     ("app_uninstall", APP_UNINSTALL),
     ("inventory_item", INVENTORY_ITEM),
     ("order_cancel", ORDER_CANCEL),
     ("order_create", ORDER_CREATE),
+    ("order_totals", ORDER_TOTALS),
     ("order_transactions", ORDER_TRANSACTIONS),
     ("orders_by_tag", ORDERS_BY_TAG),
     ("product_variants_page", PRODUCT_VARIANTS_PAGE),

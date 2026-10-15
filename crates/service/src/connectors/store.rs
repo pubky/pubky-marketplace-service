@@ -1134,6 +1134,14 @@ pub enum AlertKind {
     /// Pubky. Informational: the seller corrects the store; there is nothing
     /// to retry.
     RefundReversedAfterMirror,
+    /// Switching to split variant mode unmapped listings that combined several
+    /// store variants; the seller re-imports or ends them.
+    ListingsUnmapped,
+    /// A store stock change named a variant the service cannot address: the
+    /// mapping is stale. Permanent until the seller re-maps.
+    VariantMappingError,
+    /// The store order's total is not what the buyer paid.
+    PushTotalMismatch,
 }
 
 impl AlertKind {
@@ -1147,6 +1155,9 @@ impl AlertKind {
             AlertKind::CredentialsRejected => "credentials_rejected",
             AlertKind::InboundFailed => "inbound_failed",
             AlertKind::RefundReversedAfterMirror => "refund_reversed_after_mirror",
+            AlertKind::ListingsUnmapped => "listings_unmapped",
+            AlertKind::VariantMappingError => "variant_mapping_error",
+            AlertKind::PushTotalMismatch => "push_total_mismatch",
         }
     }
 }

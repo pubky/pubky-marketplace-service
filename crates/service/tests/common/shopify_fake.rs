@@ -147,6 +147,9 @@ pub struct Inner {
     /// true the cancel nevertheless takes effect (a retry racing the job
     /// that is already cancelling the order).
     pub cancel_refusal: Option<(String, bool)>,
+    /// A store that forces tax onto every order whatever the order says
+    /// (basis points of the order total).
+    pub forced_tax_bps: i64,
     next_id: u64,
 }
 
@@ -200,6 +203,7 @@ impl FakeShopify {
             refund_keys: HashMap::new(),
             subscription_page_size: 100,
             cancel_refusal: None,
+            forced_tax_bps: 0,
             next_id: 7000,
         }));
         let router = Router::new()
@@ -608,6 +612,51 @@ fn run(inner: &mut Inner, name: &str, document: &str, variables: &Value) -> Resu
                     "endCursor": format!("recent-{end}"),
                 },
                 "nodes": page,
+            } } }))
+        }
+        "OrderTotals" => {
+            let id = variables["id"].as_str().unwrap_or_default();
+            let bps = inner.forced_tax_bps;
+            let Some(order) = inner.orders.iter().find(|order| order.id == id) else {
+                return Ok(json!({ "data": { "order": null } }));
+            };
+            let lines: i64 = order.input["lineItems"]
+                .as_array()
+                .map(|lines| {
+                    lines
+                        .iter()
+                        .map(|line| {
+                            to_minor(
+                                line["priceSet"]["shopMoney"]["amount"]
+                                    .as_str()
+                                    .unwrap_or("0"),
+                            ) * line["quantity"].as_i64().unwrap_or(1)
+                        })
+                        .sum()
+                })
+                .unwrap_or(0);
+            let shipping: i64 = order.input["shippingLines"]
+                .as_array()
+                .map(|lines| {
+                    lines
+                        .iter()
+                        .map(|line| {
+                            to_minor(
+                                line["priceSet"]["shopMoney"]["amount"]
+                                    .as_str()
+                                    .unwrap_or("0"),
+                            )
+                        })
+                        .sum()
+                })
+                .unwrap_or(0);
+            let tax = (lines + shipping) * bps / 10_000;
+            let currency = order.input["currency"].clone();
+            Ok(json!({ "data": { "order": {
+                "id": order.id,
+                "currencyCode": currency,
+                "totalPriceSet": { "shopMoney": { "amount": decimal(lines + shipping + tax), "currencyCode": currency } },
+                "totalTaxSet": { "shopMoney": { "amount": decimal(tax), "currencyCode": currency } },
             } } }))
         }
         "OrderTransactions" => {

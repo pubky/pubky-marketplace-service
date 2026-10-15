@@ -1,0 +1,18 @@
+query OrderTotals($id: ID!) {
+  order(id: $id) {
+    id
+    currencyCode
+    totalPriceSet {
+      shopMoney {
+        amount
+        currencyCode
+      }
+    }
+    totalTaxSet {
+      shopMoney {
+        amount
+        currencyCode
+      }
+    }
+  }
+}

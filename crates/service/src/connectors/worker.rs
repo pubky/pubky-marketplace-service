@@ -23,7 +23,8 @@ use super::ledger::{self, reason, ClaimedPush};
 use super::order_push::{self, Withheld};
 use super::outbox;
 use super::provider::{
-    CancelOrder, ConnectionContext, ConnectorProvider, ExternalOrder, ProviderError, RefundRecord,
+    CancelOrder, ConnectionContext, ConnectorProvider, ExternalOrder, OrderPush, ProviderError,
+    RefundRecord,
 };
 use super::stock::{self, StockOutcome};
 use super::store::{self, AlertKind, ConnectionRow, OpenError};
@@ -294,10 +295,61 @@ async fn process_push(
                     push_id = %row.id,
                     "push finished after its claim was taken over; the new owner reconciles it"
                 );
+                return Ok(());
             }
-            Ok(())
+            check_pushed_total(
+                state,
+                runtime,
+                provider.as_ref(),
+                &context,
+                &connection,
+                row,
+                &created,
+                &push,
+            )
+            .await
         }
         Err(error) => push_failed(state, runtime, &connection, &claim, error, false).await,
+    }
+}
+
+/// Asks the provider whether the order it just created is what the buyer paid,
+/// and tells the seller if not. The order stays created; a failed check is
+/// logged, never a reason to push again.
+#[allow(clippy::too_many_arguments)]
+async fn check_pushed_total(
+    state: &AppState,
+    runtime: &ConnectorRuntime,
+    provider: &dyn ConnectorProvider,
+    context: &ConnectionContext,
+    connection: &ConnectionRow,
+    row: &ledger::PushRow,
+    created: &ExternalOrder,
+    pushed: &OrderPush,
+) -> Result<(), sqlx::Error> {
+    match with_timeout(
+        runtime.settings.provider_timeout,
+        provider.verify_pushed_order(context, created, pushed),
+    )
+    .await
+    {
+        Ok(Some(message)) => {
+            store::raise_alert(
+                &state.pool,
+                state.clock.now(),
+                connection,
+                AlertKind::PushTotalMismatch,
+                Some(row.pubky_order_id),
+                &message,
+                &format!("push-total|{}", row.id),
+            )
+            .await
+        }
+        Ok(None) => Ok(()),
+        Err(error) => {
+            tracing::warn!(push_id = %row.id, error = %error, "could not verify the pushed order's total");
+            Ok(())
+        }
     }
 }
 

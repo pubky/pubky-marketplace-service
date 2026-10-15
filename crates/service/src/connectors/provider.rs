@@ -674,6 +674,21 @@ pub trait ConnectorProvider: Send + Sync + 'static {
         order: &OrderPush,
     ) -> Result<ExternalOrder, ProviderError>;
 
+    /// Called once after a push created the store order: a provider that can
+    /// read the order back says whether it is what the buyer paid (the total,
+    /// and no tax the store added). `Ok(Some(message))` is a sentence for the
+    /// seller, who gets an alert; the order stays created. Providers that do
+    /// not check keep the default. An error is logged and ignored: the order
+    /// exists either way.
+    async fn verify_pushed_order(
+        &self,
+        _connection: &ConnectionContext,
+        _created: &ExternalOrder,
+        _pushed: &OrderPush,
+    ) -> Result<Option<String>, ProviderError> {
+        Ok(None)
+    }
+
     /// Looks up an order a push may already have created, by the Pubky order
     /// id the push stamped on it.
     async fn find_pushed_order(

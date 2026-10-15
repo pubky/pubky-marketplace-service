@@ -125,7 +125,9 @@ type Order {
   currencyCode: CurrencyCode!
   id: ID!
   tags: [String!]!
+  totalPriceSet: MoneyBag!
   totalRefundedSet: MoneyBag!
+  totalTaxSet: MoneyBag
   transactions(first: Int, capturable: Boolean, manuallyResolvable: Boolean): [OrderTransaction!]!
 }
 enum OrderAdjustmentInputDiscrepancyReason { RESTOCK DAMAGE CUSTOMER OTHER }

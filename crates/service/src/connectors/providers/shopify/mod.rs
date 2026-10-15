@@ -348,6 +348,22 @@ impl ConnectorProvider for ShopifyProvider {
         orders::push(&self.client, &connection.shop, token(connection)?, order).await
     }
 
+    async fn verify_pushed_order(
+        &self,
+        connection: &ConnectionContext,
+        created: &ExternalOrder,
+        pushed: &OrderPush,
+    ) -> Result<Option<String>, ProviderError> {
+        orders::verify_total(
+            &self.client,
+            &connection.shop,
+            token(connection)?,
+            created,
+            pushed,
+        )
+        .await
+    }
+
     async fn find_pushed_order(
         &self,
         connection: &ConnectionContext,

@@ -18,6 +18,13 @@
 //! order out and says so ([`ProviderError::Unknown`]) instead of answering
 //! "not found", so the ledger never pushes a second copy on a guess.
 //!
+//! No tax is added: the pushed order carries `taxesIncluded: false`, an empty
+//! `taxLines`, lines marked `taxable: false` and no shipping tax lines, so
+//! Shopify has nothing to compute and the store total is what the buyer paid
+//! (Pubky prices are what the buyer is charged; there is no net/VAT split).
+//! [`verify_total`] reads the created order back and reports a total or a tax
+//! that is not what was paid, for a seller alert.
+//!
 //! A refund is mirrored as a **difference**: the Pubky order's recorded refund
 //! total (in the order currency, on every rail) minus what the store order
 //! already shows refunded, so a repeated or later, larger record never refunds
@@ -159,6 +166,7 @@ pub fn order_create_variables(order: &OrderPush) -> Result<Value, ProviderError>
                 "variantId": line.provider_variant_id,
                 "quantity": line.quantity,
                 "priceSet": money(line.unit_price_minor, &currency, exp),
+                "taxable": false,
             })
         })
         .collect();
@@ -166,6 +174,8 @@ pub fn order_create_variables(order: &OrderPush) -> Result<Value, ProviderError>
         "lineItems": line_items,
         "financialStatus": "PAID",
         "currency": currency,
+        "taxesIncluded": false,
+        "taxLines": [],
         "processedAt": order.paid_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         "tags": [TAG_PUBKY, order_tag(order.pubky_order_id)],
         "customAttributes": [
@@ -183,6 +193,7 @@ pub fn order_create_variables(order: &OrderPush) -> Result<Value, ProviderError>
         input["shippingLines"] = json!([{
             "title": "Shipping",
             "priceSet": money(order.shipping_minor, &currency, exp),
+            "taxLines": [],
         }]);
     }
     if let Some(address) = &order.shipping_address {
@@ -238,6 +249,57 @@ pub async fn push(
         .and_then(Value::as_str)
         .ok_or_else(|| malformed("orderCreate payload"))?;
     Ok(ExternalOrder { id: id.to_string() })
+}
+
+/// Reads the created order back: `None` when its total is what the buyer paid
+/// and no tax was added, otherwise a sentence for the seller.
+pub async fn verify_total(
+    client: &Client,
+    shop: &str,
+    token: &str,
+    created: &ExternalOrder,
+    pushed: &OrderPush,
+) -> Result<Option<String>, ProviderError> {
+    let data = client
+        .execute(
+            shop,
+            token,
+            documents::ORDER_TOTALS,
+            json!({ "id": created.id }),
+        )
+        .await?;
+    let order = data
+        .get("order")
+        .filter(|order| !order.is_null())
+        .ok_or_else(|| malformed("order"))?;
+    let currency = pushed.currency.to_ascii_uppercase();
+    let exp = exponent(&currency);
+    let minor = |pointer: &str| {
+        order
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .and_then(|amount| decimal_to_minor(amount, exp))
+    };
+    let total = minor("/totalPriceSet/shopMoney/amount").ok_or_else(|| malformed("order total"))?;
+    let tax = order
+        .pointer("/totalTaxSet/shopMoney/amount")
+        .and_then(Value::as_str)
+        .and_then(|amount| decimal_to_minor(amount, exp))
+        .unwrap_or(0);
+    if total == pushed.total_minor && tax == 0 {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "The store order was created, but its total is {} {currency} and the buyer paid {} {currency}{}. \
+         Check the order and the store's tax settings in Shopify; Pubky did not change it.",
+        minor_to_decimal(total, exp),
+        minor_to_decimal(pushed.total_minor, exp),
+        if tax == 0 {
+            String::new()
+        } else {
+            format!(" (the store added {} {currency} tax)", minor_to_decimal(tax, exp))
+        }
+    )))
 }
 
 fn tagged(node: &Value, tag: &str) -> bool {

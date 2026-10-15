@@ -1034,3 +1034,42 @@ fn the_privacy_topics_are_named_for_the_merchant_guide() {
     assert_eq!(SUBSCRIBED_TOPICS.len(), 5);
     let _ = Value::Null;
 }
+
+#[tokio::test]
+async fn a_pushed_order_asks_for_no_tax_and_its_total_is_what_the_buyer_paid() {
+    let (fake, provider, connection) = setup().await;
+    let order = push(0);
+    let created = provider
+        .push_order(&connection, &order)
+        .await
+        .expect("pushed");
+    let sent = &fake.orders()[0].input;
+    assert_eq!(sent["taxesIncluded"], false);
+    assert_eq!(sent["taxLines"], json!([]));
+    assert_eq!(sent["lineItems"][0]["taxable"], false);
+    assert_eq!(sent["shippingLines"][0]["taxLines"], json!([]));
+    assert_eq!(
+        provider
+            .verify_pushed_order(&connection, &created, &order)
+            .await
+            .expect("verified"),
+        None,
+        "no tax, and the total is what was paid"
+    );
+
+    // A store that adds tax whatever the order says is reported, in words a
+    // seller can act on, and the order is left alone.
+    fake.lock().forced_tax_bps = 1000;
+    let message = provider
+        .verify_pushed_order(&connection, &created, &order)
+        .await
+        .expect("verified")
+        .expect("a mismatch");
+    assert!(
+        message.contains("288.20 USD") && message.contains("262.00 USD"),
+        "{message}"
+    );
+    assert!(message.contains("added 26.20 USD tax"), "{message}");
+    assert_eq!(fake.orders().len(), 1);
+    fake.assert_clean();
+}
