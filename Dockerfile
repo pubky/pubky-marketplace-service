@@ -9,6 +9,10 @@ RUN cargo build --release -p marketplace-service
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3 curl && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /build/target/release/marketplace-service /usr/local/bin/marketplace-service
+# The commit is a runtime env, set after the compile stage so a new SHA does
+# not invalidate the cargo build cache. `/health` reports it as `commit`.
+ARG GIT_COMMIT=unknown
+ENV GIT_COMMIT=${GIT_COMMIT}
 # Railway injects PORT; the service reads BIND_ADDR. Bridge them at startup.
 ENV RUST_LOG=info
 CMD ["sh", "-c", "BIND_ADDR=0.0.0.0:${PORT:-8080} exec marketplace-service"]

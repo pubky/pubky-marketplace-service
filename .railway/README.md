@@ -61,7 +61,8 @@ address-search image pin, PR #81), so it normally trails `main`, and it is
 not the source of truth for what is running: read the image digest of the
 service's active deployment (Railway deployment details, or the revision's
 image on GCP) and the `org.opencontainers.image.revision` label of that image to
-see the deployed commit. The service serves no version endpoint. The
+see the deployed commit, or read `commit` from `GET /health` on images built by
+the workflow below (the 12-character source SHA; `unknown` otherwise). The
 image workflow `.github/workflows/production-image.yml` now publishes to
 `ghcr.io/<repository owner>/pubky-marketplace-service` (lowercased, tagged
 `sha-<commit>`), which for this repository is `ghcr.io/pubky/...`; the pins

@@ -932,9 +932,15 @@ Liveness plus a capability summary. Always `200` while the process is up:
   "digital_delivery_available": true,
   "digital_delivery_max_bytes": 1048576,
   "priv_keys_available": false,
+  "commit": "2f844c1084c4",
   "paykit_rail": { "bitcoin_offer_available": true, "age_seconds": 12 }
 }
 ```
+
+`commit` is the first 12 characters of the git SHA the image was built from
+(the `GIT_COMMIT` Docker build arg, set by the production image workflow), or
+`"unknown"` when the build did not pass one or the value is not a hex SHA. It is
+the only build detail exposed: no version, build time or host information.
 
 The capability fields reflect how this deployment is configured (for example
 `priv_keys_available` is `true` only when the `/priv` key-encryption key is
@@ -950,9 +956,10 @@ refusal-audit pipeline is not ready, the database probe fails, or buyer
 delivery emails are held beyond their retention window (in that case the body
 also carries `"reason":"delivery_email_purge_overdue"`).
 
-The service publishes no version endpoint. Identify the running build from the
-deploy record: the digest of the image that is deployed (Railway, or GCP once
-the service runs there) and its `org.opencontainers.image.revision` label.
+The service publishes no version endpoint. `GET /health` reports `commit`; for
+the authoritative record use the digest of the image that is deployed (Railway,
+or GCP once the service runs there) and its `org.opencontainers.image.revision`
+label.
 
 ## Grant-flow routes (Shop BFF)
 
