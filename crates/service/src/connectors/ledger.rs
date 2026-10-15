@@ -35,6 +35,11 @@
 //!   (`FOR NO KEY UPDATE`), so each serialises with a quarantine or a retry of
 //!   the same push: a mirror is never parked behind a push that has since
 //!   moved on, and never left pending behind one that has been quarantined.
+//! * A refund mirror is keyed on the refund record the order holds (amount,
+//!   transaction id, `recorded_at`), so each recorded refund reaches the store
+//!   once with its own amount. When a reversal is cancelled (`on_refund_reversed`)
+//!   mirrors of earlier refunds that have not been sent are dropped, and ones
+//!   that were sent raise a seller alert: no provider can retract a refund.
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -538,6 +543,69 @@ pub async fn on_refund_recorded<'c>(
     .bind(ACTION_PUSH_QUARANTINED)
     .execute(&mut **tx)
     .await?;
+    Ok(())
+}
+
+/// A refund Pubky had recorded was reversed or reduced: the order's current
+/// refund (`current_key`, `None` when it holds none) replaces the ones
+/// before it. A mirror of an earlier refund that has not reached the store is
+/// dropped. One that has, or may have, cannot be unwound (no provider can
+/// retract a recorded refund), so the seller gets an alert to correct the
+/// store's books. A mirror quarantined for its own reason was never applied
+/// and keeps its own alert.
+pub async fn on_refund_reversed<'c>(
+    tx: &mut sqlx::Transaction<'c, Postgres>,
+    now: DateTime<Utc>,
+    pubky_order_id: Uuid,
+    current_key: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "DELETE FROM connector_order_actions a USING connector_order_push p \
+         WHERE a.push_id = p.id AND p.pubky_order_id = $1 AND a.kind = 'refund' \
+           AND ($2::text IS NULL OR a.action_key <> $2) \
+           AND (a.state = 'pending' \
+                OR (a.state = 'quarantined' AND a.quarantine_reason = $3))",
+    )
+    .bind(pubky_order_id)
+    .bind(current_key)
+    .bind(ACTION_PUSH_QUARANTINED)
+    .execute(&mut **tx)
+    .await?;
+    let applied: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        "SELECT a.id, p.connection_id FROM connector_order_actions a \
+         JOIN connector_order_push p ON p.id = a.push_id \
+         WHERE p.pubky_order_id = $1 AND a.kind = 'refund' \
+           AND ($2::text IS NULL OR a.action_key <> $2) \
+           AND a.state IN ('sending', 'done') \
+         ORDER BY a.created_at, a.id",
+    )
+    .bind(pubky_order_id)
+    .bind(current_key)
+    .fetch_all(&mut **tx)
+    .await?;
+    for (action_id, connection_id) in applied {
+        let connection: Option<ConnectionRow> = sqlx::query_as(&format!(
+            "SELECT {} FROM connector_connections WHERE id = $1",
+            super::store::CONNECTION_COLUMNS
+        ))
+        .bind(connection_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let Some(connection) = connection else {
+            continue;
+        };
+        raise_alert(
+            &mut **tx,
+            now,
+            &connection,
+            AlertKind::ActionQuarantined,
+            Some(pubky_order_id),
+            "refund_reversed: a refund Pubky mirrored to the store was reversed or reduced \
+             in Pubky. The store may still show it; correct it there.",
+            &format!("refund_reversed|{action_id}"),
+        )
+        .await?;
+    }
     Ok(())
 }
 

@@ -134,6 +134,13 @@ async fn apply(
             on_refund_recorded(tx, now, event, order_id).await?;
             Ok(0)
         }
+        "refund.reversal_cancelled" => {
+            let Some(order_id) = order_id_of(&event.aggregate_id) else {
+                return Ok(0);
+            };
+            on_refund_reversed(tx, now, order_id).await?;
+            Ok(0)
+        }
         _ => Ok(0),
     }
 }
@@ -342,6 +349,9 @@ async fn on_refund_recorded(
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
     let basis = refund_basis(tx, order_id, payment_method.as_deref(), &currency).await?;
+    let Some(key) = refund_key(tx, external_refund.as_ref()).await? else {
+        return Ok(());
+    };
     let payload = json!({
         "amount_minor": recorded,
         "amount_unit": currency.to_lowercase(),
@@ -352,5 +362,62 @@ async fn on_refund_recorded(
         "full": recorded >= total_minor,
         "basis": basis,
     });
-    ledger::on_refund_recorded(tx, now, order_id, &event.id.to_string(), &payload, event.id).await
+    ledger::on_refund_recorded(tx, now, order_id, &key, &payload, event.id).await
+}
+
+/// The identity of a recorded refund: a digest of the amount, transaction id
+/// and `recorded_at` of the record the order holds, which every write of a
+/// refund sets afresh. Each recorded refund mirrors once, with its own
+/// amount, however many events refer to it and whenever they are consumed;
+/// a refund recorded again after a reversal is another refund. `None` when
+/// the order holds no refund.
+async fn refund_key(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    external_refund: Option<&serde_json::Value>,
+) -> Result<Option<String>, sqlx::Error> {
+    let Some(refund) = external_refund else {
+        return Ok(None);
+    };
+    let Some(amount) = refund
+        .get("amount_minor")
+        .and_then(serde_json::Value::as_i64)
+    else {
+        return Ok(None);
+    };
+    let text = |name: &str| {
+        refund
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let identity = format!(
+        "{amount}|{}|{}",
+        text("transaction_id"),
+        text("recorded_at")
+    );
+    sqlx::query_scalar("SELECT md5($1)::uuid::text")
+        .bind(identity)
+        .fetch_one(&mut **tx)
+        .await
+        .map(Some)
+}
+
+/// A reversal was cancelled: the order's refund is now what it holds, if
+/// anything. Earlier refund mirrors are settled against it.
+async fn on_refund_reversed(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    now: DateTime<Utc>,
+    order_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    let external_refund: Option<Option<serde_json::Value>> =
+        sqlx::query_scalar("SELECT external_refund FROM orders WHERE id = $1")
+            .bind(order_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    let Some(external_refund) = external_refund else {
+        return Ok(());
+    };
+    let current = refund_key(tx, external_refund.as_ref()).await?;
+    ledger::on_refund_reversed(tx, now, order_id, current.as_deref()).await
 }
