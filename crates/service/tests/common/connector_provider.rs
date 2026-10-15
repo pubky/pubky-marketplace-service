@@ -97,6 +97,8 @@ pub struct TestStore {
     pub cancel_unknown_once: AtomicBool,
     pub last_order_push: Mutex<Option<OrderPush>>,
     pub last_refund: Mutex<Option<RefundRecord>>,
+    /// The amount of every refund the store was asked to record, in order.
+    pub refund_amounts: Mutex<Vec<Option<i64>>>,
     /// The client id of the app the last provider call carried.
     pub last_app: Mutex<Option<String>>,
     pub webhook_registrations: Mutex<Vec<String>>,
@@ -455,6 +457,11 @@ impl ConnectorProvider for TestProvider {
         self.store.refund_calls.fetch_add(1, Ordering::SeqCst);
         blob(connection)?;
         *self.store.last_refund.lock().expect("refund lock") = Some(refund.clone());
+        self.store
+            .refund_amounts
+            .lock()
+            .expect("refund amounts")
+            .push(refund.amount_minor);
         let mut orders = self.store.orders.lock().expect("orders lock");
         if let Some(remote) = orders.iter_mut().find(|remote| remote.id == order.id) {
             if !remote.refunds.contains(&refund.refund_id) {

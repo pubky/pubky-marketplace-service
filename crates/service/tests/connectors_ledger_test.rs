@@ -1686,3 +1686,174 @@ async fn a_refund_reversed_before_its_event_is_consumed_mirrors_nothing(pool: Pg
     assert_eq!(s.push().await.0, "created", "the reopened order is pushed");
     assert_eq!(s.store.refund_calls.load(Ordering::SeqCst), 0);
 }
+
+// === A refund reversed and recorded again ====================================
+
+/// What a cancelled reversal leaves on the order, and the event it emits: the
+/// order holds no refund and is open again. The revision moves on as it does
+/// for any order change.
+async fn reverse_the_refund(s: &Scenario) -> i64 {
+    let revision: i64 = sqlx::query_scalar(
+        "UPDATE orders SET state = 'return_received', external_refund = NULL, \
+         revision = revision + 1 WHERE id = $1::uuid RETURNING revision",
+    )
+    .bind(&s.order.order_id)
+    .fetch_one(&s.app.pool)
+    .await
+    .expect("reverse the refund");
+    sqlx::query(
+        "INSERT INTO events (id, command_id, aggregate_id, revision, actor_pubky, kind, \
+         occurred_at) VALUES ($1, $2, $3, $4, 'paypal', 'refund.reversal_cancelled', $5)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .bind(format!("order:{}", s.order.order_id))
+    .bind(revision)
+    .bind(s.app.clock.now())
+    .execute(&s.app.pool)
+    .await
+    .expect("reversal event");
+    revision
+}
+
+async fn record_the_refund_again(s: &Scenario, revision: i64, amount_minor: i64, txn: &str) {
+    let (status, body) = execute(
+        &s.app,
+        &s.seller.token,
+        &order_command(
+            "refund.record_external",
+            &s.order.order_id,
+            revision,
+            json!({ "amount_minor": amount_minor, "transaction_id": txn }),
+            1_216,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+fn refund_amounts(s: &Scenario) -> Vec<Option<i64>> {
+    s.store
+        .refund_amounts
+        .lock()
+        .expect("refund amounts")
+        .clone()
+}
+
+async fn refund_actions(s: &Scenario) -> Vec<(String, String)> {
+    sqlx::query_as(
+        "SELECT state, action_key FROM connector_order_actions WHERE kind = 'refund' \
+         ORDER BY created_at, id",
+    )
+    .fetch_all(&s.app.pool)
+    .await
+    .expect("refund actions")
+}
+
+async fn reversal_alerts(pool: &PgPool) -> i64 {
+    common::count(
+        pool,
+        "SELECT COUNT(*) FROM connector_alerts WHERE dedupe_key LIKE 'refund_reversed|%'",
+    )
+    .await
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_refund_recorded_again_after_a_reversal_reaches_the_store_once_with_its_own_amount(
+    pool: PgPool,
+) {
+    let s = scenario(pool).await;
+    s.pass().await;
+    assert_eq!(s.push().await.0, "created");
+    refund_order(&s).await;
+    let revision = reverse_the_refund(&s).await;
+    let second = s.order.total_minor / 2;
+    record_the_refund_again(&s, revision, second, "bitcoin-tx-2").await;
+
+    s.pass().await;
+    assert_eq!(
+        refund_amounts(&s),
+        vec![Some(second)],
+        "the store gets the second amount, once"
+    );
+    let actions = refund_actions(&s).await;
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0].0, "done");
+    assert_eq!(reversal_alerts(&s.app.pool).await, 0);
+
+    sqlx::query("UPDATE connector_event_cursor SET sequence = 0 WHERE name = 'events'")
+        .execute(&s.app.pool)
+        .await
+        .expect("rewind");
+    s.after(700);
+    s.pass().await;
+    assert_eq!(refund_amounts(&s), vec![Some(second)], "a replay adds none");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_refund_already_mirrored_when_it_is_reversed_is_flagged_and_the_new_one_mirrors_once(
+    pool: PgPool,
+) {
+    let s = scenario(pool).await;
+    s.pass().await;
+    refund_order(&s).await;
+    s.pass().await;
+    assert_eq!(refund_amounts(&s), vec![Some(s.order.total_minor)]);
+
+    let revision = reverse_the_refund(&s).await;
+    s.pass().await;
+    assert_eq!(reversal_alerts(&s.app.pool).await, 1);
+    let second = s.order.total_minor / 2;
+    record_the_refund_again(&s, revision, second, "bitcoin-tx-2").await;
+    s.pass().await;
+    assert_eq!(
+        refund_amounts(&s),
+        vec![Some(s.order.total_minor), Some(second)],
+        "the first refund cannot be unwound; the second is mirrored once with its amount"
+    );
+    assert_eq!(reversal_alerts(&s.app.pool).await, 1);
+    let (_, alerts) = api(
+        &s.app,
+        "GET",
+        "/v1/connectors/alerts?unresolved=true",
+        Some(&s.seller.token),
+        &json!(null),
+    )
+    .await;
+    assert_eq!(alerts["alerts"][0]["kind"], "action_quarantined");
+    assert_eq!(alerts["alerts"][0]["pubky_order_id"], s.order.order_id);
+    assert!(alerts["alerts"][0]["detail"]
+        .as_str()
+        .expect("detail")
+        .starts_with("refund_reversed"));
+    let states: Vec<String> = refund_actions(&s)
+        .await
+        .into_iter()
+        .map(|(state, _)| state)
+        .collect();
+    assert_eq!(states, vec!["done", "done"]);
+
+    s.pass().await;
+    assert_eq!(
+        reversal_alerts(&s.app.pool).await,
+        1,
+        "one alert per mirror"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_refund_reversed_before_it_reached_the_store_is_dropped_without_an_alert(pool: PgPool) {
+    let s = scenario(pool).await;
+    s.pass().await;
+    refund_order(&s).await;
+    worker::consume_events(&s.app.state).await.expect("consume");
+    assert_eq!(refund_actions(&s).await.len(), 1);
+
+    reverse_the_refund(&s).await;
+    worker::consume_events(&s.app.state).await.expect("consume");
+    assert_eq!(refund_actions(&s).await.len(), 0);
+    s.pass().await;
+    assert!(refund_amounts(&s).is_empty());
+    assert_eq!(s.store.refund_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(reversal_alerts(&s.app.pool).await, 0);
+}
