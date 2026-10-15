@@ -18,12 +18,25 @@ pub const COMMERCE_CONTRACT_VERSION: u64 = 1;
 pub struct ValidationIssue {
     pub path: String,
     pub message: String,
+    /// A stable snake_case token a client can branch on (the currency
+    /// refusals); absent for ordinary shape issues so their wire form is
+    /// unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 fn issue(path: &str, message: &str) -> ValidationIssue {
     ValidationIssue {
         path: path.to_string(),
         message: message.to_string(),
+        reason: None,
+    }
+}
+
+fn issue_with_reason(path: &str, message: &str, reason: &str) -> ValidationIssue {
+    ValidationIssue {
+        reason: Some(reason.to_string()),
+        ..issue(path, message)
     }
 }
 
@@ -1217,11 +1230,6 @@ fn content_hash_regex() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"^[a-f0-9]{64}$").expect("valid regex"))
 }
 
-fn currency_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^[A-Z][A-Z0-9]{2,11}$").expect("valid regex"))
-}
-
 fn country_code_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"^[A-Z]{2}$").expect("valid regex"))
@@ -1386,17 +1394,21 @@ fn validate_money(path: &str, money: &Money, issues: &mut Vec<ValidationIssue>) 
             "Expected a non-negative safe integer amount",
         ));
     }
-    if !currency_regex().is_match(&money.currency) {
-        issues.push(issue(
+    match crate::currency::refusal_reason(&money.currency, money.exponent) {
+        Some(crate::currency::REASON_CURRENCY_UNSUPPORTED) => issues.push(issue_with_reason(
             &format!("{path}.currency"),
-            "Expected an uppercase asset code",
-        ));
-    }
-    if !(0..=18).contains(&money.exponent) {
-        issues.push(issue(
+            &format!(
+                "Unsupported currency. Supported: {}",
+                crate::currency::SUPPORTED_CODES
+            ),
+            crate::currency::REASON_CURRENCY_UNSUPPORTED,
+        )),
+        Some(reason) => issues.push(issue_with_reason(
             &format!("{path}.exponent"),
-            "Expected an exponent between 0 and 18",
-        ));
+            "The exponent does not match the currency (JPY and SAT use 0, BTC 8, the others 2)",
+            reason,
+        )),
+        None => {}
     }
 }
 
@@ -1679,6 +1691,27 @@ fn validate_listing_payload(
             issues.push(issue(
                 "payload.digital_lock.criterionId",
                 "Expected a path-safe commerce identifier",
+            ));
+        }
+        // The Lock Server counts USD in cents and BTC in sats only, so a
+        // Locks price in any other currency could never be paid or verified.
+        // A currency that fails the registry check above has already been
+        // reported.
+        let locks_countable = crate::currency::Currency::for_money(
+            &payload.unit_price.currency,
+            payload.unit_price.exponent,
+        )
+        .is_some_and(crate::currency::Currency::locks_supported);
+        let already_reported = crate::currency::refusal_reason(
+            &payload.unit_price.currency,
+            payload.unit_price.exponent,
+        )
+        .is_some();
+        if !locks_countable && !already_reported {
+            issues.push(issue_with_reason(
+                "payload.unit_price.currency",
+                "A Locks listing can be priced only in USD, BTC or SAT",
+                crate::currency::REASON_LOCKS_CURRENCY_UNSUPPORTED,
             ));
         }
     }
@@ -2571,6 +2604,93 @@ mod tests {
                 "unit_price": { "amount_minor": 12_500, "currency": "USD", "exponent": 2 },
             },
         })
+    }
+
+    fn register_in(currency: &str, exponent: i32) -> Result<Command, Vec<ValidationIssue>> {
+        let mut command = register_command_json();
+        command["payload"]["unit_price"]["currency"] = json!(currency);
+        command["payload"]["unit_price"]["exponent"] = json!(exponent);
+        parse_command(&command)
+    }
+
+    #[test]
+    fn listing_prices_accept_exactly_the_registry_denominations() {
+        for (code, exponent) in [
+            ("USD", 2),
+            ("EUR", 2),
+            ("CHF", 2),
+            ("GBP", 2),
+            ("JPY", 0),
+            ("CAD", 2),
+            ("AUD", 2),
+            ("BTC", 8),
+            ("SAT", 0),
+        ] {
+            assert!(register_in(code, exponent).is_ok(), "{code}/{exponent}");
+        }
+        for (code, exponent, reason, path) in [
+            (
+                "SEK",
+                2,
+                "currency_unsupported",
+                "payload.unit_price.currency",
+            ),
+            (
+                "USDT",
+                6,
+                "currency_unsupported",
+                "payload.unit_price.currency",
+            ),
+            (
+                "eur",
+                2,
+                "currency_unsupported",
+                "payload.unit_price.currency",
+            ),
+            (
+                "EUR",
+                3,
+                "currency_exponent_mismatch",
+                "payload.unit_price.exponent",
+            ),
+            (
+                "JPY",
+                2,
+                "currency_exponent_mismatch",
+                "payload.unit_price.exponent",
+            ),
+            (
+                "SAT",
+                8,
+                "currency_exponent_mismatch",
+                "payload.unit_price.exponent",
+            ),
+            (
+                "BTC",
+                2,
+                "currency_exponent_mismatch",
+                "payload.unit_price.exponent",
+            ),
+        ] {
+            let issues = register_in(code, exponent).expect_err(code);
+            assert_eq!(issues.len(), 1, "{code}/{exponent}: {issues:?}");
+            assert_eq!(issues[0].path, path);
+            assert_eq!(issues[0].reason.as_deref(), Some(reason));
+        }
+    }
+
+    #[test]
+    fn shape_issues_keep_their_wire_form_without_a_reason() {
+        let issue = issue("payload.title", "Expected a title");
+        assert_eq!(
+            serde_json::to_value(&issue).unwrap(),
+            json!({ "path": "payload.title", "message": "Expected a title" })
+        );
+        let typed = issue_with_reason("p", "m", "currency_unsupported");
+        assert_eq!(
+            serde_json::to_value(&typed).unwrap(),
+            json!({ "path": "p", "message": "m", "reason": "currency_unsupported" })
+        );
     }
 
     #[test]

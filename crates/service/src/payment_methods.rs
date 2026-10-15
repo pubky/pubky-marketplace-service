@@ -35,7 +35,7 @@ use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use chrono::{DateTime, Utc};
 use marketplace_domain::commands::{DeliveryAddress, DeliveryEnvelope};
-use marketplace_domain::{ids, ErrorCode};
+use marketplace_domain::{ids, Currency, ErrorCode};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::{Postgres, Transaction};
@@ -839,6 +839,24 @@ fn paypal_return_url(app_base: &str) -> String {
 /// the payment itself completes, but the buyer is stranded on paypal.com
 /// instead of back on their order. `no_shipping`/`no_note` are set because
 /// the marketplace collects its own delivery address and messages.
+/// The decimal amount PayPal's `_xclick` form expects, in the order's own
+/// currency: exactly `exponent` fraction digits, and no decimal point at
+/// all for a zero-exponent currency such as JPY (PayPal does not accept
+/// fractional yen).
+fn paypal_amount(total_minor: i64, exponent: i32) -> String {
+    let exponent = u32::try_from(exponent).unwrap_or_default();
+    if exponent == 0 {
+        return total_minor.to_string();
+    }
+    let scale = 10_i64.pow(exponent);
+    format!(
+        "{}.{:0width$}",
+        total_minor / scale,
+        total_minor % scale,
+        width = exponent as usize
+    )
+}
+
 fn paypal_checkout_url(
     checkout_base: &str,
     merchant_email: &str,
@@ -849,13 +867,7 @@ fn paypal_checkout_url(
     if order.exponent < 0 || order.exponent > 4 {
         return Err("the order currency exponent is outside PayPal's supported range");
     }
-    let scale = 10_i64.pow(order.exponent as u32);
-    let amount = format!(
-        "{}.{:0width$}",
-        order.total_minor / scale,
-        order.total_minor % scale,
-        width = order.exponent as usize
-    );
+    let amount = paypal_amount(order.total_minor, order.exponent);
     let mut url =
         url::Url::parse(checkout_base).map_err(|_| "the PayPal checkout URL is invalid")?;
     url.query_pairs_mut()
@@ -1029,6 +1041,14 @@ enum RequestPlan {
         /// wanted.
         usdt_check: Option<UsdtCheck>,
     },
+}
+
+/// The USD conversion of a non-USD price: the cross rate of the snapshot and
+/// the USD cents the multi-asset request was denominated in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UsdConversionRecord {
+    cross: crate::fx::CrossRate,
+    cents: u64,
 }
 
 /// What the USDT amount of an offer is checked against.
@@ -1413,6 +1433,7 @@ pub async fn bind_payment_method(
         && state.config.paykit_marketplace_contract.is_multi_asset();
     let usdt_deployed = multi_contract && state.config.paykit_marketplace_assets.includes_usdt();
     let mut plan = RequestPlan::LegacySats;
+    let mut usd_conversion: Option<UsdConversionRecord> = None;
     let bitcoin_quote = if on_paykit {
         let bitcoin_enabled = config.as_ref().is_some_and(|config| config.bitcoin_enabled);
         // USDT rides the `paykit` method of a deployment that lists it, on
@@ -1445,86 +1466,110 @@ pub async fn bind_payment_method(
                 "Bitcoin payments are not enabled on this deployment.",
             );
         }
-        if matches!(
-            (order.currency.as_str(), order.exponent),
-            ("SAT", 0) | ("BTC", 8)
-        ) {
-            let sats = match bitcoin_amount_sats(&order) {
-                Some(sats) => sats,
-                None => {
-                    return method_error(
-                        ErrorCode::InvalidState,
-                        "invalid_sats",
-                        "The Bitcoin amount must be a positive satoshi amount.",
-                    )
+        match Currency::for_money(&order.currency, order.exponent) {
+            Some(currency) if currency.is_bitcoin() => {
+                let sats = match bitcoin_amount_sats(&order) {
+                    Some(sats) => sats,
+                    None => {
+                        return method_error(
+                            ErrorCode::InvalidState,
+                            "invalid_sats",
+                            "The Bitcoin amount must be a positive satoshi amount.",
+                        )
+                    }
+                };
+                if multi_contract {
+                    // The Bitcoin amount is the price itself. A USDT amount is
+                    // paykit-server's rate, which the service checks against its
+                    // own; without a readable rate USDT cannot be checked, so the
+                    // request narrows to Bitcoin (or, for a seller who takes only
+                    // USDT, the bind is refused like any unreadable feed).
+                    let (only, usdt_check) = if usdt_wanted {
+                        match crate::fx::reference_rate(&mut *tx, &state.config.fx_feed_url, now)
+                            .await
+                        {
+                            Ok((rate, _sample)) => (
+                                if bitcoin_enabled {
+                                    None
+                                } else {
+                                    Some(vec![AcceptedAsset::Usdt])
+                                },
+                                Some(UsdtCheck::Rate { sats, rate }),
+                            ),
+                            Err(error) if bitcoin_enabled => {
+                                tracing::warn!(
+                                    order_id = %order.id,
+                                    ?error,
+                                    "FX rate unavailable; offering Bitcoin only"
+                                );
+                                (Some(vec![AcceptedAsset::Btc]), None)
+                            }
+                            Err(error) => return fx_error_response(error),
+                        }
+                    } else {
+                        (Some(vec![AcceptedAsset::Btc]), None)
+                    };
+                    plan = RequestPlan::assets(PaymentAsset::Btc, sats, only, None, usdt_check);
                 }
-            };
-            if multi_contract {
-                // The Bitcoin amount is the price itself. A USDT amount is
-                // paykit-server's rate, which the service checks against its
-                // own; without a readable rate USDT cannot be checked, so the
-                // request narrows to Bitcoin (or, for a seller who takes only
-                // USDT, the bind is refused like any unreadable feed).
-                let (only, usdt_check) = if usdt_wanted {
-                    match crate::fx::reference_rate(&mut *tx, &state.config.fx_feed_url, now).await
+                bitcoin_enabled.then_some((None, sats))
+            }
+            Some(currency) if multi_contract && bind == BindMethod::Paykit => {
+                // Every fiat price is requested in USD cents: USD as it is,
+                // any other currency converted at the cross rate of one
+                // snapshot (rounded up), so USDT stays at parity with the
+                // request and paykit-server fixes the Bitcoin rate itself.
+                // Bitcoin is offered only while the seller takes it and the
+                // service's own BTC<CCY> quote can guard paykit-server's
+                // fixed amount.
+                let needs_quote = bitcoin_enabled || currency != Currency::Usd;
+                let quote = if needs_quote {
+                    match crate::fx::quote_order(
+                        &mut tx,
+                        &state.config.fx_feed_url,
+                        currency,
+                        order.total_minor,
+                        now,
+                    )
+                    .await
                     {
-                        Ok((rate, _sample)) => (
-                            if bitcoin_enabled {
-                                None
-                            } else {
-                                Some(vec![AcceptedAsset::Usdt])
-                            },
-                            Some(UsdtCheck::Rate { sats, rate }),
-                        ),
-                        Err(error) if bitcoin_enabled => {
+                        Ok(quote) => Some(quote),
+                        // A USD price needs no feed for USDT at parity, so an
+                        // unreadable feed narrows the request instead of
+                        // refusing the bind. Any other currency needs the
+                        // feed for its USD amount: nothing to narrow to.
+                        Err(error) if currency == Currency::Usd && usdt_wanted => {
                             tracing::warn!(
                                 order_id = %order.id,
                                 ?error,
-                                "FX rate unavailable; offering Bitcoin only"
+                                "FX quote unavailable; offering USDT only"
                             );
-                            (Some(vec![AcceptedAsset::Btc]), None)
+                            None
                         }
                         Err(error) => return fx_error_response(error),
                     }
                 } else {
-                    (Some(vec![AcceptedAsset::Btc]), None)
-                };
-                plan = RequestPlan::assets(PaymentAsset::Btc, sats, only, None, usdt_check);
-            }
-            bitcoin_enabled.then_some((None, sats))
-        } else if order.currency == "USD" && order.exponent == 2 {
-            if multi_contract && bind == BindMethod::Paykit {
-                let total_cents = u64::try_from(order.total_minor).unwrap_or_default();
-                // Bitcoin is offered only while the seller takes it and the
-                // service quote can guard paykit-server's fixed amount; with
-                // USDT available a feed that cannot be read narrows the
-                // request instead of refusing the bind.
-                let quoted = if bitcoin_enabled {
-                    Some(
-                        crate::fx::quote_usd(
-                            &mut *tx,
-                            &state.config.fx_feed_url,
-                            order.total_minor,
-                            order.exponent,
-                            now,
-                        )
-                        .await,
-                    )
-                } else {
                     None
                 };
-                let (quote, only) = match (quoted, usdt_wanted) {
-                    (Some(Ok(quote)), true) => (Some(quote), None),
-                    (Some(Ok(quote)), false) => (Some(quote), Some(vec![AcceptedAsset::Btc])),
+                let cents = match &quote {
+                    Some(quote) => quote.usd.cents,
+                    None => u64::try_from(order.total_minor).unwrap_or_default(),
+                };
+                let guard = match (&quote, bitcoin_enabled) {
+                    (Some(quote), true) => Some(quote.sats),
+                    _ => None,
+                };
+                let (only, guard_sats) = match (guard, usdt_wanted) {
+                    (Some(Ok(sats)), true) => (None, Some(sats)),
+                    (Some(Ok(sats)), false) => (Some(vec![AcceptedAsset::Btc]), Some(sats)),
                     (Some(Err(error)), true) => {
                         tracing::warn!(
                             order_id = %order.id,
                             ?error,
-                            "FX quote unavailable; offering USDT only"
+                            "Bitcoin guard unavailable; offering USDT only"
                         );
-                        (None, Some(vec![AcceptedAsset::Usdt]))
+                        (Some(vec![AcceptedAsset::Usdt]), None)
                     }
-                    (None, true) => (None, Some(vec![AcceptedAsset::Usdt])),
+                    (None, true) => (Some(vec![AcceptedAsset::Usdt]), None),
                     (Some(Err(error)), false) => return fx_error_response(error),
                     (None, false) => {
                         return method_error(
@@ -1536,20 +1581,29 @@ pub async fn bind_payment_method(
                 };
                 plan = RequestPlan::assets(
                     PaymentAsset::Usd,
-                    total_cents,
+                    cents,
                     only,
-                    quote.as_ref().map(|(_, _, sats)| *sats),
+                    guard_sats,
                     usdt_wanted.then_some(UsdtCheck::Parity {
-                        cents: order.total_minor,
+                        cents: i64::try_from(cents).unwrap_or_default(),
                     }),
                 );
-                quote.map(|(rate, sample, sats)| (Some((rate, sample)), sats))
-            } else {
-                let (rate, sample, sats) = match crate::fx::quote_usd(
+                if let Some(cross) = quote.as_ref().and_then(|quote| quote.usd.cross.clone()) {
+                    usd_conversion = Some(UsdConversionRecord { cross, cents });
+                }
+                match (quote, guard_sats) {
+                    (Some(quote), Some(sats)) => {
+                        Some((Some((quote.direct.rate.clone(), quote.direct)), sats))
+                    }
+                    _ => None,
+                }
+            }
+            Some(currency) => {
+                let (rate, sample, sats) = match crate::fx::quote_fiat(
                     &mut *tx,
                     &state.config.fx_feed_url,
+                    currency,
                     order.total_minor,
-                    order.exponent,
                     now,
                 )
                 .await
@@ -1568,12 +1622,14 @@ pub async fn bind_payment_method(
                 }
                 Some((Some((rate, sample)), sats))
             }
-        } else {
-            return method_error(
-                ErrorCode::InvalidState,
-                "currency_unsupported",
-                "Bitcoin binding supports only USD/2, BTC/8, and SAT/0 orders.",
-            );
+            None => {
+                return method_error(
+                    ErrorCode::InvalidState,
+                    "currency_unsupported",
+                    "Bitcoin binding supports only USD, EUR, CHF, GBP, JPY, CAD, AUD, BTC/8 \
+                     and SAT/0 orders.",
+                )
+            }
         }
     } else {
         None
@@ -1694,7 +1750,9 @@ pub async fn bind_payment_method(
          paykit_operation_id = NULL, paykit_payment_window_seconds = NULL, paykit_asset = NULL, \
          paykit_amount_minor = NULL, paykit_accepted_assets = NULL, \
          paykit_payment_amounts = NULL, payment_finality = NULL, payment_finality_at = NULL, \
-         paykit_second_rail_at = NULL, \
+         paykit_second_rail_at = NULL, usd_conversion_pair = NULL, usd_conversion_source = NULL, \
+         usd_conversion_usd_rate = NULL, usd_conversion_currency_rate = NULL, \
+         usd_conversion_fetched_at = NULL, usd_conversion_cents = NULL, \
          updated_at = $5 WHERE id = $1 RETURNING {}",
         crate::queries::ORDER_COLUMNS
     ))
@@ -2164,7 +2222,10 @@ pub async fn bind_payment_method(
                  paykit_payment_reference = $21, paykit_operation_id = $22, \
                  paykit_payment_window_seconds = $23, paykit_asset = $24, \
                  paykit_amount_minor = $25, paykit_accepted_assets = $26, \
-                 paykit_payment_amounts = $27 \
+                 paykit_payment_amounts = $27, usd_conversion_pair = $28, \
+                 usd_conversion_source = $29, usd_conversion_usd_rate = $30, \
+                 usd_conversion_currency_rate = $31, usd_conversion_fetched_at = $32, \
+                 usd_conversion_cents = $33 \
                  WHERE id = $1",
             )
             .bind(order.id)
@@ -2247,6 +2308,30 @@ pub async fn bind_payment_method(
             .bind(assets_terms.as_ref().map(|(amount, _, _)| *amount))
             .bind(assets_terms.as_ref().map(|(_, accepted, _)| accepted.clone()))
             .bind(assets_terms.as_ref().map(|(_, _, amounts)| amounts.clone()))
+            .bind(
+                usd_conversion
+                    .as_ref()
+                    .map(|record| record.cross.pair.clone()),
+            )
+            .bind(usd_conversion.as_ref().map(|_| crate::fx::FX_SOURCE))
+            .bind(usd_conversion.as_ref().map(|record| {
+                sqlx::types::BigDecimal::from_str(&record.cross.usd_rate.to_string_value())
+                    .expect("FX rate is a valid decimal")
+            }))
+            .bind(usd_conversion.as_ref().map(|record| {
+                sqlx::types::BigDecimal::from_str(&record.cross.currency_rate.to_string_value())
+                    .expect("FX rate is a valid decimal")
+            }))
+            .bind(
+                usd_conversion
+                    .as_ref()
+                    .map(|record| record.cross.fetched_at),
+            )
+            .bind(
+                usd_conversion
+                    .as_ref()
+                    .map(|record| i64::try_from(record.cents).expect("converted cents fit i64")),
+            )
             .execute(&mut *tx)
             .await?;
             // The payment is typed in the asset it is settled in: satoshis
@@ -3151,6 +3236,35 @@ pub async fn paypal_ipn(State(state): State<AppState>, body: String) -> Response
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     StatusCode::OK.into_response()
+}
+
+#[cfg(test)]
+mod paypal_amount_tests {
+    use super::paypal_amount;
+
+    #[test]
+    fn two_decimal_currencies_carry_exactly_two_fraction_digits() {
+        assert_eq!(paypal_amount(13_700, 2), "137.00");
+        assert_eq!(paypal_amount(13_705, 2), "137.05");
+        assert_eq!(paypal_amount(5, 2), "0.05");
+        assert_eq!(paypal_amount(100, 2), "1.00");
+        assert_eq!(paypal_amount(0, 2), "0.00");
+    }
+
+    #[test]
+    fn a_zero_exponent_currency_has_no_decimal_point() {
+        // PayPal refuses fractional yen; `1000.0` is not `1000`.
+        assert_eq!(paypal_amount(13_700, 0), "13700");
+        assert_eq!(paypal_amount(1, 0), "1");
+        assert_eq!(paypal_amount(0, 0), "0");
+    }
+
+    #[test]
+    fn higher_exponents_pad_their_fraction() {
+        assert_eq!(paypal_amount(1_234, 3), "1.234");
+        assert_eq!(paypal_amount(7, 3), "0.007");
+        assert_eq!(paypal_amount(12_345, 4), "1.2345");
+    }
 }
 
 #[cfg(test)]

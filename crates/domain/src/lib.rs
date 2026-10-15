@@ -8,6 +8,7 @@
 //!   `contracts/state-machines.json` for cross-language contract tests.
 
 pub mod commands;
+pub mod currency;
 pub mod error;
 pub mod ids;
 pub mod money;
@@ -16,5 +17,6 @@ pub mod pubky;
 pub mod state_machines;
 
 pub use commands::{Command, CommandPayload, ValidationIssue, COMMERCE_CONTRACT_VERSION};
+pub use currency::Currency;
 pub use error::ErrorCode;
 pub use money::Money;
