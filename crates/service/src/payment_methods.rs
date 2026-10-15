@@ -1498,7 +1498,7 @@ pub async fn bind_payment_method(
                 let needs_quote = bitcoin_enabled || currency != Currency::Usd;
                 let quote = if needs_quote {
                     match crate::fx::quote_order(
-                        &mut *tx,
+                        &mut tx,
                         &state.config.fx_feed_url,
                         currency,
                         order.total_minor,
