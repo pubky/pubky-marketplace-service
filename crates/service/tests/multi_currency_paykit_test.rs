@@ -12,7 +12,7 @@ mod common;
 use axum::http::StatusCode;
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use common::fx_feed::{fx_body_multi, FakeFxFeed};
-use common::paykit_review::resolve_call;
+use common::paykit_review::{poll_now, resolve_call};
 use common::*;
 use marketplace_domain::currency::Currency;
 use marketplace_service::clock::Clock;
@@ -740,4 +740,112 @@ async fn a_usdt_refund_of_a_non_usd_order_is_recorded_in_usdt_units_and_capped_a
         "a EUR-priced order refunds in USDT0 millionths, the amount paid"
     );
     assert_eq!(view["total"]["currency"], json!("EUR"));
+}
+
+/// An active EUR order (13,700 EUR minor units, 15,909 USD cents) offering
+/// both assets, as paykit-server reports it.
+fn eur_status(invoice: Uuid, deadline: DateTime<Utc>, usdt: Option<Value>) -> Value {
+    let paid = usdt.is_some();
+    json!({
+        "invoice_id": invoice,
+        "state": "active",
+        "proposal_delivery_state": "delivered",
+        "request_state": "accepted",
+        "payment_state": if paid { "confirmed" } else { "undetected" },
+        "activated_at": (deadline - Duration::minutes(30)).to_rfc3339_opts(SecondsFormat::Micros, true),
+        "payment_deadline": deadline.to_rfc3339_opts(SecondsFormat::Micros, true),
+        "bitcoin": null,
+        "usdt_arbitrum": usdt,
+        "accepted_assets": ["BTC", "USDT"],
+        "payment_amounts": {
+            "BTC": paykit_sats(15_909).to_string(),
+            "USDT": (15_909u64 * 10_000).to_string(),
+        },
+        "paid_asset": if paid { json!("USDT") } else { json!(null) },
+        "outcome": null,
+        "resolved_at": null,
+    })
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_non_usd_usdt_payment_stuck_at_its_finality_bound_is_held_with_its_conversion(
+    pool: PgPool,
+) {
+    for reverted in [false, true] {
+        let f = fixture(pool.clone(), Setup::both("EUR")).await;
+        let order = checkout(&f).await;
+        let order_id = order.order_id.clone();
+        let (status, body) = bind(&f, &order_id, "paykit").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        drain(&f).await;
+        let (invoice, deadline): (Uuid, DateTime<Utc>) =
+            sqlx::query_as("SELECT paykit_invoice_id, paykit_expires_at FROM orders WHERE id = $1")
+                .bind(uuid(&order_id))
+                .fetch_one(&pool)
+                .await
+                .expect("order");
+        let included = json!({
+            "tx_hash": TX_HASH,
+            "observed_amount": (15_909u64 * 10_000).to_string(),
+            "confirmations": 1,
+            "amount_matched": true,
+            "paid_on_time": true,
+            "finalized": false,
+        });
+        let day = |days: i64| Utc::now() + Duration::days(days);
+        f.paykit
+            .set_marketplace_status(invoice, eur_status(invoice, deadline, Some(included)));
+        poll_now(&f.app, day(0)).await;
+        if reverted {
+            f.paykit
+                .set_marketplace_status(invoice, eur_status(invoice, deadline, None));
+            poll_now(&f.app, day(1)).await;
+        }
+        let expected = if reverted { "reverted" } else { "pending" };
+        let view = read_order(&f, &f.buyer.token, &order_id).await;
+        assert_eq!(view["payment_finality"], json!(expected));
+        assert_eq!(view["state"], json!("paid"));
+
+        poll_now(&f.app, day(9)).await;
+        let queue = marketplace_service::paykit_attempts::list_needs_review(&pool)
+            .await
+            .expect("queue");
+        let row = queue
+            .iter()
+            .find(|row| row.order_id == uuid(&order_id))
+            .unwrap_or_else(|| panic!("{expected}: the stuck payment is held for an operator"));
+        assert_eq!(row.review_reason, "detected_unconfirmed");
+        assert_eq!(
+            row.observation.as_ref().expect("observation")["status"],
+            json!(format!("usdt_finality_{expected}"))
+        );
+
+        // The held row keeps the conversion that priced the request, and the
+        // order keeps its own record and projection.
+        let pinned: (Option<String>, Option<i64>, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT usd_conversion_pair, usd_conversion_cents, usd_conversion_usd_rate::text, \
+             usd_conversion_currency_rate::text FROM paykit_superseded_attempts \
+             WHERE order_id = $1 AND invoice_id = $2",
+        )
+        .bind(uuid(&order_id))
+        .bind(invoice)
+        .fetch_one(&pool)
+        .await
+        .expect("the held row");
+        assert_eq!(
+            pinned,
+            (
+                Some("EURUSD".to_string()),
+                Some(15_909),
+                Some("77197".to_string()),
+                Some("66481".to_string())
+            ),
+            "{expected}"
+        );
+        let view = read_order(&f, &f.buyer.token, &order_id).await;
+        assert_eq!(view["fx_conversion"]["to"]["amount_minor"], json!(15_909));
+        assert_eq!(view["payment_finality"], json!(expected));
+        assert_eq!(view["state"], json!("paid"), "fulfilment stays blocked");
+        assert_eq!(view["total"]["currency"], json!("EUR"));
+    }
 }
