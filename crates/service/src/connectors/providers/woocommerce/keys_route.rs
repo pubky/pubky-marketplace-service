@@ -1,5 +1,7 @@
-//! `PUT /v1/connectors/{id}/woocommerce/keys`: the pasted-keys way to connect a
-//! WooCommerce store, for merchants whose site blocks the one-click flow.
+//! `PUT /v1/connectors/{id}/woocommerce/keys` and `PUT /v1/connectors/{id}/credentials`
+//! with `{consumer_key, consumer_secret}` (the Shop's credentials form): the
+//! pasted-keys way to connect a WooCommerce store, for merchants whose site
+//! blocks the one-click flow. Both end in [`connect_with_keys`].
 //!
 //! This file is compiled as a child module of `connectors::routes` (see the
 //! `#[path]` declaration at the end of that file) so it shares the route
@@ -36,12 +38,31 @@ pub async fn put_keys(
         Ok(runtime) => runtime,
         Err(response) => return response,
     };
-    let Some(provider) = runtime.providers.get(ProviderKind::Woocommerce) else {
-        return provider_unavailable();
-    };
     let row = match owned(&state, &actor, &id).await {
         Ok(row) => row,
         Err(response) => return response,
+    };
+    connect_with_keys(
+        &state,
+        runtime,
+        row,
+        request.consumer_key,
+        request.consumer_secret,
+    )
+    .await
+}
+
+/// Verifies a pasted key pair against the store of the seller's own draft and
+/// connects it, exactly as the wc-auth callback does.
+pub async fn connect_with_keys(
+    state: &AppState,
+    runtime: &std::sync::Arc<ConnectorRuntime>,
+    row: ConnectionRow,
+    consumer_key: String,
+    consumer_secret: String,
+) -> Response {
+    let Some(provider) = runtime.providers.get(ProviderKind::Woocommerce) else {
+        return provider_unavailable();
     };
     let now = state.clock.now();
     let still_draft = row.status == "draft"
@@ -54,7 +75,7 @@ pub async fn put_keys(
             "This connection is not waiting for keys. Start a new WooCommerce connection first.",
         );
     }
-    let keys = match ApiKeys::parse(&request.consumer_key, &request.consumer_secret) {
+    let keys = match ApiKeys::parse(&consumer_key, &consumer_secret) {
         Ok(keys) => keys,
         Err(ProviderError::Invalid(message)) => {
             return error(StatusCode::UNPROCESSABLE_ENTITY, "invalid_keys", &message)
@@ -123,7 +144,7 @@ pub async fn put_keys(
     )
     .await
     {
-        Ok(connected) => connected_json(&state, runtime, &connected).await,
+        Ok(connected) => connected_json(state, runtime, &connected).await,
         Err(CompleteError::ShopInUse) => error(
             StatusCode::CONFLICT,
             "shop_in_use",

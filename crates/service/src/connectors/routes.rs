@@ -578,7 +578,12 @@ pub async fn start_connect(
     };
     let started = match call(runtime, provider.connect(&connect)).await {
         Ok(started) => started,
-        Err(failure) => return provider_failure(StatusCode::BAD_GATEWAY, failure),
+        Err(failure) => {
+            if let Err(cause) = store::discard_new_draft(&state.pool, row.id).await {
+                tracing::warn!(error = %cause, "a refused connect left its draft behind");
+            }
+            return provider_failure(StatusCode::BAD_GATEWAY, failure);
+        }
     };
     let view = match connection_view(&state, runtime, &row).await {
         Ok(view) => view,
@@ -598,8 +603,15 @@ pub async fn start_connect(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PutCredentialsRequest {
+    #[serde(default)]
     client_id: String,
+    #[serde(default)]
     client_secret: String,
+    /// WooCommerce's pasted REST key pair, routed to the provider's own flow.
+    #[serde(default)]
+    consumer_key: Option<String>,
+    #[serde(default)]
+    consumer_secret: Option<String>,
 }
 
 impl std::fmt::Debug for PutCredentialsRequest {
@@ -634,6 +646,18 @@ pub async fn put_credentials(
         Ok(row) => row,
         Err(response) => return response,
     };
+    if row.provider_kind() == Some(ProviderKind::Woocommerce)
+        && (request.consumer_key.is_some() || request.consumer_secret.is_some())
+    {
+        return woocommerce_keys::connect_with_keys(
+            &state,
+            runtime,
+            row,
+            request.consumer_key.unwrap_or_default(),
+            request.consumer_secret.unwrap_or_default(),
+        )
+        .await;
+    }
     let supported = row
         .provider_kind()
         .and_then(|kind| runtime.providers.get(kind))

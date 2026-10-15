@@ -571,6 +571,9 @@ async fn run_action(
                     .get("full")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false),
+                quote: payload
+                    .get("quote")
+                    .and_then(|quote| serde_json::from_value(quote.clone()).ok()),
             };
             with_timeout(timeout, provider.record_refund(context, order, &refund)).await
         }

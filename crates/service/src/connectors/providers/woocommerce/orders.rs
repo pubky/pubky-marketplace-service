@@ -19,6 +19,7 @@ use crate::connectors::provider::{
 use super::api::Api;
 use super::catalog::id_of;
 use super::money;
+use super::refund_quote;
 
 pub const META_ORDER_ID: &str = "pubky_order_id";
 pub const META_CANCELLED: &str = "pubky_cancelled";
@@ -363,16 +364,28 @@ pub async fn record_refund(
         return Ok(());
     }
 
-    let amount = if refund.full {
+    let mut basis: Option<String> = None;
+    let mut amount = if refund.full {
         remaining
     } else {
         match refund.amount_minor {
             Some(amount) if refund.amount_unit.eq_ignore_ascii_case(&currency) => amount,
-            _ => {
+            Some(amount) => {
+                if refund.order_currency.eq_ignore_ascii_case(&currency) && refund.order_exponent == exponent {
+                    let converted = refund_quote::convert(refund, amount)?;
+                    basis = Some(converted.basis);
+                    converted.minor
+                } else {
+                    return Err(rejected(
+                        "refund_basis_unavailable",
+                        "The store order is in another currency than the Pubky order.",
+                    ));
+                }
+            }
+            None => {
                 return Err(rejected(
                     "refund_not_in_store_currency",
-                    "A partial refund paid in another unit cannot be valued in the store's \
-                     currency; record it in the store by hand.",
+                    "The refund carries no amount to record; record it in the store by hand.",
                 ))
             }
         }
@@ -380,16 +393,25 @@ pub async fn record_refund(
     if amount <= 0 {
         return Ok(());
     }
+    // A converted amount rounds to the nearest minor unit, so the last partial
+    // refund may overshoot what is left by that one unit: cap it there. Any
+    // other excess is refused.
+    if basis.is_some() && amount > remaining && amount - remaining <= 1 {
+        amount = remaining;
+    }
     if amount > remaining {
         return Err(rejected(
             "refund_exceeds_order",
             "The refund is more than what is left to refund on the store order.",
         ));
     }
-    let reason: String = format!("{REFUND_REASON_PREFIX} {}", refund.refund_id)
-        .chars()
-        .take(200)
-        .collect();
+    let reason: String = match &basis {
+        Some(basis) => format!("{REFUND_REASON_PREFIX} {}: {basis}", refund.refund_id),
+        None => format!("{REFUND_REASON_PREFIX} {}", refund.refund_id),
+    }
+    .chars()
+    .take(200)
+    .collect();
     api.post(
         &format!("/orders/{id}/refunds"),
         &json!({

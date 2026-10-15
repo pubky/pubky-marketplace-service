@@ -533,6 +533,7 @@ fn refund(
         order_currency: order.currency.clone(),
         order_exponent: order.exponent,
         full,
+        quote: None,
     }
 }
 

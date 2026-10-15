@@ -10,6 +10,9 @@
 //! * grouped, external, draft, pending and private-draft products are not
 //!   sellable through a push and are skipped, as are variations without a
 //!   price;
+//! * categories are the store's category names; attributes that do not pick a
+//!   variant (all of a simple product's, a variable product's non-variation
+//!   ones) are `attributes`, the picking ones are `options`;
 //! * prices are the store's current price (sale price while a sale runs) in
 //!   minor units of the store currency;
 //! * stock is exact when WooCommerce manages it (the variation's own count, or
@@ -163,6 +166,49 @@ fn variation_options(product: &Value) -> Vec<CatalogOption> {
         .unwrap_or_default()
 }
 
+/// Attributes that describe the product without picking a variant (material,
+/// brand, and every attribute of a simple product).
+fn descriptive_attributes(product: &Value) -> Vec<CatalogOption> {
+    product
+        .get("attributes")
+        .and_then(Value::as_array)
+        .map(|attributes| {
+            attributes
+                .iter()
+                .filter(|attribute| attribute.get("variation").and_then(Value::as_bool) != Some(true))
+                .filter_map(|attribute| {
+                    let name = text::title(attribute.get("name")?.as_str()?);
+                    let values: Vec<String> = attribute
+                        .get("options")?
+                        .as_array()?
+                        .iter()
+                        .filter_map(|value| value.as_str().map(text::title))
+                        .filter(|value| !value.is_empty())
+                        .collect();
+                    (!name.is_empty() && !values.is_empty()).then_some(CatalogOption { name, values })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn categories(product: &Value) -> Vec<String> {
+    let mut names: Vec<String> = product
+        .get("categories")
+        .and_then(Value::as_array)
+        .map(|categories| {
+            categories
+                .iter()
+                .filter_map(|category| category.get("name")?.as_str())
+                .map(text::title)
+                .filter(|name| !name.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.dedup();
+    names
+}
+
 fn description(product: &Value) -> Option<String> {
     let full = text::plain_text(&string(product, "description"));
     let chosen = if full.is_empty() {
@@ -265,6 +311,8 @@ pub fn normalize_product(
         },
         image_urls: images,
         variants,
+        categories: categories(product),
+        attributes: descriptive_attributes(product),
     })
 }
 
@@ -281,7 +329,9 @@ mod tests {
             "sku": "PUBKY-TEST", "price": "12.50", "manage_stock": true, "stock_quantity": 10,
             "stock_status": "instock",
             "images": [{"id": 1, "src": "https://shop.example/a.png"}, {"src": "javascript:alert(1)"}],
-            "attributes": [], "variations": []
+            "categories": [{"id": 15, "name": "Clothing &amp; Gear"}, {"id": 16, "name": "Socks"}],
+            "attributes": [{"name": "Material", "variation": false, "options": ["Wool", "Cotton"]}],
+            "variations": []
         })
     }
 
@@ -363,6 +413,8 @@ mod tests {
         assert_eq!(normalized.options.len(), 1);
         assert_eq!(normalized.options[0].name, "Size");
         assert_eq!(normalized.options[0].values, vec!["S", "M", "L"]);
+        assert_eq!(normalized.attributes.len(), 1, "the non-variation attribute is descriptive");
+        assert_eq!(normalized.attributes[0].name, "Material");
         let ids: Vec<&str> = normalized
             .variants
             .iter()

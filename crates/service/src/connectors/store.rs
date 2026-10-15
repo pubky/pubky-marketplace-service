@@ -241,6 +241,23 @@ pub async fn bind_launch(
     .await
 }
 
+/// Removes a draft that [`begin_draft`] just inserted when the provider then
+/// refused the connect, so a refused attempt leaves nothing behind and never
+/// counts toward the seller's limit. A draft that already existed (a restart
+/// of the same store, whose row `begin_draft` reuses and updates) is kept: it
+/// has `updated_at` after `created_at`, a fresh insert has them equal.
+pub async fn discard_new_draft(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
+    let removed = sqlx::query(
+        "DELETE FROM connector_connections \
+         WHERE id = $1 AND status = 'draft' AND created_at = updated_at",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(removed == 1)
+}
+
 #[derive(Debug)]
 pub enum CompleteError {
     /// The state was already used or the connection changed meanwhile.

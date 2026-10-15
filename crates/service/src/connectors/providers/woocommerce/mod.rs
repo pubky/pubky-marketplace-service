@@ -32,6 +32,7 @@ pub mod creds;
 pub mod http;
 pub mod money;
 pub mod orders;
+pub mod refund_quote;
 pub mod site;
 pub mod text;
 pub mod webhooks;
@@ -60,7 +61,7 @@ const VARIATIONS_PER_PAGE: u32 = 100;
 const MAX_VARIATION_PAGES: u32 = 10;
 const PRODUCT_FIELDS: &str =
     "id,name,type,status,permalink,description,short_description,sku,price,\
-manage_stock,stock_quantity,stock_status,images,attributes,variations,parent_id";
+manage_stock,stock_quantity,stock_status,images,categories,attributes,variations,parent_id";
 const VARIATION_FIELDS: &str =
     "id,status,sku,price,manage_stock,stock_quantity,stock_status,attributes,image";
 
