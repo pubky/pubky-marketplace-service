@@ -72,8 +72,9 @@ trusts the local CA.
 
 ## Recording again
 
-Needs Docker and a PostgreSQL on `DATABASE_URL` (`docker compose up postgres`
-at the repository root). On a VM where containers cannot reach each other,
+Needs Docker and a PostgreSQL for the `#[sqlx::test]` databases
+(`DATABASE_URL`, default `postgres://postgres:postgres@localhost:5432/postgres`,
+`max_connections` above 100). On a VM where containers cannot reach each other,
 `sudo iptables -P FORWARD ACCEPT` (and the `iptables-legacy` one) fixes it.
 
 ```sh
