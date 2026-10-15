@@ -3,7 +3,13 @@ query OrderTransactions($id: ID!) {
     id
     currencyCode
     cancelledAt
-    transactions(first: 20) {
+    totalRefundedSet {
+      shopMoney {
+        amount
+        currencyCode
+      }
+    }
+    transactions(first: 50) {
       id
       kind
       status

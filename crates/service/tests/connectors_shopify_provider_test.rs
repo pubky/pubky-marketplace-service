@@ -67,7 +67,9 @@ fn push(total_extra: i64) -> OrderPush {
     }
 }
 
-fn refund(id: &str, full: bool, amount: Option<i64>, unit: &str) -> RefundRecord {
+/// A Pubky refund record: `amount` is what the Pubky books show refunded in
+/// total, in the order currency's minor units.
+fn refund(id: &str, amount: Option<i64>, unit: &str) -> RefundRecord {
     RefundRecord {
         refund_id: id.into(),
         pubky_order_id: order_id(),
@@ -77,7 +79,8 @@ fn refund(id: &str, full: bool, amount: Option<i64>, unit: &str) -> RefundRecord
         order_total_minor: 26200,
         order_currency: "USD".into(),
         order_exponent: 2,
-        full,
+        full: amount == Some(26200),
+        basis: Some("Amount recorded in USD, the order currency; no currency conversion. Paid with Bitcoin. Order quote: BTCUSD 98123.45 from feed-x at 2026-10-15T08:00:00.000Z.".into()),
     }
 }
 
@@ -274,6 +277,13 @@ async fn an_order_in_another_currency_or_that_does_not_add_up_is_refused_unsent(
         .await
         .expect_err("refused");
     assert!(matches!(error, ProviderError::Rejected { code, .. } if code == "total_mismatch"));
+    let mut odd = push(0);
+    odd.exponent = 0;
+    let error = provider
+        .push_order(&connection, &odd)
+        .await
+        .expect_err("refused");
+    assert!(matches!(error, ProviderError::Rejected { code, .. } if code == "exponent_mismatch"));
     assert!(fake.calls("OrderCreate").is_empty());
     fake.assert_clean();
 }
@@ -388,7 +398,7 @@ async fn a_refund_is_recorded_once_per_pubky_refund_with_a_manual_transaction() 
         .push_order(&connection, &push(0))
         .await
         .expect("pushed");
-    let partial = refund("refund-a", false, Some(5000), "usd");
+    let partial = refund("refund-a", Some(5000), "usd");
     provider
         .record_refund(&connection, &order, &partial)
         .await
@@ -400,7 +410,7 @@ async fn a_refund_is_recorded_once_per_pubky_refund_with_a_manual_transaction() 
     assert_eq!(
         fake.orders()[0].refunds.len(),
         1,
-        "the idempotency key makes the replay a no-op"
+        "a replay finds the refund already in the store and sends nothing"
     );
     let input = &fake.orders()[0].refunds[0];
     assert_eq!(input["transactions"][0]["kind"], "REFUND");
@@ -411,34 +421,70 @@ async fn a_refund_is_recorded_once_per_pubky_refund_with_a_manual_transaction() 
         .expect("parent")
         .contains("OrderTransaction"));
     assert_eq!(input["notify"], false);
-    assert!(
-        input.get("refundLineItems").is_none(),
-        "a Pubky refund does not restock"
-    );
+    assert!(input.get("refundLineItems").is_none(), "a Pubky refund does not restock");
+    let note = input["note"].as_str().expect("note");
+    assert!(note.contains("no currency conversion") && note.contains("BTCUSD 98123.45"), "{note}");
+    assert!(note.ends_with("pubky-refund:refund-a:5000:USD"), "{note}");
+    fake.assert_clean();
+}
 
-    provider
-        .record_refund(&connection, &order, &refund("refund-b", true, None, ""))
+#[tokio::test]
+async fn a_full_refund_after_a_partial_one_refunds_only_the_difference() {
+    let (fake, provider, connection) = setup().await;
+    let order = provider
+        .push_order(&connection, &push(0))
         .await
-        .expect("full refund");
+        .expect("pushed");
+    provider
+        .record_refund(&connection, &order, &refund("refund-a", Some(5000), "usd"))
+        .await
+        .expect("partial");
+    provider
+        .record_refund(&connection, &order, &refund("refund-b", Some(26200), "usd"))
+        .await
+        .expect("full after partial");
     let refunds = fake.orders()[0].refunds.clone();
     assert_eq!(refunds.len(), 2);
-    assert_eq!(refunds[1]["transactions"][0]["amount"], "262.00");
+    assert_eq!(refunds[1]["transactions"][0]["amount"], "212.00");
+    assert_eq!(fake.orders()[0].refunded_minor(), 26200, "the store never shows more than was paid");
     let keys: Vec<String> = fake
         .calls("RefundCreate")
         .iter()
-        .map(|call| {
-            call.document
-                .split("@idempotent(key: \"")
-                .nth(1)
-                .expect("key")
-                .split('"')
-                .next()
-                .expect("key")
-                .to_string()
-        })
+        .map(|call| call.document.split("@idempotent(key: \"").nth(1).expect("key").split('"').next().expect("key").to_string())
         .collect();
-    assert_eq!(keys[0], keys[1]);
-    assert_ne!(keys[0], keys[2]);
+    assert_eq!(keys.len(), 2);
+    assert_ne!(keys[0], keys[1]);
+    // The same full record again is already reflected: nothing is sent.
+    provider
+        .record_refund(&connection, &order, &refund("refund-b", Some(26200), "usd"))
+        .await
+        .expect("replayed full");
+    assert_eq!(fake.calls("RefundCreate").len(), 2);
+    fake.assert_clean();
+}
+
+#[tokio::test]
+async fn a_refund_the_merchant_already_made_in_the_store_is_not_made_twice() {
+    let (fake, provider, connection) = setup().await;
+    let order = provider
+        .push_order(&connection, &push(0))
+        .await
+        .expect("pushed");
+    fake.merchant_refund(&order.id, 10000);
+    provider
+        .record_refund(&connection, &order, &refund("refund-a", Some(26200), "usd"))
+        .await
+        .expect("difference");
+    assert_eq!(fake.orders()[0].refunded_minor(), 26200);
+    assert_eq!(
+        fake.orders()[0].refunds[1]["transactions"][0]["amount"],
+        "162.00"
+    );
+    provider
+        .record_refund(&connection, &order, &refund("refund-c", Some(20000), "usd"))
+        .await
+        .expect("already covered");
+    assert_eq!(fake.calls("RefundCreate").len(), 1, "a record the store already covers sends nothing");
     fake.assert_clean();
 }
 
@@ -449,22 +495,27 @@ async fn a_refund_that_cannot_be_stated_in_the_store_currency_is_refused() {
         .push_order(&connection, &push(0))
         .await
         .expect("pushed");
-    let in_sats = refund("refund-sat", false, Some(40_000), "sat");
+    for (record, wanted) in [
+        (refund("refund-sat", Some(40_000), "sat"), "refund_amount_unconvertible"),
+        (refund("refund-none", None, "usd"), "refund_amount_missing"),
+        (refund("refund-big", Some(99_999), "usd"), "refund_exceeds_payment"),
+    ] {
+        let error = provider
+            .record_refund(&connection, &order, &record)
+            .await
+            .expect_err("refused");
+        assert!(
+            matches!(&error, ProviderError::Rejected { code, .. } if code == wanted),
+            "{wanted}: {error:?}"
+        );
+    }
+    let mut euro = refund("refund-eur", Some(1000), "eur");
+    euro.order_currency = "EUR".into();
     let error = provider
-        .record_refund(&connection, &order, &in_sats)
+        .record_refund(&connection, &order, &euro)
         .await
-        .expect_err("refused");
-    assert!(
-        matches!(error, ProviderError::Rejected { code, .. } if code == "refund_amount_unconvertible")
-    );
-    let too_much = refund("refund-big", false, Some(99_999), "usd");
-    let error = provider
-        .record_refund(&connection, &order, &too_much)
-        .await
-        .expect_err("refused");
-    assert!(
-        matches!(error, ProviderError::Rejected { code, .. } if code == "refund_exceeds_payment")
-    );
+        .expect_err("the store order is in USD");
+    assert!(matches!(error, ProviderError::Rejected { code, .. } if code == "currency_mismatch"));
     assert!(fake.calls("RefundCreate").is_empty());
     fake.assert_clean();
 }
@@ -628,6 +679,161 @@ async fn disconnecting_uninstalls_the_app() {
         .await
         .expect("disconnected");
     assert!(fake.lock().app_uninstalled);
+    fake.assert_clean();
+}
+
+#[tokio::test]
+async fn the_recent_order_scan_pages_until_it_finds_the_order_or_leaves_the_horizon() {
+    let (fake, provider, connection) = setup().await;
+    let created = provider
+        .push_order(&connection, &push(0))
+        .await
+        .expect("pushed");
+    fake.lock().search_lags = true;
+    // 120 newer orders push ours to the third page of 50.
+    fake.add_other_orders(120);
+    let found = provider
+        .find_pushed_order(&connection, order_id())
+        .await
+        .expect("find")
+        .expect("found on the third page");
+    assert_eq!(found, created);
+    let pages: Vec<Value> = fake
+        .calls("RecentOrders")
+        .iter()
+        .map(|call| call.variables["after"].clone())
+        .collect();
+    assert_eq!(pages, [Value::Null, json!("recent-50"), json!("recent-100")]);
+
+    // An order that is not there ends the scan at the first order older than
+    // the horizon, not at the end of the store's history.
+    fake.age_orders(48);
+    fake.lock().orders.retain(|order| order.id == created.id);
+    let before = fake.calls("RecentOrders").len();
+    assert!(provider
+        .find_pushed_order(&connection, Uuid::new_v4())
+        .await
+        .expect("find")
+        .is_none());
+    assert_eq!(fake.calls("RecentOrders").len() - before, 1);
+    fake.assert_clean();
+}
+
+#[tokio::test]
+async fn a_scan_that_hits_its_bound_inside_the_horizon_says_it_cannot_tell() {
+    let (fake, provider, connection) = setup().await;
+    fake.lock().search_lags = true;
+    // More than 10 pages of 50 orders created within the last day.
+    fake.add_other_orders(520);
+    let error = provider
+        .find_pushed_order(&connection, order_id())
+        .await
+        .expect_err("cannot rule the order out");
+    assert!(
+        matches!(&error, ProviderError::Unknown(message) if message.contains("could not be ruled out")),
+        "{error:?}"
+    );
+    assert_eq!(fake.calls("RecentOrders").len(), 10);
+    fake.assert_clean();
+}
+
+#[tokio::test]
+async fn subscriptions_are_read_page_by_page_and_a_lost_race_is_not_a_failure() {
+    let (fake, provider, connection) = setup().await;
+    {
+        let mut inner = fake.lock();
+        inner.subscription_page_size = 2;
+        for number in 0..5 {
+            inner.webhooks.push((
+                format!("gid://shopify/WebhookSubscription/{number}"),
+                "PRODUCTS_UPDATE".into(),
+                format!("https://merchant.example/hook-{number}"),
+            ));
+        }
+        inner.webhooks.push((
+            "gid://shopify/WebhookSubscription/99".into(),
+            "REFUNDS_CREATE".into(),
+            "https://old.service.test/v1/connectors/webhooks/shopify/old/hook".into(),
+        ));
+    }
+    provider
+        .register_webhooks(&connection, HOOK)
+        .await
+        .expect("registered");
+    assert!(
+        !fake
+            .lock()
+            .webhooks
+            .iter()
+            .any(|(_, _, uri)| uri.contains("/old/")),
+        "a stale subscription on the last of three pages is still found and removed"
+    );
+    assert_eq!(fake.calls("WebhookSubscriptions").len(), 3);
+
+    // Another registration wins the race for one topic between this one's
+    // listing and its create: the create answers with a user error, and a
+    // re-read shows the subscription, so it is a success.
+    let (fake, provider, connection) = setup().await;
+    let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    fake.fault(
+        "WebhookSubscriptionCreate",
+        vec![Fault::Hold {
+            entered: entered.clone(),
+            release: release.clone(),
+        }],
+    );
+    let racing = tokio::spawn({
+        let connection = connection_clone(&connection);
+        async move { provider.register_webhooks(&connection, HOOK).await }
+    });
+    entered.notified().await;
+    fake.lock().webhooks.push((
+        "gid://shopify/WebhookSubscription/7".into(),
+        "INVENTORY_LEVELS_UPDATE".into(),
+        HOOK.into(),
+    ));
+    release.notify_one();
+    racing
+        .await
+        .expect("task")
+        .expect("the lost race is not a failure");
+    let topics = fake
+        .lock()
+        .webhooks
+        .iter()
+        .filter(|(_, _, uri)| uri == HOOK)
+        .count();
+    assert_eq!(topics, 5, "one subscription per topic, none twice");
+    fake.assert_clean();
+}
+
+#[tokio::test]
+async fn a_refused_cancel_is_judged_by_the_order_not_by_the_message() {
+    let (fake, provider, connection) = setup().await;
+    let order = provider
+        .push_order(&connection, &push(0))
+        .await
+        .expect("pushed");
+    let cancel = CancelOrder {
+        pubky_order_id: order_id(),
+        reason: "buyer".into(),
+    };
+    // Refused and not cancelled: not applied yet, so it is retried later, not
+    // quarantined.
+    fake.lock().cancel_refusal = Some(("INVALID".into(), false));
+    let error = provider
+        .cancel_order(&connection, &order, &cancel)
+        .await
+        .expect_err("not accepted yet");
+    assert!(matches!(error, ProviderError::Unknown(_)), "{error:?}");
+    // Refused because the first cancel's job got there first: the order is
+    // cancelled, so this is a success whatever the wording.
+    fake.lock().cancel_refusal = Some(("INVALID".into(), true));
+    provider
+        .cancel_order(&connection, &order, &cancel)
+        .await
+        .expect("already cancelled by the first job");
     fake.assert_clean();
 }
 

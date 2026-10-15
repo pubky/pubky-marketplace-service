@@ -606,7 +606,9 @@ pub async fn start_connect(
         Some(split) => {
             match store::set_variant_mode(&state.pool, &row, split, state.clock.now()).await {
                 Ok(row) => row,
-                Err(store::VariantModeError::SharedListing(_)) => row,
+                Err(store::VariantModeError::SharedListing(listing_id)) => {
+                    return mappings_conflict(&listing_id)
+                }
                 Err(store::VariantModeError::Database(cause)) => {
                     return internal("variant mode", &cause)
                 }
@@ -1102,20 +1104,26 @@ pub async fn put_settings(
             ),
             Err(cause) => internal("connection summary", &cause),
         },
-        Err(store::VariantModeError::SharedListing(listing_id)) => respond(
-            StatusCode::CONFLICT,
-            json!({
-                "schema_version": 1,
-                "ok": false,
-                "error": {
-                    "code": "mappings_conflict",
-                    "message": "A listing is mapped to several store variants. Remap them one to one first.",
-                    "listing_id": listing_id,
-                },
-            }),
-        ),
+        Err(store::VariantModeError::SharedListing(listing_id)) => mappings_conflict(&listing_id),
         Err(store::VariantModeError::Database(cause)) => internal("variant mode", &cause),
     }
+}
+
+/// `409 mappings_conflict`: `split` was asked for while a listing is mapped to
+/// several store variants.
+fn mappings_conflict(listing_id: &str) -> Response {
+    respond(
+        StatusCode::CONFLICT,
+        json!({
+            "schema_version": 1,
+            "ok": false,
+            "error": {
+                "code": "mappings_conflict",
+                "message": "A listing is mapped to several store variants. Remap them one to one first.",
+                "listing_id": listing_id,
+            },
+        }),
+    )
 }
 
 /// `GET /v1/connectors/{id}/check`: a live look at the connection for the

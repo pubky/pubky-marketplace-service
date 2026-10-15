@@ -571,6 +571,10 @@ async fn run_action(
                     .get("full")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false),
+                basis: payload
+                    .get("basis")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
             };
             with_timeout(timeout, provider.record_refund(context, order, &refund)).await
         }

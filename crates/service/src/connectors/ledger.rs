@@ -557,7 +557,22 @@ pub struct ActionRow {
 const ACTION_COLUMNS: &str = "id, push_id, kind, action_key, state, payload, attempts, \
      next_attempt_at, lease_until, last_error, quarantine_reason, created_at, updated_at";
 
+/// How many due candidates one claim looks through before it gives up.
+const ACTION_CANDIDATES: i64 = 20;
+
 /// The next due action whose push has created the store order.
+///
+/// Actions of one push run one at a time, in due order. A cancel and a refund,
+/// or two refunds, can be due together, and a provider that mirrors a refund as
+/// "the recorded total minus what the store already shows refunded" must not
+/// read that figure while another action of the same push is still being
+/// applied. So the claim takes the push row `FOR NO KEY UPDATE ... SKIP LOCKED`
+/// (a second worker looking at the same push in the same instant moves on
+/// instead of waiting, so workers never deadlock on each other) and then
+/// claims the action only if no other action of the push holds a live lease.
+/// The check runs as its own statement after the lock is held, so it sees what
+/// the previous holder of the lock committed. An expired lease does not block:
+/// that worker is presumed dead and its action is retried by whoever claims it.
 pub async fn claim_next_action(
     pool: &PgPool,
     now: DateTime<Utc>,
@@ -565,36 +580,62 @@ pub async fn claim_next_action(
     providers: &[String],
 ) -> Result<Option<(ActionRow, PushRow)>, sqlx::Error> {
     let lease_until = now + chrono::Duration::from_std(lease).unwrap_or(chrono::Duration::hours(1));
-    let action: Option<ActionRow> = sqlx::query_as(&format!(
-        "WITH due AS ( \
-             SELECT a.id FROM connector_order_actions a \
-             JOIN connector_order_push p ON p.id = a.push_id \
-             WHERE p.state = 'created' AND p.provider = ANY($3) \
+    let mut tx = pool.begin().await?;
+    let candidates: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        "SELECT a.id, a.push_id FROM connector_order_actions a \
+         JOIN connector_order_push p ON p.id = a.push_id \
+         WHERE p.state = 'created' AND p.provider = ANY($2) \
+           AND ((a.state = 'pending' AND a.next_attempt_at <= $1) \
+                OR (a.state = 'sending' AND a.lease_until <= $1)) \
+         ORDER BY a.next_attempt_at, a.id LIMIT $3",
+    )
+    .bind(now)
+    .bind(providers)
+    .bind(ACTION_CANDIDATES)
+    .fetch_all(&mut *tx)
+    .await?;
+    for (action_id, push_id) in candidates {
+        let locked: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM connector_order_push WHERE id = $1 AND state = 'created' \
+             FOR NO KEY UPDATE SKIP LOCKED",
+        )
+        .bind(push_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if locked.is_none() {
+            continue;
+        }
+        let action: Option<ActionRow> = sqlx::query_as(&format!(
+            "UPDATE connector_order_actions a SET state = 'sending', attempts = a.attempts + 1, \
+                 lease_until = $2, updated_at = $1 \
+             WHERE a.id = $3 \
                AND ((a.state = 'pending' AND a.next_attempt_at <= $1) \
                     OR (a.state = 'sending' AND a.lease_until <= $1)) \
-             ORDER BY a.next_attempt_at, a.id \
-             FOR UPDATE OF a SKIP LOCKED LIMIT 1 \
-         ) \
-         UPDATE connector_order_actions a SET state = 'sending', attempts = a.attempts + 1, \
-             lease_until = $2, updated_at = $1 \
-         FROM due WHERE a.id = due.id RETURNING {}",
-        prefixed(ACTION_COLUMNS, "a")
-    ))
-    .bind(now)
-    .bind(lease_until)
-    .bind(providers)
-    .fetch_optional(pool)
-    .await?;
-    let Some(action) = action else {
-        return Ok(None);
-    };
-    let push: PushRow = sqlx::query_as(&format!(
-        "SELECT {PUSH_COLUMNS} FROM connector_order_push WHERE id = $1"
-    ))
-    .bind(action.push_id)
-    .fetch_one(pool)
-    .await?;
-    Ok(Some((action, push)))
+               AND NOT EXISTS (SELECT 1 FROM connector_order_actions o \
+                               WHERE o.push_id = a.push_id AND o.id <> a.id \
+                                 AND o.state = 'sending' AND o.lease_until > $1) \
+             RETURNING {}",
+            prefixed(ACTION_COLUMNS, "a")
+        ))
+        .bind(now)
+        .bind(lease_until)
+        .bind(action_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(action) = action else {
+            continue;
+        };
+        let push: PushRow = sqlx::query_as(&format!(
+            "SELECT {PUSH_COLUMNS} FROM connector_order_push WHERE id = $1"
+        ))
+        .bind(action.push_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        return Ok(Some((action, push)));
+    }
+    tx.commit().await?;
+    Ok(None)
 }
 
 pub async fn mark_action_done(

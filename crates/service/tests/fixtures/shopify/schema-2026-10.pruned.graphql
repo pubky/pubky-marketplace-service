@@ -121,9 +121,11 @@ type Mutation {
 }
 type Order {
   cancelledAt: DateTime
+  createdAt: DateTime!
   currencyCode: CurrencyCode!
   id: ID!
   tags: [String!]!
+  totalRefundedSet: MoneyBag!
   transactions(first: Int, capturable: Boolean, manuallyResolvable: Boolean): [OrderTransaction!]!
 }
 enum OrderAdjustmentInputDiscrepancyReason { RESTOCK DAMAGE CUSTOMER OTHER }
@@ -147,6 +149,7 @@ type OrderCancelUserError {
 enum OrderCancelUserErrorCode { NO_REFUND_PERMISSION NO_REFUND_TO_STORE_CREDIT_PERMISSION STORE_CREDIT_REFUND_EXPIRATION_IN_PAST STORE_CREDIT_REFUND_MISSING_CUSTOMER STORE_CREDIT_REFUND_B2B_NOT_SUPPORTED NOT_FOUND INVALID INTERNAL_ERROR }
 type OrderConnection {
   nodes: [Order!]!
+  pageInfo: PageInfo!
 }
 input OrderCreateAssociateCustomerAttributesInput {
   id: ID
@@ -440,6 +443,7 @@ type WebhookSubscription {
 }
 type WebhookSubscriptionConnection {
   nodes: [WebhookSubscription!]!
+  pageInfo: PageInfo!
 }
 type WebhookSubscriptionCreatePayload {
   userErrors: [UserError!]!

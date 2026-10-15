@@ -9,6 +9,8 @@
 //! Dev Dashboard's app version) with the same connection webhooks URL. They are
 //! signed with the same app secret and are parsed here once they arrive.
 
+use std::collections::BTreeMap;
+
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -16,9 +18,10 @@ use super::auth::{normalize_shop, verify_webhook_hmac};
 use super::client::Client;
 use super::documents;
 use super::money::{decimal_to_minor, exponent};
+use super::orders;
 use crate::connectors::provider::{
-    AppContext, ComplianceTopic, InboundEvent, OrderRef, ProviderError, VerifiedWebhook,
-    WebhookHeaders,
+    AppContext, ComplianceTopic, InboundEvent, OrderRef, ProviderError, PubkyRefundMark,
+    RefundAmount, VerifiedWebhook, WebhookHeaders,
 };
 
 pub const HEADER_HMAC: &str = "x-shopify-hmac-sha256";
@@ -47,27 +50,69 @@ fn malformed(what: &str) -> ProviderError {
     ProviderError::Unknown(format!("shopify returned an unexpected {what}"))
 }
 
+/// The most pages of subscriptions one registration reads (100 each).
+const MAX_SUBSCRIPTION_PAGES: usize = 20;
+
+type Subscription = (String, String, String);
+
+/// Every webhook subscription this app has in the store, page by page.
+async fn subscriptions(
+    client: &Client,
+    shop: &str,
+    token: &str,
+) -> Result<Vec<Subscription>, ProviderError> {
+    let mut found = Vec::new();
+    let mut after: Option<String> = None;
+    for _ in 0..MAX_SUBSCRIPTION_PAGES {
+        let data = client
+            .execute(
+                shop,
+                token,
+                documents::WEBHOOK_SUBSCRIPTIONS,
+                json!({ "after": after }),
+            )
+            .await?;
+        let page = data
+            .get("webhookSubscriptions")
+            .ok_or_else(|| malformed("webhook subscription list"))?;
+        let nodes = page
+            .get("nodes")
+            .and_then(Value::as_array)
+            .ok_or_else(|| malformed("webhook subscription list"))?;
+        found.extend(nodes.iter().filter_map(|node| {
+            Some((
+                node.get("id")?.as_str()?.to_string(),
+                node.get("topic")?.as_str()?.to_string(),
+                node.get("uri")?.as_str()?.to_string(),
+            ))
+        }));
+        if page.pointer("/pageInfo/hasNextPage").and_then(Value::as_bool) != Some(true) {
+            return Ok(found);
+        }
+        after = page
+            .pointer("/pageInfo/endCursor")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if after.is_none() {
+            return Ok(found);
+        }
+    }
+    Err(ProviderError::Rejected {
+        code: "too_many_webhook_subscriptions".into(),
+        message: format!(
+            "The app has more than {} webhook subscriptions, so stale ones cannot be ruled out.",
+            MAX_SUBSCRIPTION_PAGES * 100
+        ),
+    })
+}
+
 pub async fn register(
     client: &Client,
     shop: &str,
     token: &str,
     webhook_url: &str,
 ) -> Result<(), ProviderError> {
-    let existing = client
-        .execute(shop, token, documents::WEBHOOK_SUBSCRIPTIONS, json!({}))
-        .await?;
-    let nodes = existing
-        .pointer("/webhookSubscriptions/nodes")
-        .and_then(Value::as_array)
-        .ok_or_else(|| malformed("webhook subscription list"))?;
-    let entry = |node: &Value| {
-        Some((
-            node.get("id")?.as_str()?.to_string(),
-            node.get("topic")?.as_str()?.to_string(),
-            node.get("uri")?.as_str()?.to_string(),
-        ))
-    };
-    let known: Vec<(String, String, String)> = nodes.iter().filter_map(entry).collect();
+    let known = subscriptions(client, shop, token).await?;
     for (_, topic) in SUBSCRIBED_TOPICS {
         if !known
             .iter()
@@ -92,17 +137,27 @@ pub async fn register(
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
-            let message = errors
-                .iter()
-                .filter_map(|error| error.get("message").and_then(Value::as_str))
-                .collect::<Vec<_>>()
-                .join("; ");
-            // Another run already subscribed this address.
-            if !errors.is_empty() && !message.to_ascii_lowercase().contains("already") {
-                return Err(ProviderError::Rejected {
-                    code: "webhook_subscription".into(),
-                    message: message.chars().take(300).collect(),
-                });
+            if !errors.is_empty() {
+                // `userErrors` of this mutation carry no code, so the message
+                // is not interpreted. A concurrent registration (the merchant
+                // opening the app twice) can make this one fail because the
+                // other won: read the list again, and only a subscription
+                // that is still missing is a failure.
+                let now_known = subscriptions(client, shop, token).await?;
+                if !now_known
+                    .iter()
+                    .any(|(_, found, uri)| found == topic && uri == webhook_url)
+                {
+                    let message = errors
+                        .iter()
+                        .filter_map(|error| error.get("message").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    return Err(ProviderError::Rejected {
+                        code: "webhook_subscription".into(),
+                        message: message.chars().take(300).collect(),
+                    });
+                }
             }
         }
         // A subscription this service made earlier for another address (a
@@ -266,39 +321,62 @@ pub fn parse(webhook: &VerifiedWebhook, body: &[u8]) -> Result<InboundEvent, Pro
                 .map(str::to_string),
         }),
         "refunds/create" => {
-            let refunded: Vec<&Value> = payload
+            // Refunded money per currency: a payload that mixes currencies is
+            // not summed into one figure.
+            let mut by_currency: BTreeMap<String, Option<i64>> = BTreeMap::new();
+            for transaction in payload
                 .get("transactions")
                 .and_then(Value::as_array)
-                .map(|list| {
-                    list.iter()
-                        .filter(|transaction| {
-                            transaction.get("kind").and_then(Value::as_str) == Some("refund")
-                                && transaction.get("status").and_then(Value::as_str)
-                                    != Some("failure")
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            let currency = refunded
+                .map(Vec::as_slice)
+                .unwrap_or_default()
                 .iter()
-                .find_map(|transaction| transaction.get("currency")?.as_str())
-                .map(str::to_ascii_uppercase);
-            let amount_minor = currency.as_ref().and_then(|currency| {
-                refunded
-                    .iter()
-                    .map(|transaction| {
-                        decimal_to_minor(transaction.get("amount")?.as_str()?, exponent(currency))
+                .filter(|transaction| {
+                    transaction.get("kind").and_then(Value::as_str) == Some("refund")
+                        && transaction.get("status").and_then(Value::as_str) != Some("failure")
+                })
+            {
+                let Some(currency) = transaction
+                    .get("currency")
+                    .and_then(Value::as_str)
+                    .map(str::to_ascii_uppercase)
+                else {
+                    continue;
+                };
+                let minor = transaction
+                    .get("amount")
+                    .and_then(Value::as_str)
+                    .and_then(|amount| decimal_to_minor(amount, exponent(&currency)));
+                let total = by_currency.entry(currency).or_insert(Some(0));
+                *total = total.zip(minor).and_then(|(sum, add)| sum.checked_add(add));
+            }
+            let amounts = by_currency
+                .into_iter()
+                .filter_map(|(currency, total)| {
+                    Some(RefundAmount {
+                        currency,
+                        amount_minor: total?,
                     })
-                    .sum::<Option<i64>>()
-            });
-            Ok(InboundEvent::Refund {
+                })
+                .collect();
+            let mark = payload
+                .get("note")
+                .and_then(Value::as_str)
+                .and_then(orders::parse_refund_mark)
+                .map(|(refund_id, amount_minor, currency)| PubkyRefundMark {
+                    refund_id,
+                    amount: RefundAmount {
+                        currency,
+                        amount_minor,
+                    },
+                });
+            Ok(InboundEvent::StoreRefund {
                 order: OrderRef {
                     external_order_id: gid("Order", &payload, "order_id")
                         .ok_or_else(|| missing("order"))?,
                     pubky_order_id: None,
                 },
-                amount_minor,
-                currency,
+                amounts,
+                mark,
             })
         }
         "app/uninstalled" => Ok(InboundEvent::AppUninstalled),
@@ -428,25 +506,57 @@ mod tests {
     }
 
     #[test]
-    fn a_store_refund_sums_its_refund_transactions() {
+    fn a_store_refund_sums_its_refund_transactions_per_currency() {
         let body = br#"{"id":1,"order_id":77,"transactions":[
             {"kind":"refund","status":"success","amount":"10.50","currency":"usd"},
             {"kind":"refund","status":"success","amount":"2.00","currency":"usd"},
-            {"kind":"refund","status":"failure","amount":"99.00","currency":"usd"}]}"#;
+            {"kind":"refund","status":"failure","amount":"99.00","currency":"usd"},
+            {"kind":"refund","status":"success","amount":"500","currency":"jpy"},
+            {"kind":"sale","status":"success","amount":"7.00","currency":"usd"}]}"#;
         match parse(&webhook("refunds/create"), body).expect("event") {
-            InboundEvent::Refund {
-                order,
-                amount_minor,
-                currency,
-            } => {
+            InboundEvent::StoreRefund { order, amounts, mark } => {
                 assert_eq!(order.external_order_id, "gid://shopify/Order/77");
-                assert_eq!(amount_minor, Some(1250));
-                assert_eq!(currency.as_deref(), Some("USD"));
+                assert_eq!(
+                    amounts,
+                    vec![
+                        RefundAmount { currency: "JPY".into(), amount_minor: 500 },
+                        RefundAmount { currency: "USD".into(), amount_minor: 1250 },
+                    ],
+                    "currencies are never added together"
+                );
+                assert_eq!(mark, None);
             }
             other => panic!("{other:?}"),
         }
         match parse(&webhook("refunds/create"), br#"{"order_id":77}"#).expect("event") {
-            InboundEvent::Refund { amount_minor, .. } => assert_eq!(amount_minor, None),
+            InboundEvent::StoreRefund { amounts, .. } => assert!(amounts.is_empty()),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_refund_this_service_made_carries_its_mark_back() {
+        let mark = orders::refund_mark("7d9c0e0e-1111-4222-8333-444455556666", 8700, "USD");
+        let body = format!(
+            r#"{{"id":1,"order_id":77,"note":"Pubky refund for order x. {mark}","transactions":[
+                {{"kind":"refund","status":"success","amount":"87.00","currency":"USD"}}]}}"#
+        );
+        match parse(&webhook("refunds/create"), body.as_bytes()).expect("event") {
+            InboundEvent::StoreRefund { mark, amounts, .. } => {
+                assert_eq!(
+                    mark,
+                    Some(PubkyRefundMark {
+                        refund_id: "7d9c0e0e-1111-4222-8333-444455556666".into(),
+                        amount: RefundAmount { currency: "USD".into(), amount_minor: 8700 },
+                    })
+                );
+                assert_eq!(amounts[0].amount_minor, 8700);
+            }
+            other => panic!("{other:?}"),
+        }
+        let merchants = br#"{"order_id":77,"note":"customer returned the boots","transactions":[]}"#;
+        match parse(&webhook("refunds/create"), merchants).expect("event") {
+            InboundEvent::StoreRefund { mark, .. } => assert_eq!(mark, None),
             other => panic!("{other:?}"),
         }
     }

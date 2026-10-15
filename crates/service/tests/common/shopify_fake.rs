@@ -24,6 +24,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use tokio::sync::Notify;
+
 use apollo_compiler::executable::{Selection, SelectionSet};
 use apollo_compiler::response::JsonMap;
 use apollo_compiler::validation::Valid;
@@ -56,9 +59,26 @@ pub struct FakeOrder {
     pub cancelled: bool,
     pub cancel_variables: Option<Value>,
     pub refunds: Vec<Value>,
+    pub created_at: DateTime<Utc>,
 }
 
 impl FakeOrder {
+    /// The sale amount in minor units (two decimals, as every fake order is).
+    pub fn sale_minor(&self) -> i64 {
+        to_minor(
+            self.input["transactions"][0]["amountSet"]["shopMoney"]["amount"]
+                .as_str()
+                .unwrap_or("0"),
+        )
+    }
+
+    pub fn refunded_minor(&self) -> i64 {
+        self.refunds
+            .iter()
+            .map(|input| to_minor(input["transactions"][0]["amount"].as_str().unwrap_or("0")))
+            .sum()
+    }
+
     pub fn tags(&self) -> Vec<String> {
         self.input["tags"]
             .as_array()
@@ -71,8 +91,25 @@ impl FakeOrder {
     }
 }
 
+fn to_minor(amount: &str) -> i64 {
+    let (whole, fraction) = amount.split_once('.').unwrap_or((amount, ""));
+    let fraction = format!("{fraction:0<2}");
+    whole.parse::<i64>().unwrap_or(0) * 100 + fraction[..2].parse::<i64>().unwrap_or(0)
+}
+
+fn decimal(minor: i64) -> String {
+    format!("{}.{:02}", minor / 100, minor % 100)
+}
+
 #[derive(Debug, Clone)]
 pub enum Fault {
+    /// Hold the request open until the test releases it: `entered` is
+    /// notified when the request has arrived, and the operation runs only
+    /// after `release` is notified.
+    Hold {
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    },
     /// Answer with this HTTP status and an empty body, without running the
     /// operation.
     Status(u16),
@@ -103,6 +140,13 @@ pub struct Inner {
     pub webhooks: Vec<(String, String, String)>,
     pub app_uninstalled: bool,
     refund_keys: HashMap<String, String>,
+    /// How many webhook subscriptions one page returns (Shopify's maximum is
+    /// 250; tests lower it to exercise paging).
+    pub subscription_page_size: usize,
+    /// `orderCancel` answers `userErrors` with this code; when the flag is
+    /// true the cancel nevertheless takes effect (a retry racing the job
+    /// that is already cancelling the order).
+    pub cancel_refusal: Option<(String, bool)>,
     next_id: u64,
 }
 
@@ -154,6 +198,8 @@ impl FakeShopify {
             webhooks: Vec::new(),
             app_uninstalled: false,
             refund_keys: HashMap::new(),
+            subscription_page_size: 100,
+            cancel_refusal: None,
             next_id: 7000,
         }));
         let router = Router::new()
@@ -196,6 +242,48 @@ impl FakeShopify {
 
     pub fn orders(&self) -> Vec<FakeOrder> {
         self.lock().orders.clone()
+    }
+
+    /// Makes every order the store holds `hours` older.
+    pub fn age_orders(&self, hours: i64) {
+        for order in &mut self.lock().orders {
+            order.created_at -= ChronoDuration::hours(hours);
+        }
+    }
+
+    /// Adds `count` other orders (not Pubky's) created now, newer than any
+    /// order already there.
+    pub fn add_other_orders(&self, count: usize) {
+        let mut inner = self.lock();
+        for _ in 0..count {
+            inner.next_id += 1;
+            let id = gid("Order", inner.next_id);
+            inner.orders.push(FakeOrder {
+                id,
+                input: json!({ "tags": ["web"], "transactions": [{ "amountSet": { "shopMoney": { "amount": "1.00" } } }] }),
+                options: Value::Null,
+                cancelled: false,
+                cancel_variables: None,
+                refunds: Vec::new(),
+                created_at: Utc::now(),
+            });
+        }
+    }
+
+    /// A refund the merchant makes in the store's admin: it reaches the order
+    /// like any refund, with no Pubky mark.
+    pub fn merchant_refund(&self, order_id: &str, minor: i64) {
+        let mut inner = self.lock();
+        let order = inner
+            .orders
+            .iter_mut()
+            .find(|order| order.id == order_id)
+            .expect("order");
+        order.refunds.push(json!({
+            "orderId": order_id,
+            "note": "Refunded in the admin",
+            "transactions": [{ "amount": decimal(minor), "kind": "REFUND" }],
+        }));
     }
 
     /// No request failed schema validation, variable coercion or the response
@@ -289,19 +377,41 @@ fn throttle_status() -> Value {
 }
 
 async fn graphql(
-    State(inner): State<Arc<Mutex<Inner>>>,
+    State(state): State<Arc<Mutex<Inner>>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let mut inner = inner.lock().expect("fake Shopify state");
+    match process(&state, &headers, &body, false) {
+        Ok(response) => response,
+        Err((entered, release)) => {
+            entered.notify_one();
+            release.notified().await;
+            process(&state, &headers, &body, true)
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
+    }
+}
+
+type Held = (Arc<Notify>, Arc<Notify>);
+
+/// One request, start to finish. A request held by [`Fault::Hold`] returns the
+/// gate to wait on and is processed again, with `resumed`, once it opens: the
+/// state lock is never held across the wait.
+fn process(
+    state: &Mutex<Inner>,
+    headers: &HeaderMap,
+    body: &Bytes,
+    resumed: bool,
+) -> Result<Response, Held> {
+    let mut inner = state.lock().expect("fake Shopify state");
     if headers
         .get("x-shopify-access-token")
         .and_then(|value| value.to_str().ok())
         != Some(ACCESS_TOKEN)
     {
-        return StatusCode::UNAUTHORIZED.into_response();
+        return Ok(StatusCode::UNAUTHORIZED.into_response());
     }
-    let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    let request: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
     let text = request["query"].as_str().unwrap_or_default().to_string();
     let variables = request
         .get("variables")
@@ -315,10 +425,10 @@ async fn graphql(
         Ok(document) => document,
         Err(errors) => {
             inner.problems.push(format!("invalid document:\n{errors}"));
-            return axum::Json(json!({
+            return Ok(axum::Json(json!({
                 "errors": [{ "message": "invalid document", "extensions": { "code": "undefinedField" } }]
             }))
-            .into_response();
+            .into_response());
         }
     };
     let name = operation_name(&document).unwrap_or_default();
@@ -327,52 +437,56 @@ async fn graphql(
         .iter()
         .next()
         .expect("a validated document has an operation");
-    if let Err(error) = apollo_compiler::request::coerce_variable_values(
-        &inner.schema,
-        operation,
-        &json_map(&variables),
-    ) {
-        inner
-            .problems
-            .push(format!("{name}: variables do not coerce: {error:?}"));
-    }
-    inner.requests.push(Recorded {
-        operation: name.clone(),
-        variables: variables.clone(),
-        document: text.clone(),
-    });
-
-    let fault = inner
-        .faults
-        .get_mut(&name)
-        .and_then(|queue| (!queue.is_empty()).then(|| queue.remove(0)));
     let mut apply_then_fail = false;
-    if let Some(fault) = fault {
-        match fault {
-            Fault::Status(code) => {
-                return StatusCode::from_u16(code).expect("status").into_response();
+    if !resumed {
+        if let Err(error) = apollo_compiler::request::coerce_variable_values(
+            &inner.schema,
+            operation,
+            &json_map(&variables),
+        ) {
+            inner
+                .problems
+                .push(format!("{name}: variables do not coerce: {error:?}"));
+        }
+        inner.requests.push(Recorded {
+            operation: name.clone(),
+            variables: variables.clone(),
+            document: text.clone(),
+        });
+        let fault = inner
+            .faults
+            .get_mut(&name)
+            .and_then(|queue| (!queue.is_empty()).then(|| queue.remove(0)));
+        if let Some(fault) = fault {
+            match fault {
+                Fault::Hold { entered, release } => return Err((entered, release)),
+                Fault::Status(code) => {
+                    return Ok(StatusCode::from_u16(code).expect("status").into_response());
+                }
+                Fault::TooManyRequests => {
+                    return Ok(
+                        (StatusCode::TOO_MANY_REQUESTS, [("retry-after", "0")], "").into_response()
+                    );
+                }
+                Fault::Throttled => {
+                    return Ok(axum::Json(json!({
+                        "errors": [{ "message": "Throttled", "extensions": { "code": "THROTTLED" } }],
+                        "extensions": { "cost": {
+                            "requestedQueryCost": 600,
+                            "actualQueryCost": null,
+                            "throttleStatus": { "maximumAvailable": 2000.0, "currentlyAvailable": 599, "restoreRate": 1000.0 }
+                        } }
+                    }))
+                    .into_response());
+                }
+                Fault::AccessDenied => {
+                    return Ok(axum::Json(json!({
+                        "errors": [{ "message": "Access denied for orderCreate field.", "extensions": { "code": "ACCESS_DENIED" } }]
+                    }))
+                    .into_response());
+                }
+                Fault::AppliedThenServerError => apply_then_fail = true,
             }
-            Fault::TooManyRequests => {
-                return (StatusCode::TOO_MANY_REQUESTS, [("retry-after", "0")], "").into_response();
-            }
-            Fault::Throttled => {
-                return axum::Json(json!({
-                    "errors": [{ "message": "Throttled", "extensions": { "code": "THROTTLED" } }],
-                    "extensions": { "cost": {
-                        "requestedQueryCost": 600,
-                        "actualQueryCost": null,
-                        "throttleStatus": { "maximumAvailable": 2000.0, "currentlyAvailable": 599, "restoreRate": 1000.0 }
-                    } }
-                }))
-                .into_response();
-            }
-            Fault::AccessDenied => {
-                return axum::Json(json!({
-                    "errors": [{ "message": "Access denied for orderCreate field.", "extensions": { "code": "ACCESS_DENIED" } }]
-                }))
-                .into_response();
-            }
-            Fault::AppliedThenServerError => apply_then_fail = true,
         }
     }
 
@@ -397,12 +511,12 @@ async fn graphql(
         }
     }
     if apply_then_fail {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        return Ok(StatusCode::INTERNAL_SERVER_ERROR.into_response());
     }
     response["extensions"] = json!({ "cost": {
         "requestedQueryCost": 10, "actualQueryCost": 10, "throttleStatus": throttle_status()
     }});
-    axum::Json(response).into_response()
+    Ok(axum::Json(response).into_response())
 }
 
 fn gid(kind: &str, number: u64) -> String {
@@ -454,6 +568,7 @@ fn run(inner: &mut Inner, name: &str, document: &str, variables: &Value) -> Resu
                 cancelled: false,
                 cancel_variables: None,
                 refunds: Vec::new(),
+                created_at: Utc::now(),
             });
             Ok(json!({ "data": { "orderCreate": { "order": { "id": id }, "userErrors": [] } } }))
         }
@@ -474,14 +589,26 @@ fn run(inner: &mut Inner, name: &str, document: &str, variables: &Value) -> Resu
         }
         "RecentOrders" => {
             let first = variables["first"].as_u64().unwrap_or(10) as usize;
-            let nodes: Vec<Value> = inner
-                .orders
+            let start = variables["after"]
+                .as_str()
+                .and_then(|cursor| cursor.strip_prefix("recent-"))
+                .and_then(|index| index.parse::<usize>().ok())
+                .unwrap_or(0);
+            let newest_first: Vec<&FakeOrder> = inner.orders.iter().rev().collect();
+            let page: Vec<Value> = newest_first
                 .iter()
-                .rev()
+                .skip(start)
                 .take(first)
-                .map(order_node)
+                .map(|order| order_node(order))
                 .collect();
-            Ok(json!({ "data": { "orders": { "nodes": nodes } } }))
+            let end = start + page.len();
+            Ok(json!({ "data": { "orders": {
+                "pageInfo": {
+                    "hasNextPage": end < newest_first.len(),
+                    "endCursor": format!("recent-{end}"),
+                },
+                "nodes": page,
+            } } }))
         }
         "OrderTransactions" => {
             let id = variables["id"].as_str().unwrap_or_default();
@@ -493,6 +620,10 @@ fn run(inner: &mut Inner, name: &str, document: &str, variables: &Value) -> Resu
                 "id": order.id,
                 "currencyCode": order.input["currency"],
                 "cancelledAt": if order.cancelled { json!("2026-10-15T10:00:00Z") } else { Value::Null },
+                "totalRefundedSet": { "shopMoney": {
+                    "amount": decimal(order.refunded_minor()),
+                    "currencyCode": order.input["currency"],
+                } },
                 "transactions": [{
                     "id": format!("{}-sale", order.id.replace("Order", "OrderTransaction")),
                     "kind": sale["kind"],
@@ -503,6 +634,7 @@ fn run(inner: &mut Inner, name: &str, document: &str, variables: &Value) -> Resu
             } } }))
         }
         "OrderCancel" => {
+            let refusal = inner.cancel_refusal.clone();
             let id = variables["orderId"]
                 .as_str()
                 .unwrap_or_default()
@@ -513,6 +645,13 @@ fn run(inner: &mut Inner, name: &str, document: &str, variables: &Value) -> Resu
                     "orderCancelUserErrors": [{ "field": ["orderId"], "message": "Order does not exist", "code": "INVALID" }]
                 } } }));
             };
+            if let Some((code, applies)) = refusal {
+                order.cancelled = applies;
+                return Ok(json!({ "data": { "orderCancel": {
+                    "job": null,
+                    "orderCancelUserErrors": [{ "field": ["orderId"], "message": "The order cannot be cancelled right now", "code": code }]
+                } } }));
+            }
             order.cancelled = true;
             order.cancel_variables = Some(variables.clone());
             Ok(json!({ "data": { "orderCancel": {
@@ -525,9 +664,7 @@ fn run(inner: &mut Inner, name: &str, document: &str, variables: &Value) -> Resu
             let input = &variables["input"];
             let id = input["orderId"].as_str().unwrap_or_default().to_string();
             if let Some(refund) = inner.refund_keys.get(&key) {
-                return Ok(
-                    json!({ "data": { "refundCreate": { "refund": { "id": refund }, "userErrors": [] } } }),
-                );
+                return Ok(json!({ "data": { "refundCreate": { "refund": { "id": refund }, "userErrors": [] } } }));
             }
             inner.next_id += 1;
             let refund_id = gid("Refund", inner.next_id);
@@ -537,19 +674,39 @@ fn run(inner: &mut Inner, name: &str, document: &str, variables: &Value) -> Resu
                     "userErrors": [{ "field": ["orderId"], "message": "Order does not exist" }]
                 } } }));
             };
+            let amount = to_minor(input["transactions"][0]["amount"].as_str().unwrap_or("0"));
+            if order.refunded_minor() + amount > order.sale_minor() {
+                return Ok(json!({ "data": { "refundCreate": {
+                    "refund": null,
+                    "userErrors": [{ "field": ["transactions"], "message": "Refund amount is greater than the refundable amount" }]
+                } } }));
+            }
             order.refunds.push(input.clone());
             inner.refund_keys.insert(key, refund_id.clone());
-            Ok(
-                json!({ "data": { "refundCreate": { "refund": { "id": refund_id }, "userErrors": [] } } }),
-            )
+            Ok(json!({ "data": { "refundCreate": { "refund": { "id": refund_id }, "userErrors": [] } } }))
         }
         "WebhookSubscriptions" => {
+            let start = variables["after"]
+                .as_str()
+                .and_then(|cursor| cursor.strip_prefix("subs-"))
+                .and_then(|index| index.parse::<usize>().ok())
+                .unwrap_or(0);
+            let size = inner.subscription_page_size;
             let nodes: Vec<Value> = inner
                 .webhooks
                 .iter()
+                .skip(start)
+                .take(size)
                 .map(|(id, topic, uri)| json!({ "id": id, "topic": topic, "uri": uri }))
                 .collect();
-            Ok(json!({ "data": { "webhookSubscriptions": { "nodes": nodes } } }))
+            let end = start + nodes.len();
+            Ok(json!({ "data": { "webhookSubscriptions": {
+                "pageInfo": {
+                    "hasNextPage": end < inner.webhooks.len(),
+                    "endCursor": format!("subs-{end}"),
+                },
+                "nodes": nodes,
+            } } }))
         }
         "WebhookSubscriptionCreate" => {
             let topic = variables["topic"].as_str().unwrap_or_default().to_string();
@@ -596,6 +753,7 @@ fn order_node(order: &FakeOrder) -> Value {
         "id": order.id,
         "tags": order.tags(),
         "cancelledAt": if order.cancelled { json!("2026-10-15T10:00:00Z") } else { Value::Null },
+        "createdAt": order.created_at.to_rfc3339(),
     })
 }
 

@@ -397,10 +397,14 @@ pub struct CancelOrder {
     pub reason: String,
 }
 
-/// A refund Pubky recorded. `amount_minor` is in `amount_unit` as recorded
-/// on the Pubky order, which is not always the order currency (`sat` for
-/// Bitcoin, `usdt` for USDT minor units, the order currency for a fiat rail).
-/// `full` is true when the whole order was refunded.
+/// A refund Pubky recorded. `amount_minor` is what the Pubky order's books
+/// show refunded **in total** so far (`refund.record_external` validates it
+/// against the order total, so it is in the order currency's minor units on
+/// every rail, Bitcoin and USDT included; `amount_unit` names that unit and
+/// equals the order currency). A provider mirrors the difference to what the
+/// store already shows refunded, so a repeat or a later, larger record never
+/// refunds the same money twice. `full` is true when the whole order was
+/// refunded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefundRecord {
     /// Deterministic per Pubky refund; the provider derives its idempotency
@@ -413,7 +417,12 @@ pub struct RefundRecord {
     pub order_total_minor: i64,
     pub order_currency: String,
     pub order_exponent: i32,
+    /// True when the recorded amount covers the whole order.
     pub full: bool,
+    /// How the amount relates to what the buyer paid (rail, the order's own
+    /// quote), for the store refund's note. The amount itself is always in
+    /// `order_currency`; no conversion happens.
+    pub basis: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -434,6 +443,23 @@ pub enum ComplianceTopic {
     CustomerDataRequest,
     CustomerRedact,
     ShopRedact,
+}
+
+/// An amount a store refunded, in one currency's minor units.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefundAmount {
+    pub currency: String,
+    pub amount_minor: i64,
+}
+
+/// What a provider wrote on a store refund it created for a Pubky refund, read
+/// back from the store's refund webhook: the Pubky refund id
+/// ([`RefundRecord::refund_id`]) and the amount it created, so an echo is
+/// matched on identity **and** amount.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PubkyRefundMark {
+    pub refund_id: String,
+    pub amount: RefundAmount,
 }
 
 /// A store variant's current sellable stock, found from an inventory item.
@@ -489,6 +515,16 @@ pub enum InboundEvent {
         order: OrderRef,
         amount_minor: Option<i64>,
         currency: Option<String>,
+    },
+    /// The same event for a provider that can say more: what the store
+    /// refunded **per currency**, and the mark of a refund this service
+    /// itself created there ([`PubkyRefundMark`]), which is what lets the
+    /// framework tell an echo of its own mirrored refund from a refund the
+    /// merchant made. Raises a seller alert, never a refund.
+    StoreRefund {
+        order: OrderRef,
+        amounts: Vec<RefundAmount>,
+        mark: Option<PubkyRefundMark>,
     },
     /// The merchant removed the app. The credential is deleted.
     AppUninstalled,
