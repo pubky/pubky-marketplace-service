@@ -4886,16 +4886,19 @@ pub struct WorkerSummary {
     pub listings_tombstoned: u64,
 }
 
-/// Samples the bounded sole source once per server-time bucket. The unique
-/// bucket constraint is the concurrency cap; invalid samples never reach the
-/// table. The endpoint and ticker contract are pinned in `fx.rs`.
+/// Samples the bounded sole source once per server-time bucket, one sample
+/// per fiat currency from a single fetch. The unique `(currency, bucket)`
+/// constraint is the concurrency cap; invalid samples never reach the table,
+/// and each currency's sample is checked against that currency's own
+/// persisted median. The endpoint and ticker contract are pinned in `fx.rs`.
+/// Returns the number of samples accepted across all currencies.
 pub async fn sample_fx_rate(
     pool: &PgPool,
     feed_url: &str,
     now: DateTime<Utc>,
 ) -> anyhow::Result<u64> {
-    let sample = match fx::fetch_current(feed_url, now).await {
-        Ok(sample) => sample,
+    let snapshot = match fx::fetch_snapshot(feed_url, now).await {
+        Ok(snapshot) => snapshot,
         Err(error) => {
             tracing::warn!(reason = ?error, "FX reference sample rejected");
             return Ok(0);
@@ -4904,43 +4907,60 @@ pub async fn sample_fx_rate(
     let bucket_seconds = now.timestamp() - now.timestamp().rem_euclid(FX_SAMPLE_INTERVAL_SECONDS);
     let bucket = DateTime::from_timestamp(bucket_seconds, 0)
         .ok_or_else(|| anyhow::anyhow!("invalid FX sample bucket"))?;
-    let reference: Vec<(String,)> = sqlx::query_as(
-        "SELECT rate::text FROM fx_rate_samples \
-         WHERE currency = 'USD' AND accepted_at >= $1",
-    )
-    .bind(fx::reference_cutoff(now))
-    .fetch_all(pool)
-    .await?;
-    if let Some(median) = fx::median(
-        reference
-            .into_iter()
-            .filter_map(|(rate,)| fx::Decimal::parse(&rate))
-            .collect(),
-    ) {
-        if !fx::within_deviation(&sample.rate, &median) {
-            tracing::warn!(
-                reason = "deviation_exceeded",
-                "FX reference sample rejected"
-            );
-            return Ok(0);
+    let mut accepted = 0;
+    for (currency, sample) in snapshot.samples() {
+        let sample = match sample {
+            Ok(sample) => sample,
+            Err(error) => {
+                tracing::warn!(
+                    currency = currency.code(),
+                    reason = ?error,
+                    "FX reference sample rejected"
+                );
+                continue;
+            }
+        };
+        let reference: Vec<(String,)> = sqlx::query_as(
+            "SELECT rate::text FROM fx_rate_samples \
+             WHERE currency = $1 AND accepted_at >= $2",
+        )
+        .bind(currency.code())
+        .bind(fx::reference_cutoff(now))
+        .fetch_all(pool)
+        .await?;
+        if let Some(median) = fx::median(
+            reference
+                .into_iter()
+                .filter_map(|(rate,)| fx::Decimal::parse(&rate))
+                .collect(),
+        ) {
+            if !fx::within_deviation(&sample.rate, &median) {
+                tracing::warn!(
+                    currency = currency.code(),
+                    reason = "deviation_exceeded",
+                    "FX reference sample rejected"
+                );
+                continue;
+            }
         }
+        accepted += sqlx::query(
+            "INSERT INTO fx_rate_samples \
+             (currency, rate, fetched_at, accepted_at, sample_bucket, source) \
+             VALUES ($1, $2, $3, $4, $5, 'blocktank') \
+             ON CONFLICT (currency, sample_bucket) DO NOTHING",
+        )
+        .bind(currency.code())
+        .bind(
+            sqlx::types::BigDecimal::from_str(&sample.rate.to_string_value())
+                .expect("validated FX rate is a decimal"),
+        )
+        .bind(sample.fetched_at)
+        .bind(now)
+        .bind(bucket)
+        .execute(pool)
+        .await?
+        .rows_affected();
     }
-    let inserted = sqlx::query(
-        "INSERT INTO fx_rate_samples \
-         (currency, rate, fetched_at, accepted_at, sample_bucket, source) \
-         VALUES ('USD', $1, $2, $3, $4, 'blocktank') \
-         ON CONFLICT (currency, sample_bucket) DO NOTHING",
-    )
-    .bind(
-        sqlx::types::BigDecimal::from_str(&sample.rate.to_string_value())
-            .expect("validated FX rate is a decimal"),
-    )
-    .bind(sample.fetched_at)
-    .bind(now)
-    .bind(bucket)
-    .execute(pool)
-    .await?
-    .rows_affected();
     sqlx::query(
         "DELETE FROM fx_rate_samples \
          WHERE accepted_at < $1 - interval '3660 seconds'",
@@ -4948,7 +4968,7 @@ pub async fn sample_fx_rate(
     .bind(now)
     .execute(pool)
     .await?;
-    Ok(inserted)
+    Ok(accepted)
 }
 
 /// One worker pass: for each task, take the lease, drain, release. Tasks
