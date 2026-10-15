@@ -354,3 +354,53 @@ async fn a_row_keeps_the_balance_rule_and_the_implicit_shape(pool: PgPool) {
         .expect("a listing deletes with its rows");
     assert!(rows(&pool, "listing:rules").await.is_empty());
 }
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn the_conversion_marker_is_constrained_rerunnable_and_leaves_with_its_listing(pool: PgPool) {
+    seed_listing(&pool, "listing:blocked", "fixed_price", (5, 4, 1, 0)).await;
+    let mark = |reason: &'static str, variants: i32, reserved: i64, sold: i64| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(
+                "INSERT INTO listing_variant_conversion_blocks \
+                 (listing_aggregate_id, reason, enabled_variants, reserved_quantity, sold_quantity) \
+                 VALUES ('listing:blocked', $1, $2, $3, $4) \
+                 ON CONFLICT (listing_aggregate_id) DO UPDATE SET reason = EXCLUDED.reason",
+            )
+            .bind(reason)
+            .bind(variants)
+            .bind(reserved)
+            .bind(sold)
+            .execute(&pool)
+            .await
+        }
+    };
+    assert!(
+        mark("because", 2, 1, 0).await.is_err(),
+        "only the two named reasons"
+    );
+    assert!(
+        mark("open_holds", 1, 1, 0).await.is_err(),
+        "a marker needs two variants"
+    );
+    assert!(mark("open_holds", 2, -1, 0).await.is_err());
+    mark("open_holds", 2, 1, 0).await.expect("a valid marker");
+    sqlx::raw_sql(MIGRATION_0070)
+        .execute(&pool)
+        .await
+        .expect("a rerun keeps the marker");
+    let kept: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM listing_variant_conversion_blocks")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(kept, 1);
+    sqlx::query("DELETE FROM listings WHERE aggregate_id = 'listing:blocked'")
+        .execute(&pool)
+        .await
+        .expect("the listing deletes with its marker");
+    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM listing_variant_conversion_blocks")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(left, 0);
+}

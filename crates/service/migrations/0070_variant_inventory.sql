@@ -37,6 +37,15 @@
 -- (`inventory.reserve`, an accepted offer, an auction win). NULL is the
 -- implicit row, which is every reservation that exists today.
 --
+-- `listing_variant_conversion_blocks` is the operator-visible marker of a
+-- listing whose record has two or more enabled variants but that cannot convert
+-- yet: `open_holds` (units reserved) or `unattributable_sales` (units sold that
+-- the paid orders' lines do not attribute to the record's variants). A sync
+-- upserts the row while the listing is blocked and deletes it when the listing
+-- converts (or its record stops listing several variants).
+-- `scripts/variant-conversion-sweep.sh` reads it; `listing.sync_many` retries
+-- the listings and reports the state per item.
+--
 -- No index is built on an existing table; the new table's primary key is
 -- built on an empty table. The `ALTER TABLE ... ADD COLUMN` statements add
 -- nullable columns without a default, so they rewrite nothing.
@@ -59,6 +68,17 @@ CREATE TABLE IF NOT EXISTS listing_variant_inventory (
         CHECK (available_quantity + reserved_quantity + sold_quantity = total_quantity),
     CONSTRAINT listing_variant_inventory_implicit_shape
         CHECK (variant_id <> '' OR (sku IS NULL AND enabled AND position = 0))
+);
+
+CREATE TABLE IF NOT EXISTS listing_variant_conversion_blocks (
+    listing_aggregate_id TEXT PRIMARY KEY REFERENCES listings (aggregate_id) ON DELETE CASCADE,
+    reason TEXT NOT NULL CHECK (reason IN ('open_holds', 'unattributable_sales')),
+    enabled_variants INTEGER NOT NULL CHECK (enabled_variants >= 2),
+    reserved_quantity BIGINT NOT NULL CHECK (reserved_quantity >= 0),
+    sold_quantity BIGINT NOT NULL CHECK (sold_quantity >= 0),
+    attempts INTEGER NOT NULL DEFAULT 1 CHECK (attempts >= 1),
+    first_blocked_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 ALTER TABLE listings ADD COLUMN IF NOT EXISTS variant_availability JSONB;

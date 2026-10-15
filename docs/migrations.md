@@ -213,6 +213,15 @@ the connectors'): it depends only on `listings` and `reservations`. See [per-var
   the public per-variant view, written only by the roll-up trigger.
 - `reservations.variant_id` (nullable `TEXT`): the variant row a reservation
   holds. `NULL` is the implicit row, which is every reservation that exists.
+- `listing_variant_conversion_blocks` (new table, one row per listing): the
+  operator-visible marker of a listing whose record lists two or more enabled
+  variants but that cannot convert yet. `reason` is `open_holds` or
+  `unattributable_sales`; `attempts`, `first_blocked_at` and `last_attempt_at`
+  show how long and how often. A sync upserts it while the listing is blocked
+  and deletes it when the listing converts or its record stops listing several
+  variants. `scripts/variant-conversion-sweep.sh` (read-only, like
+  `listing-record-sweep.sh`) lists it and prints the `sync-many` body that
+  retries those listings; `sync-many` reports the state per item.
 - Backfill: one implicit row per listing that has none, equal to the listing's
   totals. A rerun adds nothing to a listing that already has rows, so it never
   re-adds an implicit row beside keyed rows. The statement reads `listings`
@@ -245,7 +254,19 @@ migration cannot read the seller's homeserver record. A listing whose record
 lists two or more enabled variants becomes variant-tracked at its next sync.
 After the deploy, run `sync-many` over the live listings that have several
 variants so they convert at once (a listing with open holds, or with sales that
-do not attribute to the record's variants, converts at a later sync).
+do not attribute to the record's variants, converts at a later sync and shows
+in `scripts/variant-conversion-sweep.sh` until then).
+
+**Totals that counted a disabled variant.** Before 0070 a listing that sold one
+variant counted the stock of the record's disabled variants in its total. The
+first sync of the record after the deploy recomputes the total from the enabled
+variants: at the same record revision while the total is still exactly the old
+sum (a seller's `inventory.adjust` has moved it otherwise, and stays), and at
+any newer revision as for every edit. The new total is never below the units
+already reserved or sold. For a listing whose enabled stock is below its sold
+units the total becomes the sold units and the listing reads `sold`. Listings
+with no disabled variant are untouched. `sync-many` over the live listings
+applies it at once.
 
 `crates/service/tests/migration_0070_test.rs` (serial: it replays 0032 on a
 scratch database) pins the backfill on a database migrated through 0069, the

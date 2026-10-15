@@ -1722,3 +1722,219 @@ async fn an_edit_below_committed_units_is_still_refused_without_a_disabled_varia
         [("".into(), 2, 0, 3, 5)]
     );
 }
+
+async fn blocked(pool: &PgPool, seller: &str) -> Option<(String, i32, i64, i64)> {
+    sqlx::query_as(
+        "SELECT reason, attempts, reserved_quantity, sold_quantity \
+         FROM listing_variant_conversion_blocks WHERE listing_aggregate_id = $1",
+    )
+    .bind(listing_aggregate(seller))
+    .fetch_optional(pool)
+    .await
+    .expect("marker query")
+}
+
+async fn sync_many(app: &TestApp, seller: &TestActor) -> Value {
+    let (status, body) = send(
+        app.router.clone(),
+        "POST",
+        "/v1/listings/sync-many",
+        Some(&seller.token),
+        &json!({"listings": [{"seller_pubky": seller.pubky, "listing_id": "boots_01"}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::MULTI_STATUS, "{body}");
+    body["results"][0].clone()
+}
+
+fn conversion_warnings(seller: &str) -> usize {
+    common::captured_logs()
+        .lines()
+        .filter(|line| line.contains("variant_conversion") && line.contains(seller))
+        .count()
+}
+
+/// Open holds block conversion. The listing is marked, the warn is logged once,
+/// `sync-many` retries it and reports the state, and once the hold lapses the
+/// next `sync-many` converts it and clears the marker.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_listing_blocked_by_open_holds_is_marked_retried_and_cleared(pool: PgPool) {
+    common::install_log_capture();
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    execute(&app, &seller.token, &register_command(&seller.pubky, 5)).await;
+    put_record(&homeserver, &seller.pubky, record(1, &[("only", true, 5)]));
+    let revision = listing_revision(&app.pool, &seller.pubky).await;
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &reserve(&seller.pubky, 1, None, revision, 1),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    put_record(
+        &homeserver,
+        &seller.pubky,
+        record(1, &[("size_s", true, 2), ("size_m", true, 3)]),
+    );
+    let (status, body) = sync_status(&app, &buyer.token, &seller.pubky, 1).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        rows(&app.pool, &seller.pubky).await.len(),
+        1,
+        "still one shared total"
+    );
+    assert_eq!(
+        blocked(&app.pool, &seller.pubky).await,
+        Some(("open_holds".to_string(), 1, 1, 0))
+    );
+    assert_eq!(
+        conversion_warnings(&seller.pubky),
+        1,
+        "{}",
+        common::captured_logs()
+    );
+
+    let item = sync_many(&app, &seller).await;
+    assert_eq!(
+        item["variant_conversion"],
+        json!({ "state": "deferred", "reason": "open_holds", "attempts": 2 })
+    );
+    assert_eq!(
+        conversion_warnings(&seller.pubky),
+        1,
+        "the warn is logged when the listing is first blocked, not on every retry"
+    );
+
+    // The sweep the operator runs lists it.
+    let swept: Vec<(String, String, String, String)> = {
+        use sqlx::Row;
+        sqlx::query(include_str!(
+            "../../../scripts/variant-conversion-sweep.sql"
+        ))
+        .fetch_all(&app.pool)
+        .await
+        .expect("the sweep query runs")
+        .iter()
+        .map(|row| {
+            (
+                row.get::<String, _>(0),
+                row.get::<String, _>(2),
+                row.get::<String, _>(3),
+                row.get::<i32, _>(7).to_string(),
+            )
+        })
+        .collect()
+    };
+    assert_eq!(
+        swept,
+        [(
+            listing_aggregate(&seller.pubky),
+            "boots_01".to_string(),
+            "open_holds".to_string(),
+            "2".to_string()
+        )]
+    );
+
+    // The operator script prints the same listing, exits 2 while one is
+    // blocked, and with --sync-many prints the body that retries it.
+    let database: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    let base = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+    let url = format!(
+        "{}/{database}",
+        base.rsplit_once('/').expect("a database URL").0
+    );
+    let script = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../scripts/variant-conversion-sweep.sh"
+    );
+    let listed = std::process::Command::new("bash")
+        .arg(script)
+        .env("DATABASE_URL", &url)
+        .output()
+        .expect("the sweep runs");
+    assert_eq!(listed.status.code(), Some(2), "{listed:?}");
+    let listed = String::from_utf8_lossy(&listed.stdout).into_owned();
+    assert!(
+        listed.starts_with(&format!(
+            "{}\t{}\tboots_01\topen_holds\t2\t1\t0\t2\t",
+            listing_aggregate(&seller.pubky),
+            seller.pubky
+        )),
+        "{listed}"
+    );
+    let body = std::process::Command::new("bash")
+        .arg(script)
+        .arg("--sync-many")
+        .env("DATABASE_URL", &url)
+        .output()
+        .expect("the sweep runs");
+    let body: Value = serde_json::from_slice(&body.stdout).expect("a sync-many body");
+    assert_eq!(
+        body,
+        json!({ "listings": [{ "seller_pubky": seller.pubky, "listing_id": "boots_01" }] })
+    );
+
+    app.clock.advance_seconds(601);
+    assert_eq!(
+        expire_due_reservations(&app.pool, app.clock.now())
+            .await
+            .unwrap(),
+        1
+    );
+    let item = sync_many(&app, &seller).await;
+    assert!(item.get("variant_conversion").is_none(), "{item}");
+    assert_eq!(blocked(&app.pool, &seller.pubky).await, None);
+    let stored = rows(&app.pool, &seller.pubky).await;
+    assert_eq!(row(&stored, "size_s"), (2, 0, 0, 2));
+    assert_eq!(row(&stored, "size_m"), (3, 0, 0, 3));
+    assert_books_balance(&app.pool).await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn unattributable_sales_mark_the_listing_until_its_record_stops_listing_variants(
+    pool: PgPool,
+) {
+    common::install_log_capture();
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    execute(&app, &seller.token, &register_command(&seller.pubky, 5)).await;
+    put_record(&homeserver, &seller.pubky, record(1, &[("only", true, 5)]));
+    let (status, body) = buy_sandbox(&app, &buyer, &seller.pubky, "legacy_name", 1).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    put_record(
+        &homeserver,
+        &seller.pubky,
+        record(2, &[("size_s", true, 2), ("size_m", true, 3)]),
+    );
+    let (status, body) = sync_status(&app, &buyer.token, &seller.pubky, 1).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        blocked(&app.pool, &seller.pubky).await,
+        Some(("unattributable_sales".to_string(), 1, 0, 1))
+    );
+    assert_eq!(
+        rows(&app.pool, &seller.pubky).await,
+        [("".into(), 4, 0, 1, 5)]
+    );
+    let item = sync_many(&app, &seller).await;
+    assert_eq!(
+        item["variant_conversion"]["reason"],
+        json!("unattributable_sales")
+    );
+    assert!(conversion_warnings(&seller.pubky) >= 1);
+
+    // The seller republishes one variant: nothing is left to convert.
+    put_record(&homeserver, &seller.pubky, record(3, &[("only", true, 5)]));
+    let (status, body) = sync_status(&app, &buyer.token, &seller.pubky, 2).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(blocked(&app.pool, &seller.pubky).await, None);
+    assert_books_balance(&app.pool).await;
+}

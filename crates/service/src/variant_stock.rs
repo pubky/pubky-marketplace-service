@@ -358,23 +358,42 @@ impl BelowCommitted {
     }
 }
 
-/// Committed units attributable to each variant for a listing whose implicit
-/// row is being replaced by keyed rows, or `None` when they cannot be
-/// attributed exactly. Units sold are attributed from the lines of the
-/// listing's paid orders; units reserved cannot be (a hold made before
-/// per-variant stock names no variant), so a listing with open holds is
-/// converted at a later edit, once they have settled.
+/// Why a listing that should track stock per variant still sells from one
+/// shared total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferReason {
+    /// Units are reserved. A hold made before per-variant stock names no
+    /// variant, so it cannot be attributed; the listing converts at a sync
+    /// after the holds settle.
+    OpenHolds,
+    /// Units were sold that the lines of the listing's paid orders do not
+    /// attribute exactly to the record's variants.
+    UnattributableSales,
+}
+
+impl DeferReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeferReason::OpenHolds => "open_holds",
+            DeferReason::UnattributableSales => "unattributable_sales",
+        }
+    }
+}
+
+/// Sold units attributable to each variant for a listing whose implicit row
+/// is being replaced by keyed rows, or why they cannot be attributed. Units
+/// sold are attributed from the lines of the listing's paid orders.
 pub async fn attribute_sold(
     tx: &mut Transaction<'_, Postgres>,
     aggregate_id: &str,
     implicit: &VariantRow,
     offered: &HashSet<&str>,
-) -> Result<Option<HashMap<String, i64>>, sqlx::Error> {
+) -> Result<Result<HashMap<String, i64>, DeferReason>, sqlx::Error> {
     if implicit.reserved_quantity != 0 {
-        return Ok(None);
+        return Ok(Err(DeferReason::OpenHolds));
     }
     if implicit.sold_quantity == 0 {
-        return Ok(Some(HashMap::new()));
+        return Ok(Ok(HashMap::new()));
     }
     let sold: Vec<(Option<String>, i64)> = sqlx::query_as(
         "SELECT line->>'variant_id', SUM((line->>'quantity')::bigint)::bigint \
@@ -391,12 +410,81 @@ pub async fn attribute_sold(
     let mut total = 0i64;
     for (variant_id, quantity) in sold {
         let Some(variant_id) = variant_id.filter(|id| offered.contains(id.as_str())) else {
-            return Ok(None);
+            return Ok(Err(DeferReason::UnattributableSales));
         };
         total += quantity;
         attributed.insert(variant_id, quantity);
     }
-    Ok((total == implicit.sold_quantity).then_some(attributed))
+    Ok(if total == implicit.sold_quantity {
+        Ok(attributed)
+    } else {
+        Err(DeferReason::UnattributableSales)
+    })
+}
+
+/// Marks a listing the record wants per-variant but that cannot convert yet:
+/// one row per listing in `listing_variant_conversion_blocks`, which the
+/// operator sweep reads, and a warn log the first time and whenever the reason
+/// changes. Every transaction that finds the listing still blocked counts one
+/// attempt, however many times it plans.
+async fn record_deferral(
+    tx: &mut Transaction<'_, Postgres>,
+    aggregate_id: &str,
+    reason: DeferReason,
+    implicit: &VariantRow,
+    enabled_variants: usize,
+) -> Result<(), sqlx::Error> {
+    let previous: Option<String> = sqlx::query_scalar(
+        "SELECT reason FROM listing_variant_conversion_blocks WHERE listing_aggregate_id = $1",
+    )
+    .bind(aggregate_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let attempts: i32 = sqlx::query_scalar(
+        "INSERT INTO listing_variant_conversion_blocks \
+         (listing_aggregate_id, reason, enabled_variants, reserved_quantity, sold_quantity) \
+         VALUES ($1, $2, $3, $4, $5) \
+         ON CONFLICT (listing_aggregate_id) DO UPDATE SET reason = EXCLUDED.reason, \
+            enabled_variants = EXCLUDED.enabled_variants, \
+            reserved_quantity = EXCLUDED.reserved_quantity, \
+            sold_quantity = EXCLUDED.sold_quantity, \
+            attempts = CASE WHEN listing_variant_conversion_blocks.last_attempt_at = now() \
+                THEN listing_variant_conversion_blocks.attempts \
+                ELSE listing_variant_conversion_blocks.attempts + 1 END, \
+            last_attempt_at = now() \
+         RETURNING attempts",
+    )
+    .bind(aggregate_id)
+    .bind(reason.as_str())
+    .bind(i32::try_from(enabled_variants).unwrap_or(i32::MAX))
+    .bind(implicit.reserved_quantity)
+    .bind(implicit.sold_quantity)
+    .fetch_one(&mut **tx)
+    .await?;
+    if previous.as_deref() != Some(reason.as_str()) {
+        tracing::warn!(
+            target: "variant_conversion",
+            aggregate_id,
+            reason = reason.as_str(),
+            enabled_variants,
+            reserved_quantity = implicit.reserved_quantity,
+            sold_quantity = implicit.sold_quantity,
+            attempts = attempts,
+            "listing cannot convert to per-variant stock yet and keeps one shared total"
+        );
+    }
+    Ok(())
+}
+
+async fn clear_deferral(
+    tx: &mut Transaction<'_, Postgres>,
+    aggregate_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM listing_variant_conversion_blocks WHERE listing_aggregate_id = $1")
+        .bind(aggregate_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }
 
 /// Plans the rows for a record's enabled variants against the rows the
@@ -412,6 +500,9 @@ pub async fn plan(
 ) -> Result<Result<StockPlan, CommandFailure>, sqlx::Error> {
     let keyed = tracks_variants(rows);
     if !keyed && variants.len() < 2 {
+        if !new_listing {
+            clear_deferral(tx, aggregate_id).await?;
+        }
         return Ok(Ok(StockPlan::Implicit));
     }
     if keyed && variants.is_empty() {
@@ -426,11 +517,15 @@ pub async fn plan(
         };
         let offered: HashSet<&str> = variants.iter().map(|v| v.id.as_str()).collect();
         match attribute_sold(tx, aggregate_id, implicit, &offered).await? {
-            Some(sold) => {
+            Ok(sold) => {
                 attribution = sold;
                 convert = true;
+                clear_deferral(tx, aggregate_id).await?;
             }
-            None => return Ok(Ok(StockPlan::Implicit)),
+            Err(reason) => {
+                record_deferral(tx, aggregate_id, reason, implicit, variants.len()).await?;
+                return Ok(Ok(StockPlan::Implicit));
+            }
         }
     }
 

@@ -642,7 +642,14 @@ Semantics:
   older than the projection is a no-op that returns the current revision. A
   re-sync at the same record revision refreshes derived fields (shipping,
   fulfillment methods, digital lock) and bumps the aggregate revision with a
-  `listing.synced` event.
+  `listing.synced` event. A same-revision re-sync also retries a listing that
+  [cannot convert to per-variant stock yet](#per-variant-stock), recomputes a
+  total that counted a disabled variant's stock, and converts a listing that
+  has become convertible.
+- A result carries `"variant_conversion": { "state": "deferred", "reason":
+  "open_holds" | "unattributable_sales", "attempts": 2 }` while its listing is
+  still blocked from converting to per-variant stock; the key is absent
+  otherwise.
 - Failure modes per item: `NOT_FOUND` (record missing, or listing tombstoned
   once the seller's event stream confirms deletion); `UPSTREAM_UNAVAILABLE`
   (503; homeserver unreachable, retry later); `INVALID_STATE` (record cannot be
@@ -808,8 +815,11 @@ record order, omitted from the canonical JSON when empty:
 - Two or more entries: one stock row per entry; the listing's quantities are
   their sums and `payload.quantity` is not used for stock (it stays the sum of
   all the record's variants, enabled or not).
-- Fewer than two: one implicit row holding `payload.quantity`, exactly as
-  before. An auction always registers one implicit row.
+- Fewer than two: one implicit row, exactly as before. Its stock is the one
+  enabled variant's quantity when `payload.variants` has one entry (stock of the
+  record's disabled variants is not for sale and is not counted), and
+  `payload.quantity` when it has none. An auction always registers one implicit
+  row.
 - A record with two or more enabled variants whose ids are missing, malformed
   or repeated cannot be interpreted and does not register.
 - A variant-tracked listing whose payload or record lists no enabled variant
@@ -820,7 +830,21 @@ record order, omitted from the canonical JSON when empty:
   enabled variants, at the same or a newer revision, when its units sold can be
   attributed exactly to the record's variants by the variant on each paid
   order line and none are reserved. Otherwise it keeps its shared total and the
-  next sync tries again.
+  next sync tries again. While it waits it is marked in
+  `listing_variant_conversion_blocks` with the reason, `open_holds` or
+  `unattributable_sales`, a `warn` is logged once (target
+  `variant_conversion`, fields `aggregate_id`, `reason`, `enabled_variants`,
+  `reserved_quantity`, `sold_quantity`, `attempts`) and again if the reason
+  changes, and `sync-many` reports `variant_conversion` for it (see
+  [Batch sync](#batch-sync-sync-many)). `scripts/variant-conversion-sweep.sh`
+  lists the marked listings and prints the `sync-many` body that retries them.
+- A listing registered before per-variant stock counted the stock of its
+  record's disabled variants in its total. A sync of its record recomputes the
+  total from the enabled variants, never below the units already reserved or
+  sold: at a newer record revision as for any edit, and at the same revision
+  only while the total is still exactly that old sum (a seller's
+  `inventory.adjust` has moved it otherwise, and stays). An edit that lowers
+  the sum of every variant below the committed units is still refused as before.
 
 **Record edits.** A sync that changes a variant's quantity sets the row's total
 to the record's and its available count to total minus reserved and sold. A
