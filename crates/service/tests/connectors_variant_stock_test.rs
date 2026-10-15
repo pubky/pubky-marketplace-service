@@ -30,8 +30,6 @@ struct World {
     app: TestApp,
     seller: TestActor,
     connection: ConnectionRow,
-    /// This build has per-variant inventory.
-    supported: bool,
 }
 
 async fn world(pool: PgPool, variants: Option<&[(&str, i64)]>) -> World {
@@ -68,7 +66,6 @@ async fn world(pool: PgPool, variants: Option<&[(&str, i64)]>) -> World {
         app,
         seller,
         connection: row,
-        supported,
     }
 }
 

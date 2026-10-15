@@ -112,8 +112,8 @@
      "woocommerce_update_product_variation"
     ],
     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
-    "date_created": "2026-10-15T16:25:55",
-    "date_created_gmt": "2026-10-15T16:25:55",
+    "date_created": "2026-10-15T16:52:09",
+    "date_created_gmt": "2026-10-15T16:52:09",
     "date_modified": null,
     "date_modified_gmt": null,
     "_links": {
@@ -169,8 +169,8 @@
      "woocommerce_order_refunded"
     ],
     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
-    "date_created": "2026-10-15T16:25:56",
-    "date_created_gmt": "2026-10-15T16:25:56",
+    "date_created": "2026-10-15T16:52:10",
+    "date_created_gmt": "2026-10-15T16:52:10",
     "date_modified": null,
     "date_modified_gmt": null,
     "_links": {
@@ -226,8 +226,8 @@
      "woocommerce_trash_order"
     ],
     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
-    "date_created": "2026-10-15T16:25:58",
-    "date_created_gmt": "2026-10-15T16:25:58",
+    "date_created": "2026-10-15T16:52:11",
+    "date_created_gmt": "2026-10-15T16:52:11",
     "date_modified": null,
     "date_modified_gmt": null,
     "_links": {
@@ -332,8 +332,8 @@
     "currency": "CHF",
     "version": "11.2.1",
     "prices_include_tax": true,
-    "date_created": "2026-10-15T16:25:59",
-    "date_modified": "2026-10-15T16:25:59",
+    "date_created": "2026-10-15T16:52:13",
+    "date_modified": "2026-10-15T16:52:13",
     "discount_total": "0.00",
     "discount_tax": "0.00",
     "shipping_total": "0.00",
@@ -342,7 +342,7 @@
     "total": "50.90",
     "total_tax": "0.00",
     "customer_id": 0,
-    "order_key": "wc_order_JAJCGL8gOxJ8V",
+    "order_key": "wc_order_9Qc0az6zmTDQ4",
     "billing": {
      "first_name": "",
      "last_name": "",
@@ -376,22 +376,22 @@
     "created_via": "rest-api",
     "customer_note": "Pubky order 11111111-2222-8333-9444-555555555551, paid with Bitcoin. Details and the buyer's messages: https://shop.test/marketplace/orders",
     "date_completed": null,
-    "date_paid": "2026-10-15T16:25:59",
+    "date_paid": "2026-10-15T16:52:13",
     "cart_hash": "",
     "number": "49",
     "meta_data": [
      {
-      "id": 830,
+      "id": 831,
       "key": "pubky_order_id",
       "value": "11111111-2222-8333-9444-555555555551"
      },
      {
-      "id": 831,
+      "id": 832,
       "key": "pubky_payment_rail",
       "value": "bitcoin"
      },
      {
-      "id": 832,
+      "id": 833,
       "key": "pubky_paid_at",
       "value": "2026-10-15T12:00:00Z"
      }
@@ -493,14 +493,14 @@
     ],
     "coupon_lines": [],
     "refunds": [],
-    "payment_url": "https://localhost:8443/checkout/order-pay/49/?pay_for_order=true&key=wc_order_JAJCGL8gOxJ8V",
+    "payment_url": "https://localhost:8443/checkout/order-pay/49/?pay_for_order=true&key=wc_order_9Qc0az6zmTDQ4",
     "is_editable": false,
     "needs_payment": false,
     "needs_processing": true,
-    "date_created_gmt": "2026-10-15T16:25:59",
-    "date_modified_gmt": "2026-10-15T16:25:59",
+    "date_created_gmt": "2026-10-15T16:52:13",
+    "date_modified_gmt": "2026-10-15T16:52:13",
     "date_completed_gmt": null,
-    "date_paid_gmt": "2026-10-15T16:25:59",
+    "date_paid_gmt": "2026-10-15T16:52:13",
     "currency_symbol": "CHF",
     "_links": {
      "self": [
@@ -563,17 +563,17 @@
      "status": "processing",
      "meta_data": [
       {
-       "id": 830,
+       "id": 831,
        "key": "pubky_order_id",
        "value": "11111111-2222-8333-9444-555555555551"
       },
       {
-       "id": 831,
+       "id": 832,
        "key": "pubky_payment_rail",
        "value": "bitcoin"
       },
       {
-       "id": 832,
+       "id": 833,
        "key": "pubky_paid_at",
        "value": "2026-10-15T12:00:00Z"
       }
@@ -649,17 +649,17 @@
      "status": "processing",
      "meta_data": [
       {
-       "id": 830,
+       "id": 831,
        "key": "pubky_order_id",
        "value": "11111111-2222-8333-9444-555555555551"
       },
       {
-       "id": 831,
+       "id": 832,
        "key": "pubky_payment_rail",
        "value": "bitcoin"
       },
       {
-       "id": 832,
+       "id": 833,
        "key": "pubky_paid_at",
        "value": "2026-10-15T12:00:00Z"
       }
@@ -672,7 +672,7 @@
       {
        "id": 788,
        "key": "pubky_order_id",
-       "value": "ccc25054-234c-4efe-91f2-49938ddf04a9"
+       "value": "dbefc3b7-dd67-424f-8931-2538d3e757ea"
       },
       {
        "id": 789,
@@ -683,6 +683,36 @@
        "id": 790,
        "key": "pubky_paid_at",
        "value": "2026-08-19T22:00:00Z"
+      },
+      {
+       "id": 795,
+       "key": "_wc_shipment_tracking_items",
+       "value": [
+        {
+         "tracking_provider": "swiss-post",
+         "custom_tracking_provider": "",
+         "custom_tracking_link": "",
+         "tracking_number": "99.60.123456.12345678",
+         "tracking_product_code": "",
+         "source": "REST_API",
+         "date_shipped": 1792083032,
+         "status_shipped": "",
+         "tracking_id": "cabdfa0009c3188034eed1dad07a2400",
+         "user_id": 1
+        },
+        {
+         "tracking_provider": "DHL",
+         "custom_tracking_provider": "",
+         "custom_tracking_link": "",
+         "tracking_number": "JD0146000555",
+         "tracking_product_code": "",
+         "source": "REST_API",
+         "date_shipped": 1792083035,
+         "status_shipped": "",
+         "tracking_id": "94655a7b07bd1dc11b7b1ca12ecf9ba1",
+         "user_id": 1
+        }
+       ]
       }
      ]
     },
@@ -693,7 +723,7 @@
       {
        "id": 741,
        "key": "pubky_order_id",
-       "value": "b90f74f4-d52f-4206-aea4-98b0b8eef6ce"
+       "value": "ca4e51b0-08f2-48e7-9e51-a48e475f0652"
       },
       {
        "id": 742,
@@ -714,7 +744,7 @@
       {
        "id": 708,
        "key": "pubky_order_id",
-       "value": "5922a989-6aa3-4b64-b1e9-e93c6dd30904"
+       "value": "4b1cea11-5bb0-4eb8-a8af-f0e292e49cab"
       },
       {
        "id": 709,
@@ -740,7 +770,7 @@
       {
        "id": 673,
        "key": "pubky_order_id",
-       "value": "52675d8b-dddc-40f9-b625-0215ad8d3038"
+       "value": "fa9c109b-ac11-47c9-8c45-ac076bd4195a"
       },
       {
        "id": 674,
@@ -763,9 +793,9 @@
          "tracking_number": "99.60.123456.12345678",
          "tracking_product_code": "",
          "source": "REST_API",
-         "date_shipped": 1792081428,
+         "date_shipped": 1792082995,
          "status_shipped": "",
-         "tracking_id": "0c149bfe34922a4b0a11815536d15fdd",
+         "tracking_id": "8a482c74dd82d5b9a19667fea29137bb",
          "user_id": 1
         }
        ]
@@ -843,8 +873,8 @@
     "currency": "CHF",
     "version": "11.2.1",
     "prices_include_tax": true,
-    "date_created": "2026-10-15T16:26:04",
-    "date_modified": "2026-10-15T16:26:04",
+    "date_created": "2026-10-15T16:52:18",
+    "date_modified": "2026-10-15T16:52:18",
     "discount_total": "0.00",
     "discount_tax": "0.00",
     "shipping_total": "0.00",
@@ -853,7 +883,7 @@
     "total": "50.90",
     "total_tax": "0.00",
     "customer_id": 0,
-    "order_key": "wc_order_owUtx3ynkCSp7",
+    "order_key": "wc_order_jbCe2qgP1GgvX",
     "billing": {
      "first_name": "",
      "last_name": "",
@@ -887,22 +917,22 @@
     "created_via": "rest-api",
     "customer_note": "Pubky order 11111111-2222-8333-9444-555555555552, paid with Bitcoin. Details and the buyer's messages: https://shop.test/marketplace/orders",
     "date_completed": null,
-    "date_paid": "2026-10-15T16:26:04",
+    "date_paid": "2026-10-15T16:52:18",
     "cart_hash": "",
     "number": "50",
     "meta_data": [
      {
-      "id": 858,
+      "id": 859,
       "key": "pubky_order_id",
       "value": "11111111-2222-8333-9444-555555555552"
      },
      {
-      "id": 859,
+      "id": 860,
       "key": "pubky_payment_rail",
       "value": "bitcoin"
      },
      {
-      "id": 860,
+      "id": 861,
       "key": "pubky_paid_at",
       "value": "2026-10-15T12:00:00Z"
      }
@@ -1004,14 +1034,14 @@
     ],
     "coupon_lines": [],
     "refunds": [],
-    "payment_url": "https://localhost:8443/checkout/order-pay/50/?pay_for_order=true&key=wc_order_owUtx3ynkCSp7",
+    "payment_url": "https://localhost:8443/checkout/order-pay/50/?pay_for_order=true&key=wc_order_jbCe2qgP1GgvX",
     "is_editable": false,
     "needs_payment": false,
     "needs_processing": true,
-    "date_created_gmt": "2026-10-15T16:26:04",
-    "date_modified_gmt": "2026-10-15T16:26:04",
+    "date_created_gmt": "2026-10-15T16:52:18",
+    "date_modified_gmt": "2026-10-15T16:52:18",
     "date_completed_gmt": null,
-    "date_paid_gmt": "2026-10-15T16:26:04",
+    "date_paid_gmt": "2026-10-15T16:52:18",
     "currency_symbol": "CHF",
     "_links": {
      "self": [
@@ -1116,8 +1146,8 @@
     "currency": "CHF",
     "version": "11.2.1",
     "prices_include_tax": true,
-    "date_created": "2026-10-15T16:26:04",
-    "date_modified": "2026-10-15T16:26:06",
+    "date_created": "2026-10-15T16:52:18",
+    "date_modified": "2026-10-15T16:52:20",
     "discount_total": "0.00",
     "discount_tax": "0.00",
     "shipping_total": "0.00",
@@ -1126,7 +1156,7 @@
     "total": "50.90",
     "total_tax": "0.00",
     "customer_id": 0,
-    "order_key": "wc_order_owUtx3ynkCSp7",
+    "order_key": "wc_order_jbCe2qgP1GgvX",
     "billing": {
      "first_name": "",
      "last_name": "",
@@ -1160,27 +1190,27 @@
     "created_via": "rest-api",
     "customer_note": "Pubky order 11111111-2222-8333-9444-555555555552, paid with Bitcoin. Details and the buyer's messages: https://shop.test/marketplace/orders",
     "date_completed": null,
-    "date_paid": "2026-10-15T16:26:04",
+    "date_paid": "2026-10-15T16:52:18",
     "cart_hash": "",
     "number": "50",
     "meta_data": [
      {
-      "id": 858,
+      "id": 859,
       "key": "pubky_order_id",
       "value": "11111111-2222-8333-9444-555555555552"
      },
      {
-      "id": 859,
+      "id": 860,
       "key": "pubky_payment_rail",
       "value": "bitcoin"
      },
      {
-      "id": 860,
+      "id": 861,
       "key": "pubky_paid_at",
       "value": "2026-10-15T12:00:00Z"
      },
      {
-      "id": 865,
+      "id": 866,
       "key": "pubky_cancelled",
       "value": "buyer cancelled"
      }
@@ -1267,14 +1297,14 @@
     ],
     "coupon_lines": [],
     "refunds": [],
-    "payment_url": "https://localhost:8443/checkout/order-pay/50/?pay_for_order=true&key=wc_order_owUtx3ynkCSp7",
+    "payment_url": "https://localhost:8443/checkout/order-pay/50/?pay_for_order=true&key=wc_order_jbCe2qgP1GgvX",
     "is_editable": false,
     "needs_payment": false,
     "needs_processing": true,
-    "date_created_gmt": "2026-10-15T16:26:04",
-    "date_modified_gmt": "2026-10-15T16:26:06",
+    "date_created_gmt": "2026-10-15T16:52:18",
+    "date_modified_gmt": "2026-10-15T16:52:20",
     "date_completed_gmt": null,
-    "date_paid_gmt": "2026-10-15T16:26:04",
+    "date_paid_gmt": "2026-10-15T16:52:18",
     "currency_symbol": "CHF",
     "_links": {
      "self": [
@@ -1383,7 +1413,7 @@
    "query": [
     [
      "_fields",
-     "id,status,total,currency,refunds"
+     "id,total,currency,refunds"
     ]
    ],
    "auth": "basic",
@@ -1395,7 +1425,6 @@
    "response_kind": "json",
    "response_body": {
     "id": 49,
-    "status": "processing",
     "currency": "CHF",
     "total": "50.90",
     "refunds": [],
@@ -1476,20 +1505,20 @@
    "response_kind": "json",
    "response_body": {
     "id": 51,
-    "date_created": "2026-10-15T16:26:12",
-    "date_created_gmt": "2026-10-15T16:26:12",
+    "date_created": "2026-10-15T16:52:26",
+    "date_created_gmt": "2026-10-15T16:52:26",
     "amount": "5.00",
     "reason": "Pubky refund refund-1",
     "refunded_by": 1,
     "refunded_payment": false,
     "meta_data": [
      {
-      "id": 881,
+      "id": 882,
       "key": "_refund_type",
       "value": "partial"
      },
      {
-      "id": 882,
+      "id": 883,
       "key": "pubky_refund_id",
       "value": "refund-1"
      }
@@ -1529,7 +1558,7 @@
    "query": [
     [
      "_fields",
-     "id,status,total,currency,refunds"
+     "id,total,currency,refunds"
     ]
    ],
    "auth": "basic",
@@ -1541,7 +1570,6 @@
    "response_kind": "json",
    "response_body": {
     "id": 49,
-    "status": "processing",
     "currency": "CHF",
     "total": "50.90",
     "refunds": [
@@ -1580,46 +1608,6 @@
      ]
     }
    }
-  },
-  {
-   "method": "GET",
-   "path": "/wp-json/wc/v3/orders/49/refunds",
-   "query": [
-    [
-     "per_page",
-     "100"
-    ],
-    [
-     "_fields",
-     "id,meta_data"
-    ]
-   ],
-   "auth": "basic",
-   "request_body": null,
-   "status": 200,
-   "response_headers": {
-    "content-type": "application/json; charset=UTF-8",
-    "x-wp-total": "1",
-    "x-wp-totalpages": "1"
-   },
-   "response_kind": "json",
-   "response_body": [
-    {
-     "id": 51,
-     "meta_data": [
-      {
-       "id": 881,
-       "key": "_refund_type",
-       "value": "partial"
-      },
-      {
-       "id": 882,
-       "key": "pubky_refund_id",
-       "value": "refund-1"
-      }
-     ]
-    }
-   ]
   },
   {
    "method": "GET",
@@ -1627,7 +1615,7 @@
    "query": [
     [
      "_fields",
-     "id,status,total,currency,refunds"
+     "id,total,currency,refunds"
     ]
    ],
    "auth": "basic",
@@ -1639,7 +1627,6 @@
    "response_kind": "json",
    "response_body": {
     "id": 49,
-    "status": "processing",
     "currency": "CHF",
     "total": "50.90",
     "refunds": [
@@ -1706,12 +1693,12 @@
      "id": 51,
      "meta_data": [
       {
-       "id": 881,
+       "id": 882,
        "key": "_refund_type",
        "value": "partial"
       },
       {
-       "id": 882,
+       "id": 883,
        "key": "pubky_refund_id",
        "value": "refund-1"
       }
@@ -1743,20 +1730,20 @@
    "response_kind": "json",
    "response_body": {
     "id": 52,
-    "date_created": "2026-10-15T16:26:18",
-    "date_created_gmt": "2026-10-15T16:26:18",
+    "date_created": "2026-10-15T16:52:31",
+    "date_created_gmt": "2026-10-15T16:52:31",
     "amount": "11.60",
     "reason": "Pubky refund refund-2",
     "refunded_by": 1,
     "refunded_payment": false,
     "meta_data": [
      {
-      "id": 896,
+      "id": 897,
       "key": "_refund_type",
       "value": "partial"
      },
      {
-      "id": 897,
+      "id": 898,
       "key": "pubky_refund_id",
       "value": "refund-2"
      }
@@ -1796,7 +1783,7 @@
    "query": [
     [
      "_fields",
-     "id,status,total,currency,refunds"
+     "id,total,currency,refunds"
     ]
    ],
    "auth": "basic",
@@ -1808,7 +1795,6 @@
    "response_kind": "json",
    "response_body": {
     "id": 49,
-    "status": "processing",
     "currency": "CHF",
     "total": "50.90",
     "refunds": [
@@ -1853,61 +1839,6 @@
      ]
     }
    }
-  },
-  {
-   "method": "GET",
-   "path": "/wp-json/wc/v3/orders/49/refunds",
-   "query": [
-    [
-     "per_page",
-     "100"
-    ],
-    [
-     "_fields",
-     "id,meta_data"
-    ]
-   ],
-   "auth": "basic",
-   "request_body": null,
-   "status": 200,
-   "response_headers": {
-    "content-type": "application/json; charset=UTF-8",
-    "x-wp-total": "2",
-    "x-wp-totalpages": "1"
-   },
-   "response_kind": "json",
-   "response_body": [
-    {
-     "id": 52,
-     "meta_data": [
-      {
-       "id": 896,
-       "key": "_refund_type",
-       "value": "partial"
-      },
-      {
-       "id": 897,
-       "key": "pubky_refund_id",
-       "value": "refund-2"
-      }
-     ]
-    },
-    {
-     "id": 51,
-     "meta_data": [
-      {
-       "id": 881,
-       "key": "_refund_type",
-       "value": "partial"
-      },
-      {
-       "id": 882,
-       "key": "pubky_refund_id",
-       "value": "refund-1"
-      }
-     ]
-    }
-   ]
   },
   {
    "method": "GET",
@@ -1915,7 +1846,7 @@
    "query": [
     [
      "_fields",
-     "id,status,total,currency,refunds"
+     "id,total,currency,refunds"
     ]
    ],
    "auth": "basic",
@@ -1927,7 +1858,69 @@
    "response_kind": "json",
    "response_body": {
     "id": 49,
-    "status": "processing",
+    "currency": "CHF",
+    "total": "50.90",
+    "refunds": [
+     {
+      "id": 52,
+      "reason": "Pubky refund refund-2",
+      "total": "-11.60",
+      "total_tax": "0.00"
+     },
+     {
+      "id": 51,
+      "reason": "Pubky refund refund-1",
+      "total": "-5.00",
+      "total_tax": "0.00"
+     }
+    ],
+    "_links": {
+     "self": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/orders/49",
+       "targetHints": {
+        "allow": [
+         "GET",
+         "POST",
+         "PUT",
+         "PATCH",
+         "DELETE"
+        ]
+       }
+      }
+     ],
+     "collection": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/orders"
+      }
+     ],
+     "email_templates": [
+      {
+       "embeddable": true,
+       "href": "https://localhost:8443/wp-json/wc/v3/orders/49/actions/email_templates"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/wp-json/wc/v3/orders/49",
+   "query": [
+    [
+     "_fields",
+     "id,total,currency,refunds"
+    ]
+   ],
+   "auth": "basic",
+   "request_body": null,
+   "status": 200,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "id": 49,
     "currency": "CHF",
     "total": "50.90",
     "refunds": [
@@ -2000,12 +1993,12 @@
      "id": 52,
      "meta_data": [
       {
-       "id": 896,
+       "id": 897,
        "key": "_refund_type",
        "value": "partial"
       },
       {
-       "id": 897,
+       "id": 898,
        "key": "pubky_refund_id",
        "value": "refund-2"
       }
@@ -2015,12 +2008,12 @@
      "id": 51,
      "meta_data": [
       {
-       "id": 881,
+       "id": 882,
        "key": "_refund_type",
        "value": "partial"
       },
       {
-       "id": 882,
+       "id": 883,
        "key": "pubky_refund_id",
        "value": "refund-1"
       }
@@ -2035,12 +2028,12 @@
    "auth": "basic",
    "request_body": {
     "amount": "34.30",
-    "reason": "Pubky refund refund-4",
+    "reason": "Pubky refund refund-5",
     "api_refund": false,
     "meta_data": [
      {
       "key": "pubky_refund_id",
-      "value": "refund-4"
+      "value": "refund-5"
      }
     ]
    },
@@ -2052,22 +2045,22 @@
    "response_kind": "json",
    "response_body": {
     "id": 53,
-    "date_created": "2026-10-15T16:26:24",
-    "date_created_gmt": "2026-10-15T16:26:24",
+    "date_created": "2026-10-15T16:52:37",
+    "date_created_gmt": "2026-10-15T16:52:37",
     "amount": "34.30",
-    "reason": "Pubky refund refund-4",
+    "reason": "Pubky refund refund-5",
     "refunded_by": 1,
     "refunded_payment": false,
     "meta_data": [
      {
-      "id": 911,
+      "id": 912,
       "key": "_refund_type",
       "value": "full"
      },
      {
-      "id": 912,
+      "id": 913,
       "key": "pubky_refund_id",
-      "value": "refund-4"
+      "value": "refund-5"
      }
     ],
     "line_items": [],
@@ -2105,7 +2098,7 @@
    "query": [
     [
      "_fields",
-     "id,status,total,currency,refunds"
+     "id,total,currency,refunds"
     ]
    ],
    "auth": "basic",
@@ -2117,13 +2110,12 @@
    "response_kind": "json",
    "response_body": {
     "id": 49,
-    "status": "refunded",
     "currency": "CHF",
     "total": "50.90",
     "refunds": [
      {
       "id": 53,
-      "reason": "Pubky refund refund-4",
+      "reason": "Pubky refund refund-5",
       "total": "-34.30",
       "total_tax": "0.00"
      },
@@ -2196,14 +2188,14 @@
      "id": 53,
      "meta_data": [
       {
-       "id": 911,
+       "id": 912,
        "key": "_refund_type",
        "value": "full"
       },
       {
-       "id": 912,
+       "id": 913,
        "key": "pubky_refund_id",
-       "value": "refund-4"
+       "value": "refund-5"
       }
      ]
     },
@@ -2211,12 +2203,12 @@
      "id": 52,
      "meta_data": [
       {
-       "id": 896,
+       "id": 897,
        "key": "_refund_type",
        "value": "partial"
       },
       {
-       "id": 897,
+       "id": 898,
        "key": "pubky_refund_id",
        "value": "refund-2"
       }
@@ -2226,152 +2218,12 @@
      "id": 51,
      "meta_data": [
       {
-       "id": 881,
-       "key": "_refund_type",
-       "value": "partial"
-      },
-      {
        "id": 882,
-       "key": "pubky_refund_id",
-       "value": "refund-1"
-      }
-     ]
-    }
-   ]
-  },
-  {
-   "method": "GET",
-   "path": "/wp-json/wc/v3/orders/49",
-   "query": [
-    [
-     "_fields",
-     "id,status,total,currency,refunds"
-    ]
-   ],
-   "auth": "basic",
-   "request_body": null,
-   "status": 200,
-   "response_headers": {
-    "content-type": "application/json; charset=UTF-8"
-   },
-   "response_kind": "json",
-   "response_body": {
-    "id": 49,
-    "status": "refunded",
-    "currency": "CHF",
-    "total": "50.90",
-    "refunds": [
-     {
-      "id": 53,
-      "reason": "Pubky refund refund-4",
-      "total": "-34.30",
-      "total_tax": "0.00"
-     },
-     {
-      "id": 52,
-      "reason": "Pubky refund refund-2",
-      "total": "-11.60",
-      "total_tax": "0.00"
-     },
-     {
-      "id": 51,
-      "reason": "Pubky refund refund-1",
-      "total": "-5.00",
-      "total_tax": "0.00"
-     }
-    ],
-    "_links": {
-     "self": [
-      {
-       "href": "https://localhost:8443/wp-json/wc/v3/orders/49",
-       "targetHints": {
-        "allow": [
-         "GET",
-         "POST",
-         "PUT",
-         "PATCH",
-         "DELETE"
-        ]
-       }
-      }
-     ],
-     "collection": [
-      {
-       "href": "https://localhost:8443/wp-json/wc/v3/orders"
-      }
-     ],
-     "email_templates": [
-      {
-       "embeddable": true,
-       "href": "https://localhost:8443/wp-json/wc/v3/orders/49/actions/email_templates"
-      }
-     ]
-    }
-   }
-  },
-  {
-   "method": "GET",
-   "path": "/wp-json/wc/v3/orders/49/refunds",
-   "query": [
-    [
-     "per_page",
-     "100"
-    ],
-    [
-     "_fields",
-     "id,meta_data"
-    ]
-   ],
-   "auth": "basic",
-   "request_body": null,
-   "status": 200,
-   "response_headers": {
-    "content-type": "application/json; charset=UTF-8",
-    "x-wp-total": "3",
-    "x-wp-totalpages": "1"
-   },
-   "response_kind": "json",
-   "response_body": [
-    {
-     "id": 53,
-     "meta_data": [
-      {
-       "id": 911,
-       "key": "_refund_type",
-       "value": "full"
-      },
-      {
-       "id": 912,
-       "key": "pubky_refund_id",
-       "value": "refund-4"
-      }
-     ]
-    },
-    {
-     "id": 52,
-     "meta_data": [
-      {
-       "id": 896,
        "key": "_refund_type",
        "value": "partial"
       },
       {
-       "id": 897,
-       "key": "pubky_refund_id",
-       "value": "refund-2"
-      }
-     ]
-    },
-    {
-     "id": 51,
-     "meta_data": [
-      {
-       "id": 881,
-       "key": "_refund_type",
-       "value": "partial"
-      },
-      {
-       "id": 882,
+       "id": 883,
        "key": "pubky_refund_id",
        "value": "refund-1"
       }
@@ -2448,8 +2300,8 @@
     "currency": "CHF",
     "version": "11.2.1",
     "prices_include_tax": true,
-    "date_created": "2026-10-15T16:26:30",
-    "date_modified": "2026-10-15T16:26:31",
+    "date_created": "2026-10-15T16:52:41",
+    "date_modified": "2026-10-15T16:52:41",
     "discount_total": "0.00",
     "discount_tax": "0.00",
     "shipping_total": "0.00",
@@ -2458,7 +2310,7 @@
     "total": "50.90",
     "total_tax": "0.00",
     "customer_id": 0,
-    "order_key": "wc_order_ukQo7dPPc3Eu6",
+    "order_key": "wc_order_acnCLJtinykKu",
     "billing": {
      "first_name": "",
      "last_name": "",
@@ -2492,22 +2344,22 @@
     "created_via": "rest-api",
     "customer_note": "Pubky order 11111111-2222-8333-9444-555555555553, paid with Bitcoin. Details and the buyer's messages: https://shop.test/marketplace/orders",
     "date_completed": null,
-    "date_paid": "2026-10-15T16:26:31",
+    "date_paid": "2026-10-15T16:52:41",
     "cart_hash": "",
     "number": "54",
     "meta_data": [
      {
-      "id": 934,
+      "id": 935,
       "key": "pubky_order_id",
       "value": "11111111-2222-8333-9444-555555555553"
      },
      {
-      "id": 935,
+      "id": 936,
       "key": "pubky_payment_rail",
       "value": "bitcoin"
      },
      {
-      "id": 936,
+      "id": 937,
       "key": "pubky_paid_at",
       "value": "2026-10-15T12:00:00Z"
      }
@@ -2609,14 +2461,14 @@
     ],
     "coupon_lines": [],
     "refunds": [],
-    "payment_url": "https://localhost:8443/checkout/order-pay/54/?pay_for_order=true&key=wc_order_ukQo7dPPc3Eu6",
+    "payment_url": "https://localhost:8443/checkout/order-pay/54/?pay_for_order=true&key=wc_order_acnCLJtinykKu",
     "is_editable": false,
     "needs_payment": false,
     "needs_processing": true,
-    "date_created_gmt": "2026-10-15T16:26:30",
-    "date_modified_gmt": "2026-10-15T16:26:31",
+    "date_created_gmt": "2026-10-15T16:52:41",
+    "date_modified_gmt": "2026-10-15T16:52:41",
     "date_completed_gmt": null,
-    "date_paid_gmt": "2026-10-15T16:26:31",
+    "date_paid_gmt": "2026-10-15T16:52:41",
     "currency_symbol": "CHF",
     "_links": {
      "self": [
@@ -2653,7 +2505,7 @@
    "query": [
     [
      "_fields",
-     "id,status,total,currency,refunds"
+     "id,total,currency,refunds"
     ]
    ],
    "auth": "basic",
@@ -2665,7 +2517,6 @@
    "response_kind": "json",
    "response_body": {
     "id": 54,
-    "status": "processing",
     "currency": "CHF",
     "total": "50.90",
     "refunds": [
@@ -2732,7 +2583,7 @@
      "id": 55,
      "meta_data": [
       {
-       "id": 954,
+       "id": 955,
        "key": "_refund_type",
        "value": "partial"
       }
@@ -2764,20 +2615,20 @@
    "response_kind": "json",
    "response_body": {
     "id": 56,
-    "date_created": "2026-10-15T16:26:34",
-    "date_created_gmt": "2026-10-15T16:26:34",
+    "date_created": "2026-10-15T16:52:45",
+    "date_created_gmt": "2026-10-15T16:52:45",
     "amount": "6.00",
     "reason": "Pubky refund refund-7",
     "refunded_by": 1,
     "refunded_payment": false,
     "meta_data": [
      {
-      "id": 968,
+      "id": 969,
       "key": "_refund_type",
       "value": "partial"
      },
      {
-      "id": 969,
+      "id": 970,
       "key": "pubky_refund_id",
       "value": "refund-7"
      }
@@ -2817,7 +2668,7 @@
    "query": [
     [
      "_fields",
-     "id,status,total,currency,refunds"
+     "id,total,currency,refunds"
     ]
    ],
    "auth": "basic",
@@ -2829,7 +2680,6 @@
    "response_kind": "json",
    "response_body": {
     "id": 54,
-    "status": "processing",
     "currency": "CHF",
     "total": "50.90",
     "refunds": [
@@ -2874,56 +2724,6 @@
      ]
     }
    }
-  },
-  {
-   "method": "GET",
-   "path": "/wp-json/wc/v3/orders/54/refunds",
-   "query": [
-    [
-     "per_page",
-     "100"
-    ],
-    [
-     "_fields",
-     "id,meta_data"
-    ]
-   ],
-   "auth": "basic",
-   "request_body": null,
-   "status": 200,
-   "response_headers": {
-    "content-type": "application/json; charset=UTF-8",
-    "x-wp-total": "2",
-    "x-wp-totalpages": "1"
-   },
-   "response_kind": "json",
-   "response_body": [
-    {
-     "id": 56,
-     "meta_data": [
-      {
-       "id": 968,
-       "key": "_refund_type",
-       "value": "partial"
-      },
-      {
-       "id": 969,
-       "key": "pubky_refund_id",
-       "value": "refund-7"
-      }
-     ]
-    },
-    {
-     "id": 55,
-     "meta_data": [
-      {
-       "id": 954,
-       "key": "_refund_type",
-       "value": "partial"
-      }
-     ]
-    }
-   ]
   },
   {
    "method": "GET",
@@ -2931,7 +2731,7 @@
    "query": [
     [
      "_fields",
-     "id,status,total,currency,refunds"
+     "id,total,currency,refunds"
     ]
    ],
    "auth": "basic",
@@ -2943,7 +2743,6 @@
    "response_kind": "json",
    "response_body": {
     "id": 54,
-    "status": "processing",
     "currency": "CHF",
     "total": "50.90",
     "refunds": [
@@ -3016,12 +2815,12 @@
      "id": 56,
      "meta_data": [
       {
-       "id": 968,
+       "id": 969,
        "key": "_refund_type",
        "value": "partial"
       },
       {
-       "id": 969,
+       "id": 970,
        "key": "pubky_refund_id",
        "value": "refund-7"
       }
@@ -3031,7 +2830,7 @@
      "id": 55,
      "meta_data": [
       {
-       "id": 954,
+       "id": 955,
        "key": "_refund_type",
        "value": "partial"
       }
@@ -3063,20 +2862,20 @@
    "response_kind": "json",
    "response_body": {
     "id": 57,
-    "date_created": "2026-10-15T16:26:40",
-    "date_created_gmt": "2026-10-15T16:26:40",
+    "date_created": "2026-10-15T16:52:50",
+    "date_created_gmt": "2026-10-15T16:52:50",
     "amount": "40.90",
     "reason": "Pubky refund refund-9",
     "refunded_by": 1,
     "refunded_payment": false,
     "meta_data": [
      {
-      "id": 983,
+      "id": 984,
       "key": "_refund_type",
       "value": "full"
      },
      {
-      "id": 984,
+      "id": 985,
       "key": "pubky_refund_id",
       "value": "refund-9"
      }

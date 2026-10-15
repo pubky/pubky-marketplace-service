@@ -81,13 +81,13 @@
    "response_kind": "json",
    "response_body": [
     {
-     "id": 23,
-     "name": "Pubky Shop order.updated",
+     "id": 24,
+     "name": "Pubky Shop order.deleted",
      "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce"
     },
     {
-     "id": 24,
-     "name": "Pubky Shop order.deleted",
+     "id": 23,
+     "name": "Pubky Shop order.updated",
      "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce"
     },
     {
@@ -96,61 +96,6 @@
      "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce"
     }
    ]
-  },
-  {
-   "method": "DELETE",
-   "path": "/wp-json/wc/v3/webhooks/23",
-   "query": [
-    [
-     "force",
-     "true"
-    ]
-   ],
-   "auth": "basic",
-   "request_body": null,
-   "status": 200,
-   "response_headers": {
-    "content-type": "application/json; charset=UTF-8"
-   },
-   "response_kind": "json",
-   "response_body": {
-    "id": 23,
-    "name": "Pubky Shop order.updated",
-    "status": "active",
-    "topic": "order.updated",
-    "resource": "order",
-    "event": "updated",
-    "hooks": [
-     "woocommerce_update_order",
-     "woocommerce_order_refunded"
-    ],
-    "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
-    "date_created": "2026-10-15T16:24:56",
-    "date_created_gmt": "2026-10-15T16:24:56",
-    "date_modified": "2026-10-15T16:24:56",
-    "date_modified_gmt": "2026-10-15T16:24:56",
-    "_links": {
-     "self": [
-      {
-       "href": "https://localhost:8443/wp-json/wc/v3/webhooks/23",
-       "targetHints": {
-        "allow": [
-         "GET",
-         "POST",
-         "PUT",
-         "PATCH",
-         "DELETE"
-        ]
-       }
-      }
-     ],
-     "collection": [
-      {
-       "href": "https://localhost:8443/wp-json/wc/v3/webhooks"
-      }
-     ]
-    }
-   }
   },
   {
    "method": "DELETE",
@@ -180,14 +125,69 @@
      "woocommerce_trash_order"
     ],
     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
-    "date_created": "2026-10-15T16:24:56",
-    "date_created_gmt": "2026-10-15T16:24:56",
-    "date_modified": "2026-10-15T16:24:56",
-    "date_modified_gmt": "2026-10-15T16:24:56",
+    "date_created": "2026-10-15T16:51:06",
+    "date_created_gmt": "2026-10-15T16:51:06",
+    "date_modified": "2026-10-15T16:51:06",
+    "date_modified_gmt": "2026-10-15T16:51:06",
     "_links": {
      "self": [
       {
        "href": "https://localhost:8443/wp-json/wc/v3/webhooks/24",
+       "targetHints": {
+        "allow": [
+         "GET",
+         "POST",
+         "PUT",
+         "PATCH",
+         "DELETE"
+        ]
+       }
+      }
+     ],
+     "collection": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/webhooks"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "method": "DELETE",
+   "path": "/wp-json/wc/v3/webhooks/23",
+   "query": [
+    [
+     "force",
+     "true"
+    ]
+   ],
+   "auth": "basic",
+   "request_body": null,
+   "status": 200,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "id": 23,
+    "name": "Pubky Shop order.updated",
+    "status": "active",
+    "topic": "order.updated",
+    "resource": "order",
+    "event": "updated",
+    "hooks": [
+     "woocommerce_update_order",
+     "woocommerce_order_refunded"
+    ],
+    "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
+    "date_created": "2026-10-15T16:51:05",
+    "date_created_gmt": "2026-10-15T16:51:05",
+    "date_modified": "2026-10-15T16:51:05",
+    "date_modified_gmt": "2026-10-15T16:51:05",
+    "_links": {
+     "self": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/webhooks/23",
        "targetHints": {
         "allow": [
          "GET",
@@ -236,10 +236,10 @@
      "woocommerce_update_product_variation"
     ],
     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
-    "date_created": "2026-10-15T16:24:55",
-    "date_created_gmt": "2026-10-15T16:24:55",
-    "date_modified": "2026-10-15T16:24:55",
-    "date_modified_gmt": "2026-10-15T16:24:55",
+    "date_created": "2026-10-15T16:51:04",
+    "date_created_gmt": "2026-10-15T16:51:04",
+    "date_modified": "2026-10-15T16:51:04",
+    "date_modified_gmt": "2026-10-15T16:51:04",
     "_links": {
      "self": [
       {
@@ -294,8 +294,8 @@
      "woocommerce_update_product_variation"
     ],
     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
-    "date_created": "2026-10-15T16:25:31",
-    "date_created_gmt": "2026-10-15T16:25:31",
+    "date_created": "2026-10-15T16:51:44",
+    "date_created_gmt": "2026-10-15T16:51:44",
     "date_modified": null,
     "date_modified_gmt": null,
     "_links": {
@@ -351,8 +351,8 @@
      "woocommerce_order_refunded"
     ],
     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
-    "date_created": "2026-10-15T16:25:32",
-    "date_created_gmt": "2026-10-15T16:25:32",
+    "date_created": "2026-10-15T16:51:45",
+    "date_created_gmt": "2026-10-15T16:51:45",
     "date_modified": null,
     "date_modified_gmt": null,
     "_links": {
@@ -408,8 +408,8 @@
      "woocommerce_trash_order"
     ],
     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
-    "date_created": "2026-10-15T16:25:33",
-    "date_created_gmt": "2026-10-15T16:25:33",
+    "date_created": "2026-10-15T16:51:46",
+    "date_created_gmt": "2026-10-15T16:51:46",
     "date_modified": null,
     "date_modified_gmt": null,
     "_links": {
@@ -559,10 +559,10 @@
      "woocommerce_trash_order"
     ],
     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
-    "date_created": "2026-10-15T16:25:33",
-    "date_created_gmt": "2026-10-15T16:25:33",
-    "date_modified": "2026-10-15T16:25:33",
-    "date_modified_gmt": "2026-10-15T16:25:33",
+    "date_created": "2026-10-15T16:51:46",
+    "date_created_gmt": "2026-10-15T16:51:46",
+    "date_modified": "2026-10-15T16:51:46",
+    "date_modified_gmt": "2026-10-15T16:51:46",
     "_links": {
      "self": [
       {
@@ -614,10 +614,10 @@
      "woocommerce_order_refunded"
     ],
     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
-    "date_created": "2026-10-15T16:25:32",
-    "date_created_gmt": "2026-10-15T16:25:32",
-    "date_modified": "2026-10-15T16:25:32",
-    "date_modified_gmt": "2026-10-15T16:25:32",
+    "date_created": "2026-10-15T16:51:45",
+    "date_created_gmt": "2026-10-15T16:51:45",
+    "date_modified": "2026-10-15T16:51:45",
+    "date_modified_gmt": "2026-10-15T16:51:45",
     "_links": {
      "self": [
       {
@@ -670,10 +670,10 @@
      "woocommerce_update_product_variation"
     ],
     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
-    "date_created": "2026-10-15T16:25:31",
-    "date_created_gmt": "2026-10-15T16:25:31",
-    "date_modified": "2026-10-15T16:25:31",
-    "date_modified_gmt": "2026-10-15T16:25:31",
+    "date_created": "2026-10-15T16:51:44",
+    "date_created_gmt": "2026-10-15T16:51:44",
+    "date_modified": "2026-10-15T16:51:44",
+    "date_modified_gmt": "2026-10-15T16:51:44",
     "_links": {
      "self": [
       {
@@ -728,8 +728,8 @@
      "woocommerce_update_product_variation"
     ],
     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
-    "date_created": "2026-10-15T16:25:41",
-    "date_created_gmt": "2026-10-15T16:25:41",
+    "date_created": "2026-10-15T16:51:54",
+    "date_created_gmt": "2026-10-15T16:51:54",
     "date_modified": null,
     "date_modified_gmt": null,
     "_links": {
@@ -785,8 +785,8 @@
      "woocommerce_order_refunded"
     ],
     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
-    "date_created": "2026-10-15T16:25:42",
-    "date_created_gmt": "2026-10-15T16:25:42",
+    "date_created": "2026-10-15T16:51:55",
+    "date_created_gmt": "2026-10-15T16:51:55",
     "date_modified": null,
     "date_modified_gmt": null,
     "_links": {
@@ -842,8 +842,8 @@
      "woocommerce_trash_order"
     ],
     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
-    "date_created": "2026-10-15T16:25:43",
-    "date_created_gmt": "2026-10-15T16:25:43",
+    "date_created": "2026-10-15T16:51:56",
+    "date_created_gmt": "2026-10-15T16:51:56",
     "date_modified": null,
     "date_modified_gmt": null,
     "_links": {
@@ -937,10 +937,10 @@
      "woocommerce_trash_order"
     ],
     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
-    "date_created": "2026-10-15T16:25:43",
-    "date_created_gmt": "2026-10-15T16:25:43",
-    "date_modified": "2026-10-15T16:25:43",
-    "date_modified_gmt": "2026-10-15T16:25:43",
+    "date_created": "2026-10-15T16:51:56",
+    "date_created_gmt": "2026-10-15T16:51:56",
+    "date_modified": "2026-10-15T16:51:56",
+    "date_modified_gmt": "2026-10-15T16:51:56",
     "_links": {
      "self": [
       {
@@ -992,10 +992,10 @@
      "woocommerce_order_refunded"
     ],
     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
-    "date_created": "2026-10-15T16:25:42",
-    "date_created_gmt": "2026-10-15T16:25:42",
-    "date_modified": "2026-10-15T16:25:42",
-    "date_modified_gmt": "2026-10-15T16:25:42",
+    "date_created": "2026-10-15T16:51:55",
+    "date_created_gmt": "2026-10-15T16:51:55",
+    "date_modified": "2026-10-15T16:51:55",
+    "date_modified_gmt": "2026-10-15T16:51:55",
     "_links": {
      "self": [
       {
@@ -1048,10 +1048,10 @@
      "woocommerce_update_product_variation"
     ],
     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
-    "date_created": "2026-10-15T16:25:41",
-    "date_created_gmt": "2026-10-15T16:25:41",
-    "date_modified": "2026-10-15T16:25:41",
-    "date_modified_gmt": "2026-10-15T16:25:41",
+    "date_created": "2026-10-15T16:51:54",
+    "date_created_gmt": "2026-10-15T16:51:54",
+    "date_modified": "2026-10-15T16:51:54",
+    "date_modified_gmt": "2026-10-15T16:51:54",
     "_links": {
      "self": [
       {
