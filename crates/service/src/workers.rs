@@ -1986,6 +1986,36 @@ async fn claim_due_paykit_orders(
     .await
 }
 
+/// Whether the observed amount differs from what the order offered. A
+/// satoshi observation is compared only where the marketplace froze the
+/// figure at bind (an FX-quoted order: `paykit_total_sats`). A USDT
+/// observation is compared with the USDT amount paykit-server offered for the
+/// request, and an observation that names no amount is never a mismatch here
+/// (paykit-server's own `amount_matched` still decides).
+fn observed_differs_from_offer(
+    order: &crate::model::OrderRow,
+    observation: &crate::payments::PaykitObservation,
+) -> bool {
+    match observation.asset {
+        Some(AcceptedAsset::Usdt) => {
+            let offered = order
+                .paykit_payment_amounts
+                .as_ref()
+                .and_then(OfferedAssets::from_json)
+                .and_then(|offered| offered.usdt_units);
+            observation
+                .observed_units
+                .is_some_and(|observed| Some(observed) != offered)
+        }
+        _ => {
+            order.bitcoin_quoted_sats.is_some()
+                && observation
+                    .observed_sats
+                    .is_some_and(|observed| i64::try_from(observed).ok() != order.paykit_total_sats)
+        }
+    }
+}
+
 /// What one confirmed observation says about the money: whether the amount
 /// matched, what was observed, whether paykit-server marked it late, and the
 /// USDT leg when the observation is one.
@@ -2233,10 +2263,7 @@ async fn apply_confirmed_paykit_payment(
     let lapsed_auction_hold = if payment.state == "awaiting_entitlement" && amount_matched {
         match fetch_order_for_update(&mut tx, row.id).await? {
             Some(order) => {
-                let quote_mismatch = order.bitcoin_quoted_sats.is_some()
-                    && observation.observed_sats.is_some_and(|observed| {
-                        i64::try_from(observed).ok() != order.paykit_total_sats
-                    });
+                let quote_mismatch = observed_differs_from_offer(&order, observation);
                 !quote_mismatch
                     && crate::bitcoin_review::auction_hold_lapsed(&mut tx, &order).await?
             }
@@ -2379,10 +2406,7 @@ async fn apply_confirmed_paykit_payment(
     // legacy SAT/BTC orders the invoice amount is the order total and
     // paykit-server's own `amount_matched` (handled above) remains the sole
     // amount arbiter — a later observation never un-pays through this path.
-    let observed_amount_mismatch = order.bitcoin_quoted_sats.is_some()
-        && observation
-            .observed_sats
-            .is_some_and(|observed| i64::try_from(observed).ok() != order.paykit_total_sats);
+    let observed_amount_mismatch = observed_differs_from_offer(&order, observation);
     if observed_amount_mismatch {
         let (revision,): (i64,) = sqlx::query_as(
             "UPDATE payments SET state = 'manual_review', revision = revision + 1, \

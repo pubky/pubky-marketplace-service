@@ -295,7 +295,7 @@ pub async fn record_external_refund(
         || (order.fulfillment == "digital"
             && matches!(order.state.as_str(), "delivered" | "completed"));
     if !refundable_state
-        || payload.amount_minor > order.total_minor
+        || payload.amount_minor > refund_destination::refund_cap_minor(&order)
         || recorded_minor.is_none_or(|recorded| payload.amount_minor < recorded)
     {
         return Ok(Err(CommandFailure::refused(

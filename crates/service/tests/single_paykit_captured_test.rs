@@ -22,6 +22,8 @@ const SELLER: &str = "buuk6nr1caaumhms4tph5oa656z9f5k9q867h4u8ze441mpfuhyo";
 const BUYER: &str = "7ahm9mquyezn4ny85baxqo43r8epijtwo6h8149yxsm7eiu155uy";
 const INVOICE: &str = "4c6e66c7-8a8b-4d54-b97b-340cedb3e1d0";
 
+/// A captured body: `name` is a file of the fixture directory, or
+/// `status/<file>` for the status route's.
 fn fixture(name: &str) -> String {
     let path = format!(
         "{}/tests/fixtures/paykit-server-pk1/{name}.json",
@@ -324,4 +326,181 @@ async fn the_captured_activation_must_echo_the_persisted_terms() {
         activate("total-mismatch", 409, &persisted).await,
         Err(PaykitCommandError::ActivationTotalMismatch)
     );
+}
+
+// ---------------------------------------------------------------------------
+// The Marketplace status bodies (paykit-server PR-B, `0dbaed6`)
+// ---------------------------------------------------------------------------
+
+use marketplace_service::payments::{
+    PaykitDeliveryState, PaykitStatusOutcome, PaykitUsdtObservation,
+};
+
+const TX_HASH: &str = "0x1111111111111111111111111111111111111111111111111111111111111111";
+
+/// The status route's answer for one captured body, read the way the worker
+/// reads it: the invoice id is the body's own, the expected deadline is the
+/// body's own `payment_deadline` when it has one.
+async fn status(
+    name: &str,
+    http_status: u16,
+) -> (PaykitStatusOutcome, Option<PaykitDeliveryState>) {
+    let body: serde_json::Value =
+        serde_json::from_str(&fixture(&format!("status/{name}"))).expect("captured JSON");
+    let deadline = body["payment_deadline"]
+        .as_str()
+        .and_then(|value| value.parse().ok());
+    let client = replaying(http_status, &format!("status/{name}")).await;
+    client
+        .marketplace_payment_status(SELLER, INVOICE.parse().expect("invoice"), deadline)
+        .await
+}
+
+fn usdt(
+    observed_units: u64,
+    matched: bool,
+    on_time: bool,
+    finalized: bool,
+) -> PaykitUsdtObservation {
+    PaykitUsdtObservation {
+        tx_hash: TX_HASH.to_string(),
+        observed_units: Some(observed_units),
+        confirmations: 2,
+        amount_matched: matched,
+        paid_on_time: on_time,
+        finalized,
+    }
+}
+
+#[tokio::test]
+async fn the_captured_bitcoin_only_statuses_map_exactly_as_before() {
+    for (name, expected) in [
+        ("prepared", "undetected"),
+        ("active-unprojected", "active_undetected"),
+        ("proposed-undetected", "active_undetected"),
+        ("reorged", "active_undetected"),
+        ("dual-asset", "active_undetected"),
+        ("usdt-reorged", "active_undetected"),
+    ] {
+        let (outcome, _) = status(name, 200).await;
+        let seen = match outcome {
+            PaykitStatusOutcome::Undetected => "undetected",
+            PaykitStatusOutcome::ActiveUndetected { .. } => "active_undetected",
+            other => panic!("{name}: {other:?}"),
+        };
+        assert_eq!(seen, expected, "{name}");
+    }
+
+    let (detected, _) = status("detected", 200).await;
+    assert!(
+        matches!(&detected, PaykitStatusOutcome::Detected { facts }
+            if !facts.late_settlement && facts.observation.confirmations == Some(0)),
+        "{detected:?}"
+    );
+    let (confirmed, delivery) = status("confirmed-matched", 200).await;
+    assert_eq!(delivery, Some(PaykitDeliveryState::Delivered));
+    assert!(
+        matches!(&confirmed, PaykitStatusOutcome::Confirmed { amount_matched: true, facts }
+            if !facts.late_settlement
+                && facts.observation.observed_sats == Some(50_000)
+                && facts.observation.confirmations == Some(3)
+                && facts.observation.asset.is_none()),
+        "{confirmed:?}"
+    );
+    let (unmatched, _) = status("confirmed-unmatched", 200).await;
+    assert!(
+        matches!(&unmatched, PaykitStatusOutcome::Confirmed { amount_matched: false, facts }
+            if facts.late_settlement),
+        "{unmatched:?}"
+    );
+    let (late, _) = status("expired-late-match", 200).await;
+    assert!(
+        matches!(&late, PaykitStatusOutcome::Confirmed { amount_matched: true, facts }
+            if facts.late_settlement),
+        "{late:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_captured_usdt_statuses_map_to_a_usdt_observation() {
+    let (included, delivery) = status("usdt-included", 200).await;
+    assert_eq!(delivery, Some(PaykitDeliveryState::Pending));
+    assert!(
+        matches!(&included, PaykitStatusOutcome::UsdtObserved { usdt: seen, bitcoin, paid_asset, .. }
+            if *seen == usdt(50_000, true, true, false)
+                && matches!(**bitcoin, PaykitStatusOutcome::ActiveUndetected { .. })
+                && *paid_asset == Some(AcceptedAsset::Usdt)),
+        "{included:?}"
+    );
+    assert!(matches!(&status("usdt-finalized", 200).await.0,
+            PaykitStatusOutcome::UsdtObserved { usdt: seen, .. }
+                if *seen == usdt(50_000, true, true, true)));
+    assert!(matches!(&status("usdt-underpaid", 200).await.0,
+            PaykitStatusOutcome::UsdtObserved { usdt: seen, paid_asset: None, .. }
+                if *seen == usdt(49_999, false, false, false)));
+    assert!(matches!(&status("usdt-late", 200).await.0,
+            PaykitStatusOutcome::UsdtObserved { usdt: seen, paid_asset: None, .. }
+                if *seen == usdt(50_000, true, false, false)));
+}
+
+#[tokio::test]
+async fn the_captured_bitcoin_on_a_dual_request_is_a_plain_bitcoin_confirmation() {
+    let (outcome, _) = status("btc-on-dual-request", 200).await;
+    assert!(
+        matches!(&outcome, PaykitStatusOutcome::Confirmed { amount_matched: true, facts }
+            if !facts.late_settlement
+                && facts.observation.observed_sats == Some(62)
+                && facts.observation.confirmations == Some(2)),
+        "{outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_captured_cross_rail_statuses_carry_both_legs_and_the_earlier_rail() {
+    for (name, first) in [
+        ("cross-rail-usdt-first", AcceptedAsset::Usdt),
+        ("cross-rail-bitcoin-first", AcceptedAsset::Btc),
+    ] {
+        let (outcome, _) = status(name, 200).await;
+        let PaykitStatusOutcome::UsdtObserved {
+            usdt: seen,
+            bitcoin,
+            paid_asset,
+            ..
+        } = &outcome
+        else {
+            panic!("{name}: {outcome:?}");
+        };
+        assert_eq!(*seen, usdt(50_000, true, true, false), "{name}");
+        assert_eq!(*paid_asset, Some(first), "{name}");
+        assert!(
+            matches!(&**bitcoin, PaykitStatusOutcome::Confirmed { amount_matched: true, facts }
+                if !facts.late_settlement && facts.observation.observed_sats == Some(62)),
+            "{name}: {bitcoin:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_captured_status_errors_map_to_their_outcomes() {
+    assert_eq!(
+        status("not-found", 404).await.0,
+        PaykitStatusOutcome::NotFound
+    );
+    assert_eq!(
+        status("conflict", 409).await.0,
+        PaykitStatusOutcome::Unavailable
+    );
+    assert_eq!(
+        status("unavailable", 503).await.0,
+        PaykitStatusOutcome::Unavailable
+    );
+    assert!(matches!(
+        status("recovery-required", 503).await.0,
+        PaykitStatusOutcome::ManualReview { reason, .. } if reason == "recovery_required"
+    ));
+    assert!(matches!(
+        status("invalid-conflict", 409).await.0,
+        PaykitStatusOutcome::ManualReview { reason, .. } if reason == "invalid_conflict"
+    ));
 }

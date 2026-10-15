@@ -126,7 +126,11 @@ six nullable `orders` columns: the multi-asset request terms
 set together or all NULL), a USDT payment's `payment_finality` with
 `payment_finality_at`, and `paykit_second_rail_at`. It drops `NOT NULL` from
 `paykit_superseded_attempts.total_sats` (a released USDT-only attempt has no
-satoshi total) and replaces its positive check with one that allows NULL. The
+satoshi total) and replaces its positive check with one that allows NULL. It
+also widens `orders_external_refund_within_total` to admit the paid amount
+(`payment_amount_minor`): a refund of a USDT-paid order priced in satoshis is
+recorded in USDT0 millionths; the bound only widens, so existing rows satisfy
+it. The
 `orders` CHECKs are `NOT VALID` like 0053's; no default, no rewrite, no index.
 A binary from before it lists its `orders` columns and ignores them. It sets
 `lock_timeout` like 0050.

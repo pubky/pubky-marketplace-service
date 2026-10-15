@@ -62,12 +62,12 @@ description support and intentionally retain six-field prepare bodies. Current
 consumer tests use a signature-verifying producer double until new provider
 captures are available at a fixed reviewed provider revision.
 
-## The multi-asset prepare (`PAYKIT_MARKETPLACE_ASSETS` lists `USDT`)
+## The multi-asset prepare (`PAYKIT_MARKETPLACE_CONTRACT=multi_asset`)
 
 Once the deployment says the target paykit-server speaks the multi-asset
 Marketplace contract, new attempts of the `paykit` and `bitcoin` binds send
 this body instead (the legacy body above is unchanged and is still what the
-fork, an rc16 upstream and any deployment that does not list `USDT` send):
+fork, an rc16 upstream and any deployment that has not set the contract send):
 
 | Member                   | Value                                                                   |
 | ------------------------ | ----------------------------------------------------------------------- |

@@ -735,7 +735,9 @@ pub async fn get_payment_config(
 /// neither a deployment that cannot prepare USDT nor a seller who never opted
 /// in costs a Paykit lookup.
 async fn seller_usdt_available(state: &AppState, seller_pubky: &str) -> Result<bool, sqlx::Error> {
-    if !state.config.paykit_marketplace_assets.includes_usdt() {
+    if !state.config.paykit_marketplace_assets.includes_usdt()
+        || !state.config.paykit_marketplace_contract.is_multi_asset()
+    {
         return Ok(false);
     }
     if !usdt_option_enabled(&state.pool, seller_pubky).await? {
@@ -1010,8 +1012,9 @@ impl BindMethod {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RequestPlan {
     /// The legacy `amount_sats` request: the satoshi amount the service
-    /// quoted. The fork, an rc16 upstream, and every deployment that has not
-    /// listed USDT in `PAYKIT_MARKETPLACE_ASSETS` speak only this.
+    /// quoted. The fork and every deployment whose paykit-server has not
+    /// moved to the multi-asset contract
+    /// (`PAYKIT_MARKETPLACE_CONTRACT`) speak only this.
     LegacySats,
     /// The multi-asset request: the denomination and amount, with the assets
     /// paykit-server derives from the seller's setup narrowed by
@@ -1022,10 +1025,20 @@ enum RequestPlan {
         /// Bitcoin amount paykit-server fixes. `None` when no Bitcoin leg
         /// is wanted or the quote could not be taken.
         guard_sats: Option<u64>,
-        /// The order total in US cents when USDT is wanted: the USDT amount
-        /// is exactly this at parity.
-        parity_cents: Option<i64>,
+        /// What a USDT amount is checked against; `None` when USDT is not
+        /// wanted.
+        usdt_check: Option<UsdtCheck>,
     },
+}
+
+/// What the USDT amount of an offer is checked against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UsdtCheck {
+    /// A USD price: exactly the order total in cents at parity.
+    Parity { cents: i64 },
+    /// A satoshi price: within the FX deviation of what the price is worth
+    /// at the service's own rate.
+    Rate { sats: u64, rate: crate::fx::Decimal },
 }
 
 /// Why an offer paykit-server prepared is not accepted.
@@ -1033,7 +1046,7 @@ enum RequestPlan {
 enum OfferRefusal {
     /// An amount or asset that the order price does not allow.
     Inconsistent,
-    /// The Bitcoin amount strays from the service quote or its bounds.
+    /// An amount strays from the service's own rate or its bounds.
     Fx(crate::fx::FxError),
 }
 
@@ -1049,7 +1062,7 @@ impl RequestPlan {
         amount_minor: u64,
         only: Option<Vec<AcceptedAsset>>,
         guard_sats: Option<u64>,
-        parity_cents: Option<i64>,
+        usdt_check: Option<UsdtCheck>,
     ) -> Self {
         Self::Assets {
             terms: MarketplaceRequestTerms {
@@ -1058,51 +1071,55 @@ impl RequestPlan {
                 only,
             },
             guard_sats,
-            parity_cents,
+            usdt_check,
         }
     }
 
     /// Checks what paykit-server offered against what the order's price
     /// allows, before the bind records anything:
     ///
-    /// - a satoshi-denominated request has no conversion, so its Bitcoin
-    ///   amount is exactly the amount sent;
+    /// - a satoshi-denominated request has no Bitcoin conversion, so its
+    ///   Bitcoin amount is exactly the amount sent, and its USDT amount
+    ///   must sit within the FX deviation of the service's own rate;
     /// - a USD request offers USDT at exact parity with the order total and
     ///   Bitcoin within the service quote's deviation and bounds;
-    /// - an asset the order's price cannot support is never accepted.
+    /// - an asset that was not wanted is never accepted.
     fn check_offer(&self, offered: OfferedAssets) -> Result<(), OfferRefusal> {
         let Self::Assets {
             terms,
             guard_sats,
-            parity_cents,
+            usdt_check,
         } = self
         else {
             return Ok(());
         };
-        match terms.denomination {
-            PaymentAsset::Btc => {
-                if offered.usdt_units.is_some() || offered.btc_sats != Some(terms.amount_minor) {
+        match (terms.denomination, offered.usdt_units, usdt_check) {
+            (_, None, _) => {}
+            (PaymentAsset::Usd, Some(units), Some(UsdtCheck::Parity { cents })) => {
+                let parity = crate::payment_attempt::PaymentTerms::usdt_at_parity("USD", 2, *cents)
+                    .ok()
+                    .map(|terms| u64::try_from(terms.amount_minor).unwrap_or_default());
+                if parity != Some(units) {
                     return Err(OfferRefusal::Inconsistent);
                 }
             }
-            PaymentAsset::Usd => {
-                if let Some(units) = offered.usdt_units {
-                    let parity = parity_cents
-                        .and_then(|cents| {
-                            crate::payment_attempt::PaymentTerms::usdt_at_parity("USD", 2, cents)
-                                .ok()
-                        })
-                        .map(|terms| u64::try_from(terms.amount_minor).unwrap_or_default());
-                    if parity != Some(units) {
-                        return Err(OfferRefusal::Inconsistent);
-                    }
+            (PaymentAsset::Btc, Some(units), Some(UsdtCheck::Rate { sats, rate })) => {
+                crate::fx::guard_fixed_usdt_units(units, *sats, rate).map_err(OfferRefusal::Fx)?;
+            }
+            _ => return Err(OfferRefusal::Inconsistent),
+        }
+        match (terms.denomination, offered.btc_sats) {
+            (_, None) => {}
+            (PaymentAsset::Btc, Some(sats)) => {
+                if sats != terms.amount_minor {
+                    return Err(OfferRefusal::Inconsistent);
                 }
-                if let Some(sats) = offered.btc_sats {
-                    let Some(quoted) = *guard_sats else {
-                        return Err(OfferRefusal::Inconsistent);
-                    };
-                    crate::fx::guard_fixed_sats(sats, quoted).map_err(OfferRefusal::Fx)?;
-                }
+            }
+            (PaymentAsset::Usd, Some(sats)) => {
+                let Some(quoted) = *guard_sats else {
+                    return Err(OfferRefusal::Inconsistent);
+                };
+                crate::fx::guard_fixed_sats(sats, quoted).map_err(OfferRefusal::Fx)?;
             }
         }
         Ok(())
@@ -1356,29 +1373,30 @@ pub async fn bind_payment_method(
     };
 
     // How the upstream request is priced. The legacy `amount_sats` request
-    // (the fork, an rc16 upstream, and every deployment that has not listed
-    // USDT in `PAYKIT_MARKETPLACE_ASSETS`) carries the satoshi amount the
-    // service quoted. The multi-asset request carries the denomination and
-    // amount and lets paykit-server derive and price every asset the seller
-    // can receive; the service quote then only guards paykit-server's fixed
-    // Bitcoin amount.
+    // (the fork, and every deployment whose paykit-server has not moved to
+    // the multi-asset contract, `PAYKIT_MARKETPLACE_CONTRACT`) carries the
+    // satoshi amount the service quoted. The multi-asset request carries the
+    // denomination and amount and lets paykit-server derive and price every
+    // asset the seller can receive; the service quote then only guards
+    // paykit-server's fixed amounts. USDT rides only the multi-asset request,
+    // and only where the deployment lists it.
     let multi_contract = payments
         .paykit
         .as_ref()
         .is_some_and(|paykit| paykit.api() == PaykitApi::Upstream)
-        && state.config.paykit_marketplace_assets.includes_usdt();
+        && state.config.paykit_marketplace_contract.is_multi_asset();
+    let usdt_deployed = multi_contract && state.config.paykit_marketplace_assets.includes_usdt();
     let mut plan = RequestPlan::LegacySats;
     let bitcoin_quote = if on_paykit {
         let bitcoin_enabled = config.as_ref().is_some_and(|config| config.bitcoin_enabled);
-        // USDT rides the `paykit` method of a multi-asset deployment, on
-        // USD/2 orders, for a seller who consented. It does not need the
-        // seller's Bitcoin rail switch: a seller who takes only USDT is
-        // offered a USDT-only request.
-        let usdt_wanted = multi_contract
+        // USDT rides the `paykit` method of a deployment that lists it, on
+        // every order the service can convert (USD/2, SAT/0, BTC/8), for a
+        // seller who consented. It does not need the seller's Bitcoin rail
+        // switch: a seller who takes only USDT is offered a USDT-only
+        // request.
+        let usdt_wanted = usdt_deployed
             && bind == BindMethod::Paykit
             && state.config.usdt_payments_enabled
-            && order.currency == "USD"
-            && order.exponent == 2
             && match usdt_option_enabled(&mut *tx, &order.seller_pubky).await {
                 Ok(enabled) => enabled,
                 Err(error) => return internal("usdt consent read", &error),
@@ -1416,15 +1434,38 @@ pub async fn bind_payment_method(
                 }
             };
             if multi_contract {
-                plan = RequestPlan::assets(
-                    PaymentAsset::Btc,
-                    sats,
-                    Some(vec![AcceptedAsset::Btc]),
-                    None,
-                    None,
-                );
+                // The Bitcoin amount is the price itself. A USDT amount is
+                // paykit-server's rate, which the service checks against its
+                // own; without a readable rate USDT cannot be checked, so the
+                // request narrows to Bitcoin (or, for a seller who takes only
+                // USDT, the bind is refused like any unreadable feed).
+                let (only, usdt_check) = if usdt_wanted {
+                    match crate::fx::reference_rate(&mut *tx, &state.config.fx_feed_url, now).await
+                    {
+                        Ok((rate, _sample)) => (
+                            if bitcoin_enabled {
+                                None
+                            } else {
+                                Some(vec![AcceptedAsset::Usdt])
+                            },
+                            Some(UsdtCheck::Rate { sats, rate }),
+                        ),
+                        Err(error) if bitcoin_enabled => {
+                            tracing::warn!(
+                                order_id = %order.id,
+                                ?error,
+                                "FX rate unavailable; offering Bitcoin only"
+                            );
+                            (Some(vec![AcceptedAsset::Btc]), None)
+                        }
+                        Err(error) => return fx_error_response(error),
+                    }
+                } else {
+                    (Some(vec![AcceptedAsset::Btc]), None)
+                };
+                plan = RequestPlan::assets(PaymentAsset::Btc, sats, only, None, usdt_check);
             }
-            Some((None, sats))
+            bitcoin_enabled.then_some((None, sats))
         } else if order.currency == "USD" && order.exponent == 2 {
             if multi_contract && bind == BindMethod::Paykit {
                 let total_cents = u64::try_from(order.total_minor).unwrap_or_default();
@@ -1472,7 +1513,9 @@ pub async fn bind_payment_method(
                     total_cents,
                     only,
                     quote.as_ref().map(|(_, _, sats)| *sats),
-                    usdt_wanted.then_some(order.total_minor),
+                    usdt_wanted.then_some(UsdtCheck::Parity {
+                        cents: order.total_minor,
+                    }),
                 );
                 quote.map(|(rate, sample, sats)| (Some((rate, sample)), sats))
             } else {
@@ -3140,7 +3183,13 @@ mod single_paykit_bind_tests {
     use super::*;
 
     fn usd_plan(guard_sats: Option<u64>, parity_cents: Option<i64>) -> RequestPlan {
-        RequestPlan::assets(PaymentAsset::Usd, 13_700, None, guard_sats, parity_cents)
+        RequestPlan::assets(
+            PaymentAsset::Usd,
+            13_700,
+            None,
+            guard_sats,
+            parity_cents.map(|cents| UsdtCheck::Parity { cents }),
+        )
     }
 
     fn offered(btc_sats: Option<u64>, usdt_units: Option<u64>) -> OfferedAssets {
@@ -3234,7 +3283,7 @@ mod single_paykit_bind_tests {
     }
 
     #[test]
-    fn a_bitcoin_denominated_offer_is_exactly_the_amount_sent_and_never_usdt() {
+    fn a_bitcoin_denominated_offer_is_exactly_the_amount_sent() {
         let plan = RequestPlan::assets(
             PaymentAsset::Btc,
             50_000,
@@ -3250,6 +3299,33 @@ mod single_paykit_bind_tests {
         ] {
             assert_eq!(plan.check_offer(wrong), Err(OfferRefusal::Inconsistent));
         }
+    }
+
+    #[test]
+    fn a_bitcoin_denominated_usdt_amount_must_match_the_service_rate() {
+        let rate = crate::fx::Decimal::parse("81000").expect("rate");
+        let plan = RequestPlan::assets(
+            PaymentAsset::Btc,
+            50_000,
+            None,
+            None,
+            Some(UsdtCheck::Rate { sats: 50_000, rate }),
+        );
+        // 50,000 sats at 81,000 USD per BTC is 40.5 USDT0.
+        assert_eq!(
+            plan.check_offer(offered(Some(50_000), Some(40_500_000))),
+            Ok(())
+        );
+        assert_eq!(plan.check_offer(offered(None, Some(40_500_000))), Ok(()));
+        assert_eq!(
+            plan.check_offer(offered(Some(50_000), Some(20_000_000))),
+            Err(OfferRefusal::Fx(crate::fx::FxError::DeviationExceeded))
+        );
+        assert_eq!(
+            plan.check_offer(offered(Some(50_001), Some(40_500_000))),
+            Err(OfferRefusal::Inconsistent),
+            "the Bitcoin amount is still exactly the price"
+        );
     }
 }
 

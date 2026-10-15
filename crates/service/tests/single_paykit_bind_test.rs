@@ -3,10 +3,11 @@
 //! actually paid, USDT finality gating physical fulfilment, both rails paid,
 //! and the compatibility rules (rc16 upstream, fork, legacy `bitcoin` bind).
 //!
-//! The Marketplace status bodies built here are spec-derived from the PK1
-//! contract (`usdt_arbitrum`, `accepted_assets`, `payment_amounts`,
-//! `paid_asset`); `single_paykit_captured_test.rs` replays the bodies
-//! captured from paykit-server.
+//! The Marketplace status bodies built here have the shape of the bodies
+//! captured from paykit-server (`usdt_arbitrum` with `observed_amount`,
+//! `accepted_assets`, `payment_amounts` as digit strings, `paid_asset`), with
+//! this order's amounts; `single_paykit_captured_test.rs` replays the
+//! captured bodies themselves, byte for byte.
 
 mod common;
 
@@ -19,7 +20,7 @@ use common::paykit_review::{
 use common::*;
 use marketplace_service::clock::Clock;
 use marketplace_service::config::Config;
-use marketplace_service::payment_attempt::MarketplaceAssets;
+use marketplace_service::payment_attempt::{MarketplaceAssets, MarketplaceContract};
 use marketplace_service::payments::PaykitApi;
 use marketplace_service::workers::drain_outbox;
 use serde_json::{json, Value};
@@ -36,10 +37,13 @@ fn quoted_sats() -> u64 {
     (u128::from(TOTAL_CENTS) * 100_000_000).div_ceil(100 * 77_197) as u64
 }
 
-fn config(usdt_flag: bool, multi_asset: bool) -> Config {
+fn config(usdt_flag: bool, multi_asset: bool, usdt_listed: bool) -> Config {
     let mut config = Config::for_tests();
     config.usdt_payments_enabled = usdt_flag;
     if multi_asset {
+        config.paykit_marketplace_contract = MarketplaceContract::MultiAsset;
+    }
+    if usdt_listed {
         config.paykit_marketplace_assets =
             MarketplaceAssets::parse(Some("BTC,USDT"), PaykitApi::Upstream).expect("assets parse");
     }
@@ -57,7 +61,10 @@ struct Fixture {
 struct Setup {
     api: PaykitApi,
     usdt_flag: bool,
+    /// The deployed paykit-server speaks the multi-asset contract.
     multi_asset: bool,
+    /// The deployment lists USDT in `PAYKIT_MARKETPLACE_ASSETS`.
+    usdt_listed: bool,
     consent: bool,
     receivable: &'static [&'static str],
     usd_listing: bool,
@@ -71,6 +78,7 @@ impl Setup {
             api: PaykitApi::Upstream,
             usdt_flag: true,
             multi_asset: true,
+            usdt_listed: true,
             consent: true,
             receivable: &["BTC", "USDT"],
             usd_listing: true,
@@ -113,7 +121,7 @@ async fn put_config(app: &TestApp, token: &str, body: Value) {
 async fn fixture(pool: PgPool, setup: Setup) -> Fixture {
     let (app, paykit, fx) = test_app_with_paykit_fx_config(
         pool.clone(),
-        config(setup.usdt_flag, setup.multi_asset),
+        config(setup.usdt_flag, setup.multi_asset, setup.usdt_listed),
         setup.api,
     )
     .await;
@@ -274,7 +282,7 @@ async fn count(pool: &PgPool, sql: &str, order_id: &str) -> i64 {
 fn usdt_leg(confirmations: u32, matched: bool, on_time: bool, finalized: bool) -> Value {
     json!({
         "tx_hash": TX_HASH,
-        "observed_units": TOTAL_USDT_UNITS,
+        "observed_amount": TOTAL_USDT_UNITS.to_string(),
         "confirmations": confirmations,
         "amount_matched": matched,
         "paid_on_time": on_time,
@@ -313,7 +321,10 @@ fn status_body(invoice: Uuid, deadline: DateTime<Utc>, spec: StatusSpec) -> Valu
         "bitcoin": spec.bitcoin,
         "usdt_arbitrum": spec.usdt,
         "accepted_assets": ["BTC", "USDT"],
-        "payment_amounts": { "BTC": quoted_sats(), "USDT": TOTAL_USDT_UNITS },
+        "payment_amounts": {
+            "BTC": quoted_sats().to_string(),
+            "USDT": TOTAL_USDT_UNITS.to_string(),
+        },
         "paid_asset": spec.paid_asset,
         "outcome": null,
         "resolved_at": null,
@@ -629,29 +640,269 @@ async fn a_bitcoin_amount_far_from_the_service_quote_is_refused_and_voided(pool:
     );
 }
 
-#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn a_bitcoin_priced_order_is_requested_in_sats_and_never_offers_usdt(pool: PgPool) {
-    let f = fixture(
-        pool.clone(),
+fn usdt_units_for(sats: u64) -> u64 {
+    (u128::from(sats) * 77_197).div_ceil(100) as u64
+}
+
+async fn sat_fixture(pool: PgPool, setup: Setup) -> Fixture {
+    fixture(
+        pool,
         Setup {
             usd_listing: false,
-            ..Setup::both()
+            ..setup
         },
     )
-    .await;
+    .await
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_bitcoin_priced_order_offers_every_rail_the_seller_enabled(pool: PgPool) {
+    let f = sat_fixture(pool.clone(), Setup::both()).await;
     let order = create_sat_order(&f.app, &f.seller, &f.buyer).await;
     let (status, body) = bind(&f, &order.order_id, "paykit").await;
     assert_eq!(status, StatusCode::OK, "bind failed: {body}");
     let prepare = prepare_body(&f.paykit);
     assert_eq!(prepare["asset"], json!("BTC"));
-    assert_eq!(prepare["accepted_assets"], json!(["BTC"]));
+    assert!(prepare.get("accepted_assets").is_none(), "{prepare}");
     let stored = facts(&pool, &order.order_id).await;
     assert_eq!(stored.paykit_asset.as_deref(), Some("BTC"));
     assert_eq!(
         stored.paykit_amount_minor, stored.paykit_total_sats,
         "no conversion: the request amount is the Bitcoin amount"
     );
+    let sats = stored.paykit_total_sats.expect("sats") as u64;
+    assert_eq!(prepare["amount"], json!(sats.to_string()));
+    assert_eq!(body["order"]["accepted_assets"], json!(["BTC", "USDT"]));
+    assert_eq!(
+        body["order"]["payment_amounts"],
+        json!({ "BTC": sats, "USDT": usdt_units_for(sats) }),
+        "the USDT amount is paykit-server's fixed rate, checked against the service's"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_bitcoin_priced_order_narrows_when_usdt_cannot_be_checked(pool: PgPool) {
+    // No readable rate: USDT cannot be checked, so Bitcoin alone is offered.
+    let f = sat_fixture(pool.clone(), Setup::both()).await;
+    f.fx.set_status(500);
+    let order = create_sat_order(&f.app, &f.seller, &f.buyer).await;
+    let (status, body) = bind(&f, &order.order_id, "paykit").await;
+    assert_eq!(status, StatusCode::OK, "bind failed: {body}");
+    assert_eq!(prepare_body(&f.paykit)["accepted_assets"], json!(["BTC"]));
     assert_eq!(body["order"]["accepted_assets"], json!(["BTC"]));
+
+    // A seller who takes only USDT has nothing left without a rate.
+    let g = sat_fixture(pool.clone(), Setup::both()).await;
+    put_config(
+        &g.app,
+        &g.seller.token,
+        json!({ "bitcoin_enabled": false, "usdt_enabled": true }),
+    )
+    .await;
+    g.fx.set_status(500);
+    let order = create_sat_order(&g.app, &g.seller, &g.buyer).await;
+    let (status, body) = bind(&g, &order.order_id, "paykit").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["reason"], json!("fx_reference_unavailable"));
+    assert_eq!(facts(&pool, &order.order_id).await.payment_method, None);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_bitcoin_priced_usdt_only_seller_is_offered_usdt_at_the_checked_rate(pool: PgPool) {
+    let f = sat_fixture(pool.clone(), Setup::both()).await;
+    put_config(
+        &f.app,
+        &f.seller.token,
+        json!({ "bitcoin_enabled": false, "usdt_enabled": true }),
+    )
+    .await;
+    let order = create_sat_order(&f.app, &f.seller, &f.buyer).await;
+    let (status, body) = bind(&f, &order.order_id, "paykit").await;
+    assert_eq!(status, StatusCode::OK, "bind failed: {body}");
+    assert_eq!(prepare_body(&f.paykit)["accepted_assets"], json!(["USDT"]));
+    let view = &body["order"];
+    assert_eq!(view["accepted_assets"], json!(["USDT"]));
+    assert!(view["paykit_total_sats"].is_null(), "{view}");
+    let units = view["payment_amounts"]["USDT"]
+        .as_u64()
+        .expect("USDT amount");
+    let payment = payment_row(&pool, &order.order_id).await;
+    assert_eq!(
+        (payment.1, payment.2.as_str(), payment.3),
+        (units as i64, "USDT", 6)
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_usdt_amount_far_from_the_service_rate_is_refused_on_a_bitcoin_priced_order(
+    pool: PgPool,
+) {
+    let f = sat_fixture(pool.clone(), Setup::both()).await;
+    f.paykit.set_usd_per_btc(40_000);
+    let order = create_sat_order(&f.app, &f.seller, &f.buyer).await;
+    let (status, body) = bind(&f, &order.order_id, "paykit").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["reason"], json!("fx_deviation_exceeded"));
+    assert_eq!(facts(&pool, &order.order_id).await.payment_method, None);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        f.paykit
+            .calls()
+            .iter()
+            .any(|call| call.path == "/marketplace/payment-requests/void"),
+        "the prepared invoice is voided"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_usdt_refund_of_a_bitcoin_priced_order_is_recorded_in_usdt_units(pool: PgPool) {
+    let f = sat_fixture(pool.clone(), Setup::both()).await;
+    let order = create_sat_order(&f.app, &f.seller, &f.buyer).await;
+    let order_id = order.order_id.clone();
+    let (status, body) = bind(&f, &order_id, "paykit").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    drain(&f).await;
+    let stored = facts(&pool, &order_id).await;
+    let invoice = stored.paykit_invoice_id.expect("invoice");
+    let deadline = stored.paykit_expires_at.expect("deadline");
+    let sats = stored.paykit_total_sats.expect("sats") as u64;
+    let paid_units = usdt_units_for(sats);
+    // The transfer is included but one unit short: review, never paid.
+    let mut status_body = json!({
+        "invoice_id": invoice,
+        "state": "active",
+        "proposal_delivery_state": "delivered",
+        "request_state": "accepted",
+        "payment_state": "confirmed",
+        "activated_at": (deadline - Duration::minutes(30)).to_rfc3339_opts(SecondsFormat::Micros, true),
+        "payment_deadline": deadline.to_rfc3339_opts(SecondsFormat::Micros, true),
+        "accepted_assets": ["BTC", "USDT"],
+        "payment_amounts": { "BTC": sats.to_string(), "USDT": paid_units.to_string() },
+        "bitcoin": null,
+        "paid_asset": null,
+        "outcome": null,
+        "resolved_at": null,
+    });
+    status_body["usdt_arbitrum"] = json!({
+        "tx_hash": TX_HASH,
+        "observed_amount": (paid_units - 1).to_string(),
+        "confirmations": 2,
+        "amount_matched": false,
+        "paid_on_time": false,
+        "finalized": false,
+    });
+    f.paykit.set_marketplace_status(invoice, status_body);
+    poll_now(&f.app, at(1)).await;
+    let stored = facts(&pool, &order_id).await;
+    assert_eq!(stored.payment_asset.as_deref(), Some("USDT"));
+    assert_ne!(stored.state, "paid");
+    let view = read_order(&f, &f.buyer.token, &order_id).await;
+    assert_eq!(view["payment_amount_minor"], json!(paid_units - 1));
+    assert_eq!(view["payment_quote_basis"], json!("fixed_rate"));
+
+    let address = "0xd8da6bf26964af9d7eed9e03e53415d37aa96045";
+    let (status, body) = execute(
+        &f.app,
+        &f.buyer.token,
+        &order_command(
+            "refund.confirm_destination",
+            &order_id,
+            stored.revision,
+            json!({ "address": address }),
+            31,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "address confirmed: {body}");
+    let reference = format!("0x{}", "cd34".repeat(16));
+    let (status, body) = resolve_call(
+        &f.app,
+        &f.seller.token,
+        &order_id,
+        Some(Uuid::new_v4()),
+        &json!({ "outcome": "refunded", "external_refund_reference": reference }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "refund recorded: {body}");
+    let view = read_order(&f, &f.buyer.token, &order_id).await;
+    assert_eq!(view["state"], json!("refunded_external"));
+    assert_eq!(
+        view["external_refund"]["amount_minor"],
+        json!(paid_units - 1),
+        "a satoshi-priced order refunds in the paid asset's units"
+    );
+    assert_eq!(
+        view["external_refund"]["destination_address"],
+        json!(address)
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn the_multi_asset_request_is_chosen_by_its_own_setting_not_by_usdt(pool: PgPool) {
+    // The contract is deployed, USDT is not listed and the flag is off: the
+    // request is the new body and asks for Bitcoin only.
+    let f = fixture(
+        pool.clone(),
+        Setup {
+            usdt_flag: false,
+            usdt_listed: false,
+            consent: false,
+            ..Setup::both()
+        },
+    )
+    .await;
+    let order = checkout_usd(&f).await;
+    let (status, body) = bind(&f, &order.order_id, "paykit").await;
+    assert_eq!(status, StatusCode::OK, "bind failed: {body}");
+    let prepare = prepare_body(&f.paykit);
+    assert_eq!(prepare["amount"], json!(TOTAL_CENTS.to_string()));
+    assert_eq!(prepare["asset"], json!("USD"));
+    assert_eq!(prepare["accepted_assets"], json!(["BTC"]));
+    assert!(prepare.get("amount_sats").is_none(), "{prepare}");
+    assert_eq!(body["order"]["accepted_assets"], json!(["BTC"]));
+    let (_, public) = send(
+        f.app.router.clone(),
+        "GET",
+        &format!("/v0/sellers/{}/payment-config", f.seller.pubky),
+        None,
+        &Value::Null,
+    )
+    .await;
+    assert!(
+        public.get("usdt_available").is_none() && public.get("paykit_available").is_none(),
+        "the flag is off, so the USDT keys are absent: {public}"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn usdt_is_never_offered_on_the_legacy_contract_even_when_listed(pool: PgPool) {
+    // A deployment that lists USDT but whose paykit-server still speaks the
+    // legacy contract: the request is the legacy one and USDT is not offered.
+    let f = fixture(
+        pool.clone(),
+        Setup {
+            multi_asset: false,
+            ..Setup::both()
+        },
+    )
+    .await;
+    let order = checkout_usd(&f).await;
+    let (status, body) = bind(&f, &order.order_id, "paykit").await;
+    assert_eq!(status, StatusCode::OK, "bind failed: {body}");
+    let prepare = prepare_body(&f.paykit);
+    assert_eq!(prepare["amount_sats"], json!(quoted_sats()));
+    assert!(prepare.get("accepted_assets").is_none(), "{prepare}");
+    assert_eq!(body["order"]["accepted_assets"], json!(["BTC"]));
+    let (_, public) = send(
+        f.app.router.clone(),
+        "GET",
+        &format!("/v0/sellers/{}/payment-config", f.seller.pubky),
+        None,
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(public["usdt_available"], json!(false), "{public}");
+    assert_eq!(public["accepted_assets"], json!(["BTC"]), "{public}");
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
@@ -679,6 +930,7 @@ async fn on_an_rc16_upstream_the_paykit_bind_is_the_legacy_sats_request(pool: Pg
         pool.clone(),
         Setup {
             multi_asset: false,
+            usdt_listed: false,
             usdt_flag: false,
             consent: false,
             ..Setup::both()
@@ -717,6 +969,7 @@ async fn on_the_fork_the_paykit_bind_is_bitcoin_through_the_fork(pool: PgPool) {
         Setup {
             api: PaykitApi::Fork,
             multi_asset: false,
+            usdt_listed: false,
             usdt_flag: false,
             consent: false,
             usd_listing: false,
@@ -1108,6 +1361,30 @@ async fn a_usdt_transfer_for_the_wrong_amount_or_too_late_goes_to_review_never_p
             "matched {matched}, on time {on_time}"
         );
     }
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_matched_usdt_transfer_for_another_amount_than_offered_goes_to_review(pool: PgPool) {
+    // paykit-server says matched, but the amount it reports is not the one
+    // it offered for this request: the service never settles on that.
+    let f = fixture(pool.clone(), Setup::both()).await;
+    let active = active_order(&f).await;
+    let order_id = active.order.order_id.clone();
+    let mut leg = usdt_leg(1, true, true, false);
+    leg["observed_amount"] = json!((TOTAL_USDT_UNITS + 10_000).to_string());
+    f.paykit.set_marketplace_status(
+        active.invoice,
+        usdt_status(active.invoice, active.deadline, leg),
+    );
+    assert_eq!(poll_now(&f.app, at(1)).await, 1);
+    let stored = facts(&pool, &order_id).await;
+    assert_ne!(stored.state, "paid");
+    let (state, _, _, _, reason) = payment_row(&pool, &order_id).await;
+    assert_eq!(
+        (state.as_str(), reason.as_deref()),
+        ("manual_review", Some("amount_mismatch"))
+    );
+    assert_eq!(stored.payment_asset.as_deref(), Some("USDT"));
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
@@ -1700,6 +1977,150 @@ async fn bitcoin_on_a_released_paykit_attempt_takes_the_late_money_path(pool: Pg
     let view = read_order(&f, &f.buyer.token, &order_id).await;
     assert_eq!(view["accepted_assets"], json!(["BTC"]));
     assert_eq!(view["payment_amounts"], json!({ "BTC": quoted_sats() }));
+}
+
+/// A status body captured from paykit-server. Only what the capture itself
+/// replaces is changed (the invoice and its two instants), plus the amounts,
+/// which the capture made for a 5-cent request: they are set to this order's
+/// own offer so the observed amounts equal what was offered.
+fn captured_status(name: &str, invoice: Uuid, deadline: DateTime<Utc>, offer: (u64, u64)) -> Value {
+    let (sats, usdt_units) = offer;
+    let path = format!(
+        "{}/tests/fixtures/paykit-server-pk1/status/{name}.json",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let mut body: Value = serde_json::from_str(
+        &std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{path}: {error}")),
+    )
+    .expect("captured JSON");
+    body["invoice_id"] = json!(invoice);
+    body["activated_at"] =
+        json!((deadline - Duration::minutes(30)).to_rfc3339_opts(SecondsFormat::Micros, true));
+    body["payment_deadline"] = json!(deadline.to_rfc3339_opts(SecondsFormat::Micros, true));
+    if body["payment_amounts"].get("BTC").is_some() {
+        body["payment_amounts"]["BTC"] = json!(sats.to_string());
+    }
+    if body["payment_amounts"].get("USDT").is_some() {
+        body["payment_amounts"]["USDT"] = json!(usdt_units.to_string());
+    }
+    if body["bitcoin"].is_object() {
+        body["bitcoin"]["observed_sats"] = json!(sats);
+    }
+    if let Some(observed) = body["usdt_arbitrum"].get("observed_amount").cloned() {
+        body["usdt_arbitrum"]["observed_amount"] = match observed.as_str() {
+            Some("49999") => json!((usdt_units - 1).to_string()),
+            _ => json!(usdt_units.to_string()),
+        };
+    }
+    body
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn captured_status_bodies_drive_usdt_settlement_and_finality_end_to_end(pool: PgPool) {
+    let f = fixture(pool.clone(), Setup::both()).await;
+    let active = active_order(&f).await;
+    let order_id = active.order.order_id.clone();
+    let offer = (quoted_sats(), TOTAL_USDT_UNITS);
+    let serve = |name: &str| {
+        f.paykit.set_marketplace_status(
+            active.invoice,
+            captured_status(name, active.invoice, active.deadline, offer),
+        )
+    };
+
+    serve("usdt-included");
+    assert_eq!(poll_now(&f.app, at(1)).await, 1);
+    let view = read_order(&f, &f.buyer.token, &order_id).await;
+    assert_eq!(view["state"], json!("paid"));
+    assert_eq!(view["payment_asset"], json!("USDT"));
+    assert_eq!(view["payment_amount_minor"], json!(TOTAL_USDT_UNITS));
+    assert_eq!(view["payment_finality"], json!("pending"));
+
+    serve("usdt-reorged");
+    poll_now(&f.app, at(2)).await;
+    assert_eq!(
+        facts(&pool, &order_id).await.payment_finality.as_deref(),
+        Some("reverted")
+    );
+    serve("usdt-included");
+    poll_now(&f.app, at(3)).await;
+    assert_eq!(
+        facts(&pool, &order_id).await.payment_finality.as_deref(),
+        Some("pending")
+    );
+    serve("usdt-finalized");
+    poll_now(&f.app, at(4)).await;
+    assert_eq!(
+        facts(&pool, &order_id).await.payment_finality.as_deref(),
+        Some("final")
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn captured_bitcoin_and_cross_rail_bodies_settle_and_review_end_to_end(pool: PgPool) {
+    let f = fixture(pool.clone(), Setup::both()).await;
+
+    let bitcoin = active_order(&f).await;
+    f.paykit.set_marketplace_status(
+        bitcoin.invoice,
+        captured_status(
+            "btc-on-dual-request",
+            bitcoin.invoice,
+            bitcoin.deadline,
+            (quoted_sats(), TOTAL_USDT_UNITS),
+        ),
+    );
+    assert_eq!(poll_now(&f.app, at(1)).await, 1);
+    let stored = facts(&pool, &bitcoin.order.order_id).await;
+    assert_eq!(stored.state, "paid");
+    assert_eq!(stored.payment_asset.as_deref(), Some("BTC"));
+    assert_eq!(stored.payment_finality, None);
+
+    for (round, name, first) in [
+        (2, "cross-rail-usdt-first", "USDT"),
+        (3, "cross-rail-bitcoin-first", "BTC"),
+    ] {
+        let dual = active_order(&f).await;
+        f.paykit.set_marketplace_status(
+            dual.invoice,
+            captured_status(
+                name,
+                dual.invoice,
+                dual.deadline,
+                (quoted_sats(), TOTAL_USDT_UNITS),
+            ),
+        );
+        assert_eq!(poll_now(&f.app, at(round)).await, 1, "{name}");
+        let stored = facts(&pool, &dual.order.order_id).await;
+        assert_eq!(stored.state, "pending_payment", "{name}");
+        assert_eq!(stored.payment_asset.as_deref(), Some(first), "{name}");
+        let (state, _, _, _, reason) = payment_row(&pool, &dual.order.order_id).await;
+        assert_eq!(
+            (state.as_str(), reason.as_deref()),
+            ("manual_review", Some("amount_mismatch")),
+            "{name}"
+        );
+    }
+
+    for (round, name) in [(4, "usdt-underpaid"), (5, "usdt-late")] {
+        let short = active_order(&f).await;
+        f.paykit.set_marketplace_status(
+            short.invoice,
+            captured_status(
+                name,
+                short.invoice,
+                short.deadline,
+                (quoted_sats(), TOTAL_USDT_UNITS),
+            ),
+        );
+        poll_now(&f.app, at(round)).await;
+        let stored = facts(&pool, &short.order.order_id).await;
+        assert_ne!(stored.state, "paid", "{name}");
+        assert_ne!(
+            payment_row(&pool, &short.order.order_id).await.0,
+            "confirmed"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

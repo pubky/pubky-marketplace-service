@@ -36,6 +36,11 @@
 -- keeps the released attempt of such an order, so its `total_sats` may be
 -- NULL when the attempt carries no Bitcoin amount.
 --
+-- A refund of a USDT-paid order priced in satoshis is recorded in USDT0
+-- millionths, so `orders_external_refund_within_total` also admits the
+-- amount that was paid (`payment_amount_minor`). The bound only widens, so
+-- every existing row still satisfies it and it is added NOT VALID.
+--
 -- Both orders constraints are NOT VALID like 0053's: enforced for every new
 -- and updated row without scanning the table under a lock. There is NO DOWN
 -- migration.
@@ -76,3 +81,14 @@ ALTER TABLE paykit_superseded_attempts
 ALTER TABLE paykit_superseded_attempts
     ADD CONSTRAINT paykit_superseded_attempts_total_sats_check
     CHECK (total_sats IS NULL OR total_sats > 0);
+
+ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_external_refund_within_total;
+ALTER TABLE orders ADD CONSTRAINT orders_external_refund_within_total CHECK (
+    external_refund IS NULL
+    OR (external_refund ->> 'amount_minor')::bigint
+        BETWEEN 1 AND GREATEST(
+            total_minor,
+            COALESCE(paykit_total_sats, total_minor),
+            COALESCE(payment_amount_minor, total_minor)
+        )
+) NOT VALID;

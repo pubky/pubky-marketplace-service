@@ -202,18 +202,33 @@ pub async fn attach_to_views(
     Ok(())
 }
 
-/// The USDT amount the order was quoted, in order minor units (cents for a
-/// USD order): what a refund of the whole payment is. `None` when the order
-/// carries no USDT terms or the quote is not a whole number of order units.
+/// The USDT amount the order was quoted, as a refund of the whole payment
+/// records it. A USD order records it in order units (cents); an order priced
+/// in anything else records the paid asset's own units (USDT0 millionths),
+/// because its price is not in a unit a USDT refund can be expressed in.
+/// `None` when the order carries no USDT terms or a USD quote is not a whole
+/// number of order units.
 pub fn quoted_refund_amount_minor(order: &OrderRow) -> Option<i64> {
-    if order.currency != "USD" {
-        return None;
-    }
     let sent = order.payment_amount_minor?;
+    if order.currency != "USD" {
+        return Some(sent);
+    }
     let sent_exponent = i32::from(order.payment_exponent?);
     let steps = u32::try_from(sent_exponent.checked_sub(order.exponent)?).ok()?;
     let divisor = 10_i64.checked_pow(steps)?;
     (sent % divisor == 0).then_some(sent / divisor)
+}
+
+/// The most a refund of this order may record, in the units the refund is
+/// recorded in: the order total, or for a USDT-paid order priced in anything
+/// but USD the USDT0 amount that was paid.
+pub fn refund_cap_minor(order: &OrderRow) -> i64 {
+    match (is_usdt_order(order), order.currency.as_str()) {
+        (true, currency) if currency != "USD" => {
+            order.payment_amount_minor.unwrap_or(order.total_minor)
+        }
+        _ => order.total_minor,
+    }
 }
 
 #[cfg(test)]

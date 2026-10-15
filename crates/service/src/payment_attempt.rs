@@ -430,9 +430,77 @@ impl MarketplaceAssets {
     }
 }
 
+/// Which request body the service sends to paykit-server's Marketplace
+/// prepare and activate (`PAYKIT_MARKETPLACE_CONTRACT`). It is configuration,
+/// never a probe, and it is independent of whether USDT is offered: a
+/// paykit-server that speaks the multi-asset contract refuses the legacy
+/// `amount_sats` body, so a deployment moves to it as soon as that
+/// paykit-server is live, with USDT still off (the request then asks for
+/// `["BTC"]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MarketplaceContract {
+    /// The rc16 body: `amount_sats`, Bitcoin only.
+    #[default]
+    Legacy,
+    /// The multi-asset body: a denomination and amount, optionally narrowed.
+    MultiAsset,
+}
+
+impl MarketplaceContract {
+    /// Parses the variable: unset or blank is `legacy`; otherwise `legacy` or
+    /// `multi_asset`, and `multi_asset` needs the upstream API (the fork has
+    /// no Marketplace routes).
+    pub fn parse(value: Option<&str>, api: PaykitApi) -> anyhow::Result<Self> {
+        const NAME: &str = "PAYKIT_MARKETPLACE_CONTRACT";
+        let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(Self::Legacy);
+        };
+        match value {
+            "legacy" => Ok(Self::Legacy),
+            "multi_asset" if api == PaykitApi::Upstream => Ok(Self::MultiAsset),
+            "multi_asset" => {
+                anyhow::bail!("{NAME}=multi_asset needs PAYKIT_SERVER_API=upstream")
+            }
+            other => anyhow::bail!("{NAME} must be `legacy` or `multi_asset`, not {other:?}"),
+        }
+    }
+
+    pub const fn is_multi_asset(self) -> bool {
+        matches!(self, Self::MultiAsset)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_marketplace_contract_defaults_to_legacy_and_multi_asset_needs_upstream() {
+        for unset in [None, Some(""), Some("  ")] {
+            for api in [PaykitApi::Fork, PaykitApi::Upstream] {
+                assert_eq!(
+                    MarketplaceContract::parse(unset, api).expect("default"),
+                    MarketplaceContract::Legacy
+                );
+            }
+        }
+        assert_eq!(
+            MarketplaceContract::parse(Some("legacy"), PaykitApi::Fork).expect("legacy"),
+            MarketplaceContract::Legacy
+        );
+        let multi = MarketplaceContract::parse(Some(" multi_asset "), PaykitApi::Upstream)
+            .expect("upstream");
+        assert!(multi.is_multi_asset());
+        let refused = MarketplaceContract::parse(Some("multi_asset"), PaykitApi::Fork)
+            .expect_err("the fork has no Marketplace routes");
+        assert!(refused.to_string().contains("upstream"), "{refused}");
+        for bad in ["multi", "Legacy", "MULTI_ASSET", "assets", "true"] {
+            assert!(
+                MarketplaceContract::parse(Some(bad), PaykitApi::Upstream).is_err(),
+                "{bad:?}"
+            );
+        }
+    }
 
     #[test]
     fn only_bitcoin_and_usd_are_known_denominations() {
