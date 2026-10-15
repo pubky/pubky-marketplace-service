@@ -271,12 +271,22 @@ struct RefusalAuditLocksHomeserver {
 }
 
 impl HomeserverListingClient for RefusalAuditLocksHomeserver {
+    /// Registered listings answer their mirrored record; any other listing
+    /// read is an upstream outage.
     fn fetch_listing<'a>(
         &'a self,
-        _seller_pubky: &'a str,
-        _listing_id: &'a str,
+        seller_pubky: &'a str,
+        listing_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
-        Box::pin(async { HomeserverFetchOutcome::Unavailable })
+        Box::pin(async move {
+            match common::CommandMirrorHomeserver
+                .fetch_listing(seller_pubky, listing_id)
+                .await
+            {
+                HomeserverFetchOutcome::Found(record) => HomeserverFetchOutcome::Found(record),
+                _ => HomeserverFetchOutcome::Unavailable,
+            }
+        })
     }
 
     fn fetch_drop<'a>(
