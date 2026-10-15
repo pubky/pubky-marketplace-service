@@ -570,10 +570,13 @@ working unchanged (Bitcoin only, its projection unchanged).
   a USD order that is not a whole number of cents, so it cannot be recorded as
   a refund: return it from the wallet and resolve as `abandoned`).
 - **Finality bound.** A USDT payment is polled for finality for 7 days from
-  `payment_finality_at` while `pending` or `reverted`. A `pending` payment past
+  `payment_finality_at` while `pending` or `reverted`. A payment still in either state past
   that bound is held for an operator (`needs_review`, `detected_unconfirmed`,
+  `observation.status` `usdt_finality_pending` or `usdt_finality_reverted`,
   `ALERT usdt_finality_pending_too_long`, listed by `paykit-attempts-admin
-  list`); the order stays paid and fulfilment stays blocked.
+  list`; the operator checks the transfer on Arbitrum and dismisses or
+  refunds, see `docs/paykit-released-attempts.md`); the order stays paid and
+  fulfilment stays blocked. A reappearing transfer restarts the clock.
 - **Refunds follow the paid rail.** A USDT-paid order (`payment_asset` `USDT`,
   or the legacy `usdt` method) takes the buyer-confirmed Arbitrum address and
   an Arbitrum transaction hash; a Bitcoin-paid order refunds as before.
