@@ -497,8 +497,18 @@ pub enum InboundEvent {
     /// ([`ConnectorProvider::resolve_inventory`]) which variant it is and
     /// what the store can now sell, then applies it like a `StockLevel`.
     InventoryChanged { inventory_item_id: String },
-    /// A shipment with tracking for an order the push created.
+    /// A shipment for an order the push created. `tracking_number` is empty
+    /// when the store fulfilled the order without one (carrier `Other` then):
+    /// the Pubky order is still marked shipped, and the number is added later
+    /// by a [`InboundEvent::TrackingUpdated`].
     Fulfillment {
+        order: OrderRef,
+        carrier: String,
+        tracking_number: String,
+    },
+    /// Tracking added or changed in the store after the shipment. Syncs to the
+    /// Pubky order through `fulfillment.update_tracking`.
+    TrackingUpdated {
         order: OrderRef,
         carrier: String,
         tracking_number: String,

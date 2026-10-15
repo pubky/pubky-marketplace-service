@@ -1,4 +1,4 @@
-//! Money and echo behaviour of the Shopify provider inside the framework:
+//! Money, echo and fulfilment behaviour of the Shopify provider inside the framework:
 //! which store webhooks are the echo of a refund or cancel this connector
 //! applied (and which are the merchant), how a recorded Pubky refund becomes a
 //! store refund on every rail, and the interleavings where two workers or a
@@ -75,16 +75,28 @@ type Prepare = Box<dyn FnOnce(&FakeShopify)>;
 /// The same, but `prepare` sets up the fake store before the first push
 /// attempt, and the push is then not expected to have created the order.
 async fn shop(pool: PgPool, prepare: Option<Prepare>) -> Shop {
+    shop_with(pool, prepare, None).await
+}
+
+/// `optional_tracking` overrides what this build of the service supports.
+async fn shop_with(
+    pool: PgPool,
+    prepare: Option<Prepare>,
+    optional_tracking: Option<bool>,
+) -> Shop {
     let fake = FakeShopify::start().await;
     fake.expect_client_secret(APP_SECRET);
     let provider = Arc::new(ShopifyProvider::with_origin(Origin::Fixed(
         fake.base_url.clone(),
     )));
-    let runtime = ConnectorRuntime::new(
+    let mut runtime = ConnectorRuntime::new(
         test_keys(),
         ProviderRegistry::new().with(provider),
         test_settings(),
     );
+    if let Some(available) = optional_tracking {
+        runtime = runtime.with_optional_tracking(available);
+    }
     let base = common::test_app(pool).await;
     let state = base.state.clone().with_connectors(Some(Arc::new(runtime)));
     let app = rebuild(base, state);
@@ -1022,5 +1034,263 @@ async fn a_pushed_order_whose_total_matches_raises_no_alert(pool: PgPool) {
         paid,
         minor_text(s.total_minor),
         "the store order total is what the buyer paid"
+    );
+}
+
+// === Fulfilment and tracking =================================================
+
+use marketplace_service::connectors::tracking_commands_available;
+
+impl Shop {
+    fn fulfilment(&self, tracking: Option<(&str, &str)>) -> Value {
+        let (company, number) = tracking.map_or((Value::Null, Value::Null), |(company, number)| {
+            (json!(company), json!(number))
+        });
+        json!({
+            "id": 31,
+            "order_id": self.store_order_number(),
+            "status": "success",
+            "tracking_company": company,
+            "tracking_number": number,
+        })
+    }
+
+    async fn shipment(&self) -> (String, Value) {
+        sqlx::query_as(
+            "SELECT state, COALESCE(shipment, 'null'::jsonb) FROM orders WHERE id = $1::uuid",
+        )
+        .bind(&self.order_id)
+        .fetch_one(&self.app.pool)
+        .await
+        .expect("order")
+    }
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_fulfilment_with_tracking_ships_the_pubky_order(pool: PgPool) {
+    let s = pushed(pool).await;
+    s.webhook(
+        "evt-ful",
+        "fulfillments/create",
+        &s.fulfilment(Some(("DHL", "JD0123456789"))),
+    )
+    .await;
+    s.inbound().await;
+    assert_eq!(s.inbound_outcome("evt-ful").await.0, "applied");
+    let (state, shipment) = s.shipment().await;
+    assert_eq!(state, "shipped");
+    assert_eq!(shipment["carrier"], "DHL");
+    assert_eq!(shipment["tracking_number"], "JD0123456789");
+    assert!(s.alerts().await.is_empty());
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn without_the_tracking_commands_a_fulfilment_without_tracking_is_left_alone(pool: PgPool) {
+    let s = shop_with(pool, None, Some(false)).await;
+    s.webhook("evt-none", "fulfillments/create", &s.fulfilment(None))
+        .await;
+    s.inbound().await;
+    assert_eq!(
+        s.inbound_outcome("evt-none").await,
+        (
+            "ignored".into(),
+            Some("tracking_commands_unavailable".into())
+        )
+    );
+    assert_eq!(
+        s.shipment().await.0,
+        "paid",
+        "the order is not shipped on a guess"
+    );
+    // Tracking that arrives with the first fulfilment still ships it, with or without the commands.
+    s.webhook(
+        "evt-with",
+        "fulfillments/create",
+        &s.fulfilment(Some(("UPS", "1Z999AA10123456784"))),
+    )
+    .await;
+    s.inbound().await;
+    assert_eq!(s.shipment().await.0, "shipped");
+    // A later change cannot be synced without `fulfillment.update_tracking`.
+    s.webhook(
+        "evt-upd",
+        "fulfillments/update",
+        &s.fulfilment(Some(("UPS", "1Z999AA10123456999"))),
+    )
+    .await;
+    s.inbound().await;
+    assert_eq!(
+        s.inbound_outcome("evt-upd").await,
+        (
+            "ignored".into(),
+            Some("tracking_commands_unavailable".into())
+        )
+    );
+    assert_eq!(
+        s.shipment().await.1["tracking_number"],
+        "1Z999AA10123456784"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_service_that_claims_the_commands_but_refuses_them_is_ignored_not_retried(pool: PgPool) {
+    if tracking_commands_available() {
+        return;
+    }
+    // The flag says yes but this build's executor does not know the command:
+    // the refusal is permanent, so the event settles instead of looping.
+    let s = shop_with(pool, None, Some(true)).await;
+    s.webhook(
+        "evt-ful",
+        "fulfillments/create",
+        &s.fulfilment(Some(("UPS", "1Z999AA10123456784"))),
+    )
+    .await;
+    s.inbound().await;
+    s.webhook(
+        "evt-upd",
+        "fulfillments/update",
+        &s.fulfilment(Some(("UPS", "1Z999AA10123456999"))),
+    )
+    .await;
+    s.inbound().await;
+    let (state, outcome) = s.inbound_outcome("evt-upd").await;
+    assert_eq!(state, "ignored", "{outcome:?}");
+    assert!(outcome.expect("outcome").starts_with("refused_"));
+    assert!(s.alerts().await.is_empty());
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn tracking_added_or_changed_in_shopify_follows_to_the_pubky_order(pool: PgPool) {
+    if !tracking_commands_available() {
+        eprintln!("skipped: this build has no fulfillment.update_tracking (see lane-cn-report, Stage 2 follow-up)");
+        return;
+    }
+    let s = pushed(pool).await;
+    // Fulfilled in Shopify with no tracking: shipped, carrier Other.
+    s.webhook("evt-1", "fulfillments/create", &s.fulfilment(None))
+        .await;
+    s.inbound().await;
+    let (state, shipment) = s.shipment().await;
+    assert_eq!(state, "shipped");
+    assert_eq!(shipment["carrier"], "Other");
+    assert_eq!(shipment["tracking_number"], Value::Null);
+    // The merchant adds tracking later.
+    s.webhook(
+        "evt-2",
+        "fulfillments/update",
+        &s.fulfilment(Some(("UPS", "1Z999AA10123456784"))),
+    )
+    .await;
+    s.inbound().await;
+    assert_eq!(
+        s.inbound_outcome("evt-2").await,
+        ("applied".into(), Some("tracking updated".into()))
+    );
+    let shipment = s.shipment().await.1;
+    assert_eq!(shipment["carrier"], "UPS");
+    assert_eq!(shipment["tracking_number"], "1Z999AA10123456784");
+    assert_eq!(
+        shipment["tracking_history"]
+            .as_array()
+            .expect("history")
+            .len(),
+        1
+    );
+    // The same update again, and a webhook redelivered with a new id: nothing changes.
+    s.webhook(
+        "evt-3",
+        "fulfillments/update",
+        &s.fulfilment(Some(("UPS", "1Z999AA10123456784"))),
+    )
+    .await;
+    s.inbound().await;
+    assert_eq!(
+        s.inbound_outcome("evt-3").await,
+        ("ignored".into(), Some("tracking_unchanged".into()))
+    );
+    // A change replaces it.
+    s.webhook(
+        "evt-4",
+        "fulfillments/update",
+        &s.fulfilment(Some(("DHL", "JD0123456789"))),
+    )
+    .await;
+    s.inbound().await;
+    let shipment = s.shipment().await.1;
+    assert_eq!(shipment["tracking_number"], "JD0123456789");
+    assert_eq!(
+        shipment["tracking_history"]
+            .as_array()
+            .expect("history")
+            .len(),
+        2
+    );
+    // A second parcel's fulfilment does not overwrite tracking the order has.
+    s.webhook(
+        "evt-5",
+        "fulfillments/create",
+        &s.fulfilment(Some(("FedEx", "7777"))),
+    )
+    .await;
+    s.inbound().await;
+    assert_eq!(
+        s.inbound_outcome("evt-5").await,
+        (
+            "ignored".into(),
+            Some("already_shipped_with_tracking".into())
+        )
+    );
+    assert_eq!(s.shipment().await.1["tracking_number"], "JD0123456789");
+    // An update with no tracking, or for a cancelled fulfilment, is ignored.
+    s.webhook("evt-6", "fulfillments/update", &s.fulfilment(None))
+        .await;
+    s.inbound().await;
+    assert_eq!(s.inbound_outcome("evt-6").await.0, "ignored");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_update_that_beats_its_create_still_ships_the_order_with_its_tracking(pool: PgPool) {
+    if !tracking_commands_available() {
+        eprintln!("skipped: this build has no fulfillment.update_tracking");
+        return;
+    }
+    let s = pushed(pool).await;
+    s.webhook(
+        "evt-u",
+        "fulfillments/update",
+        &s.fulfilment(Some(("UPS", "1Z999AA10123456784"))),
+    )
+    .await;
+    s.inbound().await;
+    let (state, shipment) = s.shipment().await;
+    assert_eq!(state, "shipped");
+    assert_eq!(shipment["tracking_number"], "1Z999AA10123456784");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_tracking_update_racing_a_buyer_delivery_is_judged_on_the_orders_revision(pool: PgPool) {
+    if !tracking_commands_available() {
+        eprintln!("skipped: this build has no fulfillment.update_tracking");
+        return;
+    }
+    let mut s = pushed(pool).await;
+    s.webhook("evt-ship", "fulfillments/create", &s.fulfilment(None))
+        .await;
+    s.inbound().await;
+    // The buyer confirms delivery before the tracking update is applied.
+    s.run(false, "fulfillment.confirm_delivery", 3, json!({}))
+        .await;
+    s.webhook(
+        "evt-late",
+        "fulfillments/update",
+        &s.fulfilment(Some(("UPS", "1Z999AA10123456784"))),
+    )
+    .await;
+    s.inbound().await;
+    let (state, outcome) = s.inbound_outcome("evt-late").await;
+    assert_eq!(
+        (state.as_str(), outcome.as_deref()),
+        ("ignored", Some("order_not_shippable"))
     );
 }

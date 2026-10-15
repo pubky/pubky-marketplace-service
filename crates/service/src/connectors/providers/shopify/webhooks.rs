@@ -32,9 +32,10 @@ pub const HEADER_WEBHOOK_ID: &str = "x-shopify-webhook-id";
 
 /// The webhook topic as it appears in `X-Shopify-Topic` and the matching
 /// `WebhookSubscriptionTopic` value.
-pub const SUBSCRIBED_TOPICS: [(&str, &str); 5] = [
+pub const SUBSCRIBED_TOPICS: [(&str, &str); 6] = [
     ("inventory_levels/update", "INVENTORY_LEVELS_UPDATE"),
     ("fulfillments/create", "FULFILLMENTS_CREATE"),
+    ("fulfillments/update", "FULFILLMENTS_UPDATE"),
     ("orders/cancelled", "ORDERS_CANCELLED"),
     ("refunds/create", "REFUNDS_CREATE"),
     ("app/uninstalled", "APP_UNINSTALLED"),
@@ -283,7 +284,8 @@ pub fn parse(webhook: &VerifiedWebhook, body: &[u8]) -> Result<InboundEvent, Pro
             inventory_item_id: gid("InventoryItem", &payload, "inventory_item_id")
                 .ok_or_else(|| missing("inventory item"))?,
         }),
-        "fulfillments/create" => {
+        "fulfillments/create" | "fulfillments/update" => {
+            let update = webhook.topic == "fulfillments/update";
             let tracking = payload
                 .get("tracking_number")
                 .and_then(Value::as_str)
@@ -296,23 +298,36 @@ pub fn parse(webhook: &VerifiedWebhook, body: &[u8]) -> Result<InboundEvent, Pro
                 })
                 .map(str::trim)
                 .filter(|number| !number.is_empty());
-            let Some(tracking) = tracking else {
-                return ignored("fulfillment_without_tracking_number");
+            if update && payload.get("status").and_then(Value::as_str) == Some("cancelled") {
+                return ignored("fulfillment_cancelled");
+            }
+            let carrier = payload
+                .get("tracking_company")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|company| !company.is_empty())
+                .unwrap_or("Other")
+                .to_string();
+            let order = OrderRef {
+                external_order_id: gid("Order", &payload, "order_id")
+                    .ok_or_else(|| missing("order"))?,
+                pubky_order_id: None,
             };
-            Ok(InboundEvent::Fulfillment {
-                order: OrderRef {
-                    external_order_id: gid("Order", &payload, "order_id")
-                        .ok_or_else(|| missing("order"))?,
-                    pubky_order_id: None,
-                },
-                carrier: payload
-                    .get("tracking_company")
-                    .and_then(Value::as_str)
-                    .filter(|company| !company.is_empty())
-                    .unwrap_or("other")
-                    .to_string(),
-                tracking_number: tracking.to_string(),
-            })
+            // A fulfilment with no tracking still ships the Pubky order (the
+            // number is added later); an update with none changes nothing.
+            match (update, tracking) {
+                (false, tracking) => Ok(InboundEvent::Fulfillment {
+                    order,
+                    carrier,
+                    tracking_number: tracking.unwrap_or_default().to_string(),
+                }),
+                (true, Some(tracking)) => Ok(InboundEvent::TrackingUpdated {
+                    order,
+                    carrier,
+                    tracking_number: tracking.to_string(),
+                }),
+                (true, None) => ignored("no_tracking_number"),
+            }
         }
         "orders/cancelled" => Ok(InboundEvent::OrderCancelled {
             order: OrderRef {
@@ -580,7 +595,7 @@ mod tests {
     }
 
     #[test]
-    fn a_fulfillment_needs_a_tracking_number() {
+    fn a_fulfillment_ships_with_or_without_tracking_and_an_update_carries_it_later() {
         let body =
             br#"{"id":1,"order_id":77,"tracking_company":"DHL","tracking_numbers":["JD01"]}"#;
         match parse(&webhook("fulfillments/create"), body).expect("event") {
@@ -597,13 +612,45 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        assert!(matches!(
-            parse(
-                &webhook("fulfillments/create"),
-                br#"{"order_id":77,"tracking_number":null}"#
-            ),
-            Ok(InboundEvent::Ignored { .. })
-        ));
+        // No tracking: still a shipment, carrier Other, empty number.
+        match parse(
+            &webhook("fulfillments/create"),
+            br#"{"order_id":77,"tracking_number":null,"tracking_company":null}"#,
+        )
+        .expect("event")
+        {
+            InboundEvent::Fulfillment {
+                carrier,
+                tracking_number,
+                ..
+            } => {
+                assert_eq!((carrier.as_str(), tracking_number.as_str()), ("Other", ""));
+            }
+            other => panic!("{other:?}"),
+        }
+        // The tracking arrives later, on an update.
+        match parse(
+            &webhook("fulfillments/update"),
+            br#"{"order_id":77,"status":"success","tracking_company":"UPS","tracking_number":" 1Z999 "}"#,
+        )
+        .expect("event")
+        {
+            InboundEvent::TrackingUpdated { order, carrier, tracking_number } => {
+                assert_eq!(order.external_order_id, "gid://shopify/Order/77");
+                assert_eq!((carrier.as_str(), tracking_number.as_str()), ("UPS", "1Z999"));
+            }
+            other => panic!("{other:?}"),
+        }
+        // An update that carries no tracking, or cancels the fulfilment, changes nothing.
+        for body in [
+            &br#"{"order_id":77,"tracking_number":null}"#[..],
+            &br#"{"order_id":77,"status":"cancelled","tracking_number":"X1"}"#[..],
+        ] {
+            assert!(matches!(
+                parse(&webhook("fulfillments/update"), body),
+                Ok(InboundEvent::Ignored { .. })
+            ));
+        }
     }
 
     #[test]

@@ -257,13 +257,35 @@ async fn handle(
             let Some(order_id) = resolve_order(&state.pool, &connection, &order).await? else {
                 return Ok(Handled::Ignored("unknown_order".to_string()));
             };
-            ship(
+            apply_tracking(
                 state,
+                runtime,
                 &connection,
                 due,
                 order_id,
                 &carrier,
                 &tracking_number,
+                false,
+            )
+            .await
+        }
+        InboundEvent::TrackingUpdated {
+            order,
+            carrier,
+            tracking_number,
+        } => {
+            let Some(order_id) = resolve_order(&state.pool, &connection, &order).await? else {
+                return Ok(Handled::Ignored("unknown_order".to_string()));
+            };
+            apply_tracking(
+                state,
+                runtime,
+                &connection,
+                due,
+                order_id,
+                &carrier,
+                &tracking_number,
+                true,
             )
             .await
         }
@@ -690,18 +712,31 @@ async fn resolve_order(
     .await
 }
 
-async fn ship(
+/// Marks the Pubky order shipped, or adds or changes its tracking, from what
+/// the store reports.
+///
+/// * A paid order is shipped. Without a tracking number (the store fulfilled
+///   it with none) it is shipped with whatever carrier the store named, or
+///   `Other`, when this service has optional tracking
+///   ([`ConnectorRuntime::optional_tracking`]); a service without it ignores
+///   such a fulfilment, as before.
+/// * A shipped order whose tracking the store adds or changes gets
+///   `fulfillment.update_tracking`. A second fulfilment (a later parcel) never
+///   replaces tracking the order already has: only an update does.
+/// * Anything else is ignored: the order is not in a shippable state.
+#[allow(clippy::too_many_arguments)]
+async fn apply_tracking(
     state: &AppState,
+    runtime: &ConnectorRuntime,
     connection: &ConnectionRow,
     due: &DueEvent,
     order_id: Uuid,
     carrier: &str,
     tracking_number: &str,
+    replace_existing: bool,
 ) -> Result<Handled, sqlx::Error> {
     let tracking: String = tracking_number.trim().chars().take(200).collect();
-    if tracking.is_empty() {
-        return Ok(Handled::Ignored("no_tracking_number".to_string()));
-    }
+    let tracking = (!tracking.is_empty()).then_some(tracking);
     let carrier: String = {
         let trimmed: String = carrier.trim().chars().take(100).collect();
         if trimmed.is_empty() {
@@ -710,39 +745,93 @@ async fn ship(
             trimmed
         }
     };
-    let revision: Option<i64> = sqlx::query_scalar("SELECT revision FROM orders WHERE id = $1")
-        .bind(order_id)
-        .fetch_optional(&state.pool)
-        .await?;
-    let Some(revision) = revision else {
+    let order: Option<(i64, String, Option<serde_json::Value>)> =
+        sqlx::query_as("SELECT revision, state, shipment FROM orders WHERE id = $1")
+            .bind(order_id)
+            .fetch_optional(&state.pool)
+            .await?;
+    let Some((revision, order_state, shipment)) = order else {
         return Ok(Handled::Ignored("order_missing".to_string()));
+    };
+    let (kind, payload, applied) = match order_state.as_str() {
+        "paid" | "processing" => {
+            if tracking.is_none() && !runtime.optional_tracking {
+                return Ok(Handled::Ignored(
+                    "tracking_commands_unavailable".to_string(),
+                ));
+            }
+            let mut payload = json!({ "order_id": order_id, "carrier": carrier });
+            if let Some(number) = &tracking {
+                payload["tracking_number"] = json!(number);
+            }
+            ("fulfillment.ship", payload, "shipped")
+        }
+        "shipped" => {
+            let Some(number) = tracking else {
+                return Ok(Handled::Ignored("no_tracking_number".to_string()));
+            };
+            let existing = shipment
+                .as_ref()
+                .and_then(|shipment| shipment.get("tracking_number"))
+                .and_then(serde_json::Value::as_str);
+            let existing_carrier = shipment
+                .as_ref()
+                .and_then(|shipment| shipment.get("carrier"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if existing == Some(number.as_str()) && existing_carrier.eq_ignore_ascii_case(&carrier)
+            {
+                return Ok(Handled::Ignored("tracking_unchanged".to_string()));
+            }
+            if existing.is_some() && !replace_existing {
+                return Ok(Handled::Ignored(
+                    "already_shipped_with_tracking".to_string(),
+                ));
+            }
+            if !runtime.optional_tracking {
+                return Ok(Handled::Ignored(
+                    "tracking_commands_unavailable".to_string(),
+                ));
+            }
+            (
+                "fulfillment.update_tracking",
+                json!({ "order_id": order_id, "carrier": carrier, "tracking_number": number }),
+                "tracking updated",
+            )
+        }
+        _ => return Ok(Handled::Ignored("order_not_shippable".to_string())),
     };
     let raw = json!({
         "version": 1,
-        "command_id": deterministic_uuid(&format!("connector-ship|{}", due.id)),
+        "command_id": deterministic_uuid(&format!("connector-tracking|{}", due.id)),
         "aggregate_id": marketplace_domain::ids::order_aggregate_id(order_id),
         "expected_revision": revision,
         "issued_at": format_timestamp(state.clock.now()),
-        "kind": "fulfillment.ship",
-        "payload": {
-            "order_id": order_id,
-            "carrier": carrier,
-            "tracking_number": tracking,
-        },
+        "kind": kind,
+        "payload": payload,
     });
     let (status, body) = crate::executor::execute(state, &connection.seller_pubky, &raw).await?;
     if status.is_success() {
-        return Ok(Handled::Applied("shipped".to_string()));
+        return Ok(Handled::Applied(applied.to_string()));
     }
     let code = body
         .pointer("/error/code")
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default()
         .to_ascii_lowercase();
-    Ok(match code.as_str() {
-        "revision_conflict" => Handled::Retry("revision_conflict".to_string()),
-        "invalid_state" => Handled::Ignored("order_not_shippable".to_string()),
-        "" => Handled::Retry(format!("status_{}", status.as_u16())),
-        other => Handled::Ignored(format!("refused_{other}")),
+    let reason = body
+        .pointer("/error/reason")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    Ok(match (code.as_str(), reason) {
+        ("revision_conflict", _) => Handled::Retry("revision_conflict".to_string()),
+        ("invalid_state", "payment_not_final") => Handled::Retry("payment_not_final".to_string()),
+        ("invalid_state", "order_not_shipped") => Handled::Ignored("order_not_shipped".to_string()),
+        ("invalid_state", "tracking_update_limit") => {
+            Handled::Ignored("tracking_update_limit".to_string())
+        }
+        ("invalid_state", _) => Handled::Ignored("order_not_shippable".to_string()),
+        ("", _) => Handled::Retry(format!("status_{}", status.as_u16())),
+        (other, _) => Handled::Ignored(format!("refused_{other}")),
     })
 }

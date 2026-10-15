@@ -663,6 +663,7 @@ async fn webhooks_are_subscribed_once_and_stale_service_subscriptions_are_replac
         [
             "APP_UNINSTALLED",
             "FULFILLMENTS_CREATE",
+            "FULFILLMENTS_UPDATE",
             "INVENTORY_LEVELS_UPDATE",
             "ORDERS_CANCELLED",
             "REFUNDS_CREATE"
@@ -836,7 +837,7 @@ async fn subscriptions_are_read_page_by_page_and_a_lost_race_is_not_a_failure() 
         .iter()
         .filter(|(_, _, uri)| uri == HOOK)
         .count();
-    assert_eq!(topics, 5, "one subscription per topic, none twice");
+    assert_eq!(topics, 6, "one subscription per topic, none twice");
     fake.assert_clean();
 }
 
@@ -1031,7 +1032,7 @@ fn the_privacy_topics_are_named_for_the_merchant_guide() {
         PRIVACY_TOPICS,
         ["customers/data_request", "customers/redact", "shop/redact"]
     );
-    assert_eq!(SUBSCRIBED_TOPICS.len(), 5);
+    assert_eq!(SUBSCRIBED_TOPICS.len(), 6);
     let _ = Value::Null;
 }
 
