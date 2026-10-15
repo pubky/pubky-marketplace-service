@@ -236,6 +236,34 @@ so a moderation placed meanwhile is seen on the next command and lifting one
 takes effect once the cached answer expires. Orders created before a listing
 was moderated are not cancelled by this check.
 
+### Listing lifecycle
+
+A seller pauses, ends or removes a listing by rewriting `state` in its record
+at `/pub/pubky.app/marketplace/v1/listings/{listing_id}` on their homeserver;
+the listing aggregate tracks stock only. Before the service accepts
+`checkout.create`, `offer.create`, `offer.counter`, `offer.accept` or
+`auction.place_bid` it reads the record of every listing the command commits
+to, from `HOMESERVER_URL`, and refuses unless each one is `active`, with
+`LISTING_NOT_ACTIVE` (HTTP 409, audited as `invalid_state`) and `reason`
+`listing_paused`, `listing_ended`, `listing_removed` or `listing_not_active`.
+A record the homeserver answers 404 for is `listing_removed`; a record with no
+`state` field predates the field and counts as `active`. A checkout's records
+are read concurrently (at most 8 at a time).
+
+The record is the seller's authority over whether the listing is for sale, so
+the check **fails closed**: when the homeserver cannot answer (transport
+failure, timeout, a non-success status other than 404, a non-JSON body) the
+command is refused with the retriable `UPSTREAM_UNAVAILABLE` (HTTP 503) and
+nothing is written. Like the moderation check it runs before the command's
+transaction, so a slow homeserver never holds a domain connection, and a
+command id with a stored result is answered from it without a read.
+
+`offer.checkout`, the payment-method bind and `payment.prepare_locks`
+continue a commitment made while the listing was on sale and are not checked,
+so a seller who pauses a listing to stop new buyers does not strand an
+accepted offer or an order already awaiting payment. Withdrawing or rejecting
+an offer and closing an auction are not checked either.
+
 ### Public payment configuration availability
 
 `GET /v0/sellers/{pubky}/payment-config` always returns HTTP 200. Its
