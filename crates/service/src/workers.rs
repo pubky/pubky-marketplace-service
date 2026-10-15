@@ -3420,15 +3420,19 @@ async fn apply_dual_rail_review(
 }
 
 /// How long a USDT payment is polled while its finality is `pending` or
-/// `reverted`. Past it the order is no longer polled.
+/// `reverted`, from the moment it took that value. Past it the order is no
+/// longer polled.
 const USDT_FINALITY_POLL_DAYS: i64 = 7;
 
-/// Escalates USDT payments whose finality stayed `pending` for
+/// Escalates USDT payments whose finality stayed `pending` (included, never
+/// finalized) or `reverted` (reorganised away, never returned) for
 /// [`USDT_FINALITY_POLL_DAYS`]: polling stops (the claim bounds it), and one
-/// durable operator row is written (`needs_review`, `detected_unconfirmed`:
-/// an inclusion that never finalized), listed by `paykit-attempts-admin list`.
-/// The order stays paid and its finality stays `pending`, so physical
-/// fulfilment stays blocked until an operator has checked the transfer.
+/// durable operator row is written (`needs_review`, `detected_unconfirmed`,
+/// `observation.status` `usdt_finality_pending` or `usdt_finality_reverted`),
+/// listed by `paykit-attempts-admin list`. The order stays paid and its
+/// finality stays as it was, so physical fulfilment stays blocked until an
+/// operator has checked the transfer. A reappearing transfer takes a new
+/// finality value, which restarts the clock.
 /// Idempotent: an order that already has a held row for its invoice is left
 /// alone. Returns how many orders were escalated.
 pub async fn escalate_stale_usdt_finality(
@@ -3437,7 +3441,8 @@ pub async fn escalate_stale_usdt_finality(
 ) -> anyhow::Result<u64> {
     let stale: Vec<(Uuid,)> = sqlx::query_as(
         "SELECT o.id FROM orders o JOIN payments p ON p.order_id = o.id \
-         WHERE o.payment_method = 'paykit' AND o.payment_finality = 'pending' \
+         WHERE o.payment_method = 'paykit' \
+         AND o.payment_finality IN ('pending', 'reverted') \
          AND o.payment_finality_at + make_interval(days => $2) <= $1 \
          AND p.state = 'confirmed' AND o.paykit_invoice_id IS NOT NULL \
          AND NOT EXISTS (SELECT 1 FROM paykit_superseded_attempts h \
@@ -3461,9 +3466,15 @@ pub async fn escalate_stale_usdt_finality(
             tx.rollback().await?;
             continue;
         };
-        if order.payment_finality.as_deref() != Some("pending")
-            || since + chrono::Duration::days(USDT_FINALITY_POLL_DAYS) > now
-        {
+        let Some(finality) = order
+            .payment_finality
+            .as_deref()
+            .filter(|finality| matches!(*finality, "pending" | "reverted"))
+        else {
+            tx.rollback().await?;
+            continue;
+        };
+        if since + chrono::Duration::days(USDT_FINALITY_POLL_DAYS) > now {
             tx.rollback().await?;
             continue;
         }
@@ -3476,9 +3487,10 @@ pub async fn escalate_stale_usdt_finality(
         .bind(order_id)
         .bind(invoice_id)
         .bind(serde_json::json!({
-            "status": "usdt_finality_pending",
+            "status": format!("usdt_finality_{finality}"),
+            "finality": finality,
             "paid_asset": order.payment_asset,
-            "finality_pending_since": since,
+            "finality_since": since,
             "observed_at": now,
         }))
         .bind(now)
@@ -3490,9 +3502,23 @@ pub async fn escalate_stale_usdt_finality(
             tracing::error!(
                 order_id = %order_id,
                 invoice_id = %invoice_id,
+                finality,
                 code = "usdt_finality_pending_too_long",
-                "ALERT a USDT payment was included but never finalized within the polling bound; \
-                 held for review, fulfilment stays blocked"
+                "ALERT a USDT payment was included but never finalized (or was reorganised away \
+                 and never returned) within the polling bound; held for review, fulfilment \
+                 stays blocked"
+            );
+        } else {
+            // `record_released_attempt` writes no row for an order without
+            // complete pins, so nothing was held. The order is no longer
+            // polled and would otherwise be silent; say so on every pass.
+            tracing::error!(
+                order_id = %order_id,
+                invoice_id = %invoice_id,
+                finality,
+                code = "usdt_finality_escalation_not_recorded",
+                "ALERT a USDT payment past its finality polling bound could not be held for \
+                 review (no review row could be written); fulfilment stays blocked"
             );
         }
     }
