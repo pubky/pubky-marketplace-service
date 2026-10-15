@@ -169,12 +169,23 @@ fn sealed_with_share(
     domain: &str,
     bind_buyer: &str,
 ) -> Value {
+    sealed_with_share_of(seller, buyer, key, domain, bind_buyer, &address())
+}
+
+fn sealed_with_share_of(
+    seller: &TestActor,
+    buyer: &TestActor,
+    key: &Published,
+    domain: &str,
+    bind_buyer: &str,
+    address: &Value,
+) -> Value {
     let mut command = sealed_checkout_command_with_id(&seller.pubky, COMMAND_ID, 0);
     let aad = format!(
         "{CONTEXT}|{COMMAND_ID}|{bind_buyer}|{}|{}",
         seller.pubky, key.key_id
     );
-    let envelope = seal(&key.public_key, &aad, &address());
+    let envelope = seal(&key.public_key, &aad, address);
     command["payload"]["connector_shares"] =
         json!([share_entry(&seller.pubky, key, domain, envelope)]);
     let _ = buyer;
@@ -507,8 +518,20 @@ async fn a_cancelled_order_loses_the_envelope_with_the_final_state_purge(pool: P
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn the_address_is_never_logged_or_projected_to_the_provider_debug_output(pool: PgPool) {
     common::install_log_capture();
+    // Every field carries a marker no other output in the process can hold:
+    // the capture is global to the test binary, so a common value such as a
+    // postal code would match unrelated lines.
+    let marked = json!({
+        "name": "Quokka Ziggurat",
+        "line1": "77 Quokka Ziggurat Lane",
+        "line2": "Wing Zq9x",
+        "city": "Ziggurat-on-Quokka",
+        "region": "ZQ",
+        "postalCode": "QZ-5521-ZK",
+        "countryCode": "CH",
+    });
     let (app, store, seller, buyer, _connection, key) = opted_in_world(pool).await;
-    let command = sealed_with_share(&seller, &buyer, &key, SHOP, &buyer.pubky);
+    let command = sealed_with_share_of(&seller, &buyer, &key, SHOP, &buyer.pubky, &marked);
     let (_, _, order) = checkout(&app, &buyer, command).await;
     let order = order.expect("order");
     pay(&app, &buyer, &order).await;
@@ -519,10 +542,18 @@ async fn the_address_is_never_logged_or_projected_to_the_provider_debug_output(p
         .expect("lock")
         .clone()
         .expect("push");
-    assert!(pushed.shipping_address.is_some());
-    assert!(!format!("{pushed:?}").contains("Market Street"));
+    let shipped = pushed
+        .shipping_address
+        .clone()
+        .expect("the opted-in address arrives");
+    assert_eq!(
+        shipped.postal_code, "QZ-5521-ZK",
+        "the marked address is the one pushed"
+    );
+    let debug = format!("{pushed:?}");
     let logs = common::captured_logs();
-    for needle in ["Market Street", "Alice Buyer", "8001"] {
+    for needle in ["Quokka", "Ziggurat", "Zq9x", "QZ-5521-ZK"] {
+        assert!(!debug.contains(needle), "{needle} reached the Debug output");
         assert!(!logs.contains(needle), "{needle} reached the logs");
     }
 }

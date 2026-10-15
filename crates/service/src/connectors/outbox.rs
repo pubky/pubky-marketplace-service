@@ -27,6 +27,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::ledger;
+use super::refund;
 use super::store::{self, ConnectionRow};
 
 pub const CURSOR_NAME: &str = "events";
@@ -215,16 +216,6 @@ async fn on_payment_confirmed(
     Ok(queued)
 }
 
-/// `state, external_refund, total_minor, currency, exponent, payment_method`.
-type RefundOrderRow = (
-    String,
-    Option<serde_json::Value>,
-    i64,
-    String,
-    i32,
-    Option<String>,
-);
-
 async fn on_refund_recorded(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     now: DateTime<Utc>,
@@ -243,52 +234,56 @@ async fn mirror_current_refund(
     order_id: Uuid,
     source_event_id: Uuid,
 ) -> Result<(), sqlx::Error> {
-    let has_push = ledger::has_mirrorable_push(tx, order_id).await?;
-    if !has_push {
+    if !ledger::has_mirrorable_push(tx, order_id).await? {
         return Ok(());
     }
-    let order: Option<RefundOrderRow> = sqlx::query_as(
-        "SELECT state, external_refund, total_minor, currency, exponent, payment_method \
-             FROM orders WHERE id = $1",
-    )
-    .bind(order_id)
-    .fetch_optional(&mut **tx)
-    .await?;
-    let Some((state, external_refund, total_minor, currency, exponent, payment_method)) = order
+    // The whole row as JSON: the conversion columns of the order's recorded
+    // quote exist only once migration 0061 has run, and are read as optional
+    // keys (`refund::OrderBasis`).
+    let row: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT to_jsonb(o) FROM orders o WHERE o.id = $1")
+            .bind(order_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    let Some(row) = row else {
+        return Ok(());
+    };
+    let Some(basis) = refund::OrderBasis::from_row(&row) else {
+        return Ok(());
+    };
+    let external_refund = row.get("external_refund").filter(|value| !value.is_null());
+    // The refund is read as the order holds it now. A refund reversed since
+    // the event left none, and there is nothing to mirror.
+    let Some(recorded) = external_refund
+        .and_then(|refund| refund.get("amount_minor"))
+        .and_then(serde_json::Value::as_i64)
     else {
         return Ok(());
     };
-    let recorded = external_refund
-        .as_ref()
-        .and_then(|refund| refund.get("amount_minor"))
-        .and_then(serde_json::Value::as_i64);
-    // The refund is read as the order holds it now. A refund reversed since
-    // the event left none, and there is nothing to mirror.
-    let Some(recorded) = recorded else {
+    let Some(key) = refund_key(tx, external_refund).await? else {
         return Ok(());
     };
     let transaction_id = external_refund
-        .as_ref()
         .and_then(|refund| refund.get("transaction_id"))
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
-    let Some(key) = refund_key(tx, external_refund.as_ref()).await? else {
-        return Ok(());
-    };
-    let unit = match payment_method.as_deref() {
-        Some("bitcoin" | "paykit") => "sat".to_string(),
-        Some("usdt") => "usdt".to_string(),
-        _ => currency.to_lowercase(),
-    };
-    let payload = json!({
-        "amount_minor": recorded,
-        "amount_unit": unit,
+    let mut payload = json!({
         "transaction_id": transaction_id,
-        "order_total_minor": total_minor,
-        "order_currency": currency,
-        "order_exponent": exponent,
-        "full": state == "refunded_external",
+        "order_total_minor": basis.total_minor,
+        "order_currency": basis.currency,
+        "order_exponent": basis.exponent,
     });
+    match refund::order_currency_amount(&basis, recorded) {
+        Ok(converted) => {
+            payload["amount_minor"] = json!(converted.amount_minor);
+            payload["full"] = json!(converted.amount_minor >= basis.total_minor);
+            payload["basis"] = json!(converted.basis);
+        }
+        Err(blocked) => {
+            payload["blocked_code"] = json!(blocked.code);
+            payload["blocked_detail"] = json!(blocked.detail);
+        }
+    }
     ledger::on_refund_recorded(tx, now, order_id, &key, &payload, source_event_id).await
 }
 
