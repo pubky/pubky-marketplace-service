@@ -2309,6 +2309,144 @@ async fn a_fork_paykit_settlement_logs_no_alert_but_an_unknown_denomination_does
     );
 }
 
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn both_rails_without_a_named_first_rail_leaves_the_paid_rail_to_the_operator(pool: PgPool) {
+    let f = fixture(pool.clone(), Setup::both()).await;
+    let active = active_order(&f).await;
+    let order_id = active.order.order_id.clone();
+    // Both rails hold money, neither qualifies as paid on time: Paykit names
+    // no first rail.
+    f.paykit.set_marketplace_status(
+        active.invoice,
+        status_body(
+            active.invoice,
+            active.deadline,
+            StatusSpec {
+                payment_state: "confirmed",
+                bitcoin: Some(bitcoin_leg(3, false)),
+                usdt: Some(usdt_leg(1, false, false, false)),
+                paid_asset: None,
+            },
+        ),
+    );
+    assert_eq!(poll_now(&f.app, at(1)).await, 1);
+    let (state, _, _, _, reason) = payment_row(&pool, &order_id).await;
+    assert_eq!(
+        (state.as_str(), reason.as_deref()),
+        ("manual_review", Some("amount_mismatch"))
+    );
+    let stored = facts(&pool, &order_id).await;
+    assert_eq!(
+        stored.payment_asset, None,
+        "the service does not guess which rail was paid first"
+    );
+    assert_eq!(stored.payment_finality, None);
+    assert!(stored.paykit_second_rail_at.is_some());
+    let seller_view = {
+        let (_, body) = send(
+            f.app.router.clone(),
+            "GET",
+            &format!("/v1/orders/{order_id}"),
+            Some(&f.seller.token),
+            &Value::Null,
+        )
+        .await;
+        body
+    };
+    assert_eq!(
+        seller_view["paykit_observation"]["paid_rail_unknown"],
+        json!(true)
+    );
+    assert!(seller_view.get("payment_asset").is_none());
+
+    // A refund needs a rail to follow: it is refused with a named reason, the
+    // seller resolves as paid or abandoned and returns each payment.
+    let (status, body) = resolve_call(
+        &f.app,
+        &f.seller.token,
+        &order_id,
+        Some(Uuid::new_v4()),
+        &json!({ "outcome": "refunded", "external_refund_reference": "tx-1" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        body["error"]["reason"],
+        json!("refund_rail_unknown"),
+        "{body}"
+    );
+    assert_eq!(payment_row(&pool, &order_id).await.0, "manual_review");
+    let (status, body) = resolve_call(
+        &f.app,
+        &f.seller.token,
+        &order_id,
+        Some(Uuid::new_v4()),
+        &json!({ "outcome": "abandoned", "reason": "returned both payments" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_usdt_refund_with_an_amount_that_is_not_whole_cents_is_a_typed_refusal(pool: PgPool) {
+    let f = fixture(pool.clone(), Setup::both()).await;
+    let active = active_order(&f).await;
+    let order_id = active.order.order_id.clone();
+    // A matched transfer for a different amount than offered goes to review
+    // with a USDT amount that is not a whole number of cents.
+    let mut leg = usdt_leg(1, true, true, false);
+    leg["observed_amount"] = json!((TOTAL_USDT_UNITS + 1).to_string());
+    f.paykit.set_marketplace_status(
+        active.invoice,
+        usdt_status(active.invoice, active.deadline, leg),
+    );
+    poll_now(&f.app, at(1)).await;
+    let stored = facts(&pool, &order_id).await;
+    assert_eq!(stored.payment_asset.as_deref(), Some("USDT"));
+    assert_eq!(payment_row(&pool, &order_id).await.0, "manual_review");
+    let address = "0xd8da6bf26964af9d7eed9e03e53415d37aa96045";
+    let (status, body) = execute(
+        &f.app,
+        &f.buyer.token,
+        &order_command(
+            "refund.confirm_destination",
+            &order_id,
+            stored.revision,
+            json!({ "address": address }),
+            41,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let reference = format!("0x{}", "ef56".repeat(16));
+    let (status, body) = resolve_call(
+        &f.app,
+        &f.seller.token,
+        &order_id,
+        Some(Uuid::new_v4()),
+        &json!({ "outcome": "refunded", "external_refund_reference": reference }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "not a 500: {body}");
+    assert_eq!(
+        body["error"]["reason"],
+        json!("refund_amount_unrecordable"),
+        "{body}"
+    );
+    assert_eq!(payment_row(&pool, &order_id).await.0, "manual_review");
+    assert_eq!(facts(&pool, &order_id).await.state, "pending_payment");
+    // The seller can still close the review without recording the refund.
+    let (status, body) = resolve_call(
+        &f.app,
+        &f.seller.token,
+        &order_id,
+        Some(Uuid::new_v4()),
+        &json!({ "outcome": "abandoned", "reason": "refunded from my wallet" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
 // ---------------------------------------------------------------------------
 // Money path: concurrent polls of one order
 // ---------------------------------------------------------------------------

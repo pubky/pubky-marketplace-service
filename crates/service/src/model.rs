@@ -1345,6 +1345,13 @@ fn next_actor_for_order(
     }
 }
 
+/// The scalar type an optional observation key must have to be shown.
+enum ScalarKind {
+    Text,
+    Number,
+    Flag,
+}
+
 pub(crate) fn seller_observation(observation: Option<&Value>) -> Value {
     let Some(observation) = observation else {
         return Value::Null;
@@ -1361,16 +1368,18 @@ pub(crate) fn seller_observation(observation: Option<&Value>) -> Value {
     // facts of their own. They appear only when the document has them, so a
     // Bitcoin observation keeps its shape.
     let mut view = view;
-    for (key, is_number) in [
-        ("asset", false),
-        ("observed_units", true),
-        ("other_rail_asset", false),
-        ("other_rail_amount", true),
-        ("other_rail_reference", false),
+    for (key, kind) in [
+        ("asset", ScalarKind::Text),
+        ("observed_units", ScalarKind::Number),
+        ("other_rail_asset", ScalarKind::Text),
+        ("other_rail_amount", ScalarKind::Number),
+        ("other_rail_reference", ScalarKind::Text),
+        ("paid_rail_unknown", ScalarKind::Flag),
     ] {
-        let value = observation.get(key).and_then(|value| match is_number {
-            true => value.as_i64().map(|number| json!(number)),
-            false => value.as_str().map(|text| json!(text)),
+        let value = observation.get(key).and_then(|value| match kind {
+            ScalarKind::Number => value.as_i64().map(|number| json!(number)),
+            ScalarKind::Text => value.as_str().map(|text| json!(text)),
+            ScalarKind::Flag => value.as_bool().map(|flag| json!(flag)),
         });
         if let Some(value) = value {
             view[key] = value;

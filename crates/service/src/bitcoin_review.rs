@@ -871,6 +871,36 @@ pub async fn resolve_bitcoin_payment(
             );
         }
     }
+    if body.outcome == "refunded" {
+        // Both rails were paid and paykit-server named no first one: a refund
+        // has no rail to follow.
+        if order.paykit_second_rail_at.is_some() && order.payment_asset.is_none() {
+            return audited_resolve_refusal(
+                &state,
+                &actor.0,
+                Some(resolution_id),
+                ErrorCode::InvalidState,
+                ReviewReason::RefundRailUnknown,
+                "Both the Bitcoin and the USDT payment were confirmed and the payment server \
+                 did not say which came first, so a refund cannot follow one rail. Resolve \
+                 this order as paid or abandoned and return each payment from your own wallet.",
+            );
+        }
+        // A USDT refund is recorded in order units: an amount that is not a
+        // whole number of them cannot be.
+        if usdt_order && refund_destination::quoted_refund_amount_minor(&order).is_none() {
+            return audited_resolve_refusal(
+                &state,
+                &actor.0,
+                Some(resolution_id),
+                ErrorCode::InvalidState,
+                ReviewReason::RefundAmountUnrecordable,
+                "The USDT amount received is not a whole number of cents, so it cannot be \
+                 recorded as a refund here. Return the payment from your own wallet and \
+                 resolve this order as abandoned.",
+            );
+        }
+    }
     if usdt_order && body.outcome == "refunded" {
         let confirmed = match destination_confirmed(&state.pool, order_id).await {
             Ok(confirmed) => confirmed,

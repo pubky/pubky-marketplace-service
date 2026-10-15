@@ -3312,9 +3312,13 @@ fn dual_rail_observation(
 
 /// Money on both rails of one request, before the order settled: the order
 /// goes to the existing manual-review path with both observations frozen. The
-/// rail that paid first is the order's paid rail (so a refund follows it);
-/// the seller sees the other rail beside it and returns that payment from
-/// their own wallet. Nothing is refunded and nothing settles automatically.
+/// rail paykit-server names as paid first is the order's paid rail (so a
+/// refund follows it); the seller sees the other rail beside it and returns
+/// that payment from their own wallet. When paykit-server names no first
+/// rail (neither payment qualified), the service does not guess: the paid
+/// rail stays unrecorded, the observation says so, and a refund is refused
+/// until the seller resolves the review as paid or abandoned. Nothing is
+/// refunded and nothing settles automatically.
 async fn apply_dual_rail_review(
     state: &AppState,
     row: &ClaimedPaykitOrder,
@@ -3336,6 +3340,7 @@ async fn apply_dual_rail_review(
         } | PaykitStatusOutcome::AcceptancePending { .. }
     );
     let usdt_observation = usdt.as_observation();
+    let rail_known = paid_asset.is_some();
     let first_is_usdt = paid_asset == Some(AcceptedAsset::Usdt);
     let (first, first_matched, other) = if first_is_usdt {
         (&usdt_observation, usdt.amount_matched, &facts.observation)
@@ -3356,7 +3361,9 @@ async fn apply_dual_rail_review(
         tx.rollback().await?;
         return Ok(false);
     }
-    record_settlement_rail(&mut tx, row.id, first, first_is_usdt.then_some(usdt), now).await?;
+    if rail_known {
+        record_settlement_rail(&mut tx, row.id, first, first_is_usdt.then_some(usdt), now).await?;
+    }
     let (revision,): (i64,) = sqlx::query_as(
         "UPDATE payments SET state = 'manual_review', revision = revision + 1, \
          review_reason = 'amount_mismatch', manual_review_entered_at = $2, updated_at = $2 \
@@ -3385,6 +3392,10 @@ async fn apply_dual_rail_review(
         now,
     )
     .await?;
+    let mut document = dual_rail_observation(first, first_matched, other, now);
+    if !rail_known {
+        document["paid_rail_unknown"] = serde_json::json!(true);
+    }
     sqlx::query(
         "UPDATE orders SET paykit_request_state = 'confirmed', \
          paykit_seller_confirmation_entered_at = NULL, \
@@ -3393,10 +3404,12 @@ async fn apply_dual_rail_review(
     )
     .bind(row.id)
     .bind(now)
-    .bind(dual_rail_observation(first, first_matched, other, now))
+    .bind(document)
     .execute(&mut *tx)
     .await?;
-    freeze_paykit_observation(&mut tx, row.id, first.observed_sats).await?;
+    if rail_known {
+        freeze_paykit_observation(&mut tx, row.id, first.observed_sats).await?;
+    }
     tx.commit().await?;
     tracing::error!(
         order_id = %row.id,
