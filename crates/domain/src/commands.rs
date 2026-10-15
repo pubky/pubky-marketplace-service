@@ -75,6 +75,7 @@ pub enum CommandPayload {
     RequestCancellation(RequestCancellationPayload),
     ApproveCancellation(OrderActionPayload),
     ShipOrder(ShipOrderPayload),
+    UpdateTracking(UpdateTrackingPayload),
     ConfirmDelivery(OrderActionPayload),
     SetPickupDetails(SetPickupDetailsPayload),
     ClearPickupDetails(ClearPickupDetailsPayload),
@@ -118,6 +119,7 @@ impl Command {
             CommandPayload::RequestCancellation(_) => "order.cancel_request",
             CommandPayload::ApproveCancellation(_) => "order.cancel_approve",
             CommandPayload::ShipOrder(_) => "fulfillment.ship",
+            CommandPayload::UpdateTracking(_) => "fulfillment.update_tracking",
             CommandPayload::ConfirmDelivery(_) => "fulfillment.confirm_delivery",
             CommandPayload::SetPickupDetails(_) => "pickup_details.set",
             CommandPayload::ClearPickupDetails(_) => "pickup_details.clear",
@@ -163,6 +165,7 @@ impl Command {
             CommandPayload::RegisterLocks(p) => serde_json::to_value(p),
             CommandPayload::RequestCancellation(p) => serde_json::to_value(p),
             CommandPayload::ShipOrder(p) => serde_json::to_value(p),
+            CommandPayload::UpdateTracking(p) => serde_json::to_value(p),
             CommandPayload::SetPickupDetails(p) => serde_json::to_value(p),
             CommandPayload::ClearPickupDetails(p) => serde_json::to_value(p),
             CommandPayload::SetDigitalDelivery(p) => serde_json::to_value(p),
@@ -889,6 +892,26 @@ pub struct ShipOrderPayload {
     /// `La Poste`, `An Post`, `Deutsche Post`, plus free text for anything
     /// else (rendered as plain text, no tracking link).
     pub carrier: String,
+    /// The parcel's tracking number, 1–200 printable characters. Absent,
+    /// `null` and empty (after trimming) all mean "no tracking yet": the
+    /// order is shipped and the seller adds the number later with
+    /// `fulfillment.update_tracking`. A caller with no carrier sends
+    /// `"Other"`.
+    #[serde(default)]
+    pub tracking_number: Option<String>,
+}
+
+/// `fulfillment.update_tracking` (seller, own order, state `shipped`): adds
+/// or edits the carrier and tracking number of a shipment already made.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateTrackingPayload {
+    pub order_id: Uuid,
+    /// Same rules as `ShipOrderPayload.carrier`: 1–100 printable
+    /// characters, free text with a soft vocabulary.
+    pub carrier: String,
+    /// 1–200 printable characters. Required: this command adds or edits a
+    /// number and cannot clear one.
     pub tracking_number: String,
 }
 
@@ -1319,6 +1342,9 @@ pub fn parse_command(raw: &Value) -> Result<Command, Vec<ValidationIssue>> {
             parse_payload(&envelope.payload).map(CommandPayload::ApproveCancellation)?
         }
         "fulfillment.ship" => parse_payload(&envelope.payload).and_then(validate_ship_order)?,
+        "fulfillment.update_tracking" => {
+            parse_payload(&envelope.payload).and_then(validate_update_tracking)?
+        }
         "fulfillment.confirm_delivery" => {
             parse_payload(&envelope.payload).map(CommandPayload::ConfirmDelivery)?
         }
@@ -1933,6 +1959,33 @@ fn validate_ship_order(
     let mut issues = Vec::new();
     validate_trimmed("payload.carrier", &mut payload.carrier, 1, 100, &mut issues);
     validate_printable("payload.carrier", &payload.carrier, &mut issues);
+    if let Some(number) = payload.tracking_number.as_mut() {
+        *number = number.trim().to_string();
+    }
+    if payload
+        .tracking_number
+        .as_deref()
+        .is_some_and(|number| number.is_empty())
+    {
+        payload.tracking_number = None;
+    }
+    if let Some(number) = payload.tracking_number.as_mut() {
+        validate_trimmed("payload.tracking_number", number, 1, 200, &mut issues);
+        validate_printable("payload.tracking_number", number, &mut issues);
+    }
+    if issues.is_empty() {
+        Ok(CommandPayload::ShipOrder(payload))
+    } else {
+        Err(issues)
+    }
+}
+
+fn validate_update_tracking(
+    mut payload: UpdateTrackingPayload,
+) -> Result<CommandPayload, Vec<ValidationIssue>> {
+    let mut issues = Vec::new();
+    validate_trimmed("payload.carrier", &mut payload.carrier, 1, 100, &mut issues);
+    validate_printable("payload.carrier", &payload.carrier, &mut issues);
     validate_trimmed(
         "payload.tracking_number",
         &mut payload.tracking_number,
@@ -1946,7 +1999,7 @@ fn validate_ship_order(
         &mut issues,
     );
     if issues.is_empty() {
-        Ok(CommandPayload::ShipOrder(payload))
+        Ok(CommandPayload::UpdateTracking(payload))
     } else {
         Err(issues)
     }
@@ -3176,6 +3229,139 @@ mod tests {
         );
         let issues = parse_command(&with_tab_tracking).expect_err("embedded tab invalid");
         assert!(issues.iter().any(|i| i.path == "payload.tracking_number"));
+    }
+
+    #[test]
+    fn ship_treats_absent_null_empty_and_blank_tracking_as_none() {
+        let order_id = "00000000-0000-4000-8000-00000000aaaa";
+        for payload in [
+            json!({ "order_id": order_id, "carrier": "Other" }),
+            json!({ "order_id": order_id, "carrier": "Other", "tracking_number": null }),
+            json!({ "order_id": order_id, "carrier": "Other", "tracking_number": "" }),
+            json!({ "order_id": order_id, "carrier": " Other ", "tracking_number": " \t " }),
+        ] {
+            let command = parse_command(&order_command_json("fulfillment.ship", payload.clone()))
+                .unwrap_or_else(|issues| panic!("{payload} should be valid: {issues:?}"));
+            let CommandPayload::ShipOrder(ship) = &command.payload else {
+                panic!("expected ship payload");
+            };
+            assert_eq!(ship.carrier, "Other");
+            assert_eq!(ship.tracking_number, None, "{payload}");
+        }
+    }
+
+    #[test]
+    fn ship_without_tracking_hashes_the_same_for_every_spelling() {
+        let order_id = "00000000-0000-4000-8000-00000000aaaa";
+        let hash = |payload: Value| {
+            parse_command(&order_command_json("fulfillment.ship", payload))
+                .expect("valid ship")
+                .request_hash()
+        };
+        let absent = hash(json!({ "order_id": order_id, "carrier": "Other" }));
+        assert_eq!(
+            absent,
+            hash(json!({ "order_id": order_id, "carrier": "Other", "tracking_number": null }))
+        );
+        assert_eq!(
+            absent,
+            hash(json!({ "order_id": order_id, "carrier": "Other", "tracking_number": "" }))
+        );
+        assert_ne!(
+            absent,
+            hash(json!({ "order_id": order_id, "carrier": "Other", "tracking_number": "T-1" }))
+        );
+    }
+
+    #[test]
+    fn ship_still_validates_a_present_tracking_number_and_the_carrier() {
+        let order_id = "00000000-0000-4000-8000-00000000aaaa";
+        let command = parse_command(&order_command_json(
+            "fulfillment.ship",
+            json!({ "order_id": order_id, "carrier": "USPS", "tracking_number": " 9400 " }),
+        ))
+        .expect("valid ship");
+        let CommandPayload::ShipOrder(ship) = &command.payload else {
+            panic!("expected ship payload");
+        };
+        assert_eq!(ship.tracking_number.as_deref(), Some("9400"));
+
+        let too_long = "9".repeat(201);
+        for (payload, path) in [
+            (
+                json!({ "order_id": order_id, "carrier": "USPS", "tracking_number": too_long }),
+                "payload.tracking_number",
+            ),
+            (
+                json!({ "order_id": order_id, "carrier": "" }),
+                "payload.carrier",
+            ),
+        ] {
+            let issues = parse_command(&order_command_json("fulfillment.ship", payload.clone()))
+                .expect_err("invalid ship");
+            assert!(issues.iter().any(|i| i.path == path), "{payload}");
+        }
+        assert!(parse_command(&order_command_json(
+            "fulfillment.ship",
+            json!({ "order_id": order_id }),
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn parses_and_validates_update_tracking() {
+        let order_id = "00000000-0000-4000-8000-00000000aaaa";
+        let command = parse_command(&order_command_json(
+            "fulfillment.update_tracking",
+            json!({ "order_id": order_id, "carrier": " UPS ", "tracking_number": " 1Z-9 " }),
+        ))
+        .expect("valid update");
+        assert_eq!(command.kind(), "fulfillment.update_tracking");
+        let CommandPayload::UpdateTracking(update) = &command.payload else {
+            panic!("expected update_tracking payload");
+        };
+        assert_eq!(update.carrier, "UPS");
+        assert_eq!(update.tracking_number, "1Z-9");
+
+        for payload in [
+            json!({ "order_id": order_id, "carrier": "UPS" }),
+            json!({ "order_id": order_id, "carrier": "UPS", "tracking_number": null }),
+            json!({ "order_id": order_id, "carrier": "UPS", "tracking_number": "x", "extra": 1 }),
+        ] {
+            assert!(
+                parse_command(&order_command_json(
+                    "fulfillment.update_tracking",
+                    payload.clone()
+                ))
+                .is_err(),
+                "{payload}"
+            );
+        }
+        for (payload, path) in [
+            (
+                json!({ "order_id": order_id, "carrier": "UPS", "tracking_number": "  " }),
+                "payload.tracking_number",
+            ),
+            (
+                json!({ "order_id": order_id, "carrier": "UPS", "tracking_number": "A\tB" }),
+                "payload.tracking_number",
+            ),
+            (
+                json!({ "order_id": order_id, "carrier": " ", "tracking_number": "x" }),
+                "payload.carrier",
+            ),
+            (
+                json!({ "order_id": order_id, "carrier": "U".repeat(101), "tracking_number": "x" }),
+                "payload.carrier",
+            ),
+        ] {
+            let issues = parse_command(&order_command_json(
+                "fulfillment.update_tracking",
+                payload.clone(),
+            ))
+            .expect_err("invalid update");
+            assert!(issues.iter().any(|i| i.path == path), "{payload}");
+        }
     }
 
     #[test]
