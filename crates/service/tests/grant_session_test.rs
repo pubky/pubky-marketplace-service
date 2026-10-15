@@ -10,11 +10,14 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use axum::http::StatusCode;
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
 use chrono::{DateTime, Duration, Utc};
 use marketplace_service::clock::{AdjustableClock, Clock};
 use marketplace_service::config::Config;
-use marketplace_service::grant_session::{proof_data, GrantSessionConfig, ProofDocument};
+use marketplace_service::grant_session::{
+    challenge_request_data, proof_data, GrantSessionConfig, ProofDocument, MAX_LIVE_CHALLENGES,
+};
 use marketplace_service::homeserver::{HomeserverFetchOutcome, HomeserverListingClient};
 use marketplace_service::http::build_router;
 use marketplace_service::AppState;
@@ -23,6 +26,7 @@ use pubky::{Capabilities, ClientId, GrantClaims, GrantId, Keypair, PopNonce, GRA
 use pubky_common::auth::jws::sign_jws;
 use serde_json::{json, Value};
 use sqlx::PgPool;
+use tower::util::ServiceExt;
 use uuid::Uuid;
 
 use common::{send, TestApp};
@@ -128,18 +132,32 @@ impl ShopGrant {
         DateTime::<Utc>::from_timestamp(self.claims.exp as i64, 0).expect("grant expiry")
     }
 
-    fn body(&self, challenge_id: Uuid) -> Value {
+    /// Signs `data` as issued at `at`; tests that move the service clock
+    /// sign at the service's time so only the behaviour under test differs.
+    fn signed_at(&self, data: Value, at: DateTime<Utc>) -> Value {
         let pop = sign_jws(
             &self.client,
             CUSTOM_POP_JWS_TYP,
             &json!({
                 "gid": self.claims.jti,
-                "iat": Utc::now().timestamp(),
+                "iat": at.timestamp(),
                 "nonce": PopNonce::generate(),
-                "data": proof_data(AUDIENCE, challenge_id),
+                "data": data,
             }),
         );
         json!({ "grant": self.claims.sign(&self.root, GRANT_JWS_TYP), "pop": pop })
+    }
+
+    fn body(&self, challenge_id: Uuid) -> Value {
+        self.signed_at(proof_data(AUDIENCE, challenge_id), Utc::now())
+    }
+
+    fn challenge_request(&self) -> Value {
+        self.challenge_request_at(Utc::now())
+    }
+
+    fn challenge_request_at(&self, at: DateTime<Utc>) -> Value {
+        self.signed_at(challenge_request_data(AUDIENCE), at)
     }
 
     fn document(&self, challenge_id: Uuid) -> Value {
@@ -192,15 +210,43 @@ async fn session_count(pool: &PgPool, pubky: &str) -> i64 {
         .expect("session count")
 }
 
-#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn the_route_is_unavailable_while_the_flag_is_off(pool: PgPool) {
-    let (app, homeserver) = grant_session_app(pool, false).await;
-    let grant = ShopGrant::new(Duration::hours(1));
-    let challenge = Uuid::new_v4();
+/// Requests a challenge signed at the service clock's current time.
+async fn request_challenge(app: &TestApp, grant: &ShopGrant) -> (StatusCode, Value) {
+    send(
+        app.router.clone(),
+        "POST",
+        "/v1/auth/grant-session-challenges",
+        None,
+        &grant.challenge_request_at(app.clock.now()),
+    )
+    .await
+}
+
+/// Issues a challenge and writes its proof document, as the Shop does.
+async fn issue(app: &TestApp, homeserver: &ProofHomeserver, grant: &ShopGrant) -> Uuid {
+    let (status, body) = request_challenge(app, grant).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let challenge: Uuid = body["challenge_id"]
+        .as_str()
+        .and_then(|id| id.parse().ok())
+        .expect("challenge id");
     homeserver.write(&grant.pubky(), challenge, grant.document(challenge));
+    challenge
+}
 
-    let (status, body) = post(&app, &grant.body(challenge)).await;
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn both_routes_are_unavailable_while_the_flag_is_off(pool: PgPool) {
+    let (app, _) = grant_session_app(pool, false).await;
+    let grant = ShopGrant::new(Duration::hours(1));
 
+    let (challenge_status, challenge_body) = request_challenge(&app, &grant).await;
+    let (status, body) = post(&app, &grant.body(Uuid::new_v4())).await;
+
+    assert_eq!(challenge_status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        challenge_body,
+        json!({"error": "grant_session_unavailable"})
+    );
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body, json!({"error": "grant_session_unavailable"}));
     assert_eq!(session_count(&app.pool, &grant.pubky()).await, 0);
@@ -210,8 +256,7 @@ async fn the_route_is_unavailable_while_the_flag_is_off(pool: PgPool) {
 async fn a_shop_grant_proof_mints_a_narrowed_session_without_an_approval(pool: PgPool) {
     let (app, homeserver) = grant_session_app(pool, true).await;
     let grant = ShopGrant::new(Duration::days(365));
-    let challenge = Uuid::new_v4();
-    homeserver.write(&grant.pubky(), challenge, grant.document(challenge));
+    let challenge = issue(&app, &homeserver, &grant).await;
 
     let (status, session) = post(&app, &grant.body(challenge)).await;
 
@@ -240,6 +285,15 @@ async fn a_shop_grant_proof_mints_a_narrowed_session_without_an_approval(pool: P
         expires_at.timestamp(),
         (app.clock.now() + Duration::seconds(86_400)).timestamp()
     );
+    let burned: (Option<DateTime<Utc>>, Option<String>) = sqlx::query_as(
+        "SELECT used_at, grant_id FROM grant_session_challenges WHERE challenge_id = $1",
+    )
+    .bind(challenge)
+    .fetch_one(&app.pool)
+    .await
+    .expect("challenge row");
+    assert!(burned.0.is_some());
+    assert_eq!(burned.1.as_deref(), Some(grant.claims.jti.as_str()));
 
     // The bearer passes the inventory capability gate.
     let (status, listed) = send(
@@ -261,8 +315,7 @@ async fn a_shop_grant_proof_mints_a_narrowed_session_without_an_approval(pool: P
 async fn the_session_never_outlives_the_grant(pool: PgPool) {
     let (app, homeserver) = grant_session_app(pool, true).await;
     let grant = ShopGrant::new(Duration::minutes(10));
-    let challenge = Uuid::new_v4();
-    homeserver.write(&grant.pubky(), challenge, grant.document(challenge));
+    let challenge = issue(&app, &homeserver, &grant).await;
 
     let (status, session) = post(&app, &grant.body(challenge)).await;
 
@@ -276,12 +329,126 @@ async fn the_session_never_outlives_the_grant(pool: PgPool) {
     assert_eq!(expires_at, grant.expires_at());
 }
 
+/// Kimi #137 P1: a stolen client key used while the grant is live cannot
+/// stage proof documents for later. A challenge id the service never issued
+/// mints nothing, even with a correct document on the homeserver.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_pre_staged_document_for_an_unissued_challenge_mints_nothing(pool: PgPool) {
+    let (app, homeserver) = grant_session_app(pool, true).await;
+    let grant = ShopGrant::new(Duration::days(365));
+    let staged = Uuid::new_v4();
+    homeserver.write(&grant.pubky(), staged, grant.document(staged));
+
+    let (status, body) = post(&app, &grant.body(staged)).await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body, json!({"error": "grant_session_challenge_invalid"}));
+    assert_eq!(session_count(&app.pool, &grant.pubky()).await, 0);
+}
+
+/// Kimi #137 P1, the rest of the attack: challenges and documents staged
+/// while the grant is live are useless once their challenges expire, which
+/// bounds the window after a revocation to one challenge lifetime.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_staged_challenge_expires_with_its_lifetime(pool: PgPool) {
+    let (app, homeserver) = grant_session_app(pool, true).await;
+    let grant = ShopGrant::new(Duration::days(365));
+    let real_now = app.clock.now();
+    app.clock.set(real_now - Duration::seconds(121));
+    let staged = issue(&app, &homeserver, &grant).await;
+    app.clock.set(real_now);
+
+    let (status, body) = post(&app, &grant.body(staged)).await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body, json!({"error": "grant_session_challenge_invalid"}));
+    assert_eq!(session_count(&app.pool, &grant.pubky()).await, 0);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_challenge_belongs_to_the_pubky_it_was_issued_to(pool: PgPool) {
+    let (app, homeserver) = grant_session_app(pool, true).await;
+    let owner = ShopGrant::new(Duration::hours(1));
+    let other = ShopGrant::new(Duration::hours(1));
+    let challenge = issue(&app, &homeserver, &owner).await;
+    homeserver.write(&other.pubky(), challenge, other.document(challenge));
+
+    let (status, body) = post(&app, &other.body(challenge)).await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body, json!({"error": "grant_session_challenge_invalid"}));
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_pubky_holds_a_bounded_number_of_live_challenges(pool: PgPool) {
+    let (app, _) = grant_session_app(pool, true).await;
+    let grant = ShopGrant::new(Duration::hours(1));
+    let real_now = app.clock.now();
+    app.clock.set(real_now - Duration::seconds(121));
+    for _ in 0..MAX_LIVE_CHALLENGES {
+        let (status, body) = request_challenge(&app, &grant).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert!(body["expires_at"].as_str().is_some());
+    }
+    let (status, body) = request_challenge(&app, &grant).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(body, json!({"error": "too_many_challenges"}));
+
+    // Once they expire they stop counting and are pruned on the next request.
+    app.clock.set(real_now);
+    let (status, _) = request_challenge(&app, &grant).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM grant_session_challenges")
+        .fetch_one(&app.pool)
+        .await
+        .expect("challenge rows");
+    assert_eq!(rows, 1);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_challenge_request_needs_its_own_signed_purpose(pool: PgPool) {
+    let (app, _) = grant_session_app(pool, true).await;
+    let grant = ShopGrant::new(Duration::hours(1));
+    let other_client = ShopGrant::new(Duration::hours(1));
+
+    // A mint proof is not a challenge request, and vice versa.
+    let (status, body) = send(
+        app.router.clone(),
+        "POST",
+        "/v1/auth/grant-session-challenges",
+        None,
+        &grant.body(Uuid::new_v4()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body, json!({"error": "grant_session_invalid"}));
+    let (status, _) = post(&app, &grant.challenge_request()).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // A proof signed by a key other than the grant's client key.
+    let mut forged = grant.challenge_request();
+    forged["pop"] = other_client.challenge_request()["pop"].clone();
+    let (status, _) = send(
+        app.router.clone(),
+        "POST",
+        "/v1/auth/grant-session-challenges",
+        None,
+        &forged,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM grant_session_challenges")
+        .fetch_one(&app.pool)
+        .await
+        .expect("challenge rows");
+    assert_eq!(rows, 0);
+}
+
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_replayed_proof_mints_nothing(pool: PgPool) {
     let (app, homeserver) = grant_session_app(pool, true).await;
     let grant = ShopGrant::new(Duration::hours(1));
-    let challenge = Uuid::new_v4();
-    homeserver.write(&grant.pubky(), challenge, grant.document(challenge));
+    let challenge = issue(&app, &homeserver, &grant).await;
     let body = grant.body(challenge);
 
     let (first, _) = post(&app, &body).await;
@@ -291,7 +458,7 @@ async fn a_replayed_proof_mints_nothing(pool: PgPool) {
 
     assert_eq!(first, StatusCode::CREATED);
     assert_eq!(second, StatusCode::UNAUTHORIZED);
-    assert_eq!(refusal, json!({"error": "grant_session_replayed"}));
+    assert_eq!(refusal, json!({"error": "grant_session_challenge_invalid"}));
     assert_eq!(third, StatusCode::UNAUTHORIZED);
     assert_eq!(session_count(&app.pool, &grant.pubky()).await, 1);
 }
@@ -300,8 +467,7 @@ async fn a_replayed_proof_mints_nothing(pool: PgPool) {
 async fn concurrent_uses_of_one_proof_mint_exactly_one_session(pool: PgPool) {
     let (app, homeserver) = grant_session_app(pool, true).await;
     let grant = ShopGrant::new(Duration::hours(1));
-    let challenge = Uuid::new_v4();
-    homeserver.write(&grant.pubky(), challenge, grant.document(challenge));
+    let challenge = issue(&app, &homeserver, &grant).await;
     let body = grant.body(challenge);
 
     let mut tasks = tokio::task::JoinSet::new();
@@ -323,7 +489,7 @@ async fn concurrent_uses_of_one_proof_mint_exactly_one_session(pool: PgPool) {
         .iter()
         .all(|(status, body)| *status == StatusCode::CREATED
             || (*status == StatusCode::UNAUTHORIZED
-                && *body == json!({"error": "grant_session_replayed"}))));
+                && *body == json!({"error": "grant_session_challenge_invalid"}))));
     assert_eq!(session_count(&app.pool, &grant.pubky()).await, 1);
 }
 
@@ -331,7 +497,11 @@ async fn concurrent_uses_of_one_proof_mint_exactly_one_session(pool: PgPool) {
 async fn without_the_homeserver_proof_document_nothing_is_minted_or_burned(pool: PgPool) {
     let (app, homeserver) = grant_session_app(pool, true).await;
     let grant = ShopGrant::new(Duration::hours(1));
-    let challenge = Uuid::new_v4();
+    let (_, issued) = request_challenge(&app, &grant).await;
+    let challenge: Uuid = issued["challenge_id"]
+        .as_str()
+        .and_then(|id| id.parse().ok())
+        .expect("challenge id");
 
     // A revoked grant cannot write its homeserver: no document.
     let (status, body) = post(&app, &grant.body(challenge)).await;
@@ -359,16 +529,26 @@ async fn a_proof_document_for_anything_else_is_refused(pool: PgPool) {
     .into_iter()
     .enumerate()
     {
-        let challenge = Uuid::new_v4();
+        let challenge = issue(&app, &homeserver, &grant).await;
         let mut document = grant.document(challenge);
         mutate(&mut document);
         homeserver.write(&grant.pubky(), challenge, document);
         let (status, body) = post(&app, &grant.body(challenge)).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "case {index}: {body}");
         assert_eq!(body, json!({"error": "homeserver_proof_invalid"}));
+        // Refused documents burn nothing; free the slot for the next case.
+        sqlx::query("DELETE FROM grant_session_challenges WHERE challenge_id = $1")
+            .bind(challenge)
+            .execute(&app.pool)
+            .await
+            .expect("drop the case's challenge");
     }
     // The right document under another user's pubky proves nothing.
-    let challenge = Uuid::new_v4();
+    let (_, issued) = request_challenge(&app, &grant).await;
+    let challenge: Uuid = issued["challenge_id"]
+        .as_str()
+        .and_then(|id| id.parse().ok())
+        .expect("challenge id");
     homeserver.write(&other, challenge, grant.document(challenge));
     let (status, _) = post(&app, &grant.body(challenge)).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -379,8 +559,7 @@ async fn a_proof_document_for_anything_else_is_refused(pool: PgPool) {
 async fn an_unreachable_homeserver_is_retriable(pool: PgPool) {
     let (app, homeserver) = grant_session_app(pool, true).await;
     let grant = ShopGrant::new(Duration::hours(1));
-    let challenge = Uuid::new_v4();
-    homeserver.write(&grant.pubky(), challenge, grant.document(challenge));
+    let challenge = issue(&app, &homeserver, &grant).await;
     homeserver.unavailable.store(true, Ordering::SeqCst);
 
     let (status, body) = post(&app, &grant.body(challenge)).await;
@@ -393,7 +572,7 @@ async fn an_unreachable_homeserver_is_retriable(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn invalid_proofs_are_refused_before_any_homeserver_read(pool: PgPool) {
+async fn invalid_proofs_are_refused_before_any_lookup(pool: PgPool) {
     let (app, homeserver) = grant_session_app(pool, true).await;
     homeserver.unavailable.store(true, Ordering::SeqCst);
     let grant = ShopGrant::new(Duration::hours(1));
@@ -406,40 +585,29 @@ async fn invalid_proofs_are_refused_before_any_homeserver_read(pool: PgPool) {
 
     let (status, _) = post(&app, &json!({"grant": "x", "pop": "y", "extra": 1})).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-}
-
-#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn used_challenges_are_pruned_once_no_proof_can_name_them(pool: PgPool) {
-    let (app, homeserver) = grant_session_app(pool, true).await;
-    let grant = ShopGrant::new(Duration::hours(1));
-    let first = Uuid::new_v4();
-    homeserver.write(&grant.pubky(), first, grant.document(first));
-    let (status, _) = post(&app, &grant.body(first)).await;
-    assert_eq!(status, StatusCode::CREATED);
-    sqlx::query("UPDATE grant_session_challenges SET used_at = used_at - INTERVAL '301 seconds'")
-        .execute(&app.pool)
+    let oversized = serde_json::to_vec(&json!({"grant": "x".repeat(20_000), "pop": "y"}))
+        .expect("body serializes");
+    let response = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/auth/grant-sessions")
+                .header("content-type", "application/json")
+                .body(Body::from(oversized))
+                .expect("request builds"),
+        )
         .await
-        .expect("age the record");
-
-    let second = Uuid::new_v4();
-    homeserver.write(&grant.pubky(), second, grant.document(second));
-    let (status, _) = post(&app, &grant.body(second)).await;
-    assert_eq!(status, StatusCode::CREATED);
-
-    let remaining: Vec<Uuid> =
-        sqlx::query_scalar("SELECT challenge_id FROM grant_session_challenges")
-            .fetch_all(&app.pool)
-            .await
-            .expect("challenges");
-    assert_eq!(remaining, vec![second]);
+        .expect("request executes");
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn sign_out_revokes_a_grant_session(pool: PgPool) {
     let (app, homeserver) = grant_session_app(pool, true).await;
     let grant = ShopGrant::new(Duration::hours(1));
-    let challenge = Uuid::new_v4();
-    homeserver.write(&grant.pubky(), challenge, grant.document(challenge));
+    let challenge = issue(&app, &homeserver, &grant).await;
     let (_, session) = post(&app, &grant.body(challenge)).await;
     let token = session["token"].as_str().expect("token");
     let id = session["session_id"].as_str().expect("session id");

@@ -191,9 +191,19 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/auth/sessions",
             post(auth::create_session).get(auth::list_sessions),
         )
-        .route(
-            "/v1/auth/grant-sessions",
-            post(crate::grant_session::create_grant_session),
+        .merge(
+            Router::new()
+                .route(
+                    "/v1/auth/grant-session-challenges",
+                    post(crate::grant_session::create_challenge),
+                )
+                .route(
+                    "/v1/auth/grant-sessions",
+                    post(crate::grant_session::create_grant_session),
+                )
+                .layer(DefaultBodyLimit::max(
+                    crate::grant_session::MAX_REQUEST_BYTES,
+                )),
         )
         .route("/v1/auth/grant-flows", post(crate::grant::create_flow))
         .route(

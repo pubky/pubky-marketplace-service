@@ -4,17 +4,22 @@
 //! browser. Instead of a second signer approval, the browser proves to this
 //! service that it holds that grant:
 //!
-//! 1. It writes a proof document to its own homeserver under
-//!    [`PROOF_DOCUMENTS_PATH`], keyed by a fresh `challenge_id`. Only a live
-//!    homeserver session can write it, so a grant revoked at the homeserver
-//!    cannot pass, even with a stolen client key.
-//! 2. It signs a pubky custom proof (`createCustomPop`) over
+//! 1. `POST /v1/auth/grant-session-challenges` with a custom proof over
+//!    `{aud, purpose: CHALLENGE_PURPOSE}` returns a random `challenge_id` the
+//!    service stores for `pubky`, valid for the proof age (120 s by default).
+//! 2. It writes a proof document to its own homeserver under
+//!    [`PROOF_DOCUMENTS_PATH`], keyed by that `challenge_id`. Only a live
+//!    homeserver session can write it, and the id exists only from step 1, so
+//!    a document cannot be staged before the grant is revoked and used after
+//!    (beyond one challenge lifetime), even with a stolen client key.
+//! 3. It signs a pubky custom proof (`createCustomPop`) over
 //!    `{aud, challenge_id, purpose}` with the grant's client key.
-//! 3. `POST /v1/auth/grant-sessions` carries `{grant, pop}`.
+//! 4. `POST /v1/auth/grant-sessions` carries `{grant, pop}`.
 //!
 //! The service verifies both signatures offline with the SDK, then checks the
-//! audience, purpose, proof age, client id and capabilities, reads the proof
-//! document, and in one transaction burns the `challenge_id` and inserts the
+//! audience, purpose, proof age, client id and capabilities, requires an
+//! issued, unexpired and unused challenge for that pubky, reads the proof
+//! document, and in one transaction burns the challenge and inserts the
 //! session. The session's capabilities are the grant's, narrowed to the
 //! marketplace scopes; the Shop's wider storage grant is never stored.
 
@@ -51,8 +56,12 @@ pub const ENV_ENABLED: &str = "MARKETPLACE_GRANT_SESSION_ENABLED";
 pub const ENV_CLIENT_IDS: &str = "MARKETPLACE_GRANT_SESSION_CLIENT_IDS";
 pub const ENV_MAX_PROOF_AGE_SECONDS: &str = "MARKETPLACE_GRANT_SESSION_MAX_PROOF_AGE_SECONDS";
 
-/// Signed `data.purpose` of the custom proof.
+/// Signed `data.purpose` of the custom proof that mints a session.
 pub const PROOF_PURPOSE: &str = "marketplace-service/grant-session/v1";
+/// Signed `data.purpose` of the custom proof that requests a challenge.
+pub const CHALLENGE_PURPOSE: &str = "marketplace-service/grant-session-challenge/v1";
+/// Unused, unexpired challenges one pubky may hold at once.
+pub const MAX_LIVE_CHALLENGES: i64 = 5;
 /// `domain` of the homeserver proof document.
 pub const PROOF_DOCUMENT_DOMAIN: &str = "marketplace-service/grant-session-proof/v1";
 /// Where the Shop writes the proof document, followed by the challenge id.
@@ -60,7 +69,7 @@ pub const PROOF_DOCUMENTS_PATH: &str = "/pub/pubky.app/marketplace/v1/session-pr
 
 const DEFAULT_MAX_PROOF_AGE_SECONDS: i64 = 120;
 const MAX_PROOF_AGE_SECONDS_LIMIT: i64 = 600;
-const MAX_REQUEST_BYTES: usize = 16 * 1024;
+pub const MAX_REQUEST_BYTES: usize = 16 * 1024;
 const RATE_CLASS: &str = "grant_session.mint";
 
 #[derive(Clone, Debug)]
@@ -152,6 +161,13 @@ struct GrantSessionRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ChallengeRequestData {
+    aud: String,
+    purpose: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ProofData {
     aud: String,
     challenge_id: String,
@@ -190,6 +206,13 @@ pub enum GrantSessionRefusal {
     ClientNotAllowed,
     /// The grant does not cover the marketplace inventory scope with `rw`.
     CapabilityRequired,
+}
+
+/// Why a mint was refused after the proof itself verified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChallengeRefusal {
+    /// Never issued to this pubky, expired, or already used.
+    Invalid,
 }
 
 impl GrantSessionRefusal {
@@ -244,12 +267,69 @@ pub fn marketplace_capabilities(granted: &[Capability]) -> Option<String> {
 /// Offline checks of a custom proof. Signatures and grant validity come from
 /// the SDK (which reads the system clock); the proof age is bounded against
 /// `now`, the service clock.
+/// The grant facts shared by a challenge request and a mint.
+#[derive(Debug, PartialEq, Eq)]
+pub struct VerifiedGrant {
+    pub pubky: String,
+    pub client_id: String,
+    pub grant_id: String,
+    pub capabilities: String,
+    pub grant_expires_at: DateTime<Utc>,
+}
+
+/// Verifies a challenge request: a fresh proof over exactly
+/// `{aud, purpose: CHALLENGE_PURPOSE}` from an allowed, sufficient grant.
+pub fn verify_challenge_request(
+    grant: &str,
+    pop: &str,
+    config: &GrantSessionConfig,
+    now: DateTime<Utc>,
+) -> Result<VerifiedGrant, GrantSessionRefusal> {
+    let (verified, data) = verify_signed(grant, pop, config, now)?;
+    let data: ChallengeRequestData =
+        serde_json::from_value(data).map_err(|_| GrantSessionRefusal::ProofInvalid)?;
+    if data.purpose != CHALLENGE_PURPOSE || data.aud != config.audience {
+        return Err(GrantSessionRefusal::ProofInvalid);
+    }
+    Ok(verified)
+}
+
 pub fn verify_grant_session_proof(
     grant: &str,
     pop: &str,
     config: &GrantSessionConfig,
     now: DateTime<Utc>,
 ) -> Result<VerifiedGrantSession, GrantSessionRefusal> {
+    let (verified, data) = verify_signed(grant, pop, config, now)?;
+    let data: ProofData =
+        serde_json::from_value(data).map_err(|_| GrantSessionRefusal::ProofInvalid)?;
+    if data.purpose != PROOF_PURPOSE || data.aud != config.audience {
+        return Err(GrantSessionRefusal::ProofInvalid);
+    }
+    let challenge_id =
+        Uuid::parse_str(&data.challenge_id).map_err(|_| GrantSessionRefusal::ProofInvalid)?;
+    // The id becomes a homeserver path segment: only the canonical form.
+    if challenge_id.to_string() != data.challenge_id {
+        return Err(GrantSessionRefusal::ProofInvalid);
+    }
+    Ok(VerifiedGrantSession {
+        pubky: verified.pubky,
+        client_id: verified.client_id,
+        grant_id: verified.grant_id,
+        capabilities: verified.capabilities,
+        challenge_id,
+        grant_expires_at: verified.grant_expires_at,
+    })
+}
+
+/// Signatures, grant validity, proof age, client id and capabilities; the
+/// signed `data` is returned for the caller's purpose-specific checks.
+fn verify_signed(
+    grant: &str,
+    pop: &str,
+    config: &GrantSessionConfig,
+    now: DateTime<Utc>,
+) -> Result<(VerifiedGrant, Value), GrantSessionRefusal> {
     let credentials = CustomPop {
         grant: grant.to_string(),
         pop: pop.to_string(),
@@ -262,18 +342,6 @@ pub fn verify_grant_session_proof(
                 _ => GrantSessionRefusal::ProofInvalid,
             }
         })?;
-
-    let data: ProofData = serde_json::from_value(verified.data().clone())
-        .map_err(|_| GrantSessionRefusal::ProofInvalid)?;
-    if data.purpose != PROOF_PURPOSE || data.aud != config.audience {
-        return Err(GrantSessionRefusal::ProofInvalid);
-    }
-    let challenge_id =
-        Uuid::parse_str(&data.challenge_id).map_err(|_| GrantSessionRefusal::ProofInvalid)?;
-    // The id becomes a homeserver path segment: only the canonical form.
-    if challenge_id.to_string() != data.challenge_id {
-        return Err(GrantSessionRefusal::ProofInvalid);
-    }
 
     let issued_at = i64::try_from(verified.iat()).map_err(|_| GrantSessionRefusal::ProofInvalid)?;
     let now_seconds = now.timestamp();
@@ -297,14 +365,16 @@ pub fn verify_grant_session_proof(
         .and_then(|exp| DateTime::<Utc>::from_timestamp(exp, 0))
         .ok_or(GrantSessionRefusal::ProofInvalid)?;
 
-    Ok(VerifiedGrantSession {
-        pubky: verified.identity().z32(),
-        client_id: claims.client_id.as_str().to_string(),
-        grant_id: claims.jti.as_str().to_string(),
-        capabilities,
-        challenge_id,
-        grant_expires_at,
-    })
+    Ok((
+        VerifiedGrant {
+            pubky: verified.identity().z32(),
+            client_id: claims.client_id.as_str().to_string(),
+            grant_id: claims.jti.as_str().to_string(),
+            capabilities,
+            grant_expires_at,
+        },
+        verified.data().clone(),
+    ))
 }
 
 fn error_response(status: StatusCode, code: &'static str) -> Response {
@@ -322,40 +392,158 @@ fn internal_error() -> Response {
     error_response(StatusCode::INTERNAL_SERVER_ERROR, "session_unavailable")
 }
 
-/// `POST /v1/auth/grant-sessions`.
-pub async fn create_grant_session(State(state): State<AppState>, body: Bytes) -> Response {
+fn rate_limited(retry_after: i64) -> Response {
+    let mut response = error_response(StatusCode::TOO_MANY_REQUESTS, "retry_later");
+    response.headers_mut().insert(
+        header::RETRY_AFTER,
+        HeaderValue::from_str(&retry_after.to_string()).expect("retry-after is a safe integer"),
+    );
+    response
+}
+
+fn parse_request(
+    state: &AppState,
+    body: &Bytes,
+) -> Result<(Arc<GrantSessionConfig>, GrantSessionRequest), Box<Response>> {
     let Some(config) = state.grant_session.clone() else {
-        return error_response(StatusCode::NOT_FOUND, "grant_session_unavailable");
+        return Err(Box::new(error_response(
+            StatusCode::NOT_FOUND,
+            "grant_session_unavailable",
+        )));
     };
     if body.len() > MAX_REQUEST_BYTES {
-        return error_response(StatusCode::PAYLOAD_TOO_LARGE, "invalid_request");
+        return Err(Box::new(error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "invalid_request",
+        )));
     }
-    let Ok(request) = serde_json::from_slice::<GrantSessionRequest>(&body) else {
-        return error_response(StatusCode::BAD_REQUEST, "invalid_request");
+    let request = serde_json::from_slice::<GrantSessionRequest>(body)
+        .map_err(|_| Box::new(error_response(StatusCode::BAD_REQUEST, "invalid_request")))?;
+    Ok((config, request))
+}
+
+fn refused(refusal: GrantSessionRefusal) -> Response {
+    tracing::info!(refusal = ?refusal, "refused grant session proof");
+    let (status, code) = refusal.status_and_code();
+    error_response(status, code)
+}
+
+/// `POST /v1/auth/grant-session-challenges`.
+pub async fn create_challenge(State(state): State<AppState>, body: Bytes) -> Response {
+    let (config, request) = match parse_request(&state, &body) {
+        Ok(parsed) => parsed,
+        Err(response) => return *response,
+    };
+    let now = state.clock.now();
+    let verified = match verify_challenge_request(&request.grant, &request.pop, &config, now) {
+        Ok(verified) => verified,
+        Err(refusal) => return refused(refusal),
+    };
+    match crate::automation::consume_automation_rate(&state, &verified.pubky, RATE_CLASS).await {
+        Ok(None) => {}
+        Ok(Some(retry_after)) => return rate_limited(retry_after),
+        Err(error) => {
+            tracing::error!(error = %error, "grant session rate limit failed");
+            return internal_error();
+        }
+    }
+    match issue_challenge(&state, &config, &verified.pubky, now).await {
+        Ok(Some((challenge_id, expires_at))) => no_store(
+            (
+                StatusCode::CREATED,
+                Json(json!({
+                    "challenge_id": challenge_id,
+                    "expires_at": format_timestamp(expires_at),
+                })),
+            )
+                .into_response(),
+        ),
+        Ok(None) => error_response(StatusCode::TOO_MANY_REQUESTS, "too_many_challenges"),
+        Err(error) => {
+            tracing::error!(error = %error, "failed to issue grant session challenge");
+            internal_error()
+        }
+    }
+}
+
+/// Stores a fresh challenge for `pubky`, valid for one proof age. `None`
+/// when the pubky already holds [`MAX_LIVE_CHALLENGES`] live ones.
+async fn issue_challenge(
+    state: &AppState,
+    config: &GrantSessionConfig,
+    pubky: &str,
+    now: DateTime<Utc>,
+) -> anyhow::Result<Option<(Uuid, DateTime<Utc>)>> {
+    let mut tx = state.pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 6371))")
+        .bind(pubky)
+        .execute(&mut *tx)
+        .await?;
+    // An expired challenge can never mint again, used or not.
+    sqlx::query("DELETE FROM grant_session_challenges WHERE expires_at <= $1")
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+    let live: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM grant_session_challenges WHERE pubky = $1 AND used_at IS NULL",
+    )
+    .bind(pubky)
+    .fetch_one(&mut *tx)
+    .await?;
+    if live >= MAX_LIVE_CHALLENGES {
+        tx.rollback().await?;
+        return Ok(None);
+    }
+    let challenge_id = Uuid::new_v4();
+    let expires_at = now + Duration::seconds(config.max_proof_age_seconds);
+    sqlx::query(
+        "INSERT INTO grant_session_challenges (challenge_id, pubky, issued_at, expires_at) \
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(challenge_id)
+    .bind(pubky)
+    .bind(now)
+    .bind(expires_at)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Some((challenge_id, expires_at)))
+}
+
+async fn challenge_is_live(
+    state: &AppState,
+    verified: &VerifiedGrantSession,
+    now: DateTime<Utc>,
+) -> sqlx::Result<bool> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM grant_session_challenges \
+         WHERE challenge_id = $1 AND pubky = $2 AND used_at IS NULL AND expires_at > $3)",
+    )
+    .bind(verified.challenge_id)
+    .bind(&verified.pubky)
+    .bind(now)
+    .fetch_one(&state.pool)
+    .await
+}
+
+/// `POST /v1/auth/grant-sessions`.
+pub async fn create_grant_session(State(state): State<AppState>, body: Bytes) -> Response {
+    let (config, request) = match parse_request(&state, &body) {
+        Ok(parsed) => parsed,
+        Err(response) => return *response,
     };
     let now = state.clock.now();
     let verified = match verify_grant_session_proof(&request.grant, &request.pop, &config, now) {
         Ok(verified) => verified,
-        Err(refusal) => {
-            tracing::info!(refusal = ?refusal, "refused grant session proof");
-            let (status, code) = refusal.status_and_code();
-            return error_response(status, code);
-        }
+        Err(refusal) => return refused(refusal),
     };
-
-    match crate::automation::consume_automation_rate(&state, &verified.pubky, RATE_CLASS).await {
-        Ok(None) => {}
-        Ok(Some(retry_after)) => {
-            let mut response = error_response(StatusCode::TOO_MANY_REQUESTS, "retry_later");
-            response.headers_mut().insert(
-                header::RETRY_AFTER,
-                HeaderValue::from_str(&retry_after.to_string())
-                    .expect("retry-after is a safe integer"),
-            );
-            return response;
-        }
+    // Checked before the homeserver read so a replayed or unissued challenge
+    // costs one indexed lookup; the burn below re-checks under the update.
+    match challenge_is_live(&state, &verified, now).await {
+        Ok(true) => {}
+        Ok(false) => return challenge_refused(ChallengeRefusal::Invalid),
         Err(error) => {
-            tracing::error!(error = %error, "grant session rate limit failed");
+            tracing::error!(error = %error, "grant session challenge lookup failed");
             return internal_error();
         }
     }
@@ -384,9 +572,9 @@ pub async fn create_grant_session(State(state): State<AppState>, body: Bytes) ->
         }
     }
 
-    match mint(&state, &config, &verified, now).await {
+    match mint(&state, &verified, now).await {
         Ok(Some(response)) => response,
-        Ok(None) => error_response(StatusCode::UNAUTHORIZED, "grant_session_replayed"),
+        Ok(None) => challenge_refused(ChallengeRefusal::Invalid),
         Err(error) => {
             tracing::error!(error = %error, "failed to mint grant session");
             internal_error()
@@ -394,34 +582,30 @@ pub async fn create_grant_session(State(state): State<AppState>, body: Bytes) ->
     }
 }
 
+fn challenge_refused(refusal: ChallengeRefusal) -> Response {
+    tracing::info!(refusal = ?refusal, "refused grant session challenge");
+    error_response(StatusCode::UNAUTHORIZED, "grant_session_challenge_invalid")
+}
+
 /// Burns the challenge and inserts the session in one transaction. `None`
-/// when the challenge was already used.
+/// when the challenge was used, expired or never issued to this pubky.
 async fn mint(
     state: &AppState,
-    config: &GrantSessionConfig,
     verified: &VerifiedGrantSession,
     now: DateTime<Utc>,
 ) -> anyhow::Result<Option<Response>> {
     let mut tx = state.pool.begin().await?;
-    // A challenge can only be replayed while a proof naming it is young
-    // enough; doubled for margin, as the AuthToken single-use records are.
-    let skew = i64::try_from(DEFAULT_CUSTOM_POP_CLOCK_SKEW.as_secs()).unwrap_or(0);
-    let retention = Duration::seconds(2 * (config.max_proof_age_seconds + skew));
-    sqlx::query("DELETE FROM grant_session_challenges WHERE used_at < $1")
-        .bind(now - retention)
-        .execute(&mut *tx)
-        .await?;
-    let recorded = sqlx::query(
-        "INSERT INTO grant_session_challenges (challenge_id, pubky, grant_id, used_at) \
-         VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+    let burned = sqlx::query(
+        "UPDATE grant_session_challenges SET used_at = $3, grant_id = $4 \
+         WHERE challenge_id = $1 AND pubky = $2 AND used_at IS NULL AND expires_at > $3",
     )
     .bind(verified.challenge_id)
     .bind(&verified.pubky)
-    .bind(&verified.grant_id)
     .bind(now)
+    .bind(&verified.grant_id)
     .execute(&mut *tx)
     .await?;
-    if recorded.rows_affected() == 0 {
+    if burned.rows_affected() == 0 {
         tx.rollback().await?;
         return Ok(None);
     }
@@ -466,6 +650,11 @@ async fn mint(
         )
             .into_response(),
     )))
+}
+
+/// Exposed for tests that build proofs: the exact `data` a challenge request signs.
+pub fn challenge_request_data(audience: &str) -> Value {
+    json!({ "aud": audience, "purpose": CHALLENGE_PURPOSE })
 }
 
 /// Exposed for tests that build proofs: the exact `data` a valid proof signs.
@@ -728,6 +917,50 @@ mod tests {
                 Utc::now()
             ),
             Err(GrantSessionRefusal::CapabilityRequired)
+        );
+    }
+
+    #[test]
+    fn a_challenge_request_signs_only_audience_and_its_own_purpose() {
+        let fixture = Fixture::new(SHOP_CAPS, CLIENT, 3600);
+        let now = Utc::now();
+        let request = fixture.pop(
+            &fixture.client,
+            challenge_request_data(AUDIENCE),
+            now.timestamp(),
+        );
+        let verified = verify_challenge_request(&fixture.grant(), &request, &config(), now)
+            .expect("valid challenge request");
+        assert_eq!(verified.pubky, fixture.root.public_key().z32());
+        assert_eq!(
+            verified.capabilities,
+            "/pub/pubky.app/marketplace-service/v1/:rw,/priv/pubky.app/:rw"
+        );
+        for data in [
+            proof_data(AUDIENCE, Uuid::new_v4()),
+            json!({"aud": "https://other.test", "purpose": CHALLENGE_PURPOSE}),
+            json!({"aud": AUDIENCE, "purpose": CHALLENGE_PURPOSE, "challenge_id": "x"}),
+        ] {
+            let pop = fixture.pop(&fixture.client, data.clone(), now.timestamp());
+            assert_eq!(
+                verify_challenge_request(&fixture.grant(), &pop, &config(), now),
+                Err(GrantSessionRefusal::ProofInvalid),
+                "{data}"
+            );
+        }
+        // A challenge request is not a mint proof either.
+        assert_eq!(
+            verify_grant_session_proof(&fixture.grant(), &request, &config(), now),
+            Err(GrantSessionRefusal::ProofInvalid)
+        );
+        let stale = fixture.pop(
+            &fixture.client,
+            challenge_request_data(AUDIENCE),
+            now.timestamp() - 121,
+        );
+        assert_eq!(
+            verify_challenge_request(&fixture.grant(), &stale, &config(), now),
+            Err(GrantSessionRefusal::ProofInvalid)
         );
     }
 

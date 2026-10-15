@@ -30,19 +30,35 @@ async fn migration_0072_is_rerunnable_and_leaves_existing_sessions_untouched(poo
     assert_eq!((grant_id, client_id), (None, None));
 
     let id = uuid::Uuid::new_v4();
-    let insert = "INSERT INTO grant_session_challenges (challenge_id, pubky, grant_id, used_at) \
-                  VALUES ($1, 'p', 'g', now()) ON CONFLICT DO NOTHING";
-    let first = sqlx::query(insert)
+    sqlx::query(
+        "INSERT INTO grant_session_challenges (challenge_id, pubky, issued_at, expires_at) \
+         VALUES ($1, 'p', now(), now() + INTERVAL '2 minutes')",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .expect("issue a challenge");
+    let burn = "UPDATE grant_session_challenges SET used_at = now(), grant_id = 'g' \
+                WHERE challenge_id = $1 AND used_at IS NULL";
+    let first = sqlx::query(burn)
         .bind(id)
         .execute(&pool)
         .await
         .expect("first use");
-    let second = sqlx::query(insert)
+    let second = sqlx::query(burn)
         .bind(id)
         .execute(&pool)
         .await
         .expect("second use");
     assert_eq!((first.rows_affected(), second.rows_affected()), (1, 0));
+    assert!(sqlx::query(
+        "INSERT INTO grant_session_challenges (challenge_id, pubky, issued_at, expires_at, used_at) \
+         VALUES ($1, 'p', now(), now() + INTERVAL '2 minutes', now())",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .execute(&pool)
+    .await
+    .is_err(), "a burned challenge always records its grant");
 
     let bucket = "INSERT INTO automation_rate_limits \
                   (seller_pubky, endpoint_class, tokens, updated_at) VALUES ($1, $2, 1, now())";
