@@ -1078,6 +1078,7 @@ compare it.
 | `order.cancel_request` | CAS 409 vs order `revision` | `cancellation.rs:51` |
 | `order.cancel_approve` | CAS 409 vs order `revision` | `cancellation.rs:185` |
 | `fulfillment.ship` | CAS 409 vs order `revision` | `fulfillment.rs:34` |
+| `fulfillment.update_tracking` | CAS 409 vs order `revision` | `fulfillment.rs` (`update_tracking`) |
 | `fulfillment.confirm_delivery` | CAS 409 vs order `revision` | `fulfillment.rs:107` |
 | `pickup_details.set` | Envelope ignored; `payload.expected_version` is CAS 409 vs the pickup version counter | `pickup.rs:270` |
 | `pickup_details.clear` | Envelope ignored; `payload.expected_version` is CAS 409 vs the pickup version counter | `pickup.rs:346` |
@@ -1104,7 +1105,8 @@ actor may sync), `drop.sync` (convergent; any actor may sync),
 `offer.checkout`, `offer.reject`, `offer.withdraw`, `auction.place_bid`,
 `auction.close`, `payment.sandbox_advance`, `payment.prepare_locks`,
 `payment.register_locks`, `order.cancel_request`, `order.cancel_approve`,
-`fulfillment.ship`, `fulfillment.confirm_delivery`, `pickup_details.set`,
+`fulfillment.ship`, `fulfillment.update_tracking`,
+`fulfillment.confirm_delivery`, `pickup_details.set`,
 `pickup_details.clear`, `fulfillment.mark_ready`,
 `fulfillment.confirm_pickup` (see Local pickup), `return.request`,
 `return.approve`, `return.receive`, `refund.record_external`,
@@ -1249,10 +1251,15 @@ and refund branches):
   succeeds without double-releasing. A cancelled order refuses every
   subsequent payment, fulfillment, return, and cancellation
   command.
-- **Fulfillment.** `fulfillment.ship` (seller, with carrier and tracking
-  number — both trimmed printable strings, deliberately not enums; the soft
-  carrier vocabulary the reference client writes is documented on
-  `ShipOrderPayload.carrier`) and `fulfillment.confirm_delivery` (buyer) drive
+- **Fulfillment.** `fulfillment.ship` (seller, with a carrier and an optional
+  tracking number — both trimmed printable strings, deliberately not enums;
+  the soft carrier vocabulary the reference client writes is documented on
+  `ShipOrderPayload.carrier`; an absent, null or empty number ships the order
+  without tracking), `fulfillment.update_tracking` (seller; adds or edits the
+  carrier and number while the order is `shipped`, records each change in
+  `shipment.tracking_history` and notifies the buyer; see
+  [docs/api.md](docs/api.md#shipping-and-tracking-commands)) and
+  `fulfillment.confirm_delivery` (buyer) drive
   `paid/processing → shipped → delivered`. There is no separate
   seller-marks-delivered command: the buyer's confirmation is the delivery
   transition, as in the prototype. `delivered → completed` is reached
@@ -1330,7 +1337,8 @@ Every post-purchase command is participant-scoped, enforces
 idempotently by `command_id`, appends one immutable event per accepted
 command, and emits outbox notifications exactly where the prototype did
 (`payment_confirmed`, `order_cancelled` — to the seller on a cancellation
-request, to the buyer on approval — `order_shipped`, `order_delivered`,
+request, to the buyer on approval — `order_shipped`, `tracking_updated`,
+`order_delivered`,
 `return_updated`,
 `refund_recorded`,
 `review_received`). `review.update` emits none — the

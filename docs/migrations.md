@@ -154,6 +154,16 @@ additive. Orders and payments bound to Stripe are not touched.
 binary from before 0059 ignores the new columns and its inserts take their
 defaults, so a rolling replacement is safe.
 
+0071 (update tracking command kind) appends one refusal-audit command kind
+(`update_tracking`, 40) for `fulfillment.update_tracking`. It creates no table
+or column and builds no index; the tracking history rides in the existing
+`orders.shipment` JSON. The catalog is append-only and a test keeps the source
+enum and the table in exact parity. Refused commands are recorded against the
+catalog row, so the migration must run before a binary that can refuse
+`fulfillment.update_tracking`; migrations run at start, so a deployment gets
+both together. The statement is `ON CONFLICT DO NOTHING`, so the file is
+directly rerunnable.
+
 ## Numbers claimed by open pull requests
 
 `main` has 0001 to 0054 and 0056 to 0059; 0055 is #92, so the catalog is
@@ -165,6 +175,7 @@ assume it is free:
 | Number | File | Pull request |
 | --- | --- | --- |
 | 0055 | `0055_user_priv_key_custody_releases.sql` | #92 (`/priv` Phase 4) |
+| 0071 | `0071_update_tracking_command_kind.sql` | optional tracking (`cursor/optional-tracking-85f6`) |
 
 This table describes unmerged work and goes stale as pull requests land; trust
 `crates/service/migrations/` on `main` over it.
