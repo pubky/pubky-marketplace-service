@@ -992,6 +992,58 @@ struct RecordMedia {
 struct RecordVariant {
     #[serde(default)]
     quantity: i64,
+    #[serde(default)]
+    id: Option<Value>,
+    #[serde(default)]
+    enabled: Option<Value>,
+    #[serde(default)]
+    sku: Option<Value>,
+}
+
+impl RecordVariant {
+    fn is_enabled(&self) -> bool {
+        self.enabled.as_ref().and_then(Value::as_bool) == Some(true)
+    }
+
+    fn usable_id(&self) -> Option<&str> {
+        self.id
+            .as_ref()
+            .and_then(Value::as_str)
+            .filter(|id| marketplace_domain::commands::is_valid_entity_id(id))
+    }
+}
+
+/// The record's enabled variants as per-variant stock, in record order.
+/// `None` when two or more variants are enabled but their ids cannot key
+/// separate stock (a missing, malformed or repeated id): such a record
+/// cannot back per-variant inventory and must not silently fall back to one
+/// shared total.
+fn enabled_variant_stock(
+    variants: &[RecordVariant],
+) -> Option<Vec<marketplace_domain::commands::VariantStock>> {
+    let enabled: Vec<&RecordVariant> = variants.iter().filter(|v| v.is_enabled()).collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut stock = Vec::with_capacity(enabled.len());
+    for variant in &enabled {
+        let usable = variant
+            .usable_id()
+            .filter(|id| seen.insert((*id).to_string()));
+        match usable {
+            Some(id) => stock.push(marketplace_domain::commands::VariantStock {
+                id: id.to_string(),
+                sku: variant
+                    .sku
+                    .as_ref()
+                    .and_then(Value::as_str)
+                    .filter(|sku| !sku.is_empty())
+                    .map(str::to_string),
+                quantity: variant.quantity,
+            }),
+            None if enabled.len() >= 2 => return None,
+            None => {}
+        }
+    }
+    Some(stock)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1156,6 +1208,14 @@ pub fn registration_payload_from_record(
     };
     let shipping_minor =
         shipping_minor_from_options(&record.shipping_options, &unit_price.currency);
+    let variants = if sale_format == SaleFormat::FixedPrice {
+        match enabled_variant_stock(&record.variants) {
+            Some(variants) => variants,
+            None => return Ok(None),
+        }
+    } else {
+        Vec::new()
+    };
     let mut fulfillment_methods: Vec<marketplace_domain::commands::FulfillmentMethod> = record
         .fulfillment_methods
         .iter()
@@ -1218,6 +1278,7 @@ pub fn registration_payload_from_record(
         auction_reserve: None,
         fulfillment_methods,
         digital_lock,
+        variants,
     }))
 }
 
