@@ -1,72 +1,63 @@
 # Upstream Paykit prepare request: amount and description
 
-Status: consumer notes for `PAYKIT_SERVER_API=upstream` against paykit-server
-`v0.1.0-rc13` (Bitkit 2.6 RC run, `pubky/pubky-marketplace#123`).
+Status: consumer contract for `PAYKIT_SERVER_API=upstream`. Enable only after
+the target paykit-server supports the signed optional `description` field.
 
 ## What the service sends
 
-`POST {PAYKIT_SERVER_URL}/marketplace/payment-requests/prepare`, signed
-(`x-paykit-signature`), body with exactly these members:
+`POST {PAYKIT_SERVER_URL}/marketplace/payment-requests/prepare`, signed with
+`x-paykit-signature`, has these seven members for new Marketplace attempts:
 
-| Member                   | Value                                                            |
-| ------------------------ | ---------------------------------------------------------------- |
-| `amount_sats`            | The order's bitcoin price in satoshis.                           |
-| `creator`                | The seller's key (`pubky<key>`).                                 |
-| `reader`                 | The buyer's key (`pubky<key>`).                                  |
-| `reference`              | `upstream_attempt_reference(order_id, attempt)`, a UUID v4.      |
-| `operation_id`           | `marketplace-payment:{reference}:{attempt}`.                     |
-| `payment_window_seconds` | The payment window this attempt arms.                            |
+| Member                   | Value                                                               |
+| ------------------------ | ------------------------------------------------------------------- |
+| `amount_sats`            | The order's bitcoin price in satoshis.                              |
+| `creator`                | The seller's key (`pubky<key>`).                                    |
+| `description`            | `Pubky Shop order ` plus the first six uppercase hex order-ID chars.|
+| `operation_id`           | `marketplace-payment:{reference}:{attempt}`.                        |
+| `payment_window_seconds` | The payment window this attempt arms.                               |
+| `reader`                 | The buyer's key (`pubky<key>`).                                     |
+| `reference`              | `upstream_attempt_reference(order_id, attempt)`, a UUID v4.         |
 
-paykit-server rc13 reads the same six members
-(`paykit-server/src/http/marketplace_preparation.rs`, `PrepareBody`) and binds
-exactly those six into the idempotency fingerprint (`request_binding` in
-`application/marketplace_preparation.rs`). It rejects a `reference` that is not
-a canonical lowercase UUID v4, so a human-readable order reference cannot go in
-that member.
+For order `8f3a91b2-1111-4111-8111-111111111111`, every attempt uses
+`Pubky Shop order 8F3A91`. The label comes from the stable order UUID, not the
+attempt reference. It contains no listing title or seller name. Its six-character
+suffix is a display hint, not a unique ID or lookup key.
+
+The complete canonical JSON body, including `description`, is covered by the
+upstream HTTP signature. paykit-server includes a present description in its
+immutable request binding and writes it unchanged to
+`PaymentRequestTerms.metadata["note"]`. Bitkit uses that metadata key for its
+`For:` field. A changed description for an existing `(creator, operation_id)` is
+a conflict; an exact retry replays the original preparation.
+
+The Fork request remains unchanged. It does not receive `description`.
 
 ## The amount is the exact price
 
 Upstream does not add a unique amount. The prepare response carries
-`{ invoice_id, state, total_sats, prepare_expires_at }` and no `nonce_sats`;
-upstream gives each request a fresh derived address, so there is nothing to
-disambiguate by amount. `PaykitClient::create_payment_request` accepts the
-response only when `state == "prepared"` and `total_sats == amount_sats`, so an
-upstream order's `paykit_total_sats` is always the price and the payment code
-the fork mode draws (1–999 sats) is always zero.
+`{ invoice_id, state, total_sats, prepare_expires_at }` and no `nonce_sats`.
+Each request has a fresh derived address, so amount does not disambiguate it.
+`PaykitClient::create_payment_request` accepts the response only when
+`state == "prepared"` and `total_sats == amount_sats`; therefore an upstream
+order's `paykit_total_sats` remains its exact price.
 
-Only fork mode (`PAYKIT_SERVER_API=fork`) mints `nonce_sats` and returns
+Only Fork mode (`PAYKIT_SERVER_API=fork`) mints `nonce_sats` and returns
 `total_sats = amount_sats + nonce_sats`. Shop clients must not describe a
-1–999 sat addition unless the deployment runs the fork API; the Shop's checkout
+1–999 sat addition unless the deployment runs the Fork API; the Shop checkout
 note is shown only for `paykitServerApi=fork`.
 
-## The Bitkit request has no description
+## Rollout and compatibility
 
-In the Bitkit 2.6 RC run the request shows `For: Not specified`. The prepare
-route has no member that becomes the request's description: the payment request
-terms paykit-server builds from a prepare (`PaymentRequestTerms` in
-`paykit-lib`, rev `03d4f05`) are set from the amount, the payee reference, the
-endpoint, the required app id and that endpoint's address, and no `metadata`
-entry. `PaymentRequestTerms` has an application `metadata` map, but the prepare
-route never fills it. An extra member in the body would not reach the terms and
-is not part of the signed binding, so the service cannot supply a description
-today.
+Deploy and verify paykit-server description support before enabling this
+Marketplace build on a target stack. Unsupported servers reject the new closed
+request shape. Marketplace must surface that refusal; it must not retry without
+`description`.
 
-## Proposal for paykit-server
+No migration or backfill is required. Existing prepared attempts keep their
+original terms. New attempts use the label. The attempt reference, operation ID,
+response shape, amount handling, and lifecycle commands are otherwise unchanged.
 
-Add an optional, plain-text `description` to the prepare body:
-
-- Closed, short (for example up to 140 characters, no control characters), so
-  it stays inside the signed canonical binding and the idempotency fingerprint.
-- Carried into the payment request terms' application metadata, where Bitkit
-  can render it as the request's purpose.
-- Absent means the request is built exactly as today, so existing callers keep
-  working.
-
-Marketplace would send a generic label with the order's short reference, such
-as `Pubky Shop order 8F3A91`, and never the listing title, so the Paykit server
-and the buyer's wallet learn no more about the purchase than the buyer already
-knows. The wire change is one optional member; the service change is one line
-in `create_payment_request`, gated on the field being accepted by the
-configured server.
-
-Open question for Bitkit: which application metadata key renders as `For:`.
+Historical captures under `tests/fixtures/paykit-server-67-75` predate provider
+description support and intentionally retain six-field prepare bodies. Current
+consumer tests use a signature-verifying producer double until new provider
+captures are available at a fixed reviewed provider revision.

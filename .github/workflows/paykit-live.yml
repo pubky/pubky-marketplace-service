@@ -33,7 +33,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   # pubky/paykit-server commit carrying marketplace_live_harness.
-  PAYKIT_SERVER_REF: c7fe8efdac75dd9edb9685e14a17283322cbeb8e
+  PAYKIT_SERVER_REF: 5a7c195a3999d1bbd0933561c907266ac7be62aa
   # tests/common TEST_PAYKIT_SIGNING_SEED: the key the harness trusts.
   PAYKIT_HARNESS_TRUSTED_SEED: '6666666666666666666666666666666666666666666666666666666666666666'
 
