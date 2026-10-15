@@ -239,8 +239,8 @@ pub async fn listings_a_command_sells(
     }
 }
 
-/// The `(seller_pubky, listing_id)` of every listing on an order that is
-/// about to have a payment method bound, for the buyer's own order only.
+/// Every listing on an order that is about to have a payment method bound,
+/// for the buyer's own order only.
 /// Empty when the order is not the buyer's, is no longer awaiting a payment
 /// method, or already has one (a re-bind of the bound method sells nothing
 /// new), so the existing bind answers those cases itself.
@@ -248,9 +248,9 @@ pub async fn listings_a_bind_sells(
     pool: &PgPool,
     order_id: Uuid,
     buyer_pubky: &str,
-) -> Result<Vec<(String, String)>, sqlx::Error> {
+) -> Result<Vec<SoldListing>, sqlx::Error> {
     sqlx::query_as(
-        "SELECT DISTINCT l.seller_pubky, l.listing_id \
+        "SELECT DISTINCT l.seller_pubky, l.listing_id, l.deleted_at IS NULL AS live \
          FROM orders o \
          CROSS JOIN LATERAL jsonb_array_elements(o.lines) AS line \
          JOIN listings l ON l.aggregate_id = line ->> 'listing_aggregate_id' \
