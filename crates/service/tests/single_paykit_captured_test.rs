@@ -97,15 +97,18 @@ async fn prepare(
 
 use AcceptedAsset::{Btc, Usdt};
 
+/// A captured prepare body, the request it answers and the offer it records.
+type PrepareCase = (
+    &'static str,
+    PaymentAsset,
+    u64,
+    Option<Vec<AcceptedAsset>>,
+    OfferedAssets,
+);
+
 #[tokio::test]
 async fn every_captured_usd_and_bitcoin_prepare_records_the_offer_it_made() {
-    let cases: [(
-        &str,
-        PaymentAsset,
-        u64,
-        Option<Vec<AcceptedAsset>>,
-        OfferedAssets,
-    ); 10] = [
+    let cases: [PrepareCase; 10] = [
         (
             "prepare-usd-derived-btc-usdt",
             PaymentAsset::Usd,
