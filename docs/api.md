@@ -646,10 +646,14 @@ Semantics:
   [cannot convert to per-variant stock yet](#per-variant-stock), recomputes a
   total that counted a disabled variant's stock, and converts a listing that
   has become convertible.
-- A result carries `"variant_conversion": { "state": "deferred", "reason":
-  "open_holds" | "unattributable_sales", "attempts": 2 }` while its listing is
-  still blocked from converting to per-variant stock; the key is absent
-  otherwise.
+- A result carries `"variant_conversion": { "state": "deferred" | "blocked",
+  "reason": "open_holds" | "unattributable_sales" | "adjusted_total" |
+  "below_committed", "attempts": 2 }` while its listing cannot convert to
+  per-variant stock; the key is absent otherwise. A single `listing.sync`
+  carries the same object in its `result`. The sync itself succeeded (the
+  listing matches its record); `state` is the outcome of the conversion:
+  `deferred` waits for time or the next sync, `blocked` (`below_committed`)
+  needs the seller to republish the record.
 - Failure modes per item: `NOT_FOUND` (record missing, or listing tombstoned
   once the seller's event stream confirms deletion); `UPSTREAM_UNAVAILABLE`
   (503; homeserver unreachable, retry later); `INVALID_STATE` (record cannot be
@@ -829,10 +833,20 @@ record order, omitted from the canonical JSON when empty:
   converted to per-variant rows by the next sync whose record lists two or more
   enabled variants, at the same or a newer revision, when its units sold can be
   attributed exactly to the record's variants by the variant on each paid
-  order line and none are reserved. Otherwise it keeps its shared total and the
-  next sync tries again. While it waits it is marked in
-  `listing_variant_conversion_blocks` with the reason, `open_holds` or
-  `unattributable_sales`, a `warn` is logged once (target
+  order line and none are reserved. At a record revision the listing already
+  holds, the listing's own total is the truth: it converts only while that total
+  is still what the record says (the sum of the enabled variants, or of all
+  variants for a listing registered before disabled stock was left out), so a
+  seller's `inventory.adjust` since the deferral can never be undone or
+  invented; a newer record revision is an edit and is the authority, as for
+  any listing. Otherwise it keeps its shared total and the next sync tries
+  again. While it waits it is marked in `listing_variant_conversion_blocks`
+  with the reason: `open_holds` (units reserved), `unattributable_sales`,
+  `adjusted_total` (the record is unchanged but the seller moved the total; it
+  converts when the total matches the record again or the record is edited) or
+  `below_committed` (the record gives a size fewer units than its sales; the
+  seller republishes). The marker is cleared only by a conversion or when the
+  record stops listing several variants. A `warn` is logged once (target
   `variant_conversion`, fields `aggregate_id`, `reason`, `enabled_variants`,
   `reserved_quantity`, `sold_quantity`, `attempts`) and again if the reason
   changes, and `sync-many` reports `variant_conversion` for it (see

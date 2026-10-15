@@ -215,8 +215,9 @@ the connectors'): it depends only on `listings` and `reservations`. See [per-var
   holds. `NULL` is the implicit row, which is every reservation that exists.
 - `listing_variant_conversion_blocks` (new table, one row per listing): the
   operator-visible marker of a listing whose record lists two or more enabled
-  variants but that cannot convert yet. `reason` is `open_holds` or
-  `unattributable_sales`; `attempts`, `first_blocked_at` and `last_attempt_at`
+  variants but that cannot convert yet. `reason` is `open_holds`,
+  `unattributable_sales`, `adjusted_total` or `below_committed` (see
+  [api.md](api.md#per-variant-stock)); `attempts`, `first_blocked_at` and `last_attempt_at`
   show how long and how often. A sync upserts it while the listing is blocked
   and deletes it when the listing converts or its record stops listing several
   variants. `scripts/variant-conversion-sweep.sh` (read-only, like
@@ -269,6 +270,7 @@ with no disabled variant are untouched. `sync-many` over the live listings
 applies it at once.
 
 `crates/service/tests/migration_0070_test.rs` (serial: it replays 0032 on a
-scratch database) pins the backfill on a database migrated through 0069, the
+scratch database) pins the backfill on a database migrated through 0061 (the last migration
+before 0070 in this tree; 0062 to 0069 are the connectors' and are not here), the
 rerun, each trigger, the old-binary write, and the table's checks.
 
