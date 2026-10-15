@@ -2240,3 +2240,191 @@ async fn an_order_without_usdt_terms_is_unaffected_by_the_conversion_columns(poo
     assert_eq!(refund.amount_minor, half);
     assert_eq!(refund.basis, None);
 }
+
+// === One mirror at a time per store order ====================================
+
+fn refunded_at_the_store(s: &Scenario) -> i64 {
+    s.store.remote_orders()[0].refunded_minor
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn two_workers_and_two_refund_mirrors_of_one_order_make_one_store_refund(pool: PgPool) {
+    let s = scenario(pool).await;
+    s.pass().await;
+    assert_eq!(s.push().await.0, "created");
+    // Two records of the same 5,000 refund (a refund recorded again), and a
+    // cancel that is not due yet.
+    queue_refund(&s, "refund-a", 5_000).await;
+    queue_refund(&s, "refund-b", 5_000).await;
+    Mirror::Cancel.queue(&s).await;
+    sqlx::query(
+        "UPDATE connector_order_actions SET next_attempt_at = next_attempt_at + interval '1 hour' \
+         WHERE kind = 'cancel'",
+    )
+    .execute(&s.app.pool)
+    .await
+    .expect("delay the cancel");
+
+    // Worker A takes a refund mirror and the store is slow to answer.
+    let gate = s.store.open_refund_gate();
+    let worker_a = {
+        let state = s.app.state.clone();
+        tokio::spawn(async move { worker::drive_actions(&state, 1).await.expect("worker A") })
+    };
+    gate.entered.notified().await;
+    assert_eq!(
+        s.store.refund_calls.load(Ordering::SeqCst),
+        1,
+        "A is inside the store's refund call, which has not recorded anything yet"
+    );
+    assert_eq!(refunded_at_the_store(&s), 0);
+    sqlx::query(
+        "UPDATE connector_order_actions SET next_attempt_at = next_attempt_at - interval '2 hours' \
+         WHERE kind = 'cancel'",
+    )
+    .execute(&s.app.pool)
+    .await
+    .expect("the cancel is due");
+
+    // Worker B, another replica, finds the order busy: the other refund
+    // mirror and the cancel both wait, so B neither reads the store's total
+    // nor writes.
+    let mut worker_b = {
+        let state = s.app.state.clone();
+        tokio::spawn(async move { worker::drive_actions(&state, 5).await.expect("worker B") })
+    };
+    let b_result = tokio::time::timeout(Duration::from_millis(1_500), &mut worker_b).await;
+    // Let every store call finish, whether or not the code under test let B in.
+    gate.release.notify_one();
+    gate.release.notify_one();
+    *s.store.refund_gate.lock().expect("gate") = None;
+    assert_eq!(
+        b_result
+            .expect("worker B does not wait inside a store call for an order that is busy")
+            .expect("worker B task"),
+        0,
+        "nothing of a busy order is claimed"
+    );
+    assert_eq!(worker_a.await.expect("worker A task"), 1);
+    assert_eq!(s.store.refund_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(s.store.cancel_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(refunded_at_the_store(&s), 5_000);
+
+    // With A finished, B takes the rest: the second record finds the store
+    // already shows 5,000 and records nothing; the cancel runs.
+    assert_eq!(
+        worker::drive_actions(&s.app.state, 5)
+            .await
+            .expect("worker B"),
+        2
+    );
+    assert_eq!(
+        s.store.refund_amounts.lock().expect("amounts").clone(),
+        vec![5_000],
+        "exactly one store refund, of the right amount"
+    );
+    assert_eq!(refunded_at_the_store(&s), 5_000);
+    assert_eq!(s.store.cancel_calls.load(Ordering::SeqCst), 1);
+    assert!(actions(&s)
+        .await
+        .iter()
+        .all(|(_, state, _)| state == "done"));
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_worker_that_died_mid_call_leaves_the_order_busy_until_its_lease_lapses(pool: PgPool) {
+    let s = scenario(pool).await;
+    s.pass().await;
+    queue_refund(&s, "refund-a", 5_000).await;
+    queue_refund(&s, "refund-b", 5_000).await;
+
+    // A worker claims a mirror, its refund reaches the store, and the worker
+    // dies before it hears back.
+    let _lost = ledger::claim_next_action(
+        &s.app.pool,
+        s.app.clock.now(),
+        Duration::from_secs(60),
+        &["shopify".to_string()],
+    )
+    .await
+    .expect("claim")
+    .expect("a due mirror");
+    s.store.refund_in_store("ext-1", 5_000);
+
+    assert_eq!(
+        worker::drive_actions(&s.app.state, 5).await.expect("drive"),
+        0,
+        "while the lease holds, the order's other mirror waits"
+    );
+
+    // The lease lapses. The next claimant re-reads what the store shows, so
+    // neither mirror writes the 5,000 again.
+    s.after(61);
+    assert_eq!(
+        worker::drive_actions(&s.app.state, 5).await.expect("drive"),
+        2
+    );
+    assert_eq!(s.store.refund_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(refunded_at_the_store(&s), 5_000);
+    assert!(actions(&s)
+        .await
+        .iter()
+        .all(|(_, state, _)| state == "done"));
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn mirrors_of_one_order_in_different_stores_run_side_by_side(pool: PgPool) {
+    let s = scenario(pool).await;
+    s.pass().await;
+    queue_refund(&s, "refund-a", 5_000).await;
+    // The same order also pushed to a second store, with its own created push.
+    let woo = connect_woo_shop(&s.app, &s.seller, "woo.test-store.example").await;
+    let order_id: Uuid = s.order.order_id.parse().expect("order id");
+    sqlx::query(
+        "INSERT INTO connector_order_push \
+         (id, connection_id, seller_pubky, pubky_order_id, provider, state, external_id, \
+          attempts, next_attempt_at, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, 'woocommerce', 'created', 'woo-1', 1, now(), now(), now())",
+    )
+    .bind(Uuid::new_v4())
+    .bind(woo)
+    .bind(&s.seller.pubky)
+    .bind(order_id)
+    .execute(&s.app.pool)
+    .await
+    .expect("a push to the second store");
+    let mut tx = s.app.pool.begin().await.expect("tx");
+    ledger::on_refund_recorded(
+        &mut tx,
+        s.app.clock.now(),
+        order_id,
+        "refund-a",
+        &refund_payload(&s, 5_000),
+        Uuid::new_v4(),
+    )
+    .await
+    .expect("queue the refund");
+    tx.commit().await.expect("commit");
+    assert_eq!(actions(&s).await.len(), 2, "one mirror per store");
+
+    let providers = ["shopify".to_string(), "woocommerce".to_string()];
+    let first = ledger::claim_next_action(
+        &s.app.pool,
+        s.app.clock.now(),
+        Duration::from_secs(60),
+        &providers,
+    )
+    .await
+    .expect("claim")
+    .expect("a mirror");
+    let second = ledger::claim_next_action(
+        &s.app.pool,
+        s.app.clock.now(),
+        Duration::from_secs(60),
+        &providers,
+    )
+    .await
+    .expect("claim")
+    .expect("the other store's mirror, not held up by the first");
+    assert_ne!(first.1.connection_id, second.1.connection_id);
+}

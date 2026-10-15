@@ -40,6 +40,8 @@
 //!   once with its own amount. When a reversal is cancelled (`on_refund_reversed`)
 //!   mirrors of earlier refunds that have not been sent are dropped, and ones
 //!   that were sent raise a seller alert: no provider can retract a refund.
+//! * Mirror actions of one store order run one at a time across worker
+//!   replicas (`claim_next_action`: one in-flight action per push, by lease).
 //! * Statements that change several actions at once lock them in id order
 //!   (`LOCK_ACTIONS`), and the handlers lock a push's siblings in id order,
 //!   so concurrent retry, quarantine and reversal never deadlock.
@@ -670,22 +672,28 @@ pub struct ActionRow {
 const ACTION_COLUMNS: &str = "id, push_id, kind, action_key, state, payload, attempts, \
      next_attempt_at, lease_until, last_error, quarantine_reason, created_at, updated_at";
 
-/// How many due candidates one claim looks through before it gives up.
-const ACTION_CANDIDATES: i64 = 20;
-
-/// The next due action whose push has created the store order.
+/// The next due action whose push has created the store order, and only when
+/// no other action of that push is in flight.
 ///
-/// Actions of one push run one at a time, in due order. A cancel and a refund,
-/// or two refunds, can be due together, and a provider that mirrors a refund as
-/// "the recorded total minus what the store already shows refunded" must not
-/// read that figure while another action of the same push is still being
-/// applied. So the claim takes the push row `FOR NO KEY UPDATE ... SKIP LOCKED`
-/// (a second worker looking at the same push in the same instant moves on
-/// instead of waiting, so workers never deadlock on each other) and then
-/// claims the action only if no other action of the push holds a live lease.
-/// The check runs as its own statement after the lock is held, so it sees what
-/// the previous holder of the lock committed. An expired lease does not block:
-/// that worker is presumed dead and its action is retried by whoever claims it.
+/// Mirrors of one store order run one at a time, across every worker replica:
+/// a refund mirror reads the store's refunded total, then writes the
+/// difference, and two of them interleaved would both read the same total and
+/// both write. "In flight" is the existing lease: a sibling `sending` with an
+/// unexpired `lease_until`. A sibling whose lease has lapsed (its worker
+/// died, or its call ran past the lease) does not block, and whoever claims
+/// next re-reads the store's total before it writes, so the difference rule
+/// stays idempotent across a crash mid-call.
+///
+/// The claim is one short transaction. It row-locks the action and its push
+/// (`FOR NO KEY UPDATE ... SKIP LOCKED`, so a claimant never waits, and two
+/// claimants of one push exclude each other), then checks for an in-flight
+/// sibling in a **new statement**, whose snapshot sees every claim committed
+/// before the lock was won. Checking in the locking statement itself would use
+/// the statement's older snapshot and could miss a claim that committed in
+/// between. A push found busy is set aside for this call and the next due
+/// action of another push is tried. The push lock is released at commit, so
+/// event handlers and retries that lock the push are held up only for the
+/// claim, not for the provider call.
 pub async fn claim_next_action(
     pool: &PgPool,
     now: DateTime<Utc>,
@@ -693,62 +701,61 @@ pub async fn claim_next_action(
     providers: &[String],
 ) -> Result<Option<(ActionRow, PushRow)>, sqlx::Error> {
     let lease_until = now + chrono::Duration::from_std(lease).unwrap_or(chrono::Duration::hours(1));
-    let mut tx = pool.begin().await?;
-    let candidates: Vec<(Uuid, Uuid)> = sqlx::query_as(
-        "SELECT a.id, a.push_id FROM connector_order_actions a \
-         JOIN connector_order_push p ON p.id = a.push_id \
-         WHERE p.state = 'created' AND p.provider = ANY($2) \
-           AND ((a.state = 'pending' AND a.next_attempt_at <= $1) \
-                OR (a.state = 'sending' AND a.lease_until <= $1)) \
-         ORDER BY a.next_attempt_at, a.id LIMIT $3",
-    )
-    .bind(now)
-    .bind(providers)
-    .bind(ACTION_CANDIDATES)
-    .fetch_all(&mut *tx)
-    .await?;
-    for (action_id, push_id) in candidates {
-        let locked: Option<Uuid> = sqlx::query_scalar(
-            "SELECT id FROM connector_order_push WHERE id = $1 AND state = 'created' \
-             FOR NO KEY UPDATE SKIP LOCKED",
-        )
-        .bind(push_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if locked.is_none() {
-            continue;
-        }
-        let action: Option<ActionRow> = sqlx::query_as(&format!(
-            "UPDATE connector_order_actions a SET state = 'sending', attempts = a.attempts + 1, \
-                 lease_until = $2, updated_at = $1 \
-             WHERE a.id = $3 \
+    let mut busy: Vec<Uuid> = Vec::new();
+    loop {
+        let mut tx = pool.begin().await?;
+        let candidate: Option<(Uuid, Uuid)> = sqlx::query_as(
+            "SELECT a.id, a.push_id FROM connector_order_actions a \
+             JOIN connector_order_push p ON p.id = a.push_id \
+             WHERE p.state = 'created' AND p.provider = ANY($2) AND p.id <> ALL($3) \
                AND ((a.state = 'pending' AND a.next_attempt_at <= $1) \
                     OR (a.state = 'sending' AND a.lease_until <= $1)) \
-               AND NOT EXISTS (SELECT 1 FROM connector_order_actions o \
-                               WHERE o.push_id = a.push_id AND o.id <> a.id \
-                                 AND o.state = 'sending' AND o.lease_until > $1) \
-             RETURNING {}",
-            prefixed(ACTION_COLUMNS, "a")
-        ))
+             ORDER BY a.next_attempt_at, a.id \
+             FOR NO KEY UPDATE OF a, p SKIP LOCKED LIMIT 1",
+        )
         .bind(now)
-        .bind(lease_until)
-        .bind(action_id)
+        .bind(providers)
+        .bind(&busy)
         .fetch_optional(&mut *tx)
         .await?;
-        let Some(action) = action else {
-            continue;
+        let Some((action_id, push_id)) = candidate else {
+            tx.commit().await?;
+            return Ok(None);
         };
+        let in_flight: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM connector_order_actions o \
+             WHERE o.push_id = $1 AND o.id <> $2 AND o.state = 'sending' AND o.lease_until > $3)",
+        )
+        .bind(push_id)
+        .bind(action_id)
+        .bind(now)
+        .fetch_one(&mut *tx)
+        .await?;
+        if in_flight {
+            tx.rollback().await?;
+            busy.push(push_id);
+            continue;
+        }
+        let action: ActionRow = sqlx::query_as(&format!(
+            "UPDATE connector_order_actions a SET state = 'sending', attempts = a.attempts + 1, \
+                 lease_until = $2, updated_at = $3 \
+             WHERE a.id = $1 RETURNING {}",
+            prefixed(ACTION_COLUMNS, "a")
+        ))
+        .bind(action_id)
+        .bind(lease_until)
+        .bind(now)
+        .fetch_one(&mut *tx)
+        .await?;
         let push: PushRow = sqlx::query_as(&format!(
             "SELECT {PUSH_COLUMNS} FROM connector_order_push WHERE id = $1"
         ))
-        .bind(action.push_id)
+        .bind(push_id)
         .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;
         return Ok(Some((action, push)));
     }
-    tx.commit().await?;
-    Ok(None)
 }
 
 pub async fn mark_action_done(
