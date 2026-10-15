@@ -144,9 +144,11 @@ and write. "Automation" means the inventory capability plus the
 | POST | `/v1/connectors/alerts/{id}/resolve` |
 | DELETE | `/v1/connectors/{id}` |
 | GET | `/v1/connectors/{id}/catalog` |
+| GET | `/v1/connectors/{id}/check` |
 | PUT | `/v1/connectors/{id}/credentials` |
 | GET, PUT | `/v1/connectors/{id}/mappings` |
 | GET, PUT | `/v1/connectors/{id}/selection` |
+| PUT | `/v1/connectors/{id}/settings` |
 | GET | `/v1/connectors/{id}/pushes` |
 | POST | `/v1/connectors/{id}/pushes/{order}/retry` |
 
@@ -969,6 +971,90 @@ secret only. After a disconnect or an uninstall the secret is kept for up to
 30 days (or until `shop/redact` is handled) so Shopify's privacy webhooks can
 still be verified, and deleted at once for a draft that never installed. No
 Shopify values live in the environment.
+
+### Shopify
+
+The provider speaks the GraphQL Admin API, version `2026-10`
+(`crates/service/src/connectors/providers/shopify/`). Every query and mutation
+is a `.graphql` file there; `tests/shopify_graphql_test.rs` validates each one
+against Shopify's published schema.
+
+**What the merchant configures** in their own app (Dev Dashboard, custom app):
+
+- App URL: the connection's launch URL,
+  `{CONNECTOR_PUBLIC_BASE_URL}/v1/connectors/shopify/c/{connection_id}/launch`.
+- Allowed redirection URL: the connection's OAuth callback URL.
+- Access scopes: `read_products`, `read_inventory`, `read_locations`,
+  `read_fulfillments`, `write_orders`. A grant missing any puts the connection in
+  `needs_attention` and `missing_scopes` names them.
+- **Privacy webhooks.** `customers/data_request`, `customers/redact` and
+  `shop/redact` are not in the Admin API's `WebhookSubscriptionTopic` enum, so the
+  service cannot subscribe them. They are set in the app's configuration, with the
+  connection's webhooks URL as the address, for example in `shopify.app.toml`:
+
+  ```toml
+  [[webhooks.subscriptions]]
+  compliance_topics = ["customers/data_request", "customers/redact", "shop/redact"]
+  uri = "https://service.example/v1/connectors/shopify/c/{connection_id}/webhooks"
+  ```
+
+  They are signed with the same app secret and are acknowledged (the service
+  keeps no store customer data); `shop/redact` ends the 30-day secret retention.
+  The merchant guide must say this, because nothing else configures them. The
+  five operational topics need no merchant step.
+
+**What the service does.** After a verified launch it redirects to Shopify's
+authorize page; after a verified callback it exchanges the code for an offline
+access token (sealed per connection) and then subscribes `inventory_levels/update`,
+`fulfillments/create`, `orders/cancelled`, `refunds/create` and `app/uninstalled`
+to the connection's webhooks URL through `webhookSubscriptionCreate`. A repeat
+install subscribes nothing twice and removes stale subscriptions this service made
+for another address. Webhooks are verified with the base64 HMAC-SHA256 of the raw
+body under the connection's app secret (`X-Shopify-Hmac-Sha256`), and deduplicated
+on `X-Shopify-Event-Id`.
+
+- **Catalog.** Active products, a few per page, with every variant (more than 25
+  variants are read through the product's variant connection). A variant's stock
+  is its total across locations; an untracked variant has none. A product with
+  only Shopify's `Default Title` option has no options.
+- **Orders.** `orderCreate` with the mapped variant ids, financial status `PAID`,
+  one manual `SALE` transaction named `Pubky <rail>`, tags `pubky` and
+  `pubky-order-{id}`, the `pubky_order_id` attribute, inventory decremented
+  ignoring the store's oversell policy, no receipt and no customer. A shipping
+  address is attached only when the buyer opted in. The order currency must be the
+  store's currency and lines plus shipping must equal the total, else the push is
+  refused (`currency_mismatch`, `total_mismatch`). `orderCreate` has no
+  idempotency key, so after an unknown outcome the order is looked up by its tag
+  (search, then the most recent orders, since search lags a create) before any
+  second push.
+- **Cancel and refund.** A Pubky cancel is `orderCancel` with `restock: true`, no
+  refund and no customer email; a store order already cancelled is left alone. A
+  Pubky refund is `refundCreate` with a manual `REFUND` transaction against the
+  order's sale, under an `@idempotent` key derived from the Pubky refund id. A
+  partial refund that is not in the order currency (sats, USDT) cannot be stated
+  in the store's books and is refused (`refund_amount_unconvertible`).
+- **Rate limits.** The cost-based throttle is tracked per shop; a throttled or
+  429 answer is retried a couple of times inside the call, then handed to the
+  worker's own backoff. A throttled call applied nothing, so even a mutation is
+  safe to retry.
+- **What the store reports back.** A store-side cancel or refund raises a seller
+  alert and never an automatic Pubky cancel or refund. The alert's `action` (see
+  the alert JSON) names the existing Pubky command to run when one applies:
+  `order.cancel_approve` once the buyer has asked to cancel,
+  `refund.record_external` for a cancelled, returned or digital order with no
+  refund recorded; otherwise it is `null`. Cancels and refunds Pubky itself
+  mirrored to the store come back as webhooks and raise no alert.
+- **Variants.** `PUT /v1/connectors/{id}/settings` with
+  `{"variant_mode": "native" | "split"}` (default `native`). In `native` mode
+  several store variants may map to one Pubky listing's variants; their stock is
+  applied per variant through the service's per-variant inventory, and skipped
+  (`multi_variant_listing`) until that exists. In `split` mode every store variant
+  maps to its own Pubky listing (one mapping per listing, otherwise
+  `422 split_mode_listing_shared`) and stock syncs at listing level. Switching to
+  `split` while a listing is mapped to several variants answers
+  `409 mappings_conflict`.
+- `GET /v1/connectors/{id}/check` reads the store live: its name, the scopes the
+  token holds, the number of active locations and whether a catalog read works.
 
 Environment names: `CONNECTORS_ENABLED`, `CONNECTOR_PUBLIC_BASE_URL`,
 `CONNECTOR_RETURN_URL`, `CONNECTOR_CREDENTIAL_ENCRYPTION_KEY`,

@@ -139,9 +139,9 @@ additive. Orders and payments bound to Stripe are not touched.
 binary from before 0059 ignores the new columns and its inserts take their
 defaults, so a rolling replacement is safe.
 
-## Store connectors (0062 to 0064)
+## Store connectors (0062 to 0065)
 
-The connector framework uses 0062 to 0064 of the 0062 to 0069 range reserved
+The connector framework uses 0062 to 0065 of the 0062 to 0069 range reserved
 for connectors. None depends on 0060 or 0061, so they apply cleanly whether
 or not those have landed. All three are additive and rerunnable.
 
@@ -170,6 +170,11 @@ or not those have landed. All three are additive and rerunnable.
   sets `lock_timeout` like 0053. A binary from before 0064 ignores the columns.
   The envelope is deleted when the store order exists or when the order
   reaches a final state; the consent columns stay.
+
+- 0065 adds `connector_connections.variant_mode` (`native` or `split`, default
+  `native`, a CHECK on the two values). A constant default needs no table rewrite;
+  it sets `lock_timeout` like 0053. A binary from before 0065 ignores the column
+  and treats every connection as `native`, which is what every existing row holds.
 
 Roll forward rather than back once a connection exists: a binary that predates
 0062 does not know the tables, but nothing in it reads them.
