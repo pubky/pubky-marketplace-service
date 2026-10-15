@@ -14,7 +14,7 @@ use axum::http::StatusCode;
 use common::paykit_server_u4 as u4;
 use common::*;
 use marketplace_service::config::Config;
-use marketplace_service::payment_attempt::MarketplaceAssets;
+use marketplace_service::payment_attempt::{MarketplaceAssets, MarketplaceContract};
 use marketplace_service::payments::{
     PaykitApi, PaykitClient, PaykitRequestError, SetupAsset, SetupStatus,
 };
@@ -29,6 +29,7 @@ fn usdt_config() -> Config {
     let mut config = usdt_config_btc_only();
     config.paykit_marketplace_assets =
         MarketplaceAssets::parse(Some("BTC,USDT"), PaykitApi::Upstream).expect("assets parse");
+    config.paykit_marketplace_contract = MarketplaceContract::MultiAsset;
     config
 }
 

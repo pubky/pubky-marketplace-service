@@ -59,9 +59,10 @@ use crate::handlers::{fetch_order_for_update, insert_notification_intent, LISTIN
 use crate::homeserver::HomeserverListingClient;
 use crate::locks::{LocksLookupOutcome, LocksRuntime, LocksTaskStatus};
 use crate::model::{ListingRow, PaymentRow};
+use crate::payment_attempt::{AcceptedAsset, OfferedAssets, PaymentAsset, PaymentTerms};
 use crate::payments::{
-    PaykitClient, PaykitCommandError, PaykitLifecycleTarget, PaykitStatusOutcome,
-    PaykitStatusSource,
+    ActivationTerms, PaykitClient, PaykitCommandError, PaykitLifecycleTarget, PaykitStatusOutcome,
+    PaykitStatusSource, PaykitUsdtObservation,
 };
 use crate::queries::PAYMENT_COLUMNS;
 use crate::{expiry, fx, AppState};
@@ -824,6 +825,15 @@ pub async fn drain_outbox(
 // Two-phase paykit activation (§B.11.2, §B.11.8)
 // ---------------------------------------------------------------------------
 
+/// What an activation must echo, from the order's persisted request terms.
+#[derive(Debug)]
+enum Activation {
+    /// The legacy `amount_sats` request: its satoshi total.
+    Legacy(u64),
+    /// The multi-asset request: its denomination, amount and offer.
+    Assets(ActivationTerms),
+}
+
 /// The parsed `paykit.activate` payload (written in the bind transaction).
 struct ActivatePayload {
     invoice_id: Uuid,
@@ -977,7 +987,7 @@ async fn deliver_paykit_activation(
     let payload = parse_activate_payload(row)?;
     // Read the order's persisted pin under its row lock; count this try by
     // incrementing the attempt in the payload before the call.
-    let (target, total_sats, attempt) = {
+    let (target, activation, attempt) = {
         let mut tx = pool.begin().await?;
         lock_order_payment(&mut tx, payload.order_id).await?;
         let Some(order) = fetch_order_for_update(&mut tx, payload.order_id).await? else {
@@ -1146,39 +1156,83 @@ async fn deliver_paykit_activation(
                 other
             ),
         };
-        let total_sats = order.paykit_total_sats;
-        tx.commit().await?;
-        let Some(total_sats) = total_sats else {
-            anyhow::bail!(
-                "preparing order {} is missing paykit_total_sats",
-                payload.order_id
-            );
-        };
-        (target, total_sats, attempt)
-    };
-    let total_sats = u64::try_from(total_sats)
-        .map_err(|_| anyhow::anyhow!("order {} paykit_total_sats is negative", payload.order_id))?;
-    match paykit
-        .activate_payment_request(
-            &target,
-            payload.invoice_id,
-            total_sats,
-            u64::try_from(attempt).unwrap_or(0),
-        )
-        .await
-    {
-        Ok(activated) => {
-            if activated.total_sats != total_sats {
-                tracing::error!(
-                    order_id = %payload.order_id,
-                    persisted_total_sats = total_sats,
-                    activated_total_sats = activated.total_sats,
-                    "ALERT paykit activate acknowledged a different total than persisted; \
-                     voiding the bind"
-                );
-                void_prepare_effects(pool, row.id, payload.order_id, now).await?;
-                return Ok(true);
+        // A multi-asset request activates by its denomination and amount;
+        // every other request by its satoshi total.
+        let activation = match (
+            order.paykit_amount_minor,
+            order
+                .paykit_asset
+                .as_deref()
+                .and_then(PaymentAsset::from_column),
+            order
+                .paykit_payment_amounts
+                .as_ref()
+                .and_then(OfferedAssets::from_json),
+        ) {
+            (Some(amount_minor), Some(denomination), Some(offered)) => {
+                Activation::Assets(ActivationTerms {
+                    denomination,
+                    amount_minor: u64::try_from(amount_minor).map_err(|_| {
+                        anyhow::anyhow!(
+                            "order {} paykit_amount_minor is negative",
+                            payload.order_id
+                        )
+                    })?,
+                    offered,
+                })
             }
+            (None, _, _) => {
+                let Some(total_sats) = order.paykit_total_sats else {
+                    anyhow::bail!(
+                        "preparing order {} is missing paykit_total_sats",
+                        payload.order_id
+                    );
+                };
+                Activation::Legacy(u64::try_from(total_sats).map_err(|_| {
+                    anyhow::anyhow!("order {} paykit_total_sats is negative", payload.order_id)
+                })?)
+            }
+            _ => anyhow::bail!(
+                "preparing order {} carries incomplete multi-asset request terms",
+                payload.order_id
+            ),
+        };
+        tx.commit().await?;
+        (target, activation, attempt)
+    };
+    let acknowledged = match &activation {
+        Activation::Legacy(total_sats) => {
+            match paykit
+                .activate_payment_request(
+                    &target,
+                    payload.invoice_id,
+                    *total_sats,
+                    u64::try_from(attempt).unwrap_or(0),
+                )
+                .await
+            {
+                Ok(activated) if activated.total_sats != *total_sats => {
+                    tracing::error!(
+                        order_id = %payload.order_id,
+                        persisted_total_sats = *total_sats,
+                        activated_total_sats = activated.total_sats,
+                        "ALERT paykit activate acknowledged a different total than persisted; \
+                         voiding the bind"
+                    );
+                    void_prepare_effects(pool, row.id, payload.order_id, now).await?;
+                    return Ok(true);
+                }
+                Ok(activated) => Ok((activated.activated_at, activated.payment_deadline)),
+                Err(error) => Err(error),
+            }
+        }
+        Activation::Assets(terms) => paykit
+            .activate_marketplace_request(&target, payload.invoice_id, terms)
+            .await
+            .map(|activated| (activated.activated_at, activated.payment_deadline)),
+    };
+    match acknowledged {
+        Ok((activated_at, payment_deadline)) => {
             let mut tx = pool.begin().await?;
             lock_order_payment(&mut tx, payload.order_id).await?;
             let bounds: Option<ActivationBounds> = sqlx::query_as(
@@ -1194,18 +1248,18 @@ async fn deliver_paykit_activation(
             if bounds.paykit_api.as_deref() == Some("upstream")
                 && (bounds
                     .hold_expires_at
-                    .is_none_or(|hold| activated.payment_deadline > hold)
+                    .is_none_or(|hold| payment_deadline > hold)
                     || bounds
                         .paykit_prepare_expires_at
-                        .is_none_or(|prepare| activated.activated_at >= prepare))
+                        .is_none_or(|prepare| activated_at >= prepare))
             {
                 // Remote activation is already durable. Preserve its exact
                 // terms and original local hold; alert instead of extending
                 // inventory or blindly voiding a potentially live request.
                 tracing::error!(
                     order_id = %payload.order_id,
-                    %activated.activated_at,
-                    %activated.payment_deadline,
+                    %activated_at,
+                    %payment_deadline,
                     prepare_expires_at = ?bounds.paykit_prepare_expires_at,
                     hold_expires_at = ?bounds.hold_expires_at,
                     "ALERT upstream paykit activation exceeded persisted inventory bounds"
@@ -1224,7 +1278,7 @@ async fn deliver_paykit_activation(
             )
             .bind(payload.order_id)
             .bind(now)
-            .bind(activated.payment_deadline)
+            .bind(payment_deadline)
             .execute(&mut *tx)
             .await?;
             let retracked = flipped.rows_affected() == 0
@@ -1280,7 +1334,7 @@ async fn deliver_paykit_activation(
             PaykitCommandError::ActivationTotalMismatch => {
                 tracing::error!(
                     order_id = %payload.order_id,
-                    persisted_total_sats = total_sats,
+                    persisted_terms = ?activation,
                     "ALERT paykit refused activation with a total mismatch; voiding the bind"
                 );
                 void_prepare_effects(pool, row.id, payload.order_id, now).await?;
@@ -1944,6 +1998,9 @@ async fn claim_due_paykit_orders(
     // to manual_review, never to awaiting_seller_confirmation. Orders in
     // `awaiting_seller_confirmation` are claimed on the status-only path:
     // the poll refreshes facts and can never transition them to `paid`.
+    // An order bound through `paykit` that is already paid keeps polling for
+    // its USDT finality and, until the request's observation tail ends, for
+    // money on the rail that did not pay it.
     sqlx::query_as(
         "UPDATE orders SET paykit_last_checked_at = $1, updated_at = updated_at \
          WHERE id IN (\
@@ -1954,7 +2011,14 @@ async fn claim_due_paykit_orders(
                   OR (p.state = 'expired' AND o.paykit_request_state = 'detected') \
                   OR (p.state = 'expired' AND o.paykit_request_state = 'pending' \
                       AND o.paykit_expires_at IS NOT NULL \
-                      AND o.paykit_expires_at + INTERVAL '24 hours' > $1)) \
+                      AND o.paykit_expires_at + INTERVAL '24 hours' > $1) \
+                  OR (p.state = 'confirmed' AND o.paykit_request_state = 'confirmed' \
+                      AND o.payment_method = 'paykit' AND o.paykit_api = 'upstream' \
+                      AND ((o.payment_finality IN ('pending', 'reverted') \
+                            AND o.payment_finality_at + INTERVAL '7 days' > $1) \
+                           OR (o.paykit_second_rail_at IS NULL \
+                               AND o.paykit_expires_at IS NOT NULL \
+                               AND o.paykit_expires_at + INTERVAL '24 hours' > $1)))) \
              AND o.paykit_request_reference IS NOT NULL \
              AND (o.paykit_last_checked_at IS NULL OR o.paykit_last_checked_at <= $2) \
              ORDER BY o.paykit_last_checked_at ASC NULLS FIRST LIMIT $3 \
@@ -1968,6 +2032,200 @@ async fn claim_due_paykit_orders(
     .bind(PAYKIT_VERIFY_BATCH_SIZE)
     .fetch_all(pool)
     .await
+}
+
+/// Whether the observed amount differs from what the order offered. A
+/// satoshi observation is compared only where the marketplace froze the
+/// figure at bind (an FX-quoted order: `paykit_total_sats`). A USDT
+/// observation is compared with the USDT amount paykit-server offered for the
+/// request, and an observation that names no amount is never a mismatch here
+/// (paykit-server's own `amount_matched` still decides).
+fn observed_differs_from_offer(
+    order: &crate::model::OrderRow,
+    observation: &crate::payments::PaykitObservation,
+) -> bool {
+    match observation.asset {
+        Some(AcceptedAsset::Usdt) => {
+            let offered = order
+                .paykit_payment_amounts
+                .as_ref()
+                .and_then(OfferedAssets::from_json)
+                .and_then(|offered| offered.usdt_units);
+            observation
+                .observed_units
+                .is_some_and(|observed| Some(observed) != offered)
+        }
+        _ => {
+            order.bitcoin_quoted_sats.is_some()
+                && observation
+                    .observed_sats
+                    .is_some_and(|observed| i64::try_from(observed).ok() != order.paykit_total_sats)
+        }
+    }
+}
+
+/// What one confirmed observation says about the money: whether the amount
+/// matched, what was observed, whether paykit-server marked it late, and the
+/// USDT leg when the observation is one.
+#[derive(Clone, Copy)]
+struct Settlement<'a> {
+    amount_matched: bool,
+    observation: &'a crate::payments::PaykitObservation,
+    late_settlement: bool,
+    usdt: Option<&'a PaykitUsdtObservation>,
+}
+
+impl<'a> Settlement<'a> {
+    fn bitcoin(
+        amount_matched: bool,
+        observation: &'a crate::payments::PaykitObservation,
+        late_settlement: bool,
+    ) -> Self {
+        Self {
+            amount_matched,
+            observation,
+            late_settlement,
+            usdt: None,
+        }
+    }
+}
+
+/// Records the rail that paid an order bound through `paykit`: the S1 asset
+/// terms (`payment_asset`, network, amount, exponent, basis), the payment
+/// row retyped to that asset, and, for USDT, the finality of the transfer.
+/// Written once, under the caller's payment and order locks, by the first
+/// settlement or review entry that sees money, so a later poll never moves
+/// it. An order bound through the legacy `bitcoin` bind keeps its legacy
+/// shape and records nothing.
+async fn record_settlement_rail(
+    tx: &mut Transaction<'_, Postgres>,
+    order_id: Uuid,
+    observation: &crate::payments::PaykitObservation,
+    usdt: Option<&PaykitUsdtObservation>,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    let Some(order) = fetch_order_for_update(tx, order_id).await? else {
+        anyhow::bail!("paykit order {order_id} is missing while recording its rail");
+    };
+    if order.payment_method.as_deref() != Some("paykit") {
+        return Ok(());
+    }
+    let asset = observation.asset.unwrap_or(AcceptedAsset::Btc);
+    // A `paykit` order bound through the fork carries no denomination and no
+    // request terms by design: its rail is Bitcoin and nothing is recorded.
+    if order.paykit_asset.is_none() && order.paykit_amount_minor.is_none() {
+        return Ok(());
+    }
+    let Some(denomination) = order
+        .paykit_asset
+        .as_deref()
+        .and_then(PaymentAsset::from_column)
+    else {
+        tracing::error!(
+            order_id = %order.id,
+            paykit_asset = ?order.paykit_asset,
+            "ALERT paykit order carries a denomination this build does not know; \
+             the paid rail is not recorded"
+        );
+        return Ok(());
+    };
+    let offered = order
+        .paykit_payment_amounts
+        .as_ref()
+        .and_then(OfferedAssets::from_json)
+        .or_else(|| {
+            order
+                .paykit_total_sats
+                .and_then(|sats| u64::try_from(sats).ok())
+                .map(|btc_sats| OfferedAssets {
+                    btc_sats: Some(btc_sats),
+                    usdt_units: None,
+                })
+        });
+    let observed = match asset {
+        AcceptedAsset::Btc => observation.observed_sats,
+        AcceptedAsset::Usdt => observation.observed_units,
+    };
+    let Some(amount) = observed
+        .or_else(|| offered.and_then(|offered| offered.amount(asset)))
+        .and_then(|amount| i64::try_from(amount).ok())
+    else {
+        return Ok(());
+    };
+    let Some(terms) = PaymentTerms::settled(denomination, asset, amount) else {
+        return Ok(());
+    };
+    if terms.store(tx, order_id).await? && asset == AcceptedAsset::Usdt {
+        sqlx::query(
+            "UPDATE payments SET amount_minor = $2, currency = 'USDT', exponent = 6, \
+             updated_at = $3 WHERE order_id = $1",
+        )
+        .bind(order_id)
+        .bind(amount)
+        .bind(now)
+        .execute(&mut **tx)
+        .await?;
+    }
+    if let Some(usdt) = usdt {
+        set_payment_finality(tx, order_id, finality_of(usdt), now).await?;
+    }
+    Ok(())
+}
+
+/// The finality an included USDT transfer reports.
+fn finality_of(usdt: &PaykitUsdtObservation) -> &'static str {
+    if usdt.finalized {
+        "final"
+    } else {
+        "pending"
+    }
+}
+
+/// Moves a USDT payment's finality. `final` is terminal: a finalized transfer
+/// cannot be reverted by a later poll, whatever the status then says.
+/// Returns whether the value changed. A change bumps the order revision and
+/// records one event, so clients that follow revisions see it.
+async fn set_payment_finality(
+    tx: &mut Transaction<'_, Postgres>,
+    order_id: Uuid,
+    finality: &str,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    let updated: Option<(i64,)> = sqlx::query_as(
+        "UPDATE orders SET payment_finality = $2, payment_finality_at = $3, \
+         revision = revision + 1, updated_at = $3 \
+         WHERE id = $1 AND payment_asset = 'USDT' \
+         AND payment_finality IS DISTINCT FROM 'final' \
+         AND payment_finality IS DISTINCT FROM $2 \
+         RETURNING revision",
+    )
+    .bind(order_id)
+    .bind(finality)
+    .bind(now)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((revision,)) = updated else {
+        return Ok(false);
+    };
+    crate::executor::insert_event(
+        tx,
+        Uuid::new_v4(),
+        &ids::order_aggregate_id(order_id),
+        revision,
+        SYSTEM_ACTOR,
+        "payment.finality_changed",
+        now,
+    )
+    .await?;
+    if finality == "reverted" {
+        tracing::error!(
+            order_id = %order_id,
+            code = "usdt_payment_reverted",
+            "ALERT an included USDT transfer disappeared before it was final; \
+             physical fulfilment stays blocked"
+        );
+    }
+    Ok(true)
 }
 
 /// Applies one confirmed paykit payment: `awaiting_entitlement → confirmed`
@@ -2001,12 +2259,16 @@ async fn freeze_paykit_observation(
 async fn apply_confirmed_paykit_payment(
     pool: &PgPool,
     row: &ClaimedPaykitOrder,
-    amount_matched: bool,
-    observation: &crate::payments::PaykitObservation,
+    facts: Settlement<'_>,
     keys: crate::ConfirmKeys<'_>,
     now: DateTime<Utc>,
-    late_settlement: bool,
 ) -> anyhow::Result<bool> {
+    let Settlement {
+        amount_matched,
+        observation,
+        late_settlement,
+        usdt,
+    } = facts;
     let resolution_pins_present = match row.paykit_api.as_str() {
         "fork" => row.paykit_stack_id.is_some() && row.paykit_stack_endpoint.is_some(),
         "upstream" => row.paykit_stack_id.is_none() && row.paykit_stack_endpoint.is_none(),
@@ -2041,6 +2303,11 @@ async fn apply_confirmed_paykit_payment(
         );
         return Ok(false);
     }
+    // The rail that took the money is recorded first, under the payment and
+    // order locks, so every exit below (settled, late, mismatched, or
+    // routed to review) carries the paid asset and amount, and a refund
+    // follows the rail that was paid.
+    record_settlement_rail(&mut tx, row.id, observation, usdt, now).await?;
     // An on-time settlement first seen after the reservation sweep returned
     // an auction winner's unit: the plain confirmation refuses a lapsed
     // hold, so it takes the late-money fork, which re-takes the unit when it
@@ -2049,10 +2316,7 @@ async fn apply_confirmed_paykit_payment(
     let lapsed_auction_hold = if payment.state == "awaiting_entitlement" && amount_matched {
         match fetch_order_for_update(&mut tx, row.id).await? {
             Some(order) => {
-                let quote_mismatch = order.bitcoin_quoted_sats.is_some()
-                    && observation.observed_sats.is_some_and(|observed| {
-                        i64::try_from(observed).ok() != order.paykit_total_sats
-                    });
+                let quote_mismatch = observed_differs_from_offer(&order, observation);
                 !quote_mismatch
                     && crate::bitcoin_review::auction_hold_lapsed(&mut tx, &order).await?
             }
@@ -2195,10 +2459,7 @@ async fn apply_confirmed_paykit_payment(
     // legacy SAT/BTC orders the invoice amount is the order total and
     // paykit-server's own `amount_matched` (handled above) remains the sole
     // amount arbiter — a later observation never un-pays through this path.
-    let observed_amount_mismatch = order.bitcoin_quoted_sats.is_some()
-        && observation
-            .observed_sats
-            .is_some_and(|observed| i64::try_from(observed).ok() != order.paykit_total_sats);
+    let observed_amount_mismatch = observed_differs_from_offer(&order, observation);
     if observed_amount_mismatch {
         let (revision,): (i64,) = sqlx::query_as(
             "UPDATE payments SET state = 'manual_review', revision = revision + 1, \
@@ -2376,6 +2637,7 @@ async fn apply_confirmed_paykit_payment(
                 "confirmed paykit payment could not confirm the order; routing to manual review"
             );
             let mut tx = pool.begin().await?;
+            record_settlement_rail(&mut tx, row.id, observation, usdt, now).await?;
             let updated: Option<(i64,)> = sqlx::query_as(
                 "UPDATE payments SET state = 'manual_review', revision = revision + 1, \
                  manual_review_entered_at = $2, updated_at = $2 \
@@ -2499,11 +2761,9 @@ async fn apply_shared_manual_observation(
             return apply_confirmed_paykit_payment(
                 pool,
                 row,
-                amount_matched,
-                observation,
+                Settlement::bitcoin(amount_matched, observation, false),
                 keys,
                 now,
-                false,
             )
             .await;
         }
@@ -2665,7 +2925,9 @@ async fn apply_report_inside_seller_window(
         } => ("confirmed", *amount_matched, facts),
         PaykitStatusOutcome::AcceptancePending { facts } => ("confirmed", true, facts),
         PaykitStatusOutcome::Detected { facts } => ("detected", true, facts),
-        PaykitStatusOutcome::ManualReview { .. } => return Ok(false),
+        PaykitStatusOutcome::ManualReview { .. } | PaykitStatusOutcome::UsdtObserved { .. } => {
+            return Ok(false)
+        }
         PaykitStatusOutcome::Undetected | PaykitStatusOutcome::ActiveUndetected { .. } => {
             return mark_shared_manual_disappeared(pool, row, now).await
         }
@@ -2851,7 +3113,10 @@ async fn apply_paykit_status_outcome(
         PaykitStatusOutcome::Confirmed { facts, .. }
         | PaykitStatusOutcome::AcceptancePending { facts }
         | PaykitStatusOutcome::Detected { facts } => facts.payment_deadline,
-        PaykitStatusOutcome::ActiveUndetected { payment_deadline } => Some(*payment_deadline),
+        PaykitStatusOutcome::ActiveUndetected { payment_deadline }
+        | PaykitStatusOutcome::UsdtObserved {
+            payment_deadline, ..
+        } => Some(*payment_deadline),
         _ => None,
     };
     if row.paykit_api == "upstream" && row.paykit_expires_at.is_none() {
@@ -2873,10 +3138,29 @@ async fn apply_paykit_status_outcome(
     if let Some(delivery) = delivery {
         record_paykit_delivery(&state.pool, row, delivery).await?;
     }
+    if row.paykit_request_state == "confirmed" {
+        return apply_settled_status(state, row, &outcome, now).await;
+    }
     if row.paykit_request_state == "awaiting_seller_confirmation" {
         return apply_report_inside_seller_window(&state.pool, row, &outcome, now).await;
     }
+    apply_status_outcome(state, row, outcome, now).await
+}
+
+/// Applies one status to an order whose payment is still open.
+async fn apply_status_outcome(
+    state: &AppState,
+    row: &ClaimedPaykitOrder,
+    outcome: PaykitStatusOutcome,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
     match outcome {
+        PaykitStatusOutcome::UsdtObserved {
+            usdt,
+            bitcoin,
+            paid_asset,
+            ..
+        } => apply_usdt_observation(state, row, &usdt, *bitcoin, paid_asset, now).await,
         PaykitStatusOutcome::Confirmed {
             amount_matched,
             facts,
@@ -2891,11 +3175,9 @@ async fn apply_paykit_status_outcome(
                 return apply_confirmed_paykit_payment(
                     &state.pool,
                     row,
-                    amount_matched,
-                    &facts.observation,
+                    Settlement::bitcoin(amount_matched, &facts.observation, true),
                     state.confirm_keys(),
                     now,
-                    true,
                 )
                 .await;
             }
@@ -2920,11 +3202,9 @@ async fn apply_paykit_status_outcome(
                     apply_confirmed_paykit_payment(
                         &state.pool,
                         row,
-                        amount_matched,
-                        &facts.observation,
+                        Settlement::bitcoin(amount_matched, &facts.observation, false),
                         state.confirm_keys(),
                         now,
-                        false,
                     )
                     .await
                 }
@@ -2953,11 +3233,9 @@ async fn apply_paykit_status_outcome(
                 apply_confirmed_paykit_payment(
                     &state.pool,
                     row,
-                    true,
-                    &facts.observation,
+                    Settlement::bitcoin(true, &facts.observation, true),
                     state.confirm_keys(),
                     now,
-                    true,
                 )
                 .await
             } else {
@@ -3017,6 +3295,420 @@ async fn apply_paykit_status_outcome(
     }
 }
 
+/// A USDT0 transfer is in a block while Bitcoin shows no confirmed money:
+/// the order settles on USDT. With confirmed money on both rails the order
+/// takes the manual-review path instead and nothing settles on its own. A
+/// USDT leg that is not in a block yet pays nothing and the Bitcoin leg
+/// decides as a Bitcoin-only status would.
+async fn apply_usdt_observation(
+    state: &AppState,
+    row: &ClaimedPaykitOrder,
+    usdt: &PaykitUsdtObservation,
+    bitcoin: PaykitStatusOutcome,
+    paid_asset: Option<AcceptedAsset>,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    if usdt.included() && bitcoin_holds_money(&bitcoin) {
+        return apply_dual_rail_review(state, row, usdt, &bitcoin, paid_asset, now).await;
+    }
+    if usdt.included() {
+        return apply_confirmed_paykit_payment(
+            &state.pool,
+            row,
+            Settlement {
+                amount_matched: usdt.amount_matched,
+                observation: &usdt.as_observation(),
+                late_settlement: !usdt.paid_on_time,
+                usdt: Some(usdt),
+            },
+            state.confirm_keys(),
+            now,
+        )
+        .await;
+    }
+    mark_paykit_detected(&state.pool, row, now).await?;
+    Box::pin(apply_status_outcome(state, row, bitcoin, now)).await
+}
+
+/// Whether the Bitcoin leg of a status holds money on chain.
+fn bitcoin_holds_money(bitcoin: &PaykitStatusOutcome) -> bool {
+    matches!(
+        bitcoin,
+        PaykitStatusOutcome::Confirmed { .. } | PaykitStatusOutcome::AcceptancePending { .. }
+    )
+}
+
+/// The observation document of an order with money on both rails: the rail
+/// that paid first as the observation, the other rail named beside it so the
+/// seller sees both.
+fn dual_rail_observation(
+    first: &crate::payments::PaykitObservation,
+    first_matched: bool,
+    other: &crate::payments::PaykitObservation,
+    now: DateTime<Utc>,
+) -> Value {
+    let mut document =
+        crate::bitcoin_review::observation_json("confirmed", first_matched, first, now, false);
+    document["other_rail_asset"] = serde_json::json!(other.asset.unwrap_or(AcceptedAsset::Btc));
+    document["other_rail_amount"] = serde_json::json!(match other.asset {
+        Some(AcceptedAsset::Usdt) => other.observed_units,
+        _ => other.observed_sats,
+    });
+    document["other_rail_reference"] = serde_json::json!(other.txid);
+    document
+}
+
+/// Money on both rails of one request, before the order settled: the order
+/// goes to the existing manual-review path with both observations frozen. The
+/// rail paykit-server names as paid first is the order's paid rail (so a
+/// refund follows it); the seller sees the other rail beside it and returns
+/// that payment from their own wallet. When paykit-server names no first
+/// rail (neither payment qualified), the service does not guess: the paid
+/// rail stays unrecorded, the observation says so, and a refund is refused
+/// until the seller resolves the review as paid or abandoned. Nothing is
+/// refunded and nothing settles automatically.
+async fn apply_dual_rail_review(
+    state: &AppState,
+    row: &ClaimedPaykitOrder,
+    usdt: &PaykitUsdtObservation,
+    bitcoin: &PaykitStatusOutcome,
+    paid_asset: Option<AcceptedAsset>,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    let (PaykitStatusOutcome::Confirmed { facts, .. }
+    | PaykitStatusOutcome::AcceptancePending { facts }) = bitcoin
+    else {
+        anyhow::bail!("a dual-rail review needs a Bitcoin leg holding money");
+    };
+    let bitcoin_matched = matches!(
+        bitcoin,
+        PaykitStatusOutcome::Confirmed {
+            amount_matched: true,
+            ..
+        } | PaykitStatusOutcome::AcceptancePending { .. }
+    );
+    let usdt_observation = usdt.as_observation();
+    let rail_known = paid_asset.is_some();
+    let first_is_usdt = paid_asset == Some(AcceptedAsset::Usdt);
+    let (first, first_matched, other) = if first_is_usdt {
+        (&usdt_observation, usdt.amount_matched, &facts.observation)
+    } else {
+        (&facts.observation, bitcoin_matched, &usdt_observation)
+    };
+    let mut tx = state.pool.begin().await?;
+    let payment: Option<PaymentRow> = sqlx::query_as(&format!(
+        "SELECT {PAYMENT_COLUMNS} FROM payments WHERE id = $1 FOR UPDATE"
+    ))
+    .bind(row.payment_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(payment) = payment else {
+        anyhow::bail!("paykit order {} references a missing payment", row.id);
+    };
+    if !matches!(payment.state.as_str(), "awaiting_entitlement" | "expired") {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    if rail_known {
+        record_settlement_rail(&mut tx, row.id, first, first_is_usdt.then_some(usdt), now).await?;
+    }
+    let (revision,): (i64,) = sqlx::query_as(
+        "UPDATE payments SET state = 'manual_review', revision = revision + 1, \
+         review_reason = 'amount_mismatch', manual_review_entered_at = $2, updated_at = $2 \
+         WHERE id = $1 RETURNING revision",
+    )
+    .bind(payment.id)
+    .bind(now)
+    .fetch_one(&mut *tx)
+    .await?;
+    let event_id = crate::executor::insert_event(
+        &mut tx,
+        row.id,
+        &ids::payment_aggregate_id(payment.id),
+        revision,
+        &row.buyer_pubky,
+        "payment.manual_review",
+        now,
+    )
+    .await?;
+    crate::handlers::insert_bitcoin_manual_review_intent(
+        &mut tx,
+        event_id,
+        &row.seller_pubky,
+        row.id,
+        crate::handlers::BitcoinReviewNotice::AmountMismatch,
+        now,
+    )
+    .await?;
+    let mut document = dual_rail_observation(first, first_matched, other, now);
+    if !rail_known {
+        document["paid_rail_unknown"] = serde_json::json!(true);
+    }
+    sqlx::query(
+        "UPDATE orders SET paykit_request_state = 'confirmed', \
+         paykit_seller_confirmation_entered_at = NULL, \
+         paykit_seller_confirmation_deadline = NULL, paykit_observation = $3, \
+         paykit_second_rail_at = $2, updated_at = $2 WHERE id = $1",
+    )
+    .bind(row.id)
+    .bind(now)
+    .bind(document)
+    .execute(&mut *tx)
+    .await?;
+    if rail_known {
+        freeze_paykit_observation(&mut tx, row.id, first.observed_sats).await?;
+    }
+    tx.commit().await?;
+    tracing::error!(
+        order_id = %row.id,
+        code = "paykit_both_rails_paid",
+        "ALERT money confirmed on both the Bitcoin and the USDT rail of one request; \
+         routed to manual review"
+    );
+    Ok(true)
+}
+
+/// How long a USDT payment is polled while its finality is `pending` or
+/// `reverted`, from the moment it took that value. Past it the order is no
+/// longer polled.
+const USDT_FINALITY_POLL_DAYS: i64 = 7;
+
+/// Escalates USDT payments whose finality stayed `pending` (included, never
+/// finalized) or `reverted` (reorganised away, never returned) for
+/// [`USDT_FINALITY_POLL_DAYS`]: polling stops (the claim bounds it), and one
+/// durable operator row is written (`needs_review`, `detected_unconfirmed`,
+/// `observation.status` `usdt_finality_pending` or `usdt_finality_reverted`),
+/// listed by `paykit-attempts-admin list`. The order stays paid and its
+/// finality stays as it was, so physical fulfilment stays blocked until an
+/// operator has checked the transfer. A reappearing transfer takes a new
+/// finality value, which restarts the clock.
+/// Idempotent: an order that already has a held row for its invoice is left
+/// alone. Returns how many orders were escalated.
+pub async fn escalate_stale_usdt_finality(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+) -> anyhow::Result<u64> {
+    let stale: Vec<(Uuid,)> = sqlx::query_as(
+        "SELECT o.id FROM orders o JOIN payments p ON p.order_id = o.id \
+         WHERE o.payment_method = 'paykit' \
+         AND o.payment_finality IN ('pending', 'reverted') \
+         AND o.payment_finality_at + make_interval(days => $2) <= $1 \
+         AND p.state = 'confirmed' AND o.paykit_invoice_id IS NOT NULL \
+         AND NOT EXISTS (SELECT 1 FROM paykit_superseded_attempts h \
+                         WHERE h.order_id = o.id AND h.invoice_id = o.paykit_invoice_id) \
+         ORDER BY o.payment_finality_at LIMIT 50",
+    )
+    .bind(now)
+    .bind(i32::try_from(USDT_FINALITY_POLL_DAYS)?)
+    .fetch_all(pool)
+    .await?;
+    let mut escalated = 0u64;
+    for (order_id,) in stale {
+        let mut tx = pool.begin().await?;
+        lock_order_payment(&mut tx, order_id).await?;
+        let Some(order) = fetch_order_for_update(&mut tx, order_id).await? else {
+            tx.rollback().await?;
+            continue;
+        };
+        let (Some(invoice_id), Some(since)) = (order.paykit_invoice_id, order.payment_finality_at)
+        else {
+            tx.rollback().await?;
+            continue;
+        };
+        let Some(finality) = order
+            .payment_finality
+            .as_deref()
+            .filter(|finality| matches!(*finality, "pending" | "reverted"))
+        else {
+            tx.rollback().await?;
+            continue;
+        };
+        if since + chrono::Duration::days(USDT_FINALITY_POLL_DAYS) > now {
+            tx.rollback().await?;
+            continue;
+        }
+        crate::paykit_attempts::record_released_attempt(&mut tx, order_id, now).await?;
+        let held = sqlx::query(
+            "UPDATE paykit_superseded_attempts SET state = 'needs_review', \
+             review_reason = 'detected_unconfirmed', observation = $3, closed_at = $4 \
+             WHERE order_id = $1 AND invoice_id = $2 AND state = 'watching'",
+        )
+        .bind(order_id)
+        .bind(invoice_id)
+        .bind(serde_json::json!({
+            "status": format!("usdt_finality_{finality}"),
+            "finality": finality,
+            "paid_asset": order.payment_asset,
+            "finality_since": since,
+            "observed_at": now,
+        }))
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        if held.rows_affected() == 1 {
+            escalated += 1;
+            tracing::error!(
+                order_id = %order_id,
+                invoice_id = %invoice_id,
+                finality,
+                code = "usdt_finality_pending_too_long",
+                "ALERT a USDT payment was included but never finalized (or was reorganised away \
+                 and never returned) within the polling bound; held for review, fulfilment \
+                 stays blocked"
+            );
+        } else {
+            // `record_released_attempt` writes no row for an order without
+            // complete pins, so nothing was held. The order is no longer
+            // polled and would otherwise be silent; say so on every pass.
+            tracing::error!(
+                order_id = %order_id,
+                invoice_id = %invoice_id,
+                finality,
+                code = "usdt_finality_escalation_not_recorded",
+                "ALERT a USDT payment past its finality polling bound could not be held for \
+                 review (no review row could be written); fulfilment stays blocked"
+            );
+        }
+    }
+    Ok(escalated)
+}
+
+/// Applies one status to an order bound through `paykit` whose payment is
+/// already settled. It keeps two facts current and never un-pays the order:
+///
+/// - the finality of a USDT payment: `pending` until paykit-server reports
+///   the transfer finalized, `reverted` if an included transfer disappears
+///   first, and back to `pending` or `final` when it reappears. `final` is
+///   terminal;
+/// - money on the rail that did not pay the order, which can no longer be
+///   taken, is held for review exactly like money on a released attempt of a
+///   settled order.
+async fn apply_settled_status(
+    state: &AppState,
+    row: &ClaimedPaykitOrder,
+    outcome: &PaykitStatusOutcome,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    let (usdt, bitcoin): (Option<&PaykitUsdtObservation>, Option<&PaykitStatusOutcome>) =
+        match outcome {
+            PaykitStatusOutcome::UsdtObserved { usdt, bitcoin, .. } => {
+                (Some(usdt), Some(bitcoin.as_ref()))
+            }
+            PaykitStatusOutcome::Confirmed { .. }
+            | PaykitStatusOutcome::AcceptancePending { .. }
+            | PaykitStatusOutcome::Detected { .. }
+            | PaykitStatusOutcome::Undetected
+            | PaykitStatusOutcome::ActiveUndetected { .. } => (None, Some(outcome)),
+            PaykitStatusOutcome::NotFound
+            | PaykitStatusOutcome::Unavailable
+            | PaykitStatusOutcome::ManualReview { .. } => return Ok(false),
+        };
+    let mut tx = state.pool.begin().await?;
+    let payment_state: Option<(String,)> =
+        sqlx::query_as("SELECT state FROM payments WHERE id = $1 FOR UPDATE")
+            .bind(row.payment_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if payment_state.as_ref().map(|(state,)| state.as_str()) != Some("confirmed") {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    let Some(order) = fetch_order_for_update(&mut tx, row.id).await? else {
+        anyhow::bail!("paykit order {} is missing", row.id);
+    };
+    if order.payment_method.as_deref() != Some("paykit") {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    let paid_on = order.payment_asset.as_deref();
+    let mut changed = false;
+    if paid_on == Some("USDT") {
+        match usdt {
+            Some(usdt) if usdt.finalized => {
+                changed |= set_payment_finality(&mut tx, row.id, "final", now).await?;
+            }
+            Some(usdt) if usdt.included() => {
+                changed |= set_payment_finality(&mut tx, row.id, "pending", now).await?;
+            }
+            // An included transfer that the status no longer carries was
+            // reorganised away. Only a definitive answer reverts it.
+            _ => {
+                changed |= set_payment_finality(&mut tx, row.id, "reverted", now).await?;
+            }
+        }
+    }
+    let other_rail = match (paid_on, usdt, bitcoin) {
+        (Some("USDT"), _, Some(bitcoin)) if bitcoin_holds_money(bitcoin) => {
+            let (PaykitStatusOutcome::Confirmed { facts, .. }
+            | PaykitStatusOutcome::AcceptancePending { facts }) = bitcoin
+            else {
+                anyhow::bail!("a Bitcoin leg holding money carries facts");
+            };
+            Some(facts.observation.clone())
+        }
+        (Some("USDT"), _, _) => None,
+        (_, Some(usdt), _) if usdt.included() => Some(usdt.as_observation()),
+        _ => None,
+    };
+    if let Some(observation) = other_rail {
+        changed |= flag_second_rail(&mut tx, &order, &observation, now).await?;
+    }
+    if changed {
+        tx.commit().await?;
+    } else {
+        tx.rollback().await?;
+    }
+    Ok(changed)
+}
+
+/// Holds money seen on the rail that did not pay an order for an operator.
+/// The order and its payment are untouched. Once per order.
+async fn flag_second_rail(
+    tx: &mut Transaction<'_, Postgres>,
+    order: &crate::model::OrderRow,
+    observation: &crate::payments::PaykitObservation,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    let first = sqlx::query(
+        "UPDATE orders SET paykit_second_rail_at = $2, updated_at = $2 \
+         WHERE id = $1 AND paykit_second_rail_at IS NULL",
+    )
+    .bind(order.id)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    if first.rows_affected() != 1 {
+        return Ok(false);
+    }
+    crate::paykit_attempts::record_released_attempt(tx, order.id, now).await?;
+    let details = serde_json::json!({
+        "status": "second_rail",
+        "paid_asset": order.payment_asset,
+        "observed_at": now,
+        "observation": observation,
+    });
+    sqlx::query(
+        "UPDATE paykit_superseded_attempts SET state = 'needs_review', \
+         review_reason = 'payment_settled', observation = $3, closed_at = $4 \
+         WHERE order_id = $1 AND invoice_id = $2 AND state = 'watching'",
+    )
+    .bind(order.id)
+    .bind(order.paykit_invoice_id)
+    .bind(&details)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    tracing::error!(
+        order_id = %order.id,
+        paid_asset = ?order.payment_asset,
+        other_rail = ?observation.asset,
+        code = "paykit_second_rail_paid_after_settlement",
+        "ALERT money confirmed on the rail that did not pay a settled order; held for review"
+    );
+    Ok(true)
+}
+
 /// Records whether the polled request reached the buyer's wallet, for the
 /// attempt the claim polled (a re-bind since then is left alone). A final
 /// state (`delivered`, `failed`) is never moved back to `pending`.
@@ -3050,6 +3742,9 @@ pub async fn verify_due_paykit_payments(
     source: &dyn PaykitStatusSource,
     now: DateTime<Utc>,
 ) -> anyhow::Result<u64> {
+    if let Err(error) = escalate_stale_usdt_finality(&state.pool, now).await {
+        tracing::error!(error = %error, "USDT finality escalation pass failed");
+    }
     let claimed =
         claim_due_paykit_orders(&state.pool, now, state.config.paykit_poll_seconds).await?;
     let mut applied = 0u64;

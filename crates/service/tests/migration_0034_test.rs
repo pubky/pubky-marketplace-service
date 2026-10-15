@@ -254,5 +254,8 @@ fn migration_catalog_is_contiguous_through_0060() {
         })
         .collect();
     numbers.sort_unstable();
-    assert_eq!(numbers, (1..=60).collect::<Vec<_>>());
+    // Later lanes add 0061 and up (0072 is grant sessions); the catalog is
+    // contiguous through 0060.
+    let base: Vec<u32> = numbers.into_iter().filter(|number| *number <= 60).collect();
+    assert_eq!(base, (1..=60).collect::<Vec<_>>());
 }

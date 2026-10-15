@@ -120,6 +120,21 @@ shape and the source (`buyer_entered`); a later source is a widened CHECK in
 a later migration. It builds no index on an existing table and sets
 `lock_timeout` like 0050.
 
+0060 (single Paykit bind) widens `orders.payment_method` to `paykit` and adds
+six nullable `orders` columns: the multi-asset request terms
+(`paykit_amount_minor`, `paykit_accepted_assets`, `paykit_payment_amounts`,
+set together or all NULL), a USDT payment's `payment_finality` with
+`payment_finality_at`, and `paykit_second_rail_at`. It drops `NOT NULL` from
+`paykit_superseded_attempts.total_sats` (a released USDT-only attempt has no
+satoshi total) and replaces its positive check with one that allows NULL. It
+also widens `orders_external_refund_within_total` to admit the paid amount
+(`payment_amount_minor`): a refund of a USDT-paid order priced in satoshis is
+recorded in USDT0 millionths; the bound only widens, so existing rows satisfy
+it. The
+`orders` CHECKs are `NOT VALID` like 0053's; no default, no rewrite, no index.
+A binary from before it lists its `orders` columns and ignores them. It sets
+`lock_timeout` like 0050.
+
 0055 (priv data key custody releases) creates `user_priv_key_custody_releases`
 with its primary key and a key-count check. It builds no index on an existing
 table and takes no lock on one. Roll forward rather than back once any row
@@ -139,18 +154,18 @@ additive. Orders and payments bound to Stripe are not touched.
 binary from before 0059 ignores the new columns and its inserts take their
 defaults, so a rolling replacement is safe.
 
-0060 (grant sessions) creates `grant_session_challenges` with its primary key
+0072 (grant sessions) creates `grant_session_challenges` with its primary key
 and a plain index on `used_at` (a new, empty table), adds the nullable
 `auth_sessions.source_grant_id` and `source_client_id` columns, and widens the
 `automation_rate_limits` endpoint-class CHECK with `grant_session.mint` as
 `NOT VALID`. It builds no index on an existing table and sets `lock_timeout`
-like 0050. A binary from before 0060 never reads the new table and its session
+like 0050. A binary from before 0072 never reads the new table and its session
 inserts leave the new columns NULL.
 
 ## Numbers claimed by open pull requests
 
 `main` has 0001 to 0054 and 0056 to 0059; 0055 is #92, so the catalog is
-gapless 0001 to 0059 once it lands. Pull requests that are open when this was
+gapless 0001 to 0059 once it lands; 0060 is the single Paykit bind. Pull requests that are open when this was
 written claim numbers, so a new migration must check the open list
 (`gh pr list`) and take the next free number (0060 or later) rather than
 assume it is free:
@@ -158,6 +173,7 @@ assume it is free:
 | Number | File | Pull request |
 | --- | --- | --- |
 | 0055 | `0055_user_priv_key_custody_releases.sql` | #92 (`/priv` Phase 4) |
+| 0072 | `0072_grant_sessions.sql` | #137 (grant sessions; 0061 to 0071 are claimed by other open lanes, and the catalog tests require 0001 to 0060 gapless and only later numbers above) |
 
 This table describes unmerged work and goes stale as pull requests land; trust
 `crates/service/migrations/` on `main` over it.

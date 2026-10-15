@@ -225,17 +225,72 @@ pub fn quote_sats(total_minor: i64, exponent: i32, rate: &Decimal) -> Result<u64
     u64::try_from(sats).map_err(|_| FxError::Overflow)
 }
 
+/// Guards the Bitcoin amount paykit-server fixed for a USD price against the
+/// service's own quote: within [`MAX_DEVIATION_BPS`] of it, and inside the
+/// same minimum and maximum a service quote must respect.
+pub fn guard_fixed_sats(fixed_sats: u64, quoted_sats: u64) -> Result<(), FxError> {
+    let fixed = u128::from(fixed_sats);
+    if fixed < MIN_QUOTE_SATS {
+        return Err(FxError::BelowMinimum);
+    }
+    if fixed > MAX_QUOTE_SATS {
+        return Err(FxError::CapExceeded);
+    }
+    let quoted = u128::from(quoted_sats);
+    let gap = fixed.abs_diff(quoted);
+    let within = gap
+        .checked_mul(10_000)
+        .zip(quoted.checked_mul(MAX_DEVIATION_BPS))
+        .is_some_and(|(gap, allowed)| gap <= allowed);
+    if within {
+        Ok(())
+    } else {
+        Err(FxError::DeviationExceeded)
+    }
+}
+
+/// Guards the USDT amount paykit-server fixed for a satoshi price against the
+/// service's own rate: the USDT0 millionths the price is worth at `rate` (US
+/// dollars per bitcoin) must sit within [`MAX_DEVIATION_BPS`] of what
+/// paykit-server offered.
+pub fn guard_fixed_usdt_units(fixed_units: u64, sats: u64, rate: &Decimal) -> Result<(), FxError> {
+    // One satoshi is rate / 10^8 US dollars, which is rate / 100 USDT0
+    // millionths.
+    let scale = 10_u128
+        .checked_pow(rate.scale)
+        .and_then(|scale| scale.checked_mul(100))
+        .ok_or(FxError::Overflow)?;
+    let expected = u128::from(sats)
+        .checked_mul(rate.mantissa)
+        .ok_or(FxError::Overflow)?
+        .div_ceil(scale);
+    let fixed = u128::from(fixed_units);
+    if fixed == 0 || expected == 0 {
+        return Err(FxError::BelowMinimum);
+    }
+    let within = fixed
+        .abs_diff(expected)
+        .checked_mul(10_000)
+        .zip(expected.checked_mul(MAX_DEVIATION_BPS))
+        .is_some_and(|(gap, allowed)| gap <= allowed);
+    if within {
+        Ok(())
+    } else {
+        Err(FxError::DeviationExceeded)
+    }
+}
+
 pub fn reference_cutoff(now: DateTime<Utc>) -> DateTime<Utc> {
     now - Duration::seconds(REFERENCE_WINDOW_SECS)
 }
 
-pub async fn quote_usd<'e, E>(
+/// The reference BTCUSD rate: the current feed rate, accepted only while it
+/// sits within [`MAX_DEVIATION_BPS`] of the median of the persisted samples.
+pub async fn reference_rate<'e, E>(
     executor: E,
     feed_url: &str,
-    total_minor: i64,
-    exponent: i32,
     now: DateTime<Utc>,
-) -> Result<(Decimal, RateSample, u64), FxError>
+) -> Result<(Decimal, RateSample), FxError>
 where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
 {
@@ -258,8 +313,22 @@ where
     if !within_deviation(&current.rate, &median_rate) {
         return Err(FxError::DeviationExceeded);
     }
-    let sats = quote_sats(total_minor, exponent, &current.rate)?;
-    Ok((current.rate.clone(), current, sats))
+    Ok((current.rate.clone(), current))
+}
+
+pub async fn quote_usd<'e, E>(
+    executor: E,
+    feed_url: &str,
+    total_minor: i64,
+    exponent: i32,
+    now: DateTime<Utc>,
+) -> Result<(Decimal, RateSample, u64), FxError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    let (rate, current) = reference_rate(executor, feed_url, now).await?;
+    let sats = quote_sats(total_minor, exponent, &rate)?;
+    Ok((rate, current, sats))
 }
 
 pub async fn fetch_current(feed_url: &str, now: DateTime<Utc>) -> Result<RateSample, FxError> {
@@ -373,6 +442,69 @@ mod tests {
         let rate = Decimal::parse("77197").unwrap();
         assert_eq!(quote_sats(1_000, 0, &rate), Ok(1_295_388));
         assert_eq!(quote_sats(100, 3, &rate), Err(FxError::BelowMinimum));
+    }
+
+    #[test]
+    fn a_fixed_bitcoin_amount_is_guarded_by_the_quote_deviation_and_bounds() {
+        assert_eq!(guard_fixed_sats(100_000, 100_000), Ok(()));
+        assert_eq!(guard_fixed_sats(105_000, 100_000), Ok(()));
+        assert_eq!(guard_fixed_sats(95_000, 100_000), Ok(()));
+        assert_eq!(
+            guard_fixed_sats(105_001, 100_000),
+            Err(FxError::DeviationExceeded)
+        );
+        assert_eq!(
+            guard_fixed_sats(94_999, 100_000),
+            Err(FxError::DeviationExceeded)
+        );
+        assert_eq!(guard_fixed_sats(999, 1_000), Err(FxError::BelowMinimum));
+        assert_eq!(guard_fixed_sats(1_000, 1_000), Ok(()));
+        assert_eq!(
+            guard_fixed_sats(MAX_QUOTE_SATS as u64 + 1, MAX_QUOTE_SATS as u64),
+            Err(FxError::CapExceeded)
+        );
+        assert_eq!(
+            guard_fixed_sats(MAX_QUOTE_SATS as u64, MAX_QUOTE_SATS as u64),
+            Ok(())
+        );
+        assert_eq!(guard_fixed_sats(5_000, 0), Err(FxError::DeviationExceeded));
+        assert_eq!(
+            guard_fixed_sats(u64::MAX, u64::MAX),
+            Err(FxError::CapExceeded)
+        );
+    }
+
+    #[test]
+    fn a_fixed_usdt_amount_is_guarded_against_the_service_rate() {
+        // 50,000 sats at 81,000 USD per BTC is 40.5 USDT0.
+        let rate = Decimal::parse("81000").unwrap();
+        assert_eq!(guard_fixed_usdt_units(40_500_000, 50_000, &rate), Ok(()));
+        assert_eq!(guard_fixed_usdt_units(42_525_000, 50_000, &rate), Ok(()));
+        assert_eq!(guard_fixed_usdt_units(38_475_000, 50_000, &rate), Ok(()));
+        for fixed in [42_525_001, 38_474_999, 1, 81_000_000] {
+            assert_eq!(
+                guard_fixed_usdt_units(fixed, 50_000, &rate),
+                Err(FxError::DeviationExceeded),
+                "{fixed}"
+            );
+        }
+        assert_eq!(
+            guard_fixed_usdt_units(0, 50_000, &rate),
+            Err(FxError::BelowMinimum)
+        );
+        let fractional = Decimal::parse("77197.5").unwrap();
+        assert_eq!(
+            guard_fixed_usdt_units(38_599_000, 50_000, &fractional),
+            Ok(())
+        );
+        let huge = Decimal {
+            mantissa: u128::MAX,
+            scale: 0,
+        };
+        assert_eq!(
+            guard_fixed_usdt_units(1, u64::MAX, &huge),
+            Err(FxError::Overflow)
+        );
     }
 
     #[test]
