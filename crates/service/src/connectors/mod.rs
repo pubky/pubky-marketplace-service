@@ -52,8 +52,8 @@ pub struct ConnectorRuntime {
     pub keys: Arc<ConnectorKeys>,
     pub providers: ProviderRegistry,
     pub settings: ConnectorSettings,
-    /// Where per-variant store stock lands; skips it until the service has
-    /// per-variant inventory ([`stock::VariantInventory`]).
+    /// Where per-variant store stock lands ([`stock::VariantInventory`]): the
+    /// service's own variant rows when it has them, a skip when it does not.
     pub variant_inventory: Arc<dyn stock::VariantInventory>,
     /// Whether this service can mark an order shipped without a tracking
     /// number and sync tracking added later (`fulfillment.update_tracking`).
@@ -93,7 +93,7 @@ impl ConnectorRuntime {
             keys,
             providers,
             settings,
-            variant_inventory: Arc::new(stock::NoVariantInventory),
+            variant_inventory: Arc::new(stock::ServiceVariantInventory),
             optional_tracking: tracking_commands_available(),
         }
     }

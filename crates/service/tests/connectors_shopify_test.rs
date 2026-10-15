@@ -1115,3 +1115,174 @@ async fn the_connection_says_how_to_install_the_app_in_the_dev_dashboard(pool: P
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 }
+
+// === Per-variant stock through the seam ======================================
+
+/// A seam implementation that always answers a stale mapping.
+struct StaleMapping;
+
+#[async_trait]
+impl VariantInventory for StaleMapping {
+    async fn apply_variant_stock(
+        &self,
+        _state: &AppState,
+        _request: VariantStockRequest<'_>,
+    ) -> Result<StockOutcome, sqlx::Error> {
+        Ok(StockOutcome::MappingError("variant_assertion_mismatch"))
+    }
+}
+
+async fn two_variant_mapping(r: &Rig, seller: &TestActor, connection: Uuid, first_variant: &str) {
+    let (status, body) = api(
+        &r.app,
+        "PUT",
+        &format!("/v1/connectors/{connection}/mappings"),
+        Some(&seller.token),
+        &json!({ "mappings": [
+            { "listing_id": "boots_01", "variant_id": first_variant, "provider_product_id": PRODUCT, "provider_variant_id": "gid://shopify/ProductVariant/50003" },
+            { "listing_id": "boots_01", "variant_id": "other", "provider_product_id": PRODUCT, "provider_variant_id": "gid://shopify/ProductVariant/50002" },
+        ] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+async fn inventory_event(r: &Rig, connection: Uuid, id: &str) -> (String, Option<String>) {
+    r.webhook(
+        connection,
+        id,
+        "inventory_levels/update",
+        &json!({ "inventory_item_id": 4242 }),
+        APP_SECRET,
+    )
+    .await;
+    worker::drive_inbound(&r.app.state, 10)
+        .await
+        .expect("drive");
+    sqlx::query_as(
+        "SELECT state, outcome FROM connector_inbound_events WHERE provider_event_id = $1",
+    )
+    .bind(id)
+    .fetch_one(&r.app.pool)
+    .await
+    .expect("inbound row")
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_stale_variant_mapping_settles_as_an_error_alerts_once_and_is_never_retried(
+    pool: PgPool,
+) {
+    let r = rig_with(pool, Some(Arc::new(StaleMapping))).await;
+    let seller = new_actor(&r.app).await;
+    let buyer = new_actor(&r.app).await;
+    let connection = r.install(&seller).await;
+    create_paid_order(&r.app, &seller, &buyer).await;
+    two_variant_mapping(&r, &seller, connection, "a").await;
+    for id in ["evt-m1", "evt-m2"] {
+        let (state, outcome) = inventory_event(&r, connection, id).await;
+        assert_eq!(state, "ignored", "a permanent mapping error is not retried");
+        assert_eq!(
+            outcome.as_deref(),
+            Some("variant_mapping_error: variant_assertion_mismatch")
+        );
+    }
+    let attempts: i32 = sqlx::query_scalar("SELECT MAX(attempts) FROM connector_inbound_events")
+        .fetch_one(&r.app.pool)
+        .await
+        .expect("attempts");
+    assert_eq!(attempts, 1);
+    let alerts = r.alerts(&seller).await;
+    assert_eq!(
+        alerts.len(),
+        1,
+        "one alert per variant, however many events: {alerts:?}"
+    );
+    assert_eq!(alerts[0]["kind"], "variant_mapping_error");
+    assert!(alerts[0]["detail"]
+        .as_str()
+        .expect("detail")
+        .contains("Re-map"));
+}
+
+async fn variant_rows_table(r: &Rig) {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS listing_variant_inventory ( \
+            listing_aggregate_id TEXT NOT NULL, variant_id TEXT NOT NULL, \
+            available_quantity BIGINT NOT NULL, PRIMARY KEY (listing_aggregate_id, variant_id))",
+    )
+    .execute(&r.app.pool)
+    .await
+    .expect("variant rows table");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn the_default_seam_reads_the_variants_own_available_and_refuses_what_it_cannot_address(
+    pool: PgPool,
+) {
+    let r = rig(pool).await;
+    let seller = new_actor(&r.app).await;
+    let buyer = new_actor(&r.app).await;
+    let connection = r.install(&seller).await;
+    create_paid_order(&r.app, &seller, &buyer).await;
+    two_variant_mapping(&r, &seller, connection, "a").await;
+
+    // Without the service's per-variant rows the listing is skipped, as before.
+    let (state, outcome) = inventory_event(&r, connection, "evt-skip").await;
+    assert_eq!(
+        (state.as_str(), outcome.as_deref()),
+        ("ignored", Some("multi_variant_listing"))
+    );
+    assert!(r.alerts(&seller).await.is_empty());
+
+    // With them: the store says 3 and the variant already shows 3, so nothing is sent.
+    variant_rows_table(&r).await;
+    let aggregate = format!("listing:{}_boots_01", seller.pubky);
+    sqlx::query("INSERT INTO listing_variant_inventory VALUES ($1, 'a', 3), ($1, 'other', 9)")
+        .bind(&aggregate)
+        .execute(&r.app.pool)
+        .await
+        .expect("rows");
+    let (state, outcome) = inventory_event(&r, connection, "evt-same").await;
+    assert_eq!(
+        (state.as_str(), outcome.as_deref()),
+        ("ignored", Some("unchanged"))
+    );
+
+    // A mapping to a variant the listing no longer has is a mapping error.
+    two_variant_mapping(&r, &seller, connection, "gone").await;
+    let (state, outcome) = inventory_event(&r, connection, "evt-gone").await;
+    assert_eq!(state, "ignored");
+    assert_eq!(
+        outcome.as_deref(),
+        Some("variant_mapping_error: variant_not_found")
+    );
+
+    // A mapping with no Pubky variant id cannot be addressed at all.
+    two_variant_mapping(&r, &seller, connection, "").await;
+    let (_, outcome) = inventory_event(&r, connection, "evt-empty").await;
+    assert_eq!(
+        outcome.as_deref(),
+        Some("variant_mapping_error: variant_required")
+    );
+    let kinds: Vec<String> = r
+        .alerts(&seller)
+        .await
+        .iter()
+        .filter_map(|alert| alert["kind"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(kinds, ["variant_mapping_error", "variant_mapping_error"]);
+
+    // A change is judged against that variant's available (3), not the
+    // listing's: the target 3 moves the variant by the difference. The
+    // adjustment goes to the service, which answers; whatever it says the
+    // event settles and does not loop.
+    two_variant_mapping(&r, &seller, connection, "a").await;
+    sqlx::query(
+        "UPDATE listing_variant_inventory SET available_quantity = 1 WHERE variant_id = 'a'",
+    )
+    .execute(&r.app.pool)
+    .await
+    .expect("less stock");
+    let (state, outcome) = inventory_event(&r, connection, "evt-adjust").await;
+    assert_ne!(state, "pending", "{outcome:?}");
+}

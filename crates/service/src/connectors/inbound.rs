@@ -246,6 +246,9 @@ async fn handle(
                     StockOutcome::Unchanged => Handled::Ignored("unchanged".to_string()),
                     StockOutcome::Ignored(reason) => Handled::Ignored(reason.to_string()),
                     StockOutcome::Retry(reason) => Handled::Retry(reason),
+                    StockOutcome::MappingError(reason) => {
+                        Handled::Ignored(format!("variant_mapping_error: {reason}"))
+                    }
                 },
             )
         }
