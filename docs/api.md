@@ -801,6 +801,9 @@ record order, omitted from the canonical JSON when empty:
   before. An auction always registers one implicit row.
 - A record with two or more enabled variants whose ids are missing, malformed
   or repeated cannot be interpreted and does not register.
+- A variant-tracked listing whose payload or record lists no enabled variant
+  keeps its rows as they are (a client that predates variants never withdraws a
+  listing's sizes).
 - A listing registered with a total only (a client that predates variants) is
   converted to per-variant rows by the next sync whose record lists two or more
   enabled variants, at the same or a newer revision, when its units sold can be

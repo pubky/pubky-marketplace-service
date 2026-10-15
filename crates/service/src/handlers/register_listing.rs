@@ -427,6 +427,20 @@ pub(crate) async fn apply_registration(
                 state,
             )
         }
+        StockPlan::Keep => {
+            let (total, available) = current
+                .as_ref()
+                .map(|listing| (listing.total_quantity, listing.available_quantity))
+                .unwrap_or_default();
+            let state = if available > 0 {
+                "available"
+            } else if reserved_now > 0 {
+                "reserved"
+            } else {
+                "sold"
+            };
+            (total, available, reserved_now, sold_now, state)
+        }
         StockPlan::PerVariant { rows, .. } => {
             let total: i64 = rows.iter().map(|row| row.total).sum();
             let available: i64 = rows.iter().map(|row| row.available).sum();

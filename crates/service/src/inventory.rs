@@ -356,6 +356,32 @@ impl VariantStockView {
     }
 }
 
+/// Why a variant-addressed adjustment found no row to move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdjustTargetError {
+    Required,
+    Mismatch,
+}
+
+impl AdjustTargetError {
+    fn response(self) -> Response {
+        match self {
+            AdjustTargetError::Required => inventory_error(
+                StatusCode::CONFLICT,
+                "variant_required",
+                "The listing tracks stock per variant; name the variant to adjust.",
+                None,
+            ),
+            AdjustTargetError::Mismatch => inventory_error(
+                StatusCode::CONFLICT,
+                "variant_assertion_mismatch",
+                "The variant assertion does not match a variant of the listing.",
+                None,
+            ),
+        }
+    }
+}
+
 /// The variant row a variant-addressed adjustment moves, from the registered
 /// rows of a listing that tracks stock per variant. A request that names no
 /// variant is refused, as is one whose id and sku name different rows or no
@@ -363,23 +389,8 @@ impl VariantStockView {
 fn adjust_target<'a>(
     rows: &'a [VariantRow],
     assertion: Option<&VariantAssertion>,
-) -> Result<&'a VariantRow, Response> {
-    let Some(assertion) = assertion else {
-        return Err(inventory_error(
-            StatusCode::CONFLICT,
-            "variant_required",
-            "The listing tracks stock per variant; name the variant to adjust.",
-            None,
-        ));
-    };
-    let mismatch = || {
-        inventory_error(
-            StatusCode::CONFLICT,
-            "variant_assertion_mismatch",
-            "The variant assertion does not match a variant of the listing.",
-            None,
-        )
-    };
+) -> Result<&'a VariantRow, AdjustTargetError> {
+    let assertion = assertion.ok_or(AdjustTargetError::Required)?;
     let mut matches = rows.iter().filter(|row| {
         assertion
             .id
@@ -392,7 +403,7 @@ fn adjust_target<'a>(
     });
     match (matches.next(), matches.next()) {
         (Some(row), None) => Ok(row),
-        _ => Err(mismatch()),
+        _ => Err(AdjustTargetError::Mismatch),
     }
 }
 
@@ -870,7 +881,7 @@ pub async fn adjust_inventory_for(
     let target: Option<VariantRow> = if keyed {
         match adjust_target(&rows, request.wire.variant.as_ref()) {
             Ok(row) => Some(row.clone()),
-            Err(response) => return finish_without_mutation(tx, response).await,
+            Err(error) => return finish_without_mutation(tx, error.response()).await,
         }
     } else {
         None

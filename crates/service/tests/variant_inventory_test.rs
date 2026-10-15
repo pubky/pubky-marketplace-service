@@ -1515,3 +1515,33 @@ async fn a_late_bitcoin_settlement_for_a_sold_out_size_needs_a_refund_while_anot
     );
     assert_books_balance(&pool).await;
 }
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_record_that_enables_no_variant_leaves_the_rows_alone(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    put_record(
+        &homeserver,
+        &seller.pubky,
+        record(1, &[("size_s", true, 2), ("size_m", true, 3)]),
+    );
+    let (status, body) = execute(&app, &buyer.token, &sync(&seller.pubky, 1)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    put_record(
+        &homeserver,
+        &seller.pubky,
+        record(2, &[("size_s", false, 2), ("size_m", false, 3)]),
+    );
+    let (status, body) = execute(&app, &buyer.token, &sync(&seller.pubky, 2)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let stored = rows(&app.pool, &seller.pubky).await;
+    assert_eq!(row(&stored, "size_s"), (2, 0, 0, 2));
+    assert_eq!(row(&stored, "size_m"), (3, 0, 0, 3));
+    assert_eq!(
+        totals(&app.pool, &seller.pubky).await,
+        (5, 0, 0, 5, "available".to_string())
+    );
+    assert_books_balance(&app.pool).await;
+}

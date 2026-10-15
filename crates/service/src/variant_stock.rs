@@ -326,6 +326,11 @@ pub enum StockPlan {
     /// One implicit row holding the payload's quantity (the listing sells
     /// one variant, as before per-variant stock).
     Implicit,
+    /// The listing already tracks variants and the record lists no enabled
+    /// variant with a usable id (or a client that predates variants sent
+    /// none): the rows stay as they are, so a payload that says nothing about
+    /// variants never withdraws a listing's sizes.
+    Keep,
     /// One row per variant. `convert` is true when the listing's implicit row
     /// is replaced by the keyed rows.
     PerVariant {
@@ -408,6 +413,9 @@ pub async fn plan(
     let keyed = tracks_variants(rows);
     if !keyed && variants.len() < 2 {
         return Ok(Ok(StockPlan::Implicit));
+    }
+    if keyed && variants.is_empty() {
+        return Ok(Ok(StockPlan::Keep));
     }
 
     let mut convert = false;

@@ -28,12 +28,7 @@ fn through(version: i64) -> Migrator {
     }
 }
 
-async fn seed_listing(
-    pool: &PgPool,
-    aggregate: &str,
-    sale_format: &str,
-    quantities: (i64, i64, i64, i64),
-) {
+async fn seed_listing(pool: &PgPool, aggregate: &str, sale_format: &str, quantities: Quantities) {
     let (total, available, reserved, sold) = quantities;
     sqlx::query(
         "INSERT INTO listings (aggregate_id, seller_pubky, listing_id, title, listing_revision, \
@@ -55,6 +50,8 @@ async fn seed_listing(
 }
 
 type RowFacts = (String, bool, i64, i64, i64, i64);
+/// `(total, available, reserved, sold)`.
+type Quantities = (i64, i64, i64, i64);
 
 async fn rows(pool: &PgPool, aggregate: &str) -> Vec<RowFacts> {
     sqlx::query_as(
@@ -106,7 +103,7 @@ async fn insert_row(
 
 /// Replaces a listing's implicit row with keyed rows the way a registration
 /// does: keyed rows first, then the implicit row.
-async fn make_keyed(pool: &PgPool, aggregate: &str, keyed: &[(&str, (i64, i64, i64, i64))]) {
+async fn make_keyed(pool: &PgPool, aggregate: &str, keyed: &[(&str, Quantities)]) {
     for (position, (variant, quantities)) in keyed.iter().enumerate() {
         insert_row(pool, aggregate, variant, position as i32, *quantities)
             .await
