@@ -124,6 +124,41 @@ async fn a_paykit_outage_reads_as_unavailable_and_never_fails_the_read(pool: PgP
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_save_during_a_paykit_outage_commits_and_answers_unavailable(pool: PgPool) {
+    let (app, paykit) = upstream_flag_off(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    paykit.fail_setup_status_with(503);
+
+    let saved = put_own(&app, &seller.token, true).await;
+    assert_eq!(saved["payment_config"]["bitcoin_enabled"], json!(true));
+    assert_eq!(
+        saved["payment_config"]["bitcoin_setup"],
+        json!("unavailable")
+    );
+    let stored: bool = sqlx::query_scalar(
+        "SELECT bitcoin_enabled FROM seller_payment_configs WHERE seller_pubky = $1",
+    )
+    .bind(&seller.pubky)
+    .fetch_one(&pool)
+    .await
+    .expect("row");
+    assert!(stored, "the save committed despite the Paykit outage");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_fork_outage_reads_as_unavailable(pool: PgPool) {
+    let (app, paykit) = test_app_with_payments(pool).await;
+    let seller = new_actor(&app).await;
+    paykit.fail_account_exists();
+
+    let body = get_own(&app, &seller.token).await;
+    assert_eq!(
+        body["payment_config"]["bitcoin_setup"],
+        json!("unavailable")
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn the_fork_answers_from_the_claimed_watch_only_account(pool: PgPool) {
     let (app, paykit) = test_app_with_payments(pool).await;
     let seller = new_actor(&app).await;
