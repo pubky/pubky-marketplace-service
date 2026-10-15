@@ -197,3 +197,50 @@ stacked on, and reads or writes nothing 0060 creates. A binary from before
 both constraints admit, so a rolling replacement is safe. After 0061 the new
 sampler needs about three minutes of samples before a non-USD price can be
 quoted.
+
+## Per-variant inventory (0070)
+
+`0070_variant_inventory.sql` is additive and directly rerunnable. It takes
+number 0070 and reads and writes nothing from 0060 to 0069 (0062 to 0069 are
+the connectors'): it depends only on `listings` and `reservations`. See [per-variant stock](api.md#per-variant-stock).
+
+- `listing_variant_inventory` (new table): one row per variant,
+  `(listing_aggregate_id, variant_id)` primary key, `enabled`, `position`,
+  `sku`, and `total`/`available`/`reserved`/`sold` quantities with the same
+  balance check as `listings`. `variant_id = ''` is the implicit row of a
+  listing that sells one variant (no sku, enabled, position 0).
+- `listings.variant_availability` (nullable `JSONB`, no default, no rewrite):
+  the public per-variant view, written only by the roll-up trigger.
+- `reservations.variant_id` (nullable `TEXT`): the variant row a reservation
+  holds. `NULL` is the implicit row, which is every reservation that exists.
+- Backfill: one implicit row per listing that has none, equal to the listing's
+  totals. A rerun adds nothing to a listing that already has rows, so it never
+  re-adds an implicit row beside keyed rows. The statement reads `listings`
+  and inserts into the new table; it takes no lock on `listings`.
+- Three triggers keep the listing's quantity columns the sum of its rows in
+  the same statement as every change: `listing_variant_inventory_roll_up`
+  (rows to listing), `listings_variant_rows_follow` (a direct write of the
+  listing's quantity columns, to the implicit row) and
+  `listings_implicit_variant_row` (every new listing has its implicit row).
+
+No index is built on an existing table. `ALTER TABLE ... ADD COLUMN` adds
+nullable columns without a default, and the file sets `lock_timeout` like 0050,
+so creating the triggers on `listings` fails the start instead of queueing
+behind a long transaction.
+
+**Deploy mode: rolling.** A binary from before 0070 keeps working on a listing
+that sells one variant: its write of the listing's totals is copied into the
+implicit row, and its `INSERT INTO listings` gets an implicit row from the
+insert trigger. It cannot sell a listing that tracks several variants: its
+write of that listing's totals raises `check_violation` (`listing ... tracks
+stock per variant`) and rolls that transaction back, instead of selling units
+the variant rows do not know about. A listing becomes variant-tracked only when
+a new binary reads a record with two or more enabled variants, so during the
+overlap an old replica refuses only those listings. Roll forward rather than
+back once a listing tracks variants: a binary that predates 0070 would refuse
+every sale of it.
+
+`crates/service/tests/migration_0070_test.rs` (serial: it replays 0032 on a
+scratch database) pins the backfill on a database migrated through 0069, the
+rerun, each trigger, the old-binary write, and the table's checks.
+
