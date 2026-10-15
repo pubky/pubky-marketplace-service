@@ -2513,14 +2513,12 @@ async fn usdt_finality_that_stays_pending_for_seven_days_goes_to_an_operator(poo
 // ---------------------------------------------------------------------------
 
 /// Two polls of one order overlap (the first is held at the status call
-/// while the second claims, which the poll interval allows once the clock
-/// moved on) and apply different observations. Whatever the interleaving,
-/// the order settles exactly once or goes to review exactly once, never
-/// both, never twice.
+/// until the second one's request arrives, with no timing involved) and
+/// apply different observations. Whatever the interleaving, the order settles
+/// exactly once or goes to review exactly once, never both, never twice.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn concurrent_polls_settle_or_review_an_order_exactly_once(pool: PgPool) {
     let f = fixture(pool.clone(), Setup::both()).await;
-    f.paykit.delay_marketplace_status(400);
     for round in 0..4_i64 {
         let active = active_order(&f).await;
         let order_id = active.order.order_id.clone();
@@ -2545,6 +2543,7 @@ async fn concurrent_polls_settle_or_review_an_order_exactly_once(pool: PgPool) {
             (both.clone(), usdt_only.clone())
         };
         f.paykit.set_marketplace_status(active.invoice, first);
+        f.paykit.rendezvous_marketplace_status(active.invoice, 2);
         let state = f.app.state.clone();
         let started = tokio::spawn(async move {
             let client = state
@@ -2560,7 +2559,12 @@ async fn concurrent_polls_settle_or_review_an_order_exactly_once(pool: PgPool) {
             .await
             .expect("first poll")
         });
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        // The first poll has claimed the order and its request waits at the
+        // barrier holding the first body; only now does the second body go
+        // up, and the second poll's request releases both answers together.
+        f.paykit
+            .wait_for_marketplace_status_requests(active.invoice, 1)
+            .await;
         f.paykit.set_marketplace_status(active.invoice, second);
         let second_poll = poll_now(&f.app, at(10 * (round + 1) + 5)).await;
         let first_poll = started.await.expect("first poll joins");

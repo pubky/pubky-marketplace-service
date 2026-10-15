@@ -2447,8 +2447,11 @@ struct FakePaykitState {
     /// Exact Marketplace status bodies by server-issued invoice id.
     marketplace_status_bodies: HashMap<uuid::Uuid, Value>,
     marketplace_status_failure: Option<(u16, String)>,
-    /// How long every Marketplace status answer is held back.
-    marketplace_status_delay_ms: u64,
+    /// Holds the Marketplace status answers for one invoice at a barrier:
+    /// the answers are released together once `parties` requests arrived.
+    marketplace_status_rendezvous: Option<(uuid::Uuid, Arc<tokio::sync::Barrier>)>,
+    /// Signalled whenever a Marketplace status request arrives.
+    marketplace_status_arrived: Arc<tokio::sync::Notify>,
     /// Status every transaction-status call answers with, when forced.
     status_failure: Option<u16>,
     calls: Vec<FakePaykitCall>,
@@ -2781,12 +2784,41 @@ impl FakePaykit {
             .insert(invoice_id, body);
     }
 
-    /// Holds every Marketplace status answer back by `millis`.
-    pub fn delay_marketplace_status(&self, millis: u64) {
+    /// Holds the status answers for `invoice_id` at a barrier of `parties`:
+    /// each request reads its body when it arrives and waits until `parties`
+    /// requests for the invoice have arrived, then the answers go out
+    /// together. The barrier is reusable.
+    pub fn rendezvous_marketplace_status(&self, invoice_id: uuid::Uuid, parties: usize) {
         self.state
             .lock()
             .expect("fake paykit lock")
-            .marketplace_status_delay_ms = millis;
+            .marketplace_status_rendezvous =
+            Some((invoice_id, Arc::new(tokio::sync::Barrier::new(parties))));
+    }
+
+    /// Returns once `count` status requests for `invoice_id` have arrived.
+    pub async fn wait_for_marketplace_status_requests(&self, invoice_id: uuid::Uuid, count: usize) {
+        let wanted = serde_json::json!(invoice_id);
+        loop {
+            let (arrived, notify) = {
+                let guard = self.state.lock().expect("fake paykit lock");
+                (
+                    guard
+                        .calls
+                        .iter()
+                        .filter(|call| {
+                            call.path == "/marketplace/payment-requests/status"
+                                && call.body["invoice_id"] == wanted
+                        })
+                        .count(),
+                    guard.marketplace_status_arrived.clone(),
+                )
+            };
+            if arrived >= count {
+                return;
+            }
+            notify.notified().await;
+        }
     }
 
     pub fn clear_marketplace_status_failure(&self) {
@@ -3970,14 +4002,21 @@ async fn serve_marketplace_status(
         }
         guard.marketplace_status_bodies.get(&invoice_id).cloned()
     };
-    // The body is fixed when the request arrives; the delay only holds the
-    // answer, so two polls can read different bodies and still overlap.
-    let delay = state
-        .lock()
-        .expect("fake paykit lock")
-        .marketplace_status_delay_ms;
-    if delay > 0 {
-        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+    // The body is fixed when the request arrives; the rendezvous only holds
+    // the answer, so two polls can read different bodies and still overlap.
+    let (rendezvous, arrived) = {
+        let guard = state.lock().expect("fake paykit lock");
+        (
+            guard
+                .marketplace_status_rendezvous
+                .clone()
+                .filter(|(invoice, _)| *invoice == invoice_id),
+            guard.marketplace_status_arrived.clone(),
+        )
+    };
+    arrived.notify_one();
+    if let Some((_, barrier)) = rendezvous {
+        barrier.wait().await;
     }
     match response {
         Some(response) => (StatusCode::OK, axum::Json(response)).into_response(),
@@ -4009,7 +4048,8 @@ pub async fn spawn_fake_paykit() -> FakePaykit {
         status_bodies: HashMap::new(),
         marketplace_status_bodies: HashMap::new(),
         marketplace_status_failure: None,
-        marketplace_status_delay_ms: 0,
+        marketplace_status_rendezvous: None,
+        marketplace_status_arrived: Arc::new(tokio::sync::Notify::new()),
         status_failure: None,
         calls: Vec::new(),
         rail_health: json!({
