@@ -915,18 +915,27 @@ async fn split_mode_maps_each_store_variant_to_its_own_listing(pool: PgPool) {
         &json!({ "variant_mode": "split" }),
     )
     .await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(body["error"]["code"], "mappings_conflict");
-
-    api(
-        &r.app,
-        "PUT",
-        &mappings,
-        Some(&seller.token),
-        &json!({ "mappings": [] }),
-    )
-    .await;
-    let (status, body) = api(
+    // No circular refusal: the switch unmaps the combined listing, says so in
+    // the response and in an alert, and the seller re-imports or ends it.
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["connection"]["variant_mode"], "split");
+    assert_eq!(
+        body["unmapped_listings"],
+        json!([{ "listing_id": "boots_01", "mappings_removed": 2 }])
+    );
+    assert_eq!(body["connection"]["mapping_count"], 0);
+    let alerts = r.alerts(&seller).await;
+    assert_eq!(alerts.len(), 1, "{alerts:?}");
+    assert_eq!(alerts[0]["kind"], "listings_unmapped");
+    let detail = alerts[0]["detail"].as_str().expect("detail");
+    assert!(
+        detail.contains("boots_01") && detail.contains("re-import"),
+        "{detail}"
+    );
+    let (_, listed) = api(&r.app, "GET", &mappings, Some(&seller.token), &json!(null)).await;
+    assert_eq!(listed["mappings"], json!([]));
+    // Switching again with nothing combined unmaps nothing and raises nothing more.
+    let (status, again) = api(
         &r.app,
         "PUT",
         &settings,
@@ -934,8 +943,9 @@ async fn split_mode_maps_each_store_variant_to_its_own_listing(pool: PgPool) {
         &json!({ "variant_mode": "split" }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["connection"]["variant_mode"], "split");
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(again["unmapped_listings"], json!([]));
+    assert_eq!(r.alerts(&seller).await.len(), 1);
     let (status, body) = api(&r.app, "PUT", &mappings, Some(&seller.token), &two_variants).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     assert_eq!(body["error"]["code"], "split_mode_listing_shared");
@@ -1053,4 +1063,55 @@ async fn without_per_variant_inventory_a_multi_variant_listing_is_left_alone(poo
         .await
         .expect("listing");
     assert_eq!(before, after);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn the_connection_says_how_to_install_the_app_in_the_dev_dashboard(pool: PgPool) {
+    let r = rig(pool).await;
+    let seller = new_actor(&r.app).await;
+    let id = start_connect(&r.app, &seller, SHOP).await;
+    let (status, saved) = save_credentials(&r.app, &seller, id, CLIENT_ID, APP_SECRET).await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    for connection in [
+        &saved["connection"],
+        &api(
+            &r.app,
+            "GET",
+            "/v1/connectors",
+            Some(&seller.token),
+            &json!(null),
+        )
+        .await
+        .1["connections"][0],
+    ] {
+        // Shopify's docs do not say the authorize URL installs an app the
+        // store does not have yet, so there is no service-built link: the
+        // Dev Dashboard path is returned instead.
+        assert_eq!(connection["install_url"], Value::Null);
+        let install = &connection["install"];
+        assert_eq!(install["method"], "dev_dashboard");
+        assert!(install["where"]
+            .as_str()
+            .expect("where")
+            .contains("Installs card"));
+        assert!(install["where"]
+            .as_str()
+            .expect("where")
+            .contains("Generate link"));
+        assert_eq!(install["app_url"], connection["urls"]["launch"]);
+        assert_eq!(
+            install["redirect_url"],
+            connection["urls"]["oauth_callback"]
+        );
+        assert!(!install.to_string().contains(APP_SECRET));
+    }
+    let (status, _) = api(
+        &r.app,
+        "DELETE",
+        &format!("/v1/connectors/{id}"),
+        Some(&seller.token),
+        &json!(null),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
 }

@@ -275,6 +275,32 @@ fn urls_json(runtime: &ConnectorRuntime, row: &ConnectionRow) -> Value {
     }
 }
 
+/// How the merchant installs the app (see
+/// [`ConnectorProvider::install_guidance`]); `null` once the connection is
+/// disconnected or when the provider needs no install step. `install_url`
+/// beside it is `null` for Shopify, whose install happens in the Dev
+/// Dashboard.
+fn install_json(runtime: &ConnectorRuntime, row: &ConnectionRow) -> Value {
+    if row.status == "disconnected" {
+        return Value::Null;
+    }
+    let Some(kind) = row.provider_kind() else {
+        return Value::Null;
+    };
+    let (app_url, redirect_url) = match kind {
+        ProviderKind::Shopify => (
+            runtime.settings.shopify_launch_url(row.id),
+            runtime.settings.shopify_callback_url(row.id),
+        ),
+        ProviderKind::Woocommerce => return Value::Null,
+    };
+    runtime
+        .providers
+        .get(kind)
+        .and_then(|provider| provider.install_guidance(&app_url, &redirect_url))
+        .unwrap_or(Value::Null)
+}
+
 struct ConnectionFacts {
     mappings: i64,
     pushes: BTreeMap<String, i64>,
@@ -298,6 +324,8 @@ fn connection_json(
         "missing_scopes": row.missing_scopes,
         "credentials_saved": facts.credentials_saved,
         "urls": urls_json(runtime, row),
+        "install_url": Value::Null,
+        "install": install_json(runtime, row),
         "expires_at": (row.status == "draft")
             .then(|| row.connect_expires_at.map(ts))
             .flatten(),
@@ -602,19 +630,14 @@ pub async fn start_connect(
         }
         Err(ConnectError::Database(cause)) => return internal("connect start", &cause),
     };
-    let row = match variant_mode {
+    let (row, unmapped) = match variant_mode {
         Some(split) => {
             match store::set_variant_mode(&state.pool, &row, split, state.clock.now()).await {
-                Ok(row) => row,
-                Err(store::VariantModeError::SharedListing(listing_id)) => {
-                    return mappings_conflict(&listing_id)
-                }
-                Err(store::VariantModeError::Database(cause)) => {
-                    return internal("variant mode", &cause)
-                }
+                Ok(switch) => (switch.connection, switch.unmapped),
+                Err(cause) => return internal("variant mode", &cause),
             }
         }
-        None => row,
+        None => (row, Vec::new()),
     };
     let app = match runtime.app_for(&state.pool, &row).await {
         Ok(app) => app,
@@ -656,6 +679,7 @@ pub async fn start_connect(
             "kind": "connector_connect",
             "connection": view,
             "authorize_url": started.authorize_url,
+            "unmapped_listings": unmapped,
         }),
     )
 }
@@ -1058,8 +1082,9 @@ pub struct PutSettingsRequest {
 
 /// `PUT /v1/connectors/{id}/settings`: how the connection's store variants
 /// relate to Pubky listings. `split` maps each store variant to its own
-/// listing (stock then syncs per listing); it is refused while a listing is
-/// mapped to several store variants (`409 mappings_conflict`).
+/// listing (stock then syncs per listing). Switching to it unmaps every listing
+/// that combines several store variants, in the same step, and says which in
+/// the response (`unmapped_listings`) and in a `listings_unmapped` alert.
 pub async fn put_settings(
     State(state): State<AppState>,
     Extension(actor): Extension<Actor>,
@@ -1093,37 +1118,20 @@ pub async fn put_settings(
         );
     }
     match store::set_variant_mode(&state.pool, &row, split, state.clock.now()).await {
-        Ok(updated) => match connection_view(&state, runtime, &updated).await {
+        Ok(switch) => match connection_view(&state, runtime, &switch.connection).await {
             Ok(view) => respond(
                 StatusCode::OK,
                 json!({
                     "schema_version": 1,
                     "kind": "connector_settings",
                     "connection": view,
+                    "unmapped_listings": switch.unmapped,
                 }),
             ),
             Err(cause) => internal("connection summary", &cause),
         },
-        Err(store::VariantModeError::SharedListing(listing_id)) => mappings_conflict(&listing_id),
-        Err(store::VariantModeError::Database(cause)) => internal("variant mode", &cause),
+        Err(cause) => internal("variant mode", &cause),
     }
-}
-
-/// `409 mappings_conflict`: `split` was asked for while a listing is mapped to
-/// several store variants.
-fn mappings_conflict(listing_id: &str) -> Response {
-    respond(
-        StatusCode::CONFLICT,
-        json!({
-            "schema_version": 1,
-            "ok": false,
-            "error": {
-                "code": "mappings_conflict",
-                "message": "A listing is mapped to several store variants. Remap them one to one first.",
-                "listing_id": listing_id,
-            },
-        }),
-    )
 }
 
 /// `GET /v1/connectors/{id}/check`: a live look at the connection for the

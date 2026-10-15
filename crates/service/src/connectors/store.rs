@@ -797,45 +797,66 @@ pub fn truncate(text: &str, max_chars: usize) -> String {
     text.chars().take(max_chars).collect()
 }
 
-#[derive(Debug)]
-pub enum VariantModeError {
-    /// Switching to `split` while a listing is mapped to more than one store
-    /// variant.
-    SharedListing(String),
-    Database(sqlx::Error),
+/// A listing that combined several store variants and was unmapped when the
+/// connection switched to `split`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnmappedListing {
+    pub listing_id: String,
+    /// How many variant mappings the listing had.
+    pub mappings_removed: i64,
 }
 
-impl From<sqlx::Error> for VariantModeError {
-    fn from(error: sqlx::Error) -> Self {
-        Self::Database(error)
-    }
+/// What switching the variant mode did.
+#[derive(Debug)]
+pub struct VariantSwitch {
+    pub connection: ConnectionRow,
+    /// Listings unmapped because they combined several store variants; empty
+    /// unless the connection switched to `split`.
+    pub unmapped: Vec<UnmappedListing>,
 }
 
 /// Sets how the connection's store variants relate to Pubky listings
-/// (`native` or `split`). `split` is refused while a listing is mapped to
-/// more than one store variant.
+/// (`native` or `split`). Switching to `split` unmaps every listing that
+/// combines several store variants (all of its mappings: which one the listing
+/// keeps is the seller's call), in the same transaction, and raises a
+/// `listings_unmapped` alert naming them. The seller then re-imports each
+/// store variant as its own listing or ends the combined one; the product
+/// selection is left as it was, so the catalog still offers them. Nothing is
+/// refused: an unmapped listing is the starting point of that fix, and a
+/// refusal that told the seller to unmap first would send them in a circle.
 pub async fn set_variant_mode(
     pool: &PgPool,
     connection: &ConnectionRow,
     split: bool,
     now: DateTime<Utc>,
-) -> Result<ConnectionRow, VariantModeError> {
+) -> Result<VariantSwitch, sqlx::Error> {
     let mut tx = pool.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('connector-map|' || $1::text, 0))")
         .bind(connection.id)
         .execute(&mut *tx)
         .await?;
+    let mut unmapped = Vec::new();
     if split {
-        let shared: Option<String> = sqlx::query_scalar(
-            "SELECT listing_id FROM connector_variant_map WHERE connection_id = $1 \
-             GROUP BY listing_id HAVING COUNT(*) > 1 LIMIT 1",
+        let removed: Vec<(String, i64)> = sqlx::query_as(
+            "WITH combined AS ( \
+                 SELECT listing_id FROM connector_variant_map WHERE connection_id = $1 \
+                 GROUP BY listing_id HAVING COUNT(*) > 1), \
+             gone AS ( \
+                 DELETE FROM connector_variant_map m USING combined c \
+                 WHERE m.connection_id = $1 AND m.listing_id = c.listing_id \
+                 RETURNING m.listing_id) \
+             SELECT listing_id, COUNT(*) FROM gone GROUP BY listing_id ORDER BY listing_id",
         )
         .bind(connection.id)
-        .fetch_optional(&mut *tx)
+        .fetch_all(&mut *tx)
         .await?;
-        if let Some(listing_id) = shared {
-            return Err(VariantModeError::SharedListing(listing_id));
-        }
+        unmapped = removed
+            .into_iter()
+            .map(|(listing_id, mappings_removed)| UnmappedListing {
+                listing_id,
+                mappings_removed,
+            })
+            .collect();
     }
     let row: ConnectionRow = sqlx::query_as(&format!(
         "UPDATE connector_connections SET variant_mode = $2, updated_at = $3 \
@@ -847,8 +868,40 @@ pub async fn set_variant_mode(
     .bind(&connection.seller_pubky)
     .fetch_one(&mut *tx)
     .await?;
+    if !unmapped.is_empty() {
+        let names = unmapped
+            .iter()
+            .map(|listing| {
+                format!(
+                    "{} ({} variants)",
+                    listing.listing_id, listing.mappings_removed
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        raise_alert(
+            &mut *tx,
+            now,
+            &row,
+            AlertKind::ListingsUnmapped,
+            None,
+            &format!(
+                "Switching to split variant mode unmapped {} listing{} that combined several store variants: {names}. \
+                 In split mode each store variant is its own Pubky listing: re-import each variant from the store's \
+                 catalog as a separate listing, or end the combined listing. Orders for an unmapped listing are not \
+                 sent to the store until it is mapped again.",
+                unmapped.len(),
+                if unmapped.len() == 1 { "" } else { "s" },
+            ),
+            &format!("listings-unmapped|{}|{}", row.id, crate::clock::format_timestamp(now)),
+        )
+        .await?;
+    }
     tx.commit().await?;
-    Ok(row)
+    Ok(VariantSwitch {
+        connection: row,
+        unmapped,
+    })
 }
 
 // === Mappings and product selection ==========================================

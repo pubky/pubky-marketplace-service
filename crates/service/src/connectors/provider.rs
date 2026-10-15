@@ -588,6 +588,16 @@ pub trait ConnectorProvider: Send + Sync + 'static {
         Vec::new()
     }
 
+    /// How the merchant installs the app on their store, for the Shop to show
+    /// next to the connection's URLs: a JSON object (`method`, `where`,
+    /// `app_url`, `redirect_url`, `note`) or `None` for a provider that needs
+    /// no merchant-side install (WooCommerce sends the merchant straight to the
+    /// store). The service builds no install link when the provider's own
+    /// documentation does not confirm that one would install the app.
+    fn install_guidance(&self, _app_url: &str, _redirect_url: &str) -> Option<serde_json::Value> {
+        None
+    }
+
     /// Starts a connection after the seller's connect request. Returns where
     /// the merchant approves it, or `None` when the install starts from the
     /// store (see [`Self::verify_launch`]).

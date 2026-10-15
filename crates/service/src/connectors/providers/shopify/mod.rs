@@ -136,6 +136,16 @@ impl ConnectorProvider for ShopifyProvider {
             .collect()
     }
 
+    fn install_guidance(&self, app_url: &str, redirect_url: &str) -> Option<Value> {
+        Some(json!({
+            "method": "dev_dashboard",
+            "where": "In the Shopify Dev Dashboard, open your app and install it from the Installs card (an app created in the store's own organization), or choose Custom distribution, enter the store's myshopify.com domain, click Generate link and open that link as the store owner.",
+            "app_url": app_url,
+            "redirect_url": redirect_url,
+            "note": "Set the app's App URL and redirect URL to the two values above before installing. Shopify opens the App URL after the install, which sends you to approve the connection. The service gives no authorize link of its own: Shopify's documentation describes the authorize URL as the step that obtains a token for an app, not as one that installs an app the store does not have yet.",
+        }))
+    }
+
     async fn connect(&self, _request: &ConnectRequest) -> Result<ConnectStart, ProviderError> {
         Ok(ConnectStart {
             authorize_url: None,

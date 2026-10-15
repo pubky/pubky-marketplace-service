@@ -883,7 +883,9 @@ async fn a_refund_in_other_currencies_is_alerted_with_each_amount_not_one_sum(po
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn asking_for_split_mode_on_a_connection_with_a_shared_listing_is_a_conflict(pool: PgPool) {
+async fn asking_for_split_mode_at_connect_unmaps_a_combined_listing_instead_of_refusing(
+    pool: PgPool,
+) {
     let s = pushed(pool).await;
     // A draft for another store that already carries two mappings on one
     // listing (written directly: the mapping API refuses drafts).
@@ -920,19 +922,26 @@ async fn asking_for_split_mode_on_a_connection_with_a_shared_listing_is_a_confli
         &json!({ "provider": "shopify", "domain": other, "variant_mode": "split" }),
     )
     .await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(body["error"]["code"], "mappings_conflict");
-    assert_eq!(body["error"]["listing_id"], "boots_01");
-    let mode: String =
-        sqlx::query_scalar("SELECT variant_mode FROM connector_connections WHERE id = $1::uuid")
-            .bind(&draft)
-            .fetch_one(&s.app.pool)
-            .await
-            .expect("mode");
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["connection"]["variant_mode"], "split");
     assert_eq!(
-        mode, "native",
-        "the answer is the refusal, not a silent downgrade"
+        body["unmapped_listings"],
+        json!([{ "listing_id": "boots_01", "mappings_removed": 2 }]),
+        "the combined listing is unmapped and reported, not refused and not silently kept"
     );
+    let left: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM connector_variant_map WHERE connection_id = $1::uuid",
+    )
+    .bind(&draft)
+    .fetch_one(&s.app.pool)
+    .await
+    .expect("count");
+    assert_eq!(left, 0);
+    assert!(s
+        .alerts()
+        .await
+        .iter()
+        .any(|alert| alert["kind"] == "listings_unmapped"));
     let _ = s.connection;
 }
 
