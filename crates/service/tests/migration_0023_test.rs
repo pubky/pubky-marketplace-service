@@ -549,8 +549,8 @@ async fn migration_0023_adds_the_shared_manual_resolution_schema() {
 /// per-order delivery terms 0056, sealed delivery addresses 0057, the purge of
 /// retired Stripe values 0058, listing deletion follower backoff 0059, and
 /// the single Paykit bind 0060, multi-currency FX 0061, and the update-tracking
-/// command kind 0071 (0062 to 0070 are claimed by other open branches, so this
-/// branch does not number into them).
+/// command kind 0071, and the store connectors 0062 to 0067 (0065 and 0067 are
+/// the Shopify provider's; 0068 to 0070 are claimed by other open branches).
 fn sorted_migration_catalog(mut numbers: Vec<u32>) -> Vec<u32> {
     numbers.sort_unstable();
     numbers

@@ -168,8 +168,8 @@ defaults, so a rolling replacement is safe.
 
 ## Store connectors (0062 to 0067)
 
-The connector framework uses 0062 to 0064, 0066 and 0067 of the 0062 to 0069 range reserved
-for connectors (0065 is the Shopify provider's). They follow 0061 (multi-currency
+The connector framework uses 0062 to 0064 and 0066 of the 0062 to 0069 range reserved
+for connectors (0065 and 0067 are the Shopify provider's). They follow 0061 (multi-currency
 FX, merged) and read two of its `orders` columns only as optional values
 (`usd_conversion_pair`, `usd_conversion_cents`). All are additive and
 rerunnable.
