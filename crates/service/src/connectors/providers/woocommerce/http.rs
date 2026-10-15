@@ -30,6 +30,9 @@ pub struct WooOptions {
     pub request_timeout: Duration,
     /// Products per catalog request (WooCommerce allows up to 100).
     pub catalog_page_size: u32,
+    /// Items per request when a list is read in full (webhooks, an order's
+    /// refunds, order search); every such read follows the pages.
+    pub list_page_size: u32,
 }
 
 impl Default for WooOptions {
@@ -39,6 +42,7 @@ impl Default for WooOptions {
             extra_roots: Vec::new(),
             request_timeout: Duration::from_secs(25),
             catalog_page_size: 50,
+            list_page_size: 100,
         }
     }
 }
@@ -58,7 +62,13 @@ impl WooOptions {
             extra_roots,
             request_timeout: Duration::from_secs(25),
             catalog_page_size: 50,
+            list_page_size: 100,
         }
+    }
+
+    pub fn with_list_page_size(mut self, size: u32) -> Self {
+        self.list_page_size = size.clamp(1, 100);
+        self
     }
 
     pub fn with_catalog_page_size(mut self, size: u32) -> Self {
@@ -172,6 +182,10 @@ impl WooHttp {
 
     pub fn plain_http(&self) -> bool {
         self.options.policy.plain_http
+    }
+
+    pub fn list_page_size(&self) -> u32 {
+        self.options.list_page_size.clamp(1, 100)
     }
 
     pub fn catalog_page_size(&self) -> u32 {

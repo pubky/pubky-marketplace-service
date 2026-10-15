@@ -196,13 +196,48 @@ pub async fn push(
     // between the caller's lookup and this create. The Pubky order id is on
     // every order we make, so look again: the oldest order is the push, any
     // other is a duplicate and is cancelled (the store puts its stock back).
+    // If cancelling fails the push fails, and the retry starts with
+    // [`find`], which settles duplicates the same way, so a duplicate is never
+    // abandoned.
     let all = matching_orders(api, order.pubky_order_id).await?;
-    let Some(&kept) = all.iter().min() else {
-        return Ok(ExternalOrder { id: id.to_string() });
+    match settle_duplicates(api, &all).await? {
+        Some(kept) => Ok(ExternalOrder {
+            id: kept.to_string(),
+        }),
+        None => Ok(ExternalOrder { id: id.to_string() }),
+    }
+}
+
+/// A store order carrying our Pubky order id, as the search found it.
+#[derive(Debug, Clone)]
+struct Hit {
+    id: i64,
+    status: String,
+}
+
+/// Statuses in which a duplicate may still be cancelled; a duplicate the
+/// merchant already completed, refunded or otherwise closed is left alone.
+const OPEN_STATUSES: [&str; 3] = ["pending", "processing", "on-hold"];
+
+/// The order that is the push: the oldest not cancelled, or, when every one was
+/// cancelled, the oldest of those. Every other open order is a duplicate and
+/// is cancelled, marked as such, so it never counts and its stock goes back.
+/// Returns the id kept, or `None` for no hits.
+async fn settle_duplicates(api: &Api<'_>, hits: &[Hit]) -> Result<Option<i64>, ProviderError> {
+    let Some(kept) = hits
+        .iter()
+        .map(|hit| (hit.status == "cancelled", hit.id))
+        .min()
+        .map(|(_, id)| id)
+    else {
+        return Ok(None);
     };
-    for duplicate in all.iter().filter(|other| **other != kept) {
+    for duplicate in hits
+        .iter()
+        .filter(|hit| hit.id != kept && OPEN_STATUSES.contains(&hit.status.as_str()))
+    {
         api.put(
-            &format!("/orders/{duplicate}"),
+            &format!("/orders/{}", duplicate.id),
             &json!({
                 "status": "cancelled",
                 "meta_data": [{"key": META_CANCELLED, "value": "duplicate push"}],
@@ -210,34 +245,42 @@ pub async fn push(
         )
         .await?;
     }
-    Ok(ExternalOrder {
-        id: kept.to_string(),
-    })
+    Ok(Some(kept))
 }
 
-/// The ids of every store order carrying this Pubky order id, found by the
-/// item-name search and checked against the order meta.
-async fn matching_orders(api: &Api<'_>, pubky_order_id: Uuid) -> Result<Vec<i64>, ProviderError> {
+fn hits_of(orders: &[Value], pubky_order_id: &str) -> Vec<Hit> {
+    orders
+        .iter()
+        .filter(|order| has_order_meta(order, pubky_order_id))
+        .filter_map(|order| {
+            Some(Hit {
+                id: id_of(order)?,
+                status: order
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Every store order carrying this Pubky order id, found by the item-name
+/// search (all its pages) and checked against the order meta.
+async fn matching_orders(api: &Api<'_>, pubky_order_id: Uuid) -> Result<Vec<Hit>, ProviderError> {
     let wanted = pubky_order_id.to_string();
     let searched = api
-        .get(
+        .list_all(
             "/orders",
             &[
                 ("search", wanted.clone()),
-                ("per_page", "20".into()),
+                ("orderby", "id".into()),
+                ("order", "asc".into()),
                 ("_fields", "id,status,meta_data".into()),
             ],
         )
-        .await?
-        .json()?;
-    Ok(searched
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|order| has_order_meta(order, &wanted))
-        .filter(|order| order.get("status").and_then(Value::as_str) != Some("cancelled"))
-        .filter_map(id_of)
-        .collect())
+        .await?;
+    Ok(hits_of(&searched, &wanted))
 }
 
 fn has_order_meta(order: &Value, pubky_order_id: &str) -> bool {
@@ -252,44 +295,23 @@ fn has_order_meta(order: &Value, pubky_order_id: &str) -> bool {
         })
 }
 
-/// The order a push may already have created.
+/// The order a push may already have created: the oldest that was not
+/// cancelled as a duplicate, found by the item-name search (all pages) and, if
+/// that finds nothing, in the newest orders. A duplicate found on the way
+/// (a late-applied attempt next to its retry) is cancelled before this
+/// returns, and a failure to cancel it fails the lookup, so the caller's retry
+/// settles it.
 pub async fn find(
     api: &Api<'_>,
     pubky_order_id: Uuid,
 ) -> Result<Option<ExternalOrder>, ProviderError> {
-    let wanted = pubky_order_id.to_string();
-    // The order that is the push: the oldest one carrying the id that was not
-    // cancelled as a duplicate (a late-applied attempt and its retry can both
-    // exist for a moment, see [`push`]).
-    let hit = |orders: &Value| -> Option<ExternalOrder> {
-        let matches: Vec<(bool, i64)> = orders
-            .as_array()?
-            .iter()
-            .filter(|order| has_order_meta(order, &wanted))
-            .filter_map(|order| {
-                let cancelled = order.get("status").and_then(Value::as_str) == Some("cancelled");
-                id_of(order).map(|id| (cancelled, id))
-            })
-            .collect();
-        matches
-            .iter()
-            .min()
-            .map(|(_, id)| ExternalOrder { id: id.to_string() })
-    };
-    let searched = api
-        .get(
-            "/orders",
-            &[
-                ("search", wanted.clone()),
-                ("per_page", "20".into()),
-                ("_fields", "id,status,meta_data".into()),
-            ],
-        )
-        .await?
-        .json()?;
-    if let Some(found) = hit(&searched) {
-        return Ok(Some(found));
+    let hits = matching_orders(api, pubky_order_id).await?;
+    if let Some(kept) = settle_duplicates(api, &hits).await? {
+        return Ok(Some(ExternalOrder {
+            id: kept.to_string(),
+        }));
     }
+    let wanted = pubky_order_id.to_string();
     for page in 1..=SCAN_PAGES {
         let reply = api
             .get(
@@ -304,10 +326,13 @@ pub async fn find(
             )
             .await?;
         let orders = reply.json()?;
-        if let Some(found) = hit(&orders) {
-            return Ok(Some(found));
+        let orders = orders.as_array().cloned().unwrap_or_default();
+        if let Some(kept) = settle_duplicates(api, &hits_of(&orders, &wanted)).await? {
+            return Ok(Some(ExternalOrder {
+                id: kept.to_string(),
+            }));
         }
-        if orders.as_array().map_or(0, Vec::len) < SCAN_PAGE_SIZE as usize {
+        if orders.len() < SCAN_PAGE_SIZE as usize {
             break;
         }
     }
@@ -440,19 +465,13 @@ async fn marked_refunds(
     action_key: &str,
 ) -> Result<Vec<i64>, ProviderError> {
     let listed = api
-        .get(
+        .list_all(
             &format!("/orders/{order_id}/refunds"),
-            &[
-                ("per_page", "100".into()),
-                ("_fields", "id,reason,meta_data".into()),
-            ],
+            &[("_fields", "id,reason,meta_data".into())],
         )
-        .await?
-        .json()?;
+        .await?;
     let mut ids: Vec<i64> = listed
-        .as_array()
-        .into_iter()
-        .flatten()
+        .iter()
         .filter(|refund| carries_marker(refund, action_key))
         .filter_map(id_of)
         .collect();
