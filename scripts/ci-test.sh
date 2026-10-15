@@ -33,6 +33,7 @@ SERIAL=(
   migration_0070_test
   rolling_overlap_test
   manual_review_resolve_test
+  migrator_tolerance_test
 )
 
 is_serial() {
