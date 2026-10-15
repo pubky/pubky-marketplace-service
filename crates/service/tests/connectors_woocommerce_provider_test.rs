@@ -431,11 +431,23 @@ async fn the_catalog_is_read_in_pages_with_variations_stock_images_and_chf_price
     );
     assert_eq!(socks.variants[0].option_values[0].value, "S");
     assert!(socks.image_urls.len() >= 2, "product image and gallery");
+    assert_eq!(socks.categories, ["Socks"]);
+    assert_eq!(
+        socks.attributes.len(),
+        1,
+        "Material does not pick a variant"
+    );
+    assert_eq!(socks.attributes[0].name, "Material");
+    assert_eq!(socks.attributes[0].values, ["Merino wool", "Cotton"]);
+    assert_eq!(socks.options.len(), 1, "only Size picks a variant");
 
     let item = products
         .iter()
         .find(|p| p.title == "Pubky Test Item")
         .expect("item");
+    assert_eq!(item.categories, ["Accessories"]);
+    assert_eq!(item.attributes[0].name, "Material");
+    assert_eq!(item.attributes[0].values, ["Cotton"]);
     assert_eq!(item.variants.len(), 1);
     assert_eq!(
         item.variants[0].provider_variant_id,
@@ -464,6 +476,8 @@ async fn the_catalog_is_read_in_pages_with_variations_stock_images_and_chf_price
         .find(|p| p.title == "V-Neck T-Shirt")
         .expect("tee");
     assert!(!tee.options.is_empty());
+    assert_eq!(tee.categories, ["Tshirts"]);
+    assert!(tee.attributes.is_empty(), "Color and Size pick variants");
 
     assert!(matches!(
         provider.list_catalog(&context, Some("nonsense")).await,

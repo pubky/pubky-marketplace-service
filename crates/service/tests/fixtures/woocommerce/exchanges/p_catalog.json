@@ -81,17 +81,17 @@
    "response_kind": "json",
    "response_body": [
     {
-     "id": 27,
+     "id": 30,
      "name": "Pubky Shop order.deleted",
      "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce"
     },
     {
-     "id": 26,
+     "id": 29,
      "name": "Pubky Shop order.updated",
      "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce"
     },
     {
-     "id": 25,
+     "id": 28,
      "name": "Pubky Shop product.updated",
      "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce"
     }
@@ -99,7 +99,7 @@
   },
   {
    "method": "DELETE",
-   "path": "/wp-json/wc/v3/webhooks/27",
+   "path": "/wp-json/wc/v3/webhooks/30",
    "query": [
     [
      "force",
@@ -114,7 +114,7 @@
    },
    "response_kind": "json",
    "response_body": {
-    "id": 27,
+    "id": 30,
     "name": "Pubky Shop order.deleted",
     "status": "active",
     "topic": "order.deleted",
@@ -125,14 +125,14 @@
      "woocommerce_trash_order"
     ],
     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
-    "date_created": "2026-10-15T14:10:45",
-    "date_created_gmt": "2026-10-15T14:10:45",
-    "date_modified": "2026-10-15T14:10:45",
-    "date_modified_gmt": "2026-10-15T14:10:45",
+    "date_created": "2026-10-15T15:09:28",
+    "date_created_gmt": "2026-10-15T15:09:28",
+    "date_modified": "2026-10-15T15:09:28",
+    "date_modified_gmt": "2026-10-15T15:09:28",
     "_links": {
      "self": [
       {
-       "href": "https://localhost:8443/wp-json/wc/v3/webhooks/27",
+       "href": "https://localhost:8443/wp-json/wc/v3/webhooks/30",
        "targetHints": {
         "allow": [
          "GET",
@@ -154,7 +154,7 @@
   },
   {
    "method": "DELETE",
-   "path": "/wp-json/wc/v3/webhooks/26",
+   "path": "/wp-json/wc/v3/webhooks/29",
    "query": [
     [
      "force",
@@ -169,7 +169,7 @@
    },
    "response_kind": "json",
    "response_body": {
-    "id": 26,
+    "id": 29,
     "name": "Pubky Shop order.updated",
     "status": "active",
     "topic": "order.updated",
@@ -180,14 +180,14 @@
      "woocommerce_order_refunded"
     ],
     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
-    "date_created": "2026-10-15T14:10:44",
-    "date_created_gmt": "2026-10-15T14:10:44",
-    "date_modified": "2026-10-15T14:10:44",
-    "date_modified_gmt": "2026-10-15T14:10:44",
+    "date_created": "2026-10-15T15:09:27",
+    "date_created_gmt": "2026-10-15T15:09:27",
+    "date_modified": "2026-10-15T15:09:27",
+    "date_modified_gmt": "2026-10-15T15:09:27",
     "_links": {
      "self": [
       {
-       "href": "https://localhost:8443/wp-json/wc/v3/webhooks/26",
+       "href": "https://localhost:8443/wp-json/wc/v3/webhooks/29",
        "targetHints": {
         "allow": [
          "GET",
@@ -209,7 +209,7 @@
   },
   {
    "method": "DELETE",
-   "path": "/wp-json/wc/v3/webhooks/25",
+   "path": "/wp-json/wc/v3/webhooks/28",
    "query": [
     [
      "force",
@@ -221,64 +221,6 @@
    "status": 200,
    "response_headers": {
     "content-type": "application/json; charset=UTF-8"
-   },
-   "response_kind": "json",
-   "response_body": {
-    "id": 25,
-    "name": "Pubky Shop product.updated",
-    "status": "active",
-    "topic": "product.updated",
-    "resource": "product",
-    "event": "updated",
-    "hooks": [
-     "woocommerce_process_product_meta",
-     "woocommerce_update_product",
-     "woocommerce_update_product_variation"
-    ],
-    "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
-    "date_created": "2026-10-15T14:10:43",
-    "date_created_gmt": "2026-10-15T14:10:43",
-    "date_modified": "2026-10-15T14:10:43",
-    "date_modified_gmt": "2026-10-15T14:10:43",
-    "_links": {
-     "self": [
-      {
-       "href": "https://localhost:8443/wp-json/wc/v3/webhooks/25",
-       "targetHints": {
-        "allow": [
-         "GET",
-         "POST",
-         "PUT",
-         "PATCH",
-         "DELETE"
-        ]
-       }
-      }
-     ],
-     "collection": [
-      {
-       "href": "https://localhost:8443/wp-json/wc/v3/webhooks"
-      }
-     ]
-    }
-   }
-  },
-  {
-   "method": "POST",
-   "path": "/wp-json/wc/v3/webhooks",
-   "query": [],
-   "auth": "basic",
-   "request_body": {
-    "name": "Pubky Shop product.updated",
-    "topic": "product.updated",
-    "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
-    "secret": "<secret>",
-    "status": "active"
-   },
-   "status": 201,
-   "response_headers": {
-    "content-type": "application/json; charset=UTF-8",
-    "location": "https://localhost:8443/wp-json/wc/v3/webhooks/28"
    },
    "response_kind": "json",
    "response_body": {
@@ -294,10 +236,10 @@
      "woocommerce_update_product_variation"
     ],
     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
-    "date_created": "2026-10-15T14:11:15",
-    "date_created_gmt": "2026-10-15T14:11:15",
-    "date_modified": null,
-    "date_modified_gmt": null,
+    "date_created": "2026-10-15T15:09:26",
+    "date_created_gmt": "2026-10-15T15:09:26",
+    "date_modified": "2026-10-15T15:09:26",
+    "date_modified_gmt": "2026-10-15T15:09:26",
     "_links": {
      "self": [
       {
@@ -327,6 +269,64 @@
    "query": [],
    "auth": "basic",
    "request_body": {
+    "name": "Pubky Shop product.updated",
+    "topic": "product.updated",
+    "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
+    "secret": "<secret>",
+    "status": "active"
+   },
+   "status": 201,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8",
+    "location": "https://localhost:8443/wp-json/wc/v3/webhooks/31"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "id": 31,
+    "name": "Pubky Shop product.updated",
+    "status": "active",
+    "topic": "product.updated",
+    "resource": "product",
+    "event": "updated",
+    "hooks": [
+     "woocommerce_process_product_meta",
+     "woocommerce_update_product",
+     "woocommerce_update_product_variation"
+    ],
+    "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
+    "date_created": "2026-10-15T15:10:29",
+    "date_created_gmt": "2026-10-15T15:10:29",
+    "date_modified": null,
+    "date_modified_gmt": null,
+    "_links": {
+     "self": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/webhooks/31",
+       "targetHints": {
+        "allow": [
+         "GET",
+         "POST",
+         "PUT",
+         "PATCH",
+         "DELETE"
+        ]
+       }
+      }
+     ],
+     "collection": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/webhooks"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/wp-json/wc/v3/webhooks",
+   "query": [],
+   "auth": "basic",
+   "request_body": {
     "name": "Pubky Shop order.updated",
     "topic": "order.updated",
     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
@@ -336,11 +336,11 @@
    "status": 201,
    "response_headers": {
     "content-type": "application/json; charset=UTF-8",
-    "location": "https://localhost:8443/wp-json/wc/v3/webhooks/29"
+    "location": "https://localhost:8443/wp-json/wc/v3/webhooks/32"
    },
    "response_kind": "json",
    "response_body": {
-    "id": 29,
+    "id": 32,
     "name": "Pubky Shop order.updated",
     "status": "active",
     "topic": "order.updated",
@@ -351,14 +351,14 @@
      "woocommerce_order_refunded"
     ],
     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
-    "date_created": "2026-10-15T14:11:16",
-    "date_created_gmt": "2026-10-15T14:11:16",
+    "date_created": "2026-10-15T15:10:30",
+    "date_created_gmt": "2026-10-15T15:10:30",
     "date_modified": null,
     "date_modified_gmt": null,
     "_links": {
      "self": [
       {
-       "href": "https://localhost:8443/wp-json/wc/v3/webhooks/29",
+       "href": "https://localhost:8443/wp-json/wc/v3/webhooks/32",
        "targetHints": {
         "allow": [
          "GET",
@@ -393,11 +393,11 @@
    "status": 201,
    "response_headers": {
     "content-type": "application/json; charset=UTF-8",
-    "location": "https://localhost:8443/wp-json/wc/v3/webhooks/30"
+    "location": "https://localhost:8443/wp-json/wc/v3/webhooks/33"
    },
    "response_kind": "json",
    "response_body": {
-    "id": 30,
+    "id": 33,
     "name": "Pubky Shop order.deleted",
     "status": "active",
     "topic": "order.deleted",
@@ -408,14 +408,14 @@
      "woocommerce_trash_order"
     ],
     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
-    "date_created": "2026-10-15T14:11:17",
-    "date_created_gmt": "2026-10-15T14:11:17",
+    "date_created": "2026-10-15T15:10:32",
+    "date_created_gmt": "2026-10-15T15:10:32",
     "date_modified": null,
     "date_modified_gmt": null,
     "_links": {
      "self": [
       {
-       "href": "https://localhost:8443/wp-json/wc/v3/webhooks/30",
+       "href": "https://localhost:8443/wp-json/wc/v3/webhooks/33",
        "targetHints": {
         "allow": [
          "GET",
@@ -498,7 +498,7 @@
     ],
     [
      "_fields",
-     "id,name,type,status,permalink,description,short_description,sku,price,manage_stock,stock_quantity,stock_status,images,attributes,variations,parent_id"
+     "id,name,type,status,permalink,description,short_description,sku,price,manage_stock,stock_quantity,stock_status,images,categories,attributes,variations,parent_id"
     ]
    ],
    "auth": "basic",
@@ -524,6 +524,13 @@
      "manage_stock": false,
      "stock_quantity": null,
      "images": [],
+     "categories": [
+      {
+       "id": 17,
+       "name": "Tshirts",
+       "slug": "tshirts"
+      }
+     ],
      "attributes": [
       {
        "id": 0,
@@ -573,6 +580,13 @@
      "manage_stock": false,
      "stock_quantity": null,
      "images": [],
+     "categories": [
+      {
+       "id": 18,
+       "name": "Hoodies",
+       "slug": "hoodies"
+      }
+     ],
      "attributes": [
       {
        "id": 0,
@@ -622,6 +636,13 @@
      "manage_stock": false,
      "stock_quantity": null,
      "images": [],
+     "categories": [
+      {
+       "id": 18,
+       "name": "Hoodies",
+       "slug": "hoodies"
+      }
+     ],
      "attributes": [],
      "variations": [],
      "parent_id": 0,
@@ -640,6 +661,13 @@
      "manage_stock": false,
      "stock_quantity": null,
      "images": [],
+     "categories": [
+      {
+       "id": 17,
+       "name": "Tshirts",
+       "slug": "tshirts"
+      }
+     ],
      "attributes": [],
      "variations": [],
      "parent_id": 0,
@@ -658,6 +686,13 @@
      "manage_stock": false,
      "stock_quantity": null,
      "images": [],
+     "categories": [
+      {
+       "id": 19,
+       "name": "Accessories",
+       "slug": "accessories"
+      }
+     ],
      "attributes": [],
      "variations": [],
      "parent_id": 0,
@@ -676,6 +711,13 @@
      "manage_stock": false,
      "stock_quantity": null,
      "images": [],
+     "categories": [
+      {
+       "id": 19,
+       "name": "Accessories",
+       "slug": "accessories"
+      }
+     ],
      "attributes": [],
      "variations": [],
      "parent_id": 0,
@@ -694,6 +736,13 @@
      "manage_stock": false,
      "stock_quantity": null,
      "images": [],
+     "categories": [
+      {
+       "id": 19,
+       "name": "Accessories",
+       "slug": "accessories"
+      }
+     ],
      "attributes": [],
      "variations": [],
      "parent_id": 0,
@@ -988,7 +1037,7 @@
     ],
     [
      "_fields",
-     "id,name,type,status,permalink,description,short_description,sku,price,manage_stock,stock_quantity,stock_status,images,attributes,variations,parent_id"
+     "id,name,type,status,permalink,description,short_description,sku,price,manage_stock,stock_quantity,stock_status,images,categories,attributes,variations,parent_id"
     ]
    ],
    "auth": "basic",
@@ -1014,6 +1063,13 @@
      "manage_stock": false,
      "stock_quantity": null,
      "images": [],
+     "categories": [
+      {
+       "id": 19,
+       "name": "Accessories",
+       "slug": "accessories"
+      }
+     ],
      "attributes": [],
      "variations": [],
      "parent_id": 0,
@@ -1032,6 +1088,13 @@
      "manage_stock": false,
      "stock_quantity": null,
      "images": [],
+     "categories": [
+      {
+       "id": 18,
+       "name": "Hoodies",
+       "slug": "hoodies"
+      }
+     ],
      "attributes": [],
      "variations": [],
      "parent_id": 0,
@@ -1050,6 +1113,13 @@
      "manage_stock": false,
      "stock_quantity": null,
      "images": [],
+     "categories": [
+      {
+       "id": 18,
+       "name": "Hoodies",
+       "slug": "hoodies"
+      }
+     ],
      "attributes": [],
      "variations": [],
      "parent_id": 0,
@@ -1068,6 +1138,13 @@
      "manage_stock": false,
      "stock_quantity": null,
      "images": [],
+     "categories": [
+      {
+       "id": 17,
+       "name": "Tshirts",
+       "slug": "tshirts"
+      }
+     ],
      "attributes": [],
      "variations": [],
      "parent_id": 0,
@@ -1086,6 +1163,13 @@
      "manage_stock": false,
      "stock_quantity": null,
      "images": [],
+     "categories": [
+      {
+       "id": 17,
+       "name": "Tshirts",
+       "slug": "tshirts"
+      }
+     ],
      "attributes": [],
      "variations": [],
      "parent_id": 0,
@@ -1104,6 +1188,13 @@
      "manage_stock": false,
      "stock_quantity": null,
      "images": [],
+     "categories": [
+      {
+       "id": 20,
+       "name": "Music",
+       "slug": "music"
+      }
+     ],
      "attributes": [],
      "variations": [],
      "parent_id": 0,
@@ -1122,6 +1213,13 @@
      "manage_stock": false,
      "stock_quantity": null,
      "images": [],
+     "categories": [
+      {
+       "id": 20,
+       "name": "Music",
+       "slug": "music"
+      }
+     ],
      "attributes": [],
      "variations": [],
      "parent_id": 0,
@@ -1192,7 +1290,7 @@
     ],
     [
      "_fields",
-     "id,name,type,status,permalink,description,short_description,sku,price,manage_stock,stock_quantity,stock_status,images,attributes,variations,parent_id"
+     "id,name,type,status,permalink,description,short_description,sku,price,manage_stock,stock_quantity,stock_status,images,categories,attributes,variations,parent_id"
     ]
    ],
    "auth": "basic",
@@ -1218,6 +1316,13 @@
      "manage_stock": false,
      "stock_quantity": null,
      "images": [],
+     "categories": [
+      {
+       "id": 17,
+       "name": "Tshirts",
+       "slug": "tshirts"
+      }
+     ],
      "attributes": [],
      "variations": [],
      "parent_id": 0,
@@ -1236,6 +1341,13 @@
      "manage_stock": false,
      "stock_quantity": null,
      "images": [],
+     "categories": [
+      {
+       "id": 19,
+       "name": "Accessories",
+       "slug": "accessories"
+      }
+     ],
      "attributes": [],
      "variations": [],
      "parent_id": 0,
@@ -1254,6 +1366,13 @@
      "manage_stock": false,
      "stock_quantity": null,
      "images": [],
+     "categories": [
+      {
+       "id": 16,
+       "name": "Clothing",
+       "slug": "clothing"
+      }
+     ],
      "attributes": [],
      "variations": [],
      "parent_id": 0,
@@ -1272,6 +1391,13 @@
      "manage_stock": false,
      "stock_quantity": null,
      "images": [],
+     "categories": [
+      {
+       "id": 21,
+       "name": "Decor",
+       "slug": "decor"
+      }
+     ],
      "attributes": [],
      "variations": [],
      "parent_id": 0,
@@ -1292,10 +1418,10 @@
      "images": [
       {
        "id": 40,
-       "date_created": "2026-10-15T14:08:45",
-       "date_created_gmt": "2026-10-15T14:08:45",
-       "date_modified": "2026-10-15T14:08:45",
-       "date_modified_gmt": "2026-10-15T14:08:45",
+       "date_created": "2026-10-15T15:07:10",
+       "date_created_gmt": "2026-10-15T15:07:10",
+       "date_modified": "2026-10-15T15:07:10",
+       "date_modified_gmt": "2026-10-15T15:07:10",
        "src": "https://localhost:8443/wp-content/uploads/2026/10/little-hodler-socks.png",
        "name": "little-hodler-socks",
        "alt": "",
@@ -1305,16 +1431,23 @@
       },
       {
        "id": 41,
-       "date_created": "2026-10-15T14:08:45",
-       "date_created_gmt": "2026-10-15T14:08:45",
-       "date_modified": "2026-10-15T14:08:45",
-       "date_modified_gmt": "2026-10-15T14:08:45",
+       "date_created": "2026-10-15T15:07:10",
+       "date_created_gmt": "2026-10-15T15:07:10",
+       "date_modified": "2026-10-15T15:07:10",
+       "date_modified_gmt": "2026-10-15T15:07:10",
        "src": "https://localhost:8443/wp-content/uploads/2026/10/socks-detail.png",
        "name": "socks-detail",
        "alt": "",
        "srcset": "https://localhost:8443/wp-content/uploads/2026/10/socks-detail.png 600w, https://localhost:8443/wp-content/uploads/2026/10/socks-detail-300x300.png 300w, https://localhost:8443/wp-content/uploads/2026/10/socks-detail-150x150.png 150w, https://localhost:8443/wp-content/uploads/2026/10/socks-detail-100x100.png 100w",
        "sizes": "(max-width: 600px) 100vw, 600px",
        "thumbnail": "https://localhost:8443/wp-content/uploads/2026/10/socks-detail-300x300.png"
+      }
+     ],
+     "categories": [
+      {
+       "id": 15,
+       "name": "Uncategorized",
+       "slug": "uncategorized"
       }
      ],
      "attributes": [
@@ -1355,16 +1488,23 @@
      "images": [
       {
        "id": 42,
-       "date_created": "2026-10-15T14:08:45",
-       "date_created_gmt": "2026-10-15T14:08:45",
-       "date_modified": "2026-10-15T14:08:45",
-       "date_modified_gmt": "2026-10-15T14:08:45",
+       "date_created": "2026-10-15T15:07:10",
+       "date_created_gmt": "2026-10-15T15:07:10",
+       "date_modified": "2026-10-15T15:07:10",
+       "date_modified_gmt": "2026-10-15T15:07:10",
        "src": "https://localhost:8443/wp-content/uploads/2026/10/pubky-test-item.png",
        "name": "pubky-test-item",
        "alt": "",
        "srcset": "https://localhost:8443/wp-content/uploads/2026/10/pubky-test-item.png 600w, https://localhost:8443/wp-content/uploads/2026/10/pubky-test-item-300x300.png 300w, https://localhost:8443/wp-content/uploads/2026/10/pubky-test-item-150x150.png 150w, https://localhost:8443/wp-content/uploads/2026/10/pubky-test-item-100x100.png 100w",
        "sizes": "(max-width: 600px) 100vw, 600px",
        "thumbnail": "https://localhost:8443/wp-content/uploads/2026/10/pubky-test-item-300x300.png"
+      }
+     ],
+     "categories": [
+      {
+       "id": 15,
+       "name": "Uncategorized",
+       "slug": "uncategorized"
       }
      ],
      "attributes": [],
@@ -1419,10 +1559,10 @@
      "stock_status": "instock",
      "image": {
       "id": 40,
-      "date_created": "2026-10-15T14:08:45",
-      "date_created_gmt": "2026-10-15T14:08:45",
-      "date_modified": "2026-10-15T14:08:45",
-      "date_modified_gmt": "2026-10-15T14:08:45",
+      "date_created": "2026-10-15T15:07:10",
+      "date_created_gmt": "2026-10-15T15:07:10",
+      "date_modified": "2026-10-15T15:07:10",
+      "date_modified_gmt": "2026-10-15T15:07:10",
       "src": "https://localhost:8443/wp-content/uploads/2026/10/little-hodler-socks.png",
       "name": "little-hodler-socks",
       "alt": ""
@@ -1446,10 +1586,10 @@
      "stock_status": "instock",
      "image": {
       "id": 40,
-      "date_created": "2026-10-15T14:08:45",
-      "date_created_gmt": "2026-10-15T14:08:45",
-      "date_modified": "2026-10-15T14:08:45",
-      "date_modified_gmt": "2026-10-15T14:08:45",
+      "date_created": "2026-10-15T15:07:10",
+      "date_created_gmt": "2026-10-15T15:07:10",
+      "date_modified": "2026-10-15T15:07:10",
+      "date_modified_gmt": "2026-10-15T15:07:10",
       "src": "https://localhost:8443/wp-content/uploads/2026/10/little-hodler-socks.png",
       "name": "little-hodler-socks",
       "alt": ""
@@ -1473,10 +1613,10 @@
      "stock_status": "outofstock",
      "image": {
       "id": 40,
-      "date_created": "2026-10-15T14:08:45",
-      "date_created_gmt": "2026-10-15T14:08:45",
-      "date_modified": "2026-10-15T14:08:45",
-      "date_modified_gmt": "2026-10-15T14:08:45",
+      "date_created": "2026-10-15T15:07:10",
+      "date_created_gmt": "2026-10-15T15:07:10",
+      "date_modified": "2026-10-15T15:07:10",
+      "date_modified_gmt": "2026-10-15T15:07:10",
       "src": "https://localhost:8443/wp-content/uploads/2026/10/little-hodler-socks.png",
       "name": "little-hodler-socks",
       "alt": ""

@@ -42,6 +42,8 @@ async fn a_merchant_connects_picks_products_and_gets_paid_orders_stock_and_track
     assert_eq!(item["variants"][0]["price"]["currency"], "CHF");
     assert_eq!(item["variants"][0]["price"]["amount_minor"], 1250);
     assert_eq!(item["variants"][0]["stock"], 10);
+    assert_eq!(item["categories"], json!(["Accessories"]));
+    assert_eq!(item["attributes"][0]["name"], "Material");
     assert!(!item["image_urls"].as_array().expect("images").is_empty());
     let socks = by_title("Little Hodler Socks");
     assert_eq!(socks["options"][0]["name"], "Size");
