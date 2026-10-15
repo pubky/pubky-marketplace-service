@@ -5,7 +5,8 @@
 -- nothing.
 --
 -- Columns (tab-separated, no header): aggregate_id, seller_pubky, listing_id,
--- reason (`open_holds` or `unattributable_sales`), enabled_variants,
+-- reason (`open_holds`, `unattributable_sales`, `adjusted_total` or
+-- `below_committed`), enabled_variants,
 -- reserved_quantity, sold_quantity, attempts, first_blocked_at,
 -- last_attempt_at (UTC). Seller pubkeys are public; no buyer data is read.
 SELECT l.aggregate_id, l.seller_pubky, l.listing_id, b.reason, b.enabled_variants,

@@ -14,6 +14,11 @@
 #                          attribute to the record's variants; stays on its
 #                          shared total until the seller republishes the record
 #                          with those variants or the sales are resolved
+#   adjusted_total         the seller adjusted the listing's total away from the
+#                          record's sum; converts once a record edit or an
+#                          adjust brings them back in line
+#   below_committed        the record gives a size fewer units than it has sold
+#                          or reserved; blocked until the seller republishes
 # With --sync-many it prints instead the body for POST /v1/listings/sync-many
 # (the first 100 blocked listings) so the operator can re-attempt them:
 #   scripts/variant-conversion-sweep.sh --sync-many | curl -sS -X POST \
