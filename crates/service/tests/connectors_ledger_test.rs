@@ -2070,24 +2070,6 @@ async fn a_store_order_in_another_currency_is_never_refunded_against(pool: PgPoo
     );
 }
 
-/// The columns migration 0061 (#133) adds to `orders`, exactly as it names
-/// them. Added here by the test only because 0061 is not on this branch;
-/// `IF NOT EXISTS` makes this a no-op once it is.
-async fn add_the_conversion_columns(pool: &PgPool) {
-    sqlx::query(
-        "ALTER TABLE orders \
-         ADD COLUMN IF NOT EXISTS usd_conversion_pair TEXT, \
-         ADD COLUMN IF NOT EXISTS usd_conversion_source TEXT, \
-         ADD COLUMN IF NOT EXISTS usd_conversion_usd_rate NUMERIC, \
-         ADD COLUMN IF NOT EXISTS usd_conversion_currency_rate NUMERIC, \
-         ADD COLUMN IF NOT EXISTS usd_conversion_fetched_at TIMESTAMPTZ, \
-         ADD COLUMN IF NOT EXISTS usd_conversion_cents BIGINT",
-    )
-    .execute(pool)
-    .await
-    .expect("conversion columns");
-}
-
 /// Reprices the paid, unpushed order in EUR and records that it was paid with
 /// USDT (`payment_amount_minor` USDT0 millionths for `cents` USD cents).
 async fn paid_in_usdt0_for_a_eur_order(s: &Scenario, cents: Option<i64>) -> i64 {
@@ -2151,7 +2133,6 @@ async fn a_usdt0_refund_of_a_non_usd_order_is_converted_with_the_orders_own_conv
     pool: PgPool,
 ) {
     let s = scenario(pool).await;
-    add_the_conversion_columns(&s.app.pool).await;
     let total = s.order.total_minor;
     let payment = paid_in_usdt0_for_a_eur_order(&s, Some(2 * total)).await;
     s.pass().await;
@@ -2184,7 +2165,6 @@ async fn a_usdt0_refund_of_a_non_usd_order_is_converted_with_the_orders_own_conv
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_usdt0_refund_of_the_whole_payment_is_the_whole_order(pool: PgPool) {
     let s = scenario(pool).await;
-    add_the_conversion_columns(&s.app.pool).await;
     let total = s.order.total_minor;
     let payment = paid_in_usdt0_for_a_eur_order(&s, Some(2 * total)).await;
     s.pass().await;
@@ -2197,7 +2177,7 @@ async fn a_usdt0_refund_of_the_whole_payment_is_the_whole_order(pool: PgPool) {
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_usdt0_refund_with_no_recorded_conversion_is_quarantined_not_sent(pool: PgPool) {
-    // No conversion columns at all: the database as it is without #133.
+    // The order records USDT terms but no conversion (its columns are NULL).
     let s = scenario(pool).await;
     let payment = paid_in_usdt0_for_a_eur_order(&s, None).await;
     s.pass().await;
@@ -2231,7 +2211,6 @@ async fn a_usdt0_refund_with_no_recorded_conversion_is_quarantined_not_sent(pool
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn an_order_without_usdt_terms_is_unaffected_by_the_conversion_columns(pool: PgPool) {
     let s = scenario(pool).await;
-    add_the_conversion_columns(&s.app.pool).await;
     s.pass().await;
     let half = s.order.total_minor / 2;
     refund_order_of(&s, half).await;
@@ -2427,4 +2406,90 @@ async fn mirrors_of_one_order_in_different_stores_run_side_by_side(pool: PgPool)
     .expect("claim")
     .expect("the other store's mirror, not held up by the first");
     assert_ne!(first.1.connection_id, second.1.connection_id);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_legacy_usdt_order_with_no_terms_to_convert_with_is_quarantined_not_sent(pool: PgPool) {
+    // `payment_method = 'usdt'` with no asset terms and no conversion: the
+    // refund is in USDT0 units by the rule main applies, and nothing here can
+    // convert it.
+    let s = scenario(pool).await;
+    sqlx::query("UPDATE orders SET currency = 'EUR', payment_method = 'usdt' WHERE id = $1::uuid")
+        .bind(&s.order.order_id)
+        .execute(&s.app.pool)
+        .await
+        .expect("a legacy USDT order");
+    s.pass().await;
+    assert_eq!(s.push().await.0, "created");
+    record_a_usdt0_refund(&s, 1_000).await;
+    s.pass().await;
+    assert_eq!(s.store.refund_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        actions(&s).await,
+        vec![(
+            "refund".to_string(),
+            "quarantined".to_string(),
+            Some("refund_amount_unconvertible".to_string())
+        )]
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_usd_order_paid_in_usdt_records_in_the_order_currency(pool: PgPool) {
+    // A USD price paid in USDT records its refund in cents, like any rail.
+    let s = scenario(pool).await;
+    sqlx::query(
+        "UPDATE orders SET payment_method = 'usdt', payment_asset = 'USDT', \
+         payment_network = 'arbitrum-one', payment_amount_minor = total_minor * 10000, \
+         payment_exponent = 6, payment_quote_basis = 'usd-parity' WHERE id = $1::uuid",
+    )
+    .bind(&s.order.order_id)
+    .execute(&s.app.pool)
+    .await
+    .expect("USDT terms");
+    s.pass().await;
+    let half = s.order.total_minor / 2;
+    sqlx::query("UPDATE orders SET paykit_total_sats = total_minor * 10000 WHERE id = $1::uuid")
+        .bind(&s.order.order_id)
+        .execute(&s.app.pool)
+        .await
+        .expect("cap");
+    record_a_usdt0_refund(&s, half).await;
+    s.pass().await;
+    let refund = last_refund(&s);
+    assert_eq!(refund.amount_minor, half);
+    assert_eq!(refund.basis, None);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_push_of_a_disconnected_connection_gets_no_mirror(pool: PgPool) {
+    let s = scenario(pool).await;
+    s.pass().await;
+    assert_eq!(s.push().await.0, "created");
+    let (status, _) = api(
+        &s.app,
+        "DELETE",
+        &format!("/v1/connectors/{}", s.connection),
+        Some(&s.seller.token),
+        &json!(null),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let order_id: Uuid = s.order.order_id.parse().expect("order id");
+    let mut tx = s.app.pool.begin().await.expect("tx");
+    assert!(
+        !ledger::has_mirrorable_push(&mut tx, order_id)
+            .await
+            .expect("mirrorable"),
+        "nothing of that push can ever run"
+    );
+    tx.rollback().await.expect("rollback");
+    queue_refund(&s, "refund-a", 5_000).await;
+    Mirror::Cancel.queue(&s).await;
+    assert_eq!(
+        actions(&s).await,
+        Vec::<(String, String, Option<String>)>::new(),
+        "no mirror is queued behind a disconnected connection"
+    );
 }

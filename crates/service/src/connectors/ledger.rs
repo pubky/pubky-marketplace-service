@@ -124,11 +124,15 @@ pub const ACTION_PUSH_QUARANTINED: &str = "push_quarantined";
 const LOCK_ACTIONS: &str = "ORDER BY a.id FOR UPDATE OF a";
 
 /// A push that a cancel or refund can still be mirrored onto: one that has
-/// created, or may yet create, a store order. A push set aside because the
-/// order was cancelled before it was sent is not: no store order exists and a
-/// retry is withheld again. Expects the push aliased as `p`.
-const MIRRORABLE_PUSH: &str = "(p.state IN ('pending', 'sending', 'created') \
-     OR (p.state = 'quarantined' AND p.quarantine_reason <> 'order_cancelled_before_push'))";
+/// created, or may yet create, a store order, on a connection that has not
+/// been disconnected (a disconnect deletes the credential, so nothing of that
+/// push can ever run). A push set aside because the order was cancelled
+/// before it was sent is not: no store order exists and a retry is withheld
+/// again. Expects the push aliased as `p`.
+const MIRRORABLE_PUSH: &str = "((p.state IN ('pending', 'sending', 'created') \
+     OR (p.state = 'quarantined' AND p.quarantine_reason <> 'order_cancelled_before_push')) \
+     AND EXISTS (SELECT 1 FROM connector_connections c \
+                 WHERE c.id = p.connection_id AND c.status <> 'disconnected'))";
 
 /// Adds the ledger row for an order, once. Returns whether this call
 /// created it; a duplicate delivery of the same event creates nothing.
