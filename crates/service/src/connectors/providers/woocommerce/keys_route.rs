@@ -44,10 +44,10 @@ pub async fn put_keys(
         Err(response) => return response,
     };
     let now = state.clock.now();
-    let still_pending = row.status == "pending"
+    let still_draft = row.status == "draft"
         && row.connect_state_hash.is_some()
         && row.connect_expires_at.is_some_and(|expires| expires > now);
-    if row.provider != ProviderKind::Woocommerce.as_str() || !still_pending {
+    if row.provider != ProviderKind::Woocommerce.as_str() || !still_draft {
         return error(
             StatusCode::CONFLICT,
             "not_pending",
@@ -78,9 +78,7 @@ pub async fn put_keys(
             body,
             ..CallbackParams::default()
         },
-        webhook_url: runtime
-            .settings
-            .webhook_url(ProviderKind::Woocommerce.as_str(), None),
+        webhook_url: runtime.settings.woocommerce_webhook_url(),
     };
     let completed = match call(runtime, provider.complete_connect(&complete)).await {
         Ok(completed) => completed,
@@ -107,6 +105,11 @@ pub async fn put_keys(
         }
         Err(failure) => return provider_failure(StatusCode::BAD_GATEWAY, failure),
     };
+    let missing: Vec<String> = provider
+        .required_scopes()
+        .into_iter()
+        .filter(|scope| !completed.scopes.contains(scope))
+        .collect();
     let recipient_key = recipient::generate();
     match store::complete_connect(
         &state.pool,
@@ -115,11 +118,12 @@ pub async fn put_keys(
         &row,
         &completed.credentials,
         &completed.scopes,
+        &missing,
         &recipient_key,
     )
     .await
     {
-        Ok(connected) => connected_json(&state, &connected).await,
+        Ok(connected) => connected_json(&state, runtime, &connected).await,
         Err(CompleteError::ShopInUse) => error(
             StatusCode::CONFLICT,
             "shop_in_use",

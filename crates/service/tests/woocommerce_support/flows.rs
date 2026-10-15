@@ -80,7 +80,7 @@ pub async fn connect_via_routes(
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "connect: {body}");
-    assert_eq!(body["connection"]["status"], "pending");
+    assert_eq!(body["connection"]["status"], "draft");
     let id: Uuid = body["connection"]["id"]
         .as_str()
         .expect("id")

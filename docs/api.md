@@ -147,6 +147,7 @@ and write. "Automation" means the inventory capability plus the
 | PUT | `/v1/connectors/{id}/credentials` |
 | GET, PUT | `/v1/connectors/{id}/mappings` |
 | GET, PUT | `/v1/connectors/{id}/selection` |
+| PUT | `/v1/connectors/{id}/woocommerce/keys` |
 | GET | `/v1/connectors/{id}/pushes` |
 | POST | `/v1/connectors/{id}/pushes/{order}/retry` |
 
@@ -980,6 +981,78 @@ Environment names: `CONNECTORS_ENABLED`, `CONNECTOR_PUBLIC_BASE_URL`,
 `SHOPIFY_PUBLIC_APP_CLIENT_SECRET` are reserved for Pubky's own public app and
 are not read yet. The worker is the `connector-worker` binary of the same
 image.
+
+### WooCommerce
+
+A WooCommerce store is connected with its REST v3 API over HTTPS. The store
+must be on HTTPS with a valid certificate, WordPress must use "Post name" (or
+any other pretty) permalinks, WooCommerce must be active (this was captured
+against WooCommerce 11.2.1 on WordPress 7.1.3; that WooCommerce release needs
+WordPress 7.0 or newer), and the store's own address (`home`) must be the one
+the seller enters. `POST /v1/connectors` with `{"provider":"woocommerce",
+"domain":"shop.example"}` probes the site and refuses, with the reason in
+`error.message` (`422 invalid_request`, or `invalid_domain` for the address
+itself), plain HTTP, an address that is not a public domain name, a site
+without pretty permalinks, a site without WooCommerce, a blocked REST API and
+a site whose WordPress address differs from the one entered. A store that
+cannot be reached answers `502 provider_unavailable`.
+
+Two ways to finish the connection:
+
+* **One click.** The `authorize_url` in the `201` answer is
+  `{site}/wc-auth/v1/authorize` with `app_name=Pubky Shop`,
+  `scope=read_write`, `user_id` (the draft's single-use nonce), `return_url`
+  (`CONNECTOR_RETURN_URL`, or `params.return_url` when that is unset) and
+  `callback_url` (`POST /v1/connectors/woocommerce/oauth/callback`, which must
+  be HTTPS). The merchant approves in WordPress; WooCommerce posts
+  `{key_id, user_id, consumer_key, consumer_secret, key_permissions}` to the
+  callback. A key without `read_write` is refused.
+* **Pasted keys**, for a site that blocks the callback:
+  `PUT /v1/connectors/{id}/woocommerce/keys` with
+  `{"consumer_key":"ck_...","consumer_secret":"cs_..."}` on the seller's own
+  draft. `200` is the same `connector_connected` answer as the callback.
+  Errors: `422 invalid_keys` (wrong shape), `422 credentials_rejected` (the
+  store refuses the pair), `422 keys_read_only`, `409 not_pending` (no draft
+  waiting, or it expired), `409 shop_in_use`, `404 connection_not_found`,
+  `502 provider_unavailable`.
+
+Either way the pair is checked against the store before anything is stored.
+A harmless authenticated read decides how it is sent: HTTP Basic (the normal
+way) or, when the host drops the `Authorization` header and Basic is refused
+while the same pair works in the query string, `consumer_key` and
+`consumer_secret` query parameters (WooCommerce accepts them over HTTPS). The
+choice is recorded with the credential. The webhook secret, generated per
+connection, is sealed with the key pair, and `product.updated`,
+`order.updated` and `order.deleted` webhooks named `Pubky Shop ...` are
+registered at `/v1/connectors/webhooks/woocommerce`, replacing ones left by an
+earlier connection. A connection that cannot register them is not connected.
+Disconnecting deletes them from the store.
+
+Catalog: products are read in pages of 50 with their variations; simple and
+variable products only, published or private. A simple product is one variant
+whose id is the product id. Prices are the store's current price in minor
+units of `woocommerce_currency`; stock is the exact count where WooCommerce
+manages it, `0` for an unmanaged product marked out of stock, and `null`
+otherwise. Descriptions are plain text, images are the product's own.
+
+Orders: a paid Pubky order becomes `POST /orders` with `set_paid: true`,
+status `processing` (WooCommerce takes the stock), line items by product and
+variation id with the Pubky prices, the Pubky order id as order meta
+`pubky_order_id` and in a zero-value fee line (WooCommerce's order search
+matches item names but not custom meta), a customer note with the order id and
+a link to the Shop orders page, and no billing details. The shipping address is
+set only when the buyer shared it. A cancel after the push sets the order to
+`cancelled` (WooCommerce restocks); a Pubky refund adds a refund to the order
+with `api_refund: false`, so the store's books match and no money moves.
+
+Webhooks are verified with the base64 HMAC-SHA256 of the raw body in
+`X-WC-Webhook-Signature`; WooCommerce's unsigned ping (`webhook_id=N`) is
+acknowledged. A completed order with a tracking number in the common
+shipment-tracking meta (`_wc_shipment_tracking_items`, the AfterShip and
+`_tracking_number` keys) ships the Pubky order; a store-side cancel, trash or
+refund raises a seller alert and never refunds. The 15-minute poll
+(`CONNECTOR_STOCK_POLL_SECONDS`) reads the catalog for mapped products because
+WordPress cron is unreliable.
 
 ## Operational endpoints
 

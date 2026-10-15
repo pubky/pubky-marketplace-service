@@ -157,7 +157,7 @@ async fn a_merchant_connects_picks_products_and_gets_paid_orders_stock_and_track
                 live.rest("PUT", &format!("/wc/v3/orders/{external}"), Some(json!({"status": "completed"}))).await;
             },
             |topic, body| {
-                topic == "order.updated" && body["id"].to_string() == external && body["status"] == "completed"
+                topic == "order.updated" && body["id"].as_i64() == external.parse().ok() && body["status"] == "completed"
             },
         )
         .await;
@@ -258,7 +258,7 @@ async fn a_cancel_or_delete_in_the_store_alerts_the_seller_and_refunds_nobody(po
             },
             |topic, body| {
                 topic == "order.updated"
-                    && body["id"].to_string() == external
+                    && body["id"].as_i64() == external.parse().ok()
                     && body["status"] == "cancelled"
             },
         )
@@ -294,7 +294,7 @@ async fn a_cancel_or_delete_in_the_store_alerts_the_seller_and_refunds_nobody(po
                     .rest("DELETE", &format!("/wc/v3/orders/{external}"), None)
                     .await;
             },
-            |topic, body| topic == "order.deleted" && body["id"].to_string() == external,
+            |topic, body| topic == "order.deleted" && body["id"].as_i64() == external.parse().ok(),
         )
         .await;
     let (status, _) = deliver_and_apply(&shop, &deleted).await;
@@ -354,7 +354,7 @@ async fn a_pubky_cancel_cancels_the_store_order_and_its_echo_raises_no_alert(poo
             async {},
             |topic, body| {
                 topic == "order.updated"
-                    && body["id"].to_string() == external
+                    && body["id"].as_i64() == external.parse().ok()
                     && body["status"] == "cancelled"
             },
         )
@@ -417,7 +417,7 @@ async fn a_pubky_refund_is_recorded_in_the_store_without_moving_money(pool: PgPo
             async {},
             |topic, body| {
                 topic == "order.updated"
-                    && body["id"].to_string() == external
+                    && body["id"].as_i64() == external.parse().ok()
                     && body["status"] == "refunded"
             },
         )

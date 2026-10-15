@@ -498,6 +498,13 @@ pub async fn start_connect(
         Ok(shop) if !shop.is_empty() && shop.len() <= 255 && !shop.contains(['|', '\n', '\r']) => {
             shop
         }
+        Err(ProviderError::Invalid(reason)) => {
+            return error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_domain",
+                &store::truncate(&reason, 200),
+            )
+        }
         _ => {
             return error(
                 StatusCode::UNPROCESSABLE_ENTITY,

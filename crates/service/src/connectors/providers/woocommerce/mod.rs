@@ -405,11 +405,15 @@ impl ConnectorProvider for WooCommerceProvider {
         Ok(self.site(raw)?.canonical())
     }
 
+    fn required_scopes(&self) -> Vec<String> {
+        vec![SCOPE.to_string()]
+    }
+
     async fn connect(&self, request: &ConnectRequest) -> Result<ConnectStart, ProviderError> {
         let site = self.site(&request.shop)?;
-        if !request.callback_url.starts_with("https://")
-            && !(self.http.plain_http() && request.callback_url.starts_with("http://"))
-        {
+        let callback_ok = request.callback_url.starts_with("https://")
+            || (self.http.plain_http() && request.callback_url.starts_with("http://"));
+        if !callback_ok {
             return Err(ProviderError::Invalid(
                 "WooCommerce only posts its keys to an https callback; this deployment's public \
                  base URL is not https."
@@ -591,5 +595,71 @@ impl ConnectorProvider for WooCommerceProvider {
         body: &[u8],
     ) -> Result<InboundEvent, ProviderError> {
         webhooks::parse(webhook, body)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn provider(return_url: Option<&str>) -> WooCommerceProvider {
+        WooCommerceProvider::with_options(WooOptions::default(), return_url.map(str::to_string))
+    }
+
+    #[test]
+    fn the_configured_return_url_wins_over_the_request() {
+        let configured = provider(Some("https://shop.pubky.app/marketplace/connections"));
+        let url = configured
+            .return_url_for(&json!({"return_url": "https://elsewhere.example/"}))
+            .unwrap();
+        assert_eq!(url, "https://shop.pubky.app/marketplace/connections");
+        assert_eq!(configured.shop_origin().as_deref(), Some("https://shop.pubky.app"));
+    }
+
+    #[test]
+    fn without_configuration_the_request_names_the_return_page() {
+        let open = provider(None);
+        assert_eq!(
+            open.return_url_for(&json!({"return_url": "https://shop.pubky.app/connections"}))
+                .unwrap(),
+            "https://shop.pubky.app/connections"
+        );
+        assert_eq!(open.shop_origin(), None);
+        for bad in [json!({}), json!({"return_url": "javascript:alert(1)"}), json!({"return_url": "nonsense"})] {
+            assert!(matches!(open.return_url_for(&bad), Err(ProviderError::Invalid(_))), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_callback_is_read_from_json_a_form_or_the_query() {
+        let json_body = CallbackParams {
+            body: serde_json::to_vec(&json!({"user_id": "n1", "consumer_key": "ck_x"})).unwrap(),
+            ..CallbackParams::default()
+        };
+        let fields = callback_fields(&json_body).unwrap();
+        assert_eq!(field(&fields, "user_id").as_deref(), Some("n1"));
+        assert_eq!(provider(None).callback_state(&json_body).unwrap(), "n1");
+
+        let form = CallbackParams {
+            body: b"user_id=n2&consumer_key=ck_y&key_id=7".to_vec(),
+            ..CallbackParams::default()
+        };
+        let fields = callback_fields(&form).unwrap();
+        assert_eq!(field(&fields, "consumer_key").as_deref(), Some("ck_y"));
+        assert_eq!(field(&fields, "key_id").as_deref(), Some("7"));
+
+        let query = CallbackParams {
+            query: [("user_id".to_string(), "n3".to_string())].into_iter().collect(),
+            ..CallbackParams::default()
+        };
+        assert_eq!(provider(None).callback_state(&query).unwrap(), "n3");
+
+        assert!(provider(None).callback_state(&CallbackParams::default()).is_err());
+        let blank = CallbackParams {
+            body: serde_json::to_vec(&json!({"user_id": ""})).unwrap(),
+            ..CallbackParams::default()
+        };
+        assert!(provider(None).callback_state(&blank).is_err());
     }
 }
