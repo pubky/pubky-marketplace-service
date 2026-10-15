@@ -981,6 +981,18 @@ against Shopify's published schema.
 
 **What the merchant configures** in their own app (Dev Dashboard, custom app):
 
+- **Install.** Install the app from the Dev Dashboard: the app's Installs card
+  (an app created in the store's own organization), or Custom distribution, the
+  store's `myshopify.com` domain, Generate link, opened by the store owner. The
+  connection (`POST`/`GET /v1/connectors`, `PUT .../credentials`) carries
+  `install` (`method: "dev_dashboard"`, where to click, `app_url`,
+  `redirect_url`) and `install_url: null`. The service builds no
+  `/admin/oauth/authorize` link of its own: Shopify's authorization-code
+  documentation describes that URL as the step that obtains a token for an app,
+  and nothing in Shopify's documentation says it installs an app the store does
+  not yet have (the documented install paths for such an app are the Installs
+  card and the custom-distribution link). After the install, Shopify opens the
+  App URL, which sends the merchant to approve the connection.
 - App URL: the connection's launch URL,
   `{CONNECTOR_PUBLIC_BASE_URL}/v1/connectors/shopify/c/{connection_id}/launch`.
 - Allowed redirection URL: the connection's OAuth callback URL.
@@ -1001,13 +1013,13 @@ against Shopify's published schema.
   They are signed with the same app secret and are acknowledged (the service
   keeps no store customer data); `shop/redact` ends the 30-day secret retention.
   The merchant guide must say this, because nothing else configures them. The
-  five operational topics need no merchant step.
+  six operational topics need no merchant step.
 
 **What the service does.** After a verified launch it redirects to Shopify's
 authorize page; after a verified callback it exchanges the code for an offline
 access token (sealed per connection) and then subscribes `inventory_levels/update`,
-`fulfillments/create`, `orders/cancelled`, `refunds/create` and `app/uninstalled`
-to the connection's webhooks URL through `webhookSubscriptionCreate`. A repeat
+`fulfillments/create`, `fulfillments/update`, `orders/cancelled`, `refunds/create`
+and `app/uninstalled` to the connection's webhooks URL through `webhookSubscriptionCreate`. A repeat
 install reads the subscription list page by page, subscribes nothing twice (a
 create that loses a race to a concurrent install is confirmed by re-reading the
 list, not by interpreting the message) and removes stale subscriptions this
@@ -1076,15 +1088,40 @@ on `X-Shopify-Event-Id`.
   refund in a currency other than the order's, or in several, says so in the
   alert.
 - **Variants.** `PUT /v1/connectors/{id}/settings` (or `variant_mode` on
-  `POST /v1/connectors`, which answers `409 mappings_conflict` the same way) with
-  `{"variant_mode": "native" | "split"}` (default `native`). In `native` mode
-  several store variants may map to one Pubky listing's variants; their stock is
-  applied per variant through the service's per-variant inventory, and skipped
-  (`multi_variant_listing`) until that exists. In `split` mode every store variant
+  `POST /v1/connectors`) with `{"variant_mode": "native" | "split"}` (default
+  `native`). In `native` mode several store variants may map to one Pubky
+  listing's variants. Their stock is applied per variant: the target is what the
+  store can sell, the adjustment is that target minus **that variant's own**
+  `available` (never the listing's, which sums the variants), sent as an
+  `inventory.adjust` addressed to the Pubky variant id the mapping stores. This
+  needs the service's per-variant inventory (`listing_variant_inventory`); a
+  service without it skips the listing (`multi_variant_listing`). A stock change
+  for a variant the service cannot address (no Pubky variant id on the mapping,
+  the variant no longer on the listing, `variant_required`,
+  `variant_assertion_mismatch`) is a permanent mapping error: the event settles
+  as `variant_mapping_error`, is never retried, and raises one
+  `variant_mapping_error` alert per variant. In `split` mode every store variant
   maps to its own Pubky listing (one mapping per listing, otherwise
-  `422 split_mode_listing_shared`) and stock syncs at listing level. Switching to
-  `split` while a listing is mapped to several variants answers
-  `409 mappings_conflict`.
+  `422 split_mode_listing_shared`) and stock syncs at listing level. Switching
+  to `split` **unmaps** every listing that combines several store variants (all
+  of its mappings), in the same step; the response lists them
+  (`unmapped_listings: [{listing_id, mappings_removed}]`) and a
+  `listings_unmapped` alert says to re-import each variant as its own listing or
+  end the combined one. Nothing is refused, so there is no unmap-first loop.
+- **Tax.** No tax is added: the pushed order carries `taxesIncluded: false`, no
+  tax lines, lines marked not taxable, so the store total is what the buyer paid.
+  The created order is read back; a total or tax that differs raises a
+  `push_total_mismatch` alert (the order stays created).
+- **Fulfilment and tracking.** A `fulfillments/create` marks the Pubky order
+  shipped: with the tracking the store gives, or, when it has none, with carrier
+  `Other` and no number. Tracking added or changed later in Shopify
+  (`fulfillments/update`; both topics need `read_fulfillments`) syncs through
+  `fulfillment.update_tracking`; an update that beats its create ships the order
+  with that tracking, a second parcel never replaces tracking the order already
+  has, and a cancelled or tracking-less update changes nothing. A service built
+  without `fulfillment.update_tracking` (and ship-without-tracking) is detected
+  from its command vocabulary and keeps the old behaviour: a fulfilment without
+  tracking is ignored (`tracking_commands_unavailable`), one with tracking ships.
 - `GET /v1/connectors/{id}/check` reads the store live: its name, the scopes the
   token holds, the number of active locations and whether a catalog read works.
 

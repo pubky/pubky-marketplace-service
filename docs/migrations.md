@@ -139,9 +139,9 @@ additive. Orders and payments bound to Stripe are not touched.
 binary from before 0059 ignores the new columns and its inserts take their
 defaults, so a rolling replacement is safe.
 
-## Store connectors (0062 to 0066)
+## Store connectors (0062 to 0067)
 
-The connector framework uses 0062 to 0064 and 0066 of the 0062 to 0069 range reserved
+The connector framework uses 0062 to 0064, 0066 and 0067 of the 0062 to 0069 range reserved
 for connectors (0065 is the Shopify provider's). None depends on 0060 or 0061, so they apply cleanly whether
 or not those have landed. All are additive and rerunnable.
 
@@ -180,6 +180,12 @@ or not those have landed. All are additive and rerunnable.
   `native`, a CHECK on the two values). A constant default needs no table rewrite;
   it sets `lock_timeout` like 0053. A binary from before 0065 ignores the column
   and treats every connection as `native`, which is what every existing row holds.
+
+- 0067 widens the `connector_alerts` kind check from 0066 by three values
+  (`listings_unmapped`, `variant_mapping_error`, `push_total_mismatch`). Additive
+  and rerunnable; the table is small, so the constraint is replaced in one pass
+  under a short `lock_timeout`. A binary from before 0067 never writes the new
+  kinds.
 
 Roll forward rather than back once a connection exists: a binary that predates
 0062 does not know the tables, but nothing in it reads them.
