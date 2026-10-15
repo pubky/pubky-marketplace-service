@@ -13,7 +13,7 @@
    },
    "response_kind": "json",
    "response_body": {
-    "$blob": "b6e776b005a1e168"
+    "$blob": "7815651c67bd935d"
    }
   },
   {
@@ -112,8 +112,8 @@
      "woocommerce_update_product_variation"
     ],
     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
-    "date_created": "2026-10-15T13:43:20",
-    "date_created_gmt": "2026-10-15T13:43:20",
+    "date_created": "2026-10-15T14:10:43",
+    "date_created_gmt": "2026-10-15T14:10:43",
     "date_modified": null,
     "date_modified_gmt": null,
     "_links": {
@@ -169,8 +169,8 @@
      "woocommerce_order_refunded"
     ],
     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
-    "date_created": "2026-10-15T13:43:21",
-    "date_created_gmt": "2026-10-15T13:43:21",
+    "date_created": "2026-10-15T14:10:44",
+    "date_created_gmt": "2026-10-15T14:10:44",
     "date_modified": null,
     "date_modified_gmt": null,
     "_links": {
@@ -226,8 +226,8 @@
      "woocommerce_trash_order"
     ],
     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
-    "date_created": "2026-10-15T13:43:22",
-    "date_created_gmt": "2026-10-15T13:43:22",
+    "date_created": "2026-10-15T14:10:45",
+    "date_created_gmt": "2026-10-15T14:10:45",
     "date_modified": null,
     "date_modified_gmt": null,
     "_links": {
@@ -270,13 +270,15 @@
       "product_id": 39,
       "quantity": 2,
       "subtotal": "25.00",
-      "total": "25.00"
+      "total": "25.00",
+      "tax_class": "zero-rate"
      },
      {
       "product_id": 35,
       "quantity": 1,
       "subtotal": "19.90",
       "total": "19.90",
+      "tax_class": "zero-rate",
       "variation_id": 36
      }
     ],
@@ -331,9 +333,9 @@
     "status": "processing",
     "currency": "CHF",
     "version": "11.2.1",
-    "prices_include_tax": false,
-    "date_created": "2026-10-15T13:43:23",
-    "date_modified": "2026-10-15T13:43:23",
+    "prices_include_tax": true,
+    "date_created": "2026-10-15T14:10:46",
+    "date_modified": "2026-10-15T14:10:46",
     "discount_total": "0.00",
     "discount_tax": "0.00",
     "shipping_total": "6.00",
@@ -342,7 +344,7 @@
     "total": "50.90",
     "total_tax": "0.00",
     "customer_id": 0,
-    "order_key": "wc_order_G91dNMUxEOPYs",
+    "order_key": "wc_order_5RE70ASZFSYsW",
     "billing": {
      "first_name": "",
      "last_name": "",
@@ -376,7 +378,7 @@
     "created_via": "rest-api",
     "customer_note": "Pubky order 11111111-2222-8333-9444-555555555551, paid with Bitcoin. Details and the buyer's messages: https://shop.test/marketplace/orders",
     "date_completed": null,
-    "date_paid": "2026-10-15T13:43:23",
+    "date_paid": "2026-10-15T14:10:46",
     "cart_hash": "",
     "number": "48",
     "meta_data": [
@@ -403,7 +405,7 @@
       "product_id": 39,
       "variation_id": 0,
       "quantity": 2,
-      "tax_class": "",
+      "tax_class": "zero-rate",
       "subtotal": "25.00",
       "subtotal_tax": "0.00",
       "total": "25.00",
@@ -433,7 +435,7 @@
       "product_id": 35,
       "variation_id": 36,
       "quantity": 1,
-      "tax_class": "",
+      "tax_class": "zero-rate",
       "subtotal": "19.90",
       "subtotal_tax": "0.00",
       "total": "19.90",
@@ -494,14 +496,14 @@
     ],
     "coupon_lines": [],
     "refunds": [],
-    "payment_url": "https://localhost:8443/checkout/order-pay/48/?pay_for_order=true&key=wc_order_G91dNMUxEOPYs",
+    "payment_url": "https://localhost:8443/checkout/order-pay/48/?pay_for_order=true&key=wc_order_5RE70ASZFSYsW",
     "is_editable": false,
     "needs_payment": false,
     "needs_processing": true,
-    "date_created_gmt": "2026-10-15T13:43:23",
-    "date_modified_gmt": "2026-10-15T13:43:23",
+    "date_created_gmt": "2026-10-15T14:10:46",
+    "date_modified_gmt": "2026-10-15T14:10:46",
     "date_completed_gmt": null,
-    "date_paid_gmt": "2026-10-15T13:43:23",
+    "date_paid_gmt": "2026-10-15T14:10:46",
     "currency_symbol": "CHF",
     "_links": {
      "self": [
@@ -673,7 +675,7 @@
       {
        "id": 740,
        "key": "pubky_order_id",
-       "value": "887ce669-6f59-4352-82ff-8f62ba22aef7"
+       "value": "f9256d42-7c91-472a-b0bb-542a225b17d9"
       },
       {
        "id": 741,
@@ -694,7 +696,7 @@
       {
        "id": 707,
        "key": "pubky_order_id",
-       "value": "85adf40e-2336-4e15-b5ec-d97c15a18e27"
+       "value": "a21cd4e6-8d14-4d08-98c4-8f0e4d868d91"
       },
       {
        "id": 708,
@@ -720,7 +722,7 @@
       {
        "id": 672,
        "key": "pubky_order_id",
-       "value": "cd142ca5-90cb-462b-8140-43a0425e00e2"
+       "value": "c8a7af9e-238f-4475-b536-7030f8c9443b"
       },
       {
        "id": 673,
@@ -743,9 +745,9 @@
          "tracking_number": "99.60.123456.12345678",
          "tracking_product_code": "",
          "source": "REST_API",
-         "date_shipped": 1792071722,
+         "date_shipped": 1792073359,
          "status_shipped": "",
-         "tracking_id": "5c374f3e98635bc52c9983e59f5c1edf",
+         "tracking_id": "a9115a67029f5450d8c80a2e0f8e37e5",
          "user_id": 1
         }
        ]
@@ -771,13 +773,15 @@
       "product_id": 39,
       "quantity": 2,
       "subtotal": "25.00",
-      "total": "25.00"
+      "total": "25.00",
+      "tax_class": "zero-rate"
      },
      {
       "product_id": 35,
       "quantity": 1,
       "subtotal": "19.90",
       "total": "19.90",
+      "tax_class": "zero-rate",
       "variation_id": 36
      }
     ],
@@ -822,9 +826,9 @@
     "status": "processing",
     "currency": "CHF",
     "version": "11.2.1",
-    "prices_include_tax": false,
-    "date_created": "2026-10-15T13:43:27",
-    "date_modified": "2026-10-15T13:43:27",
+    "prices_include_tax": true,
+    "date_created": "2026-10-15T14:10:49",
+    "date_modified": "2026-10-15T14:10:49",
     "discount_total": "0.00",
     "discount_tax": "0.00",
     "shipping_total": "6.00",
@@ -833,7 +837,7 @@
     "total": "50.90",
     "total_tax": "0.00",
     "customer_id": 0,
-    "order_key": "wc_order_7pXA7m9ILuhC6",
+    "order_key": "wc_order_tfvcuzI3Ure0H",
     "billing": {
      "first_name": "",
      "last_name": "",
@@ -867,7 +871,7 @@
     "created_via": "rest-api",
     "customer_note": "Pubky order 11111111-2222-8333-9444-555555555552, paid with Bitcoin. Details and the buyer's messages: https://shop.test/marketplace/orders",
     "date_completed": null,
-    "date_paid": "2026-10-15T13:43:27",
+    "date_paid": "2026-10-15T14:10:49",
     "cart_hash": "",
     "number": "49",
     "meta_data": [
@@ -894,7 +898,7 @@
       "product_id": 39,
       "variation_id": 0,
       "quantity": 2,
-      "tax_class": "",
+      "tax_class": "zero-rate",
       "subtotal": "25.00",
       "subtotal_tax": "0.00",
       "total": "25.00",
@@ -924,7 +928,7 @@
       "product_id": 35,
       "variation_id": 36,
       "quantity": 1,
-      "tax_class": "",
+      "tax_class": "zero-rate",
       "subtotal": "19.90",
       "subtotal_tax": "0.00",
       "total": "19.90",
@@ -985,14 +989,14 @@
     ],
     "coupon_lines": [],
     "refunds": [],
-    "payment_url": "https://localhost:8443/checkout/order-pay/49/?pay_for_order=true&key=wc_order_7pXA7m9ILuhC6",
+    "payment_url": "https://localhost:8443/checkout/order-pay/49/?pay_for_order=true&key=wc_order_tfvcuzI3Ure0H",
     "is_editable": false,
     "needs_payment": false,
     "needs_processing": true,
-    "date_created_gmt": "2026-10-15T13:43:27",
-    "date_modified_gmt": "2026-10-15T13:43:27",
+    "date_created_gmt": "2026-10-15T14:10:49",
+    "date_modified_gmt": "2026-10-15T14:10:49",
     "date_completed_gmt": null,
-    "date_paid_gmt": "2026-10-15T13:43:27",
+    "date_paid_gmt": "2026-10-15T14:10:49",
     "currency_symbol": "CHF",
     "_links": {
      "self": [
@@ -1096,9 +1100,9 @@
     "status": "cancelled",
     "currency": "CHF",
     "version": "11.2.1",
-    "prices_include_tax": false,
-    "date_created": "2026-10-15T13:43:27",
-    "date_modified": "2026-10-15T13:43:29",
+    "prices_include_tax": true,
+    "date_created": "2026-10-15T14:10:49",
+    "date_modified": "2026-10-15T14:10:51",
     "discount_total": "0.00",
     "discount_tax": "0.00",
     "shipping_total": "6.00",
@@ -1107,7 +1111,7 @@
     "total": "50.90",
     "total_tax": "0.00",
     "customer_id": 0,
-    "order_key": "wc_order_7pXA7m9ILuhC6",
+    "order_key": "wc_order_tfvcuzI3Ure0H",
     "billing": {
      "first_name": "",
      "last_name": "",
@@ -1141,7 +1145,7 @@
     "created_via": "rest-api",
     "customer_note": "Pubky order 11111111-2222-8333-9444-555555555552, paid with Bitcoin. Details and the buyer's messages: https://shop.test/marketplace/orders",
     "date_completed": null,
-    "date_paid": "2026-10-15T13:43:27",
+    "date_paid": "2026-10-15T14:10:49",
     "cart_hash": "",
     "number": "49",
     "meta_data": [
@@ -1173,7 +1177,7 @@
       "product_id": 39,
       "variation_id": 0,
       "quantity": 2,
-      "tax_class": "",
+      "tax_class": "zero-rate",
       "subtotal": "25.00",
       "subtotal_tax": "0.00",
       "total": "25.00",
@@ -1195,7 +1199,7 @@
       "product_id": 35,
       "variation_id": 36,
       "quantity": 1,
-      "tax_class": "",
+      "tax_class": "zero-rate",
       "subtotal": "19.90",
       "subtotal_tax": "0.00",
       "total": "19.90",
@@ -1249,14 +1253,14 @@
     ],
     "coupon_lines": [],
     "refunds": [],
-    "payment_url": "https://localhost:8443/checkout/order-pay/49/?pay_for_order=true&key=wc_order_7pXA7m9ILuhC6",
+    "payment_url": "https://localhost:8443/checkout/order-pay/49/?pay_for_order=true&key=wc_order_tfvcuzI3Ure0H",
     "is_editable": false,
     "needs_payment": false,
     "needs_processing": true,
-    "date_created_gmt": "2026-10-15T13:43:27",
-    "date_modified_gmt": "2026-10-15T13:43:29",
+    "date_created_gmt": "2026-10-15T14:10:49",
+    "date_modified_gmt": "2026-10-15T14:10:51",
     "date_completed_gmt": null,
-    "date_paid_gmt": "2026-10-15T13:43:27",
+    "date_paid_gmt": "2026-10-15T14:10:49",
     "currency_symbol": "CHF",
     "_links": {
      "self": [
@@ -1458,8 +1462,8 @@
    "response_kind": "json",
    "response_body": {
     "id": 50,
-    "date_created": "2026-10-15T13:43:34",
-    "date_created_gmt": "2026-10-15T13:43:34",
+    "date_created": "2026-10-15T14:10:56",
+    "date_created_gmt": "2026-10-15T14:10:56",
     "amount": "5.00",
     "reason": "Pubky refund refund-1",
     "refunded_by": 1,
@@ -1921,8 +1925,8 @@
    "response_kind": "json",
    "response_body": {
     "id": 51,
-    "date_created": "2026-10-15T13:43:41",
-    "date_created_gmt": "2026-10-15T13:43:41",
+    "date_created": "2026-10-15T14:11:04",
+    "date_created_gmt": "2026-10-15T14:11:04",
     "amount": "45.90",
     "reason": "Pubky refund refund-4",
     "refunded_by": 1,

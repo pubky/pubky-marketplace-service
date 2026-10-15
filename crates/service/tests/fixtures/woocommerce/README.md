@@ -12,7 +12,7 @@ replays it; nothing here needs Docker.
 | MariaDB | 11.8.9 |
 | TLS proxy | nginx 1.31.7, certificate from a local CA |
 | Shipment tracking | Advanced Shipment Tracking for WooCommerce 4.0.4 (writes `_wc_shipment_tracking_items`) |
-| Store | currency CHF, WooCommerce's own sample products (created row by row from `sample-data/sample_products.csv`) plus a variable product *Little Hodler Socks* (S, M, L, in CHF, per-variation stock 5, 3, 0, two images) and a simple *Pubky Test Item* (CHF 12.50, 10 in stock) |
+| Store | currency CHF, Swiss VAT 8.1% switched on with prices entered including tax (pushed orders must still total what the buyer paid), WooCommerce's own sample products (created row by row from `sample-data/sample_products.csv`) plus a variable product *Little Hodler Socks* (S, M, L, in CHF, per-variation stock 5, 3, 0, two images) and a simple *Pubky Test Item* (CHF 12.50, 10 in stock) |
 
 ## What is captured
 

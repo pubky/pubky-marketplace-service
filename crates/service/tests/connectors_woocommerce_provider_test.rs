@@ -559,7 +559,12 @@ async fn orders_are_pushed_found_cancelled_and_refunded_without_ever_doing_a_thi
             .await;
         assert_eq!(live["status"], "processing");
         assert!(live["date_paid"].is_string());
-        assert_eq!(live["total"], "50.90");
+        assert_eq!(
+            live["total"], "50.90",
+            "the store has Swiss VAT on, and still the total is what was paid"
+        );
+        assert_eq!(live["total_tax"], "0.00");
+        assert_eq!(live["shipping_tax"], "0.00");
         assert_eq!(live["shipping"]["first_name"], "Anna");
         assert_eq!(live["shipping"]["last_name"], "Muster");
         assert_eq!(live["shipping"]["address_1"], "Bahnhofstrasse 1");

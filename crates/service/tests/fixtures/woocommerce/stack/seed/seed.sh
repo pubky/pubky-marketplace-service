@@ -14,7 +14,10 @@ wp plugin install woo-advanced-shipment-tracking --activate
 wp option update woocommerce_currency CHF
 wp option update woocommerce_price_decimals 2
 wp option update woocommerce_default_country CH
-wp option update woocommerce_calc_taxes no
+# Swiss VAT, prices entered with tax: pushed orders must still total what the buyer paid.
+wp option update woocommerce_calc_taxes yes
+wp option update woocommerce_prices_include_tax yes
+wp wc --user=admin tax create --country=CH --rate=8.1 --name=MWST --shipping=true --class=standard
 wp option update woocommerce_manage_stock yes
 wp wc --user=admin tool run install_pages >/dev/null 2>&1 || true
 wp eval-file /seed/seed-products.php

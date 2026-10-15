@@ -1040,7 +1040,11 @@ status `processing` (WooCommerce takes the stock), line items by product and
 variation id with the Pubky prices, the Pubky order id as order meta
 `pubky_order_id` and in a zero-value fee line (WooCommerce's order search
 matches item names but not custom meta), a customer note with the order id and
-a link to the Shop orders page, and no billing details. The shipping address is
+a link to the Shop orders page, and no billing details. Lines use the
+`zero-rate` tax class: WooCommerce adds tax on top of API totals by the store's
+rates, whatever "prices include tax" says, so without this the order would
+total more than the buyer paid. The merchant books VAT on Pubky sales from the
+Pubky order. The shipping address is
 set only when the buyer shared it. A cancel after the push sets the order to
 `cancelled` (WooCommerce restocks); a Pubky refund adds a refund to the order
 with `api_refund: false`, so the store's books match and no money moves.

@@ -322,6 +322,11 @@ pub async fn verify_live_order(
         .await;
     assert_eq!(order["status"], "processing", "created paid and processing");
     assert!(order["date_paid"].is_string(), "paid");
+    assert_eq!(
+        order["total"], "137.00",
+        "the Pubky total, with Swiss VAT switched on in the store"
+    );
+    assert_eq!(order["total_tax"], "0.00");
     assert_eq!(order["billing"]["email"], "", "no billing email");
     assert_eq!(order["billing"]["first_name"], "");
     assert!(order["customer_note"]

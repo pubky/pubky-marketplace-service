@@ -13,7 +13,7 @@
    },
    "response_kind": "json",
    "response_body": {
-    "$blob": "b6e776b005a1e168"
+    "$blob": "7815651c67bd935d"
    }
   },
   {
@@ -81,6 +81,11 @@
    "response_kind": "json",
    "response_body": [
     {
+     "id": 1,
+     "name": "Pubky Shop product.updated",
+     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce"
+    },
+    {
      "id": 2,
      "name": "Pubky Shop order.updated",
      "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce"
@@ -89,13 +94,64 @@
      "id": 3,
      "name": "Pubky Shop order.deleted",
      "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce"
-    },
-    {
-     "id": 1,
-     "name": "Pubky Shop product.updated",
-     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce"
     }
    ]
+  },
+  {
+   "method": "DELETE",
+   "path": "/wp-json/wc/v3/webhooks/1",
+   "query": [
+    [
+     "force",
+     "true"
+    ]
+   ],
+   "auth": "basic",
+   "request_body": null,
+   "status": 200,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "id": 1,
+    "name": "Pubky Shop product.updated",
+    "status": "active",
+    "topic": "product.updated",
+    "resource": "product",
+    "event": "updated",
+    "hooks": [
+     "woocommerce_process_product_meta",
+     "woocommerce_update_product",
+     "woocommerce_update_product_variation"
+    ],
+    "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
+    "date_created": "2026-10-15T14:09:02",
+    "date_created_gmt": "2026-10-15T14:09:02",
+    "date_modified": "2026-10-15T14:09:07",
+    "date_modified_gmt": "2026-10-15T14:09:07",
+    "_links": {
+     "self": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/webhooks/1",
+       "targetHints": {
+        "allow": [
+         "GET",
+         "POST",
+         "PUT",
+         "PATCH",
+         "DELETE"
+        ]
+       }
+      }
+     ],
+     "collection": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/webhooks"
+      }
+     ]
+    }
+   }
   },
   {
    "method": "DELETE",
@@ -125,10 +181,10 @@
      "woocommerce_order_refunded"
     ],
     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
-    "date_created": "2026-10-15T13:41:46",
-    "date_created_gmt": "2026-10-15T13:41:46",
-    "date_modified": "2026-10-15T13:41:49",
-    "date_modified_gmt": "2026-10-15T13:41:49",
+    "date_created": "2026-10-15T14:09:02",
+    "date_created_gmt": "2026-10-15T14:09:02",
+    "date_modified": "2026-10-15T14:09:07",
+    "date_modified_gmt": "2026-10-15T14:09:07",
     "_links": {
      "self": [
       {
@@ -180,70 +236,14 @@
      "woocommerce_trash_order"
     ],
     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
-    "date_created": "2026-10-15T13:41:46",
-    "date_created_gmt": "2026-10-15T13:41:46",
-    "date_modified": "2026-10-15T13:41:52",
-    "date_modified_gmt": "2026-10-15T13:41:52",
+    "date_created": "2026-10-15T14:09:02",
+    "date_created_gmt": "2026-10-15T14:09:02",
+    "date_modified": "2026-10-15T14:09:09",
+    "date_modified_gmt": "2026-10-15T14:09:09",
     "_links": {
      "self": [
       {
        "href": "https://localhost:8443/wp-json/wc/v3/webhooks/3",
-       "targetHints": {
-        "allow": [
-         "GET",
-         "POST",
-         "PUT",
-         "PATCH",
-         "DELETE"
-        ]
-       }
-      }
-     ],
-     "collection": [
-      {
-       "href": "https://localhost:8443/wp-json/wc/v3/webhooks"
-      }
-     ]
-    }
-   }
-  },
-  {
-   "method": "DELETE",
-   "path": "/wp-json/wc/v3/webhooks/1",
-   "query": [
-    [
-     "force",
-     "true"
-    ]
-   ],
-   "auth": "basic",
-   "request_body": null,
-   "status": 200,
-   "response_headers": {
-    "content-type": "application/json; charset=UTF-8"
-   },
-   "response_kind": "json",
-   "response_body": {
-    "id": 1,
-    "name": "Pubky Shop product.updated",
-    "status": "active",
-    "topic": "product.updated",
-    "resource": "product",
-    "event": "updated",
-    "hooks": [
-     "woocommerce_process_product_meta",
-     "woocommerce_update_product",
-     "woocommerce_update_product_variation"
-    ],
-    "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
-    "date_created": "2026-10-15T13:41:45",
-    "date_created_gmt": "2026-10-15T13:41:45",
-    "date_modified": "2026-10-15T13:41:49",
-    "date_modified_gmt": "2026-10-15T13:41:49",
-    "_links": {
-     "self": [
-      {
-       "href": "https://localhost:8443/wp-json/wc/v3/webhooks/1",
        "targetHints": {
         "allow": [
          "GET",
@@ -294,8 +294,8 @@
      "woocommerce_update_product_variation"
     ],
     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
-    "date_created": "2026-10-15T13:41:54",
-    "date_created_gmt": "2026-10-15T13:41:54",
+    "date_created": "2026-10-15T14:09:12",
+    "date_created_gmt": "2026-10-15T14:09:12",
     "date_modified": null,
     "date_modified_gmt": null,
     "_links": {
@@ -351,8 +351,8 @@
      "woocommerce_order_refunded"
     ],
     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
-    "date_created": "2026-10-15T13:41:54",
-    "date_created_gmt": "2026-10-15T13:41:54",
+    "date_created": "2026-10-15T14:09:12",
+    "date_created_gmt": "2026-10-15T14:09:12",
     "date_modified": null,
     "date_modified_gmt": null,
     "_links": {
@@ -408,8 +408,8 @@
      "woocommerce_trash_order"
     ],
     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
-    "date_created": "2026-10-15T13:41:55",
-    "date_created_gmt": "2026-10-15T13:41:55",
+    "date_created": "2026-10-15T14:09:12",
+    "date_created_gmt": "2026-10-15T14:09:12",
     "date_modified": null,
     "date_modified_gmt": null,
     "_links": {
@@ -1292,10 +1292,10 @@
      "images": [
       {
        "id": 40,
-       "date_created": "2026-10-15T13:41:35",
-       "date_created_gmt": "2026-10-15T13:41:35",
-       "date_modified": "2026-10-15T13:41:35",
-       "date_modified_gmt": "2026-10-15T13:41:35",
+       "date_created": "2026-10-15T14:08:45",
+       "date_created_gmt": "2026-10-15T14:08:45",
+       "date_modified": "2026-10-15T14:08:45",
+       "date_modified_gmt": "2026-10-15T14:08:45",
        "src": "https://localhost:8443/wp-content/uploads/2026/10/little-hodler-socks.png",
        "name": "little-hodler-socks",
        "alt": "",
@@ -1305,10 +1305,10 @@
       },
       {
        "id": 41,
-       "date_created": "2026-10-15T13:41:35",
-       "date_created_gmt": "2026-10-15T13:41:35",
-       "date_modified": "2026-10-15T13:41:35",
-       "date_modified_gmt": "2026-10-15T13:41:35",
+       "date_created": "2026-10-15T14:08:45",
+       "date_created_gmt": "2026-10-15T14:08:45",
+       "date_modified": "2026-10-15T14:08:45",
+       "date_modified_gmt": "2026-10-15T14:08:45",
        "src": "https://localhost:8443/wp-content/uploads/2026/10/socks-detail.png",
        "name": "socks-detail",
        "alt": "",
@@ -1355,10 +1355,10 @@
      "images": [
       {
        "id": 42,
-       "date_created": "2026-10-15T13:41:35",
-       "date_created_gmt": "2026-10-15T13:41:35",
-       "date_modified": "2026-10-15T13:41:35",
-       "date_modified_gmt": "2026-10-15T13:41:35",
+       "date_created": "2026-10-15T14:08:45",
+       "date_created_gmt": "2026-10-15T14:08:45",
+       "date_modified": "2026-10-15T14:08:45",
+       "date_modified_gmt": "2026-10-15T14:08:45",
        "src": "https://localhost:8443/wp-content/uploads/2026/10/pubky-test-item.png",
        "name": "pubky-test-item",
        "alt": "",
@@ -1419,10 +1419,10 @@
      "stock_status": "instock",
      "image": {
       "id": 40,
-      "date_created": "2026-10-15T13:41:35",
-      "date_created_gmt": "2026-10-15T13:41:35",
-      "date_modified": "2026-10-15T13:41:35",
-      "date_modified_gmt": "2026-10-15T13:41:35",
+      "date_created": "2026-10-15T14:08:45",
+      "date_created_gmt": "2026-10-15T14:08:45",
+      "date_modified": "2026-10-15T14:08:45",
+      "date_modified_gmt": "2026-10-15T14:08:45",
       "src": "https://localhost:8443/wp-content/uploads/2026/10/little-hodler-socks.png",
       "name": "little-hodler-socks",
       "alt": ""
@@ -1446,10 +1446,10 @@
      "stock_status": "instock",
      "image": {
       "id": 40,
-      "date_created": "2026-10-15T13:41:35",
-      "date_created_gmt": "2026-10-15T13:41:35",
-      "date_modified": "2026-10-15T13:41:35",
-      "date_modified_gmt": "2026-10-15T13:41:35",
+      "date_created": "2026-10-15T14:08:45",
+      "date_created_gmt": "2026-10-15T14:08:45",
+      "date_modified": "2026-10-15T14:08:45",
+      "date_modified_gmt": "2026-10-15T14:08:45",
       "src": "https://localhost:8443/wp-content/uploads/2026/10/little-hodler-socks.png",
       "name": "little-hodler-socks",
       "alt": ""
@@ -1473,10 +1473,10 @@
      "stock_status": "outofstock",
      "image": {
       "id": 40,
-      "date_created": "2026-10-15T13:41:35",
-      "date_created_gmt": "2026-10-15T13:41:35",
-      "date_modified": "2026-10-15T13:41:35",
-      "date_modified_gmt": "2026-10-15T13:41:35",
+      "date_created": "2026-10-15T14:08:45",
+      "date_created_gmt": "2026-10-15T14:08:45",
+      "date_modified": "2026-10-15T14:08:45",
+      "date_modified_gmt": "2026-10-15T14:08:45",
       "src": "https://localhost:8443/wp-content/uploads/2026/10/little-hodler-socks.png",
       "name": "little-hodler-socks",
       "alt": ""
@@ -1993,18 +1993,19 @@
     "currency": "USD",
     "payment_method": "pubky",
     "payment_method_title": "Pubky",
-    "customer_note": "Pubky order cd142ca5-90cb-462b-8140-43a0425e00e2, paid with Pubky. Details and the buyer's messages: https://shop.test/marketplace/orders",
+    "customer_note": "Pubky order c8a7af9e-238f-4475-b536-7030f8c9443b, paid with Pubky. Details and the buyer's messages: https://shop.test/marketplace/orders",
     "line_items": [
      {
       "product_id": 39,
       "quantity": 1,
       "subtotal": "125.00",
-      "total": "125.00"
+      "total": "125.00",
+      "tax_class": "zero-rate"
      }
     ],
     "fee_lines": [
      {
-      "name": "Pubky order cd142ca5-90cb-462b-8140-43a0425e00e2",
+      "name": "Pubky order c8a7af9e-238f-4475-b536-7030f8c9443b",
       "total": "0.00",
       "tax_status": "none"
      }
@@ -2012,7 +2013,7 @@
     "meta_data": [
      {
       "key": "pubky_order_id",
-      "value": "cd142ca5-90cb-462b-8140-43a0425e00e2"
+      "value": "c8a7af9e-238f-4475-b536-7030f8c9443b"
      },
      {
       "key": "pubky_payment_rail",
@@ -2043,9 +2044,9 @@
     "status": "processing",
     "currency": "USD",
     "version": "11.2.1",
-    "prices_include_tax": false,
-    "date_created": "2026-10-15T13:41:57",
-    "date_modified": "2026-10-15T13:41:57",
+    "prices_include_tax": true,
+    "date_created": "2026-10-15T14:09:15",
+    "date_modified": "2026-10-15T14:09:15",
     "discount_total": "0.00",
     "discount_tax": "0.00",
     "shipping_total": "12.00",
@@ -2054,7 +2055,7 @@
     "total": "137.00",
     "total_tax": "0.00",
     "customer_id": 0,
-    "order_key": "wc_order_wSPM6r8SmJe6h",
+    "order_key": "wc_order_h7KjTKecM0eTd",
     "billing": {
      "first_name": "",
      "last_name": "",
@@ -2086,16 +2087,16 @@
     "customer_ip_address": "",
     "customer_user_agent": "",
     "created_via": "rest-api",
-    "customer_note": "Pubky order cd142ca5-90cb-462b-8140-43a0425e00e2, paid with Pubky. Details and the buyer's messages: https://shop.test/marketplace/orders",
+    "customer_note": "Pubky order c8a7af9e-238f-4475-b536-7030f8c9443b, paid with Pubky. Details and the buyer's messages: https://shop.test/marketplace/orders",
     "date_completed": null,
-    "date_paid": "2026-10-15T13:41:57",
+    "date_paid": "2026-10-15T14:09:15",
     "cart_hash": "",
     "number": "44",
     "meta_data": [
      {
       "id": 672,
       "key": "pubky_order_id",
-      "value": "cd142ca5-90cb-462b-8140-43a0425e00e2"
+      "value": "c8a7af9e-238f-4475-b536-7030f8c9443b"
      },
      {
       "id": 673,
@@ -2115,7 +2116,7 @@
       "product_id": 39,
       "variation_id": 0,
       "quantity": 1,
-      "tax_class": "",
+      "tax_class": "zero-rate",
       "subtotal": "125.00",
       "subtotal_tax": "0.00",
       "total": "125.00",
@@ -2157,7 +2158,7 @@
     "fee_lines": [
      {
       "id": 6,
-      "name": "Pubky order cd142ca5-90cb-462b-8140-43a0425e00e2",
+      "name": "Pubky order c8a7af9e-238f-4475-b536-7030f8c9443b",
       "tax_class": "",
       "tax_status": "none",
       "amount": "",
@@ -2169,14 +2170,14 @@
     ],
     "coupon_lines": [],
     "refunds": [],
-    "payment_url": "https://localhost:8443/checkout/order-pay/44/?pay_for_order=true&key=wc_order_wSPM6r8SmJe6h",
+    "payment_url": "https://localhost:8443/checkout/order-pay/44/?pay_for_order=true&key=wc_order_h7KjTKecM0eTd",
     "is_editable": false,
     "needs_payment": false,
     "needs_processing": true,
-    "date_created_gmt": "2026-10-15T13:41:57",
-    "date_modified_gmt": "2026-10-15T13:41:57",
+    "date_created_gmt": "2026-10-15T14:09:15",
+    "date_modified_gmt": "2026-10-15T14:09:15",
     "date_completed_gmt": null,
-    "date_paid_gmt": "2026-10-15T13:41:57",
+    "date_paid_gmt": "2026-10-15T14:09:15",
     "currency_symbol": "$",
     "_links": {
      "self": [
@@ -3064,10 +3065,10 @@
      "images": [
       {
        "id": 40,
-       "date_created": "2026-10-15T13:41:35",
-       "date_created_gmt": "2026-10-15T13:41:35",
-       "date_modified": "2026-10-15T13:41:35",
-       "date_modified_gmt": "2026-10-15T13:41:35",
+       "date_created": "2026-10-15T14:08:45",
+       "date_created_gmt": "2026-10-15T14:08:45",
+       "date_modified": "2026-10-15T14:08:45",
+       "date_modified_gmt": "2026-10-15T14:08:45",
        "src": "https://localhost:8443/wp-content/uploads/2026/10/little-hodler-socks.png",
        "name": "little-hodler-socks",
        "alt": "",
@@ -3077,10 +3078,10 @@
       },
       {
        "id": 41,
-       "date_created": "2026-10-15T13:41:35",
-       "date_created_gmt": "2026-10-15T13:41:35",
-       "date_modified": "2026-10-15T13:41:35",
-       "date_modified_gmt": "2026-10-15T13:41:35",
+       "date_created": "2026-10-15T14:08:45",
+       "date_created_gmt": "2026-10-15T14:08:45",
+       "date_modified": "2026-10-15T14:08:45",
+       "date_modified_gmt": "2026-10-15T14:08:45",
        "src": "https://localhost:8443/wp-content/uploads/2026/10/socks-detail.png",
        "name": "socks-detail",
        "alt": "",
@@ -3127,10 +3128,10 @@
      "images": [
       {
        "id": 42,
-       "date_created": "2026-10-15T13:41:35",
-       "date_created_gmt": "2026-10-15T13:41:35",
-       "date_modified": "2026-10-15T13:41:35",
-       "date_modified_gmt": "2026-10-15T13:41:35",
+       "date_created": "2026-10-15T14:08:45",
+       "date_created_gmt": "2026-10-15T14:08:45",
+       "date_modified": "2026-10-15T14:08:45",
+       "date_modified_gmt": "2026-10-15T14:08:45",
        "src": "https://localhost:8443/wp-content/uploads/2026/10/pubky-test-item.png",
        "name": "pubky-test-item",
        "alt": "",
@@ -3191,10 +3192,10 @@
      "stock_status": "instock",
      "image": {
       "id": 40,
-      "date_created": "2026-10-15T13:41:35",
-      "date_created_gmt": "2026-10-15T13:41:35",
-      "date_modified": "2026-10-15T13:41:35",
-      "date_modified_gmt": "2026-10-15T13:41:35",
+      "date_created": "2026-10-15T14:08:45",
+      "date_created_gmt": "2026-10-15T14:08:45",
+      "date_modified": "2026-10-15T14:08:45",
+      "date_modified_gmt": "2026-10-15T14:08:45",
       "src": "https://localhost:8443/wp-content/uploads/2026/10/little-hodler-socks.png",
       "name": "little-hodler-socks",
       "alt": ""
@@ -3218,10 +3219,10 @@
      "stock_status": "instock",
      "image": {
       "id": 40,
-      "date_created": "2026-10-15T13:41:35",
-      "date_created_gmt": "2026-10-15T13:41:35",
-      "date_modified": "2026-10-15T13:41:35",
-      "date_modified_gmt": "2026-10-15T13:41:35",
+      "date_created": "2026-10-15T14:08:45",
+      "date_created_gmt": "2026-10-15T14:08:45",
+      "date_modified": "2026-10-15T14:08:45",
+      "date_modified_gmt": "2026-10-15T14:08:45",
       "src": "https://localhost:8443/wp-content/uploads/2026/10/little-hodler-socks.png",
       "name": "little-hodler-socks",
       "alt": ""
@@ -3245,10 +3246,10 @@
      "stock_status": "outofstock",
      "image": {
       "id": 40,
-      "date_created": "2026-10-15T13:41:35",
-      "date_created_gmt": "2026-10-15T13:41:35",
-      "date_modified": "2026-10-15T13:41:35",
-      "date_modified_gmt": "2026-10-15T13:41:35",
+      "date_created": "2026-10-15T14:08:45",
+      "date_created_gmt": "2026-10-15T14:08:45",
+      "date_modified": "2026-10-15T14:08:45",
+      "date_modified_gmt": "2026-10-15T14:08:45",
       "src": "https://localhost:8443/wp-content/uploads/2026/10/little-hodler-socks.png",
       "name": "little-hodler-socks",
       "alt": ""
@@ -3288,11 +3289,6 @@
    "response_kind": "json",
    "response_body": [
     {
-     "id": 6,
-     "name": "Pubky Shop order.deleted",
-     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce"
-    },
-    {
      "id": 4,
      "name": "Pubky Shop product.updated",
      "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce"
@@ -3301,63 +3297,13 @@
      "id": 5,
      "name": "Pubky Shop order.updated",
      "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce"
+    },
+    {
+     "id": 6,
+     "name": "Pubky Shop order.deleted",
+     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce"
     }
    ]
-  },
-  {
-   "method": "DELETE",
-   "path": "/wp-json/wc/v3/webhooks/6",
-   "query": [
-    [
-     "force",
-     "true"
-    ]
-   ],
-   "auth": "basic",
-   "request_body": null,
-   "status": 200,
-   "response_headers": {
-    "content-type": "application/json; charset=UTF-8"
-   },
-   "response_kind": "json",
-   "response_body": {
-    "id": 6,
-    "name": "Pubky Shop order.deleted",
-    "status": "active",
-    "topic": "order.deleted",
-    "resource": "order",
-    "event": "deleted",
-    "hooks": [
-     "wp_trash_post",
-     "woocommerce_trash_order"
-    ],
-    "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
-    "date_created": "2026-10-15T13:41:55",
-    "date_created_gmt": "2026-10-15T13:41:55",
-    "date_modified": "2026-10-15T13:41:55",
-    "date_modified_gmt": "2026-10-15T13:41:55",
-    "_links": {
-     "self": [
-      {
-       "href": "https://localhost:8443/wp-json/wc/v3/webhooks/6",
-       "targetHints": {
-        "allow": [
-         "GET",
-         "POST",
-         "PUT",
-         "PATCH",
-         "DELETE"
-        ]
-       }
-      }
-     ],
-     "collection": [
-      {
-       "href": "https://localhost:8443/wp-json/wc/v3/webhooks"
-      }
-     ]
-    }
-   }
   },
   {
    "method": "DELETE",
@@ -3388,10 +3334,10 @@
      "woocommerce_update_product_variation"
     ],
     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
-    "date_created": "2026-10-15T13:41:54",
-    "date_created_gmt": "2026-10-15T13:41:54",
-    "date_modified": "2026-10-15T13:42:02",
-    "date_modified_gmt": "2026-10-15T13:42:02",
+    "date_created": "2026-10-15T14:09:12",
+    "date_created_gmt": "2026-10-15T14:09:12",
+    "date_modified": "2026-10-15T14:09:19",
+    "date_modified_gmt": "2026-10-15T14:09:19",
     "_links": {
      "self": [
       {
@@ -3443,14 +3389,69 @@
      "woocommerce_order_refunded"
     ],
     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
-    "date_created": "2026-10-15T13:41:54",
-    "date_created_gmt": "2026-10-15T13:41:54",
-    "date_modified": "2026-10-15T13:42:04",
-    "date_modified_gmt": "2026-10-15T13:42:04",
+    "date_created": "2026-10-15T14:09:12",
+    "date_created_gmt": "2026-10-15T14:09:12",
+    "date_modified": "2026-10-15T14:09:22",
+    "date_modified_gmt": "2026-10-15T14:09:22",
     "_links": {
      "self": [
       {
        "href": "https://localhost:8443/wp-json/wc/v3/webhooks/5",
+       "targetHints": {
+        "allow": [
+         "GET",
+         "POST",
+         "PUT",
+         "PATCH",
+         "DELETE"
+        ]
+       }
+      }
+     ],
+     "collection": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/webhooks"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "method": "DELETE",
+   "path": "/wp-json/wc/v3/webhooks/6",
+   "query": [
+    [
+     "force",
+     "true"
+    ]
+   ],
+   "auth": "basic",
+   "request_body": null,
+   "status": 200,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "id": 6,
+    "name": "Pubky Shop order.deleted",
+    "status": "active",
+    "topic": "order.deleted",
+    "resource": "order",
+    "event": "deleted",
+    "hooks": [
+     "wp_trash_post",
+     "woocommerce_trash_order"
+    ],
+    "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
+    "date_created": "2026-10-15T14:09:12",
+    "date_created_gmt": "2026-10-15T14:09:12",
+    "date_modified": "2026-10-15T14:09:12",
+    "date_modified_gmt": "2026-10-15T14:09:12",
+    "_links": {
+     "self": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/webhooks/6",
        "targetHints": {
         "allow": [
          "GET",

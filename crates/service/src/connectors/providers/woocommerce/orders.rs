@@ -26,6 +26,12 @@ pub const META_REFUND_ID: &str = "pubky_refund_id";
 /// Every refund this service records starts its reason with this, so the
 /// order webhook can tell it from one the merchant made.
 pub const REFUND_REASON_PREFIX: &str = "Pubky refund";
+/// WooCommerce adds tax on top of the totals an API client sends, by the
+/// store's rates for the shipping country, whatever the "prices include tax"
+/// setting says. The buyer already paid a fixed amount, so the order is
+/// created in a tax class that has no rates and its total equals what the buyer
+/// paid. The merchant books tax on Pubky sales from the Pubky order.
+const NO_TAX_CLASS: &str = "zero-rate";
 const SCAN_PAGES: u32 = 3;
 const SCAN_PAGE_SIZE: u32 = 100;
 const FINAL_STATUSES: [&str; 4] = ["cancelled", "refunded", "failed", "trash"];
@@ -93,6 +99,7 @@ pub fn order_body(push: &OrderPush, shop_origin: Option<&str>) -> Result<Value, 
             "quantity": line.quantity,
             "subtotal": amount,
             "total": amount,
+            "tax_class": NO_TAX_CLASS,
         });
         if line.provider_variant_id != line.provider_product_id {
             item["variation_id"] = json!(woo_id(&line.provider_variant_id)?);
@@ -443,6 +450,11 @@ mod tests {
         assert_eq!(body["line_items"][0]["product_id"], 39);
         assert!(body["line_items"][0].get("variation_id").is_none());
         assert_eq!(body["line_items"][0]["total"], "25.00");
+        assert_eq!(
+            body["line_items"][0]["tax_class"], "zero-rate",
+            "no tax added on top of what was paid"
+        );
+        assert_eq!(body["line_items"][1]["tax_class"], "zero-rate");
         assert_eq!(body["line_items"][1]["variation_id"], 36);
         assert_eq!(body["shipping_lines"][0]["total"], "6.00");
         assert_eq!(body["meta_data"][0]["key"], "pubky_order_id");
