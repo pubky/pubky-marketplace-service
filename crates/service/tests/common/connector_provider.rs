@@ -95,6 +95,9 @@ pub struct TestStore {
     pub disconnect_calls: AtomicUsize,
     pub script: Mutex<VecDeque<PushScript>>,
     pub gate: Mutex<Option<Arc<Gate>>>,
+    /// Holds `record_refund` open, like `gate` does for `push_order`: a slow
+    /// store.
+    pub refund_gate: Mutex<Option<Arc<Gate>>>,
     pub push_delay: Mutex<Duration>,
     pub catalog: Mutex<Vec<CatalogProduct>>,
     pub reject_credentials: AtomicBool,
@@ -125,6 +128,12 @@ impl TestStore {
     pub fn open_gate(&self) -> Arc<Gate> {
         let gate = Arc::new(Gate::default());
         *self.gate.lock().expect("gate lock") = Some(gate.clone());
+        gate
+    }
+
+    pub fn open_refund_gate(&self) -> Arc<Gate> {
+        let gate = Arc::new(Gate::default());
+        *self.refund_gate.lock().expect("refund gate lock") = Some(gate.clone());
         gate
     }
 
@@ -486,6 +495,11 @@ impl ConnectorProvider for TestProvider {
     ) -> Result<(), ProviderError> {
         self.store.refund_calls.fetch_add(1, Ordering::SeqCst);
         blob(connection)?;
+        let gate = self.store.refund_gate.lock().expect("refund gate").clone();
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
         *self.store.last_refund.lock().expect("refund lock") = Some(refund.clone());
         self.store
             .refund_amounts
