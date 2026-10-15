@@ -500,7 +500,9 @@ working unchanged (Bitcoin only, its projection unchanged).
   seller can receive and fixes the Bitcoin rate once, at prepare. The service
   sends `accepted_assets` only to narrow: `["BTC"]` when the seller's USDT
   consent is off, `USDT_PAYMENTS_ENABLED` is off or the order is not priced in
-  USD; `["USDT"]` when the FX feed cannot be read but USDT is available.
+  USD; `["USDT"]` when the seller's Bitcoin switch is off (a seller who takes
+  only USDT, no FX quote needed) or the FX feed cannot be read but USDT is
+  available.
   Activation names the same denomination and amount (`{amount, asset,
   creator, invoice_id}`), and the response must echo the persisted terms.
   Against the fork, an rc16 upstream, or any deployment that does not list
@@ -513,8 +515,8 @@ working unchanged (Bitcoin only, its projection unchanged).
   inside the 1,000-sat minimum and the cap; a satoshi-priced order's Bitcoin
   amount is exactly the price and never offers USDT. A mismatch refuses the
   bind and voids the prepared invoice. USDT is offered only on `USD/2`
-  orders; the seller's Bitcoin rail switch (`bitcoin_enabled`) is the Paykit
-  switch.
+  orders. A `paykit` bind needs the seller's Bitcoin switch (`bitcoin_enabled`)
+  or the USDT consent; neither is `method_unavailable`.
 - **Order projection.** A `paykit` order carries `payment_method: "paykit"`,
   `accepted_assets` (what the request offers: `["BTC"]`, `["USDT"]` or
   `["BTC","USDT"]`) and `payment_amounts` (what each asset costs in its own
@@ -525,8 +527,8 @@ working unchanged (Bitcoin only, its projection unchanged).
   `parity` or `fixed_rate`); they are absent until then. A USDT payment also
   carries `payment_finality`. Legacy `bitcoin` and `usdt` orders keep their
   projection.
-- **Public seller config** (flag on only). `paykit_available` (the seller takes
-  Paykit payments and can receive Bitcoin or USDT through it) and
+- **Public seller config** (flag on only). `paykit_available` (the seller can
+  receive Bitcoin or USDT through Paykit) and
   `accepted_assets` beside the existing `bitcoin_available` and
   `usdt_available`. With the flag off the keys are absent.
 - **Settlement.** Bitcoin settles exactly as before. USDT is paid at verified

@@ -49,10 +49,13 @@ pub const MAX_LIMIT: i64 = 200;
 
 pub const ORDER_COLUMNS: &str =
     "id, auction_aggregate_id, drop_aggregate_id, buyer_pubky, seller_pubky, \
-     EXISTS (SELECT 1 FROM seller_payment_configs AS seller_config \
+     (EXISTS (SELECT 1 FROM seller_payment_configs AS seller_config \
        WHERE seller_config.seller_pubky = orders.seller_pubky \
        AND (seller_config.bitcoin_enabled \
-         OR seller_config.paypal_merchant_email IS NOT NULL)) AS seller_has_rail, revision, \
+         OR seller_config.paypal_merchant_email IS NOT NULL)) \
+      OR EXISTS (SELECT 1 FROM seller_accepted_payment_options AS seller_option \
+       WHERE seller_option.seller_pubky = orders.seller_pubky \
+       AND seller_option.enabled)) AS seller_has_rail, revision, \
      state, lines, delivery_address, checkout_command_id, delivery_address_envelope, \
      delivery_key_id, subtotal_minor, shipping_minor, total_minor, \
      currency, exponent, payment_id, receipt_id, edition, \
@@ -94,7 +97,9 @@ pub async fn seller_has_rail(
         "SELECT EXISTS (SELECT 1 FROM seller_payment_configs \
          WHERE seller_pubky = $1 \
          AND (bitcoin_enabled \
-           OR paypal_merchant_email IS NOT NULL))",
+           OR paypal_merchant_email IS NOT NULL)) \
+         OR EXISTS (SELECT 1 FROM seller_accepted_payment_options \
+         WHERE seller_pubky = $1 AND enabled)",
     )
     .bind(seller_pubky)
     .fetch_one(&mut **tx)

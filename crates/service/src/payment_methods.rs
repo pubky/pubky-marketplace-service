@@ -605,7 +605,6 @@ fn public_config_view(
     bitcoin_offer_available: bool,
     paypal_available: bool,
     usdt_available: Option<bool>,
-    paykit_bindable: bool,
 ) -> Response {
     let mut view = json!({
         "bitcoin_available": bitcoin_available,
@@ -614,10 +613,10 @@ fn public_config_view(
     });
     // Only while the USDT flag is on: the keys are absent otherwise, so the
     // body is byte-identical to a build without USDT. `paykit_available` is
-    // the one Paykit method the buyer is offered: the seller takes Paykit
-    // payments (the Bitcoin rail switch) and can receive Bitcoin or USDT
-    // through it. `accepted_assets` names which, so checkout can say
-    // "Bitcoin or USDT in Bitkit"; the order names what its request offered.
+    // the one Paykit method the buyer is offered: the seller can receive
+    // Bitcoin or USDT through it. `accepted_assets` names which, so checkout
+    // can say "Bitcoin or USDT in Bitkit"; the order names what its request
+    // offered. A seller who takes only USDT is offered `["USDT"]`.
     if let Some(usdt_available) = usdt_available {
         view["usdt_available"] = json!(usdt_available);
         let assets: Vec<&str> = [
@@ -625,7 +624,7 @@ fn public_config_view(
             (usdt_available, AcceptedAsset::Usdt),
         ]
         .into_iter()
-        .filter(|(available, _)| *available && paykit_bindable)
+        .filter(|(available, _)| *available)
         .map(|(_, asset)| asset.as_str())
         .collect();
         view["paykit_available"] = json!(!assets.is_empty());
@@ -698,7 +697,7 @@ pub async fn get_payment_config(
         None
     };
     let Some(config) = config else {
-        return public_config_view(false, rail_health, false, usdt_available, false);
+        return public_config_view(false, rail_health, false, usdt_available);
     };
     let bitcoin_available = if config.bitcoin_enabled {
         let paykit = state
@@ -728,7 +727,6 @@ pub async fn get_payment_config(
         rail_health,
         config.paypal_merchant_email.is_some(),
         usdt_available,
-        config.bitcoin_enabled,
     )
 }
 
@@ -1371,7 +1369,21 @@ pub async fn bind_payment_method(
         && state.config.paykit_marketplace_assets.includes_usdt();
     let mut plan = RequestPlan::LegacySats;
     let bitcoin_quote = if on_paykit {
-        if !config.as_ref().is_some_and(|config| config.bitcoin_enabled) {
+        let bitcoin_enabled = config.as_ref().is_some_and(|config| config.bitcoin_enabled);
+        // USDT rides the `paykit` method of a multi-asset deployment, on
+        // USD/2 orders, for a seller who consented. It does not need the
+        // seller's Bitcoin rail switch: a seller who takes only USDT is
+        // offered a USDT-only request.
+        let usdt_wanted = multi_contract
+            && bind == BindMethod::Paykit
+            && state.config.usdt_payments_enabled
+            && order.currency == "USD"
+            && order.exponent == 2
+            && match usdt_option_enabled(&mut *tx, &order.seller_pubky).await {
+                Ok(enabled) => enabled,
+                Err(error) => return internal("usdt consent read", &error),
+            };
+        if !bitcoin_enabled && !usdt_wanted {
             return method_error(
                 ErrorCode::InvalidState,
                 "method_unavailable",
@@ -1414,30 +1426,46 @@ pub async fn bind_payment_method(
             }
             Some((None, sats))
         } else if order.currency == "USD" && order.exponent == 2 {
-            let quoted = crate::fx::quote_usd(
-                &mut *tx,
-                &state.config.fx_feed_url,
-                order.total_minor,
-                order.exponent,
-                now,
-            )
-            .await;
             if multi_contract && bind == BindMethod::Paykit {
-                let usdt_wanted = state.config.usdt_payments_enabled
-                    && match usdt_option_enabled(&mut *tx, &order.seller_pubky).await {
-                        Ok(enabled) => enabled,
-                        Err(error) => return internal("usdt consent read", &error),
-                    };
                 let total_cents = u64::try_from(order.total_minor).unwrap_or_default();
-                // Bitcoin is offered only while the service quote can guard
-                // paykit-server's fixed amount; with USDT available a feed
-                // that cannot be read narrows the request instead of
-                // refusing the bind.
+                // Bitcoin is offered only while the seller takes it and the
+                // service quote can guard paykit-server's fixed amount; with
+                // USDT available a feed that cannot be read narrows the
+                // request instead of refusing the bind.
+                let quoted = if bitcoin_enabled {
+                    Some(
+                        crate::fx::quote_usd(
+                            &mut *tx,
+                            &state.config.fx_feed_url,
+                            order.total_minor,
+                            order.exponent,
+                            now,
+                        )
+                        .await,
+                    )
+                } else {
+                    None
+                };
                 let (quote, only) = match (quoted, usdt_wanted) {
-                    (Ok(quote), true) => (Some(quote), None),
-                    (Ok(quote), false) => (Some(quote), Some(vec![AcceptedAsset::Btc])),
-                    (Err(_), true) => (None, Some(vec![AcceptedAsset::Usdt])),
-                    (Err(error), false) => return fx_error_response(error),
+                    (Some(Ok(quote)), true) => (Some(quote), None),
+                    (Some(Ok(quote)), false) => (Some(quote), Some(vec![AcceptedAsset::Btc])),
+                    (Some(Err(error)), true) => {
+                        tracing::warn!(
+                            order_id = %order.id,
+                            ?error,
+                            "FX quote unavailable; offering USDT only"
+                        );
+                        (None, Some(vec![AcceptedAsset::Usdt]))
+                    }
+                    (None, true) => (None, Some(vec![AcceptedAsset::Usdt])),
+                    (Some(Err(error)), false) => return fx_error_response(error),
+                    (None, false) => {
+                        return method_error(
+                            ErrorCode::InvalidState,
+                            "method_unavailable",
+                            "The seller does not accept Paykit payments.",
+                        )
+                    }
                 };
                 plan = RequestPlan::assets(
                     PaymentAsset::Usd,
@@ -1448,7 +1476,15 @@ pub async fn bind_payment_method(
                 );
                 quote.map(|(rate, sample, sats)| (Some((rate, sample)), sats))
             } else {
-                let (rate, sample, sats) = match quoted {
+                let (rate, sample, sats) = match crate::fx::quote_usd(
+                    &mut *tx,
+                    &state.config.fx_feed_url,
+                    order.total_minor,
+                    order.exponent,
+                    now,
+                )
+                .await
+                {
                     Ok(quote) => quote,
                     Err(error) => return fx_error_response(error),
                 };

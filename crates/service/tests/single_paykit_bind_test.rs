@@ -555,6 +555,60 @@ async fn an_unreadable_fx_feed_narrows_to_usdt_and_fails_a_bitcoin_only_bind(poo
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_seller_who_takes_only_usdt_is_offered_a_usdt_only_request(pool: PgPool) {
+    let f = fixture(
+        pool.clone(),
+        Setup {
+            receivable: &["BTC", "USDT"],
+            ..Setup::both()
+        },
+    )
+    .await;
+    put_config(
+        &f.app,
+        &f.seller.token,
+        json!({ "bitcoin_enabled": false, "usdt_enabled": true }),
+    )
+    .await;
+    let order = checkout_usd(&f).await;
+    let unbound = read_order(&f, &f.buyer.token, &order.order_id).await;
+    assert_eq!(
+        unbound["next_actor"],
+        json!("buyer"),
+        "the seller has a rail"
+    );
+    let (status, body) = bind(&f, &order.order_id, "paykit").await;
+    assert_eq!(status, StatusCode::OK, "bind failed: {body}");
+    assert_eq!(
+        prepare_body(&f.paykit)["accepted_assets"],
+        json!(["USDT"]),
+        "the Bitcoin switch is off, so Bitcoin is never requested"
+    );
+    assert_eq!(f.fx.fetch_count(), 0, "no Bitcoin leg, no FX quote");
+    let view = &body["order"];
+    assert_eq!(view["accepted_assets"], json!(["USDT"]));
+    assert_eq!(view["payment_amounts"], json!({ "USDT": TOTAL_USDT_UNITS }));
+
+    // A legacy Bitcoin bind of the same seller is refused: the switch is off.
+    let other = checkout_usd(&f).await;
+    let (status, body) = bind(&f, &other.order_id, "bitcoin").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["reason"], json!("method_unavailable"));
+
+    // With the consent off as well, Paykit is not available at all.
+    put_config(
+        &f.app,
+        &f.seller.token,
+        json!({ "bitcoin_enabled": false, "usdt_enabled": false }),
+    )
+    .await;
+    let third = checkout_usd(&f).await;
+    let (status, body) = bind(&f, &third.order_id, "paykit").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["reason"], json!("method_unavailable"));
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_bitcoin_amount_far_from_the_service_quote_is_refused_and_voided(pool: PgPool) {
     let f = fixture(pool.clone(), Setup::both()).await;
     f.paykit.set_usd_per_btc(40_000);
@@ -771,10 +825,11 @@ async fn the_public_config_names_the_one_paykit_method_and_its_assets(pool: PgPo
     .await;
     assert_eq!(
         body["paykit_available"],
-        json!(false),
-        "Paykit needs the seller's Bitcoin rail switch: {body}"
+        json!(true),
+        "a seller who takes only USDT is offered Paykit: {body}"
     );
-    assert_eq!(body["accepted_assets"], json!([]));
+    assert_eq!(body["accepted_assets"], json!(["USDT"]), "{body}");
+    assert_eq!(body["bitcoin_available"], json!(false));
 }
 
 // ---------------------------------------------------------------------------
