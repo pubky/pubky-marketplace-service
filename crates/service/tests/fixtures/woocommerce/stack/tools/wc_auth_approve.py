@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """Plays the merchant: logs in to WP admin and approves a wc-auth request.
 
-  ADMIN_PASSWORD=... python3 wc_auth_approve.py 'https://localhost:8443/wc-auth/v1/authorize?...' CA_PEM
+  ADMIN_PASSWORD=... python3 wc_auth_approve.py 'https://localhost:8443/wc-auth/v1/authorize?...' CA_PEM [ADMIN_ORIGIN]
+
+ADMIN_ORIGIN (default: the origin of the URL) is where the merchant's browser
+actually talks to; the recording rig sets it to the stack's own proxy so the
+login does not pass through the capture proxy.
 
 Prints the final redirect location (the return_url with success=1) and exits 0
 when WooCommerce reported success.
@@ -10,6 +14,9 @@ import html, http.cookiejar, os, re, ssl, sys, urllib.parse, urllib.request
 
 authorize_url, ca = sys.argv[1], sys.argv[2]
 context = ssl.create_default_context(cafile=ca)
+site_origin = "{0.scheme}://{0.netloc}".format(urllib.parse.urlparse(authorize_url))
+admin_origin = sys.argv[3] if len(sys.argv) > 3 else site_origin
+authorize_url = authorize_url.replace(site_origin, admin_origin, 1)
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -26,6 +33,7 @@ opener = urllib.request.build_opener(
 
 
 def fetch(url, data=None):
+    url = url.replace(site_origin, admin_origin)
     request = urllib.request.Request(url, data=data)
     try:
         response = opener.open(request)
@@ -34,7 +42,7 @@ def fetch(url, data=None):
     return response.status, response.headers, response.read().decode("utf-8", "replace")
 
 
-origin = "{0.scheme}://{0.netloc}".format(urllib.parse.urlparse(authorize_url))
+origin = admin_origin
 fetch(origin + "/wp-login.php")
 status, headers, _ = fetch(
     origin + "/wp-login.php",

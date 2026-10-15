@@ -9,6 +9,8 @@ wp core install --url=https://localhost:8443 --title="Dezentralshop (fixture)" \
   --admin_user=admin --admin_password="$ADMIN_PASSWORD" --admin_email=admin@example.invalid --skip-email
 wp rewrite structure '/%postname%/' --hard
 wp plugin install woocommerce --activate
+# Shipment tracking meta (_wc_shipment_tracking_items) as real stores write it.
+wp plugin install woo-advanced-shipment-tracking --activate
 wp option update woocommerce_currency CHF
 wp option update woocommerce_price_decimals 2
 wp option update woocommerce_default_country CH

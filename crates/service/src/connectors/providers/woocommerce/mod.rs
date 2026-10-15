@@ -56,7 +56,6 @@ use self::site::Site;
 
 pub const APP_NAME: &str = "Pubky Shop";
 pub const SCOPE: &str = "read_write";
-const PRODUCTS_PER_PAGE: u32 = 50;
 const VARIATIONS_PER_PAGE: u32 = 100;
 const MAX_VARIATION_PAGES: u32 = 10;
 const PRODUCT_FIELDS: &str =
@@ -135,18 +134,6 @@ impl WooCommerceProvider {
         };
         match index.status {
             200 => {}
-            301 | 302 | 303 | 307 | 308 => {
-                let target = index
-                    .header("location")
-                    .and_then(|location| url::Url::parse(location).ok())
-                    .and_then(|url| url.host_str().map(str::to_string));
-                return Err(ProviderError::Invalid(match target {
-                    Some(host) => format!(
-                        "The store redirects to {host}. Use that address (and HTTPS) as the store address."
-                    ),
-                    None => "The store address redirects elsewhere. Use the final address (HTTPS) as the store address.".into(),
-                }));
-            }
             401 | 403 => {
                 return Err(ProviderError::Invalid(
                     "The store's REST API is blocked (a security plugin or the host is refusing \
@@ -160,7 +147,11 @@ impl WooCommerceProvider {
                     index.status
                 )))
             }
-            _ => {
+            status => {
+                // With plain permalinks WordPress does not serve /wp-json/ (it
+                // 404s or redirects it to itself), but the same REST API answers
+                // at /?rest_route=/ . WooCommerce's one-click flow needs the
+                // pretty URLs, so say what to change.
                 let plain = self
                     .http
                     .send(
@@ -172,17 +163,36 @@ impl WooCommerceProvider {
                         None,
                     )
                     .await?;
-                return Err(ProviderError::Invalid(
-                    if plain.status == 200 && namespaces(&plain).is_some() {
-                        "WordPress is using plain permalinks. In WordPress go to Settings > Permalinks, \
-                     choose \"Post name\" and save; WooCommerce's one-click connection needs it."
-                        .into()
-                    } else {
-                        "The WordPress REST API was not found at this address. Check the store address \
-                     and that WordPress is installed there."
-                        .into()
-                    },
-                ));
+                if plain.status == 200 && namespaces(&plain).is_some() {
+                    return Err(ProviderError::Invalid(
+                        "WordPress is using plain permalinks. In WordPress go to Settings > \
+                         Permalinks, choose \"Post name\" and save; WooCommerce's one-click \
+                         connection needs it."
+                            .into(),
+                    ));
+                }
+                let target = [&index, &plain]
+                    .into_iter()
+                    .filter(|reply| matches!(reply.status, 301 | 302 | 303 | 307 | 308))
+                    .find_map(|reply| {
+                        url::Url::parse(reply.header("location")?).ok().map(|url| {
+                            match url.port() {
+                                Some(port) => {
+                                    format!("{}:{port}", url.host_str().unwrap_or_default())
+                                }
+                                None => url.host_str().unwrap_or_default().to_string(),
+                            }
+                        })
+                    });
+                return Err(ProviderError::Invalid(match (status, target) {
+                    (301 | 302 | 303 | 307 | 308, Some(host)) => format!(
+                        "The store redirects to {host}. Use that address (and HTTPS) as the store address."
+                    ),
+                    (301 | 302 | 303 | 307 | 308, None) => "The store address redirects elsewhere. Use the final address (HTTPS) as the store address.".into(),
+                    _ => "The WordPress REST API was not found at this address. Check the store address \
+                          and that WordPress is installed there."
+                        .into(),
+                }));
             }
         }
         let Some(root) = namespaces(&index) else {
@@ -331,6 +341,8 @@ impl WooCommerceProvider {
                     &[
                         ("per_page", VARIATIONS_PER_PAGE.to_string()),
                         ("page", page.to_string()),
+                        ("orderby", "id".into()),
+                        ("order", "asc".into()),
                         ("_fields", VARIATION_FIELDS.into()),
                     ],
                 )
@@ -346,6 +358,7 @@ impl WooCommerceProvider {
                 break;
             }
         }
+        all.sort_by_key(|variation| catalog::id_of(variation).unwrap_or(i64::MAX));
         Ok(all)
     }
 }
@@ -474,7 +487,7 @@ impl ConnectorProvider for WooCommerceProvider {
             .get(
                 "/products",
                 &[
-                    ("per_page", PRODUCTS_PER_PAGE.to_string()),
+                    ("per_page", self.http.catalog_page_size().to_string()),
                     ("page", number.to_string()),
                     ("orderby", "id".into()),
                     ("order", "asc".into()),

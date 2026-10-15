@@ -28,6 +28,8 @@ pub struct WooOptions {
     pub policy: SitePolicy,
     pub extra_roots: Vec<reqwest::Certificate>,
     pub request_timeout: Duration,
+    /// Products per catalog request (WooCommerce allows up to 100).
+    pub catalog_page_size: u32,
 }
 
 impl Default for WooOptions {
@@ -36,6 +38,7 @@ impl Default for WooOptions {
             policy: SitePolicy::default(),
             extra_roots: Vec::new(),
             request_timeout: Duration::from_secs(25),
+            catalog_page_size: 50,
         }
     }
 }
@@ -54,7 +57,13 @@ impl WooOptions {
             },
             extra_roots,
             request_timeout: Duration::from_secs(25),
+            catalog_page_size: 50,
         }
+    }
+
+    pub fn with_catalog_page_size(mut self, size: u32) -> Self {
+        self.catalog_page_size = size.clamp(1, 100);
+        self
     }
 }
 
@@ -96,10 +105,21 @@ impl Reply {
             .unwrap_or_default()
     }
 
+    /// WooCommerce answers a write with a read-only key by 401, saying so; an
+    /// unknown key gets the same status with another message.
+    fn is_read_only_key(&self) -> bool {
+        self.error_code().as_deref() == Some("woocommerce_rest_authentication_error")
+            && self.error_message().contains("write permissions")
+    }
+
     /// `Ok(self)` for a 2xx; otherwise the framework's error for it.
     pub fn checked(self) -> Result<Self, ProviderError> {
         match self.status {
             200..=299 => Ok(self),
+            401 if self.is_read_only_key() => Err(ProviderError::Rejected {
+                code: "keys_read_only".into(),
+                message: self.error_message(),
+            }),
             401 => Err(ProviderError::Unauthorized),
             429 => Err(ProviderError::RateLimited {
                 retry_after: self
@@ -152,6 +172,10 @@ impl WooHttp {
 
     pub fn plain_http(&self) -> bool {
         self.options.policy.plain_http
+    }
+
+    pub fn catalog_page_size(&self) -> u32 {
+        self.options.catalog_page_size.clamp(1, 100)
     }
 
     async fn client(&self, site: &Site) -> Result<reqwest::Client, ProviderError> {

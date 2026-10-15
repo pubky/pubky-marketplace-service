@@ -1,0 +1,20 @@
+{
+ "label": "p_home_mismatch",
+ "exchanges": [
+  {
+   "method": "GET",
+   "path": "/wp-json/",
+   "query": [],
+   "auth": "none",
+   "request_body": null,
+   "status": 200,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "$blob": "b6e776b005a1e168"
+   }
+  }
+ ]
+}

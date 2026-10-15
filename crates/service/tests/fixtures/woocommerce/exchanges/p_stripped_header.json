@@ -1,0 +1,771 @@
+{
+ "label": "p_stripped_header",
+ "exchanges": [
+  {
+   "method": "GET",
+   "path": "/wp-json/",
+   "query": [],
+   "auth": "none",
+   "request_body": null,
+   "status": 200,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "$blob": "b6e776b005a1e168"
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/wp-json/wc/v3/settings/general/woocommerce_currency",
+   "query": [
+    [
+     "_fields",
+     "id,value"
+    ]
+   ],
+   "auth": "basic",
+   "request_body": null,
+   "status": 401,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "code": "woocommerce_rest_cannot_view",
+    "message": "Sorry, you cannot list resources.",
+    "data": {
+     "status": 401
+    }
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/wp-json/wc/v3/settings/general/woocommerce_currency",
+   "query": [
+    [
+     "_fields",
+     "id,value"
+    ]
+   ],
+   "auth": "query",
+   "request_body": null,
+   "status": 200,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "id": "woocommerce_currency",
+    "value": "CHF",
+    "_links": {
+     "self": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/settings/general/woocommerce_currency",
+       "targetHints": {
+        "allow": [
+         "GET",
+         "POST",
+         "PUT",
+         "PATCH"
+        ]
+       }
+      }
+     ],
+     "collection": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/settings/general"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/wp-json/wc/v3/webhooks",
+   "query": [
+    [
+     "per_page",
+     "100"
+    ],
+    [
+     "_fields",
+     "id,name,delivery_url"
+    ]
+   ],
+   "auth": "query",
+   "request_body": null,
+   "status": 200,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8",
+    "x-wp-total": "0",
+    "x-wp-totalpages": "0"
+   },
+   "response_kind": "json",
+   "response_body": []
+  },
+  {
+   "method": "POST",
+   "path": "/wp-json/wc/v3/webhooks",
+   "query": [],
+   "auth": "query",
+   "request_body": {
+    "name": "Pubky Shop product.updated",
+    "topic": "product.updated",
+    "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
+    "secret": "<secret>",
+    "status": "active"
+   },
+   "status": 201,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8",
+    "location": "https://localhost:8443/wp-json/wc/v3/webhooks/1"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "id": 1,
+    "name": "Pubky Shop product.updated",
+    "status": "active",
+    "topic": "product.updated",
+    "resource": "product",
+    "event": "updated",
+    "hooks": [
+     "woocommerce_process_product_meta",
+     "woocommerce_update_product",
+     "woocommerce_update_product_variation"
+    ],
+    "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
+    "date_created": "2026-10-15T12:51:52",
+    "date_created_gmt": "2026-10-15T12:51:52",
+    "date_modified": null,
+    "date_modified_gmt": null,
+    "_links": {
+     "self": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/webhooks/1",
+       "targetHints": {
+        "allow": [
+         "GET",
+         "POST",
+         "PUT",
+         "PATCH",
+         "DELETE"
+        ]
+       }
+      }
+     ],
+     "collection": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/webhooks"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/wp-json/wc/v3/webhooks",
+   "query": [],
+   "auth": "query",
+   "request_body": {
+    "name": "Pubky Shop order.updated",
+    "topic": "order.updated",
+    "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
+    "secret": "<secret>",
+    "status": "active"
+   },
+   "status": 201,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8",
+    "location": "https://localhost:8443/wp-json/wc/v3/webhooks/2"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "id": 2,
+    "name": "Pubky Shop order.updated",
+    "status": "active",
+    "topic": "order.updated",
+    "resource": "order",
+    "event": "updated",
+    "hooks": [
+     "woocommerce_update_order",
+     "woocommerce_order_refunded"
+    ],
+    "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
+    "date_created": "2026-10-15T12:51:52",
+    "date_created_gmt": "2026-10-15T12:51:52",
+    "date_modified": null,
+    "date_modified_gmt": null,
+    "_links": {
+     "self": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/webhooks/2",
+       "targetHints": {
+        "allow": [
+         "GET",
+         "POST",
+         "PUT",
+         "PATCH",
+         "DELETE"
+        ]
+       }
+      }
+     ],
+     "collection": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/webhooks"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/wp-json/wc/v3/webhooks",
+   "query": [],
+   "auth": "query",
+   "request_body": {
+    "name": "Pubky Shop order.deleted",
+    "topic": "order.deleted",
+    "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
+    "secret": "<secret>",
+    "status": "active"
+   },
+   "status": 201,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8",
+    "location": "https://localhost:8443/wp-json/wc/v3/webhooks/3"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "id": 3,
+    "name": "Pubky Shop order.deleted",
+    "status": "active",
+    "topic": "order.deleted",
+    "resource": "order",
+    "event": "deleted",
+    "hooks": [
+     "wp_trash_post",
+     "woocommerce_trash_order"
+    ],
+    "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce",
+    "date_created": "2026-10-15T12:51:52",
+    "date_created_gmt": "2026-10-15T12:51:52",
+    "date_modified": null,
+    "date_modified_gmt": null,
+    "_links": {
+     "self": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/webhooks/3",
+       "targetHints": {
+        "allow": [
+         "GET",
+         "POST",
+         "PUT",
+         "PATCH",
+         "DELETE"
+        ]
+       }
+      }
+     ],
+     "collection": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/webhooks"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/wp-json/wc/v3/settings/general/woocommerce_currency",
+   "query": [
+    [
+     "_fields",
+     "id,value"
+    ]
+   ],
+   "auth": "query",
+   "request_body": null,
+   "status": 200,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "id": "woocommerce_currency",
+    "value": "CHF",
+    "_links": {
+     "self": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/settings/general/woocommerce_currency",
+       "targetHints": {
+        "allow": [
+         "GET",
+         "POST",
+         "PUT",
+         "PATCH"
+        ]
+       }
+      }
+     ],
+     "collection": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/settings/general"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/wp-json/wc/v3/products",
+   "query": [
+    [
+     "per_page",
+     "7"
+    ],
+    [
+     "page",
+     "1"
+    ],
+    [
+     "orderby",
+     "id"
+    ],
+    [
+     "order",
+     "asc"
+    ],
+    [
+     "_fields",
+     "id,name,type,status,permalink,description,short_description,sku,price,manage_stock,stock_quantity,stock_status,images,attributes,variations,parent_id"
+    ]
+   ],
+   "auth": "query",
+   "request_body": null,
+   "status": 200,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8",
+    "x-wp-total": "20",
+    "x-wp-totalpages": "3"
+   },
+   "response_kind": "json",
+   "response_body": [
+    {
+     "id": 10,
+     "name": "V-Neck T-Shirt",
+     "type": "variable",
+     "status": "publish",
+     "permalink": "https://localhost:8443/product/v-neck-t-shirt/",
+     "description": "<p>Pellentesque habitant morbi tristique senectus et netus et malesuada fames ac turpis egestas. Vestibulum tortor quam, feugiat vitae, ultricies eget, tempor sit amet, ante. Donec eu libero sit amet quam egestas semper. Aenean ultricies mi vitae est. Mauris placerat eleifend leo.</p>\n",
+     "short_description": "<p>This is a variable product.</p>\n",
+     "sku": "woo-vneck-tee",
+     "price": "15",
+     "manage_stock": false,
+     "stock_quantity": null,
+     "images": [],
+     "attributes": [
+      {
+       "id": 0,
+       "name": "Color",
+       "slug": "Color",
+       "position": 0,
+       "visible": true,
+       "variation": true,
+       "options": [
+        "Blue",
+        "Green",
+        "Red"
+       ]
+      },
+      {
+       "id": 0,
+       "name": "Size",
+       "slug": "Size",
+       "position": 1,
+       "visible": true,
+       "variation": true,
+       "options": [
+        "Large",
+        "Medium",
+        "Small"
+       ]
+      }
+     ],
+     "variations": [
+      24,
+      25,
+      26
+     ],
+     "parent_id": 0,
+     "stock_status": "instock"
+    },
+    {
+     "id": 11,
+     "name": "Hoodie",
+     "type": "variable",
+     "status": "publish",
+     "permalink": "https://localhost:8443/product/hoodie/",
+     "description": "<p>Pellentesque habitant morbi tristique senectus et netus et malesuada fames ac turpis egestas. Vestibulum tortor quam, feugiat vitae, ultricies eget, tempor sit amet, ante. Donec eu libero sit amet quam egestas semper. Aenean ultricies mi vitae est. Mauris placerat eleifend leo.</p>\n",
+     "short_description": "<p>This is a variable product.</p>\n",
+     "sku": "woo-hoodie",
+     "price": "42",
+     "manage_stock": false,
+     "stock_quantity": null,
+     "images": [],
+     "attributes": [
+      {
+       "id": 0,
+       "name": "Color",
+       "slug": "Color",
+       "position": 0,
+       "visible": true,
+       "variation": true,
+       "options": [
+        "Blue",
+        "Green",
+        "Red"
+       ]
+      },
+      {
+       "id": 0,
+       "name": "Logo",
+       "slug": "Logo",
+       "position": 1,
+       "visible": true,
+       "variation": true,
+       "options": [
+        "Yes",
+        "No"
+       ]
+      }
+     ],
+     "variations": [
+      27,
+      28,
+      29,
+      34
+     ],
+     "parent_id": 0,
+     "stock_status": "instock"
+    },
+    {
+     "id": 12,
+     "name": "Hoodie with Logo",
+     "type": "simple",
+     "status": "publish",
+     "permalink": "https://localhost:8443/product/hoodie-with-logo/",
+     "description": "<p>Pellentesque habitant morbi tristique senectus et netus et malesuada fames ac turpis egestas. Vestibulum tortor quam, feugiat vitae, ultricies eget, tempor sit amet, ante. Donec eu libero sit amet quam egestas semper. Aenean ultricies mi vitae est. Mauris placerat eleifend leo.</p>\n",
+     "short_description": "<p>This is a simple product.</p>\n",
+     "sku": "woo-hoodie-with-logo",
+     "price": "45",
+     "manage_stock": false,
+     "stock_quantity": null,
+     "images": [],
+     "attributes": [],
+     "variations": [],
+     "parent_id": 0,
+     "stock_status": "instock"
+    },
+    {
+     "id": 13,
+     "name": "T-Shirt",
+     "type": "simple",
+     "status": "publish",
+     "permalink": "https://localhost:8443/product/t-shirt/",
+     "description": "<p>Pellentesque habitant morbi tristique senectus et netus et malesuada fames ac turpis egestas. Vestibulum tortor quam, feugiat vitae, ultricies eget, tempor sit amet, ante. Donec eu libero sit amet quam egestas semper. Aenean ultricies mi vitae est. Mauris placerat eleifend leo.</p>\n",
+     "short_description": "<p>This is a simple product.</p>\n",
+     "sku": "woo-tshirt",
+     "price": "18",
+     "manage_stock": false,
+     "stock_quantity": null,
+     "images": [],
+     "attributes": [],
+     "variations": [],
+     "parent_id": 0,
+     "stock_status": "instock"
+    },
+    {
+     "id": 14,
+     "name": "Beanie",
+     "type": "simple",
+     "status": "publish",
+     "permalink": "https://localhost:8443/product/beanie/",
+     "description": "<p>Pellentesque habitant morbi tristique senectus et netus et malesuada fames ac turpis egestas. Vestibulum tortor quam, feugiat vitae, ultricies eget, tempor sit amet, ante. Donec eu libero sit amet quam egestas semper. Aenean ultricies mi vitae est. Mauris placerat eleifend leo.</p>\n",
+     "short_description": "<p>This is a simple product.</p>\n",
+     "sku": "woo-beanie",
+     "price": "18",
+     "manage_stock": false,
+     "stock_quantity": null,
+     "images": [],
+     "attributes": [],
+     "variations": [],
+     "parent_id": 0,
+     "stock_status": "instock"
+    },
+    {
+     "id": 15,
+     "name": "Belt",
+     "type": "simple",
+     "status": "publish",
+     "permalink": "https://localhost:8443/product/belt/",
+     "description": "<p>Pellentesque habitant morbi tristique senectus et netus et malesuada fames ac turpis egestas. Vestibulum tortor quam, feugiat vitae, ultricies eget, tempor sit amet, ante. Donec eu libero sit amet quam egestas semper. Aenean ultricies mi vitae est. Mauris placerat eleifend leo.</p>\n",
+     "short_description": "<p>This is a simple product.</p>\n",
+     "sku": "woo-belt",
+     "price": "55",
+     "manage_stock": false,
+     "stock_quantity": null,
+     "images": [],
+     "attributes": [],
+     "variations": [],
+     "parent_id": 0,
+     "stock_status": "instock"
+    },
+    {
+     "id": 16,
+     "name": "Cap",
+     "type": "simple",
+     "status": "publish",
+     "permalink": "https://localhost:8443/product/cap/",
+     "description": "<p>Pellentesque habitant morbi tristique senectus et netus et malesuada fames ac turpis egestas. Vestibulum tortor quam, feugiat vitae, ultricies eget, tempor sit amet, ante. Donec eu libero sit amet quam egestas semper. Aenean ultricies mi vitae est. Mauris placerat eleifend leo.</p>\n",
+     "short_description": "<p>This is a simple product.</p>\n",
+     "sku": "woo-cap",
+     "price": "16",
+     "manage_stock": false,
+     "stock_quantity": null,
+     "images": [],
+     "attributes": [],
+     "variations": [],
+     "parent_id": 0,
+     "stock_status": "instock"
+    }
+   ]
+  },
+  {
+   "method": "GET",
+   "path": "/wp-json/wc/v3/products/10/variations",
+   "query": [
+    [
+     "per_page",
+     "100"
+    ],
+    [
+     "page",
+     "1"
+    ],
+    [
+     "orderby",
+     "id"
+    ],
+    [
+     "order",
+     "asc"
+    ],
+    [
+     "_fields",
+     "id,status,sku,price,manage_stock,stock_quantity,stock_status,attributes,image"
+    ]
+   ],
+   "auth": "query",
+   "request_body": null,
+   "status": 200,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8",
+    "x-wp-total": "3",
+    "x-wp-totalpages": "1"
+   },
+   "response_kind": "json",
+   "response_body": [
+    {
+     "id": 24,
+     "sku": "woo-vneck-tee-red",
+     "price": "20",
+     "status": "publish",
+     "manage_stock": false,
+     "stock_quantity": null,
+     "stock_status": "instock",
+     "image": null,
+     "attributes": [
+      {
+       "id": 0,
+       "name": "Color",
+       "slug": "color",
+       "option": "Red"
+      }
+     ]
+    },
+    {
+     "id": 25,
+     "sku": "woo-vneck-tee-green",
+     "price": "20",
+     "status": "publish",
+     "manage_stock": false,
+     "stock_quantity": null,
+     "stock_status": "instock",
+     "image": null,
+     "attributes": [
+      {
+       "id": 0,
+       "name": "Color",
+       "slug": "color",
+       "option": "Green"
+      }
+     ]
+    },
+    {
+     "id": 26,
+     "sku": "woo-vneck-tee-blue",
+     "price": "15",
+     "status": "publish",
+     "manage_stock": false,
+     "stock_quantity": null,
+     "stock_status": "instock",
+     "image": null,
+     "attributes": [
+      {
+       "id": 0,
+       "name": "Color",
+       "slug": "color",
+       "option": "Blue"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "method": "GET",
+   "path": "/wp-json/wc/v3/products/11/variations",
+   "query": [
+    [
+     "per_page",
+     "100"
+    ],
+    [
+     "page",
+     "1"
+    ],
+    [
+     "orderby",
+     "id"
+    ],
+    [
+     "order",
+     "asc"
+    ],
+    [
+     "_fields",
+     "id,status,sku,price,manage_stock,stock_quantity,stock_status,attributes,image"
+    ]
+   ],
+   "auth": "query",
+   "request_body": null,
+   "status": 200,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8",
+    "x-wp-total": "4",
+    "x-wp-totalpages": "1"
+   },
+   "response_kind": "json",
+   "response_body": [
+    {
+     "id": 27,
+     "sku": "woo-hoodie-red",
+     "price": "42",
+     "status": "publish",
+     "manage_stock": false,
+     "stock_quantity": null,
+     "stock_status": "instock",
+     "image": null,
+     "attributes": [
+      {
+       "id": 0,
+       "name": "Color",
+       "slug": "color",
+       "option": "Red"
+      },
+      {
+       "id": 0,
+       "name": "Logo",
+       "slug": "logo",
+       "option": "No"
+      }
+     ]
+    },
+    {
+     "id": 28,
+     "sku": "woo-hoodie-green",
+     "price": "45",
+     "status": "publish",
+     "manage_stock": false,
+     "stock_quantity": null,
+     "stock_status": "instock",
+     "image": null,
+     "attributes": [
+      {
+       "id": 0,
+       "name": "Color",
+       "slug": "color",
+       "option": "Green"
+      },
+      {
+       "id": 0,
+       "name": "Logo",
+       "slug": "logo",
+       "option": "No"
+      }
+     ]
+    },
+    {
+     "id": 29,
+     "sku": "woo-hoodie-blue",
+     "price": "45",
+     "status": "publish",
+     "manage_stock": false,
+     "stock_quantity": null,
+     "stock_status": "instock",
+     "image": null,
+     "attributes": [
+      {
+       "id": 0,
+       "name": "Color",
+       "slug": "color",
+       "option": "Blue"
+      },
+      {
+       "id": 0,
+       "name": "Logo",
+       "slug": "logo",
+       "option": "No"
+      }
+     ]
+    },
+    {
+     "id": 34,
+     "sku": "woo-hoodie-blue-logo",
+     "price": "45",
+     "status": "publish",
+     "manage_stock": false,
+     "stock_quantity": null,
+     "stock_status": "instock",
+     "image": null,
+     "attributes": [
+      {
+       "id": 0,
+       "name": "Color",
+       "slug": "color",
+       "option": "Blue"
+      },
+      {
+       "id": 0,
+       "name": "Logo",
+       "slug": "logo",
+       "option": "Yes"
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

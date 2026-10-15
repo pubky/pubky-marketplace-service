@@ -1,4 +1,6 @@
 .local/
-certs/*.key
-certs/server.pem
 nginx/extra/*.conf
+certs/*.pem
+certs/*.key
+certs/*.srl
+.env
