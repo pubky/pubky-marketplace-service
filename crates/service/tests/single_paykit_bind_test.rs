@@ -2509,6 +2509,168 @@ async fn usdt_finality_that_stays_pending_for_seven_days_goes_to_an_operator(poo
     assert_eq!(stored.payment_finality.as_deref(), Some("pending"));
 }
 
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn usdt_finality_that_stays_reverted_for_seven_days_goes_to_an_operator(pool: PgPool) {
+    let f = fixture(pool.clone(), Setup::both()).await;
+    let active = active_order(&f).await;
+    let order_id = active.order.order_id.clone();
+    f.paykit.set_marketplace_status(
+        active.invoice,
+        usdt_status(
+            active.invoice,
+            active.deadline,
+            usdt_leg(1, true, true, false),
+        ),
+    );
+    poll_now(&f.app, at(1)).await;
+    // The transfer is reorganised away on day 1 and never returns.
+    f.paykit.set_marketplace_status(
+        active.invoice,
+        nothing_observed(active.invoice, active.deadline),
+    );
+    poll_now(&f.app, at(2)).await;
+    assert_eq!(
+        facts(&pool, &order_id).await.payment_finality.as_deref(),
+        Some("reverted")
+    );
+    let status_reads = || {
+        f.paykit
+            .calls()
+            .iter()
+            .filter(|call| call.path == "/marketplace/payment-requests/status")
+            .count()
+    };
+    let day = |days: i64| Utc::now() + Duration::days(days);
+
+    let before = status_reads();
+    poll_now(&f.app, day(6)).await;
+    assert!(status_reads() > before, "still polled on day 6");
+    assert!(
+        marketplace_service::paykit_attempts::list_needs_review(&pool)
+            .await
+            .expect("queue")
+            .is_empty()
+    );
+
+    poll_now(&f.app, day(8)).await;
+    let queue = marketplace_service::paykit_attempts::list_needs_review(&pool)
+        .await
+        .expect("queue");
+    assert_eq!(queue.len(), 1, "a reverted payment is not left silent");
+    assert_eq!(queue[0].order_id, uuid(&order_id));
+    assert_eq!(queue[0].review_reason, "detected_unconfirmed");
+    assert_eq!(
+        queue[0].observation.as_ref().expect("observation")["status"],
+        json!("usdt_finality_reverted")
+    );
+    let after = status_reads();
+    poll_now(&f.app, day(9)).await;
+    poll_now(&f.app, day(10)).await;
+    assert_eq!(status_reads(), after, "no longer polled after the bound");
+    assert_eq!(
+        marketplace_service::paykit_attempts::list_needs_review(&pool)
+            .await
+            .expect("queue")
+            .len(),
+        1,
+        "escalated once"
+    );
+    let stored = facts(&pool, &order_id).await;
+    assert_eq!(stored.state, "paid", "the order stays paid");
+    assert_eq!(stored.payment_finality.as_deref(), Some("reverted"));
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_reappearing_usdt_transfer_restarts_the_finality_clock(pool: PgPool) {
+    let f = fixture(pool.clone(), Setup::both()).await;
+    let active = active_order(&f).await;
+    let order_id = active.order.order_id.clone();
+    let included = usdt_status(
+        active.invoice,
+        active.deadline,
+        usdt_leg(1, true, true, false),
+    );
+    let gone = nothing_observed(active.invoice, active.deadline);
+    let day = |days: i64| Utc::now() + Duration::days(days);
+    f.paykit
+        .set_marketplace_status(active.invoice, included.clone());
+    poll_now(&f.app, day(0)).await;
+    f.paykit.set_marketplace_status(active.invoice, gone);
+    poll_now(&f.app, day(1)).await;
+    assert_eq!(
+        facts(&pool, &order_id).await.payment_finality.as_deref(),
+        Some("reverted")
+    );
+    // It comes back on day 5: pending again, with a new clock.
+    f.paykit.set_marketplace_status(active.invoice, included);
+    poll_now(&f.app, day(5)).await;
+    assert_eq!(
+        facts(&pool, &order_id).await.payment_finality.as_deref(),
+        Some("pending")
+    );
+    poll_now(&f.app, day(9)).await;
+    assert!(
+        marketplace_service::paykit_attempts::list_needs_review(&pool)
+            .await
+            .expect("queue")
+            .is_empty(),
+        "eight days after the first inclusion but four after the return"
+    );
+    poll_now(&f.app, day(13)).await;
+    let queue = marketplace_service::paykit_attempts::list_needs_review(&pool)
+        .await
+        .expect("queue");
+    assert_eq!(queue.len(), 1);
+    assert_eq!(
+        queue[0].observation.as_ref().expect("observation")["status"],
+        json!("usdt_finality_pending")
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_escalation_that_cannot_be_recorded_is_alerted_every_pass(pool: PgPool) {
+    let (logs, _guard) = LogBuffer::capture();
+    let f = fixture(pool.clone(), Setup::both()).await;
+    let active = active_order(&f).await;
+    let order_id = active.order.order_id.clone();
+    f.paykit.set_marketplace_status(
+        active.invoice,
+        usdt_status(
+            active.invoice,
+            active.deadline,
+            usdt_leg(1, true, true, false),
+        ),
+    );
+    poll_now(&f.app, at(1)).await;
+    // An order without complete request terms: the review row cannot be
+    // written (`record_released_attempt` needs a satoshi total or an amount).
+    sqlx::query(
+        "UPDATE orders SET paykit_total_sats = NULL, paykit_amount_minor = NULL, \
+         paykit_accepted_assets = NULL, paykit_payment_amounts = NULL WHERE id = $1",
+    )
+    .bind(uuid(&order_id))
+    .execute(&pool)
+    .await
+    .expect("strip the terms");
+    let day = |days: i64| Utc::now() + Duration::days(days);
+    poll_now(&f.app, day(8)).await;
+    poll_now(&f.app, day(9)).await;
+    let text = logs.text();
+    assert_eq!(
+        text.matches("usdt_finality_escalation_not_recorded")
+            .count(),
+        2,
+        "one ALERT per pass, never a silent no-op:\n{text}"
+    );
+    assert!(
+        marketplace_service::paykit_attempts::list_needs_review(&pool)
+            .await
+            .expect("queue")
+            .is_empty()
+    );
+    assert_eq!(facts(&pool, &order_id).await.state, "paid");
+}
+
 // ---------------------------------------------------------------------------
 // Money path: concurrent polls of one order
 // ---------------------------------------------------------------------------
