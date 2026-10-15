@@ -3,6 +3,9 @@
 //! rollback works, while a version missing from inside its own range still
 //! refuses startup and checksums of known versions are still verified.
 
+use std::time::Duration;
+
+use sqlx::migrate::Migrate;
 use sqlx::PgPool;
 
 /// `TEST_MIGRATOR` wraps the catalog in test-only lock versions (0 and
@@ -63,4 +66,55 @@ async fn checksums_of_known_versions_are_still_verified(pool: PgPool) {
         .await
         .expect_err("a changed applied migration is refused");
     assert!(error.to_string().contains("previously applied"), "{error}");
+}
+
+/// Rolling deploy: another replica holds the migration lock and commits a
+/// newer version while this build waits for it. The tolerance decision is
+/// taken under the lock, so this build still starts.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_newer_version_committed_while_waiting_for_the_lock_is_tolerated(pool: PgPool) {
+    production_ledger(&pool).await;
+    let mut other_replica = pool.acquire().await.expect("other replica connection");
+    Migrate::lock(&mut *other_replica)
+        .await
+        .expect("other replica takes the migration lock");
+
+    let starting = tokio::spawn({
+        let pool = pool.clone();
+        async move { marketplace_service::migrations::run(&pool).await }
+    });
+    let waiting = "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted \
+                   AND database = (SELECT oid FROM pg_database WHERE datname = current_database())";
+    let mut blocked = false;
+    for _ in 0..500 {
+        let count: i64 = sqlx::query_scalar(waiting)
+            .fetch_one(&mut *other_replica)
+            .await
+            .expect("lock waiters");
+        if count > 0 {
+            blocked = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        blocked,
+        "the starting build must wait for the migration lock"
+    );
+
+    sqlx::query(
+        "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
+         VALUES (9999, 'from the other replica', true, '\\x00', 0)",
+    )
+    .execute(&mut *other_replica)
+    .await
+    .expect("other replica commits a newer migration");
+    Migrate::unlock(&mut *other_replica)
+        .await
+        .expect("other replica releases the lock");
+
+    starting
+        .await
+        .expect("startup task")
+        .expect("a version committed during the wait is tolerated");
 }

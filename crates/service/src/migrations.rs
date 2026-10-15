@@ -18,7 +18,7 @@
 
 use std::borrow::Cow;
 
-use sqlx::migrate::Migrator;
+use sqlx::migrate::{Migrate, Migrator};
 use sqlx::{PgConnection, PgPool};
 
 const OWNER_CREATED_BY: i64 = 32;
@@ -27,7 +27,20 @@ static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
 pub async fn run(pool: &PgPool) -> anyhow::Result<()> {
     let mut connection = pool.acquire().await?;
-    let applied = applied_versions(&mut connection).await?;
+    // sqlx's migration lock is held across the ledger read too, so a replica
+    // migrating concurrently cannot commit a newer version between this
+    // build's tolerance decision and its run. Postgres session advisory locks
+    // stack, so `run_direct` taking the same lock inside is fine.
+    Migrate::lock(&mut *connection).await?;
+    let migrated = run_locked(&mut connection).await;
+    let unlocked = Migrate::unlock(&mut *connection).await;
+    migrated?;
+    unlocked?;
+    Ok(())
+}
+
+async fn run_locked(connection: &mut PgConnection) -> anyhow::Result<()> {
+    let applied = applied_versions(&mut *connection).await?;
     let migrator = tolerating_newer(&MIGRATOR, &applied)?;
     let superuser: bool =
         sqlx::query_scalar("SELECT rolsuper FROM pg_catalog.pg_roles WHERE rolname = current_user")
@@ -36,7 +49,7 @@ pub async fn run(pool: &PgPool) -> anyhow::Result<()> {
     if superuser || !pending(&migrator, &applied) {
         return Ok(migrator.run_direct(&mut *connection).await?);
     }
-    if !owner_exists(&mut connection).await? {
+    if !owner_exists(&mut *connection).await? {
         through(&migrator, OWNER_CREATED_BY)
             .run_direct(&mut *connection)
             .await?;
