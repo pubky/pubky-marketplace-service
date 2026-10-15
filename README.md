@@ -306,6 +306,15 @@ order they bound to PayPal (`POST /v0/orders/{id}/payment-method`), which only
 that order's buyer and seller can read. The seller reads their own stored
 values from the authenticated `GET /v0/sellers/me/payment-config`.
 
+The seller's own view (`GET` and `PUT /v0/sellers/me/payment-config`) also
+carries `bitcoin_setup`: `ready`, `setup_required` or `unavailable`, asked of
+paykit-server on every call (the same question as `bitcoin_available`,
+uncached, and answered whether or not Bitcoin is switched on). The Shop uses it
+to confirm a Bitkit setup without a Lock Server session. `unavailable` covers a
+Paykit outage, an answer outside the contract, and a deployment without Paykit;
+it is never a reason to start an authorization flow. A seller who never saved
+anything reads the empty configuration (epoch `updated_at`) instead of `null`.
+
 Stripe is not a payment method: the service has no Stripe client, binding
 `stripe` answers `invalid_method`, and `PUT /v0/sellers/me/payment-config`
 answers `stripe_removed` to a non-empty `stripe_payment_link` or
@@ -484,7 +493,7 @@ stays refused.
   and the public config (`GET /v0/sellers/{pubky}/payment-config`) carries
   `usdt_available`. With the flag off none of these keys exists, a `PUT`
   carrying `usdt_enabled` is refused as the unknown field it is, and
-  paykit-server is only ever asked about Bitcoin.
+  paykit-server is only ever asked about Bitcoin (`bitcoin_setup`).
   - Readiness comes only from paykit-server's signed `POST /setup/status`
     (`PAYKIT_SERVER_API=upstream`): `{accepted_asset: "USDT"}` for the seller, and the
     authority-only `{}` body to tell a seller with no Paykit account
@@ -503,8 +512,7 @@ stays refused.
     `PUT` read paykit-server uncached, so a Bitkit setup or reconnect shows
     at once.
   - A seller who never saved anything reads the empty configuration (epoch
-    `updated_at`) instead of `null` while the flag is on, because that seller
-    is who needs `setup`.
+    `updated_at`) instead of `null`, flag on or off.
   - `PUT` replaces the rails, but an absent or `null` `usdt_enabled` leaves
     the stored consent unchanged; only an explicit boolean changes it. The
     consent is not gated on readiness, and a seller who is not ready is never
@@ -1082,6 +1090,7 @@ compare it.
 | `order.cancel_request` | CAS 409 vs order `revision` | `cancellation.rs:51` |
 | `order.cancel_approve` | CAS 409 vs order `revision` | `cancellation.rs:185` |
 | `fulfillment.ship` | CAS 409 vs order `revision` | `fulfillment.rs:34` |
+| `fulfillment.update_tracking` | CAS 409 vs order `revision` | `fulfillment.rs` (`update_tracking`) |
 | `fulfillment.confirm_delivery` | CAS 409 vs order `revision` | `fulfillment.rs:107` |
 | `pickup_details.set` | Envelope ignored; `payload.expected_version` is CAS 409 vs the pickup version counter | `pickup.rs:270` |
 | `pickup_details.clear` | Envelope ignored; `payload.expected_version` is CAS 409 vs the pickup version counter | `pickup.rs:346` |
@@ -1108,7 +1117,8 @@ actor may sync), `drop.sync` (convergent; any actor may sync),
 `offer.checkout`, `offer.reject`, `offer.withdraw`, `auction.place_bid`,
 `auction.close`, `payment.sandbox_advance`, `payment.prepare_locks`,
 `payment.register_locks`, `order.cancel_request`, `order.cancel_approve`,
-`fulfillment.ship`, `fulfillment.confirm_delivery`, `pickup_details.set`,
+`fulfillment.ship`, `fulfillment.update_tracking`,
+`fulfillment.confirm_delivery`, `pickup_details.set`,
 `pickup_details.clear`, `fulfillment.mark_ready`,
 `fulfillment.confirm_pickup` (see Local pickup), `return.request`,
 `return.approve`, `return.receive`, `refund.record_external`,
@@ -1253,10 +1263,15 @@ and refund branches):
   succeeds without double-releasing. A cancelled order refuses every
   subsequent payment, fulfillment, return, and cancellation
   command.
-- **Fulfillment.** `fulfillment.ship` (seller, with carrier and tracking
-  number — both trimmed printable strings, deliberately not enums; the soft
-  carrier vocabulary the reference client writes is documented on
-  `ShipOrderPayload.carrier`) and `fulfillment.confirm_delivery` (buyer) drive
+- **Fulfillment.** `fulfillment.ship` (seller, with a carrier and an optional
+  tracking number — both trimmed printable strings, deliberately not enums;
+  the soft carrier vocabulary the reference client writes is documented on
+  `ShipOrderPayload.carrier`; an absent, null or empty number ships the order
+  without tracking), `fulfillment.update_tracking` (seller; adds or edits the
+  carrier and number while the order is `shipped`, records each change in
+  `shipment.tracking_history` and notifies the buyer; see
+  [docs/api.md](docs/api.md#shipping-and-tracking-commands)) and
+  `fulfillment.confirm_delivery` (buyer) drive
   `paid/processing → shipped → delivered`. There is no separate
   seller-marks-delivered command: the buyer's confirmation is the delivery
   transition, as in the prototype. `delivered → completed` is reached
@@ -1334,7 +1349,8 @@ Every post-purchase command is participant-scoped, enforces
 idempotently by `command_id`, appends one immutable event per accepted
 command, and emits outbox notifications exactly where the prototype did
 (`payment_confirmed`, `order_cancelled` — to the seller on a cancellation
-request, to the buyer on approval — `order_shipped`, `order_delivered`,
+request, to the buyer on approval — `order_shipped`, `tracking_updated`,
+`order_delivered`,
 `return_updated`,
 `refund_recorded`,
 `review_received`). `review.update` emits none — the

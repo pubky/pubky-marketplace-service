@@ -239,10 +239,12 @@ fn config_view(
     bitcoin_enabled: bool,
     paypal_merchant_email: &Option<String>,
     updated_at: DateTime<Utc>,
+    bitcoin_setup: BitcoinSetup,
     usdt: Option<&UsdtOwnView>,
 ) -> Value {
     let mut view = json!({
         "bitcoin_enabled": bitcoin_enabled,
+        "bitcoin_setup": bitcoin_setup.as_str(),
         "paypal_merchant_email": paypal_merchant_email,
         "updated_at": format_timestamp(updated_at),
     });
@@ -254,6 +256,50 @@ fn config_view(
         view["usdt_setup_action"] = json!(usdt.action.map(UsdtSetupAction::as_str));
     }
     view
+}
+
+/// `bitcoin_setup`: whether the seller's Paykit setup can receive Bitcoin,
+/// whether or not the seller switched Bitcoin on, so the Shop can confirm a
+/// Bitkit setup before the rail is enabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BitcoinSetup {
+    Ready,
+    SetupRequired,
+    /// Paykit cannot say, or this deployment has no Paykit. Never a reason to
+    /// start an authorization flow.
+    Unavailable,
+}
+
+impl BitcoinSetup {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::SetupRequired => "setup_required",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// Asks paykit-server, uncached, whether the seller can receive Bitcoin: the
+/// signed `POST /setup/status {asset: "BTC"}` upstream, the claimed watch-only
+/// account on the fork (both through [`PaykitClient::seller_ready`], the same
+/// question `bitcoin_available` caches). Any failure is `unavailable`.
+async fn lookup_bitcoin_setup(paykit: Option<&PaykitClient>, seller_pubky: &str) -> BitcoinSetup {
+    let Some(paykit) = paykit else {
+        return BitcoinSetup::Unavailable;
+    };
+    match paykit.seller_ready(seller_pubky).await {
+        Ok(true) => BitcoinSetup::Ready,
+        Ok(false) => BitcoinSetup::SetupRequired,
+        Err(_) => BitcoinSetup::Unavailable,
+    }
+}
+
+fn own_paykit(state: &AppState) -> Option<&PaykitClient> {
+    state
+        .payments
+        .as_ref()
+        .and_then(|payments| payments.paykit.as_ref())
 }
 
 /// What the seller's own config says about USDT while the flag is on.
@@ -372,11 +418,7 @@ where
 
 async fn own_usdt_view(state: &AppState, seller_pubky: &str) -> Result<UsdtOwnView, sqlx::Error> {
     let enabled = usdt_option_enabled(&state.pool, seller_pubky).await?;
-    let paykit = state
-        .payments
-        .as_ref()
-        .and_then(|payments| payments.paykit.as_ref());
-    let (setup, action) = lookup_usdt_setup(paykit, seller_pubky).await;
+    let (setup, action) = lookup_usdt_setup(own_paykit(state), seller_pubky).await;
     Ok(UsdtOwnView {
         enabled,
         setup,
@@ -502,13 +544,17 @@ pub async fn put_payment_config(
         Ok(row) => row,
         Err(error) => return internal("payment config upsert", &error),
     };
-    let usdt = if usdt_flag {
-        match own_usdt_view(&state, &actor.0).await {
-            Ok(view) => Some(view),
-            Err(error) => return internal("payment config upsert", &error),
-        }
-    } else {
-        None
+    let (bitcoin_setup, usdt) =
+        tokio::join!(lookup_bitcoin_setup(own_paykit(&state), &actor.0), async {
+            if usdt_flag {
+                own_usdt_view(&state, &actor.0).await.map(Some)
+            } else {
+                Ok(None)
+            }
+        },);
+    let usdt = match usdt {
+        Ok(view) => view,
+        Err(error) => return internal("payment config upsert", &error),
     };
     (
         StatusCode::OK,
@@ -518,6 +564,7 @@ pub async fn put_payment_config(
                 row.bitcoin_enabled,
                 &row.paypal_merchant_email,
                 row.updated_at,
+                bitcoin_setup,
                 usdt.as_ref(),
             ),
         })),
@@ -540,17 +587,18 @@ async fn store_config_with_usdt(
 }
 
 /// `GET /v0/sellers/me/payment-config` (seller session): the seller's own
-/// stored configuration, exactly as the PUT returns it. This is the raw row
-/// (`bitcoin_enabled` as stored, no paykit availability lookup) so the
-/// settings page can load state on mount.
+/// stored configuration, exactly as the PUT returns it, so the settings page
+/// can load state on mount. `bitcoin_enabled` is the stored row, not
+/// availability.
 ///
-/// While `USDT_PAYMENTS_ENABLED` is on the body also carries `usdt_enabled`,
-/// `usdt_setup` and `usdt_setup_action` (see [`lookup_usdt_setup`]), read
-/// from paykit-server on every call, never from the availability cache, so
-/// the Shop sees a Bitkit setup or reconnect the moment it completes. A
-/// seller who never saved anything has no row; with the flag on that read is
-/// the empty configuration (epoch `updated_at`) instead of `null`, because
-/// that seller is exactly who needs `usdt_setup_action: "setup"`.
+/// The body also carries `bitcoin_setup` (see [`lookup_bitcoin_setup`]) and,
+/// while `USDT_PAYMENTS_ENABLED` is on, `usdt_enabled`, `usdt_setup` and
+/// `usdt_setup_action` (see [`lookup_usdt_setup`]). Both are read from
+/// paykit-server on every call, never from the availability cache, so the
+/// Shop sees a Bitkit setup or reconnect the moment it completes. A seller
+/// who never saved anything has no row; that read is the empty configuration
+/// (epoch `updated_at`) instead of `null`, because that seller is exactly
+/// who needs to see `bitcoin_setup: "setup_required"`.
 pub async fn get_own_payment_config(
     State(state): State<AppState>,
     Extension(actor): Extension<Actor>,
@@ -559,28 +607,15 @@ pub async fn get_own_payment_config(
         Ok(row) => row,
         Err(error) => return internal("payment config read", &error),
     };
-    if !state.config.usdt_payments_enabled {
-        return match row {
-            Some(row) => (
-                StatusCode::OK,
-                Json(json!({
-                    "payment_config": config_view(
-                        row.bitcoin_enabled,
-                        &row.paypal_merchant_email,
-                        row.updated_at,
-                        None,
-                    ),
-                })),
-            )
-                .into_response(),
-            None => (
-                StatusCode::OK,
-                Json(json!({ "payment_config": Value::Null })),
-            )
-                .into_response(),
-        };
-    }
-    let usdt = match own_usdt_view(&state, &actor.0).await {
+    let (bitcoin_setup, usdt) =
+        tokio::join!(lookup_bitcoin_setup(own_paykit(&state), &actor.0), async {
+            if state.config.usdt_payments_enabled {
+                own_usdt_view(&state, &actor.0).await.map(Some)
+            } else {
+                Ok(None)
+            }
+        },);
+    let usdt = match usdt {
         Ok(view) => view,
         Err(error) => return internal("payment config read", &error),
     };
@@ -589,9 +624,16 @@ pub async fn get_own_payment_config(
             row.bitcoin_enabled,
             &row.paypal_merchant_email,
             row.updated_at,
-            Some(&usdt),
+            bitcoin_setup,
+            usdt.as_ref(),
         ),
-        None => config_view(false, &None, DateTime::<Utc>::UNIX_EPOCH, Some(&usdt)),
+        None => config_view(
+            false,
+            &None,
+            DateTime::<Utc>::UNIX_EPOCH,
+            bitcoin_setup,
+            usdt.as_ref(),
+        ),
     };
     (StatusCode::OK, Json(json!({ "payment_config": view }))).into_response()
 }
