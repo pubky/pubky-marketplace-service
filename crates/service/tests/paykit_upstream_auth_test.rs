@@ -2586,13 +2586,20 @@ async fn setup_status_is_not_called_for_a_seller_who_disabled_bitcoin(pool: PgPo
     )
     .await;
     assert_eq!(status, StatusCode::OK, "config put failed: {body}");
+    // The seller's own save asks only `bitcoin_setup`; buyers' reads ask nothing.
+    assert_eq!(
+        body["payment_config"]["bitcoin_setup"],
+        json!("setup_required")
+    );
     paykit.set_claimed(&seller.pubky);
+    let before = paykit.calls().len();
 
     let (_, body) = get_public_config(&app, &seller.pubky).await;
     assert_eq!(body["bitcoin_available"], json!(false));
     assert_eq!(body["paypal_available"], json!(true));
-    assert!(
-        paykit.calls().is_empty(),
-        "PayPal-only sellers never reach paykit-server"
+    assert_eq!(
+        paykit.calls().len(),
+        before,
+        "PayPal-only sellers never reach paykit-server from a public read"
     );
 }

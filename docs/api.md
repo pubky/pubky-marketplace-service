@@ -27,6 +27,7 @@ Contents:
 - [Rate limits](#rate-limits)
 - [Seller exports](#seller-exports)
 - [Event feed](#event-feed)
+- [Shipping and tracking commands](#shipping-and-tracking-commands)
 - [Batch sync (`sync-many`)](#batch-sync-sync-many)
 - [Inventory](#inventory)
 - [Webhooks](#webhooks)
@@ -592,13 +593,137 @@ participant-scoped application routes, not through this export.
   `listing.synced`, `inventory.adjusted`, `inventory.reserved`,
   `order.created`, `order.cancel_requested`, `order.cancelled`,
   `order.completed`, `payment.confirmed`, `payment.expired`,
-  `fulfillment.shipped`, `fulfillment.delivered`, `offer.created`,
+  `fulfillment.shipped`, `fulfillment.tracking_updated`,
+  `fulfillment.delivered`, `offer.created`,
   `offer.accepted`, `auction.bid_placed`, `drop.started`, `return.requested`,
   `refund.recorded_external` and `review.created`. The list is not exhaustive
   and not guaranteed to be closed; ignore unknown types.
 - `data` is always `{}` today. Treat the event as a change notification: fetch
   the aggregate (listing export, order export) for the new state, using
   `revision` to discard stale reads.
+
+## Shipping and tracking commands
+
+Both commands go through `POST /v1/commands` (the envelope is described in the
+README's [Command envelope](../README.md#command-envelope-adr-0019-3)). The
+caller is the order's seller. `expected_revision` is the order's current
+`revision`; a stale one is refused with `REVISION_CONFLICT` and
+`error.current_revision`.
+
+### `fulfillment.ship`
+
+```json
+{
+  "kind": "fulfillment.ship",
+  "aggregate_id": "order:<order_id>",
+  "expected_revision": 2,
+  "payload": {
+    "order_id": "<order_id>",
+    "carrier": "USPS",
+    "tracking_number": "9400100000000000000001"
+  }
+}
+```
+
+- `carrier` is required: 1 to 100 printable characters, trimmed, free text
+  (the reference client's soft vocabulary is `USPS`, `UPS`, `FedEx`, `DHL`,
+  `Royal Mail`, `DPD`, `Evri`, `PostNL`, `Correos`, `La Poste`, `An Post`,
+  `Deutsche Post`). A caller that has no carrier sends `"Other"`.
+- `tracking_number` is optional: 1 to 200 printable characters, trimmed.
+  Absent, `null`, empty and whitespace-only all mean no tracking yet. The
+  order is shipped either way, and the seller adds the number later with
+  `fulfillment.update_tracking`. Connectors use this for an order the store
+  marks completed without tracking.
+- Allowed from `paid` or `processing` on a shipping order. Refused with
+  `INVALID_STATE` and `error.reason: "payment_not_final"` while a USDT
+  payment's finality is `pending` or `reverted`.
+- Emits `fulfillment.shipped` and a `order_shipped` notification to the buyer.
+
+The result is `{"kind": "order", "order": {...}}`. The order's `shipment`
+object is:
+
+```json
+{
+  "carrier": "Other",
+  "tracking_number": null,
+  "state": "shipped",
+  "shipped_at": "2026-10-15T14:00:00.000Z",
+  "delivered_at": null,
+  "tracking_updated_at": null,
+  "tracking_history": []
+}
+```
+
+`tracking_number` is `null` while there is no number. `tracking_updated_at`
+and `tracking_history` are new: a shipment made before they existed lacks both
+keys, so read an absent key as `null` and `[]`. The same `shipment` appears in
+the buyer's and the seller's order projections and in the seller order export.
+
+### `fulfillment.update_tracking`
+
+```json
+{
+  "kind": "fulfillment.update_tracking",
+  "aggregate_id": "order:<order_id>",
+  "expected_revision": 3,
+  "payload": {
+    "order_id": "<order_id>",
+    "carrier": "UPS",
+    "tracking_number": "1Z999AA10123456784"
+  }
+}
+```
+
+- Seller only. Both fields are required and validated like `fulfillment.ship`
+  (`tracking_number` must be non-empty here: this command adds or edits a
+  number and cannot clear one). `INVALID_COMMAND` with `issues` otherwise.
+- Allowed only while the order is `shipped`. Delivered, completed, cancelled,
+  returned, refunded and not-yet-shipped orders are refused.
+- A change replaces `shipment.carrier` and `shipment.tracking_number`, sets
+  `shipment.tracking_updated_at`, appends one entry to
+  `shipment.tracking_history`, and bumps the order `revision` by one. The state
+  stays `shipped`, and `shipped_at` is unchanged. A history entry is
+  `{"at": <timestamp>, "from": {"carrier", "tracking_number"}, "to": {"carrier", "tracking_number"}}`,
+  where `from.tracking_number` is `null` for a shipment that had no number.
+- Identical values (after trimming) change nothing: the result is the current
+  order with `"changed": false`, the revision is not bumped, and no event or
+  notification is written. The envelope `expected_revision` is still checked,
+  so a retry that reads a stale revision gets `REVISION_CONFLICT` and re-reads.
+  Replaying the same `command_id` returns the stored result.
+- Emits the `fulfillment.tracking_updated` event and a `tracking_updated`
+  notification to the buyer, the same path the ship event takes. The event is
+  in the seller's [event feed](#event-feed) and so in webhooks. The buyer gets
+  one notification per change.
+- The result is `{"kind": "order", "order": {...}, "changed": true}`.
+
+Racing commands resolve on the order revision. If a second
+`fulfillment.update_tracking` or a buyer's `fulfillment.confirm_delivery`
+carries the same `expected_revision` as the winner, it is refused with
+`REVISION_CONFLICT` and `error.current_revision`. After a delivery wins, the
+update is refused with `order_not_shipped`.
+
+### Refusals
+
+| HTTP | `error.code` | `error.reason` | When |
+| --- | --- | --- | --- |
+| 422 | `INVALID_COMMAND` | | Missing or invalid `carrier` or `tracking_number`, unknown payload field, wrong `aggregate_id`. |
+| 403 | `UNAUTHORIZED` | | The caller is not the seller (a buyer, or anyone else). |
+| 404 | `NOT_FOUND` | | Unknown order. |
+| 409 | `REVISION_CONFLICT` | | Stale `expected_revision`; carries `current_revision`. |
+| 409 | `INVALID_STATE` | `order_not_shipped` | `fulfillment.update_tracking` on an order that is not currently `shipped`. |
+| 409 | `INVALID_STATE` | `payment_not_final` | USDT finality is `pending` or `reverted`: `fulfillment.ship` and `fulfillment.update_tracking`. |
+| 409 | `INVALID_STATE` | `tracking_update_limit` | The shipment already holds 100 recorded changes. |
+| 409 | `INVALID_STATE` | | `fulfillment.ship` on an order that is not `paid` or `processing`, or a pickup or digital order. |
+
+### Event and notification
+
+| Command | Event `type` | Notification `type` (recipient) |
+| --- | --- | --- |
+| `fulfillment.ship` | `fulfillment.shipped` | `order_shipped` (buyer) |
+| `fulfillment.update_tracking` (a change) | `fulfillment.tracking_updated` | `tracking_updated` (buyer) |
+
+The event carries the new order `revision` and, like every event, `data: {}`:
+fetch the order for the new carrier, number and history.
 
 ## Batch sync (`sync-many`)
 
