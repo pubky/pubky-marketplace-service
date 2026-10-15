@@ -621,7 +621,7 @@ pub fn lock_document_for(seller_pubky: &str, amount: i64, asset: &str) -> Value 
 /// The content-lock-serving homeserver double used by every Locks-enabled
 /// test app: it answers `fetch_content_lock` for exactly the resources
 /// [`lock_resource_for_payment`] derives at the listed `(amount, asset)`
-/// fixtures, and nothing else.
+/// fixtures, and serves listing records as [`CommandMirrorHomeserver`] does.
 pub fn test_locks_homeserver() -> Arc<dyn HomeserverListingClient> {
     Arc::new(TestLocksHomeserver)
 }
@@ -631,8 +631,8 @@ struct TestLocksHomeserver;
 impl HomeserverListingClient for TestLocksHomeserver {
     fn fetch_listing<'a>(
         &'a self,
-        _seller_pubky: &'a str,
-        _listing_id: &'a str,
+        seller_pubky: &'a str,
+        listing_id: &'a str,
     ) -> Pin<
         Box<
             dyn Future<Output = marketplace_service::homeserver::HomeserverFetchOutcome>
@@ -640,7 +640,21 @@ impl HomeserverListingClient for TestLocksHomeserver {
                 + 'a,
         >,
     > {
-        Box::pin(async { marketplace_service::homeserver::HomeserverFetchOutcome::NotFound })
+        CommandMirrorHomeserver.fetch_listing(seller_pubky, listing_id)
+    }
+
+    fn fetch_listing_raw<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        listing_id: &'a str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = marketplace_service::homeserver::HomeserverRawFetchOutcome>
+                + Send
+                + 'a,
+        >,
+    > {
+        CommandMirrorHomeserver.fetch_listing_raw(seller_pubky, listing_id)
     }
 
     fn fetch_drop<'a>(
@@ -849,6 +863,14 @@ impl FakeHomeserver {
             "PUT",
             format!("/pub/pubky.app/marketplace/v1/listings/{listing_id}"),
         );
+    }
+
+    /// Publishes the record a seller writes before issuing this
+    /// `listing.register` command.
+    pub fn publish_registration(&self, command: &Value) {
+        let (seller_pubky, listing_id, record) =
+            registration_record(command).expect("a listing.register command");
+        self.put_record(&seller_pubky, &listing_id, record);
     }
 
     /// The seller deletes the record: the fetch 404s and the event stream
@@ -1801,16 +1823,23 @@ pub async fn execute(app: &TestApp, token: &str, body: &Value) -> (StatusCode, V
 }
 
 fn mirror_listing_registration(command: &Value) {
+    if let Some((seller_pubky, listing_id, record)) = registration_record(command) {
+        command_mirror_records()
+            .lock()
+            .expect("command mirror records lock")
+            .insert((seller_pubky, listing_id), record);
+    }
+}
+
+/// The record a seller publishes before issuing this `listing.register`, as
+/// `(seller_pubky, listing_id, record)`; `None` for any other command.
+fn registration_record(command: &Value) -> Option<(String, String, Value)> {
     if command["kind"] != json!("listing.register") {
-        return;
+        return None;
     }
     let payload = &command["payload"];
-    let Some(seller_pubky) = payload["seller_pubky"].as_str() else {
-        return;
-    };
-    let Some(listing_id) = payload["listing_id"].as_str() else {
-        return;
-    };
+    let seller_pubky = payload["seller_pubky"].as_str()?;
+    let listing_id = payload["listing_id"].as_str()?;
     let is_auction = payload["sale_format"] == json!("auction");
     let shipping_options = if is_auction {
         json!([{
@@ -1878,10 +1907,7 @@ fn mirror_listing_registration(command: &Value) {
             .unwrap_or_else(|| vec![json!("shipping")]),
         "sale": sale
     });
-    command_mirror_records()
-        .lock()
-        .expect("command mirror records lock")
-        .insert((seller_pubky.to_string(), listing_id.to_string()), record);
+    Some((seller_pubky.to_string(), listing_id.to_string(), record))
 }
 
 /// Puts a seller-authored listing record on the mirror homeserver as-is, for
