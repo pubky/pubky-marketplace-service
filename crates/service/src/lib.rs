@@ -31,6 +31,7 @@ pub mod http;
 pub mod inventory;
 pub mod listing_availability;
 pub mod listing_deletion;
+pub mod listing_lifecycle;
 pub mod listing_moderation;
 pub mod locks;
 pub(crate) mod logging;

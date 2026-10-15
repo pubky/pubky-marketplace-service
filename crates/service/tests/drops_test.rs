@@ -96,6 +96,7 @@ async fn sync_drop_over_boots_01(
     total_quantity: i64,
     per_buyer_limit: i64,
 ) -> String {
+    homeserver.publish_registration(&register_command(&seller.pubky, listing_quantity));
     let (status, body) = execute(
         app,
         &seller.token,
@@ -136,7 +137,9 @@ async fn drop_sync_registers_updates_while_announced_and_locks_terms_at_launch(p
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let aggregate_id = drop_aggregate(&seller.pubky, DROP_ID);
+    homeserver.publish_registration(&register_command(&seller.pubky, 5));
     execute(&app, &seller.token, &register_command(&seller.pubky, 5)).await;
+    homeserver.publish_registration(&register_listing_command(&seller.pubky, "boots_02", 5, 1));
     let (status, body) = execute(
         &app,
         &seller.token,
@@ -362,6 +365,7 @@ async fn gating_refuses_before_start_after_end_and_after_cancel(pool: PgPool) {
     assert_eq!(body["error"]["message"], json!("The drop has ended."));
 
     // A cancelled drop refuses identically.
+    homeserver.publish_registration(&register_listing_command(&seller.pubky, "boots_02", 5, 1));
     let (status, body) = execute(
         &app,
         &seller.token,
@@ -415,6 +419,7 @@ async fn mixed_carts_and_multi_unit_lines_are_refused(pool: PgPool) {
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     sync_drop_over_boots_01(&app, &homeserver, &seller, &buyer, 5, 0, None, 5, 2).await;
+    homeserver.publish_registration(&register_listing_command(&seller.pubky, "plain_tee", 5, 1));
     let (status, body) = execute(
         &app,
         &seller.token,
@@ -475,7 +480,9 @@ async fn a_two_line_drop_checkout_is_refused(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
+    homeserver.publish_registration(&register_command(&seller.pubky, 5));
     execute(&app, &seller.token, &register_command(&seller.pubky, 5)).await;
+    homeserver.publish_registration(&register_listing_command(&seller.pubky, "boots_02", 5, 1));
     let (status, body) = execute(
         &app,
         &seller.token,
@@ -868,7 +875,9 @@ async fn the_sweep_worker_starts_and_closes_untouched_drops_on_server_time(pool:
     let holder = Uuid::new_v4();
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
+    homeserver.publish_registration(&register_command(&seller.pubky, 5));
     execute(&app, &seller.token, &register_command(&seller.pubky, 5)).await;
+    homeserver.publish_registration(&register_listing_command(&seller.pubky, "boots_02", 5, 1));
     let (status, body) = execute(
         &app,
         &seller.token,
@@ -1376,6 +1385,7 @@ async fn the_public_drop_projection_redacts_stock_server_side(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
+    homeserver.publish_registration(&register_command(&seller.pubky, 5));
     execute(&app, &seller.token, &register_command(&seller.pubky, 5)).await;
     for (listing_id, index) in [
         ("boots_02", 1),
@@ -1383,6 +1393,12 @@ async fn the_public_drop_projection_redacts_stock_server_side(pool: PgPool) {
         ("boots_04", 3),
         ("boots_05", 4),
     ] {
+        homeserver.publish_registration(&register_listing_command(
+            &seller.pubky,
+            listing_id,
+            5,
+            index,
+        ));
         let (status, body) = execute(
             &app,
             &seller.token,
