@@ -2175,13 +2175,12 @@ async fn a_review_row_without_a_satoshi_total_lists_through_the_query_and_the_ad
     marketplace_service::paykit_attempts::verify_due_released_attempts(&f.app.state, client, at(1))
         .await
         .expect("released attempts poll");
-    let total: Option<i64> = sqlx::query_scalar(
-        "SELECT total_sats FROM paykit_superseded_attempts WHERE order_id = $1",
-    )
-    .bind(uuid(&order_id))
-    .fetch_one(&pool)
-    .await
-    .expect("held row");
+    let total: Option<i64> =
+        sqlx::query_scalar("SELECT total_sats FROM paykit_superseded_attempts WHERE order_id = $1")
+            .bind(uuid(&order_id))
+            .fetch_one(&pool)
+            .await
+            .expect("held row");
     assert_eq!(total, None, "a USDT-only attempt has no satoshi total");
 
     let listed = marketplace_service::paykit_attempts::list_needs_review(&pool)
@@ -2478,10 +2477,12 @@ async fn usdt_finality_that_stays_pending_for_seven_days_goes_to_an_operator(poo
     let before = status_reads();
     poll_now(&f.app, day(6)).await;
     assert!(status_reads() > before, "still polled on day 6");
-    assert!(marketplace_service::paykit_attempts::list_needs_review(&pool)
-        .await
-        .expect("queue")
-        .is_empty());
+    assert!(
+        marketplace_service::paykit_attempts::list_needs_review(&pool)
+            .await
+            .expect("queue")
+            .is_empty()
+    );
 
     // Past it, one durable operator row is written and polling stops.
     poll_now(&f.app, day(8)).await;

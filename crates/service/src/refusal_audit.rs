@@ -1292,9 +1292,7 @@ pub const fn refusal_kind_for_review_reason(
         ReviewReason::RefundRequired
         | ReviewReason::RefundDestinationRequired
         | ReviewReason::RefundRailUnknown
-        | ReviewReason::RefundAmountUnrecordable => {
-            Some(RefusalKind::InvalidState)
-        }
+        | ReviewReason::RefundAmountUnrecordable => Some(RefusalKind::InvalidState),
     }
 }
 
