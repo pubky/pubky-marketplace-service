@@ -1050,20 +1050,18 @@ on `X-Shopify-Event-Id`.
 - **Cancel and refund.** A Pubky cancel is `orderCancel` with `restock: true`, no
   refund and no customer email; a store order already cancelled is left alone. A
   Pubky refund is `refundCreate` with a manual `REFUND` transaction against the
-  order's sale. The recorded amount (`refund.record_external`) is validated
-  against the order total, so it is in the order currency's minor units on every
-  rail, Bitcoin and USDT included; no conversion happens, and the store refund's
-  note says so, adds how the order was paid (the order's own Bitcoin quote or
-  USDT basis, and its USD conversion when it has one) and ends with a mark
-  `pubky-refund:{refund id}:{minor}:{CUR}`. The recorded amount is the Pubky
-  books' refunded **total**, so the store gets only the difference to what it
-  already shows refunded (`totalRefundedSet`): a larger record after a partial
-  one refunds the rest, a repeat or an already covered record sends nothing, and
-  the total never exceeds the payment (`refund_exceeds_payment` if Pubky claims
-  more). The `@idempotent` key covers the Pubky refund id and that difference.
-  The refund must be in the store order's currency (`currency_mismatch`) and a
-  unit other than the order currency, or no amount, is refused
-  (`refund_amount_unconvertible`, `refund_amount_missing`). A cancel the store
+  order's sale. The framework owns the arithmetic (`connectors/refund.rs`): the
+  recorded amount is the Pubky books' refunded **total** in the order currency's
+  minor units on every rail (a USDT-paid order priced in another currency is
+  converted with the order's own recorded conversion, and the conversion basis
+  goes in the note), and the provider is asked only for the difference to what
+  the store already shows refunded. The Shopify provider reports that figure
+  (`refunded_total`: the sale amount and `totalRefundedSet`, the merchant's own
+  refunds included) and records the difference; the store refuses a refund
+  above the payment, so a concurrent refund cannot push it over. The note ends
+  with a mark `pubky-refund:{refund id}:{minor}:{CUR}` and the `@idempotent` key
+  covers the Pubky refund id and the amount. A store order in another currency
+  than the refund is refused (`currency_mismatch`). A cancel the store
   refuses is judged by reading the order, not the message: cancelled means done,
   otherwise it is retried. Actions of one push (a cancel and refunds) run one at
   a time.
