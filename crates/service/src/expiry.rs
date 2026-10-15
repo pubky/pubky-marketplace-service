@@ -40,7 +40,7 @@ pub async fn expire_due_reservations(pool: &PgPool, now: DateTime<Utc>) -> anyho
              SELECT 1 FROM orders o JOIN payments p ON p.order_id = o.id \
              WHERE o.auction_aggregate_id = reservations.listing_aggregate_id \
              AND o.buyer_pubky = reservations.buyer_pubky \
-             AND o.payment_method = 'bitcoin' AND p.adapter = 'paykit' \
+             AND o.payment_method IN ('bitcoin', 'paykit') AND p.adapter = 'paykit' \
              AND (o.paykit_request_state = 'awaiting_seller_confirmation' \
                   OR p.state = 'manual_review')) \
          ORDER BY expires_at FOR UPDATE SKIP LOCKED",

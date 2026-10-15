@@ -740,8 +740,33 @@ pub struct OrderRow {
     /// The amount sent, in units of `10^-payment_exponent`.
     pub payment_amount_minor: Option<i64>,
     pub payment_exponent: Option<i16>,
-    /// How the amount was derived from the price (`parity`).
+    /// How the amount was derived from the price (`parity`, `native`,
+    /// `fixed_rate`).
     pub payment_quote_basis: Option<String>,
+    /// The multi-asset request's amount in `paykit_asset`'s base units, the
+    /// assets paykit-server offered (`BTC`, `USDT`), and what each costs in
+    /// its own base units. All three are set together or all NULL (every
+    /// legacy `amount_sats` request).
+    pub paykit_amount_minor: Option<i64>,
+    pub paykit_accepted_assets: Option<Vec<String>>,
+    pub paykit_payment_amounts: Option<Value>,
+    /// The USD conversion of a non-USD price behind a multi-asset request
+    /// (migration 0061): the pair (`EURUSD`), the feed, both exact ticker
+    /// rates, the older ticker time and the cents requested. All six are set
+    /// together or all NULL.
+    pub usd_conversion_pair: Option<String>,
+    pub usd_conversion_source: Option<String>,
+    pub usd_conversion_usd_rate: Option<sqlx::types::BigDecimal>,
+    pub usd_conversion_currency_rate: Option<sqlx::types::BigDecimal>,
+    pub usd_conversion_fetched_at: Option<DateTime<Utc>>,
+    pub usd_conversion_cents: Option<i64>,
+    /// A USDT payment's finality (`pending` | `final` | `reverted`) and when
+    /// it last changed; NULL for every order not paid in USDT.
+    pub payment_finality: Option<String>,
+    pub payment_finality_at: Option<DateTime<Utc>>,
+    /// When money was first seen on the rail that did not pay the order.
+    /// Never serialized.
+    pub paykit_second_rail_at: Option<DateTime<Utc>>,
 }
 
 impl std::fmt::Debug for OrderRow {
@@ -952,6 +977,18 @@ impl OrderRow {
             payment_amount_minor: None,
             payment_exponent: None,
             payment_quote_basis: None,
+            paykit_amount_minor: None,
+            paykit_accepted_assets: None,
+            paykit_payment_amounts: None,
+            usd_conversion_pair: None,
+            usd_conversion_source: None,
+            usd_conversion_usd_rate: None,
+            usd_conversion_currency_rate: None,
+            usd_conversion_fetched_at: None,
+            usd_conversion_cents: None,
+            payment_finality: None,
+            payment_finality_at: None,
+            paykit_second_rail_at: None,
         }
     }
 
@@ -1135,6 +1172,28 @@ impl OrderRow {
         )
     }
 
+    /// The bind-time quote of a fiat price. `pair` names the ticker `rate`
+    /// belongs to (`BTCEUR`: units of the listing currency per bitcoin) and
+    /// is present only once a quote exists, so an order without one keeps
+    /// its earlier projection byte for byte.
+    fn bitcoin_quote_view(&self) -> Value {
+        let mut quote = json!({
+            "rate": self.bitcoin_quote_rate.as_ref().map(ToString::to_string),
+            "source": self.bitcoin_quote_source,
+            "fetched_at": self.bitcoin_quote_fetched_at.map(format_timestamp),
+            "quoted_sats": self.bitcoin_quoted_sats,
+            "expires_at": self.bitcoin_quote_expires_at.map(format_timestamp),
+            "currency": self.bitcoin_quote_currency,
+            "exponent": self.bitcoin_quote_exponent,
+            "spread_bps": self.bitcoin_quote_spread_bps,
+        });
+        if let (Some(_), Some(currency)) = (&self.bitcoin_quote_rate, &self.bitcoin_quote_currency)
+        {
+            quote["pair"] = json!(format!("BTC{}", currency.trim_end()));
+        }
+        quote
+    }
+
     fn raw_view(&self) -> Value {
         let displayed_total = if matches!(self.currency.as_str(), "SAT" | "BTC")
             && self.paykit_total_sats.is_some()
@@ -1176,16 +1235,7 @@ impl OrderRow {
             "paykit_activation_state": self.paykit_activation_state,
             "paykit_total_sats": self.paykit_total_sats,
             "paykit_expires_at": self.paykit_expires_at.map(format_timestamp),
-            "bitcoin_quote": {
-                "rate": self.bitcoin_quote_rate.as_ref().map(ToString::to_string),
-                "source": self.bitcoin_quote_source,
-                "fetched_at": self.bitcoin_quote_fetched_at.map(format_timestamp),
-                "quoted_sats": self.bitcoin_quoted_sats,
-                "expires_at": self.bitcoin_quote_expires_at.map(format_timestamp),
-                "currency": self.bitcoin_quote_currency,
-                "exponent": self.bitcoin_quote_exponent,
-                "spread_bps": self.bitcoin_quote_spread_bps,
-            },
+            "bitcoin_quote": self.bitcoin_quote_view(),
             "fulfillment": self.fulfillment,
             "first_revealed_at": self.first_revealed_at.map(format_timestamp),
             "created_at": format_timestamp(self.created_at),
@@ -1226,7 +1276,74 @@ impl OrderRow {
             view["payment_exponent"] = json!(exponent);
             view["payment_quote_basis"] = json!(basis);
         }
+        // An order bound through `paykit` names what its request offers and
+        // what each asset costs, in each asset's base units. Other orders
+        // keep their projection byte for byte.
+        if self.payment_method.as_deref() == Some("paykit") {
+            view["accepted_assets"] = json!(self.offered_asset_names());
+            view["payment_amounts"] = self.offered_amounts();
+        }
+        // Only a USDT payment has finality (S3).
+        if let Some(finality) = &self.payment_finality {
+            view["payment_finality"] = json!(finality);
+        }
+        if let Some(conversion) = self.usd_conversion_view() {
+            view["fx_conversion"] = conversion;
+        }
         view
+    }
+
+    /// How a non-USD price was converted to the USD cents its multi-asset
+    /// request was denominated in: the listing-currency total (`from`), the
+    /// cents requested (`to`), the cross pair and rate, the two exact ticker
+    /// rates it comes from, the feed and the older ticker time. Absent for
+    /// every order without a conversion.
+    fn usd_conversion_view(&self) -> Option<Value> {
+        let (Some(pair), Some(source), Some(usd_rate), Some(currency_rate)) = (
+            &self.usd_conversion_pair,
+            &self.usd_conversion_source,
+            &self.usd_conversion_usd_rate,
+            &self.usd_conversion_currency_rate,
+        ) else {
+            return None;
+        };
+        let (fetched_at, cents) = (self.usd_conversion_fetched_at?, self.usd_conversion_cents?);
+        let cross = crate::fx::CrossRate {
+            pair: pair.clone(),
+            usd_rate: crate::fx::Decimal::parse(&usd_rate.to_string())?,
+            currency_rate: crate::fx::Decimal::parse(&currency_rate.to_string())?,
+            fetched_at,
+        };
+        Some(json!({
+            "pair": pair,
+            "rate": cross.rate_string(),
+            "usd_rate": usd_rate.to_string(),
+            "currency_rate": currency_rate.to_string(),
+            "source": source,
+            "fetched_at": format_timestamp(fetched_at),
+            "from": money_json(self.total_minor, &self.currency, self.exponent),
+            "to": money_json(cents, "USD", 2),
+        }))
+    }
+
+    /// The assets the order's Paykit request offers: what paykit-server
+    /// derived for a multi-asset request, Bitcoin for the legacy
+    /// `amount_sats` request.
+    fn offered_asset_names(&self) -> Vec<String> {
+        match &self.paykit_accepted_assets {
+            Some(assets) => assets.clone(),
+            None => vec!["BTC".to_string()],
+        }
+    }
+
+    fn offered_amounts(&self) -> Value {
+        match &self.paykit_payment_amounts {
+            Some(amounts) => amounts.clone(),
+            None => match self.paykit_total_sats {
+                Some(sats) => json!({ "BTC": sats }),
+                None => json!({}),
+            },
+        }
     }
 }
 
@@ -1293,18 +1410,47 @@ fn next_actor_for_order(
     }
 }
 
+/// The scalar type an optional observation key must have to be shown.
+enum ScalarKind {
+    Text,
+    Number,
+    Flag,
+}
+
 pub(crate) fn seller_observation(observation: Option<&Value>) -> Value {
     let Some(observation) = observation else {
         return Value::Null;
     };
-    json!({
+    let view = json!({
         "txid": observation.get("txid").and_then(Value::as_str),
         "observed_sats": observation.get("observed_sats").and_then(Value::as_i64),
         "confirmations": observation.get("confirmations").and_then(Value::as_i64),
         "amount_matched": observation.get("amount_matched").and_then(Value::as_bool),
         "observed_at": observation.get("observed_at").and_then(Value::as_str),
         "disappeared": observation.get("disappeared").and_then(Value::as_bool),
-    })
+    });
+    // A USDT leg, and the other rail of an order paid on both, carry scalar
+    // facts of their own. They appear only when the document has them, so a
+    // Bitcoin observation keeps its shape.
+    let mut view = view;
+    for (key, kind) in [
+        ("asset", ScalarKind::Text),
+        ("observed_units", ScalarKind::Number),
+        ("other_rail_asset", ScalarKind::Text),
+        ("other_rail_amount", ScalarKind::Number),
+        ("other_rail_reference", ScalarKind::Text),
+        ("paid_rail_unknown", ScalarKind::Flag),
+    ] {
+        let value = observation.get(key).and_then(|value| match kind {
+            ScalarKind::Number => value.as_i64().map(|number| json!(number)),
+            ScalarKind::Text => value.as_str().map(|text| json!(text)),
+            ScalarKind::Flag => value.as_bool().map(|flag| json!(flag)),
+        });
+        if let Some(value) = value {
+            view[key] = value;
+        }
+    }
+    view
 }
 
 #[cfg(test)]

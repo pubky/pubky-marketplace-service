@@ -2420,6 +2420,19 @@ pub struct FakePaykitInvoice {
     pub total_sats: u64,
     pub expires_at: String,
     pub prepare_expires_at: String,
+    /// The terms of a multi-asset request; `None` for a legacy `amount_sats`
+    /// invoice.
+    pub multi: Option<FakeMultiInvoice>,
+}
+
+/// The multi-asset terms the double prepared: the denomination amount in
+/// base units (as sent), the denomination, and what each offered asset costs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FakeMultiInvoice {
+    pub amount: String,
+    pub asset: String,
+    pub accepted: Vec<String>,
+    pub payment_amounts: Value,
 }
 
 struct FakePaykitPrepared {
@@ -2473,6 +2486,11 @@ struct FakePaykitState {
     /// Exact Marketplace status bodies by server-issued invoice id.
     marketplace_status_bodies: HashMap<uuid::Uuid, Value>,
     marketplace_status_failure: Option<(u16, String)>,
+    /// Holds the Marketplace status answers for one invoice at a barrier:
+    /// the answers are released together once `parties` requests arrived.
+    marketplace_status_rendezvous: Option<(uuid::Uuid, Arc<tokio::sync::Barrier>)>,
+    /// Signalled whenever a Marketplace status request arrives.
+    marketplace_status_arrived: Arc<tokio::sync::Notify>,
     /// Status every transaction-status call answers with, when forced.
     status_failure: Option<u16>,
     calls: Vec<FakePaykitCall>,
@@ -2482,6 +2500,15 @@ struct FakePaykitState {
     account_status: u16,
     /// Which signature preimage the double verifies (the API it plays).
     api: PaykitApi,
+    /// Plays the multi-asset Marketplace contract: prepare and activate take
+    /// `amount` + `asset` (+ optional `accepted_assets`) and the legacy
+    /// `amount_sats` body is refused, as the closed body refuses it.
+    multi_asset: bool,
+    /// Seller (bare z32) -> the assets the seller can receive. A claimed
+    /// seller without an entry receives Bitcoin only.
+    receivable: HashMap<String, Vec<String>>,
+    /// The Bitcoin rate the double fixes at prepare, US dollars per bitcoin.
+    usd_per_btc: u64,
     /// Seller (bare z32) -> the `/setup/status` answer, when scripted. A
     /// claimed seller without an entry answers `ready`; anyone else
     /// `setup_required`.
@@ -2537,6 +2564,28 @@ impl FakePaykit {
     /// preimage (method, path, body); a body-only signature is a 401.
     pub fn use_upstream_api(&self) {
         self.state.lock().expect("fake paykit lock").api = PaykitApi::Upstream;
+    }
+
+    /// Plays paykit-server's multi-asset Marketplace contract.
+    pub fn use_multi_asset_contract(&self) {
+        self.state.lock().expect("fake paykit lock").multi_asset = true;
+    }
+
+    /// The assets (`BTC`, `USDT`) a seller (bare z32) can receive.
+    pub fn set_receivable(&self, seller_pubky: &str, assets: &[&str]) {
+        self.state
+            .lock()
+            .expect("fake paykit lock")
+            .receivable
+            .insert(
+                seller_pubky.to_string(),
+                assets.iter().map(|asset| asset.to_string()).collect(),
+            );
+    }
+
+    /// The Bitcoin rate the double fixes at prepare.
+    pub fn set_usd_per_btc(&self, rate: u64) {
+        self.state.lock().expect("fake paykit lock").usd_per_btc = rate;
     }
 
     pub fn set_upstream_prepare_ttl_seconds(&self, seconds: i64) {
@@ -2772,6 +2821,50 @@ impl FakePaykit {
             .expect("fake paykit lock")
             .marketplace_status_bodies
             .insert(invoice_id, body);
+    }
+
+    /// Holds the status answers for `invoice_id` at a barrier of `parties`:
+    /// each request reads its body when it arrives and waits until `parties`
+    /// requests for the invoice have arrived, then the answers go out
+    /// together. The barrier is reusable.
+    pub fn rendezvous_marketplace_status(&self, invoice_id: uuid::Uuid, parties: usize) {
+        self.state
+            .lock()
+            .expect("fake paykit lock")
+            .marketplace_status_rendezvous =
+            Some((invoice_id, Arc::new(tokio::sync::Barrier::new(parties))));
+    }
+
+    /// Returns once `count` status requests for `invoice_id` have arrived.
+    pub async fn wait_for_marketplace_status_requests(&self, invoice_id: uuid::Uuid, count: usize) {
+        let wanted = serde_json::json!(invoice_id);
+        loop {
+            let (arrived, notify) = {
+                let guard = self.state.lock().expect("fake paykit lock");
+                (
+                    guard
+                        .calls
+                        .iter()
+                        .filter(|call| {
+                            call.path == "/marketplace/payment-requests/status"
+                                && call.body["invoice_id"] == wanted
+                        })
+                        .count(),
+                    guard.marketplace_status_arrived.clone(),
+                )
+            };
+            if arrived >= count {
+                return;
+            }
+            notify.notified().await;
+        }
+    }
+
+    pub fn clear_marketplace_status_failure(&self) {
+        self.state
+            .lock()
+            .expect("fake paykit lock")
+            .marketplace_status_failure = None;
     }
 
     pub fn fail_marketplace_status_with(&self, status: u16, code: &str) {
@@ -3083,6 +3176,7 @@ async fn serve_paykit_payment_request(
                     total_sats,
                     expires_at: expires_at.clone(),
                     prepare_expires_at: prepare_expires_at.clone(),
+                    multi: None,
                 },
             );
             let mut body = json!({
@@ -3145,6 +3239,9 @@ async fn serve_upstream_prepare(
         return paykit_unauthorized();
     };
     paykit_record_call(&state, "POST", PATH, &host, &parsed);
+    if state.lock().expect("fake paykit lock").multi_asset {
+        return serve_multi_asset_prepare(&state, parsed);
+    }
     let expected = [
         "amount_sats",
         "creator",
@@ -3203,12 +3300,187 @@ async fn serve_upstream_prepare(
             total_sats: amount_sats,
             expires_at: (now + chrono::Duration::seconds(window)).to_rfc3339(),
             prepare_expires_at: prepare_expires_at.clone(),
+            multi: None,
         },
     );
     let response = json!({
         "invoice_id": invoice_id,
         "state": "prepared",
         "total_sats": amount_sats,
+        "prepare_expires_at": prepare_expires_at,
+    });
+    guard.prepared.insert(
+        key,
+        FakePaykitPrepared {
+            binding: parsed,
+            invoice_id,
+            body: response.clone(),
+        },
+    );
+    (StatusCode::OK, axum::Json(response)).into_response()
+}
+
+/// The multi-asset prepare: `amount` (base units, as a digit string) and
+/// `asset` (`BTC`, `USD` or `USDT`) with an optional `accepted_assets`
+/// narrowing. The double derives the offer from what the seller can receive
+/// (never adding an asset that was not asked for), fixes the Bitcoin rate
+/// once, and answers the shape captured from paykit-server in
+/// `tests/fixtures/paykit-server-pk1/` (amounts as digit strings).
+fn serve_multi_asset_prepare(
+    state: &Arc<Mutex<FakePaykitState>>,
+    parsed: Value,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let required = [
+        "amount",
+        "asset",
+        "creator",
+        "description",
+        "operation_id",
+        "payment_window_seconds",
+        "reader",
+        "reference",
+    ];
+    let Some(object) = parsed.as_object() else {
+        return paykit_error(StatusCode::BAD_REQUEST, "invalid_request");
+    };
+    let optional = ["accepted_assets"];
+    if required.iter().any(|key| !object.contains_key(*key))
+        || object
+            .keys()
+            .any(|key| !required.contains(&key.as_str()) && !optional.contains(&key.as_str()))
+    {
+        return paykit_error(StatusCode::BAD_REQUEST, "invalid_request");
+    }
+    let mut guard = state.lock().expect("fake paykit lock");
+    if let Some(code) = guard.create_error.clone() {
+        return paykit_error(
+            StatusCode::from_u16(guard.create_error_status).expect("valid fake status"),
+            &code,
+        );
+    }
+    let key = (
+        parsed["creator"].as_str().unwrap_or_default().to_string(),
+        parsed["operation_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+    );
+    if let Some(prepared) = guard.prepared.get(&key) {
+        return if prepared.binding == parsed {
+            (StatusCode::OK, axum::Json(prepared.body.clone())).into_response()
+        } else {
+            paykit_error(StatusCode::CONFLICT, "operation_conflict")
+        };
+    }
+    let amount_text = parsed["amount"].as_str().unwrap_or_default().to_string();
+    let amount: u64 = if !amount_text.is_empty() && amount_text.bytes().all(|b| b.is_ascii_digit())
+    {
+        amount_text.parse().unwrap_or_default()
+    } else {
+        0
+    };
+    let asset = parsed["asset"].as_str().unwrap_or_default().to_string();
+    let window = parsed["payment_window_seconds"]
+        .as_i64()
+        .unwrap_or_default();
+    if amount == 0
+        || window <= 0
+        || !matches!(asset.as_str(), "BTC" | "USD" | "USDT")
+        || uuid::Uuid::parse_str(parsed["reference"].as_str().unwrap_or_default()).is_err()
+    {
+        return paykit_error(StatusCode::BAD_REQUEST, "invalid_request");
+    }
+    let narrowing: Option<Vec<String>> = match parsed.get("accepted_assets") {
+        None => None,
+        Some(list) => {
+            let Some(list) = list.as_array() else {
+                return paykit_error(StatusCode::BAD_REQUEST, "invalid_request");
+            };
+            let names: Vec<String> = list
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect();
+            let unique: std::collections::HashSet<&String> = names.iter().collect();
+            if names.is_empty()
+                || names.len() != list.len()
+                || unique.len() != names.len()
+                || names
+                    .iter()
+                    .any(|name| !matches!(name.as_str(), "BTC" | "USDT"))
+            {
+                return paykit_error(StatusCode::BAD_REQUEST, "invalid_request");
+            }
+            Some(names)
+        }
+    };
+    let seller = key.0.strip_prefix("pubky").unwrap_or(&key.0).to_string();
+    let receivable = guard.receivable.get(&seller).cloned().unwrap_or_else(|| {
+        if guard.claimed.contains(&seller) {
+            vec!["BTC".to_string()]
+        } else {
+            Vec::new()
+        }
+    });
+    let offered: Vec<String> = ["BTC", "USDT"]
+        .into_iter()
+        .filter(|name| receivable.iter().any(|have| have == name))
+        .filter(|name| {
+            narrowing
+                .as_ref()
+                .is_none_or(|only| only.iter().any(|o| o == name))
+        })
+        .map(str::to_string)
+        .collect();
+    if offered.is_empty() {
+        return paykit_error(StatusCode::SERVICE_UNAVAILABLE, "seller_setup_pending");
+    }
+    let rate = u128::from(guard.usd_per_btc);
+    let units = u128::from(amount);
+    let mut payment_amounts = serde_json::Map::new();
+    for name in &offered {
+        let payable: u128 = match (asset.as_str(), name.as_str()) {
+            ("USD", "BTC") => (units * 100_000_000).div_ceil(rate * 100),
+            ("USD", "USDT") => units * 10_000,
+            ("BTC", "BTC") => units,
+            ("BTC", "USDT") => (units * rate).div_ceil(100),
+            _ => return paykit_error(StatusCode::BAD_REQUEST, "invalid_request"),
+        };
+        payment_amounts.insert(name.clone(), json!(payable.to_string()));
+    }
+    let invoice_id = uuid::Uuid::new_v4();
+    let now = chrono::DateTime::from_timestamp_micros(chrono::Utc::now().timestamp_micros())
+        .expect("microsecond timestamp");
+    let prepare_expires_at =
+        (now + chrono::Duration::seconds(guard.upstream_prepare_ttl_seconds)).to_rfc3339();
+    let payment_amounts = Value::Object(payment_amounts);
+    guard.invoices.insert(
+        invoice_id,
+        FakePaykitInvoice {
+            invoice_id,
+            state: "prepared".into(),
+            total_sats: payment_amounts["BTC"]
+                .as_str()
+                .and_then(|sats| sats.parse().ok())
+                .unwrap_or_default(),
+            expires_at: (now + chrono::Duration::seconds(window)).to_rfc3339(),
+            prepare_expires_at: prepare_expires_at.clone(),
+            multi: Some(FakeMultiInvoice {
+                amount: amount_text.clone(),
+                asset: asset.clone(),
+                accepted: offered.clone(),
+                payment_amounts: payment_amounts.clone(),
+            }),
+        },
+    );
+    let response = json!({
+        "invoice_id": invoice_id,
+        "state": "prepared",
+        "amount": amount_text,
+        "asset": asset,
+        "accepted_assets": offered,
+        "payment_amounts": payment_amounts,
+        "rates": {},
         "prepare_expires_at": prepare_expires_at,
     });
     guard.prepared.insert(
@@ -3282,6 +3554,31 @@ async fn serve_upstream_command(
         return paykit_error(StatusCode::NOT_FOUND, "not_found");
     };
     match command {
+        "activate" if invoice.multi.is_some() => {
+            let multi = invoice.multi.clone().expect("checked");
+            if parsed["amount"].as_str() != Some(multi.amount.as_str())
+                || parsed["asset"].as_str() != Some(multi.asset.as_str())
+                || parsed.get("total_sats").is_some()
+            {
+                return paykit_error(StatusCode::CONFLICT, "total_mismatch");
+            }
+            if invoice.state == "voided" {
+                return paykit_error(StatusCode::CONFLICT, "lifecycle_terminal");
+            }
+            invoice.state = "active".into();
+            (
+                StatusCode::OK,
+                axum::Json(json!({
+                    "invoice_id": invoice_id, "state": "active",
+                    "activated_at": chrono::Utc::now().to_rfc3339(),
+                    "payment_deadline": invoice.expires_at,
+                    "amount": multi.amount, "asset": multi.asset,
+                    "accepted_assets": multi.accepted,
+                    "payment_amounts": multi.payment_amounts,
+                })),
+            )
+                .into_response()
+        }
         "activate" => {
             if parsed["total_sats"].as_u64() != Some(invoice.total_sats) {
                 return paykit_error(StatusCode::CONFLICT, "total_mismatch");
@@ -3744,6 +4041,22 @@ async fn serve_marketplace_status(
         }
         guard.marketplace_status_bodies.get(&invoice_id).cloned()
     };
+    // The body is fixed when the request arrives; the rendezvous only holds
+    // the answer, so two polls can read different bodies and still overlap.
+    let (rendezvous, arrived) = {
+        let guard = state.lock().expect("fake paykit lock");
+        (
+            guard
+                .marketplace_status_rendezvous
+                .clone()
+                .filter(|(invoice, _)| *invoice == invoice_id),
+            guard.marketplace_status_arrived.clone(),
+        )
+    };
+    arrived.notify_one();
+    if let Some((_, barrier)) = rendezvous {
+        barrier.wait().await;
+    }
     match response {
         Some(response) => (StatusCode::OK, axum::Json(response)).into_response(),
         None => paykit_error(StatusCode::NOT_FOUND, "not_found"),
@@ -3774,6 +4087,8 @@ pub async fn spawn_fake_paykit() -> FakePaykit {
         status_bodies: HashMap::new(),
         marketplace_status_bodies: HashMap::new(),
         marketplace_status_failure: None,
+        marketplace_status_rendezvous: None,
+        marketplace_status_arrived: Arc::new(tokio::sync::Notify::new()),
         status_failure: None,
         calls: Vec::new(),
         rail_health: json!({
@@ -3785,6 +4100,9 @@ pub async fn spawn_fake_paykit() -> FakePaykit {
         rail_health_status: 200,
         account_status: 200,
         api: PaykitApi::Fork,
+        multi_asset: false,
+        receivable: HashMap::new(),
+        usd_per_btc: 100_000,
         setup_statuses: HashMap::new(),
         setup_status_failure: None,
         setup_status_body: None,
@@ -4080,6 +4398,18 @@ async fn test_app_with_payments_and_fx_api(
     pool: PgPool,
     api: PaykitApi,
 ) -> (TestApp, FakePaykit, fx_feed::FakeFxFeed) {
+    test_app_with_paykit_fx_config(pool, Config::for_tests(), api).await
+}
+
+/// A payments-enabled app on the given Paykit API with a caller-supplied
+/// config and the FX feed double (the config's `fx_feed_url` is overridden
+/// in-process). On the upstream API the app clock is the real instant, since
+/// the Paykit double stamps real deadlines.
+pub async fn test_app_with_paykit_fx_config(
+    pool: PgPool,
+    mut config: Config,
+    api: PaykitApi,
+) -> (TestApp, FakePaykit, fx_feed::FakeFxFeed) {
     let paykit = spawn_fake_paykit().await;
     if api == PaykitApi::Upstream {
         paykit.use_upstream_api();
@@ -4102,7 +4432,6 @@ async fn test_app_with_payments_and_fx_api(
         NOW.parse().expect("valid test timestamp")
     };
     let clock = Arc::new(AdjustableClock::new(now));
-    let mut config = Config::for_tests();
     config.fx_feed_url = fx.base_url.clone();
     let state = AppState::new(pool.clone(), clock.clone(), config)
         .with_payments(Some(runtime))

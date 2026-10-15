@@ -2,11 +2,14 @@
 //! buyer sends, and where it settles.
 //!
 //! - [`PaymentAsset`] is the *denomination* of an upstream Paykit request,
-//!   stored in `orders.paykit_asset` (open text, migration 0052). Bitcoin is
-//!   the only denomination the Marketplace prepares today; a later one is a
-//!   new variant plus a new stored value, not a migration, and
-//!   [`PaymentAsset::from_column`] refuses a stored value this build does not
-//!   know instead of reading it as Bitcoin.
+//!   stored in `orders.paykit_asset` (open text, migration 0052): Bitcoin for
+//!   the legacy `amount_sats` request, and Bitcoin or USD for the
+//!   multi-asset request. A later one is a new variant plus a new stored
+//!   value, not a migration, and [`PaymentAsset::from_column`] refuses a
+//!   stored value this build does not know instead of reading it as Bitcoin.
+//! - [`AcceptedAsset`] is a payment asset a Paykit request can offer (what
+//!   the buyer may send), and [`OfferedAssets`] is what paykit-server
+//!   reported each offered asset costs.
 //! - [`PaymentOption`] is what the buyer picks (`{method}.{asset}.{network}`),
 //!   and [`PaymentTerms`] is what that choice costs, recorded on the order
 //!   (migration 0053).
@@ -18,11 +21,12 @@ use uuid::Uuid;
 
 use crate::payments::PaykitApi;
 
-/// What an upstream Paykit request is denominated in. Bitcoin is the only
-/// asset the Marketplace prepares today.
+/// What an upstream Paykit request is denominated in: satoshis, or US cents
+/// when paykit-server fixes the Bitcoin rate itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaymentAsset {
     Btc,
+    Usd,
 }
 
 impl PaymentAsset {
@@ -30,6 +34,7 @@ impl PaymentAsset {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Btc => "BTC",
+            Self::Usd => "USD",
         }
     }
 
@@ -37,8 +42,98 @@ impl PaymentAsset {
     pub fn from_column(value: &str) -> Option<Self> {
         match value {
             "BTC" => Some(Self::Btc),
+            "USD" => Some(Self::Usd),
             _ => None,
         }
+    }
+}
+
+/// An asset a Paykit request offers the buyer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum AcceptedAsset {
+    Btc,
+    Usdt,
+}
+
+impl AcceptedAsset {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Btc => "BTC",
+            Self::Usdt => "USDT",
+        }
+    }
+
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "BTC" => Some(Self::Btc),
+            "USDT" => Some(Self::Usdt),
+            _ => None,
+        }
+    }
+
+    /// The decimals of the asset's base unit: satoshis, USDT0 millionths.
+    pub const fn exponent(self) -> i16 {
+        match self {
+            Self::Btc => 8,
+            Self::Usdt => 6,
+        }
+    }
+}
+
+/// What paykit-server reported each offered asset costs, in the asset's base
+/// units. An asset that is not offered is `None`; at least one is offered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OfferedAssets {
+    pub btc_sats: Option<u64>,
+    pub usdt_units: Option<u64>,
+}
+
+impl OfferedAssets {
+    pub fn amount(self, asset: AcceptedAsset) -> Option<u64> {
+        match asset {
+            AcceptedAsset::Btc => self.btc_sats,
+            AcceptedAsset::Usdt => self.usdt_units,
+        }
+    }
+
+    /// The offered assets in wire order (`BTC` before `USDT`).
+    pub fn assets(self) -> Vec<AcceptedAsset> {
+        [AcceptedAsset::Btc, AcceptedAsset::Usdt]
+            .into_iter()
+            .filter(|asset| self.amount(*asset).is_some())
+            .collect()
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.btc_sats.is_none() && self.usdt_units.is_none()
+    }
+
+    /// The `orders.paykit_payment_amounts` document.
+    pub fn to_json(self) -> serde_json::Value {
+        let mut amounts = serde_json::Map::new();
+        for asset in self.assets() {
+            amounts.insert(
+                asset.as_str().to_string(),
+                serde_json::json!(self.amount(asset)),
+            );
+        }
+        serde_json::Value::Object(amounts)
+    }
+
+    /// Reads the stored document; anything that is not an object of known
+    /// assets with whole positive amounts is `None`.
+    pub fn from_json(value: &serde_json::Value) -> Option<Self> {
+        let object = value.as_object()?;
+        let mut offered = Self::default();
+        for (key, amount) in object {
+            let amount = amount.as_u64().filter(|amount| *amount > 0)?;
+            match AcceptedAsset::from_wire(key)? {
+                AcceptedAsset::Btc => offered.btc_sats = Some(amount),
+                AcceptedAsset::Usdt => offered.usdt_units = Some(amount),
+            }
+        }
+        (!offered.is_empty()).then_some(offered)
     }
 }
 
@@ -125,17 +220,20 @@ impl PaymentNetwork {
     }
 }
 
-/// What the buyer sends (`orders.payment_asset`). Only USDT carries these
-/// columns today; Bitcoin and PayPal orders (and historical Stripe orders)
-/// leave them NULL.
+/// What the buyer sent (`orders.payment_asset`). Legacy Bitcoin and PayPal
+/// orders (and historical Stripe orders) leave these columns NULL; an order
+/// bound through the `paykit` method records the rail that actually paid it
+/// when the payment settles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettlementAsset {
+    Btc,
     Usdt,
 }
 
 impl SettlementAsset {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Btc => "BTC",
             Self::Usdt => "USDT",
         }
     }
@@ -144,7 +242,15 @@ impl SettlementAsset {
     /// counts millionths.
     pub const fn exponent(self) -> i16 {
         match self {
+            Self::Btc => 8,
             Self::Usdt => 6,
+        }
+    }
+
+    pub const fn network(self) -> PaymentNetwork {
+        match self {
+            Self::Btc => PaymentNetwork::Bitcoin,
+            Self::Usdt => PaymentNetwork::ArbitrumOne,
         }
     }
 }
@@ -155,12 +261,20 @@ impl SettlementAsset {
 pub enum QuoteBasis {
     /// Exact 1:1 USD to USDT, with no rate source and no rounding.
     Parity,
+    /// The price was already in the asset sent (a Bitcoin price paid in
+    /// Bitcoin): no conversion.
+    Native,
+    /// One Bitcoin rate fixed by paykit-server when the request was
+    /// prepared, never refetched.
+    FixedRate,
 }
 
 impl QuoteBasis {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Parity => "parity",
+            Self::Native => "native",
+            Self::FixedRate => "fixed_rate",
         }
     }
 }
@@ -215,6 +329,32 @@ impl PaymentTerms {
             network: PaymentNetwork::ArbitrumOne,
             amount_minor,
             quote_basis: QuoteBasis::Parity,
+        })
+    }
+
+    /// The terms of an order that settled on `asset` for `amount_minor` base
+    /// units, as paykit-server reported them. A USD price paid in USDT is
+    /// parity; a Bitcoin price paid in Bitcoin is native; every other pair
+    /// crossed Bitcoin at the rate paykit-server fixed.
+    pub fn settled(
+        denomination: PaymentAsset,
+        asset: AcceptedAsset,
+        amount_minor: i64,
+    ) -> Option<Self> {
+        if amount_minor <= 0 {
+            return None;
+        }
+        let (asset, quote_basis) = match (denomination, asset) {
+            (PaymentAsset::Usd, AcceptedAsset::Usdt) => (SettlementAsset::Usdt, QuoteBasis::Parity),
+            (PaymentAsset::Btc, AcceptedAsset::Btc) => (SettlementAsset::Btc, QuoteBasis::Native),
+            (_, AcceptedAsset::Btc) => (SettlementAsset::Btc, QuoteBasis::FixedRate),
+            (_, AcceptedAsset::Usdt) => (SettlementAsset::Usdt, QuoteBasis::FixedRate),
+        };
+        Some(Self {
+            asset,
+            network: asset.network(),
+            amount_minor,
+            quote_basis,
         })
     }
 
@@ -290,15 +430,85 @@ impl MarketplaceAssets {
     }
 }
 
+/// Which request body the service sends to paykit-server's Marketplace
+/// prepare and activate (`PAYKIT_MARKETPLACE_CONTRACT`). It is configuration,
+/// never a probe, and it is independent of whether USDT is offered: a
+/// paykit-server that speaks the multi-asset contract refuses the legacy
+/// `amount_sats` body, so a deployment moves to it as soon as that
+/// paykit-server is live, with USDT still off (the request then asks for
+/// `["BTC"]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MarketplaceContract {
+    /// The rc16 body: `amount_sats`, Bitcoin only.
+    #[default]
+    Legacy,
+    /// The multi-asset body: a denomination and amount, optionally narrowed.
+    MultiAsset,
+}
+
+impl MarketplaceContract {
+    /// Parses the variable: unset or blank is `legacy`; otherwise `legacy` or
+    /// `multi_asset`, and `multi_asset` needs the upstream API (the fork has
+    /// no Marketplace routes).
+    pub fn parse(value: Option<&str>, api: PaykitApi) -> anyhow::Result<Self> {
+        const NAME: &str = "PAYKIT_MARKETPLACE_CONTRACT";
+        let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(Self::Legacy);
+        };
+        match value {
+            "legacy" => Ok(Self::Legacy),
+            "multi_asset" if api == PaykitApi::Upstream => Ok(Self::MultiAsset),
+            "multi_asset" => {
+                anyhow::bail!("{NAME}=multi_asset needs PAYKIT_SERVER_API=upstream")
+            }
+            other => anyhow::bail!("{NAME} must be `legacy` or `multi_asset`, not {other:?}"),
+        }
+    }
+
+    pub const fn is_multi_asset(self) -> bool {
+        matches!(self, Self::MultiAsset)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn only_bitcoin_is_a_known_asset() {
+    fn the_marketplace_contract_defaults_to_legacy_and_multi_asset_needs_upstream() {
+        for unset in [None, Some(""), Some("  ")] {
+            for api in [PaykitApi::Fork, PaykitApi::Upstream] {
+                assert_eq!(
+                    MarketplaceContract::parse(unset, api).expect("default"),
+                    MarketplaceContract::Legacy
+                );
+            }
+        }
+        assert_eq!(
+            MarketplaceContract::parse(Some("legacy"), PaykitApi::Fork).expect("legacy"),
+            MarketplaceContract::Legacy
+        );
+        let multi = MarketplaceContract::parse(Some(" multi_asset "), PaykitApi::Upstream)
+            .expect("upstream");
+        assert!(multi.is_multi_asset());
+        let refused = MarketplaceContract::parse(Some("multi_asset"), PaykitApi::Fork)
+            .expect_err("the fork has no Marketplace routes");
+        assert!(refused.to_string().contains("upstream"), "{refused}");
+        for bad in ["multi", "Legacy", "MULTI_ASSET", "assets", "true"] {
+            assert!(
+                MarketplaceContract::parse(Some(bad), PaykitApi::Upstream).is_err(),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_bitcoin_and_usd_are_known_denominations() {
         assert_eq!(PaymentAsset::from_column("BTC"), Some(PaymentAsset::Btc));
+        assert_eq!(PaymentAsset::from_column("USD"), Some(PaymentAsset::Usd));
         assert_eq!(PaymentAsset::Btc.as_str(), "BTC");
-        for other in ["", "btc", "USDT", "USD"] {
+        assert_eq!(PaymentAsset::Usd.as_str(), "USD");
+        for other in ["", "btc", "usd", "USDT", "EUR"] {
             assert_eq!(PaymentAsset::from_column(other), None, "{other:?}");
         }
     }
@@ -415,6 +625,100 @@ mod tests {
                 "{total}"
             );
         }
+    }
+
+    #[test]
+    fn an_offer_reads_back_what_it_wrote_and_refuses_anything_else() {
+        let offered = OfferedAssets {
+            btc_sats: Some(51_637),
+            usdt_units: Some(137_000_000),
+        };
+        assert_eq!(
+            offered.to_json(),
+            serde_json::json!({ "BTC": 51_637, "USDT": 137_000_000 })
+        );
+        assert_eq!(OfferedAssets::from_json(&offered.to_json()), Some(offered));
+        assert_eq!(offered.assets(), [AcceptedAsset::Btc, AcceptedAsset::Usdt]);
+        let usdt_only = OfferedAssets {
+            btc_sats: None,
+            usdt_units: Some(5),
+        };
+        assert_eq!(usdt_only.assets(), [AcceptedAsset::Usdt]);
+        assert_eq!(usdt_only.to_json(), serde_json::json!({ "USDT": 5 }));
+        assert!(OfferedAssets::default().is_empty());
+        for bad in [
+            serde_json::json!({}),
+            serde_json::json!([]),
+            serde_json::json!({ "BTC": 0 }),
+            serde_json::json!({ "BTC": -1 }),
+            serde_json::json!({ "BTC": "5" }),
+            serde_json::json!({ "DAI": 5 }),
+            serde_json::json!({ "btc": 5 }),
+            serde_json::Value::Null,
+        ] {
+            assert_eq!(OfferedAssets::from_json(&bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_settled_rail_records_its_asset_and_how_the_price_was_derived() {
+        use AcceptedAsset::{Btc, Usdt};
+        use PaymentAsset::{Btc as PriceBtc, Usd};
+        let cases = [
+            (
+                Usd,
+                Usdt,
+                SettlementAsset::Usdt,
+                "usdt",
+                "parity",
+                "arbitrum-one",
+                6,
+            ),
+            (
+                Usd,
+                Btc,
+                SettlementAsset::Btc,
+                "btc",
+                "fixed_rate",
+                "bitcoin",
+                8,
+            ),
+            (
+                PriceBtc,
+                Btc,
+                SettlementAsset::Btc,
+                "btc",
+                "native",
+                "bitcoin",
+                8,
+            ),
+            (
+                PriceBtc,
+                Usdt,
+                SettlementAsset::Usdt,
+                "usdt",
+                "fixed_rate",
+                "arbitrum-one",
+                6,
+            ),
+        ];
+        for (price, paid, asset, _, basis, network, exponent) in cases {
+            let terms = PaymentTerms::settled(price, paid, 42).expect("terms");
+            assert_eq!(terms.asset, asset);
+            assert_eq!(terms.quote_basis.as_str(), basis);
+            assert_eq!(terms.network.as_str(), network);
+            assert_eq!(terms.asset.exponent(), exponent);
+            assert_eq!(terms.amount_minor, 42);
+        }
+        for amount in [0, -1] {
+            assert_eq!(PaymentTerms::settled(Usd, Usdt, amount), None);
+        }
+        assert_eq!(AcceptedAsset::from_wire("BTC"), Some(Btc));
+        assert_eq!(AcceptedAsset::from_wire("btc"), None);
+        assert_eq!(
+            serde_json::to_value(Usdt).expect("serializes"),
+            serde_json::json!("USDT")
+        );
     }
 
     #[test]

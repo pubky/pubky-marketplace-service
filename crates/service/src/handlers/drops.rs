@@ -412,6 +412,7 @@ fn unregistered_listings(missing: &[&str]) -> CommandFailure {
             .map(|listing_id| marketplace_domain::ValidationIssue {
                 path: "payload.listing_ids".to_string(),
                 message: format!("Unregistered listing: {listing_id}"),
+                reason: None,
             })
             .collect(),
     )

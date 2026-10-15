@@ -120,6 +120,21 @@ shape and the source (`buyer_entered`); a later source is a widened CHECK in
 a later migration. It builds no index on an existing table and sets
 `lock_timeout` like 0050.
 
+0060 (single Paykit bind) widens `orders.payment_method` to `paykit` and adds
+six nullable `orders` columns: the multi-asset request terms
+(`paykit_amount_minor`, `paykit_accepted_assets`, `paykit_payment_amounts`,
+set together or all NULL), a USDT payment's `payment_finality` with
+`payment_finality_at`, and `paykit_second_rail_at`. It drops `NOT NULL` from
+`paykit_superseded_attempts.total_sats` (a released USDT-only attempt has no
+satoshi total) and replaces its positive check with one that allows NULL. It
+also widens `orders_external_refund_within_total` to admit the paid amount
+(`payment_amount_minor`): a refund of a USDT-paid order priced in satoshis is
+recorded in USDT0 millionths; the bound only widens, so existing rows satisfy
+it. The
+`orders` CHECKs are `NOT VALID` like 0053's; no default, no rewrite, no index.
+A binary from before it lists its `orders` columns and ignores them. It sets
+`lock_timeout` like 0050.
+
 0055 (priv data key custody releases) creates `user_priv_key_custody_releases`
 with its primary key and a key-count check. It builds no index on an existing
 table and takes no lock on one. Roll forward rather than back once any row
@@ -182,7 +197,7 @@ Roll forward rather than back once a connection exists: a binary that predates
 ## Numbers claimed by open pull requests
 
 `main` has 0001 to 0054 and 0056 to 0059; 0055 is #92, so the catalog is
-gapless 0001 to 0059 once it lands. Pull requests that are open when this was
+gapless 0001 to 0059 once it lands; 0060 is the single Paykit bind. Pull requests that are open when this was
 written claim numbers, so a new migration must check the open list
 (`gh pr list`) and take the next free number (0060 or later) rather than
 assume it is free:
@@ -205,3 +220,20 @@ so it drops `orders_total_balance` and re-adds it `NOT VALID` around itself, as
 0043 does: staging's tax-era orders break that constraint and would otherwise
 abort the file. Number 0055 belongs to the owner-held key custody release
 table (#92).
+
+## Multi-currency FX (0061)
+
+`0061_multi_currency_fx.sql` is additive and directly rerunnable. It widens
+`fx_rate_samples` from USD only to the seven fiat currencies (the currency
+check) with one sanity band per currency (`fx_rate_samples_rate_check`,
+repeated from `fx::rate_bounds` and kept equal by a test), and adds the six
+`usd_conversion_*` columns with an all-or-nothing, currency-matching check to
+`orders` and `paykit_superseded_attempts`. Constraints are `NOT VALID` then
+validated. See `docs/multi-currency.md`.
+
+It follows 0060 (the single Paykit bind) in number and in the branch it is
+stacked on, and reads or writes nothing 0060 creates. A binary from before
+0061 ignores the new columns, and its sampler inserts only USD rows, which
+both constraints admit, so a rolling replacement is safe. After 0061 the new
+sampler needs about three minutes of samples before a non-USD price can be
+quoted.
