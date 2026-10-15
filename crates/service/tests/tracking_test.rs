@@ -227,6 +227,10 @@ async fn ship_still_requires_a_carrier_and_a_printable_number(pool: PgPool) {
             json!({ "carrier": "Other", "tracking_number": "9".repeat(201) }),
             Some("payload.tracking_number"),
         ),
+        (
+            json!({ "carrier": "Other", "tracking_number": " ".repeat(201) }),
+            Some("payload.tracking_number"),
+        ),
     ] {
         let (status, body) = execute(
             &f.app,
@@ -621,6 +625,10 @@ async fn update_tracking_is_seller_only_and_validates_its_payload(pool: PgPool) 
             Some("payload.tracking_number"),
         ),
         (
+            json!({ "carrier": "USPS", "tracking_number": " ".repeat(201) }),
+            Some("payload.tracking_number"),
+        ),
+        (
             json!({ "carrier": "", "tracking_number": "9400-1" }),
             Some("payload.carrier"),
         ),
@@ -796,15 +804,29 @@ async fn wait_for_blocked_order_fetches(f: &Fixture, expected: i64) {
     panic!("{expected} command(s) never blocked on the order row lock");
 }
 
-/// Runs two commands that both read the same revision while the order row is
-/// held locked. `first` queues on the row lock before `second` is sent, so
-/// the row lock (not request timing) decides the interleaving: `first` gets
-/// the row and commits, and `second` then sees the new revision.
+/// Runs two commands that both carry the revision the order has now, while
+/// the order row is held locked by a separate transaction. Both are proven
+/// blocked on the row before it is released, so they genuinely contend.
+///
+/// Which of the two gets the row first is left to Postgres: nothing here
+/// assumes a lock-queue order, so every caller asserts the set of acceptable
+/// outcomes (exactly one winner, whichever it is) and checks the winner's
+/// consistency. The deterministic per-order cases are covered separately by
+/// the sequential `*_then_stale_*` tests, which force each order with a
+/// stale `expected_revision`.
+///
+/// The holder, the two commands and the polling query are four concurrent
+/// connections; the pool must allow them or the test would hang on the pool
+/// rather than on the lock.
 async fn race(
     f: &Fixture,
-    first: (&str, Value),
-    second: (&str, Value),
+    a: (&str, Value),
+    b: (&str, Value),
 ) -> ((StatusCode, Value), (StatusCode, Value)) {
+    assert!(
+        f.app.pool.options().get_max_connections() >= 4,
+        "the race needs a holder, two commands and a poller"
+    );
     let mut holder = f.app.pool.begin().await.expect("holder begins");
     sqlx::query("SELECT id FROM orders WHERE id = $1::uuid FOR UPDATE")
         .bind(&f.order_id)
@@ -819,9 +841,8 @@ async fn race(
             async move { send(router, "POST", "/v1/commands", Some(&token), &command).await },
         )
     };
-    let a = spawn(first.0, first.1);
-    wait_for_blocked_order_fetches(f, 1).await;
-    let b = spawn(second.0, second.1);
+    let a = spawn(a.0, a.1);
+    let b = spawn(b.0, b.1);
     wait_for_blocked_order_fetches(f, 2).await;
     holder.commit().await.expect("holder releases the order");
     (
@@ -830,123 +851,175 @@ async fn race(
     )
 }
 
-async fn update_racing_confirm_delivery(pool: PgPool, update_first: bool) {
-    let f = shipped_without_tracking(pool).await;
-    let update = (
-        f.seller.token.as_str(),
-        update_command(&f.order_id, 3, "USPS", "9400-1", 2_800),
+fn update_cmd_a(order_id: &str) -> Value {
+    update_command(order_id, 3, "USPS", "9400-1", 2_800)
+}
+
+fn confirm_cmd(order_id: &str, number: u64) -> Value {
+    order_command(
+        "fulfillment.confirm_delivery",
+        order_id,
+        3,
+        json!({}),
+        number,
+    )
+}
+
+/// The update committed and the delivery lost (revision 4, still shipped).
+async fn assert_update_won_over_confirm(
+    f: &Fixture,
+    update: (StatusCode, Value),
+    confirm: (StatusCode, Value),
+) {
+    assert_eq!(update.0, StatusCode::OK, "{}", update.1);
+    assert_eq!(confirm.0, StatusCode::CONFLICT, "{}", confirm.1);
+    assert_eq!(confirm.1["error"]["code"], json!("REVISION_CONFLICT"));
+    assert_eq!(confirm.1["error"]["current_revision"], json!(4));
+    let order = read_order(f, &f.buyer.token).await;
+    assert_eq!(order["revision"], json!(4));
+    assert_eq!(order["state"], json!("shipped"));
+    assert_eq!(order["shipment"]["tracking_number"], json!("9400-1"));
+    assert_eq!(
+        order_event_count(f, "fulfillment.tracking_updated").await,
+        1
     );
-    let confirm = (
-        f.buyer.token.as_str(),
-        order_command(
+    assert_eq!(order_event_count(f, "fulfillment.delivered").await, 0);
+    // The buyer retries at the new revision and delivers the updated shipment.
+    let (status, retry) = execute(
+        &f.app,
+        &f.buyer.token,
+        &order_command(
             "fulfillment.confirm_delivery",
             &f.order_id,
-            3,
+            4,
             json!({}),
-            2_801,
+            2_802,
         ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{retry}");
+    assert_eq!(
+        retry["result"]["order"]["shipment"]["tracking_number"],
+        json!("9400-1")
     );
-    let (update_result, confirm_result) = if update_first {
-        race(&f, update, confirm).await
-    } else {
-        let (confirm_result, update_result) = race(&f, confirm, update).await;
-        (update_result, confirm_result)
-    };
-    let (update_status, update_body) = update_result;
-    let (confirm_status, confirm_body) = confirm_result;
+}
 
-    let order = read_order(&f, &f.buyer.token).await;
-    assert_eq!(order["revision"], json!(4), "exactly one command committed");
-    let events_updated = order_event_count(&f, "fulfillment.tracking_updated").await;
-    let events_delivered = order_event_count(&f, "fulfillment.delivered").await;
-    assert_eq!(events_updated + events_delivered, 1);
+/// The delivery committed and the update lost (revision 4, delivered).
+async fn assert_confirm_won_over_update(
+    f: &Fixture,
+    update: (StatusCode, Value),
+    confirm: (StatusCode, Value),
+) {
+    assert_eq!(confirm.0, StatusCode::OK, "{}", confirm.1);
+    assert_eq!(update.0, StatusCode::CONFLICT, "{}", update.1);
+    assert_eq!(update.1["error"]["code"], json!("REVISION_CONFLICT"));
+    assert_eq!(update.1["error"]["current_revision"], json!(4));
+    let order = read_order(f, &f.buyer.token).await;
+    assert_eq!(order["revision"], json!(4));
+    assert_eq!(order["state"], json!("delivered"));
+    assert_eq!(order["shipment"]["tracking_number"], Value::Null);
+    assert_eq!(order["shipment"]["tracking_history"], json!([]));
+    assert_eq!(
+        order_event_count(f, "fulfillment.tracking_updated").await,
+        0
+    );
+    assert_eq!(order_event_count(f, "fulfillment.delivered").await, 1);
+    // The seller retries at the new revision and is refused: delivered.
+    let (status, retry) = execute(
+        &f.app,
+        &f.seller.token,
+        &update_command(&f.order_id, 4, "USPS", "9400-1", 2_803),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{retry}");
+    assert_eq!(retry["error"]["reason"], json!("order_not_shipped"));
+    assert_eq!(
+        order_event_count(f, "fulfillment.tracking_updated").await,
+        0
+    );
+}
 
-    if update_first {
-        assert_eq!(update_status, StatusCode::OK, "{update_body}");
-        assert_eq!(confirm_status, StatusCode::CONFLICT, "{confirm_body}");
-        assert_eq!(confirm_body["error"]["code"], json!("REVISION_CONFLICT"));
-        assert_eq!(confirm_body["error"]["current_revision"], json!(4));
-        assert_eq!((events_updated, events_delivered), (1, 0));
-        assert_eq!(order["state"], json!("shipped"));
-        assert_eq!(order["shipment"]["tracking_number"], json!("9400-1"));
-        // The buyer retries at the new revision and delivers the updated shipment.
-        let (status, retry) = execute(
-            &f.app,
-            &f.buyer.token,
-            &order_command(
-                "fulfillment.confirm_delivery",
-                &f.order_id,
-                4,
-                json!({}),
-                2_802,
-            ),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{retry}");
-        assert_eq!(
-            retry["result"]["order"]["shipment"]["tracking_number"],
-            json!("9400-1")
-        );
+/// Racing `update_tracking` against `confirm_delivery`: whichever the
+/// database serialises first wins and the other gets `REVISION_CONFLICT`.
+/// Both outcomes are valid and each is checked in full; the assertion holds
+/// for either lock order.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn update_tracking_racing_confirm_delivery_has_exactly_one_winner(pool: PgPool) {
+    let f = shipped_without_tracking(pool).await;
+    let (update, confirm) = race(
+        &f,
+        (&f.seller.token, update_cmd_a(&f.order_id)),
+        (&f.buyer.token, confirm_cmd(&f.order_id, 2_801)),
+    )
+    .await;
+    let statuses = [update.0, confirm.0];
+    assert_eq!(
+        statuses.iter().filter(|s| **s == StatusCode::OK).count(),
+        1,
+        "exactly one winner: {} / {}",
+        update.1,
+        confirm.1
+    );
+    if update.0 == StatusCode::OK {
+        assert_update_won_over_confirm(&f, update, confirm).await;
     } else {
-        assert_eq!(confirm_status, StatusCode::OK, "{confirm_body}");
-        assert_eq!(update_status, StatusCode::CONFLICT, "{update_body}");
-        assert_eq!(update_body["error"]["code"], json!("REVISION_CONFLICT"));
-        assert_eq!(update_body["error"]["current_revision"], json!(4));
-        assert_eq!((events_updated, events_delivered), (0, 1));
-        assert_eq!(order["state"], json!("delivered"));
-        assert_eq!(order["shipment"]["tracking_number"], Value::Null);
-        assert_eq!(order["shipment"]["tracking_history"], json!([]));
-        // The seller retries at the new revision and is refused: delivered.
-        let (status, retry) = execute(
-            &f.app,
-            &f.seller.token,
-            &update_command(&f.order_id, 4, "USPS", "9400-1", 2_802),
-        )
-        .await;
-        assert_eq!(status, StatusCode::CONFLICT, "{retry}");
-        assert_eq!(retry["error"]["reason"], json!("order_not_shipped"));
-        assert_eq!(
-            order_event_count(&f, "fulfillment.tracking_updated").await,
-            0
-        );
+        assert_confirm_won_over_update(&f, update, confirm).await;
     }
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn update_tracking_wins_the_race_against_confirm_delivery(pool: PgPool) {
-    update_racing_confirm_delivery(pool, true).await;
-}
-
-#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn confirm_delivery_wins_the_race_against_update_tracking(pool: PgPool) {
-    update_racing_confirm_delivery(pool, false).await;
-}
-
-#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn two_racing_tracking_updates_have_one_winner_and_a_consistent_history(pool: PgPool) {
+async fn update_tracking_then_stale_confirm_delivery_conflicts(pool: PgPool) {
     let f = shipped_without_tracking(pool).await;
-    let first = update_command(&f.order_id, 3, "USPS", "FIRST-1", 2_900);
-    let second = update_command(&f.order_id, 3, "UPS", "SECOND-2", 2_901);
-    let ((status_a, body_a), (status_b, body_b)) =
-        race(&f, (&f.seller.token, first), (&f.seller.token, second)).await;
+    let update = execute(&f.app, &f.seller.token, &update_cmd_a(&f.order_id)).await;
+    let confirm = execute(&f.app, &f.buyer.token, &confirm_cmd(&f.order_id, 2_801)).await;
+    assert_update_won_over_confirm(&f, update, confirm).await;
+}
 
-    assert_eq!(status_a, StatusCode::OK, "{body_a}");
-    assert_eq!(status_b, StatusCode::CONFLICT, "{body_b}");
-    assert_eq!(body_b["error"]["code"], json!("REVISION_CONFLICT"));
-    assert_eq!(body_b["error"]["current_revision"], json!(4));
-    assert_eq!(body_a["result"]["order"]["revision"], json!(4));
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn confirm_delivery_then_stale_update_tracking_conflicts(pool: PgPool) {
+    let f = shipped_without_tracking(pool).await;
+    let confirm = execute(&f.app, &f.buyer.token, &confirm_cmd(&f.order_id, 2_801)).await;
+    let update = execute(&f.app, &f.seller.token, &update_cmd_a(&f.order_id)).await;
+    assert_confirm_won_over_update(&f, update, confirm).await;
+}
 
-    let order = read_order(&f, &f.buyer.token).await;
+/// The winner of two simultaneous updates is whichever the database
+/// serialises first; the loser retries at the new revision and lands second.
+async fn assert_two_updates_outcome(
+    f: &Fixture,
+    first: (StatusCode, Value),
+    second: (StatusCode, Value),
+) {
+    // The two commands are (USPS, FIRST-1) and (UPS, SECOND-2), both at rev 3.
+    let ((win_body, lose_body), (win_carrier, win_number), (lose_carrier, lose_number)) =
+        match (first.0, second.0) {
+            (StatusCode::OK, StatusCode::CONFLICT) => (
+                (first.1, second.1),
+                ("USPS", "FIRST-1"),
+                ("UPS", "SECOND-2"),
+            ),
+            (StatusCode::CONFLICT, StatusCode::OK) => (
+                (second.1, first.1),
+                ("UPS", "SECOND-2"),
+                ("USPS", "FIRST-1"),
+            ),
+            other => panic!("expected one OK and one CONFLICT, got {other:?}"),
+        };
+    assert_eq!(lose_body["error"]["code"], json!("REVISION_CONFLICT"));
+    assert_eq!(lose_body["error"]["current_revision"], json!(4));
+    assert_eq!(win_body["result"]["order"]["revision"], json!(4));
+
+    let order = read_order(f, &f.buyer.token).await;
     assert_eq!(order["revision"], json!(4));
-    assert_eq!(order["shipment"]["carrier"], json!("USPS"));
-    assert_eq!(order["shipment"]["tracking_number"], json!("FIRST-1"));
+    assert_eq!(order["shipment"]["carrier"], json!(win_carrier));
+    assert_eq!(order["shipment"]["tracking_number"], json!(win_number));
     let history = order["shipment"]["tracking_history"]
         .as_array()
         .expect("history");
     assert_eq!(history.len(), 1, "the loser recorded nothing");
-    assert_eq!(history[0]["to"]["tracking_number"], json!("FIRST-1"));
+    assert_eq!(history[0]["to"]["tracking_number"], json!(win_number));
     assert_eq!(
-        order_event_count(&f, "fulfillment.tracking_updated").await,
+        order_event_count(f, "fulfillment.tracking_updated").await,
         1
     );
     assert_eq!(
@@ -958,11 +1031,10 @@ async fn two_racing_tracking_updates_have_one_winner_and_a_consistent_history(po
         1
     );
 
-    // The loser retries at the new revision and lands as a second change.
     let (status, retry) = execute(
         &f.app,
         &f.seller.token,
-        &update_command(&f.order_id, 4, "UPS", "SECOND-2", 2_902),
+        &update_command(&f.order_id, 4, lose_carrier, lose_number, 2_902),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{retry}");
@@ -970,6 +1042,25 @@ async fn two_racing_tracking_updates_have_one_winner_and_a_consistent_history(po
         .as_array()
         .expect("history");
     assert_eq!(history.len(), 2);
-    assert_eq!(history[1]["from"]["tracking_number"], json!("FIRST-1"));
-    assert_eq!(history[1]["to"]["tracking_number"], json!("SECOND-2"));
+    assert_eq!(history[1]["from"]["tracking_number"], json!(win_number));
+    assert_eq!(history[1]["to"]["tracking_number"], json!(lose_number));
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn two_racing_tracking_updates_have_exactly_one_winner(pool: PgPool) {
+    let f = shipped_without_tracking(pool).await;
+    let first = update_command(&f.order_id, 3, "USPS", "FIRST-1", 2_900);
+    let second = update_command(&f.order_id, 3, "UPS", "SECOND-2", 2_901);
+    let (a, b) = race(&f, (&f.seller.token, first), (&f.seller.token, second)).await;
+    assert_two_updates_outcome(&f, a, b).await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_second_update_at_a_stale_revision_conflicts_and_retries_cleanly(pool: PgPool) {
+    let f = shipped_without_tracking(pool).await;
+    let first = update_command(&f.order_id, 3, "USPS", "FIRST-1", 2_900);
+    let second = update_command(&f.order_id, 3, "UPS", "SECOND-2", 2_901);
+    let a = execute(&f.app, &f.seller.token, &first).await;
+    let b = execute(&f.app, &f.seller.token, &second).await;
+    assert_two_updates_outcome(&f, a, b).await;
 }
