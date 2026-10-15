@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::connectors::provider::{
-    CancelOrder, ExternalOrder, OrderPush, ProviderError, RefundRecord,
+    CancelOrder, ExternalOrder, OrderPush, ProviderError, RefundRecord, StoreRefundTotals,
 };
 
 use super::api::Api;
@@ -311,28 +311,18 @@ fn refunded_so_far(order: &Value, exponent: i32) -> i64 {
         .unwrap_or(0)
 }
 
-/// Mirrors Pubky's refund record in the store's books, without moving money
-/// (`api_refund: false`).
-///
-/// `refund.amount_minor` is the refund total Pubky recorded, in the order
-/// currency's minor units (the framework converts anything else before a
-/// provider is called); `full` means the whole payment. The store may already
-/// show refunds, ours from an earlier record or the merchant's own, so what is
-/// added is the **difference**: the recorded total, capped at the payment,
-/// minus what the store already shows refunded. Nothing to add (a repeat, a
-/// smaller later record, a merchant who already refunded as much) is a
-/// success, which also makes a retry after an unknown outcome safe. A refund
-/// already written for this refund id is never written twice.
-pub async fn record_refund(
+/// What the store order was paid and what it already shows refunded (ours
+/// from an earlier record, or the merchant's own), read fresh. The framework
+/// works out how much of a Pubky refund is still to mirror from this.
+pub async fn refunded_total(
     api: &Api<'_>,
     order: &ExternalOrder,
-    refund: &RefundRecord,
-) -> Result<(), ProviderError> {
+) -> Result<StoreRefundTotals, ProviderError> {
     let id = woo_id(&order.id)?;
     let Some(current) = api
         .get_optional(
             &format!("/orders/{id}"),
-            &[("_fields", "id,status,total,currency,refunds".into())],
+            &[("_fields", "id,total,currency,refunds".into())],
         )
         .await?
     else {
@@ -345,16 +335,35 @@ pub async fn record_refund(
     let currency = current
         .get("currency")
         .and_then(Value::as_str)
-        .unwrap_or(&refund.order_currency)
+        .unwrap_or_default()
         .to_string();
     let exponent = money::exponent_for(&currency);
-    let total = current
+    let paid_minor = current
         .get("total")
         .and_then(Value::as_str)
         .and_then(|total| money::parse_minor(total, exponent))
         .ok_or_else(|| ProviderError::Unknown("the store order has no readable total".into()))?;
-    let already_refunded = refunded_so_far(&current, exponent);
+    Ok(StoreRefundTotals {
+        refunded_minor: refunded_so_far(&current, exponent),
+        paid_minor,
+        currency,
+    })
+}
 
+/// Writes the refund the framework decided on, without moving money
+/// (`api_refund: false`). `refund.amount_minor` is the amount still to mirror,
+/// in the order currency, already the difference from what the store shows
+/// and never above its payment. A refund already written for this Pubky refund
+/// id is never written twice, so a retry after an unknown outcome is safe.
+pub async fn record_refund(
+    api: &Api<'_>,
+    order: &ExternalOrder,
+    refund: &RefundRecord,
+) -> Result<(), ProviderError> {
+    let id = woo_id(&order.id)?;
+    if refund.amount_minor <= 0 {
+        return Ok(());
+    }
     let existing = api
         .get(
             &format!("/orders/{id}/refunds"),
@@ -381,29 +390,17 @@ pub async fn record_refund(
     if written {
         return Ok(());
     }
-
-    let recorded = match refund.amount_minor {
-        _ if refund.full => total,
-        Some(amount) => amount.min(total),
-        None => {
-            return Err(rejected(
-                "refund_amount_missing",
-                "The refund carries no amount to record; record it in the store by hand.",
-            ))
-        }
-    };
-    let difference = recorded - already_refunded;
-    if difference <= 0 {
-        return Ok(());
+    let reason: String = match &refund.basis {
+        Some(basis) => format!("{REFUND_REASON_PREFIX} {}: {basis}", refund.refund_id),
+        None => format!("{REFUND_REASON_PREFIX} {}", refund.refund_id),
     }
-    let reason: String = format!("{REFUND_REASON_PREFIX} {}", refund.refund_id)
-        .chars()
-        .take(200)
-        .collect();
+    .chars()
+    .take(200)
+    .collect();
     api.post(
         &format!("/orders/{id}/refunds"),
         &json!({
-            "amount": money::format_minor(difference, exponent),
+            "amount": money::format_minor(refund.amount_minor, money::exponent_for(&refund.order_currency)),
             "reason": reason,
             "api_refund": false,
             "meta_data": [{"key": META_REFUND_ID, "value": refund.refund_id}],

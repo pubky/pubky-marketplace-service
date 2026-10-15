@@ -45,7 +45,8 @@ use crate::connectors::config::ENV_CONNECTOR_RETURN_URL;
 use crate::connectors::provider::{
     CallbackParams, CancelOrder, CatalogPage, CompleteRequest, ConnectCompleted, ConnectRequest,
     ConnectStart, ConnectionContext, ConnectorProvider, ExternalOrder, InboundEvent, OrderPush,
-    ProviderError, ProviderKind, RefundRecord, VerifiedWebhook, WebhookContext, WebhookHeaders,
+    ProviderError, ProviderKind, RefundRecord, StoreRefundTotals, VerifiedWebhook, WebhookContext,
+    WebhookHeaders,
 };
 
 use self::api::{Session, REST_ROOT};
@@ -564,6 +565,15 @@ impl ConnectorProvider for WooCommerceProvider {
     ) -> Result<(), ProviderError> {
         let session = Session::open(self, connection)?;
         orders::cancel(&session.api(&self.http), order, cancel).await
+    }
+
+    async fn refunded_total(
+        &self,
+        connection: &ConnectionContext,
+        order: &ExternalOrder,
+    ) -> Result<StoreRefundTotals, ProviderError> {
+        let session = Session::open(self, connection)?;
+        orders::refunded_total(&session.api(&self.http), order).await
     }
 
     async fn record_refund(

@@ -530,18 +530,49 @@ fn order(id: &str, address: bool) -> OrderPush {
     }
 }
 
-fn refund(id: &str, order: &OrderPush, amount: Option<i64>, full: bool) -> RefundRecord {
+fn refund_record(id: &str, order: &OrderPush, recorded_total: i64) -> RefundRecord {
     RefundRecord {
         refund_id: id.into(),
         pubky_order_id: order.pubky_order_id,
-        amount_minor: amount,
-        amount_unit: order.currency.to_lowercase(),
+        amount_minor: recorded_total,
+        recorded_total_minor: recorded_total,
         transaction_id: None,
         order_total_minor: order.total_minor,
         order_currency: order.currency.clone(),
         order_exponent: order.exponent,
-        full,
+        full: recorded_total >= order.total_minor,
+        basis: None,
     }
+}
+
+/// What the worker does for a refund: ask the store what it shows, take the
+/// framework's difference, and record only that. `false` when there was
+/// nothing left to mirror.
+async fn mirror(
+    provider: &WooCommerceProvider,
+    context: &ConnectionContext,
+    store_order: &ExternalOrder,
+    order: &OrderPush,
+    id: &str,
+    recorded_total: i64,
+) -> Result<bool, ProviderError> {
+    let shown = provider.refunded_total(context, store_order).await?;
+    let Some(amount) = marketplace_service::connectors::refund::amount_to_mirror(
+        recorded_total,
+        &order.currency,
+        &shown,
+    )?
+    else {
+        return Ok(false);
+    };
+    let record = RefundRecord {
+        amount_minor: amount,
+        ..refund_record(id, order, recorded_total)
+    };
+    provider
+        .record_refund(context, store_order, &record)
+        .await?;
+    Ok(true)
 }
 
 const ORDER_ONE: &str = "11111111-2222-8333-9444-555555555551";
@@ -677,44 +708,55 @@ async fn orders_are_pushed_found_cancelled_and_refunded_without_ever_doing_a_thi
         );
     }
 
-    // Refunds are recorded in the store's books, never as money moved. Each
-    // Pubky record is a refund total in the order currency; what is added is
-    // the difference from what the store already shows refunded.
-    let first = refund("refund-1", &one, Some(500), false);
-    provider
-        .record_refund(&context, &created, &first)
+    // Refunds are mirrored the way the framework drives a provider: read what
+    // the store shows (`refunded_total`), work out what is still to mirror
+    // from Pubky's recorded total, and record only that.
+    assert!(mirror(&provider, &context, &created, &one, "refund-1", 500)
         .await
-        .expect("5.00");
+        .expect("5.00"));
+    assert!(
+        !mirror(&provider, &context, &created, &one, "refund-1b", 500)
+            .await
+            .expect("the same total again"),
+        "the store already shows it"
+    );
+    assert!(
+        mirror(&provider, &context, &created, &one, "refund-2", 1660)
+            .await
+            .expect("a later, larger total"),
+        "adds only the difference"
+    );
+    assert!(
+        !mirror(&provider, &context, &created, &one, "refund-3", 1000)
+            .await
+            .expect("a smaller later total"),
+    );
+    assert!(
+        matches!(
+            mirror(&provider, &context, &created, &one, "refund-4", 1_000_000).await,
+            Err(ProviderError::Rejected { ref code, .. }) if code == "refund_exceeds_payment"
+        ),
+        "never above the payment"
+    );
+    assert!(
+        mirror(&provider, &context, &created, &one, "refund-5", 5090)
+            .await
+            .expect("the rest")
+    );
+    assert!(
+        !mirror(&provider, &context, &created, &one, "refund-5b", 5090)
+            .await
+            .expect("nothing left")
+    );
+    // A refund id already written is not written again, whatever the amount.
+    let again = RefundRecord {
+        amount_minor: 100,
+        ..refund_record("refund-5", &one, 5090)
+    };
     provider
-        .record_refund(&context, &created, &first)
+        .record_refund(&context, &created, &again)
         .await
-        .expect("the same record again adds nothing");
-    let larger = refund("refund-2", &one, Some(1660), false);
-    provider
-        .record_refund(&context, &created, &larger)
-        .await
-        .expect("a later, larger total adds only the difference");
-    let smaller = refund("refund-3", &one, Some(1000), false);
-    provider
-        .record_refund(&context, &created, &smaller)
-        .await
-        .expect("a smaller later total adds nothing");
-    let beyond = refund("refund-4", &one, Some(1_000_000), false);
-    provider
-        .record_refund(&context, &created, &beyond)
-        .await
-        .expect("a total above the payment is capped at the payment");
-    let full = refund("refund-5", &one, None, true);
-    provider
-        .record_refund(&context, &created, &full)
-        .await
-        .expect("nothing is left to refund");
-    assert!(matches!(
-        provider
-            .record_refund(&context, &created, &refund("refund-6", &one, None, false))
-            .await,
-        Err(ProviderError::Rejected { ref code, .. }) if code == "refund_amount_missing"
-    ));
+        .expect("the same refund id again writes nothing");
     if side.is_live() {
         let live = side
             .live()
@@ -770,26 +812,21 @@ async fn orders_are_pushed_found_cancelled_and_refunded_without_ever_doing_a_thi
             )
             .await;
     }
-    provider
-        .record_refund(
-            &context,
-            &third,
-            &refund("refund-7", &three, Some(1000), false),
-        )
-        .await
-        .expect("10.00 total, 4.00 already refunded by the merchant");
-    provider
-        .record_refund(
-            &context,
-            &third,
-            &refund("refund-8", &three, Some(300), false),
-        )
-        .await
-        .expect("the store already shows more than this");
-    provider
-        .record_refund(&context, &third, &refund("refund-9", &three, None, true))
-        .await
-        .expect("the rest");
+    assert!(
+        mirror(&provider, &context, &third, &three, "refund-7", 1000)
+            .await
+            .expect("10.00 total")
+    );
+    assert!(
+        !mirror(&provider, &context, &third, &three, "refund-8", 300)
+            .await
+            .expect("covered")
+    );
+    assert!(
+        mirror(&provider, &context, &third, &three, "refund-9", 5090)
+            .await
+            .expect("the rest")
+    );
     if side.is_live() {
         let live = side
             .live()
