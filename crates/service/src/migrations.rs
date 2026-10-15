@@ -32,11 +32,21 @@ pub async fn run(pool: &PgPool) -> anyhow::Result<()> {
     // build's tolerance decision and its run. Postgres session advisory locks
     // stack, so `run_direct` taking the same lock inside is fine.
     Migrate::lock(&mut *connection).await?;
-    let migrated = run_locked(&mut connection).await;
-    let unlocked = Migrate::unlock(&mut *connection).await;
-    migrated?;
-    unlocked?;
-    Ok(())
+    let result = match run_locked(&mut connection).await {
+        Ok(()) => Migrate::unlock(&mut *connection)
+            .await
+            .map_err(anyhow::Error::from),
+        Err(error) => Err(error),
+    };
+    if result.is_err() {
+        // A failed `run_direct` returns before releasing its own level of the
+        // lock, so one unlock is not enough. Closing the session releases
+        // every level instead of returning a locked connection to the pool.
+        if let Err(error) = connection.close().await {
+            tracing::warn!(error = %error, "failed to close the migration connection");
+        }
+    }
+    result
 }
 
 async fn run_locked(connection: &mut PgConnection) -> anyhow::Result<()> {

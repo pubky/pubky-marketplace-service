@@ -118,3 +118,46 @@ async fn a_newer_version_committed_while_waiting_for_the_lock_is_tolerated(pool:
         .expect("startup task")
         .expect("a version committed during the wait is tolerated");
 }
+
+/// Whether any session (including an idle pooled connection a failed run
+/// returned) still holds an advisory lock in this test database.
+async fn migration_lock_is_free(pool: &PgPool) -> bool {
+    let held: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND granted \
+         AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("advisory locks");
+    held == 0
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_failed_migration_run_leaves_no_migration_lock_held(pool: PgPool) {
+    production_ledger(&pool).await;
+    // A dirty row makes sqlx's run_direct fail after taking its own lock level.
+    sqlx::query("UPDATE _sqlx_migrations SET success = false WHERE version = 60")
+        .execute(&pool)
+        .await
+        .expect("mark a migration dirty");
+    marketplace_service::migrations::run(&pool)
+        .await
+        .expect_err("a dirty ledger refuses startup");
+    assert!(
+        migration_lock_is_free(&pool).await,
+        "a failed run inside run_direct must release the migration lock"
+    );
+
+    sqlx::query("UPDATE _sqlx_migrations SET success = true WHERE version = 60")
+        .execute(&pool)
+        .await
+        .expect("clean the ledger");
+    record(&pool, 0).await;
+    marketplace_service::migrations::run(&pool)
+        .await
+        .expect_err("an unknown version below the newest refuses startup");
+    assert!(
+        migration_lock_is_free(&pool).await,
+        "a refusal before run_direct must release the migration lock"
+    );
+}
