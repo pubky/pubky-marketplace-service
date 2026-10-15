@@ -32,7 +32,6 @@ pub mod creds;
 pub mod http;
 pub mod money;
 pub mod orders;
-pub mod refund_quote;
 pub mod site;
 pub mod text;
 pub mod webhooks;

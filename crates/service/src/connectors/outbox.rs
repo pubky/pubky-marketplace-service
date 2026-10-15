@@ -280,7 +280,6 @@ async fn mirror_current_refund(
         Some("usdt") => "usdt".to_string(),
         _ => currency.to_lowercase(),
     };
-    let quote = refund_quote(tx, order_id, &unit).await?;
     let payload = json!({
         "amount_minor": recorded,
         "amount_unit": unit,
@@ -289,7 +288,6 @@ async fn mirror_current_refund(
         "order_currency": currency,
         "order_exponent": exponent,
         "full": state == "refunded_external",
-        "quote": quote,
     });
     ledger::on_refund_recorded(tx, now, order_id, &key, &payload, source_event_id).await
 }
@@ -359,78 +357,4 @@ async fn on_refund_reversed(
         mirror_current_refund(tx, now, order_id, event.id).await?;
     }
     Ok(())
-}
-
-/// `rate, currency, exponent, quoted_sats, source, fetched_at`.
-type BitcoinQuoteRow = (
-    Option<String>,
-    Option<String>,
-    Option<i16>,
-    Option<i64>,
-    Option<String>,
-    Option<DateTime<Utc>>,
-);
-
-/// `asset, network, paid_minor, paid_exponent, basis`.
-type AssetQuoteRow = (
-    Option<String>,
-    Option<String>,
-    Option<i64>,
-    Option<i16>,
-    Option<String>,
-);
-
-/// How the order converts a refund in `unit` to its own currency: the Bitcoin
-/// quote pinned at bind for `sat`, the USDT payment terms for `usdt`.
-async fn refund_quote(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    order_id: Uuid,
-    unit: &str,
-) -> Result<Option<super::provider::RefundQuote>, sqlx::Error> {
-    use super::provider::RefundQuote;
-    match unit {
-        "sat" => {
-            let row: Option<BitcoinQuoteRow> = sqlx::query_as(
-                "SELECT bitcoin_quote_rate::text, bitcoin_quote_currency, bitcoin_quote_exponent, \
-                 bitcoin_quoted_sats, bitcoin_quote_source, bitcoin_quote_fetched_at \
-                 FROM orders WHERE id = $1",
-            )
-            .bind(order_id)
-            .fetch_optional(&mut **tx)
-            .await?;
-            Ok(row.and_then(
-                |(rate, currency, exponent, quoted_sats, source, fetched_at)| {
-                    Some(RefundQuote::Bitcoin {
-                        currency: currency?,
-                        exponent: i32::from(exponent?),
-                        rate: rate?,
-                        quoted_sats,
-                        source,
-                        fetched_at,
-                    })
-                },
-            ))
-        }
-        "usdt" => {
-            let row: Option<AssetQuoteRow> = sqlx::query_as(
-                "SELECT payment_asset, payment_network, payment_amount_minor, payment_exponent, \
-                 payment_quote_basis FROM orders WHERE id = $1",
-            )
-            .bind(order_id)
-            .fetch_optional(&mut **tx)
-            .await?;
-            Ok(
-                row.and_then(|(asset, network, paid_minor, paid_exponent, basis)| {
-                    Some(RefundQuote::Asset {
-                        asset: asset?,
-                        network,
-                        paid_minor: paid_minor?,
-                        paid_exponent: i32::from(paid_exponent?),
-                        basis,
-                    })
-                }),
-            )
-        }
-        _ => Ok(None),
-    }
 }

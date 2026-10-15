@@ -17,6 +17,8 @@ wp option update woocommerce_default_country CH
 # Swiss VAT, prices entered with tax: pushed orders must still total what the buyer paid.
 wp option update woocommerce_calc_taxes yes
 wp option update woocommerce_prices_include_tax yes
+# Standard, not "based on cart items": the harsher setting, which taxes a shipping line.
+wp option update woocommerce_shipping_tax_class ''
 wp wc --user=admin tax create --country=CH --rate=8.1 --name=MWST --shipping=true --class=standard
 wp option update woocommerce_manage_stock yes
 wp wc --user=admin tool run install_pages >/dev/null 2>&1 || true

@@ -530,24 +530,17 @@ fn order(id: &str, address: bool) -> OrderPush {
     }
 }
 
-fn refund(
-    id: &str,
-    order: &OrderPush,
-    amount: Option<i64>,
-    unit: &str,
-    full: bool,
-) -> RefundRecord {
+fn refund(id: &str, order: &OrderPush, amount: Option<i64>, full: bool) -> RefundRecord {
     RefundRecord {
         refund_id: id.into(),
         pubky_order_id: order.pubky_order_id,
         amount_minor: amount,
-        amount_unit: unit.into(),
+        amount_unit: order.currency.to_lowercase(),
         transaction_id: None,
         order_total_minor: order.total_minor,
         order_currency: order.currency.clone(),
         order_exponent: order.exponent,
         full,
-        quote: None,
     }
 }
 
@@ -684,66 +677,44 @@ async fn orders_are_pushed_found_cancelled_and_refunded_without_ever_doing_a_thi
         );
     }
 
-    // Refunds are recorded in the store's books, never as money moved.
-    let partial = refund("refund-1", &one, Some(500), "CHF", false);
+    // Refunds are recorded in the store's books, never as money moved. Each
+    // Pubky record is a refund total in the order currency; what is added is
+    // the difference from what the store already shows refunded.
+    let first = refund("refund-1", &one, Some(500), false);
     provider
-        .record_refund(&context, &created, &partial)
+        .record_refund(&context, &created, &first)
         .await
-        .expect("partial");
+        .expect("5.00");
     provider
-        .record_refund(&context, &created, &partial)
+        .record_refund(&context, &created, &first)
         .await
-        .expect("the same refund again");
-
-    // A partial in sats without the order's quote cannot be valued.
-    let unquoted = refund("refund-2", &one, Some(120_000), "sat", false);
+        .expect("the same record again adds nothing");
+    let larger = refund("refund-2", &one, Some(1660), false);
+    provider
+        .record_refund(&context, &created, &larger)
+        .await
+        .expect("a later, larger total adds only the difference");
+    let smaller = refund("refund-3", &one, Some(1000), false);
+    provider
+        .record_refund(&context, &created, &smaller)
+        .await
+        .expect("a smaller later total adds nothing");
+    let beyond = refund("refund-4", &one, Some(1_000_000), false);
+    provider
+        .record_refund(&context, &created, &beyond)
+        .await
+        .expect("a total above the payment is capped at the payment");
+    let full = refund("refund-5", &one, None, true);
+    provider
+        .record_refund(&context, &created, &full)
+        .await
+        .expect("nothing is left to refund");
     assert!(matches!(
-        provider.record_refund(&context, &created, &unquoted).await,
-        Err(ProviderError::Rejected { ref code, .. }) if code == "refund_not_in_store_currency"
+        provider
+            .record_refund(&context, &created, &refund("refund-6", &one, None, false))
+            .await,
+        Err(ProviderError::Rejected { ref code, .. }) if code == "refund_amount_missing"
     ));
-
-    // With it, the order's own Bitcoin quote converts the amount, rounded to
-    // the minor unit, and the basis is written on the refund.
-    let mut bitcoin = refund("refund-btc-1", &one, Some(20_000), "sat", false);
-    bitcoin.quote = Some(bitcoin_quote());
-    provider
-        .record_refund(&context, &created, &bitcoin)
-        .await
-        .expect("a partial in sats");
-    provider
-        .record_refund(&context, &created, &bitcoin)
-        .await
-        .expect("the same sat refund again");
-    let mut too_many_sats = refund("refund-btc-2", &one, Some(1_000_000), "sat", false);
-    too_many_sats.quote = Some(bitcoin_quote());
-    assert!(
-        matches!(
-            provider.record_refund(&context, &created, &too_many_sats).await,
-            Err(ProviderError::Rejected { ref code, .. }) if code == "refund_exceeds_order"
-        ),
-        "capped by what is left: 580.00 CHF against 34.30"
-    );
-    let too_much = refund("refund-3", &one, Some(1_000_000), "CHF", false);
-    assert!(matches!(
-        provider.record_refund(&context, &created, &too_much).await,
-        Err(ProviderError::Rejected { ref code, .. }) if code == "refund_exceeds_order"
-    ));
-
-    // A partial followed by a full refund: the full one is what is left.
-    let rest = refund("refund-4", &one, None, "sat", true);
-    provider
-        .record_refund(&context, &created, &rest)
-        .await
-        .expect("the rest");
-    provider
-        .record_refund(&context, &created, &rest)
-        .await
-        .expect("the rest again");
-    let after = refund("refund-5", &one, None, "sat", true);
-    provider
-        .record_refund(&context, &created, &after)
-        .await
-        .expect("nothing left to refund");
     if side.is_live() {
         let live = side
             .live()
@@ -751,24 +722,15 @@ async fn orders_are_pushed_found_cancelled_and_refunded_without_ever_doing_a_thi
             .await;
         assert_eq!(live["status"], "refunded");
         let refunds = live["refunds"].as_array().expect("refunds");
-        assert_eq!(
-            refunds.len(),
-            3,
-            "a fiat partial, a sat partial, the rest; none repeated"
-        );
         let mut totals: Vec<&str> = refunds
             .iter()
             .map(|r| r["total"].as_str().expect("total"))
             .collect();
         totals.sort();
-        assert_eq!(totals, ["-11.60", "-34.30", "-5.00"]);
-        let sat = refunds
-            .iter()
-            .find(|r| r["total"] == "-11.60")
-            .expect("the sat refund");
         assert_eq!(
-            sat["reason"],
-            "Pubky refund refund-btc-1: 20000 sat = 11.60 CHF at BTCCHF 58000.00000000 (blocktank, 2026-10-15T12:00:00Z)"
+            totals,
+            ["-11.60", "-34.30", "-5.00"],
+            "5.00, then 16.60 in all (11.60 more), then the rest of the payment (50.90 in all)"
         );
         assert!(refunds.iter().all(|r| r["reason"]
             .as_str()
@@ -780,52 +742,52 @@ async fn orders_are_pushed_found_cancelled_and_refunded_without_ever_doing_a_thi
             "POST",
             &format!("/wp-json/wc/v3/orders/{}/refunds", created.id),
         );
-        assert_eq!(refunds.len(), 3);
-        for posted in &refunds {
-            let body = posted.body.as_ref().expect("body");
-            assert_eq!(body["api_refund"], false, "records only, never moves money");
-        }
         let amounts: Vec<&str> = refunds
             .iter()
             .map(|posted| {
-                posted.body.as_ref().expect("body")["amount"]
-                    .as_str()
-                    .expect("amount")
+                let body = posted.body.as_ref().expect("body");
+                assert_eq!(body["api_refund"], false, "records only, never moves money");
+                body["amount"].as_str().expect("amount")
             })
             .collect();
         assert_eq!(amounts, ["5.00", "11.60", "34.30"]);
-        assert_eq!(
-            refunds[1].body.as_ref().expect("body")["reason"],
-            "Pubky refund refund-btc-1: 20000 sat = 11.60 CHF at BTCCHF 58000.00000000 (blocktank, 2026-10-15T12:00:00Z)"
-        );
     }
 
-    // An order paid in USDT: partials convert by the order's own ratio of
-    // USDT paid to the order total, then the rest is refunded.
+    // A refund the merchant already made in the store counts: Pubky's record
+    // of 10.00 adds only the 6.00 that is missing, and a record that the store
+    // already covers adds nothing.
     let three = order(ORDER_THREE, false);
     let third = provider
         .push_order(&context, &three)
         .await
-        .expect("push the USDT order");
-    let mut first = refund("refund-usdt-1", &three, Some(10_000_000), "usdt", false);
-    first.quote = Some(usdt_quote());
+        .expect("push the third order");
+    if side.is_live() {
+        side.live()
+            .rest(
+                "POST",
+                &format!("/wc/v3/orders/{}/refunds", third.id),
+                Some(json!({"amount": "4.00", "reason": "Damaged box", "api_refund": false})),
+            )
+            .await;
+    }
     provider
-        .record_refund(&context, &third, &first)
+        .record_refund(
+            &context,
+            &third,
+            &refund("refund-7", &three, Some(1000), false),
+        )
         .await
-        .expect("a USDT partial");
-    let mut second = refund("refund-usdt-2", &three, Some(3_333_333), "usdt", false);
-    second.quote = Some(usdt_quote());
+        .expect("10.00 total, 4.00 already refunded by the merchant");
     provider
-        .record_refund(&context, &third, &second)
+        .record_refund(
+            &context,
+            &third,
+            &refund("refund-8", &three, Some(300), false),
+        )
         .await
-        .expect("a USDT partial that rounds");
+        .expect("the store already shows more than this");
     provider
-        .record_refund(&context, &third, &second)
-        .await
-        .expect("the same USDT refund again");
-    let rest = refund("refund-usdt-3", &three, None, "usdt", true);
-    provider
-        .record_refund(&context, &third, &rest)
+        .record_refund(&context, &third, &refund("refund-9", &three, None, true))
         .await
         .expect("the rest");
     if side.is_live() {
@@ -834,18 +796,14 @@ async fn orders_are_pushed_found_cancelled_and_refunded_without_ever_doing_a_thi
             .rest("GET", &format!("/wc/v3/orders/{}", third.id), None)
             .await;
         assert_eq!(live["status"], "refunded");
-        let refunds = live["refunds"].as_array().expect("refunds");
-        let mut totals: Vec<&str> = refunds
+        let mut totals: Vec<&str> = live["refunds"]
+            .as_array()
+            .expect("refunds")
             .iter()
             .map(|r| r["total"].as_str().expect("total"))
             .collect();
         totals.sort();
-        assert_eq!(totals, ["-2.67", "-40.23", "-8.00"]);
-        let reasons: Vec<&str> = refunds
-            .iter()
-            .map(|r| r["reason"].as_str().expect("reason"))
-            .collect();
-        assert!(reasons.contains(&"Pubky refund refund-usdt-1: 10.000000 USDT = 8.00 CHF at the order's payment of 63.625000 USDT for 50.90 CHF (usd parity)"), "{reasons:?}");
+        assert_eq!(totals, ["-4.00", "-40.90", "-6.00"]);
     }
     if let Some(replay) = &side.replay {
         let refunds = replay.requests(
@@ -860,33 +818,8 @@ async fn orders_are_pushed_found_cancelled_and_refunded_without_ever_doing_a_thi
                     .expect("amount")
             })
             .collect();
-        assert_eq!(amounts, ["8.00", "2.67", "40.23"]);
+        assert_eq!(amounts, ["6.00", "40.90"]);
         replay.assert_no_misses();
-    }
-}
-
-fn bitcoin_quote() -> RefundQuote {
-    RefundQuote::Bitcoin {
-        currency: "CHF".into(),
-        exponent: 2,
-        rate: "58000.00000000".into(),
-        quoted_sats: Some(87_759),
-        source: Some("blocktank".into()),
-        fetched_at: Some(
-            "2026-10-15T12:00:00Z"
-                .parse::<DateTime<Utc>>()
-                .expect("time"),
-        ),
-    }
-}
-
-fn usdt_quote() -> RefundQuote {
-    RefundQuote::Asset {
-        asset: "USDT".into(),
-        network: Some("arbitrum".into()),
-        paid_minor: 63_625_000,
-        paid_exponent: 6,
-        basis: Some("usd parity".into()),
     }
 }
 

@@ -19,7 +19,6 @@ use crate::connectors::provider::{
 use super::api::Api;
 use super::catalog::id_of;
 use super::money;
-use super::refund_quote;
 
 pub const META_ORDER_ID: &str = "pubky_order_id";
 pub const META_CANCELLED: &str = "pubky_cancelled";
@@ -29,9 +28,11 @@ pub const META_REFUND_ID: &str = "pubky_refund_id";
 pub const REFUND_REASON_PREFIX: &str = "Pubky refund";
 /// WooCommerce adds tax on top of the totals an API client sends, by the
 /// store's rates for the shipping country, whatever the "prices include tax"
-/// setting says. The buyer already paid a fixed amount, so the order is
-/// created in a tax class that has no rates and its total equals what the buyer
-/// paid. The merchant books tax on Pubky sales from the Pubky order.
+/// setting says. The buyer already paid a fixed amount, so items are created in
+/// a tax class that has no rates, and shipping and adjustments are fee lines
+/// with `tax_status: none`, so the order total equals what the buyer paid under
+/// any tax configuration. The merchant books tax on Pubky sales from the Pubky
+/// order.
 const NO_TAX_CLASS: &str = "zero-rate";
 const SCAN_PAGES: u32 = 3;
 const SCAN_PAGE_SIZE: u32 = 100;
@@ -151,11 +152,18 @@ pub fn order_body(push: &OrderPush, shop_origin: Option<&str>) -> Result<Value, 
         ],
     });
     if push.shipping_minor > 0 {
-        body["shipping_lines"] = json!([{
-            "method_id": "pubky_shipping",
-            "method_title": "Pubky shipping",
-            "total": money::format_minor(push.shipping_minor, exponent),
-        }]);
+        // A fee line, not a shipping line: WooCommerce taxes a shipping line by
+        // the store's "shipping tax class" (Standard on many stores) even when
+        // every item is in the zero-rate class, but never a fee line marked
+        // `tax_status: none`.
+        body["fee_lines"]
+            .as_array_mut()
+            .expect("fee_lines is an array")
+            .push(json!({
+                "name": "Pubky shipping",
+                "total": money::format_minor(push.shipping_minor, exponent),
+                "tax_status": "none",
+            }));
     }
     if let Some(address) = &push.shipping_address {
         let (first, last) = split_name(&address.name);
@@ -303,8 +311,18 @@ fn refunded_so_far(order: &Value, exponent: i32) -> i64 {
         .unwrap_or(0)
 }
 
-/// Records a refund Pubky made, without moving money (`api_refund: false`):
-/// the refund appears on the order so the store's books match.
+/// Mirrors Pubky's refund record in the store's books, without moving money
+/// (`api_refund: false`).
+///
+/// `refund.amount_minor` is the refund total Pubky recorded, in the order
+/// currency's minor units (the framework converts anything else before a
+/// provider is called); `full` means the whole payment. The store may already
+/// show refunds, ours from an earlier record or the merchant's own, so what is
+/// added is the **difference**: the recorded total, capped at the payment,
+/// minus what the store already shows refunded. Nothing to add (a repeat, a
+/// smaller later record, a merchant who already refunded as much) is a
+/// success, which also makes a retry after an unknown outcome safe. A refund
+/// already written for this refund id is never written twice.
 pub async fn record_refund(
     api: &Api<'_>,
     order: &ExternalOrder,
@@ -335,7 +353,7 @@ pub async fn record_refund(
         .and_then(Value::as_str)
         .and_then(|total| money::parse_minor(total, exponent))
         .ok_or_else(|| ProviderError::Unknown("the store order has no readable total".into()))?;
-    let remaining = total - refunded_so_far(&current, exponent);
+    let already_refunded = refunded_so_far(&current, exponent);
 
     let existing = api
         .get(
@@ -347,7 +365,7 @@ pub async fn record_refund(
         )
         .await?
         .json()?;
-    let already = existing.as_array().is_some_and(|refunds| {
+    let written = existing.as_array().is_some_and(|refunds| {
         refunds.iter().any(|entry| {
             entry
                 .get("meta_data")
@@ -360,64 +378,32 @@ pub async fn record_refund(
                 })
         })
     });
-    if already {
+    if written {
         return Ok(());
     }
 
-    let mut basis: Option<String> = None;
-    let mut amount = if refund.full {
-        remaining
-    } else {
-        match refund.amount_minor {
-            Some(amount) if refund.amount_unit.eq_ignore_ascii_case(&currency) => amount,
-            Some(amount) => {
-                if refund.order_currency.eq_ignore_ascii_case(&currency)
-                    && refund.order_exponent == exponent
-                {
-                    let converted = refund_quote::convert(refund, amount)?;
-                    basis = Some(converted.basis);
-                    converted.minor
-                } else {
-                    return Err(rejected(
-                        "refund_basis_unavailable",
-                        "The store order is in another currency than the Pubky order.",
-                    ));
-                }
-            }
-            None => {
-                return Err(rejected(
-                    "refund_not_in_store_currency",
-                    "The refund carries no amount to record; record it in the store by hand.",
-                ))
-            }
+    let recorded = match refund.amount_minor {
+        _ if refund.full => total,
+        Some(amount) => amount.min(total),
+        None => {
+            return Err(rejected(
+                "refund_amount_missing",
+                "The refund carries no amount to record; record it in the store by hand.",
+            ))
         }
     };
-    if amount <= 0 {
+    let difference = recorded - already_refunded;
+    if difference <= 0 {
         return Ok(());
     }
-    // A converted amount rounds to the nearest minor unit, so the last partial
-    // refund may overshoot what is left by that one unit: cap it there. Any
-    // other excess is refused.
-    if basis.is_some() && amount > remaining && amount - remaining <= 1 {
-        amount = remaining;
-    }
-    if amount > remaining {
-        return Err(rejected(
-            "refund_exceeds_order",
-            "The refund is more than what is left to refund on the store order.",
-        ));
-    }
-    let reason: String = match &basis {
-        Some(basis) => format!("{REFUND_REASON_PREFIX} {}: {basis}", refund.refund_id),
-        None => format!("{REFUND_REASON_PREFIX} {}", refund.refund_id),
-    }
-    .chars()
-    .take(200)
-    .collect();
+    let reason: String = format!("{REFUND_REASON_PREFIX} {}", refund.refund_id)
+        .chars()
+        .take(200)
+        .collect();
     api.post(
         &format!("/orders/{id}/refunds"),
         &json!({
-            "amount": money::format_minor(amount, exponent),
+            "amount": money::format_minor(difference, exponent),
             "reason": reason,
             "api_refund": false,
             "meta_data": [{"key": META_REFUND_ID, "value": refund.refund_id}],
@@ -480,7 +466,17 @@ mod tests {
         );
         assert_eq!(body["line_items"][1]["tax_class"], "zero-rate");
         assert_eq!(body["line_items"][1]["variation_id"], 36);
-        assert_eq!(body["shipping_lines"][0]["total"], "6.00");
+        assert!(
+            body.get("shipping_lines").is_none(),
+            "shipping is a taxless fee"
+        );
+        let fees = body["fee_lines"].as_array().unwrap();
+        let shipping = fees
+            .iter()
+            .find(|fee| fee["name"] == "Pubky shipping")
+            .unwrap();
+        assert_eq!(shipping["total"], "6.00");
+        assert_eq!(shipping["tax_status"], "none");
         assert_eq!(body["meta_data"][0]["key"], "pubky_order_id");
         assert_eq!(
             body["meta_data"][0]["value"],
@@ -495,7 +491,14 @@ mod tests {
     fn the_order_id_is_searchable_in_an_item_name() {
         let body = order_body(&push(), None).unwrap();
         let fees = body["fee_lines"].as_array().unwrap();
-        assert_eq!(fees.len(), 1, "totals add up, so no adjustment line");
+        assert!(
+            fees.iter().all(|fee| fee["name"] != "Pubky adjustment"),
+            "totals add up, so no adjustment line"
+        );
+        assert!(
+            fees.iter().all(|fee| fee["tax_status"] == "none"),
+            "nothing but the lines is taxed"
+        );
         assert_eq!(
             fees[0]["name"],
             "Pubky order 11111111-2222-8333-9444-555555555555"

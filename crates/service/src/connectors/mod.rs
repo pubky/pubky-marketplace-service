@@ -35,6 +35,7 @@ pub mod recipient;
 pub mod routes;
 pub mod stock;
 pub mod store;
+pub mod variant_stock;
 pub mod worker;
 
 use std::sync::Arc;
@@ -52,6 +53,9 @@ pub struct ConnectorRuntime {
     pub keys: Arc<ConnectorKeys>,
     pub providers: ProviderRegistry,
     pub settings: ConnectorSettings,
+    /// Where per-variant store stock lands; skips it until the service has
+    /// per-variant inventory ([`stock::VariantInventory`]).
+    pub variant_inventory: Arc<dyn stock::VariantInventory>,
 }
 
 impl ConnectorRuntime {
@@ -64,7 +68,13 @@ impl ConnectorRuntime {
             keys,
             providers,
             settings,
+            variant_inventory: Arc::new(stock::NoVariantInventory),
         }
+    }
+
+    pub fn with_variant_inventory(mut self, inventory: Arc<dyn stock::VariantInventory>) -> Self {
+        self.variant_inventory = inventory;
+        self
     }
 
     /// The merchant's own app credentials for a connection, opened for one
@@ -110,9 +120,10 @@ pub fn runtime_from_env(
             config::ENV_CONNECTORS_ENABLED
         );
     };
-    Ok(Some(Arc::new(ConnectorRuntime::new(
-        keys, providers, settings,
-    ))))
+    Ok(Some(Arc::new(
+        ConnectorRuntime::new(keys, providers, settings)
+            .with_variant_inventory(Arc::new(variant_stock::ServiceVariantInventory)),
+    )))
 }
 
 /// The providers this build knows, configured from the environment. This is

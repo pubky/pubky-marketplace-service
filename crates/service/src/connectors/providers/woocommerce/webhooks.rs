@@ -227,7 +227,6 @@ pub enum Change {
         carrier: String,
         tracking_number: String,
     },
-    CompletedWithoutTracking,
     Cancelled {
         reason: Option<String>,
     },
@@ -267,7 +266,7 @@ fn meta<'a>(order: &'a Value, key: &str) -> Option<&'a Value> {
 fn tracking_of(order: &Value) -> Option<(String, String)> {
     let clean = |value: &str| -> String { value.trim().chars().take(200).collect() };
     if let Some(items) = meta(order, "_wc_shipment_tracking_items").and_then(Value::as_array) {
-        for item in items {
+        for item in items.iter().rev() {
             let number = clean(&text(item, "tracking_number"));
             if number.is_empty() {
                 continue;
@@ -349,7 +348,12 @@ pub fn classify(order: &Value) -> Result<Classified, ProviderError> {
                 carrier,
                 tracking_number,
             },
-            None => Change::CompletedWithoutTracking,
+            // Completed with no tracking: shipped, carrier unknown. Tracking a
+            // plugin adds later arrives as another order.updated.
+            None => Change::Fulfillment {
+                carrier: "Other".to_string(),
+                tracking_number: String::new(),
+            },
         },
         "cancelled" if meta(order, META_CANCELLED).is_some() => Change::CancelledByPubky,
         "cancelled" => Change::Cancelled { reason: None },
@@ -392,7 +396,6 @@ pub fn parse(webhook: &VerifiedWebhook, body: &[u8]) -> Result<InboundEvent, Pro
                     carrier,
                     tracking_number,
                 },
-                Change::CompletedWithoutTracking => ignored("completed_without_tracking"),
                 Change::Cancelled { reason } => InboundEvent::OrderCancelled { order, reason },
                 Change::CancelledByPubky => ignored("cancelled_by_pubky"),
                 Change::Refunded {
@@ -562,11 +565,41 @@ mod tests {
     }
 
     #[test]
-    fn completed_without_tracking_and_foreign_orders_are_ignored() {
-        assert!(
-            matches!(event(&pubky_order(json!({"status": "completed"}))),
-            InboundEvent::Ignored { reason } if reason == "completed_without_tracking")
-        );
+    fn completed_without_tracking_ships_with_the_carrier_other() {
+        match event(&pubky_order(json!({"status": "completed"}))) {
+            InboundEvent::Fulfillment {
+                order,
+                carrier,
+                tracking_number,
+            } => {
+                assert_eq!(order.external_order_id, "47");
+                assert_eq!(carrier, "Other");
+                assert_eq!(tracking_number, "");
+            }
+            other => panic!("{other:?}"),
+        }
+        // An item with a blank number is no tracking either.
+        let blank = pubky_order(json!({"status": "completed", "meta_data": [
+            {"key": "pubky_order_id", "value": "11111111-2222-8333-9444-555555555555"},
+            {"key": "_wc_shipment_tracking_items", "value": [
+                {"tracking_provider": "Swiss Post", "tracking_number": "  "}]}]}));
+        assert!(matches!(event(&blank),
+            InboundEvent::Fulfillment { carrier, tracking_number, .. } if carrier == "Other" && tracking_number.is_empty()));
+    }
+
+    #[test]
+    fn the_newest_tracking_item_is_the_one_that_counts() {
+        let order = pubky_order(json!({"status": "completed", "meta_data": [
+            {"key": "pubky_order_id", "value": "11111111-2222-8333-9444-555555555555"},
+            {"key": "_wc_shipment_tracking_items", "value": [
+                {"tracking_provider": "swiss-post", "tracking_number": "OLD1"},
+                {"tracking_provider": "dhl", "tracking_number": "NEW2"}]}]}));
+        assert!(matches!(event(&order),
+            InboundEvent::Fulfillment { carrier, tracking_number, .. } if carrier == "dhl" && tracking_number == "NEW2"));
+    }
+
+    #[test]
+    fn foreign_orders_and_unshipped_statuses_are_ignored() {
         let foreign = json!({"id": 9, "status": "completed", "meta_data": [], "refunds": []});
         assert!(
             matches!(event(&foreign), InboundEvent::Ignored { reason } if reason == "not_a_pubky_order")
@@ -574,6 +607,13 @@ mod tests {
         assert!(
             matches!(event(&pubky_order(json!({"status": "processing"}))),
             InboundEvent::Ignored { reason } if reason == "order_status_processing")
+        );
+        let tracked_but_processing = pubky_order(json!({"status": "processing", "meta_data": [
+            {"key": "pubky_order_id", "value": "11111111-2222-8333-9444-555555555555"},
+            {"key": "_wc_shipment_tracking_items", "value": [{"tracking_provider": "dhl", "tracking_number": "N1"}]}]}));
+        assert!(
+            matches!(event(&tracked_but_processing), InboundEvent::Ignored { .. }),
+            "tracking on an order the store has not completed is not a shipment"
         );
     }
 

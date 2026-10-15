@@ -407,9 +407,7 @@ pub struct CancelOrder {
 /// A refund Pubky recorded. `amount_minor` is in `amount_unit` as recorded
 /// on the Pubky order, which is not always the order currency (`sat` for
 /// Bitcoin, `usdt` for USDT minor units, the order currency for a fiat rail).
-/// `full` is true when the whole order was refunded. `quote` is how the order
-/// itself converts a refund in `amount_unit` to the order currency, when the
-/// order recorded one.
+/// `full` is true when the whole order was refunded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefundRecord {
     /// Deterministic per Pubky refund; the provider derives its idempotency
@@ -423,35 +421,6 @@ pub struct RefundRecord {
     pub order_currency: String,
     pub order_exponent: i32,
     pub full: bool,
-    pub quote: Option<RefundQuote>,
-}
-
-/// The payment basis an order recorded, for converting a partial refund made
-/// in sats or USDT into the order currency. Read from the order when the
-/// refund is queued, never fetched again: the conversion uses the rate the
-/// buyer actually paid at.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum RefundQuote {
-    /// A Bitcoin payment: `rate` is the price of one BTC in `currency` major
-    /// units (a decimal string), as pinned at bind.
-    Bitcoin {
-        currency: String,
-        exponent: i32,
-        rate: String,
-        quoted_sats: Option<i64>,
-        source: Option<String>,
-        fetched_at: Option<DateTime<Utc>>,
-    },
-    /// A USDT payment: `paid_minor` base units of `asset` (`10^-paid_exponent`
-    /// each) settled the order total.
-    Asset {
-        asset: String,
-        network: Option<String>,
-        paid_minor: i64,
-        paid_exponent: i32,
-        basis: Option<String>,
-    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -485,7 +454,9 @@ pub enum InboundEvent {
         provider_variant_id: String,
         available: i64,
     },
-    /// A shipment with tracking for an order the push created.
+    /// A shipment for an order the push created. `tracking_number` is empty
+    /// when the store shipped without one (the carrier is then `Other`). The
+    /// same event again with a tracking number sets or changes it.
     Fulfillment {
         order: OrderRef,
         carrier: String,
