@@ -470,6 +470,7 @@ pub fn order_machine() -> AggregateMachine {
             "order.cancel_request",
             "order.cancel_approve",
             "fulfillment.ship",
+            "fulfillment.update_tracking",
             "fulfillment.confirm_delivery",
             "fulfillment.mark_ready",
             "fulfillment.confirm_pickup",
@@ -1070,6 +1071,28 @@ mod tests {
         ] {
             assert!(machine.commands.contains(&command), "{command}");
         }
+    }
+
+    // Updating tracking edits the shipment of an order that stays `shipped`,
+    // so no edge names it; only the catalog does. The handler refuses every
+    // other state.
+    #[test]
+    fn update_tracking_is_catalogued_and_moves_no_state() {
+        let machine = order_machine();
+        assert!(machine.commands.contains(&"fulfillment.update_tracking"));
+        for transition in &machine.transitions {
+            assert!(
+                !transition
+                    .via
+                    .contains(&Command("fulfillment.update_tracking")),
+                "{} -> {} must not name update_tracking",
+                transition.from,
+                transition.to
+            );
+        }
+        assert!(can_transition(&machine, "shipped", "delivered"));
+        assert!(!can_transition(&machine, "delivered", "shipped"));
+        assert!(!can_transition(&machine, "completed", "shipped"));
     }
 
     // Other machines move on commands another aggregate accepts (a listing
