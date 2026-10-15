@@ -796,6 +796,53 @@ pub async fn connect_shop_with(
     id
 }
 
+/// The full WooCommerce install: the seller's connect request and the
+/// store's authorization callback.
+pub async fn connect_woo_shop(app: &TestApp, seller: &TestActor, shop: &str) -> Uuid {
+    let (status, started) = api(
+        app,
+        "POST",
+        "/v1/connectors",
+        Some(&seller.token),
+        &json!({ "provider": "woocommerce", "domain": shop }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::CREATED,
+        "woo connect: {started}"
+    );
+    let id: Uuid = started["connection"]["id"]
+        .as_str()
+        .expect("connection id")
+        .parse()
+        .expect("uuid");
+    let nonce = query_param(
+        started["authorize_url"].as_str().expect("wc-auth url"),
+        "user_id",
+    );
+    let (status, _, body) = raw(
+        app.router.clone(),
+        "POST",
+        "/v1/connectors/woocommerce/oauth/callback",
+        &[("content-type", "application/json")],
+        serde_json::to_vec(&json!({
+            "user_id": nonce,
+            "consumer_key": "ck_test",
+            "consumer_secret": "cs_test",
+        }))
+        .expect("body"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::OK,
+        "woo callback: {}",
+        String::from_utf8_lossy(&body)
+    );
+    id
+}
+
 pub async fn map_listing(
     app: &TestApp,
     seller: &TestActor,
