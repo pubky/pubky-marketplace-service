@@ -696,6 +696,54 @@ pub fn with_connectors(
     (rebuild(base, state), stores)
 }
 
+/// Whether the connector's event cursor has reached the newest event.
+async fn feed_caught_up(pool: &PgPool) -> bool {
+    sqlx::query_scalar(
+        "SELECT COALESCE((SELECT sequence FROM connector_event_cursor WHERE name = 'events'), 0) \
+         >= COALESCE((SELECT MAX(sequence) FROM events), 0)",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("cursor position")
+}
+
+/// A worker pass, repeated until the event feed is consumed.
+///
+/// The consumer reads only events whose writing transaction is older than
+/// every transaction still open anywhere in the Postgres cluster (it must not
+/// pass an event a slower transaction could still commit before), so a
+/// transaction of another test database, another process or `psql` that is
+/// open for a few milliseconds defers an event to the next pass. A test that
+/// writes an event and then runs one pass would see no effect. This waits for
+/// the deferral to end, up to ten seconds; nothing about what a test asserts
+/// changes, and when nothing defers it is exactly one pass.
+pub async fn settled_pass(app: &TestApp) {
+    for _ in 0..500 {
+        marketplace_service::connectors::worker::run_pass(&app.state)
+            .await
+            .expect("pass");
+        if feed_caught_up(&app.pool).await {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the connector's event cursor never caught up with the feed");
+}
+
+/// [`settled_pass`] for the event consumer alone.
+pub async fn settled_consume(app: &TestApp) {
+    for _ in 0..500 {
+        marketplace_service::connectors::worker::consume_events(&app.state)
+            .await
+            .expect("consume");
+        if feed_caught_up(&app.pool).await {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the connector's event cursor never caught up with the feed");
+}
+
 pub fn rebuild(base: TestApp, state: marketplace_service::AppState) -> TestApp {
     TestApp {
         router: build_router(state.clone()).layer(axum::extract::connect_info::MockConnectInfo(

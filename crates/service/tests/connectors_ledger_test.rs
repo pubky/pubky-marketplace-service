@@ -51,7 +51,7 @@ async fn scenario(pool: PgPool) -> Scenario {
 
 impl Scenario {
     async fn pass(&self) {
-        worker::run_pass(&self.app.state).await.expect("pass");
+        settled_pass(&self.app).await;
     }
 
     async fn push(&self) -> (String, Option<String>, Option<String>, i32) {
@@ -125,7 +125,7 @@ async fn duplicate_event_delivery_creates_one_ledger_row_and_one_push(pool: PgPo
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn crash_after_the_remote_create_is_reconciled_by_a_lookup(pool: PgPool) {
     let s = scenario(pool).await;
-    worker::consume_events(&s.app.state).await.expect("consume");
+    settled_consume(&s.app).await;
     let claim = ledger::claim_next_push(
         &s.app.pool,
         s.app.clock.now(),
@@ -161,7 +161,7 @@ async fn crash_after_the_remote_create_is_reconciled_by_a_lookup(pool: PgPool) {
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn crash_before_the_remote_create_pushes_once_after_the_lookup_finds_nothing(pool: PgPool) {
     let s = scenario(pool).await;
-    worker::consume_events(&s.app.state).await.expect("consume");
+    settled_consume(&s.app).await;
     ledger::claim_next_push(
         &s.app.pool,
         s.app.clock.now(),
@@ -231,7 +231,7 @@ async fn a_provider_call_that_outlives_its_timeout_is_an_unknown_outcome(pool: P
     let order = create_paid_order(&app, &seller, &buyer).await;
     map_listing(&app, &seller, connection, "boots_01", "prod-1", "var-1").await;
     *store.push_delay.lock().expect("delay lock") = Duration::from_secs(5);
-    worker::run_pass(&app.state).await.expect("pass");
+    settled_pass(&app).await;
     let (state, _, _, _) = push_state(&app.pool, &order.order_id).await;
     assert_eq!(state, "sending");
     assert_eq!(
@@ -244,7 +244,7 @@ async fn a_provider_call_that_outlives_its_timeout_is_an_unknown_outcome(pool: P
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn concurrent_workers_on_one_order_push_exactly_once(pool: PgPool) {
     let s = scenario(pool).await;
-    worker::consume_events(&s.app.state).await.expect("consume");
+    settled_consume(&s.app).await;
     *s.store.push_delay.lock().expect("delay lock") = Duration::from_millis(200);
     let mut tasks = Vec::new();
     for _ in 0..8 {
@@ -266,7 +266,7 @@ async fn concurrent_workers_on_one_order_push_exactly_once(pool: PgPool) {
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_second_worker_interleaved_with_an_open_push_does_nothing(pool: PgPool) {
     let s = scenario(pool).await;
-    worker::consume_events(&s.app.state).await.expect("consume");
+    settled_consume(&s.app).await;
     let gate = s.store.open_gate();
 
     let first = {
@@ -302,7 +302,7 @@ async fn a_second_worker_interleaved_with_an_open_push_does_nothing(pool: PgPool
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_worker_that_lost_its_lease_cannot_overwrite_the_new_owner(pool: PgPool) {
     let s = scenario(pool).await;
-    worker::consume_events(&s.app.state).await.expect("consume");
+    settled_consume(&s.app).await;
     let stale = ledger::claim_next_push(
         &s.app.pool,
         s.app.clock.now(),
@@ -441,7 +441,7 @@ async fn a_mapping_removed_before_the_push_sets_the_order_aside_until_it_is_rest
     let connection = connect_shop(&app, &seller, SHOP).await;
     let order = create_paid_order(&app, &seller, &buyer).await;
     map_listing(&app, &seller, connection, "boots_01", "prod-1", "var-1").await;
-    worker::consume_events(&app.state).await.expect("consume");
+    settled_consume(&app).await;
     // The seller removes the mapping between the event and the push.
     api(
         &app,
@@ -483,7 +483,7 @@ async fn a_mapping_removed_before_the_push_sets_the_order_aside_until_it_is_rest
     )
     .await;
     assert_eq!(status, StatusCode::ACCEPTED);
-    worker::run_pass(&app.state).await.expect("pass");
+    settled_pass(&app).await;
     assert_eq!(push_state(&app.pool, &order.order_id).await.0, "created");
 }
 
@@ -542,7 +542,7 @@ async fn an_order_with_no_mapped_line_is_a_pubky_only_sale_and_is_not_pushed(poo
     let (status, body) = execute(&app, &seller.token, &second_listing_command(&seller.pubky)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     map_listing(&app, &seller, connection, "socks_01", "prod-9", "var-9").await;
-    worker::run_pass(&app.state).await.expect("pass");
+    settled_pass(&app).await;
     assert_eq!(
         common::count(&app.pool, "SELECT COUNT(*) FROM connector_order_push").await,
         0,
@@ -564,7 +564,7 @@ async fn an_order_with_only_some_lines_mapped_is_quarantined_with_an_alert(pool:
     let connection = connect_shop(&app, &seller, SHOP).await;
     let order_id = two_line_order(&app, &seller, &buyer).await;
     map_listing(&app, &seller, connection, "boots_01", "prod-1", "var-1").await;
-    worker::run_pass(&app.state).await.expect("pass");
+    settled_pass(&app).await;
     let (state, _, reason, _) = push_state(&app.pool, &order_id).await;
     assert_eq!(state, "quarantined");
     assert_eq!(reason.as_deref(), Some("unmapped_variant"));
@@ -604,7 +604,7 @@ async fn an_order_with_only_some_lines_mapped_is_quarantined_with_an_alert(pool:
         &json!(null),
     )
     .await;
-    worker::run_pass(&app.state).await.expect("pass");
+    settled_pass(&app).await;
     assert_eq!(push_state(&app.pool, &order_id).await.0, "created");
     let pushed = store
         .last_order_push
@@ -844,7 +844,7 @@ async fn an_order_paid_before_the_connection_existed_is_not_pushed(pool: PgPool)
     app.clock.advance_seconds(60);
     let connection = connect_shop(&app, &seller, SHOP).await;
     map_listing(&app, &seller, connection, "boots_01", "prod-1", "var-1").await;
-    worker::run_pass(&app.state).await.expect("pass");
+    settled_pass(&app).await;
     assert_eq!(
         common::count(&app.pool, "SELECT COUNT(*) FROM connector_order_push").await,
         0,
@@ -1026,7 +1026,7 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
-    worker::consume_events(&s.app.state).await.expect("consume");
+    settled_consume(&s.app).await;
     s.store.script(PushScript::Rejected("validation"));
     let gate = s.store.open_gate();
     let task = {
@@ -1091,7 +1091,7 @@ async fn a_cancel_queued_while_the_push_is_in_flight_is_parked_by_its_quarantine
     let s = scenario(pool).await;
     reject_a_push_in_flight(&s, || async {
         cancel_order(&s).await;
-        worker::consume_events(&s.app.state).await.expect("consume");
+        settled_consume(&s.app).await;
         assert_eq!(actions(&s).await, vec![waiting("cancel")]);
     })
     .await;
@@ -1137,7 +1137,7 @@ async fn a_refund_recorded_while_the_push_is_in_flight_is_parked_by_its_quaranti
     let s = scenario(pool).await;
     reject_a_push_in_flight(&s, || async {
         refund_order(&s).await;
-        worker::consume_events(&s.app.state).await.expect("consume");
+        settled_consume(&s.app).await;
         assert_eq!(actions(&s).await, vec![waiting("refund")]);
     })
     .await;
@@ -1228,10 +1228,10 @@ async fn a_retry_that_finds_no_store_order_for_a_refunded_order_withholds_it_and
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_refund_recorded_while_the_push_is_pending_never_leaves_an_action_behind(pool: PgPool) {
     let s = scenario(pool).await;
-    worker::consume_events(&s.app.state).await.expect("consume");
+    settled_consume(&s.app).await;
     assert_eq!(s.push().await.0, "pending");
     refund_order(&s).await;
-    worker::consume_events(&s.app.state).await.expect("consume");
+    settled_consume(&s.app).await;
     assert_eq!(
         actions(&s).await,
         vec![waiting("refund")],
@@ -1257,7 +1257,7 @@ async fn a_refund_recorded_while_the_push_is_pending_never_leaves_an_action_behi
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_cancel_and_a_refund_recorded_before_the_push_start_leave_no_action(pool: PgPool) {
     let s = scenario(pool).await;
-    worker::consume_events(&s.app.state).await.expect("consume");
+    settled_consume(&s.app).await;
     cancel_order(&s).await;
     let (status, body) = execute(
         &s.app,
@@ -1287,7 +1287,7 @@ async fn a_refund_queued_on_a_pending_push_is_applied_once_the_push_creates_the_
     pool: PgPool,
 ) {
     let s = scenario(pool).await;
-    worker::consume_events(&s.app.state).await.expect("consume");
+    settled_consume(&s.app).await;
     assert_eq!(s.push().await.0, "pending");
     let order_id: Uuid = s.order.order_id.parse().expect("order id");
     let mut tx = s.app.pool.begin().await.expect("tx");
@@ -1341,7 +1341,7 @@ async fn a_refund_queued_on_a_pending_push_is_applied_once_the_push_creates_the_
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_cancel_of_a_pending_push_drops_the_mirror_already_queued_for_it(pool: PgPool) {
     let s = scenario(pool).await;
-    worker::consume_events(&s.app.state).await.expect("consume");
+    settled_consume(&s.app).await;
     let order_id: Uuid = s.order.order_id.parse().expect("order id");
     let now = s.app.clock.now();
     let mut tx = s.app.pool.begin().await.expect("tx");
@@ -1586,7 +1586,7 @@ fn both_parked() -> Vec<(String, String, Option<String>)> {
 
 /// The claimed push, with a pending refund queued behind it.
 async fn a_push_in_flight_with_a_mirror(s: &Scenario) -> ledger::ClaimedPush {
-    worker::consume_events(&s.app.state).await.expect("consume");
+    settled_consume(&s.app).await;
     let claim = ledger::claim_next_push(
         &s.app.pool,
         s.app.clock.now(),
@@ -1676,7 +1676,7 @@ async fn a_quarantine_that_arrives_while_a_cancel_is_being_queued_parks_it(pool:
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_refund_reversed_before_its_event_is_consumed_mirrors_nothing(pool: PgPool) {
     let s = scenario(pool).await;
-    worker::consume_events(&s.app.state).await.expect("consume");
+    settled_consume(&s.app).await;
     assert_eq!(s.push().await.0, "pending");
     refund_order(&s).await;
     sqlx::query(
@@ -1857,11 +1857,11 @@ async fn a_refund_reversed_before_it_reached_the_store_is_dropped_without_an_ale
     let s = scenario(pool).await;
     s.pass().await;
     refund_order(&s).await;
-    worker::consume_events(&s.app.state).await.expect("consume");
+    settled_consume(&s.app).await;
     assert_eq!(refund_actions(&s).await.len(), 1);
 
     reverse_the_refund(&s).await;
-    worker::consume_events(&s.app.state).await.expect("consume");
+    settled_consume(&s.app).await;
     assert_eq!(refund_actions(&s).await.len(), 0);
     s.pass().await;
     assert!(refund_amounts(&s).is_empty());
