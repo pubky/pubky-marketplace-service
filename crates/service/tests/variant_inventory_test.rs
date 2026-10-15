@@ -1938,3 +1938,297 @@ async fn unattributable_sales_mark_the_listing_until_its_record_stops_listing_va
     assert_eq!(blocked(&app.pool, &seller.pubky).await, None);
     assert_books_balance(&app.pool).await;
 }
+
+/// A listing registered with 8 units, one of them held, whose record (same
+/// revision) lists two sizes that sum to 8: the sync defers it for the hold.
+async fn deferred_by_a_hold(
+    app: &TestApp,
+    homeserver: &common::FakeHomeserver,
+    seller: &TestActor,
+    buyer: &TestActor,
+    hold_command: u64,
+) {
+    let (status, body) = execute(app, &seller.token, &register_command(&seller.pubky, 8)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    put_record(homeserver, &seller.pubky, record(1, &[("only", true, 8)]));
+    let revision = listing_revision(&app.pool, &seller.pubky).await;
+    let (status, body) = execute(
+        app,
+        &buyer.token,
+        &reserve(&seller.pubky, hold_command, None, revision, 1),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    put_record(
+        homeserver,
+        &seller.pubky,
+        record(1, &[("size_m", true, 5), ("size_l", true, 3)]),
+    );
+    let (status, body) = sync_status(app, &buyer.token, &seller.pubky, hold_command).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["result"]["variant_conversion"],
+        json!({ "state": "deferred", "reason": "open_holds", "attempts": 1 }),
+        "the single sync reports that conversion is deferred"
+    );
+}
+
+async fn lapse_holds(app: &TestApp) {
+    app.clock.advance_seconds(601);
+    expire_due_reservations(&app.pool, app.clock.now())
+        .await
+        .expect("holds expire");
+}
+
+/// The seller removes two units with `inventory.adjust` while conversion waits
+/// on a hold. The next sync of the unchanged record must not put them back on
+/// sale: the listing stays deferred, with its adjusted total, until the total
+/// again matches the record or the record is edited.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_adjustment_made_while_conversion_waited_is_not_undone_by_the_sync(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    deferred_by_a_hold(&app, &homeserver, &seller, &buyer, 1).await;
+
+    let revision = listing_revision(&app.pool, &seller.pubky).await;
+    let (status, body) = post_adjust(
+        &app,
+        &seller.token,
+        &adjust(&seller.pubky, revision, -2, 11, None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        rows(&app.pool, &seller.pubky).await,
+        [("".into(), 5, 1, 0, 6)]
+    );
+    lapse_holds(&app).await;
+    assert_eq!(
+        rows(&app.pool, &seller.pubky).await,
+        [("".into(), 6, 0, 0, 6)]
+    );
+
+    let item = sync_many(&app, &seller).await;
+    assert_eq!(
+        item["variant_conversion"],
+        json!({ "state": "deferred", "reason": "adjusted_total", "attempts": 2 }),
+        "{item}"
+    );
+    assert_eq!(
+        item["result"]["result"]["variant_conversion"]["reason"],
+        json!("adjusted_total")
+    );
+    assert_eq!(
+        rows(&app.pool, &seller.pubky).await,
+        [("".into(), 6, 0, 0, 6)],
+        "the two removed units stay removed: nothing was converted from the record's 8"
+    );
+    assert_eq!(
+        totals(&app.pool, &seller.pubky).await,
+        (6, 0, 0, 6, "available".to_string())
+    );
+
+    // Putting the units back makes the total match the record again; the
+    // next sync converts with every unit placed on a size.
+    let revision = listing_revision(&app.pool, &seller.pubky).await;
+    let (status, body) = post_adjust(
+        &app,
+        &seller.token,
+        &adjust(&seller.pubky, revision, 2, 12, None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let item = sync_many(&app, &seller).await;
+    assert!(item.get("variant_conversion").is_none(), "{item}");
+    let stored = rows(&app.pool, &seller.pubky).await;
+    assert_eq!(row(&stored, "size_m"), (5, 0, 0, 5));
+    assert_eq!(row(&stored, "size_l"), (3, 0, 0, 3));
+    assert_eq!(blocked(&app.pool, &seller.pubky).await, None);
+    assert_books_balance(&app.pool).await;
+}
+
+/// The other order: the sync converts first, so the seller's adjustment must
+/// name a size; it moves that size and the units stay accounted for.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_sync_that_converts_first_leaves_the_adjustment_to_name_a_size(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    deferred_by_a_hold(&app, &homeserver, &seller, &buyer, 1).await;
+    lapse_holds(&app).await;
+    let item = sync_many(&app, &seller).await;
+    assert!(item.get("variant_conversion").is_none(), "{item}");
+    assert_eq!(rows(&app.pool, &seller.pubky).await.len(), 2);
+
+    let revision = listing_revision(&app.pool, &seller.pubky).await;
+    let (status, body) = post_adjust(
+        &app,
+        &seller.token,
+        &adjust(&seller.pubky, revision, -2, 21, None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], json!("variant_required"));
+    let (status, body) = post_adjust(
+        &app,
+        &seller.token,
+        &adjust(
+            &seller.pubky,
+            revision,
+            -2,
+            22,
+            Some(json!({ "id": "size_m" })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let stored = rows(&app.pool, &seller.pubky).await;
+    assert_eq!(row(&stored, "size_m"), (3, 0, 0, 3));
+    assert_eq!(row(&stored, "size_l"), (3, 0, 0, 3));
+    assert_eq!(
+        totals(&app.pool, &seller.pubky).await,
+        (6, 0, 0, 6, "available".to_string())
+    );
+    assert_books_balance(&app.pool).await;
+}
+
+/// The adjustment and the converting sync race. Whichever commits first, the
+/// units are conserved: an adjustment that lands first stays and the listing
+/// stays deferred at the adjusted total; a sync that lands first converts the
+/// 8 units and the unnamed adjustment is refused.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_adjustment_racing_the_converting_sync_never_creates_or_loses_units(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    for round in 0..6u64 {
+        let seller = new_actor(&app).await;
+        let buyer = new_actor(&app).await;
+        deferred_by_a_hold(&app, &homeserver, &seller, &buyer, 100 + round).await;
+        lapse_holds(&app).await;
+        let revision = listing_revision(&app.pool, &seller.pubky).await;
+        let take = adjust(&seller.pubky, revision, -2, 30 + u128::from(round), None);
+        let (synced, adjusted) = tokio::join!(
+            sync_many_status(&app, &seller),
+            post_adjust(&app, &seller.token, &take),
+        );
+        assert_eq!(synced, StatusCode::MULTI_STATUS);
+        let stored = rows(&app.pool, &seller.pubky).await;
+        let sum: i64 = stored.iter().map(|row| row.4).sum();
+        if adjusted.1["ok"] == json!(true) {
+            assert_eq!(
+                stored,
+                [("".into(), 6, 0, 0, 6)],
+                "round {round}: {adjusted:?}"
+            );
+            assert_eq!(
+                blocked(&app.pool, &seller.pubky)
+                    .await
+                    .map(|marker| marker.0),
+                Some("adjusted_total".to_string()),
+                "round {round}"
+            );
+        } else {
+            assert_eq!(stored.len(), 2, "round {round}: converted, {adjusted:?}");
+            assert_eq!(sum, 8, "round {round}: every unit placed on a size");
+            assert_eq!(blocked(&app.pool, &seller.pubky).await, None);
+        }
+        assert_books_balance(&app.pool).await;
+    }
+}
+
+async fn sync_many_status(app: &TestApp, seller: &TestActor) -> StatusCode {
+    send(
+        app.router.clone(),
+        "POST",
+        "/v1/listings/sync-many",
+        Some(&seller.token),
+        &json!({"listings": [{"seller_pubky": seller.pubky, "listing_id": "boots_01"}]}),
+    )
+    .await
+    .0
+}
+
+/// A record that gives a size fewer units than its attributed sales cannot be
+/// converted from. The listing stays marked, the sync says it is blocked
+/// (never a plain success), and the marker is cleared only by a conversion.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_listing_whose_record_is_below_its_sales_stays_marked_and_reports_blocked(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    execute(&app, &seller.token, &register_command(&seller.pubky, 8)).await;
+    put_record(
+        &homeserver,
+        &seller.pubky,
+        record(1, &[("size_m", true, 8)]),
+    );
+    for n in 1..=5 {
+        let (status, body) = buy_sandbox(&app, &buyer, &seller.pubky, "size_m", n).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let revision = listing_revision(&app.pool, &seller.pubky).await;
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &reserve(&seller.pubky, 1, None, revision, 1),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Record revision 2 gives size M 3 units, fewer than the 5 sold: the hold
+    // defers conversion first.
+    put_record(
+        &homeserver,
+        &seller.pubky,
+        record(2, &[("size_m", true, 3), ("size_l", true, 5)]),
+    );
+    let (status, body) = sync_status(&app, &buyer.token, &seller.pubky, 1).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["result"]["variant_conversion"]["reason"],
+        json!("open_holds")
+    );
+    lapse_holds(&app).await;
+
+    // The hold is gone, so conversion is attempted at the unchanged record and
+    // found impossible: the marker moves to below_committed, it is not cleared,
+    // and the sync reports blocked.
+    let (status, body) = sync_status(&app, &buyer.token, &seller.pubky, 2).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["result"]["variant_conversion"],
+        json!({ "state": "blocked", "reason": "below_committed", "attempts": 2 }),
+        "{body}"
+    );
+    assert_eq!(
+        blocked(&app.pool, &seller.pubky)
+            .await
+            .map(|marker| marker.0),
+        Some("below_committed".to_string())
+    );
+    let item = sync_many(&app, &seller).await;
+    assert_eq!(
+        item["variant_conversion"],
+        json!({ "state": "blocked", "reason": "below_committed", "attempts": 3 })
+    );
+    assert_eq!(
+        rows(&app.pool, &seller.pubky).await,
+        [("".into(), 3, 0, 5, 8)]
+    );
+
+    // The seller republishes the record with enough units; the next sync
+    // converts and only then does the marker go.
+    put_record(
+        &homeserver,
+        &seller.pubky,
+        record(3, &[("size_m", true, 6), ("size_l", true, 2)]),
+    );
+    let (status, body) = sync_status(&app, &buyer.token, &seller.pubky, 3).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["result"].get("variant_conversion").is_none(), "{body}");
+    assert_eq!(blocked(&app.pool, &seller.pubky).await, None);
+    let stored = rows(&app.pool, &seller.pubky).await;
+    assert_eq!(row(&stored, "size_m"), (1, 0, 5, 6));
+    assert_eq!(row(&stored, "size_l"), (2, 0, 0, 2));
+    assert_books_balance(&app.pool).await;
+}

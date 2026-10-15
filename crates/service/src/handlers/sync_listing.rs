@@ -41,6 +41,37 @@ pub async fn handle(
     homeserver: Option<&dyn HomeserverListingClient>,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
+    let mut outcome = sync(tx, actor, command, payload, homeserver, now).await?;
+    // A sync that converged the listing to its record but could not convert it
+    // to per-variant stock says so: `variant_conversion` names the state
+    // (`deferred`, or `blocked` when the record itself has to change) and why.
+    if let Ok(success) = outcome.as_mut() {
+        let marker: Option<(String, i32)> = sqlx::query_as(
+            "SELECT reason, attempts FROM listing_variant_conversion_blocks \
+             WHERE listing_aggregate_id = $1",
+        )
+        .bind(&command.aggregate_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if let Some((reason, attempts)) = marker {
+            success.result["variant_conversion"] = json!({
+                "state": crate::variant_stock::conversion_state(&reason),
+                "reason": reason,
+                "attempts": attempts,
+            });
+        }
+    }
+    Ok(outcome)
+}
+
+async fn sync(
+    tx: &mut Transaction<'_, Postgres>,
+    actor: &str,
+    command: &Command,
+    payload: &SyncListingPayload,
+    homeserver: Option<&dyn HomeserverListingClient>,
+    now: DateTime<Utc>,
+) -> Result<HandlerResult, sqlx::Error> {
     // Fail closed: without a configured homeserver there is no canonical
     // record to derive registration from.
     let Some(homeserver) = homeserver else {
@@ -200,6 +231,14 @@ pub async fn handle(
                         &rows,
                         false,
                         current.server_revision,
+                        Some(crate::variant_stock::UnchangedRecord {
+                            enabled_sum: registration
+                                .variants
+                                .iter()
+                                .map(|variant| variant.quantity)
+                                .sum(),
+                            all_variants_sum: registration.quantity,
+                        }),
                     )
                     .await?;
                     if matches!(plan, Ok(crate::variant_stock::StockPlan::PerVariant { .. })) {

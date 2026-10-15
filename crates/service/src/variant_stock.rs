@@ -369,6 +369,17 @@ pub enum DeferReason {
     /// Units were sold that the lines of the listing's paid orders do not
     /// attribute exactly to the record's variants.
     UnattributableSales,
+    /// The record has not changed since the listing last synced it, but the
+    /// listing's total is no longer what the record says: the seller moved it
+    /// with `inventory.adjust` while conversion waited. A listing-total
+    /// adjustment names no variant, so its units cannot be placed on one;
+    /// converting from the record would create or destroy them. The next
+    /// record edit (the record is the authority then) converts it.
+    AdjustedTotal,
+    /// The record gives a variant fewer units than the paid orders attribute
+    /// to it. Converting would drop it below its sold units; the seller has to
+    /// republish the record.
+    BelowCommitted,
 }
 
 impl DeferReason {
@@ -376,6 +387,8 @@ impl DeferReason {
         match self {
             DeferReason::OpenHolds => "open_holds",
             DeferReason::UnattributableSales => "unattributable_sales",
+            DeferReason::AdjustedTotal => "adjusted_total",
+            DeferReason::BelowCommitted => "below_committed",
         }
     }
 }
@@ -420,6 +433,17 @@ pub async fn attribute_sold(
     } else {
         Err(DeferReason::UnattributableSales)
     })
+}
+
+/// The state a marker reason reports: `blocked` when the record itself has to
+/// change before the listing can convert, `deferred` when time or nothing but
+/// the next sync is needed.
+pub fn conversion_state(reason: &str) -> &'static str {
+    if reason == DeferReason::BelowCommitted.as_str() {
+        "blocked"
+    } else {
+        "deferred"
+    }
 }
 
 /// Marks a listing the record wants per-variant but that cannot convert yet:
@@ -487,9 +511,22 @@ async fn clear_deferral(
     Ok(())
 }
 
+/// What a record of the revision the listing already holds may convert the
+/// listing's total to. A sync of an unchanged record is not an edit, so the
+/// listing's own total stays the truth: conversion goes ahead only while that
+/// total is still what the record says (the sum of its enabled variants, or of
+/// all its variants for a listing registered before disabled stock was left
+/// out of the total). Anything else is a seller's adjustment and defers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnchangedRecord {
+    pub enabled_sum: i64,
+    pub all_variants_sum: i64,
+}
+
 /// Plans the rows for a record's enabled variants against the rows the
 /// listing has now. Pure apart from the sold-unit attribution a conversion
-/// needs.
+/// needs. `unchanged` is `Some` when the record is at the revision the listing
+/// already holds, `None` when the record is a new edit and is the authority.
 pub async fn plan(
     tx: &mut Transaction<'_, Postgres>,
     aggregate_id: &str,
@@ -497,6 +534,7 @@ pub async fn plan(
     rows: &[VariantRow],
     new_listing: bool,
     current_revision: i64,
+    unchanged: Option<UnchangedRecord>,
 ) -> Result<Result<StockPlan, CommandFailure>, sqlx::Error> {
     let keyed = tracks_variants(rows);
     if !keyed && variants.len() < 2 {
@@ -511,22 +549,35 @@ pub async fn plan(
 
     let mut convert = false;
     let mut attribution: HashMap<String, i64> = HashMap::new();
+    let mut converting_from: Option<&VariantRow> = None;
     if !keyed && !new_listing {
         let Some(implicit) = rows.iter().find(|row| row.is_implicit()) else {
             return Ok(Ok(StockPlan::Implicit));
         };
         let offered: HashSet<&str> = variants.iter().map(|v| v.id.as_str()).collect();
         match attribute_sold(tx, aggregate_id, implicit, &offered).await? {
-            Ok(sold) => {
-                attribution = sold;
-                convert = true;
-                clear_deferral(tx, aggregate_id).await?;
-            }
+            Ok(sold) => attribution = sold,
             Err(reason) => {
                 record_deferral(tx, aggregate_id, reason, implicit, variants.len()).await?;
                 return Ok(Ok(StockPlan::Implicit));
             }
         }
+        if unchanged.is_some_and(|record| {
+            implicit.total_quantity != record.enabled_sum
+                && implicit.total_quantity != record.all_variants_sum
+        }) {
+            record_deferral(
+                tx,
+                aggregate_id,
+                DeferReason::AdjustedTotal,
+                implicit,
+                variants.len(),
+            )
+            .await?;
+            return Ok(Ok(StockPlan::Implicit));
+        }
+        convert = true;
+        converting_from = Some(implicit);
     }
 
     let mut planned = Vec::with_capacity(variants.len() + rows.len());
@@ -537,6 +588,18 @@ pub async fn plan(
             None => (0, attribution.get(&variant.id).copied().unwrap_or(0)),
         };
         if variant.quantity < reserved + sold {
+            // A conversion that cannot be written stays marked: the marker is
+            // never cleared while the listing is unconvertible.
+            if let Some(implicit) = converting_from {
+                record_deferral(
+                    tx,
+                    aggregate_id,
+                    DeferReason::BelowCommitted,
+                    implicit,
+                    variants.len(),
+                )
+                .await?;
+            }
             return Ok(Err(BelowCommitted {
                 variant_id: variant.id.clone(),
             }
@@ -571,6 +634,9 @@ pub async fn plan(
                 sold: row.sold_quantity,
             });
         }
+    }
+    if converting_from.is_some() {
+        clear_deferral(tx, aggregate_id).await?;
     }
     Ok(Ok(StockPlan::PerVariant {
         rows: planned,

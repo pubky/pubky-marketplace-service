@@ -732,7 +732,7 @@ pub async fn sync_many(
                 {
                     Ok(Some((reason, attempts))) => {
                         entry["variant_conversion"] = json!({
-                            "state": "deferred",
+                            "state": crate::variant_stock::conversion_state(&reason),
                             "reason": reason,
                             "attempts": attempts
                         });

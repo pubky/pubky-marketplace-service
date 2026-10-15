@@ -389,6 +389,17 @@ pub(crate) async fn apply_registration(
         &variant_rows,
         current.is_none(),
         current_revision,
+        // A record at the revision the listing already holds is not an edit
+        // (only `listing.sync` gets here with one), so it is not the authority
+        // for a total the seller may have adjusted since.
+        current
+            .filter(|listing| {
+                !listing.is_deleted() && payload.listing_revision <= listing.listing_revision
+            })
+            .map(|_| variant_stock::UnchangedRecord {
+                enabled_sum: variants.iter().map(|variant| variant.quantity).sum(),
+                all_variants_sum: payload.quantity,
+            }),
     )
     .await?
     {

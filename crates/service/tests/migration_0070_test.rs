@@ -384,7 +384,14 @@ async fn the_conversion_marker_is_constrained_rerunnable_and_leaves_with_its_lis
         "a marker needs two variants"
     );
     assert!(mark("open_holds", 2, -1, 0).await.is_err());
-    mark("open_holds", 2, 1, 0).await.expect("a valid marker");
+    for reason in [
+        "unattributable_sales",
+        "adjusted_total",
+        "below_committed",
+        "open_holds",
+    ] {
+        mark(reason, 2, 1, 0).await.expect("a valid marker");
+    }
     sqlx::raw_sql(MIGRATION_0070)
         .execute(&pool)
         .await

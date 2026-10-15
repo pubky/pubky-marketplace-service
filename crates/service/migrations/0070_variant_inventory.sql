@@ -39,8 +39,12 @@
 --
 -- `listing_variant_conversion_blocks` is the operator-visible marker of a
 -- listing whose record has two or more enabled variants but that cannot convert
--- yet: `open_holds` (units reserved) or `unattributable_sales` (units sold that
--- the paid orders' lines do not attribute to the record's variants). A sync
+-- yet: `open_holds` (units reserved), `unattributable_sales` (units sold that
+-- the paid orders' lines do not attribute to the record's variants),
+-- `adjusted_total` (the record is unchanged but the seller's `inventory.adjust`
+-- moved the listing total, so converting from the record would create or
+-- destroy units) or `below_committed` (the record gives a variant fewer units
+-- than the paid orders attribute to it). A sync
 -- upserts the row while the listing is blocked and deletes it when the listing
 -- converts (or its record stops listing several variants).
 -- `scripts/variant-conversion-sweep.sh` reads it; `listing.sync_many` retries
@@ -72,7 +76,7 @@ CREATE TABLE IF NOT EXISTS listing_variant_inventory (
 
 CREATE TABLE IF NOT EXISTS listing_variant_conversion_blocks (
     listing_aggregate_id TEXT PRIMARY KEY REFERENCES listings (aggregate_id) ON DELETE CASCADE,
-    reason TEXT NOT NULL CHECK (reason IN ('open_holds', 'unattributable_sales')),
+    reason TEXT NOT NULL CHECK (reason IN ('open_holds', 'unattributable_sales', 'adjusted_total', 'below_committed')),
     enabled_variants INTEGER NOT NULL CHECK (enabled_variants >= 2),
     reserved_quantity BIGINT NOT NULL CHECK (reserved_quantity >= 0),
     sold_quantity BIGINT NOT NULL CHECK (sold_quantity >= 0),
