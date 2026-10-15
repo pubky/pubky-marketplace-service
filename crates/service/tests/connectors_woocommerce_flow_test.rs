@@ -11,6 +11,8 @@ mod woocommerce_support;
 use axum::http::StatusCode;
 use common::connector_provider::{api, as_json, raw};
 use common::{create_paid_order, new_actor};
+use marketplace_service::clock::Clock;
+use marketplace_service::connectors::store;
 use marketplace_service::connectors::worker;
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -932,6 +934,194 @@ async fn completed_without_tracking_ships_as_other_and_later_tracking_follows(po
         "a shipment is never an alert"
     );
     if let Some(replay) = &shop.side.replay {
+        replay.assert_no_misses();
+    }
+}
+
+/// A wc-auth URL for the store, to mint a key pair as the merchant would.
+fn authorize_url(side: &StoreSide, scope: &str) -> String {
+    let origin = if side.is_live() {
+        "https://localhost:8443".to_string()
+    } else {
+        format!("http://{}", side.site())
+    };
+    let mut url = url::Url::parse(&format!("{origin}/wc-auth/v1/authorize")).expect("url");
+    url.query_pairs_mut()
+        .append_pair("app_name", "Pubky Shop")
+        .append_pair("scope", scope)
+        .append_pair(
+            "user_id",
+            &format!("rotate-{scope}-{}", uuid::Uuid::new_v4().simple()),
+        )
+        .append_pair("return_url", woocommerce_support::RETURN_URL)
+        .append_pair("callback_url", woocommerce_support::CALLBACK_URL);
+    url.into()
+}
+
+fn minted(side: &StoreSide, scope: &str, name: &str) -> Value {
+    let body = side.approve(&authorize_url(side, scope), name);
+    let keys: Value = serde_json::from_slice(&body).expect("keys JSON");
+    json!({"consumer_key": keys["consumer_key"], "consumer_secret": keys["consumer_secret"]})
+}
+
+async fn sealed_credential(app: &common::TestApp, connection: uuid::Uuid) -> Vec<u8> {
+    sqlx::query_scalar("SELECT sealed FROM connector_credentials WHERE connection_id = $1")
+        .bind(connection)
+        .fetch_one(&app.pool)
+        .await
+        .expect("sealed credential")
+}
+
+async fn webhook_status(
+    side: &StoreSide,
+    app: &common::TestApp,
+    secret: &str,
+) -> (StatusCode, Option<String>) {
+    let source = if side.is_live() {
+        "https://localhost:8443/".to_string()
+    } else {
+        format!("http://{}/", side.site())
+    };
+    let delivery = woocommerce_support::resign(
+        &woocommerce_support::replay::Delivery::load("flow_a.stock_changed"),
+        secret,
+        &source,
+    );
+    let (status, body) = post_delivery(app, &delivery).await;
+    (status, body["status"].as_str().map(str::to_string))
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn replacing_the_keys_of_a_connected_store_swaps_them_or_changes_nothing(pool: PgPool) {
+    let side = StoreSide::open("flow_i").await;
+    let app = woo_app(pool, side.provider(7)).await;
+    let seller = new_actor(&app).await;
+    let stranger = new_actor(&app).await;
+    let (connection, first_secret) = connect_via_routes(&app, &seller, &side).await;
+    let path = format!("/v1/connectors/{connection}/credentials");
+    let before = sealed_credential(&app, connection).await;
+    assert_eq!(
+        webhook_status(&side, &app, &first_secret).await.0,
+        StatusCode::OK
+    );
+
+    // Refusals change nothing: wrong shape, another seller's connection, keys the
+    // store does not know, a read-only key.
+    let (status, body) = api(
+        &app,
+        "PUT",
+        &path,
+        Some(&seller.token),
+        &json!({"consumer_key": "nope", "consumer_secret": "nope"}),
+    )
+    .await;
+    assert_eq!(
+        (status, body["error"]["code"].as_str()),
+        (StatusCode::UNPROCESSABLE_ENTITY, Some("invalid_keys"))
+    );
+    let unknown = json!({"consumer_key": format!("ck_{}", "e".repeat(40)), "consumer_secret": format!("cs_{}", "f".repeat(40))});
+    let (status, body) = api(&app, "PUT", &path, Some(&seller.token), &unknown).await;
+    assert_eq!(
+        (status, body["error"]["code"].as_str()),
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Some("credentials_rejected")
+        ),
+        "{body}"
+    );
+    let read_only = minted(&side, "read", "keys_read_only");
+    let (status, body) = api(&app, "PUT", &path, Some(&seller.token), &read_only).await;
+    assert_eq!(
+        (status, body["error"]["code"].as_str()),
+        (StatusCode::UNPROCESSABLE_ENTITY, Some("keys_read_only")),
+        "{body}"
+    );
+    let good = minted(&side, "read_write", "keys_new");
+    let (status, body) = api(&app, "PUT", &path, Some(&stranger.token), &good).await;
+    assert_eq!(
+        (status, body["error"]["code"].as_str()),
+        (StatusCode::NOT_FOUND, Some("connection_not_found"))
+    );
+    assert_eq!(
+        sealed_credential(&app, connection).await,
+        before,
+        "the old keys are still sealed"
+    );
+    assert_eq!(webhook_secret(&app, connection).await, first_secret);
+    assert_eq!(
+        webhook_status(&side, &app, &first_secret).await.0,
+        StatusCode::OK,
+        "the old webhooks still work with the old secret"
+    );
+
+    // The new pair replaces the old: same connection, new sealed credential, new
+    // webhook secret, our webhooks swapped on the store.
+    let (status, body) = api(&app, "PUT", &path, Some(&seller.token), &good).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["kind"], "connector_connected");
+    assert_eq!(body["connection"]["id"], connection.to_string());
+    assert_eq!(body["connection"]["status"], "connected");
+    assert!(!body.to_string().contains("ck_") && !body.to_string().contains("cs_"));
+    assert_ne!(sealed_credential(&app, connection).await, before);
+    let second_secret = webhook_secret(&app, connection).await;
+    assert_ne!(second_secret, first_secret);
+    assert_eq!(
+        webhook_status(&side, &app, &first_secret).await.0,
+        StatusCode::UNAUTHORIZED,
+        "the old secret no longer verifies"
+    );
+    assert_eq!(
+        webhook_status(&side, &app, &second_secret).await.0,
+        StatusCode::OK
+    );
+    let products = read_catalog(&app, &seller, connection).await;
+    assert!(!products.is_empty(), "the new keys read the catalog");
+    if side.is_live() {
+        let hooks = side
+            .live()
+            .rest("GET", "/wc/v3/webhooks?per_page=100", None)
+            .await;
+        let ours = hooks
+            .as_array()
+            .expect("hooks")
+            .iter()
+            .filter(|hook| hook["delivery_url"] == woocommerce_support::WEBHOOK_URL)
+            .count();
+        assert_eq!(ours, 3, "the old webhooks are gone, the new ones are there");
+    }
+
+    // A store that needs attention is brought back by the same call.
+    store::set_attention(
+        &app.pool,
+        connection,
+        "webhook_registration_failed",
+        app.clock.now(),
+    )
+    .await
+    .expect("attention");
+    let again = minted(&side, "read_write", "keys_again");
+    let (status, body) = api(&app, "PUT", &path, Some(&seller.token), &again).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["connection"]["status"], "connected");
+    assert!(body["connection"]["last_error"].is_null());
+    assert_ne!(webhook_secret(&app, connection).await, second_secret);
+
+    // A disconnected connection takes no keys.
+    let (status, _) = api(
+        &app,
+        "DELETE",
+        &format!("/v1/connectors/{connection}"),
+        Some(&seller.token),
+        &json!(null),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, body) = api(&app, "PUT", &path, Some(&seller.token), &again).await;
+    assert_eq!(
+        (status, body["error"]["code"].as_str()),
+        (StatusCode::CONFLICT, Some("not_pending"))
+    );
+    if let Some(replay) = &side.replay {
         replay.assert_no_misses();
     }
 }

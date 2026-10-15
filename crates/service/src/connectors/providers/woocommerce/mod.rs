@@ -124,7 +124,7 @@ impl WooCommerceProvider {
     /// reachable over HTTPS with a valid certificate, WordPress with pretty
     /// permalinks (the `wc-auth` endpoint needs the rewrite rules), WooCommerce
     /// active, and the address WordPress itself reports.
-    async fn check_storefront(&self, site: &Site) -> Result<(), ProviderError> {
+    async fn check_storefront(&self, site: &Site, rotating: bool) -> Result<(), ProviderError> {
         let index = self
             .http
             .send(site, Auth::None, Method::GET, "/wp-json/", &[], None)
@@ -215,10 +215,20 @@ impl WooCommerceProvider {
         if let Some(home) = root.get("home").and_then(Value::as_str) {
             if let Ok(reported) = Site::parse(home, self.policy()) {
                 if reported.canonical() != site.canonical() {
-                    return Err(ProviderError::Invalid(format!(
+                    let message = format!(
                         "WordPress reports this store's address as {}. Use exactly that address.",
                         reported.canonical()
-                    )));
+                    );
+                    // Replacing the keys of a connected store: keys for the store at
+                    // this address are not keys for the store the connection is for.
+                    return Err(if rotating {
+                        ProviderError::Rejected {
+                            code: "wrong_store".into(),
+                            message,
+                        }
+                    } else {
+                        ProviderError::Invalid(message)
+                    });
                 }
             }
         }
@@ -422,7 +432,7 @@ impl ConnectorProvider for WooCommerceProvider {
             ));
         }
         let return_url = self.return_url_for(&request.params)?;
-        self.check_storefront(&site).await?;
+        self.check_storefront(&site, false).await?;
         let mut authorize =
             url::Url::parse(&site.url(self.http.plain_http(), "/wc-auth/v1/authorize"))
                 .map_err(|_| ProviderError::Invalid("The store address is not valid.".into()))?;
@@ -462,6 +472,13 @@ impl ConnectorProvider for WooCommerceProvider {
             &field(&fields, "consumer_key").unwrap_or_default(),
             &field(&fields, "consumer_secret").unwrap_or_default(),
         )?;
+        // The pasted-keys route replacing a connected store's keys marks its
+        // request, and the store is probed again first: reachable over HTTPS,
+        // WooCommerce there, and at the address the connection is for.
+        if fields.get("rotate").and_then(Value::as_bool) == Some(true) {
+            self.check_storefront(&self.site(&request.pending.shop)?, true)
+                .await?;
+        }
         self.adopt_keys(&request.pending.shop, &request.webhook_url, keys)
             .await
     }

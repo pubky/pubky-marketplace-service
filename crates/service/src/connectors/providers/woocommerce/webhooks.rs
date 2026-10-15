@@ -38,12 +38,11 @@ fn invalid(message: &str) -> ProviderError {
     ProviderError::Invalid(message.to_string())
 }
 
-/// Removes webhooks a previous connection of ours left on the store. A reconnect
-/// carries a new secret, so the old ones would only fail their signature.
-async fn delete_ours(
+/// The ids of our webhooks on the store whose delivery URL `matches_url`.
+async fn list_ours(
     api: &Api<'_>,
     matches_url: impl Fn(&str) -> bool,
-) -> Result<u32, ProviderError> {
+) -> Result<Vec<i64>, ProviderError> {
     let listed = api
         .get(
             "/webhooks",
@@ -54,34 +53,44 @@ async fn delete_ours(
         )
         .await?
         .json()?;
-    let mut removed = 0;
-    for hook in listed.as_array().into_iter().flatten() {
-        let name = hook.get("name").and_then(Value::as_str).unwrap_or_default();
-        let url = hook
-            .get("delivery_url")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if !name.starts_with(WEBHOOK_NAME_PREFIX) || !matches_url(url) {
-            continue;
-        }
-        if let Some(id) = id_of(hook) {
-            api.delete(&format!("/webhooks/{id}"), &[("force", "true".into())])
-                .await?;
-            removed += 1;
-        }
+    Ok(listed
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|hook| {
+            let name = hook.get("name").and_then(Value::as_str).unwrap_or_default();
+            let url = hook
+                .get("delivery_url")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            name.starts_with(WEBHOOK_NAME_PREFIX) && matches_url(url)
+        })
+        .filter_map(id_of)
+        .collect())
+}
+
+async fn delete_ids(api: &Api<'_>, ids: &[i64]) -> Result<(), ProviderError> {
+    for id in ids {
+        api.delete(&format!("/webhooks/{id}"), &[("force", "true".into())])
+            .await?;
     }
-    Ok(removed)
+    Ok(())
 }
 
 /// Registers the three topics at `delivery_url` with `secret`, replacing ours
-/// from an earlier connection. A key without write access is the usual
-/// failure, and is reported as such.
+/// from an earlier connection or an earlier key. The new webhooks are created
+/// first and the old ones deleted after, so a failure part way (a key without
+/// write access, the store going away) leaves the old webhooks working with
+/// the old secret, which is still the one stored; what was created is removed
+/// again. A key without write access is the usual failure, and is reported as
+/// such.
 pub async fn register(
     api: &Api<'_>,
     delivery_url: &str,
     secret: &str,
 ) -> Result<(), ProviderError> {
-    delete_ours(api, |url| url == delivery_url).await?;
+    let earlier = list_ours(api, |url| url == delivery_url).await?;
+    let mut created_ids: Vec<i64> = Vec::new();
     for topic in TOPICS {
         let created = api
             .post(
@@ -96,19 +105,28 @@ pub async fn register(
             )
             .await;
         match created {
-            Ok(_) => {}
-            Err(ProviderError::Rejected { code, .. })
-                if code == "forbidden" || code == "cannot_create" =>
-            {
-                return Err(ProviderError::Rejected {
-                    code: "keys_read_only".into(),
-                    message: "The API key cannot create webhooks. Create a key with Read/Write permissions.".into(),
+            Ok(reply) => {
+                if let Some(id) = reply.json().ok().as_ref().and_then(id_of) {
+                    created_ids.push(id);
+                }
+            }
+            Err(error) => {
+                let _ = delete_ids(api, &created_ids).await;
+                return Err(match error {
+                    ProviderError::Rejected { code, .. }
+                        if code == "forbidden" || code == "cannot_create" =>
+                    {
+                        ProviderError::Rejected {
+                            code: "keys_read_only".into(),
+                            message: "The API key cannot create webhooks. Create a key with Read/Write permissions.".into(),
+                        }
+                    }
+                    other => other,
                 });
             }
-            Err(error) => return Err(error),
         }
     }
-    Ok(())
+    delete_ids(api, &earlier).await
 }
 
 /// Deletes our webhooks from the store, best effort (the caller deletes its
@@ -117,10 +135,13 @@ pub async fn unregister(
     session: &Session,
     http: &super::http::WooHttp,
 ) -> Result<u32, ProviderError> {
-    delete_ours(&session.api(http), |url| {
+    let api = session.api(http);
+    let ids = list_ours(&api, |url| {
         url.ends_with(WEBHOOK_PATH) || url.contains(&format!("{WEBHOOK_PATH}?"))
     })
-    .await
+    .await?;
+    delete_ids(&api, &ids).await?;
+    Ok(ids.len() as u32)
 }
 
 fn is_ping(body: &[u8]) -> bool {

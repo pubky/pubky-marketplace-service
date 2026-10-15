@@ -14,6 +14,7 @@
 
 use super::*;
 
+use crate::connectors::provider::ConnectCompleted;
 use crate::connectors::providers::woocommerce::creds::ApiKeys;
 
 #[derive(Deserialize)]
@@ -52,8 +53,8 @@ pub async fn put_keys(
     .await
 }
 
-/// Verifies a pasted key pair against the store of the seller's own draft and
-/// connects it, exactly as the wc-auth callback does.
+/// Connects the seller's own draft with a pasted key pair, or replaces the key
+/// pair of a connection that is already connected ("replace credentials").
 pub async fn connect_with_keys(
     state: &AppState,
     runtime: &std::sync::Arc<ConnectorRuntime>,
@@ -61,14 +62,18 @@ pub async fn connect_with_keys(
     consumer_key: String,
     consumer_secret: String,
 ) -> Response {
-    let Some(provider) = runtime.providers.get(ProviderKind::Woocommerce) else {
+    if runtime.providers.get(ProviderKind::Woocommerce).is_none() {
         return provider_unavailable();
-    };
+    }
     let now = state.clock.now();
     let still_draft = row.status == "draft"
         && row.connect_state_hash.is_some()
         && row.connect_expires_at.is_some_and(|expires| expires > now);
-    if row.provider != ProviderKind::Woocommerce.as_str() || !still_draft {
+    let replaceable = matches!(
+        row.status.as_str(),
+        "connected" | "needs_attention" | "error"
+    );
+    if row.provider != ProviderKind::Woocommerce.as_str() || !(still_draft || replaceable) {
         return error(
             StatusCode::CONFLICT,
             "not_pending",
@@ -82,50 +87,17 @@ pub async fn connect_with_keys(
         }
         Err(other) => return provider_failure(StatusCode::BAD_GATEWAY, other),
     };
-    let body = serde_json::to_vec(&json!({
-        "consumer_key": keys.key,
-        "consumer_secret": keys.secret,
-    }))
-    .expect("keys serialize");
-    let complete = CompleteRequest {
-        pending: PendingConnection {
-            connection_id: row.id,
-            seller_pubky: row.seller_pubky.clone(),
-            shop: row.shop.clone(),
-            state: String::new(),
-        },
-        app: None,
-        callback: CallbackParams {
-            body,
-            ..CallbackParams::default()
-        },
-        webhook_url: runtime.settings.woocommerce_webhook_url(),
-    };
-    let completed = match call(runtime, provider.complete_connect(&complete)).await {
+    if replaceable {
+        return replace_keys(state, runtime, row, keys).await;
+    }
+    let completed = match verify_keys(runtime, &row, &keys, false).await {
         Ok(completed) => completed,
-        Err(ProviderError::Rejected { code, .. }) if code == "credentials_rejected" => {
-            return error(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "credentials_rejected",
-                "The store does not accept this consumer key and secret.",
-            )
-        }
-        Err(ProviderError::Unauthorized) => {
-            return error(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "credentials_rejected",
-                "The store does not accept this consumer key and secret.",
-            )
-        }
-        Err(ProviderError::Rejected { code, .. }) if code == "keys_read_only" => {
-            return error(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "keys_read_only",
-                "These keys cannot create webhooks or orders. Create a key with Read/Write permissions.",
-            )
-        }
-        Err(failure) => return provider_failure(StatusCode::BAD_GATEWAY, failure),
+        Err(response) => return response,
     };
+    let provider = runtime
+        .providers
+        .get(ProviderKind::Woocommerce)
+        .expect("checked above");
     let missing: Vec<String> = provider
         .required_scopes()
         .into_iter()
@@ -157,4 +129,164 @@ pub async fn connect_with_keys(
         ),
         Err(CompleteError::Database(cause)) => internal("connection completion", &cause),
     }
+}
+
+/// Verifies a key pair against the connection's store, exactly as connecting
+/// does (the read that decides Basic or query-string auth, the webhooks
+/// registered with a fresh per-connection secret), and returns the credential to
+/// seal. `rotate` adds the storefront probe: the store must still answer at the
+/// address the connection is for. A refusal is typed and nothing was changed on
+/// our side.
+async fn verify_keys(
+    runtime: &std::sync::Arc<ConnectorRuntime>,
+    row: &ConnectionRow,
+    keys: &ApiKeys,
+    rotate: bool,
+) -> Result<ConnectCompleted, Response> {
+    let provider = runtime
+        .providers
+        .get(ProviderKind::Woocommerce)
+        .ok_or_else(provider_unavailable)?;
+    let body = serde_json::to_vec(&json!({
+        "consumer_key": keys.key,
+        "consumer_secret": keys.secret,
+        "rotate": rotate,
+    }))
+    .expect("keys serialize");
+    let complete = CompleteRequest {
+        pending: PendingConnection {
+            connection_id: row.id,
+            seller_pubky: row.seller_pubky.clone(),
+            shop: row.shop.clone(),
+            state: String::new(),
+        },
+        app: None,
+        callback: CallbackParams {
+            body,
+            ..CallbackParams::default()
+        },
+        webhook_url: runtime.settings.woocommerce_webhook_url(),
+    };
+    match call(runtime, provider.complete_connect(&complete)).await {
+        Ok(completed) => Ok(completed),
+        Err(ProviderError::Rejected { code, .. }) if code == "credentials_rejected" => Err(error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "credentials_rejected",
+            "The store does not accept this consumer key and secret.",
+        )),
+        Err(ProviderError::Unauthorized) => Err(error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "credentials_rejected",
+            "The store does not accept this consumer key and secret.",
+        )),
+        Err(ProviderError::Rejected { code, .. }) if code == "keys_read_only" => Err(error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "keys_read_only",
+            "These keys cannot create webhooks or orders. Create a key with Read/Write permissions.",
+        )),
+        Err(ProviderError::Rejected { code, message }) if code == "wrong_store" => Err(error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "wrong_store",
+            &message,
+        )),
+        Err(failure) => Err(provider_failure(StatusCode::BAD_GATEWAY, failure)),
+    }
+}
+
+/// "Replace credentials" on a connected (or needs-attention, or rejected)
+/// store: verify the new pair, then swap it for the old one in one
+/// transaction.
+///
+/// The connection's row is locked for the whole call, so two replacements of
+/// the same store run one after the other and the webhooks the store ends up
+/// with always match the secret that is stored. A refusal (wrong keys, keys
+/// for another store, a read-only key, the store unreachable) returns before
+/// anything is written and leaves the old keys, secret and status as they were;
+/// the webhooks are swapped create-first, so even a failure while registering
+/// leaves the old ones working. The old key pair is not revoked on the store
+/// (WooCommerce has no call for it): the merchant deletes it under WooCommerce
+/// > Settings > Advanced > REST API.
+async fn replace_keys(
+    state: &AppState,
+    runtime: &std::sync::Arc<ConnectorRuntime>,
+    row: ConnectionRow,
+    keys: ApiKeys,
+) -> Response {
+    let provider = runtime
+        .providers
+        .get(ProviderKind::Woocommerce)
+        .expect("checked by the caller");
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(cause) => return internal("credential replacement", &cause),
+    };
+    let locked: Option<(String,)> = match sqlx::query_as(
+        "SELECT status FROM connector_connections \
+         WHERE id = $1 AND status IN ('connected', 'needs_attention', 'error') FOR UPDATE",
+    )
+    .bind(row.id)
+    .fetch_optional(&mut *tx)
+    .await
+    {
+        Ok(locked) => locked,
+        Err(cause) => return internal("credential replacement", &cause),
+    };
+    if locked.is_none() {
+        return error(
+            StatusCode::CONFLICT,
+            "not_pending",
+            "This connection is no longer connected.",
+        );
+    }
+    let completed = match verify_keys(runtime, &row, &keys, true).await {
+        Ok(completed) => completed,
+        Err(response) => return response,
+    };
+    let missing: Vec<String> = provider
+        .required_scopes()
+        .into_iter()
+        .filter(|scope| !completed.scopes.contains(scope))
+        .collect();
+    let now = state.clock.now();
+    let aad = crate::connectors::keys::credential_aad(&row.seller_pubky, &row.provider, &row.shop);
+    let sealed = runtime.keys.seal(&aad, completed.credentials.expose());
+    let written = sqlx::query(
+        "INSERT INTO connector_credentials (connection_id, sealed, created_at, updated_at) \
+         VALUES ($1, $2, $3, $3) \
+         ON CONFLICT (connection_id) DO UPDATE SET sealed = EXCLUDED.sealed, \
+             updated_at = EXCLUDED.updated_at",
+    )
+    .bind(row.id)
+    .bind(&sealed)
+    .bind(now)
+    .execute(&mut *tx)
+    .await;
+    if let Err(cause) = written {
+        return internal("credential replacement", &cause);
+    }
+    let updated: Result<ConnectionRow, sqlx::Error> = sqlx::query_as(&format!(
+        "UPDATE connector_connections SET status = $4, scopes = $2, missing_scopes = $3, \
+         last_error = NULL, last_error_at = NULL, updated_at = $5 \
+         WHERE id = $1 RETURNING {}",
+        store::CONNECTION_COLUMNS
+    ))
+    .bind(row.id)
+    .bind(&completed.scopes)
+    .bind(&missing)
+    .bind(if missing.is_empty() {
+        "connected"
+    } else {
+        "needs_attention"
+    })
+    .bind(now)
+    .fetch_one(&mut *tx)
+    .await;
+    let connected = match updated {
+        Ok(connected) => connected,
+        Err(cause) => return internal("credential replacement", &cause),
+    };
+    if let Err(cause) = tx.commit().await {
+        return internal("credential replacement", &cause);
+    }
+    connected_json(state, runtime, &connected).await
 }

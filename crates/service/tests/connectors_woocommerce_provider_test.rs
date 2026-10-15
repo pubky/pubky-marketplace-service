@@ -946,3 +946,62 @@ async fn a_real_webhook_signature_verifies_and_a_changed_body_does_not() {
         .verify_webhook(&context(wrong), &delivery.body(), &headers)
         .is_err());
 }
+
+#[tokio::test]
+async fn replacing_keys_for_a_store_that_answers_at_another_address_is_refused() {
+    // Valid keys, but the store at this address says it is somewhere else:
+    // they are not the keys of the store the connection is for.
+    let side = StoreSide::open_with("p_rotate_other_store", false).await;
+    let provider = side.provider(7);
+    let origin = if side.is_live() {
+        "https://localhost:8443".to_string()
+    } else {
+        format!("http://{}", side.site())
+    };
+    let mut authorize = url::Url::parse(&format!("{origin}/wc-auth/v1/authorize")).expect("url");
+    authorize
+        .query_pairs_mut()
+        .append_pair("app_name", "Pubky Shop")
+        .append_pair("scope", "read_write")
+        .append_pair("user_id", "rotate-other-store")
+        .append_pair("return_url", RETURN_URL)
+        .append_pair("callback_url", CALLBACK_URL);
+    let mut keys: Value =
+        serde_json::from_slice(&side.approve(authorize.as_str(), "callback")).expect("keys");
+    keys["rotate"] = json!(true);
+    let site = if side.is_live() {
+        "127.0.0.1:8443".to_string()
+    } else {
+        side.site()
+    };
+    let refused = provider
+        .complete_connect(&CompleteRequest {
+            pending: PendingConnection {
+                connection_id: Uuid::new_v4(),
+                seller_pubky: "seller".into(),
+                shop: provider.normalize_shop(&site).expect("shop"),
+                state: String::new(),
+            },
+            app: None,
+            callback: CallbackParams {
+                body: serde_json::to_vec(&keys).expect("json"),
+                ..CallbackParams::default()
+            },
+            webhook_url: WEBHOOK_URL.into(),
+        })
+        .await;
+    match refused {
+        Err(ProviderError::Rejected { code, message }) => {
+            assert_eq!(code, "wrong_store");
+            assert!(message.contains("localhost:8443"), "{message}");
+        }
+        other => panic!("expected wrong_store, got {other:?}"),
+    }
+    if let Some(replay) = &side.replay {
+        assert!(
+            replay.matched().iter().all(|seen| seen.auth == "none"),
+            "no key was sent to a store that is not the connection's"
+        );
+        replay.assert_no_misses();
+    }
+}
