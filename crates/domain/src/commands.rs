@@ -2012,7 +2012,6 @@ fn validate_ship_order(
         .tracking_number
         .as_deref()
         .is_some_and(|number| number.is_empty())
-        && issues.is_empty()
     {
         payload.tracking_number = None;
     }
@@ -3479,6 +3478,38 @@ mod tests {
             panic!("expected ship payload");
         };
         assert_eq!(ship.tracking_number.as_deref(), Some("T-1"));
+    }
+
+    #[test]
+    fn ship_tracking_issues_are_independent_of_carrier_issues() {
+        let order_id = "00000000-0000-4000-8000-00000000aaaa";
+        let issues = parse_command(&order_command_json(
+            "fulfillment.ship",
+            json!({ "order_id": order_id, "carrier": "", "tracking_number": "   " }),
+        ))
+        .expect_err("an empty carrier is invalid");
+        assert!(
+            issues.iter().any(|i| i.path == "payload.carrier"),
+            "{issues:?}"
+        );
+        assert!(
+            issues.iter().all(|i| i.path != "payload.tracking_number"),
+            "a blank number within the bound is no tracking: {issues:?}"
+        );
+
+        let issues = parse_command(&order_command_json(
+            "fulfillment.ship",
+            json!({ "order_id": order_id, "carrier": "Other", "tracking_number": " ".repeat(201) }),
+        ))
+        .expect_err("over-length blank tracking is invalid");
+        assert_eq!(
+            issues
+                .iter()
+                .filter(|i| i.path == "payload.tracking_number")
+                .count(),
+            1,
+            "{issues:?}"
+        );
     }
 
     #[test]
