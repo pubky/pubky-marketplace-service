@@ -1,0 +1,4 @@
+.local/
+certs/*.key
+certs/server.pem
+nginx/extra/*.conf

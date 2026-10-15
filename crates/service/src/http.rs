@@ -121,6 +121,10 @@ pub fn build_router(state: AppState) -> Router {
                 .put(crate::connectors::routes::put_selection),
         )
         .route(
+            "/v1/connectors/{id}/woocommerce/keys",
+            put(crate::connectors::routes::woocommerce_keys::put_keys),
+        )
+        .route(
             "/v1/connectors/{id}/pushes",
             get(crate::connectors::routes::list_pushes),
         )

@@ -1624,3 +1624,6 @@ async fn connected_json(state: &AppState, connected: &ConnectionRow) -> Response
         Err(cause) => internal("connection summary", &cause),
     }
 }
+
+#[path = "providers/woocommerce/keys_route.rs"]
+pub mod woocommerce_keys;
