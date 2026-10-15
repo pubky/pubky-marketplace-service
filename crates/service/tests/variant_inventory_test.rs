@@ -1557,3 +1557,168 @@ async fn a_record_that_enables_no_variant_leaves_the_rows_alone(pool: PgPool) {
     );
     assert_books_balance(&app.pool).await;
 }
+
+async fn sync_status(app: &TestApp, token: &str, seller: &str, n: u64) -> (StatusCode, Value) {
+    execute(app, token, &sync(seller, n)).await
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_record_with_one_enabled_variant_counts_only_its_stock(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    put_record(
+        &homeserver,
+        &seller.pubky,
+        record(1, &[("size_m", true, 4), ("size_xl", false, 9)]),
+    );
+    let (status, body) = sync_status(&app, &buyer.token, &seller.pubky, 1).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        rows(&app.pool, &seller.pubky).await,
+        [("".into(), 4, 0, 0, 4)]
+    );
+    assert_eq!(
+        totals(&app.pool, &seller.pubky).await,
+        (4, 0, 0, 4, "available".to_string()),
+        "the withdrawn size's nine units are not for sale"
+    );
+
+    // With no disabled variant the listing is what it always was.
+    let other = new_actor(&app).await;
+    put_record(&homeserver, &other.pubky, record(1, &[("only", true, 4)]));
+    let (status, body) = sync_status(&app, &buyer.token, &other.pubky, 2).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        rows(&app.pool, &other.pubky).await,
+        [("".into(), 4, 0, 0, 4)]
+    );
+    assert_books_balance(&app.pool).await;
+}
+
+/// A listing registered before this change counted the disabled variant's
+/// stock. The next sync of its record, at the same revision, recomputes the
+/// total from the enabled variant: once, and only while the total is still
+/// exactly that legacy sum.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_legacy_total_that_counted_disabled_stock_is_recomputed_once(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (status, body) = execute(&app, &seller.token, &register_command(&seller.pubky, 13)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    put_record(
+        &homeserver,
+        &seller.pubky,
+        record(1, &[("size_m", true, 4), ("size_xl", false, 9)]),
+    );
+    assert_eq!(
+        rows(&app.pool, &seller.pubky).await,
+        [("".into(), 13, 0, 0, 13)]
+    );
+
+    let (status, body) = sync_status(&app, &buyer.token, &seller.pubky, 1).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        rows(&app.pool, &seller.pubky).await,
+        [("".into(), 4, 0, 0, 4)]
+    );
+    let revision = listing_revision(&app.pool, &seller.pubky).await;
+
+    let (status, body) = sync_status(&app, &buyer.token, &seller.pubky, 2).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        listing_revision(&app.pool, &seller.pubky).await,
+        revision,
+        "a second sync finds nothing to recompute"
+    );
+    assert_books_balance(&app.pool).await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn the_recompute_never_goes_below_the_units_already_sold(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    execute(&app, &seller.token, &register_command(&seller.pubky, 13)).await;
+    put_record(
+        &homeserver,
+        &seller.pubky,
+        record(1, &[("size_m", true, 4), ("size_xl", false, 9)]),
+    );
+    for n in 1..=6 {
+        let (status, body) = buy_sandbox(&app, &buyer, &seller.pubky, "size_m", n).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    assert_eq!(
+        rows(&app.pool, &seller.pubky).await,
+        [("".into(), 7, 0, 6, 13)]
+    );
+
+    let (status, body) = sync_status(&app, &buyer.token, &seller.pubky, 1).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        rows(&app.pool, &seller.pubky).await,
+        [("".into(), 0, 0, 6, 6)],
+        "four enabled units are fewer than six sold, so the total is the sold units"
+    );
+    assert_eq!(
+        totals(&app.pool, &seller.pubky).await,
+        (0, 0, 6, 6, "sold".to_string())
+    );
+    assert_books_balance(&app.pool).await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_sellers_adjustment_is_not_undone_by_the_recompute(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    execute(&app, &seller.token, &register_command(&seller.pubky, 13)).await;
+    put_record(
+        &homeserver,
+        &seller.pubky,
+        record(1, &[("size_m", true, 4), ("size_xl", false, 9)]),
+    );
+    let revision = listing_revision(&app.pool, &seller.pubky).await;
+    let (status, body) = post_adjust(
+        &app,
+        &seller.token,
+        &adjust(&seller.pubky, revision, 1, 1, None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = sync_status(&app, &buyer.token, &seller.pubky, 1).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        rows(&app.pool, &seller.pubky).await,
+        [("".into(), 14, 0, 0, 14)],
+        "the total moved by the seller is not the legacy sum, so the same-revision sync keeps it"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_edit_below_committed_units_is_still_refused_without_a_disabled_variant(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    execute(&app, &seller.token, &register_command(&seller.pubky, 5)).await;
+    put_record(&homeserver, &seller.pubky, record(1, &[("only", true, 5)]));
+    for n in 1..=3 {
+        let (status, body) = buy_sandbox(&app, &buyer, &seller.pubky, "only", n).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    put_record(&homeserver, &seller.pubky, record(2, &[("only", true, 2)]));
+    let (status, body) = sync_status(&app, &buyer.token, &seller.pubky, 1).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], json!("INVARIANT_VIOLATION"));
+    assert_eq!(
+        body["error"]["message"],
+        json!("Listing quantity cannot fall below committed inventory.")
+    );
+    assert_eq!(
+        rows(&app.pool, &seller.pubky).await,
+        [("".into(), 2, 0, 3, 5)]
+    );
+}

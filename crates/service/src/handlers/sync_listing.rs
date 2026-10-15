@@ -218,6 +218,43 @@ pub async fn handle(
                     }
                 }
             }
+            // A listing that sells one variant counted the stock of the
+            // record's disabled variants in its total. At the same record
+            // revision the total is recomputed from the enabled variants when
+            // it is still exactly that legacy sum (a seller's adjustment has
+            // moved it otherwise, and stays), never below the units already
+            // reserved or sold.
+            if registration.listing_revision == current.listing_revision
+                && registration.sale_format == SaleFormat::FixedPrice
+                && !registration.variants.is_empty()
+                && current.total_quantity == registration.quantity
+            {
+                let enabled: i64 = registration
+                    .variants
+                    .iter()
+                    .map(|variant| variant.quantity)
+                    .sum();
+                let committed = current.reserved_quantity + current.sold_quantity;
+                let target = enabled.max(committed);
+                if target != current.total_quantity
+                    && !crate::variant_stock::tracks_variants(
+                        &crate::variant_stock::lock_rows(tx, &command.aggregate_id).await?,
+                    )
+                {
+                    return apply_registration(
+                        tx,
+                        actor,
+                        command.command_id,
+                        &command.aggregate_id,
+                        &registration,
+                        Some(current),
+                        None,
+                        "listing.synced",
+                        now,
+                    )
+                    .await;
+                }
+            }
             let registration_methods: Vec<String> = registration
                 .fulfillment_methods
                 .iter()

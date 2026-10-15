@@ -402,7 +402,22 @@ pub(crate) async fn apply_registration(
     let (total, available, reserved, sold, state) = match &plan {
         StockPlan::Implicit => {
             let committed = reserved_now + sold_now;
-            if payload.quantity < committed {
+            // Stock is the enabled variants' units: a disabled variant is not
+            // for sale. A client that sent no variants (or a record with no
+            // enabled variant with an id) gives only `payload.quantity`, which
+            // is the sum of every variant, as before.
+            let enabled_stock = if variants.is_empty() {
+                payload.quantity
+            } else {
+                variants.iter().map(|variant| variant.quantity).sum()
+            };
+            // Recomputing a listing that counted a disabled variant's stock
+            // must not go below the units already reserved or sold. Only that
+            // case clamps; an edit that lowers the sum of every variant below
+            // committed units is refused, exactly as before.
+            let clamped = enabled_stock < committed && payload.quantity >= committed;
+            let quantity = if clamped { committed } else { enabled_stock };
+            if quantity < committed {
                 return Ok(Err(CommandFailure::refused_with_revision(
                     crate::refusal_audit::RefusalKind::InvariantViolation,
                     ErrorCode::InvariantViolation,
@@ -410,8 +425,12 @@ pub(crate) async fn apply_registration(
                     current_revision,
                 )));
             }
-            let state = if payload.quantity == committed {
-                if committed > 0 {
+            // A fully committed listing reads `reserved` whenever it has any
+            // committed unit (an old rule, kept for listings that sell one
+            // variant as they were); a recompute that clamped to the committed
+            // units reads `reserved` only while a hold is open.
+            let state = if quantity == committed {
+                if (clamped && reserved_now > 0) || (!clamped && committed > 0) {
                     "reserved"
                 } else {
                     "sold"
@@ -420,8 +439,8 @@ pub(crate) async fn apply_registration(
                 "available"
             };
             (
-                payload.quantity,
-                payload.quantity - committed,
+                quantity,
+                quantity - committed,
                 reserved_now,
                 sold_now,
                 state,
