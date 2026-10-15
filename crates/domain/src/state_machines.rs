@@ -1074,9 +1074,8 @@ mod tests {
     }
 
     // Updating tracking edits the shipment of an order that stays `shipped`,
-    // so no edge names it; only the catalog does. No edge leaves `shipped`
-    // for any state but `delivered` (and its cancel and return siblings), so
-    // the command cannot be offered once the order is delivered or closed.
+    // so no edge names it; only the catalog does. The handler refuses every
+    // other state.
     #[test]
     fn update_tracking_is_catalogued_and_moves_no_state() {
         let machine = order_machine();
