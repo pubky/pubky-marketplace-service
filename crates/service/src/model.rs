@@ -102,6 +102,11 @@ pub struct ListingRow {
     /// Offers, awards, and unpaid orders created earlier belong to the
     /// deleted listing and cannot take stock from the revived one.
     pub recreated_at: Option<DateTime<Utc>>,
+    /// Per-variant availability (`[{variant_id, available_quantity,
+    /// sold_out}]`, offered variants only) for a listing that tracks stock
+    /// per variant; NULL for a listing that sells one variant. Maintained by
+    /// the variant-inventory trigger (migration 0070), never written here.
+    pub variant_availability: Option<Value>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -242,6 +247,10 @@ impl ListingRow {
             "digital_delivery": self.digital_delivery_projection(),
             "updated_at": format_timestamp(self.updated_at),
         });
+        let mut projection = projection;
+        if let Some(variants) = &self.variant_availability {
+            projection["variants"] = variants.clone();
+        }
         crate::reserve_secrecy::ensure_reserve_free(&projection)
             .map_err(|_| ListingProjectionError)?;
         Ok(projection)

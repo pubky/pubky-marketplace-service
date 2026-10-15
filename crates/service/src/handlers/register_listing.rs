@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use marketplace_domain::commands::{
     validate_public_listing_payload, AuctionReserve, Command, CommandPayload,
-    RegisterListingPayload, SaleFormat, UNLIMITED_STOCK_ON_PHYSICAL_LISTING,
+    RegisterListingPayload, SaleFormat, VariantStock, UNLIMITED_STOCK_ON_PHYSICAL_LISTING,
 };
 use marketplace_domain::{ids, ErrorCode};
 use serde_json::{json, Value};
@@ -19,6 +19,7 @@ use crate::homeserver::{
 };
 use crate::model::{money_json, AuctionReserveRow, AuctionState, ListingRow};
 use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
+use crate::variant_stock::{self, StockPlan};
 
 /// The refusal for a listing that ships or offers pickup at the unlimited
 /// digital cap (`listing.register` and `listing.sync`, and so
@@ -371,26 +372,75 @@ pub(crate) async fn apply_registration(
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     let current_revision = current.as_ref().map(|c| c.server_revision).unwrap_or(0);
-    let reserved = current.as_ref().map(|c| c.reserved_quantity).unwrap_or(0);
-    let sold = current.as_ref().map(|c| c.sold_quantity).unwrap_or(0);
-    let committed = reserved + sold;
-    if payload.quantity < committed {
-        return Ok(Err(CommandFailure::refused_with_revision(
-            crate::refusal_audit::RefusalKind::InvariantViolation,
-            ErrorCode::InvariantViolation,
-            "Listing quantity cannot fall below committed inventory.",
-            current_revision,
-        )));
-    }
-
-    let state = if payload.quantity == committed {
-        if committed > 0 {
-            "reserved"
-        } else {
-            "sold"
-        }
+    let variants: &[VariantStock] = if payload.sale_format == SaleFormat::FixedPrice {
+        &payload.variants
     } else {
-        "available"
+        &[]
+    };
+    let variant_rows = if current.is_some() {
+        variant_stock::lock_rows(tx, aggregate_id).await?
+    } else {
+        Vec::new()
+    };
+    let plan = match variant_stock::plan(
+        tx,
+        aggregate_id,
+        variants,
+        &variant_rows,
+        current.is_none(),
+        current_revision,
+    )
+    .await?
+    {
+        Ok(plan) => plan,
+        Err(failure) => return Ok(Err(failure)),
+    };
+    let reserved_now = current.as_ref().map(|c| c.reserved_quantity).unwrap_or(0);
+    let sold_now = current.as_ref().map(|c| c.sold_quantity).unwrap_or(0);
+    // The listing's quantity columns: the payload's quantity for a listing
+    // that sells one variant, the sum of its variant rows otherwise.
+    let (total, available, reserved, sold, state) = match &plan {
+        StockPlan::Implicit => {
+            let committed = reserved_now + sold_now;
+            if payload.quantity < committed {
+                return Ok(Err(CommandFailure::refused_with_revision(
+                    crate::refusal_audit::RefusalKind::InvariantViolation,
+                    ErrorCode::InvariantViolation,
+                    "Listing quantity cannot fall below committed inventory.",
+                    current_revision,
+                )));
+            }
+            let state = if payload.quantity == committed {
+                if committed > 0 {
+                    "reserved"
+                } else {
+                    "sold"
+                }
+            } else {
+                "available"
+            };
+            (
+                payload.quantity,
+                payload.quantity - committed,
+                reserved_now,
+                sold_now,
+                state,
+            )
+        }
+        StockPlan::PerVariant { rows, .. } => {
+            let total: i64 = rows.iter().map(|row| row.total).sum();
+            let available: i64 = rows.iter().map(|row| row.available).sum();
+            let reserved: i64 = rows.iter().map(|row| row.reserved).sum();
+            let sold: i64 = rows.iter().map(|row| row.sold).sum();
+            let state = if available > 0 {
+                "available"
+            } else if reserved > 0 {
+                "reserved"
+            } else {
+                "sold"
+            };
+            (total, available, reserved, sold, state)
+        }
     };
     let sale_format = match payload.sale_format {
         SaleFormat::FixedPrice => "fixed_price",
@@ -411,6 +461,11 @@ pub(crate) async fn apply_registration(
         .map(|method| method.as_str().to_string())
         .collect();
 
+    if current.is_some() {
+        if let StockPlan::PerVariant { rows, convert } = &plan {
+            variant_stock::write_plan(tx, aggregate_id, rows, *convert).await?;
+        }
+    }
     let written = if current.is_none() {
         let inserted = sqlx::query(
             "INSERT INTO listings (aggregate_id, seller_pubky, listing_id, title, \
@@ -429,8 +484,8 @@ pub(crate) async fn apply_registration(
         .bind(&payload.content_hash)
         .bind(new_revision)
         .bind(state)
-        .bind(payload.quantity)
-        .bind(payload.quantity - committed)
+        .bind(total)
+        .bind(available)
         .bind(reserved)
         .bind(sold)
         .bind(payload.unit_price.amount_minor)
@@ -465,8 +520,8 @@ pub(crate) async fn apply_registration(
         .bind(&payload.content_hash)
         .bind(new_revision)
         .bind(state)
-        .bind(payload.quantity)
-        .bind(payload.quantity - committed)
+        .bind(total)
+        .bind(available)
         .bind(payload.unit_price.amount_minor)
         .bind(&payload.unit_price.currency)
         .bind(payload.unit_price.exponent)
@@ -489,6 +544,11 @@ pub(crate) async fn apply_registration(
             "The listing revision is stale.",
             latest,
         )));
+    }
+    if current.is_none() {
+        if let StockPlan::PerVariant { rows, .. } = &plan {
+            variant_stock::write_plan(tx, aggregate_id, rows, true).await?;
+        }
     }
 
     if let Some(reserve) = payload.auction_reserve.as_ref() {

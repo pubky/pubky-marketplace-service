@@ -17,6 +17,7 @@ struct DueReservation {
     buyer_pubky: String,
     quantity: i64,
     drop_aggregate_id: Option<String>,
+    variant_id: Option<String>,
 }
 
 /// Expires every active reservation due at `now`. Returns the number of
@@ -32,7 +33,7 @@ pub async fn expire_due_reservations(pool: &PgPool, now: DateTime<Utc>) -> anyho
     // to manual_review never releases the hold). Scoped to the Paykit
     // bitcoin rail; every other reservation sweeps exactly as before.
     let due: Vec<DueReservation> = sqlx::query_as(
-        "SELECT id, listing_aggregate_id, buyer_pubky, quantity, drop_aggregate_id \
+        "SELECT id, listing_aggregate_id, buyer_pubky, quantity, drop_aggregate_id, variant_id \
          FROM reservations \
          WHERE status = 'active' AND expires_at <= $1 \
          AND offer_award_id IS NULL \
@@ -83,15 +84,35 @@ pub async fn expire_due_reservations(pool: &PgPool, now: DateTime<Utc>) -> anyho
             }
         }
 
-        let new_revision: (i64,) = sqlx::query_as(
-            "UPDATE listings SET server_revision = server_revision + 1, state = 'available', \
-             available_quantity = available_quantity + $2, \
-             reserved_quantity = reserved_quantity - $2, updated_at = $3 \
-             WHERE aggregate_id = $1 AND reserved_quantity >= $2 \
-             RETURNING server_revision",
+        let rows =
+            crate::variant_stock::lock_rows(&mut tx, &reservation.listing_aggregate_id).await?;
+        let row = crate::variant_stock::resolve_held(&rows, reservation.variant_id.as_deref())
+            .map_err(|refusal| {
+                anyhow::anyhow!(
+                    "expired reservation {} names no variant row of its listing: {refusal:?}",
+                    reservation.id
+                )
+            })?;
+        if !crate::variant_stock::release(
+            &mut tx,
+            &reservation.listing_aggregate_id,
+            &row.variant_id,
+            reservation.quantity,
+            crate::variant_stock::Held::Reserved,
         )
+        .await?
+        {
+            anyhow::bail!(
+                "expired reservation {} is not held by its listing",
+                reservation.id
+            );
+        }
+        let new_revision: (i64,) = sqlx::query_as(&format!(
+            "UPDATE listings SET server_revision = server_revision + 1, state = {}, \
+             updated_at = $2 WHERE aggregate_id = $1 RETURNING server_revision",
+            crate::variant_stock::STATE_FROM_TOTALS_SQL
+        ))
         .bind(&reservation.listing_aggregate_id)
-        .bind(reservation.quantity)
         .bind(now)
         .fetch_one(&mut *tx)
         .await?;

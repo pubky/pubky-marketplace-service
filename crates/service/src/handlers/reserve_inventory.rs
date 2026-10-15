@@ -81,6 +81,23 @@ pub async fn handle(
         }
     }
 
+    let rows = crate::variant_stock::lock_rows(tx, &command.aggregate_id).await?;
+    let keyed = crate::variant_stock::tracks_variants(&rows);
+    let row = match crate::variant_stock::resolve(&rows, payload.variant_id.as_deref()) {
+        Ok(row) => row,
+        Err(refusal) => return Ok(Err(refusal.failure())),
+    };
+    if crate::variant_stock::shortfall(row, payload.quantity).is_some() {
+        return Ok(Err(CommandFailure::refused_with_revision(
+            crate::refusal_audit::RefusalKind::InsufficientInventory,
+            ErrorCode::InsufficientInventory,
+            "The requested quantity is unavailable.",
+            listing.server_revision,
+        )));
+    }
+    let variant_id = row.variant_id.clone();
+    let reservation_variant = keyed.then(|| variant_id.clone());
+
     let new_state = if listing.available_quantity == payload.quantity {
         "reserved"
     } else {
@@ -95,22 +112,27 @@ pub async fn handle(
         )));
     }
 
-    // Compare-and-swap on the expected revision; the CHECK constraints keep
-    // inventory non-negative even if this guard were bypassed.
-    let updated: Option<ListingRow> = sqlx::query_as(&format!(
-        "UPDATE listings SET server_revision = server_revision + 1, state = $3, \
-         available_quantity = available_quantity - $4, \
-         reserved_quantity = reserved_quantity + $4, updated_at = $5 \
-         WHERE aggregate_id = $1 AND server_revision = $2 AND available_quantity >= $4 \
-         RETURNING {LISTING_COLUMNS}"
-    ))
-    .bind(&command.aggregate_id)
-    .bind(command.expected_revision)
-    .bind(new_state)
-    .bind(payload.quantity)
-    .bind(now)
-    .fetch_optional(&mut **tx)
-    .await?;
+    // Compare-and-swap on the expected revision and on the variant's available
+    // units; the CHECK constraints keep inventory non-negative even if these
+    // guards were bypassed.
+    let held =
+        crate::variant_stock::reserve(tx, &command.aggregate_id, &variant_id, payload.quantity)
+            .await?;
+    let updated: Option<ListingRow> = if held {
+        sqlx::query_as(&format!(
+            "UPDATE listings SET server_revision = server_revision + 1, state = $3, \
+             updated_at = $4 WHERE aggregate_id = $1 AND server_revision = $2 \
+             RETURNING {LISTING_COLUMNS}"
+        ))
+        .bind(&command.aggregate_id)
+        .bind(command.expected_revision)
+        .bind(new_state)
+        .bind(now)
+        .fetch_optional(&mut **tx)
+        .await?
+    } else {
+        None
+    };
     let Some(listing) = updated else {
         let latest = current_listing_revision(tx, &command.aggregate_id).await?;
         return Ok(Err(CommandFailure::refused_with_revision(
@@ -124,8 +146,8 @@ pub async fn handle(
     let expires_at = now + chrono::Duration::seconds(payload.reservation_ttl_seconds);
     sqlx::query(
         "INSERT INTO reservations (id, listing_aggregate_id, buyer_pubky, quantity, status, \
-         expires_at, created_at, updated_at, drop_aggregate_id) \
-         VALUES ($1, $2, $3, $4, 'active', $5, $6, $6, $7)",
+         expires_at, created_at, updated_at, drop_aggregate_id, variant_id) \
+         VALUES ($1, $2, $3, $4, 'active', $5, $6, $6, $7, $8)",
     )
     .bind(command.command_id)
     .bind(&command.aggregate_id)
@@ -134,6 +156,7 @@ pub async fn handle(
     .bind(expires_at)
     .bind(now)
     .bind(&drop_aggregate_id)
+    .bind(&reservation_variant)
     .execute(&mut **tx)
     .await?;
     let reservation = ReservationRow {

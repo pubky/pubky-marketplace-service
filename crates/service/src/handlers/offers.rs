@@ -661,7 +661,13 @@ pub async fn accept(
             "The offer listing is unavailable.",
         )));
     };
-    if listing.available_quantity < offer.quantity {
+    let rows = crate::variant_stock::lock_rows(tx, &listing.aggregate_id).await?;
+    let keyed = crate::variant_stock::tracks_variants(&rows);
+    let row = match crate::variant_stock::resolve(&rows, Some(variant.id.as_str())) {
+        Ok(row) => row,
+        Err(refusal) => return Ok(Err(refusal.failure())),
+    };
+    if crate::variant_stock::shortfall(row, offer.quantity).is_some() {
         return Ok(Err(CommandFailure::refused_with_revision(
             crate::refusal_audit::RefusalKind::InsufficientInventory,
             ErrorCode::InsufficientInventory,
@@ -669,6 +675,8 @@ pub async fn accept(
             offer.revision,
         )));
     }
+    let held_variant = row.variant_id.clone();
+    let reservation_variant = keyed.then(|| held_variant.clone());
 
     let new_listing_state = if listing.available_quantity == offer.quantity {
         "reserved"
@@ -683,17 +691,19 @@ pub async fn accept(
             listing.server_revision,
         )));
     }
+    if !crate::variant_stock::reserve(tx, &listing.aggregate_id, &held_variant, offer.quantity)
+        .await?
+    {
+        return Err(sqlx::Error::RowNotFound);
+    }
     let updated_listing: ListingRow = sqlx::query_as(&format!(
         "UPDATE listings SET server_revision = server_revision + 1, state = $3, \
-         available_quantity = available_quantity - $4, \
-         reserved_quantity = reserved_quantity + $4, updated_at = $5 \
-         WHERE aggregate_id = $1 AND server_revision = $2 AND available_quantity >= $4 \
+         updated_at = $4 WHERE aggregate_id = $1 AND server_revision = $2 \
          RETURNING {LISTING_COLUMNS}"
     ))
     .bind(&listing.aggregate_id)
     .bind(listing.server_revision)
     .bind(new_listing_state)
-    .bind(offer.quantity)
     .bind(now)
     .fetch_one(&mut **tx)
     .await?;
@@ -702,8 +712,8 @@ pub async fn accept(
     let award_id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO reservations (id, listing_aggregate_id, buyer_pubky, quantity, status, \
-         expires_at, created_at, updated_at, offer_award_id) \
-         VALUES ($1, $2, $3, $4, 'active', $5, $6, $6, $7)",
+         expires_at, created_at, updated_at, offer_award_id, variant_id) \
+         VALUES ($1, $2, $3, $4, 'active', $5, $6, $6, $7, $8)",
     )
     .bind(command.command_id)
     .bind(&listing.aggregate_id)
@@ -712,6 +722,7 @@ pub async fn accept(
     .bind(expires_at)
     .bind(now)
     .bind(award_id)
+    .bind(&reservation_variant)
     .execute(&mut **tx)
     .await?;
     let reservation = ReservationRow {

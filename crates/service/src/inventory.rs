@@ -1,9 +1,13 @@
 //! Phase 6 Wave 1 listing-total inventory authority.
 //!
-//! The service never claims per-variant availability. An optional variant is
-//! only a seller-record lookup assertion, accepted when exactly one variant
-//! is enabled. Stock mutation, event append, external-reference persistence,
-//! and immutable idempotent result storage share one PostgreSQL transaction.
+//! A listing that sells one variant is adjusted as a listing total, and an
+//! optional variant on that request is only a seller-record lookup assertion,
+//! accepted when exactly one variant is enabled. A listing whose record has
+//! two or more enabled variants tracks stock per variant
+//! (`listing_variant_inventory`): its adjustment names the variant, which is
+//! resolved against the registered variant rows, and moves that variant's
+//! stock. Stock mutation, event append, external-reference persistence, and
+//! immutable idempotent result storage share one PostgreSQL transaction.
 
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
@@ -21,6 +25,7 @@ use uuid::Uuid;
 
 use crate::auth::AuthSession;
 use crate::homeserver::HomeserverRawFetchOutcome;
+use crate::variant_stock::{self, VariantRow};
 use crate::AppState;
 
 pub const MAX_INVENTORY_BODY_BYTES: usize = 4096;
@@ -180,9 +185,7 @@ struct ValidatedAdjustRequest {
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
-struct StockView {
-    #[schemars(regex(pattern = r"^listing_total$"))]
-    authority: &'static str,
+struct ListingTotalView {
     #[schemars(range(min = 0))]
     total: i64,
     #[schemars(range(min = 0))]
@@ -191,6 +194,50 @@ struct StockView {
     reserved: i64,
     #[schemars(range(min = 0))]
     sold: i64,
+}
+
+/// `listing_total` for a listing that sells one variant (the numbers are the
+/// listing's). `variant` for a listing that tracks stock per variant: the
+/// numbers are the addressed variant's, `variant_id` names it, and
+/// `listing_total` carries the listing's sums.
+#[derive(Debug, Serialize, JsonSchema)]
+struct StockView {
+    #[schemars(regex(pattern = r"^(listing_total|variant)$"))]
+    authority: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = 128), regex(pattern = r"^[A-Za-z0-9_.-]+$"))]
+    variant_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sku: Option<String>,
+    #[schemars(range(min = 0))]
+    total: i64,
+    #[schemars(range(min = 0))]
+    available: i64,
+    #[schemars(range(min = 0))]
+    reserved: i64,
+    #[schemars(range(min = 0))]
+    sold: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    listing_total: Option<ListingTotalView>,
+}
+
+/// One variant row of a listing that tracks stock per variant.
+#[derive(Debug, Serialize, JsonSchema)]
+struct VariantStockView {
+    #[schemars(length(min = 1, max = 128), regex(pattern = r"^[A-Za-z0-9_.-]+$"))]
+    variant_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sku: Option<String>,
+    enabled: bool,
+    #[schemars(range(min = 0))]
+    total: i64,
+    #[schemars(range(min = 0))]
+    available: i64,
+    #[schemars(range(min = 0))]
+    reserved: i64,
+    #[schemars(range(min = 0))]
+    sold: i64,
+    sold_out: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -224,6 +271,9 @@ struct InventoryProjection {
     #[schemars(range(min = 1))]
     server_revision: i64,
     stock: StockView,
+    /// Present only for a listing that tracks stock per variant.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    variants: Option<Vec<VariantStockView>>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -257,11 +307,92 @@ impl StockView {
     fn new(total: i64, available: i64, reserved: i64, sold: i64) -> Self {
         Self {
             authority: "listing_total",
+            variant_id: None,
+            sku: None,
             total,
             available,
             reserved,
             sold,
+            listing_total: None,
         }
+    }
+
+    fn for_variant(
+        variant_id: String,
+        sku: Option<String>,
+        variant: (i64, i64, i64, i64),
+        listing: (i64, i64, i64, i64),
+    ) -> Self {
+        Self {
+            authority: "variant",
+            variant_id: Some(variant_id),
+            sku,
+            total: variant.0,
+            available: variant.1,
+            reserved: variant.2,
+            sold: variant.3,
+            listing_total: Some(ListingTotalView {
+                total: listing.0,
+                available: listing.1,
+                reserved: listing.2,
+                sold: listing.3,
+            }),
+        }
+    }
+}
+
+impl VariantStockView {
+    fn from_row(row: &VariantRow) -> Self {
+        Self {
+            variant_id: row.variant_id.clone(),
+            sku: row.sku.clone(),
+            enabled: row.enabled,
+            total: row.total_quantity,
+            available: row.available_quantity,
+            reserved: row.reserved_quantity,
+            sold: row.sold_quantity,
+            sold_out: row.available_quantity == 0,
+        }
+    }
+}
+
+/// The variant row a variant-addressed adjustment moves, from the registered
+/// rows of a listing that tracks stock per variant. A request that names no
+/// variant is refused, as is one whose id and sku name different rows or no
+/// row.
+fn adjust_target<'a>(
+    rows: &'a [VariantRow],
+    assertion: Option<&VariantAssertion>,
+) -> Result<&'a VariantRow, Response> {
+    let Some(assertion) = assertion else {
+        return Err(inventory_error(
+            StatusCode::CONFLICT,
+            "variant_required",
+            "The listing tracks stock per variant; name the variant to adjust.",
+            None,
+        ));
+    };
+    let mismatch = || {
+        inventory_error(
+            StatusCode::CONFLICT,
+            "variant_assertion_mismatch",
+            "The variant assertion does not match a variant of the listing.",
+            None,
+        )
+    };
+    let mut matches = rows.iter().filter(|row| {
+        assertion
+            .id
+            .as_deref()
+            .is_none_or(|id| row.variant_id == id)
+            && assertion
+                .sku
+                .as_deref()
+                .is_none_or(|sku| row.sku.as_deref() == Some(sku))
+    });
+    match (matches.next(), matches.next()) {
+        (Some(row), None) => Ok(row),
+        _ => Err(mismatch()),
     }
 }
 
@@ -618,8 +749,22 @@ pub async fn adjust_inventory_for(
     // the idempotency advisory lock. For a new variant-addressed request it
     // closes before remote I/O; after validation, the mutation transaction
     // re-acquires the same lock and reclassifies to close the concurrency gap.
-    let (variant_binding, rate_consumed, mutation_now) = if let Some(assertion) =
-        &request.wire.variant
+    let keyed_hint: bool = match sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM listing_variant_inventory \
+         WHERE listing_aggregate_id = $1 AND variant_id <> '')",
+    )
+    .bind(&request.wire.aggregate_id)
+    .fetch_one(&mut *tx)
+    .await
+    {
+        Ok(keyed) => keyed,
+        Err(_) => return internal_error(),
+    };
+    // A listing that tracks stock per variant resolves the variant against
+    // its own rows, so the seller-record lookup (which exists to check the
+    // one variant of a single-variant listing) is skipped for it.
+    let (variant_binding, rate_consumed, mutation_now) = if let (Some(assertion), false) =
+        (&request.wire.variant, keyed_hint)
     {
         let rate_allowed = if enforce_rate_limit {
             match consume_rate(&mut tx, session, "inventory.adjust", preflight_now, config).await {
@@ -717,7 +862,34 @@ pub async fn adjust_inventory_for(
         )
         .await;
     }
-    if let Some(binding) = &variant_binding {
+    let rows = match variant_stock::lock_rows(&mut tx, &request.wire.aggregate_id).await {
+        Ok(rows) => rows,
+        Err(_) => return internal_error(),
+    };
+    let keyed = variant_stock::tracks_variants(&rows);
+    let target: Option<VariantRow> = if keyed {
+        match adjust_target(&rows, request.wire.variant.as_ref()) {
+            Ok(row) => Some(row.clone()),
+            Err(response) => return finish_without_mutation(tx, response).await,
+        }
+    } else {
+        None
+    };
+    if request.wire.variant.is_some() && !keyed && variant_binding.is_none() {
+        // The listing moved from per-variant rows to one variant between the
+        // lookup decision and the lock; the caller retries.
+        return finish_without_mutation(
+            tx,
+            inventory_error(
+                StatusCode::CONFLICT,
+                "variant_record_conflict",
+                "The seller listing record does not match the registered listing.",
+                None,
+            ),
+        )
+        .await;
+    }
+    if let (Some(binding), false) = (&variant_binding, keyed) {
         // The digest binds the exact bytes validated before this transaction.
         // It is intentionally not compared with listings.content_hash, which
         // is a media hash rather than a listing-record digest. The locked
@@ -791,11 +963,24 @@ pub async fn adjust_inventory_for(
         }
     }
 
-    let balanced = listing
-        .reserved
-        .checked_add(listing.sold)
-        .and_then(|committed| listing.available.checked_add(committed))
-        == Some(listing.total);
+    let (basis_total, basis_available, basis_reserved, basis_sold) = match &target {
+        Some(row) => (
+            row.total_quantity,
+            row.available_quantity,
+            row.reserved_quantity,
+            row.sold_quantity,
+        ),
+        None => (
+            listing.total,
+            listing.available,
+            listing.reserved,
+            listing.sold,
+        ),
+    };
+    let balanced = basis_reserved
+        .checked_add(basis_sold)
+        .and_then(|committed| basis_available.checked_add(committed))
+        == Some(basis_total);
     if !balanced {
         return finish_without_mutation(
             tx,
@@ -808,7 +993,7 @@ pub async fn adjust_inventory_for(
         )
         .await;
     }
-    let Some(new_total) = listing.total.checked_add(request.wire.delta) else {
+    let Some(new_total) = basis_total.checked_add(request.wire.delta) else {
         return finish_without_mutation(
             tx,
             inventory_error(
@@ -820,7 +1005,7 @@ pub async fn adjust_inventory_for(
         )
         .await;
     };
-    let Some(new_available) = listing.available.checked_add(request.wire.delta) else {
+    let Some(new_available) = basis_available.checked_add(request.wire.delta) else {
         return finish_without_mutation(
             tx,
             inventory_error(
@@ -859,33 +1044,72 @@ pub async fn adjust_inventory_for(
             .await
         }
     };
-    let state_name = if new_available > 0 {
+    let listing_new_available = listing.available.saturating_add(request.wire.delta);
+    let state_name = if listing_new_available > 0 {
         "available"
     } else if listing.reserved > 0 {
         "reserved"
     } else {
         "sold"
     };
-    let updated: Option<(i64, i64, i64, i64, i64)> = match sqlx::query_as(
-        "UPDATE listings SET total_quantity = $2, available_quantity = $3, \
-             server_revision = $4, state = $5, updated_at = $6 \
-         WHERE aggregate_id = $1 AND server_revision = $7 \
-         RETURNING server_revision, total_quantity, available_quantity, \
-                   reserved_quantity, sold_quantity",
-    )
-    .bind(&request.wire.aggregate_id)
-    .bind(new_total)
-    .bind(new_available)
-    .bind(new_revision)
-    .bind(state_name)
-    .bind(mutation_now)
-    .bind(listing.server_revision)
-    .fetch_optional(&mut *tx)
-    .await
-    {
-        Ok(updated) => updated,
-        Err(_) => return internal_error(),
+    let variant_after: Option<(String, Option<String>, i64, i64, i64, i64)> = match &target {
+        Some(row) => {
+            match sqlx::query_as(
+                "UPDATE listing_variant_inventory SET total_quantity = $3, \
+                     available_quantity = $4, updated_at = $5 \
+                 WHERE listing_aggregate_id = $1 AND variant_id = $2 \
+                 RETURNING variant_id, sku, total_quantity, available_quantity, \
+                           reserved_quantity, sold_quantity",
+            )
+            .bind(&request.wire.aggregate_id)
+            .bind(&row.variant_id)
+            .bind(new_total)
+            .bind(new_available)
+            .bind(mutation_now)
+            .fetch_optional(&mut *tx)
+            .await
+            {
+                Ok(Some(after)) => Some(after),
+                Ok(None) | Err(_) => return internal_error(),
+            }
+        }
+        None => None,
     };
+    let listing_write = if target.is_some() {
+        // The variant row above rolled the listing's totals up; only the
+        // revision and state move here.
+        sqlx::query_as(
+            "UPDATE listings SET server_revision = $2, state = $3, updated_at = $4 \
+             WHERE aggregate_id = $1 AND server_revision = $5 \
+             RETURNING server_revision, total_quantity, available_quantity, \
+                       reserved_quantity, sold_quantity",
+        )
+        .bind(&request.wire.aggregate_id)
+        .bind(new_revision)
+        .bind(state_name)
+        .bind(mutation_now)
+        .bind(listing.server_revision)
+    } else {
+        sqlx::query_as(
+            "UPDATE listings SET total_quantity = $2, available_quantity = $3, \
+                 server_revision = $4, state = $5, updated_at = $6 \
+             WHERE aggregate_id = $1 AND server_revision = $7 \
+             RETURNING server_revision, total_quantity, available_quantity, \
+                       reserved_quantity, sold_quantity",
+        )
+        .bind(&request.wire.aggregate_id)
+        .bind(new_total)
+        .bind(new_available)
+        .bind(new_revision)
+        .bind(state_name)
+        .bind(mutation_now)
+        .bind(listing.server_revision)
+    };
+    let updated: Option<(i64, i64, i64, i64, i64)> =
+        match listing_write.fetch_optional(&mut *tx).await {
+            Ok(updated) => updated,
+            Err(_) => return internal_error(),
+        };
     let Some((revision, total, available, reserved, sold)) = updated else {
         return internal_error();
     };
@@ -938,7 +1162,17 @@ pub async fn adjust_inventory_for(
             listing_id: request.wire.listing_id.clone(),
             server_revision: revision,
             event_id,
-            stock: StockView::new(total, available, reserved, sold),
+            stock: match variant_after {
+                Some((variant_id, sku, v_total, v_available, v_reserved, v_sold)) => {
+                    StockView::for_variant(
+                        variant_id,
+                        sku,
+                        (v_total, v_available, v_reserved, v_sold),
+                        (total, available, reserved, sold),
+                    )
+                }
+                None => StockView::new(total, available, reserved, sold),
+            },
         },
     };
     let result_json = match serde_json::to_string(&response) {
@@ -1133,6 +1367,21 @@ pub async fn get_inventory_projection(
         )
         .await;
     };
+    let rows: Vec<VariantRow> = match sqlx::query_as(
+        "SELECT variant_id, sku, enabled, total_quantity, available_quantity, \
+                reserved_quantity, sold_quantity \
+         FROM listing_variant_inventory WHERE listing_aggregate_id = $1 \
+         ORDER BY position, variant_id",
+    )
+    .bind(&aggregate_id)
+    .fetch_all(&mut *tx)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(_) => return internal_error(),
+    };
+    let variants = variant_stock::tracks_variants(&rows)
+        .then(|| rows.iter().map(VariantStockView::from_row).collect());
     let projection = InventoryProjection {
         schema_version: 1,
         kind: "inventory_projection",
@@ -1141,6 +1390,7 @@ pub async fn get_inventory_projection(
         listing_id,
         server_revision: revision,
         stock: StockView::new(total, available, reserved, sold),
+        variants,
     };
     match tx.commit().await {
         Ok(()) => (StatusCode::OK, Json(projection)).into_response(),

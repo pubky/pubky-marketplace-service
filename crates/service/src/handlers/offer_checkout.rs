@@ -20,6 +20,7 @@ struct AwardReservation {
     status: String,
     expires_at: DateTime<Utc>,
     offer_award_id: Option<Uuid>,
+    variant_id: Option<String>,
 }
 
 pub async fn handle(
@@ -123,8 +124,8 @@ pub async fn handle(
         .reservation_id
         .ok_or_else(|| sqlx::Error::Protocol("accepted offer has no reservation".to_string()))?;
     let reservation: Option<AwardReservation> = sqlx::query_as(
-        "SELECT listing_aggregate_id, buyer_pubky, quantity, status, expires_at, offer_award_id \
-             FROM reservations WHERE id = $1 FOR UPDATE",
+        "SELECT listing_aggregate_id, buyer_pubky, quantity, status, expires_at, offer_award_id, \
+             variant_id FROM reservations WHERE id = $1 FOR UPDATE",
     )
     .bind(reservation_id)
     .fetch_optional(&mut **tx)
@@ -158,11 +159,15 @@ pub async fn handle(
             "The offer listing is unavailable.",
         )));
     }
+    let rows = crate::variant_stock::lock_rows(tx, &listing.aggregate_id).await?;
+    let still_reserved =
+        crate::variant_stock::resolve_held(&rows, reservation.variant_id.as_deref())
+            .is_ok_and(|row| row.reserved_quantity >= reservation.quantity);
     if reservation.buyer_pubky != offer.buyer_pubky
         || reservation.listing_aggregate_id != payload.listing_aggregate_id
         || reservation.quantity != payload.quantity
         || reservation.offer_award_id != Some(payload.award_id)
-        || listing.reserved_quantity < reservation.quantity
+        || !still_reserved
     {
         return Ok(Err(CommandFailure::refused(
             crate::refusal_audit::RefusalKind::AwardHoldMissing,

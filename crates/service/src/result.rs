@@ -44,6 +44,11 @@ impl CommandFailure {
         }
     }
 
+    pub(crate) fn with_reason(mut self, reason: &'static str) -> Self {
+        self.reason = Some(reason);
+        self
+    }
+
     pub(crate) fn refused_with_revision(
         kind: RefusalKind,
         code: ErrorCode,

@@ -182,6 +182,42 @@ pub async fn handle(
         // (quantity, price, state) is touched. Sync carries no pickup
         // DETAILS and can never null them (§A4).
         if registration.listing_revision <= current.listing_revision {
+            // A listing registered before per-variant stock (or by a client
+            // that sent no variants) keeps one shared total while its record
+            // lists several enabled variants. An equal-revision sync moves it
+            // to per-variant rows as soon as its committed stock can be
+            // attributed to variants exactly.
+            if registration.listing_revision == current.listing_revision
+                && registration.sale_format == SaleFormat::FixedPrice
+                && registration.variants.len() >= 2
+            {
+                let rows = crate::variant_stock::lock_rows(tx, &command.aggregate_id).await?;
+                if !crate::variant_stock::tracks_variants(&rows) {
+                    let plan = crate::variant_stock::plan(
+                        tx,
+                        &command.aggregate_id,
+                        &registration.variants,
+                        &rows,
+                        false,
+                        current.server_revision,
+                    )
+                    .await?;
+                    if matches!(plan, Ok(crate::variant_stock::StockPlan::PerVariant { .. })) {
+                        return apply_registration(
+                            tx,
+                            actor,
+                            command.command_id,
+                            &command.aggregate_id,
+                            &registration,
+                            Some(current),
+                            None,
+                            "listing.synced",
+                            now,
+                        )
+                        .await;
+                    }
+                }
+            }
             let registration_methods: Vec<String> = registration
                 .fulfillment_methods
                 .iter()
