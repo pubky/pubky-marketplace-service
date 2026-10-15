@@ -5,6 +5,18 @@ migration, and are directly rerunnable unless a rule below says otherwise.
 An applied file is immutable: sqlx checksums every applied migration, so a
 changed byte stops the next start.
 
+## A ledger ahead of the build
+
+Startup tolerates applied versions that are newer than every migration in the
+running build: a newer image, or a branch image on staging, migrated first.
+The build logs them (`database has migrations newer than this build`) and
+starts, so rolling an image back across an additive migration works without
+editing `_sqlx_migrations`. An applied version the build lacks at or below its
+newest migration means a file was removed or renumbered, and startup is
+refused as before. Checksums of the versions the build knows are always
+verified, so a branch migration that later lands under the same number with
+different bytes still stops startup; delete that branch row first.
+
 ## Index builds on existing tables
 
 A plain `CREATE INDEX` holds a `SHARE` lock on its table for the whole
@@ -205,6 +217,20 @@ converted).
 Roll forward rather than back once a connection exists: a binary that predates
 0062 does not know the tables, but nothing in it reads them.
 
+0071 (update tracking command kind) appends one refusal-audit command kind
+(`update_tracking`, 40) for `fulfillment.update_tracking`. It creates no table
+or column and builds no index; the tracking history rides in the existing
+`orders.shipment` JSON. The catalog is append-only and a test keeps the source
+enum and the table in exact parity. Refused commands are recorded against the
+catalog row, so the migration must run before a binary that can refuse
+`fulfillment.update_tracking`; migrations run at start, so a deployment gets
+both together. The insert is `ON CONFLICT DO NOTHING` so the file is directly
+rerunnable, and a closing check fails the migration if id 40 already holds a
+different name. The number jumps from 0061 to 0071 on purpose (0062 to 0070 are
+claimed by other branches); sqlx applies pending migrations in version order
+and does not need the numbers to be contiguous, which `migration_0033_test`
+already exercises with a missing 0032.
+
 ## Numbers claimed by open pull requests
 
 `main` has 0001 to 0054 and 0056 to 0059; 0055 is #92, so the catalog is
@@ -216,6 +242,7 @@ assume it is free:
 | Number | File | Pull request |
 | --- | --- | --- |
 | 0055 | `0055_user_priv_key_custody_releases.sql` | #92 (`/priv` Phase 4) |
+| 0071 | `0071_update_tracking_command_kind.sql` | optional tracking (`cursor/optional-tracking-85f6`) |
 
 This table describes unmerged work and goes stale as pull requests land; trust
 `crates/service/migrations/` on `main` over it.

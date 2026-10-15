@@ -512,6 +512,7 @@ fn command_kind(payload: &CommandPayload) -> CommandKind {
         CommandPayload::RequestCancellation(_) => CommandKind::RequestCancellation,
         CommandPayload::ApproveCancellation(_) => CommandKind::ApproveCancellation,
         CommandPayload::ShipOrder(_) => CommandKind::ShipOrder,
+        CommandPayload::UpdateTracking(_) => CommandKind::UpdateTracking,
         CommandPayload::ConfirmDelivery(_) => CommandKind::ConfirmDelivery,
         CommandPayload::SetPickupDetails(_) => CommandKind::SetPickupDetails,
         CommandPayload::ClearPickupDetails(_) => CommandKind::ClearPickupDetails,
@@ -709,6 +710,9 @@ async fn dispatch(
         }
         CommandPayload::ShipOrder(payload) => {
             crate::handlers::fulfillment::ship(tx, actor, command, payload, now).await
+        }
+        CommandPayload::UpdateTracking(payload) => {
+            crate::handlers::fulfillment::update_tracking(tx, actor, command, payload, now).await
         }
         CommandPayload::ConfirmDelivery(payload) => {
             crate::handlers::fulfillment::confirm_delivery(tx, actor, command, payload, now).await
