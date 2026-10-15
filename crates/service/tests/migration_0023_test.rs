@@ -548,14 +548,14 @@ async fn migration_0023_adds_the_shared_manual_resolution_schema() {
 /// refund destinations 0054, owner-held priv data key custody releases 0055,
 /// per-order delivery terms 0056, sealed delivery addresses 0057, the purge of
 /// retired Stripe values 0058, listing deletion follower backoff 0059, and
-/// the single Paykit bind 0060.
+/// the single Paykit bind 0060, and multi-currency FX 0061.
 fn sorted_migration_catalog(mut numbers: Vec<u32>) -> Vec<u32> {
     numbers.sort_unstable();
     numbers
 }
 
 #[test]
-fn migration_catalog_is_gapless_through_0060() {
+fn migration_catalog_is_gapless_through_0061() {
     let numbers: Vec<u32> = std::fs::read_dir(MIGRATIONS_DIR)
         .expect("migrations dir")
         .filter_map(|entry| {
@@ -565,11 +565,11 @@ fn migration_catalog_is_gapless_through_0060() {
                 .and_then(|prefix| prefix.parse::<u32>().ok())
         })
         .collect();
-    let expected = (1..=60).collect::<Vec<_>>();
+    let expected = (1..=61).collect::<Vec<_>>();
     assert_eq!(
         sorted_migration_catalog(numbers),
         expected,
-        "the raw catalog is 0001..=0060, gapless"
+        "the raw catalog is 0001..=0061, gapless"
     );
 }
 
