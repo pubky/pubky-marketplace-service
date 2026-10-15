@@ -74,8 +74,8 @@ pub async fn execute(
             let (moderated, not_on_sale) = tokio::join!(
                 async {
                     let gate = moderation?;
-                    for (seller_pubky, listing_id) in &listings {
-                        if gate.check(seller_pubky, listing_id).await
+                    for listing in &listings {
+                        if gate.check(&listing.seller_pubky, &listing.listing_id).await
                             == crate::listing_moderation::ModerationVerdict::Moderated
                         {
                             return Some(CommandFailure::refused(
@@ -87,7 +87,14 @@ pub async fn execute(
                     }
                     None
                 },
-                async { crate::listing_lifecycle::check(lifecycle?, &listings).await },
+                async {
+                    let live: Vec<(String, String)> = listings
+                        .iter()
+                        .filter(|listing| listing.live)
+                        .map(|listing| (listing.seller_pubky.clone(), listing.listing_id.clone()))
+                        .collect();
+                    crate::listing_lifecycle::check(lifecycle?, &live).await
+                },
             );
             if let Some(failure) = moderated.or(not_on_sale) {
                 log_command(

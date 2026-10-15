@@ -247,7 +247,8 @@ to, from `HOMESERVER_URL`, and refuses unless each one is `active`, with
 `LISTING_NOT_ACTIVE` (HTTP 409, audited as `invalid_state`) and `reason`
 `listing_paused`, `listing_ended`, `listing_removed` or `listing_not_active`.
 A record the homeserver answers 404 for is `listing_removed`; a record with no
-`state` field predates the field and counts as `active`. A checkout's records
+`state` field predates the field and counts as `active`. A listing the service
+has already tombstoned is not read and keeps its `NOT_FOUND` refusal. A checkout's records
 are read concurrently (at most 8 at a time).
 
 The record is the seller's authority over whether the listing is for sale, so
