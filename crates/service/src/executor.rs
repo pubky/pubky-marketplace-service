@@ -52,10 +52,17 @@ pub async fn execute(
     let request_hash = command.request_hash();
 
     // A command that sells a listing is refused when the index says the
-    // listing, or its seller, is moderated. The index is read before the
-    // transaction, so a slow index never holds a domain connection. A command
-    // id that already has a stored result is a replay and is answered from it.
-    if let Some(gate) = state.listing_moderation.as_deref() {
+    // listing, or its seller, is moderated, and a command that opens a new
+    // commitment on a listing is refused unless the seller's current record
+    // says it is on sale. Both are read before the transaction, so a slow
+    // index or homeserver never holds a domain connection. A command id that
+    // already has a stored result is a replay and is answered from it.
+    let moderation = state.listing_moderation.as_deref();
+    let lifecycle = state
+        .homeserver
+        .clone()
+        .filter(|_| crate::listing_lifecycle::opens_a_commitment(&command.payload));
+    if moderation.is_some() || lifecycle.is_some() {
         let listings =
             crate::listing_moderation::listings_a_command_sells(&state.pool, actor, &command)
                 .await?;
@@ -64,37 +71,53 @@ pub async fn execute(
                 .await?
                 .is_none()
         {
-            for (seller_pubky, listing_id) in &listings {
-                if gate.check(seller_pubky, listing_id).await
-                    == crate::listing_moderation::ModerationVerdict::Moderated
-                {
-                    let failure = CommandFailure::refused(
-                        crate::refusal_audit::RefusalKind::InvalidState,
-                        ErrorCode::ListingModerated,
-                        crate::listing_moderation::LISTING_MODERATED_MESSAGE,
-                    );
-                    log_command(
-                        actor,
-                        command.kind(),
-                        &command.command_id.to_string(),
-                        &command.aggregate_id,
-                        "refused",
-                        Some(failure.code()),
-                        Some(failure.message()),
-                        command.expected_revision,
-                        started.elapsed().as_millis() as u64,
-                    );
-                    enqueue_refusal(
-                        state,
-                        actor,
-                        state.clock.now(),
-                        SurfaceKind::V1Command,
-                        command_kind(&command.payload),
-                        failure.refusal_kind(),
-                        Some(command.command_id),
-                    );
-                    return Ok(failure_response(&failure));
-                }
+            let (moderated, not_on_sale) = tokio::join!(
+                async {
+                    let gate = moderation?;
+                    for listing in &listings {
+                        if gate.check(&listing.seller_pubky, &listing.listing_id).await
+                            == crate::listing_moderation::ModerationVerdict::Moderated
+                        {
+                            return Some(CommandFailure::refused(
+                                crate::refusal_audit::RefusalKind::InvalidState,
+                                ErrorCode::ListingModerated,
+                                crate::listing_moderation::LISTING_MODERATED_MESSAGE,
+                            ));
+                        }
+                    }
+                    None
+                },
+                async {
+                    let live: Vec<(String, String)> = listings
+                        .iter()
+                        .filter(|listing| listing.live)
+                        .map(|listing| (listing.seller_pubky.clone(), listing.listing_id.clone()))
+                        .collect();
+                    crate::listing_lifecycle::check(lifecycle?, &live).await
+                },
+            );
+            if let Some(failure) = moderated.or(not_on_sale) {
+                log_command(
+                    actor,
+                    command.kind(),
+                    &command.command_id.to_string(),
+                    &command.aggregate_id,
+                    "refused",
+                    Some(failure.code()),
+                    Some(failure.message()),
+                    command.expected_revision,
+                    started.elapsed().as_millis() as u64,
+                );
+                enqueue_refusal(
+                    state,
+                    actor,
+                    state.clock.now(),
+                    SurfaceKind::V1Command,
+                    command_kind(&command.payload),
+                    failure.refusal_kind(),
+                    Some(command.command_id),
+                );
+                return Ok(failure_response(&failure));
             }
         }
     }

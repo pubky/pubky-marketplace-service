@@ -143,7 +143,23 @@ async fn seed_production_shaped_legacy_auction(
     .execute(pool)
     .await
     .expect("Wave 1-shaped pre-0033 auction seeds");
+    publish_active_record(seller, listing_id);
     aggregate_id
+}
+
+/// The seller's published listing record, which bids are checked against.
+fn publish_active_record(seller: &str, listing_id: &str) {
+    common::put_command_mirror_record(
+        seller,
+        listing_id,
+        json!({
+            "recordType": "listing",
+            "schemaVersion": 1,
+            "ownerPubky": seller,
+            "listingId": listing_id,
+            "state": "active",
+        }),
+    );
 }
 
 fn bid_command(aggregate_id: &str, index: u64, expected_revision: i64) -> Value {
@@ -194,6 +210,7 @@ async fn seed_listing(pool: &PgPool, aggregate_id: &str) {
     .execute(pool)
     .await
     .expect("auction listing seeds");
+    publish_active_record(&"y".repeat(52), &aggregate_id.replace(':', "_"));
 }
 
 async fn overwrite_auction(pool: &PgPool, aggregate_id: &str, auction: Value) {

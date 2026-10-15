@@ -309,7 +309,7 @@ request failed, so clients should branch on HTTP status first, and parse
    | `NOT_FOUND` | 404 |
    | `REVISION_CONFLICT`, `IDEMPOTENCY_CONFLICT`, `INSUFFICIENT_INVENTORY`, `INVARIANT_VIOLATION`, `OFFER_EXPIRED`, `INVALID_STATE`, `AUCTION_CLOSED`, `BID_TOO_LOW`, `SELLER_REGISTRATION_REQUIRED` | 409 |
    | `AWARD_EXPIRED`, `AWARD_ALREADY_CONVERTED`, `AWARD_QUANTITY_MISMATCH`, `AWARD_VARIANT_MISMATCH`, `AWARD_LISTING_CHANGED`, `AWARD_HOLD_MISSING` | 409 |
-   | `LISTING_MODERATED` | 409 |
+   | `LISTING_MODERATED`, `LISTING_NOT_ACTIVE` | 409 |
    | `UPSTREAM_UNAVAILABLE` | 503 (retriable) |
 
    A command error may also carry `issues` and `reason` fields.
@@ -322,6 +322,15 @@ request failed, so clients should branch on HTTP status first, and parse
    when the marketplace index reports the listing, or its seller, as
    moderated (see [Listing moderation](../README.md#listing-moderation)). It is a
    409, not a 403, because clients read a 403 on a command as a session problem.
+
+   `LISTING_NOT_ACTIVE` refuses `checkout.create`, `offer.create`,
+   `offer.counter`, `offer.accept` and `auction.place_bid` when the seller's
+   current homeserver record for a listing is not `active`. `reason` is
+   `listing_paused`, `listing_ended` or `listing_removed` (also used when the
+   homeserver no longer has the record), or `listing_not_active` for any other
+   state. When the homeserver cannot answer, those commands are refused with
+   `UPSTREAM_UNAVAILABLE` instead (see
+   [Listing lifecycle](../README.md#listing-lifecycle)).
 
 ### Automation error codes
 
