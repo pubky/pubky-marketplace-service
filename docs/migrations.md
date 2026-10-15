@@ -139,6 +139,37 @@ additive. Orders and payments bound to Stripe are not touched.
 binary from before 0059 ignores the new columns and its inserts take their
 defaults, so a rolling replacement is safe.
 
+## Store connectors (0062 to 0064)
+
+The connector framework uses 0062 to 0064 of the 0062 to 0069 range reserved
+for connectors. None depends on 0060 or 0061, so they apply cleanly whether
+or not those have landed. All three are additive and rerunnable.
+
+- 0062 creates `connector_connections` (one row per seller, provider and
+  shop, with a pending state hash and the app key), `connector_credentials`
+  (the sealed store secret), `connector_recipient_keys` (the sealed X25519
+  key a buyer's opted-in address is sealed to, and its public half),
+  `connector_variant_map` and `connector_product_selection`. Every index is
+  built on a table the same file creates, so none blocks writes. One live
+  (connected or error) connection per store is a unique partial index.
+- 0063 creates `connector_order_push` (the idempotent push ledger, unique per
+  seller, order and provider), `connector_order_actions` (cancel and refund
+  mirrors), `connector_event_cursor` (started at the newest event when the
+  file runs, so earlier orders are never pushed), `connector_inbound_events`
+  (webhook dedupe) and `connector_alerts`. It reads `events` once, for the
+  cursor's starting point, and builds indexes only on its own tables.
+- 0064 adds five nullable columns to `orders` (`connector_share_domain`,
+  `connector_share_consent_version`, `connector_share_consented_at`,
+  `connector_address_envelope`, `connector_key_id`) and one `NOT VALID`
+  CHECK (consent columns together, envelope and key id together and only with
+  consent, envelope exactly 2,096 bytes). No default, no rewrite, no index; it
+  sets `lock_timeout` like 0053. A binary from before 0064 ignores the columns.
+  The envelope is deleted when the store order exists or when the order
+  reaches a final state; the consent columns stay.
+
+Roll forward rather than back once a connection exists: a binary that predates
+0062 does not know the tables, but nothing in it reads them.
+
 ## Numbers claimed by open pull requests
 
 `main` has 0001 to 0054 and 0056 to 0059; 0055 is #92, so the catalog is

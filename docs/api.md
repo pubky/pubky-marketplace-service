@@ -30,6 +30,7 @@ Contents:
 - [Batch sync (`sync-many`)](#batch-sync-sync-many)
 - [Inventory](#inventory)
 - [Webhooks](#webhooks)
+- [Store connectors](#store-connectors)
 - [Operational endpoints](#operational-endpoints)
 - [Grant-flow routes (Shop BFF)](#grant-flow-routes-shop-bff)
 - [OpenAPI](#openapi)
@@ -94,6 +95,12 @@ and write. "Automation" means the inventory capability plus the
 | POST | `/v1/auth/grant-flows/{flow_id}/result-ticket` | Grant-flow (Shop BFF). |
 | POST | `/v1/auth/grant-flows/{flow_id}/claim` | Grant-flow (Shop BFF). |
 | GET | `/v0/sellers/{pubky}/payment-config` | Public payment configuration of a seller. |
+| GET | `/v0/sellers/{pubky}/connector-status` | The stores a buyer may share an address with and each store's recipient public key. Public; answers an empty list while connectors are off. See [Store connectors](#store-connectors). |
+| POST | `/v1/connectors/webhooks/{provider}` | Store webhook (WooCommerce). Authenticity is the provider's signature. See [Store connectors](#store-connectors). |
+| POST | `/v1/connectors/webhooks/{provider}/{app_key}` | Store webhook (Shopify app `app_key`), including the privacy topics. |
+| GET | `/v1/connectors/shopify/apps/{app_key}/launch` | The Shopify app's App URL: verifies the launch, matches the pending connect, redirects to authorize. |
+| GET | `/v1/connectors/shopify/apps/{app_key}/oauth/callback` | The Shopify app's OAuth callback. |
+| POST | `/v1/connectors/woocommerce/oauth/callback` | WooCommerce's key callback, `user_id` is the pending-connect nonce. |
 | GET | `/v0/drops/{seller_pubky}/{drop_id}` | Public drop read. |
 | GET | `/v0/listings/{seller_pubky}/{listing_id}/availability` | Stock state of one listing, state only. See [Public listing availability](#public-listing-availability). |
 | POST | `/v0/address/suggest` | Address autocomplete. |
@@ -132,6 +139,15 @@ and write. "Automation" means the inventory capability plus the
 | POST | `/v0/orders/{id}/fiat/confirm-received` |
 | POST | `/v0/orders/{id}/confirm-bitcoin-payment` |
 | POST | `/v0/orders/{id}/bitcoin/resolve` |
+| GET, POST | `/v1/connectors` |
+| GET | `/v1/connectors/alerts` |
+| POST | `/v1/connectors/alerts/{id}/resolve` |
+| DELETE | `/v1/connectors/{id}` |
+| GET | `/v1/connectors/{id}/catalog` |
+| GET, PUT | `/v1/connectors/{id}/mappings` |
+| GET, PUT | `/v1/connectors/{id}/selection` |
+| GET | `/v1/connectors/{id}/pushes` |
+| POST | `/v1/connectors/{id}/pushes/{order}/retry` |
 
 These are the buyer and seller application routes. Authorization on them is
 per resource (participants only) and per command (keyed on the session's
@@ -915,6 +931,29 @@ event id `018f47d2-6a27-7c23-a49d-6b21bb770120` and body `{"ok":true}` produce
 reference verifier, `verify_webhook` in `crates/service/src/automation.rs`,
 returns `Malformed`, `Stale`, `WrongKey` or `InvalidSignature` for the failure
 cases above.
+
+## Store connectors
+
+Off unless `CONNECTORS_ENABLED=true`: every `/v1/connectors` route then
+answers `404 connectors_disabled` and `/health` carries no `connectors` key.
+The seller routes take the same session bearer as the other seller routes and
+act only on the session's own connections (another seller's id answers like an
+unknown one, `404 connection_not_found`). The provider routes are public and
+authenticated by the provider's signature or the single-use connect state.
+Credentials are never returned and never logged. The full contract, with JSON
+shapes and error codes, is `connector-contract.md` in the commerce
+integrations workstream; the behaviour is described in
+`crates/service/src/connectors/`.
+
+Environment names: `CONNECTORS_ENABLED`, `CONNECTOR_PUBLIC_BASE_URL`,
+`CONNECTOR_RETURN_URL`, `CONNECTOR_CREDENTIAL_ENCRYPTION_KEY`,
+`CONNECTOR_CREDENTIAL_ENCRYPTION_KEY_PREVIOUS`, `SHOPIFY_APPS`,
+`SHOPIFY_APP_<KEY>_CLIENT_ID`, `SHOPIFY_APP_<KEY>_CLIENT_SECRET`, and the
+tuning values `CONNECTOR_PUSH_LEASE_SECONDS`,
+`CONNECTOR_PROVIDER_TIMEOUT_SECONDS`, `CONNECTOR_MAX_ATTEMPTS`,
+`CONNECTOR_BACKOFF_BASE_SECONDS`, `CONNECTOR_BACKOFF_MAX_SECONDS`,
+`CONNECTOR_STOCK_POLL_SECONDS`, `CONNECTOR_WORKER_TICK_MILLIS`. The worker is
+the `connector-worker` binary of the same image.
 
 ## Operational endpoints
 
