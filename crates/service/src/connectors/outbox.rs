@@ -224,13 +224,7 @@ async fn on_refund_recorded(
     event: &EventRow,
     order_id: Uuid,
 ) -> Result<(), sqlx::Error> {
-    let has_push: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM connector_order_push \
-         WHERE pubky_order_id = $1 AND state IN ('created', 'sending'))",
-    )
-    .bind(order_id)
-    .fetch_one(&mut **tx)
-    .await?;
+    let has_push = ledger::has_mirrorable_push(tx, order_id).await?;
     if !has_push {
         return Ok(());
     }
