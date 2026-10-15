@@ -3253,7 +3253,8 @@ async fn serve_upstream_prepare(
 /// `asset` (`BTC`, `USD` or `USDT`) with an optional `accepted_assets`
 /// narrowing. The double derives the offer from what the seller can receive
 /// (never adding an asset that was not asked for), fixes the Bitcoin rate
-/// once, and answers the echo the real server sends.
+/// once, and answers the shape captured from paykit-server in
+/// `tests/fixtures/paykit-server-pk1/` (amounts as digit strings).
 fn serve_multi_asset_prepare(
     state: &Arc<Mutex<FakePaykitState>>,
     parsed: Value,
@@ -3374,7 +3375,7 @@ fn serve_multi_asset_prepare(
             ("BTC", "USDT") => (units * rate).div_ceil(100),
             _ => return paykit_error(StatusCode::BAD_REQUEST, "invalid_request"),
         };
-        payment_amounts.insert(name.clone(), json!(u64::try_from(payable).expect("fits")));
+        payment_amounts.insert(name.clone(), json!(payable.to_string()));
     }
     let invoice_id = uuid::Uuid::new_v4();
     let now = chrono::DateTime::from_timestamp_micros(chrono::Utc::now().timestamp_micros())
@@ -3387,7 +3388,10 @@ fn serve_multi_asset_prepare(
         FakePaykitInvoice {
             invoice_id,
             state: "prepared".into(),
-            total_sats: payment_amounts["BTC"].as_u64().unwrap_or_default(),
+            total_sats: payment_amounts["BTC"]
+                .as_str()
+                .and_then(|sats| sats.parse().ok())
+                .unwrap_or_default(),
             expires_at: (now + chrono::Duration::seconds(window)).to_rfc3339(),
             prepare_expires_at: prepare_expires_at.clone(),
             multi: Some(FakeMultiInvoice {
@@ -3405,7 +3409,7 @@ fn serve_multi_asset_prepare(
         "asset": asset,
         "accepted_assets": offered,
         "payment_amounts": payment_amounts,
-        "conversion_rates": [{ "asset": "btc", "value": "0.00001" }],
+        "rates": {},
         "prepare_expires_at": prepare_expires_at,
     });
     guard.prepared.insert(
