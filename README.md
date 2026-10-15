@@ -302,6 +302,15 @@ order they bound to PayPal (`POST /v0/orders/{id}/payment-method`), which only
 that order's buyer and seller can read. The seller reads their own stored
 values from the authenticated `GET /v0/sellers/me/payment-config`.
 
+The seller's own view (`GET` and `PUT /v0/sellers/me/payment-config`) also
+carries `bitcoin_setup`: `ready`, `setup_required` or `unavailable`, asked of
+paykit-server on every call (the same question as `bitcoin_available`,
+uncached, and answered whether or not Bitcoin is switched on). The Shop uses it
+to confirm a Bitkit setup without a Lock Server session. `unavailable` covers a
+Paykit outage, an answer outside the contract, and a deployment without Paykit;
+it is never a reason to start an authorization flow. A seller who never saved
+anything reads the empty configuration (epoch `updated_at`) instead of `null`.
+
 Stripe is not a payment method: the service has no Stripe client, binding
 `stripe` answers `invalid_method`, and `PUT /v0/sellers/me/payment-config`
 answers `stripe_removed` to a non-empty `stripe_payment_link` or
@@ -480,7 +489,7 @@ stays refused.
   and the public config (`GET /v0/sellers/{pubky}/payment-config`) carries
   `usdt_available`. With the flag off none of these keys exists, a `PUT`
   carrying `usdt_enabled` is refused as the unknown field it is, and
-  paykit-server is only ever asked about Bitcoin.
+  paykit-server is only ever asked about Bitcoin (`bitcoin_setup`).
   - Readiness comes only from paykit-server's signed `POST /setup/status`
     (`PAYKIT_SERVER_API=upstream`): `{accepted_asset: "USDT"}` for the seller, and the
     authority-only `{}` body to tell a seller with no Paykit account
@@ -499,8 +508,7 @@ stays refused.
     `PUT` read paykit-server uncached, so a Bitkit setup or reconnect shows
     at once.
   - A seller who never saved anything reads the empty configuration (epoch
-    `updated_at`) instead of `null` while the flag is on, because that seller
-    is who needs `setup`.
+    `updated_at`) instead of `null`, flag on or off.
   - `PUT` replaces the rails, but an absent or `null` `usdt_enabled` leaves
     the stored consent unchanged; only an explicit boolean changes it. The
     consent is not gated on readiness, and a seller who is not ready is never
