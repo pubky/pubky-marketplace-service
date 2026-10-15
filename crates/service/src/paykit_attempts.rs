@@ -70,6 +70,8 @@ pub(crate) async fn record_released_attempt(
          address_fingerprint, bitcoin_quote_rate, bitcoin_quote_source, \
          bitcoin_quote_fetched_at, bitcoin_quoted_sats, bitcoin_quote_expires_at, \
          bitcoin_quote_currency, bitcoin_quote_exponent, bitcoin_quote_spread_bps, \
+         usd_conversion_pair, usd_conversion_source, usd_conversion_usd_rate, \
+         usd_conversion_currency_rate, usd_conversion_fetched_at, usd_conversion_cents, \
          released_at) \
          SELECT id, paykit_invoice_id, paykit_request_reference, paykit_api, paykit_stack_id, \
          paykit_stack_endpoint, paykit_payment_reference, paykit_operation_id, \
@@ -77,7 +79,9 @@ pub(crate) async fn record_released_attempt(
          paykit_prepare_expires_at, paykit_allocation_mode, paykit_address_fingerprint, \
          bitcoin_quote_rate, bitcoin_quote_source, bitcoin_quote_fetched_at, \
          bitcoin_quoted_sats, bitcoin_quote_expires_at, bitcoin_quote_currency, \
-         bitcoin_quote_exponent, bitcoin_quote_spread_bps, $2 FROM orders \
+         bitcoin_quote_exponent, bitcoin_quote_spread_bps, usd_conversion_pair, \
+         usd_conversion_source, usd_conversion_usd_rate, usd_conversion_currency_rate, \
+         usd_conversion_fetched_at, usd_conversion_cents, $2 FROM orders \
          WHERE id = $1 AND paykit_invoice_id IS NOT NULL AND paykit_api IS NOT NULL \
          AND (paykit_total_sats > 0 OR paykit_amount_minor > 0) \
          AND ((paykit_api = 'fork' AND paykit_stack_id IS NOT NULL AND paykit_stack_endpoint IS NOT NULL) \
@@ -644,7 +648,10 @@ async fn route_released_settlement(
          paykit_observed_sats = $20, paykit_payment_reference = $23, \
          paykit_operation_id = $24, paykit_payment_window_seconds = $25, paykit_asset = $26, \
          paykit_amount_minor = NULL, paykit_accepted_assets = NULL, \
-         paykit_payment_amounts = NULL, \
+         paykit_payment_amounts = NULL, usd_conversion_pair = NULL, \
+         usd_conversion_source = NULL, usd_conversion_usd_rate = NULL, \
+         usd_conversion_currency_rate = NULL, usd_conversion_fetched_at = NULL, \
+         usd_conversion_cents = NULL, \
          paykit_seller_confirmation_entered_at = NULL, \
          paykit_seller_confirmation_deadline = NULL, updated_at = $21 WHERE id = $1",
     )

@@ -3323,9 +3323,24 @@ async fn denominated_locks_order_under(
     };
     let buyer = new_actor(&app).await;
 
+    // Registration refuses a Locks price outside USD/2, BTC/8 and SAT/0
+    // (`locks_currency_unsupported`), so a denomination the Lock Server
+    // cannot count reaches prepare only through a row written around the
+    // registry. Register the same listing in USD and rewrite its price
+    // denomination, to keep prepare's own refusal under test.
+    let registrable = marketplace_domain::Currency::for_money(currency, exponent)
+        .is_some_and(marketplace_domain::Currency::locks_supported);
+    let (registered_currency, registered_exponent) = if registrable {
+        (currency, exponent)
+    } else {
+        ("USD", 2)
+    };
     let mut listing = register_command(&seller.pubky, 1);
-    listing["payload"]["unit_price"] =
-        json!({ "amount_minor": unit_minor, "currency": currency, "exponent": exponent });
+    listing["payload"]["unit_price"] = json!({
+        "amount_minor": unit_minor,
+        "currency": registered_currency,
+        "exponent": registered_exponent,
+    });
     listing["payload"]["shipping_minor"] = json!(DENOMINATED_SHIPPING_MINOR);
     listing["payload"]["digital_lock"] = json!({
         "policyUri": resource,
@@ -3334,6 +3349,18 @@ async fn denominated_locks_order_under(
     as_digital_locks_listing(&mut listing);
     let (status, body) = execute(&app, &seller.token, &listing).await;
     assert_eq!(status, StatusCode::OK, "register fixture failed: {body}");
+    if !registrable {
+        sqlx::query(
+            "UPDATE listings SET unit_price_currency = $2, unit_price_exponent = $3 \
+             WHERE aggregate_id = $1",
+        )
+        .bind(format!("listing:{}_boots_01", seller.pubky))
+        .bind(currency)
+        .bind(exponent)
+        .execute(&app.pool)
+        .await
+        .expect("listing denomination rewritten");
+    }
     let (status, body) = execute(
         &app,
         &buyer.token,

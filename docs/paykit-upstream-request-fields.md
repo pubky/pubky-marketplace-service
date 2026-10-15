@@ -72,7 +72,7 @@ fork, an rc16 upstream and any deployment that has not set the contract send):
 | Member                   | Value                                                                   |
 | ------------------------ | ----------------------------------------------------------------------- |
 | `amount`                 | The request amount in base units as a digit string (cents or satoshis). |
-| `asset`                  | The denomination: `USD`, or `BTC` for a satoshi price.                  |
+| `asset`                  | The denomination: `USD` (any fiat price: a non-USD price is converted to USD cents at bind, `docs/multi-currency.md`), or `BTC` for a satoshi price. |
 | `accepted_assets`        | Optional narrowing, a subset of `BTC`, `USDT`; never an extension.      |
 | `creator`, `description`, `operation_id`, `payment_window_seconds`, `reader`, `reference` | As above. |
 
