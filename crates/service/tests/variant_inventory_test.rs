@@ -10,14 +10,15 @@
 mod common;
 
 use axum::http::StatusCode;
+use common::paykit_review::{bound_order, poll_now, status_confirmed};
 use common::{
     count, execute, indexed_command_id, listing_aggregate, new_actor, order_command,
     payment_command, register_command, send, test_app, test_app_with_homeserver,
-    test_app_with_pickup_and_paypal, TestActor, TestApp,
+    test_app_with_payments, test_app_with_pickup_and_paypal, TestActor, TestApp,
 };
 use marketplace_service::clock::Clock;
 use marketplace_service::expiry::expire_due_reservations;
-use marketplace_service::workers::expire_due_payment_windows;
+use marketplace_service::workers::{expire_due_offers, expire_due_payment_windows, run_once};
 use serde_json::{json, Value};
 use sqlx::PgPool;
 
@@ -1124,4 +1125,393 @@ async fn inventory_adjust_by_sku_and_projection_list_the_variant_rows(pool: PgPo
         json!({ "variant_id": "size_s", "available_quantity": 0, "sold_out": true })
     );
     assert_books_balance(&app.pool).await;
+}
+
+const DROP_ID: &str = "winter_drop";
+
+/// A keyed `boots_01` (S: 1, M: 5) with a live drop over it.
+async fn keyed_drop(
+    app: &TestApp,
+    homeserver: &common::FakeHomeserver,
+    seller: &TestActor,
+    syncer: &TestActor,
+) {
+    let (status, body) = register_variants(app, seller, &[("size_s", 1), ("size_m", 5)]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    homeserver.put_drop_record(
+        &seller.pubky,
+        DROP_ID,
+        common::drop_record_json(
+            &seller.pubky,
+            DROP_ID,
+            1,
+            &["boots_01"],
+            &common::ts_after(0),
+            None,
+            6,
+            1,
+        ),
+    );
+    let (status, body) = execute(
+        app,
+        &syncer.token,
+        &common::sync_drop_command(&seller.pubky, DROP_ID, 900),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "drop sync: {body}");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_drop_stamped_reservation_holds_and_restocks_its_variant(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    keyed_drop(&app, &homeserver, &seller, &buyer).await;
+    let revision = listing_revision(&app.pool, &seller.pubky).await;
+
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &reserve(&seller.pubky, 1, Some("size_m"), revision, 1),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let stored = rows(&app.pool, &seller.pubky).await;
+    assert_eq!(row(&stored, "size_m"), (4, 1, 0, 5));
+    assert_eq!(row(&stored, "size_s"), (1, 0, 0, 1));
+
+    app.clock.advance_seconds(601);
+    let summary = run_once(&app.state, uuid::Uuid::new_v4(), app.clock.now())
+        .await
+        .expect("worker pass");
+    assert_eq!(summary.reservations_expired, 1);
+    let stored = rows(&app.pool, &seller.pubky).await;
+    assert_eq!(row(&stored, "size_m"), (5, 0, 0, 5));
+    assert_books_balance(&app.pool).await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_drop_claim_holds_the_chosen_variant_and_a_cancel_releases_it(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    keyed_drop(&app, &homeserver, &seller, &buyer).await;
+    let revision = listing_revision(&app.pool, &seller.pubky).await;
+
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &checkout(
+            &seller.pubky,
+            &indexed_command_id(0x7a08, 1),
+            Some("size_m"),
+            revision,
+            1,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["orders"][0]["stock_held"], json!(true));
+    let order_id = body["result"]["orders"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let stored = rows(&app.pool, &seller.pubky).await;
+    assert_eq!(
+        row(&stored, "size_m"),
+        (4, 1, 0, 5),
+        "the claim holds size M"
+    );
+    assert_eq!(row(&stored, "size_s"), (1, 0, 0, 1));
+
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &order_command(
+            "order.cancel_request",
+            &order_id,
+            1,
+            json!({ "reason": "Changed my mind" }),
+            7_400,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let stored = rows(&app.pool, &seller.pubky).await;
+    assert_eq!(row(&stored, "size_m"), (5, 0, 0, 5));
+    assert_books_balance(&app.pool).await;
+}
+
+/// An accepted offer holds the offered variant; letting the award lapse
+/// returns exactly that variant, and the other size is never touched.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_accepted_offer_holds_its_variant_and_a_lapsed_award_releases_it(pool: PgPool) {
+    let app = test_app(pool).await;
+    app.clock.set(
+        chrono::DateTime::from_timestamp_micros(chrono::Utc::now().timestamp_micros())
+            .expect("microsecond timestamp"),
+    );
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    register_variants(&app, &seller, &[("size_s", 1), ("size_m", 3)]).await;
+    // The seller's record lists size M as the one enabled variant, so the
+    // offer names it.
+    let mut published = record(1, &[("size_s", false, 1), ("size_m", true, 3)]);
+    published["ownerPubky"] = json!(seller.pubky);
+    published["listingId"] = json!("boots_01");
+    common::put_command_mirror_record(&seller.pubky, "boots_01", published);
+
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &common::create_offer_command(&seller.pubky, 2),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let offered: Option<String> = sqlx::query_scalar("SELECT variant_id FROM offers")
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(offered.as_deref(), Some("size_m"));
+    let (status, body) = execute(
+        &app,
+        &seller.token,
+        &common::offer_action("offer.accept", 1, "00000000-0000-4000-8000-000000001101"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let stored = rows(&app.pool, &seller.pubky).await;
+    assert_eq!(row(&stored, "size_m"), (1, 2, 0, 3), "the award holds M");
+    assert_eq!(row(&stored, "size_s"), (1, 0, 0, 1));
+    let held: Option<String> =
+        sqlx::query_scalar("SELECT variant_id FROM reservations WHERE offer_award_id IS NOT NULL")
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(held.as_deref(), Some("size_m"));
+
+    app.clock.advance_seconds(1_801);
+    expire_due_offers(&app.pool, app.clock.now())
+        .await
+        .expect("award expiry");
+    let stored = rows(&app.pool, &seller.pubky).await;
+    assert_eq!(row(&stored, "size_m"), (3, 0, 0, 3));
+    assert_eq!(row(&stored, "size_s"), (1, 0, 0, 1));
+    assert_books_balance(&app.pool).await;
+}
+
+/// The seller adjusts the last unit of a size away while a buyer confirms
+/// payment for it. Whichever commits first wins; the unit is never both
+/// sold and removed, and the books balance.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_seller_adjustment_races_a_payment_confirmation_for_the_last_unit(pool: PgPool) {
+    let app = test_app(pool).await;
+    for round in 0..6u64 {
+        let seller = new_actor(&app).await;
+        let buyer = new_actor(&app).await;
+        register_variants(&app, &seller, &[("size_s", 1), ("size_m", 2)]).await;
+        let revision = listing_revision(&app.pool, &seller.pubky).await;
+        let (_, body) = execute(
+            &app,
+            &buyer.token,
+            &checkout(
+                &seller.pubky,
+                &indexed_command_id(0x7a09, round + 1),
+                Some("size_s"),
+                revision,
+                1,
+            ),
+        )
+        .await;
+        let payment_id = body["result"]["payments"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let confirm = payment_command(&payment_id, 1, "confirmed", 1, 7_500 + round);
+        let take = adjust(
+            &seller.pubky,
+            revision,
+            -1,
+            100 + u128::from(round),
+            Some(json!({ "id": "size_s" })),
+        );
+        let (confirmed, adjusted) = tokio::join!(
+            execute(&app, &buyer.token, &confirm),
+            post_adjust(&app, &seller.token, &take),
+        );
+        let confirmed_ok = confirmed.1["ok"] == json!(true);
+        let adjusted_ok = adjusted.1["ok"] == json!(true);
+        let stored = rows(&app.pool, &seller.pubky).await;
+        let size_s = row(&stored, "size_s");
+        match (confirmed_ok, adjusted_ok) {
+            (true, false) => assert_eq!(size_s, (0, 0, 1, 1), "round {round}: sold"),
+            (false, true) => assert_eq!(size_s, (0, 0, 0, 0), "round {round}: removed"),
+            other => {
+                panic!("round {round}: exactly one wins, got {other:?}: {confirmed:?} {adjusted:?}")
+            }
+        }
+        assert_eq!(row(&stored, "size_m"), (2, 0, 0, 2), "round {round}");
+        assert_books_balance(&app.pool).await;
+    }
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn the_public_availability_names_sold_out_sizes_without_quantities(pool: PgPool) {
+    let app = test_app(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    register_variants(&app, &seller, &[("size_s", 1), ("size_m", 4)]).await;
+    let path = format!("/v0/listings/{}/boots_01/availability", seller.pubky);
+
+    let (status, body) = send(app.router.clone(), "GET", &path, None, &Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["variants"],
+        json!([
+            { "variant_id": "size_s", "sold_out": false },
+            { "variant_id": "size_m", "sold_out": false },
+        ])
+    );
+
+    let (status, body) = buy_sandbox(&app, &buyer, &seller.pubky, "size_s", 1).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = send(app.router.clone(), "GET", &path, None, &Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["state"], json!("available"));
+    assert_eq!(
+        body["variants"][0],
+        json!({ "variant_id": "size_s", "sold_out": true })
+    );
+    let rendered = body.to_string();
+    assert!(
+        !rendered.contains("quantity") && !rendered.contains(&buyer.pubky),
+        "stock or buyer leaked: {rendered}"
+    );
+}
+
+/// Moves a bound Bitcoin order's listing to per-variant rows after its hold
+/// lapsed, and names the order's line `size_s`, so the late settlement's
+/// re-hold runs against a listing that tracks stock per variant.
+async fn into_variants_after_the_hold_lapsed(
+    pool: &PgPool,
+    seller: &str,
+    order_id: &str,
+    size_s: (i64, i64, i64, i64),
+) {
+    let aggregate = listing_aggregate(seller);
+    for (position, (variant, (total, available, reserved, sold))) in
+        [("size_s", size_s), ("size_m", (4, 4, 0, 0))]
+            .into_iter()
+            .enumerate()
+    {
+        sqlx::query(
+            "INSERT INTO listing_variant_inventory (listing_aggregate_id, variant_id, position, \
+             total_quantity, available_quantity, reserved_quantity, sold_quantity) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(&aggregate)
+        .bind(variant)
+        .bind(position as i32)
+        .bind(total)
+        .bind(available)
+        .bind(reserved)
+        .bind(sold)
+        .execute(pool)
+        .await
+        .expect("keyed row");
+    }
+    sqlx::query(
+        "DELETE FROM listing_variant_inventory WHERE listing_aggregate_id = $1 AND variant_id = ''",
+    )
+    .bind(&aggregate)
+    .execute(pool)
+    .await
+    .expect("implicit row dropped");
+    sqlx::query("UPDATE orders SET lines = jsonb_set(lines, '{0,variant_id}', '\"size_s\"') WHERE id = $1::uuid")
+        .bind(order_id)
+        .execute(pool)
+        .await
+        .expect("order line names its variant");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_late_bitcoin_settlement_re_holds_the_size_the_buyer_chose(pool: PgPool) {
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (order_id, _payment_id, reference) =
+        bound_order(&app, &paykit, &seller, &buyer, "exclusive").await;
+    let after = app.clock.now() + chrono::Duration::seconds(7_300);
+    assert!(
+        expire_due_payment_windows(&app.state, after)
+            .await
+            .expect("expire")
+            >= 1
+    );
+    into_variants_after_the_hold_lapsed(&pool, &seller.pubky, &order_id, (16, 16, 0, 0)).await;
+
+    let mut late = status_confirmed("exclusive", true, 2);
+    late["late_settlement"] = json!(true);
+    paykit.set_status(&reference, late);
+    assert!(poll_now(&app, after + chrono::Duration::seconds(60)).await >= 1);
+
+    let (state,): (String,) = sqlx::query_as("SELECT state FROM orders WHERE id = $1::uuid")
+        .bind(&order_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "paid");
+    let stored = rows(&pool, &seller.pubky).await;
+    assert_eq!(
+        row(&stored, "size_s"),
+        (15, 0, 1, 16),
+        "the late money re-held and sold size S"
+    );
+    assert_eq!(row(&stored, "size_m"), (4, 0, 0, 4));
+    assert_books_balance(&pool).await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_late_bitcoin_settlement_for_a_sold_out_size_needs_a_refund_while_another_size_has_stock(
+    pool: PgPool,
+) {
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (order_id, _payment_id, reference) =
+        bound_order(&app, &paykit, &seller, &buyer, "exclusive").await;
+    let after = app.clock.now() + chrono::Duration::seconds(7_300);
+    assert!(
+        expire_due_payment_windows(&app.state, after)
+            .await
+            .expect("expire")
+            >= 1
+    );
+    // Size S sold out to another buyer meanwhile; size M still has stock.
+    into_variants_after_the_hold_lapsed(&pool, &seller.pubky, &order_id, (16, 0, 0, 16)).await;
+
+    let mut late = status_confirmed("exclusive", true, 2);
+    late["late_settlement"] = json!(true);
+    paykit.set_status(&reference, late);
+    assert!(poll_now(&app, after + chrono::Duration::seconds(60)).await >= 1);
+
+    let (order_state, payment_state, reason): (String, String, Option<String>) = sqlx::query_as(
+        "SELECT o.state, p.state, p.review_reason \
+         FROM orders o JOIN payments p ON p.order_id = o.id WHERE o.id = $1::uuid",
+    )
+    .bind(&order_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(order_state, "cancelled");
+    assert_eq!(payment_state, "manual_review");
+    assert_eq!(reason.as_deref(), Some("refund_required"));
+    let stored = rows(&pool, &seller.pubky).await;
+    assert_eq!(row(&stored, "size_s"), (0, 0, 16, 16));
+    assert_eq!(
+        row(&stored, "size_m"),
+        (4, 0, 0, 4),
+        "size M is never taken for a size S order"
+    );
+    assert_books_balance(&pool).await;
 }

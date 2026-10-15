@@ -2802,6 +2802,139 @@ mod tests {
             .registers_unlimited_cap_with_physical_methods());
     }
 
+    fn register_with_variants(variants: Value) -> Result<Command, Vec<ValidationIssue>> {
+        let mut command = register_command_json();
+        command["payload"]["variants"] = variants;
+        parse_command(&command)
+    }
+
+    #[test]
+    fn variants_are_carried_in_record_order_and_omitted_when_empty() {
+        let plain = parse_command(&register_command_json()).expect("valid command");
+        let CommandPayload::RegisterListing(plain) = &plain.payload else {
+            panic!("expected register payload");
+        };
+        assert!(plain.variants.is_empty());
+        let serialized = serde_json::to_value(plain).expect("payload serializes");
+        assert!(
+            serialized.get("variants").is_none(),
+            "an empty variant list never reaches the canonical JSON"
+        );
+
+        let command = register_with_variants(json!([
+            { "id": "size_s", "quantity": 0, "sku": "SKU-S" },
+            { "id": "size_m", "quantity": 3 },
+        ]))
+        .expect("valid variants");
+        let CommandPayload::RegisterListing(payload) = &command.payload else {
+            panic!("expected register payload");
+        };
+        assert_eq!(
+            payload.variants,
+            vec![
+                VariantStock {
+                    id: "size_s".to_string(),
+                    sku: Some("SKU-S".to_string()),
+                    quantity: 0
+                },
+                VariantStock {
+                    id: "size_m".to_string(),
+                    sku: None,
+                    quantity: 3
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_variant_stock_is_refused_by_path() {
+        for (variants, path) in [
+            (
+                json!([{ "id": "bad id!", "quantity": 1 }]),
+                "payload.variants.0.id",
+            ),
+            (
+                json!([{ "id": "a", "quantity": 1 }, { "id": "a", "quantity": 2 }]),
+                "payload.variants.1.id",
+            ),
+            (
+                json!([{ "id": "a", "quantity": -1 }]),
+                "payload.variants.0.quantity",
+            ),
+            (
+                json!([{ "id": "a", "quantity": 1_000_001 }]),
+                "payload.variants.0.quantity",
+            ),
+            (
+                json!([{ "id": "a", "quantity": 1, "sku": "" }]),
+                "payload.variants.0.sku",
+            ),
+        ] {
+            let issues = register_with_variants(variants).expect_err(path);
+            assert!(
+                issues.iter().any(|issue| issue.path == path),
+                "{path}: {issues:?}"
+            );
+        }
+        let too_many: Vec<Value> = (0..=MAX_LISTING_VARIANTS)
+            .map(|index| json!({ "id": format!("v{index}"), "quantity": 1 }))
+            .collect();
+        let issues = register_with_variants(json!(too_many)).expect_err("101 variants");
+        assert!(issues.iter().any(|issue| issue.path == "payload.variants"));
+        let mut unknown = register_command_json();
+        unknown["payload"]["variants"] = json!([{ "id": "a", "quantity": 1, "price": 5 }]);
+        assert!(
+            parse_command(&unknown).is_err(),
+            "unknown variant fields are refused"
+        );
+    }
+
+    #[test]
+    fn a_variant_at_the_unlimited_cap_makes_a_physical_listing_unregisterable() {
+        let mut command = register_command_json();
+        command["payload"]["variants"] = json!([
+            { "id": "a", "quantity": UNLIMITED_STOCK_QUANTITY },
+            { "id": "b", "quantity": 0 },
+        ]);
+        let command = parse_command(&command).expect("valid command");
+        let CommandPayload::RegisterListing(payload) = &command.payload else {
+            panic!("expected register payload");
+        };
+        assert!(payload.registers_unlimited_cap_with_physical_methods());
+    }
+
+    #[test]
+    fn a_reserve_names_its_variant_only_when_it_has_one() {
+        let reserve = |variant: Option<Value>| {
+            let mut payload = json!({ "quantity": 1, "reservation_ttl_seconds": 600 });
+            if let Some(variant) = variant {
+                payload["variant_id"] = variant;
+            }
+            let mut command = register_command_json();
+            command["kind"] = json!("inventory.reserve");
+            command["payload"] = payload;
+            parse_command(&command)
+        };
+        let plain = reserve(None).expect("valid reserve");
+        let CommandPayload::ReserveInventory(plain) = &plain.payload else {
+            panic!("expected reserve payload");
+        };
+        assert_eq!(plain.variant_id, None);
+        assert!(serde_json::to_value(plain)
+            .unwrap()
+            .get("variant_id")
+            .is_none());
+        let named = reserve(Some(json!("size_m"))).expect("valid reserve");
+        let CommandPayload::ReserveInventory(named) = &named.payload else {
+            panic!("expected reserve payload");
+        };
+        assert_eq!(named.variant_id.as_deref(), Some("size_m"));
+        let issues = reserve(Some(json!("not valid!"))).expect_err("malformed variant");
+        assert!(issues
+            .iter()
+            .any(|issue| issue.path == "payload.variant_id"));
+    }
+
     #[test]
     fn parses_a_valid_register_command_with_defaults() {
         let command = parse_command(&register_command_json()).expect("valid command");
