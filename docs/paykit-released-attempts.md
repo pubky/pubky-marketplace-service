@@ -22,7 +22,7 @@ A released invoice can still receive money, for example when an activation commi
 
 - `payment_settled`: money confirmed on a released attempt after the order's payment was already confirmed, resolved, or under review. The buyer paid twice.
 - `other_rail`: money confirmed on a released Bitcoin attempt while another rail owns the payment: the order is bound to PayPal (or, for an order that predates the Stripe removal, Stripe), or the payment is managed by Locks (or any adapter other than `paykit` or `sandbox`). The order and payment are left untouched.
-- `detected_unconfirmed`: money was detected on the released attempt but did not confirm within 7 days.
+- `detected_unconfirmed`: money was detected on the released attempt but did not confirm within 7 days. A row can also be written for a live USDT order (`observation.status` is `usdt_finality_pending`): the transfer was included, the order is paid, but paykit-server never reported it finalized within 7 days of inclusion. Polling of that order has stopped and fulfilment stays blocked (`payment_not_final`); check the transfer on Arbitrum before releasing the order.
 - `upstream_inconsistent`: upstream reported a recovery-required or invalid lifecycle instead of a Bitcoin observation. No settlement is inferred; the order and payment are left untouched.
 
 ## Polling cadence
@@ -34,6 +34,7 @@ A released attempt is first checked on the next Paykit poll pass. After each che
 - `ALERT money detected on a released paykit attempt`: a detection was recorded. No action yet.
 - `ALERT money confirmed on a released paykit attempt …` (`code=paykit_released_attempt_paid_after_settlement`): a `payment_settled` or `other_rail` entry was created.
 - `ALERT money detected on a released paykit attempt never confirmed` (`code=paykit_released_attempt_detected_unconfirmed`).
+- `ALERT a USDT payment was included but never finalized within the polling bound` (`code=usdt_finality_pending_too_long`): the `detected_unconfirmed` row above.
 - `ALERT released paykit attempt has an invalid upstream lifecycle` (`code=paykit_released_attempt_upstream_inconsistent`).
 
 ## Operator path
@@ -42,7 +43,7 @@ A released attempt is first checked on the next Paykit poll pass. After each che
 
 ```bash
 # Everything waiting for review, one JSON object per line: order, invoice,
-# seller, buyer, reason, invoice total, frozen observation (txid, observed
+# seller, buyer, reason, invoice total (`null` when the attempt offered no Bitcoin), frozen observation (txid, observed
 # sats, confirmations), and when it was held.
 cargo run -p marketplace-service --bin paykit-attempts-admin -- list
 

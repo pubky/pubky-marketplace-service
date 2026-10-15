@@ -562,6 +562,18 @@ working unchanged (Bitcoin only, its projection unchanged).
   `needs_review` (`payment_settled`) like money on a released attempt, once
   per order. USDT on a released attempt is held for an operator
   (`other_rail`) and never restored automatically.
+- **Refund refusals** (`bitcoin/resolve` with `refunded`, 409, closed
+  `error.reason`): `refund_rail_unknown` (both rails were paid and
+  paykit-server named no first one, so no rail was recorded and a refund has
+  none to follow: resolve as `paid` or `abandoned` and return each payment
+  from the seller's wallet) and `refund_amount_unrecordable` (a USDT amount on
+  a USD order that is not a whole number of cents, so it cannot be recorded as
+  a refund: return it from the wallet and resolve as `abandoned`).
+- **Finality bound.** A USDT payment is polled for finality for 7 days from
+  `payment_finality_at` while `pending` or `reverted`. A `pending` payment past
+  that bound is held for an operator (`needs_review`, `detected_unconfirmed`,
+  `ALERT usdt_finality_pending_too_long`, listed by `paykit-attempts-admin
+  list`); the order stays paid and fulfilment stays blocked.
 - **Refunds follow the paid rail.** A USDT-paid order (`payment_asset` `USDT`,
   or the legacy `usdt` method) takes the buyer-confirmed Arbitrum address and
   an Arbitrum transaction hash; a Bitcoin-paid order refunds as before.
