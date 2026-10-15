@@ -1344,6 +1344,7 @@ fn record_issue(path: &str, message: &str) -> ValidationIssue {
     ValidationIssue {
         path: path.to_string(),
         message: message.to_string(),
+        reason: None,
     }
 }
 

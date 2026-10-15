@@ -190,3 +190,20 @@ so it drops `orders_total_balance` and re-adds it `NOT VALID` around itself, as
 0043 does: staging's tax-era orders break that constraint and would otherwise
 abort the file. Number 0055 belongs to the owner-held key custody release
 table (#92).
+
+## Multi-currency FX (0061)
+
+`0061_multi_currency_fx.sql` is additive and directly rerunnable. It widens
+`fx_rate_samples` from USD only to the seven fiat currencies (the currency
+check) with one sanity band per currency (`fx_rate_samples_rate_check`,
+repeated from `fx::rate_bounds` and kept equal by a test), and adds the six
+`usd_conversion_*` columns with an all-or-nothing, currency-matching check to
+`orders` and `paykit_superseded_attempts`. Constraints are `NOT VALID` then
+validated. See `docs/multi-currency.md`.
+
+It follows 0060 (the single Paykit bind) in number and in the branch it is
+stacked on, and reads or writes nothing 0060 creates. A binary from before
+0061 ignores the new columns, and its sampler inserts only USD rows, which
+both constraints admit, so a rolling replacement is safe. After 0061 the new
+sampler needs about three minutes of samples before a non-USD price can be
+quoted.
