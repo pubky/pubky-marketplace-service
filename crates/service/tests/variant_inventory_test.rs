@@ -868,6 +868,11 @@ async fn a_listing_registered_before_variants_converts_when_its_sales_attribute(
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(rows(&app.pool, &seller.pubky).await.len(), 1);
 
+    put_record(
+        &homeserver,
+        &seller.pubky,
+        record(1, &[("size_m", true, 5)]),
+    );
     // One unit sells, naming size M (the buyer's snapshot at the time).
     let (status, body) = buy_sandbox(&app, &buyer, &seller.pubky, "size_m", 1).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -902,6 +907,7 @@ async fn a_listing_with_unattributable_sales_stays_on_its_shared_total(pool: PgP
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     execute(&app, &seller.token, &register_command(&seller.pubky, 5)).await;
+    put_record(&homeserver, &seller.pubky, record(1, &[("only", true, 5)]));
     // The sold unit names a variant the record does not list.
     let (status, body) = buy_sandbox(&app, &buyer, &seller.pubky, "legacy_name", 1).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -1138,6 +1144,12 @@ async fn keyed_drop(
 ) {
     let (status, body) = register_variants(app, seller, &[("size_s", 1), ("size_m", 5)]).await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    // Commitments need the seller's published record (listing lifecycle).
+    put_record(
+        homeserver,
+        &seller.pubky,
+        record(1, &[("size_s", true, 1), ("size_m", true, 5)]),
+    );
     homeserver.put_drop_record(
         &seller.pubky,
         DROP_ID,
