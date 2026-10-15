@@ -297,16 +297,18 @@ async fn refund_quote(
             .bind(order_id)
             .fetch_optional(&mut **tx)
             .await?;
-            Ok(row.and_then(|(rate, currency, exponent, quoted_sats, source, fetched_at)| {
-                Some(RefundQuote::Bitcoin {
-                    currency: currency?,
-                    exponent: i32::from(exponent?),
-                    rate: rate?,
-                    quoted_sats,
-                    source,
-                    fetched_at,
-                })
-            }))
+            Ok(row.and_then(
+                |(rate, currency, exponent, quoted_sats, source, fetched_at)| {
+                    Some(RefundQuote::Bitcoin {
+                        currency: currency?,
+                        exponent: i32::from(exponent?),
+                        rate: rate?,
+                        quoted_sats,
+                        source,
+                        fetched_at,
+                    })
+                },
+            ))
         }
         "usdt" => {
             let row: Option<(
@@ -322,15 +324,17 @@ async fn refund_quote(
             .bind(order_id)
             .fetch_optional(&mut **tx)
             .await?;
-            Ok(row.and_then(|(asset, network, paid_minor, paid_exponent, basis)| {
-                Some(RefundQuote::Asset {
-                    asset: asset?,
-                    network,
-                    paid_minor: paid_minor?,
-                    paid_exponent: i32::from(paid_exponent?),
-                    basis,
-                })
-            }))
+            Ok(
+                row.and_then(|(asset, network, paid_minor, paid_exponent, basis)| {
+                    Some(RefundQuote::Asset {
+                        asset: asset?,
+                        network,
+                        paid_minor: paid_minor?,
+                        paid_exponent: i32::from(paid_exponent?),
+                        basis,
+                    })
+                }),
+            )
         }
         _ => Ok(None),
     }

@@ -545,3 +545,188 @@ async fn pasted_keys_connect_a_pending_store_and_wrong_ones_do_not(pool: PgPool)
         replay.assert_no_misses();
     }
 }
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_refused_connect_leaves_no_draft_behind_and_never_hits_the_limit(pool: PgPool) {
+    let side = StoreSide::open("flow_f").await;
+    let _restore = side
+        .live
+        .as_ref()
+        .map(woocommerce_support::live::RestoreStore);
+    let app = woo_app(pool, side.provider(7)).await;
+    let seller = new_actor(&app).await;
+    let drafts = |app: &common::TestApp| {
+        let pool = app.pool.clone();
+        async move {
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM connector_connections")
+                .fetch_one(&pool)
+                .await
+                .expect("count");
+            count
+        }
+    };
+
+    // WooCommerce is not active: the probe refuses. The limit is five
+    // connections per seller, so six refusals in a row would block a seller
+    // if each left its draft behind.
+    if side.is_live() {
+        side.live().woocommerce_active(false);
+    }
+    for attempt in 1..=6 {
+        let (status, body) = api(
+            &app,
+            "POST",
+            "/v1/connectors",
+            Some(&seller.token),
+            &json!({ "provider": "woocommerce", "domain": side.site() }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "attempt {attempt}: {body}"
+        );
+        assert!(body["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("WooCommerce was not found"));
+        assert_eq!(drafts(&app).await, 0, "attempt {attempt} left a draft");
+    }
+    // A malformed address is refused before any draft exists.
+    let (status, body) = api(
+        &app,
+        "POST",
+        "/v1/connectors",
+        Some(&seller.token),
+        &json!({ "provider": "woocommerce", "domain": "http://dezentralshop.ch" }),
+    )
+    .await;
+    assert_eq!(
+        (status, body["error"]["code"].as_str()),
+        (StatusCode::UNPROCESSABLE_ENTITY, Some("invalid_domain"))
+    );
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("HTTPS"),
+        "{body}"
+    );
+    assert_eq!(drafts(&app).await, 0);
+
+    // With WooCommerce back, the same seller connects; a restart of the same
+    // store reuses its draft rather than adding another.
+    if side.is_live() {
+        side.live().woocommerce_active(true);
+    }
+    for _ in 0..2 {
+        let (status, body) = api(
+            &app,
+            "POST",
+            "/v1/connectors",
+            Some(&seller.token),
+            &json!({ "provider": "woocommerce", "domain": side.site() }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(drafts(&app).await, 1);
+    }
+    if let Some(replay) = &side.replay {
+        replay.assert_no_misses();
+    }
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn the_shops_credentials_form_connects_a_woocommerce_store_with_its_key_pair(pool: PgPool) {
+    let side = StoreSide::open("flow_g").await;
+    let app = woo_app(pool, side.provider(7)).await;
+    let seller = new_actor(&app).await;
+    let stranger = new_actor(&app).await;
+    let (status, started) = api(
+        &app,
+        "POST",
+        "/v1/connectors",
+        Some(&seller.token),
+        &json!({ "provider": "woocommerce", "domain": side.site() }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{started}");
+    let id = started["connection"]["id"]
+        .as_str()
+        .expect("id")
+        .to_string();
+    let path = format!("/v1/connectors/{id}/credentials");
+    let minted: Value = serde_json::from_slice(
+        &side.approve(started["authorize_url"].as_str().expect("url"), "keys"),
+    )
+    .expect("keys JSON");
+    let right = json!({"consumer_key": minted["consumer_key"], "consumer_secret": minted["consumer_secret"]});
+
+    // The Shopify body is not for this provider.
+    let (status, body) = api(
+        &app,
+        "PUT",
+        &path,
+        Some(&seller.token),
+        &json!({"client_id": "a", "client_secret": "b"}),
+    )
+    .await;
+    assert_eq!(
+        (status, body["error"]["code"].as_str()),
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Some("credentials_not_supported")
+        )
+    );
+    let (status, body) = api(
+        &app,
+        "PUT",
+        &path,
+        Some(&seller.token),
+        &json!({"consumer_key": "nope", "consumer_secret": "nope"}),
+    )
+    .await;
+    assert_eq!(
+        (status, body["error"]["code"].as_str()),
+        (StatusCode::UNPROCESSABLE_ENTITY, Some("invalid_keys"))
+    );
+    let wrong = json!({"consumer_key": format!("ck_{}", "e".repeat(40)), "consumer_secret": format!("cs_{}", "f".repeat(40))});
+    let (status, body) = api(&app, "PUT", &path, Some(&seller.token), &wrong).await;
+    assert_eq!(
+        (status, body["error"]["code"].as_str()),
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Some("credentials_rejected")
+        ),
+        "{body}"
+    );
+    let (status, body) = api(&app, "PUT", &path, Some(&stranger.token), &right).await;
+    assert_eq!(
+        (status, body["error"]["code"].as_str()),
+        (StatusCode::NOT_FOUND, Some("connection_not_found"))
+    );
+
+    let (status, body) = api(&app, "PUT", &path, Some(&seller.token), &right).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["kind"], "connector_connected");
+    assert_eq!(body["connection"]["status"], "connected");
+    assert!(!body.to_string().contains("ck_") && !body.to_string().contains("cs_"));
+    let (status, again) = api(&app, "PUT", &path, Some(&seller.token), &right).await;
+    assert_eq!(
+        (status, again["error"]["code"].as_str()),
+        (StatusCode::CONFLICT, Some("not_pending"))
+    );
+    let (status, catalog) = api(
+        &app,
+        "GET",
+        &format!("/v1/connectors/{id}/catalog"),
+        Some(&seller.token),
+        &json!(null),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{catalog}");
+    assert!(!catalog["products"].as_array().expect("products").is_empty());
+    if let Some(replay) = &side.replay {
+        replay.assert_no_misses();
+    }
+}

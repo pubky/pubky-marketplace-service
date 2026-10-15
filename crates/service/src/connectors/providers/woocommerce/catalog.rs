@@ -175,7 +175,9 @@ fn descriptive_attributes(product: &Value) -> Vec<CatalogOption> {
         .map(|attributes| {
             attributes
                 .iter()
-                .filter(|attribute| attribute.get("variation").and_then(Value::as_bool) != Some(true))
+                .filter(|attribute| {
+                    attribute.get("variation").and_then(Value::as_bool) != Some(true)
+                })
                 .filter_map(|attribute| {
                     let name = text::title(attribute.get("name")?.as_str()?);
                     let values: Vec<String> = attribute
@@ -185,7 +187,8 @@ fn descriptive_attributes(product: &Value) -> Vec<CatalogOption> {
                         .filter_map(|value| value.as_str().map(text::title))
                         .filter(|value| !value.is_empty())
                         .collect();
-                    (!name.is_empty() && !values.is_empty()).then_some(CatalogOption { name, values })
+                    (!name.is_empty() && !values.is_empty())
+                        .then_some(CatalogOption { name, values })
                 })
                 .collect()
         })
@@ -413,7 +416,11 @@ mod tests {
         assert_eq!(normalized.options.len(), 1);
         assert_eq!(normalized.options[0].name, "Size");
         assert_eq!(normalized.options[0].values, vec!["S", "M", "L"]);
-        assert_eq!(normalized.attributes.len(), 1, "the non-variation attribute is descriptive");
+        assert_eq!(
+            normalized.attributes.len(),
+            1,
+            "the non-variation attribute is descriptive"
+        );
         assert_eq!(normalized.attributes[0].name, "Material");
         let ids: Vec<&str> = normalized
             .variants

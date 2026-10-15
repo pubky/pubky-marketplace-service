@@ -371,7 +371,9 @@ pub async fn record_refund(
         match refund.amount_minor {
             Some(amount) if refund.amount_unit.eq_ignore_ascii_case(&currency) => amount,
             Some(amount) => {
-                if refund.order_currency.eq_ignore_ascii_case(&currency) && refund.order_exponent == exponent {
+                if refund.order_currency.eq_ignore_ascii_case(&currency)
+                    && refund.order_exponent == exponent
+                {
                     let converted = refund_quote::convert(refund, amount)?;
                     basis = Some(converted.basis);
                     converted.minor

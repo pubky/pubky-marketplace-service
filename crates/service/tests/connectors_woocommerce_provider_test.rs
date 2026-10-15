@@ -539,6 +539,7 @@ fn refund(
 
 const ORDER_ONE: &str = "11111111-2222-8333-9444-555555555551";
 const ORDER_TWO: &str = "11111111-2222-8333-9444-555555555552";
+const ORDER_THREE: &str = "11111111-2222-8333-9444-555555555553";
 const ORDER_UNKNOWN: &str = "11111111-2222-8333-9444-5555555555ff";
 
 #[tokio::test]
@@ -679,16 +680,42 @@ async fn orders_are_pushed_found_cancelled_and_refunded_without_ever_doing_a_thi
         .record_refund(&context, &created, &partial)
         .await
         .expect("the same refund again");
-    let in_sats = refund("refund-2", &one, Some(120_000), "sat", false);
+
+    // A partial in sats without the order's quote cannot be valued.
+    let unquoted = refund("refund-2", &one, Some(120_000), "sat", false);
     assert!(matches!(
-        provider.record_refund(&context, &created, &in_sats).await,
+        provider.record_refund(&context, &created, &unquoted).await,
         Err(ProviderError::Rejected { ref code, .. }) if code == "refund_not_in_store_currency"
     ));
+
+    // With it, the order's own Bitcoin quote converts the amount, rounded to
+    // the minor unit, and the basis is written on the refund.
+    let mut bitcoin = refund("refund-btc-1", &one, Some(20_000), "sat", false);
+    bitcoin.quote = Some(bitcoin_quote());
+    provider
+        .record_refund(&context, &created, &bitcoin)
+        .await
+        .expect("a partial in sats");
+    provider
+        .record_refund(&context, &created, &bitcoin)
+        .await
+        .expect("the same sat refund again");
+    let mut too_many_sats = refund("refund-btc-2", &one, Some(1_000_000), "sat", false);
+    too_many_sats.quote = Some(bitcoin_quote());
+    assert!(
+        matches!(
+            provider.record_refund(&context, &created, &too_many_sats).await,
+            Err(ProviderError::Rejected { ref code, .. }) if code == "refund_exceeds_order"
+        ),
+        "capped by what is left: 580.00 CHF against 34.30"
+    );
     let too_much = refund("refund-3", &one, Some(1_000_000), "CHF", false);
     assert!(matches!(
         provider.record_refund(&context, &created, &too_much).await,
         Err(ProviderError::Rejected { ref code, .. }) if code == "refund_exceeds_order"
     ));
+
+    // A partial followed by a full refund: the full one is what is left.
     let rest = refund("refund-4", &one, None, "sat", true);
     provider
         .record_refund(&context, &created, &rest)
@@ -712,15 +739,23 @@ async fn orders_are_pushed_found_cancelled_and_refunded_without_ever_doing_a_thi
         let refunds = live["refunds"].as_array().expect("refunds");
         assert_eq!(
             refunds.len(),
-            2,
-            "one partial, one for the rest, none repeated"
+            3,
+            "a fiat partial, a sat partial, the rest; none repeated"
         );
         let mut totals: Vec<&str> = refunds
             .iter()
             .map(|r| r["total"].as_str().expect("total"))
             .collect();
         totals.sort();
-        assert_eq!(totals, ["-45.90", "-5.00"]);
+        assert_eq!(totals, ["-11.60", "-34.30", "-5.00"]);
+        let sat = refunds
+            .iter()
+            .find(|r| r["total"] == "-11.60")
+            .expect("the sat refund");
+        assert_eq!(
+            sat["reason"],
+            "Pubky refund refund-btc-1: 20000 sat = 11.60 CHF at BTCCHF 58000.00000000 (blocktank, 2026-10-15T12:00:00Z)"
+        );
         assert!(refunds.iter().all(|r| r["reason"]
             .as_str()
             .expect("reason")
@@ -731,14 +766,113 @@ async fn orders_are_pushed_found_cancelled_and_refunded_without_ever_doing_a_thi
             "POST",
             &format!("/wp-json/wc/v3/orders/{}/refunds", created.id),
         );
-        assert_eq!(refunds.len(), 2);
+        assert_eq!(refunds.len(), 3);
         for posted in &refunds {
             let body = posted.body.as_ref().expect("body");
             assert_eq!(body["api_refund"], false, "records only, never moves money");
         }
-        assert_eq!(refunds[0].body.as_ref().expect("body")["amount"], "5.00");
-        assert_eq!(refunds[1].body.as_ref().expect("body")["amount"], "45.90");
+        let amounts: Vec<&str> = refunds
+            .iter()
+            .map(|posted| {
+                posted.body.as_ref().expect("body")["amount"]
+                    .as_str()
+                    .expect("amount")
+            })
+            .collect();
+        assert_eq!(amounts, ["5.00", "11.60", "34.30"]);
+        assert_eq!(
+            refunds[1].body.as_ref().expect("body")["reason"],
+            "Pubky refund refund-btc-1: 20000 sat = 11.60 CHF at BTCCHF 58000.00000000 (blocktank, 2026-10-15T12:00:00Z)"
+        );
+    }
+
+    // An order paid in USDT: partials convert by the order's own ratio of
+    // USDT paid to the order total, then the rest is refunded.
+    let three = order(ORDER_THREE, false);
+    let third = provider
+        .push_order(&context, &three)
+        .await
+        .expect("push the USDT order");
+    let mut first = refund("refund-usdt-1", &three, Some(10_000_000), "usdt", false);
+    first.quote = Some(usdt_quote());
+    provider
+        .record_refund(&context, &third, &first)
+        .await
+        .expect("a USDT partial");
+    let mut second = refund("refund-usdt-2", &three, Some(3_333_333), "usdt", false);
+    second.quote = Some(usdt_quote());
+    provider
+        .record_refund(&context, &third, &second)
+        .await
+        .expect("a USDT partial that rounds");
+    provider
+        .record_refund(&context, &third, &second)
+        .await
+        .expect("the same USDT refund again");
+    let rest = refund("refund-usdt-3", &three, None, "usdt", true);
+    provider
+        .record_refund(&context, &third, &rest)
+        .await
+        .expect("the rest");
+    if side.is_live() {
+        let live = side
+            .live()
+            .rest("GET", &format!("/wc/v3/orders/{}", third.id), None)
+            .await;
+        assert_eq!(live["status"], "refunded");
+        let refunds = live["refunds"].as_array().expect("refunds");
+        let mut totals: Vec<&str> = refunds
+            .iter()
+            .map(|r| r["total"].as_str().expect("total"))
+            .collect();
+        totals.sort();
+        assert_eq!(totals, ["-2.67", "-40.23", "-8.00"]);
+        let reasons: Vec<&str> = refunds
+            .iter()
+            .map(|r| r["reason"].as_str().expect("reason"))
+            .collect();
+        assert!(reasons.contains(&"Pubky refund refund-usdt-1: 10.000000 USDT = 8.00 CHF at the order's payment of 63.625000 USDT for 50.90 CHF (usd parity)"), "{reasons:?}");
+    }
+    if let Some(replay) = &side.replay {
+        let refunds = replay.requests(
+            "POST",
+            &format!("/wp-json/wc/v3/orders/{}/refunds", third.id),
+        );
+        let amounts: Vec<&str> = refunds
+            .iter()
+            .map(|posted| {
+                posted.body.as_ref().expect("body")["amount"]
+                    .as_str()
+                    .expect("amount")
+            })
+            .collect();
+        assert_eq!(amounts, ["8.00", "2.67", "40.23"]);
         replay.assert_no_misses();
+    }
+}
+
+fn bitcoin_quote() -> RefundQuote {
+    RefundQuote::Bitcoin {
+        currency: "CHF".into(),
+        exponent: 2,
+        rate: "58000.00000000".into(),
+        quoted_sats: Some(87_759),
+        source: Some("blocktank".into()),
+        fetched_at: Some(
+            "2026-10-15T12:00:00Z"
+                .parse::<DateTime<Utc>>()
+                .expect("time"),
+        ),
+    }
+}
+
+fn usdt_quote() -> RefundQuote {
+    RefundQuote::Asset {
+        asset: "USDT".into(),
+        network: Some("arbitrum".into()),
+        paid_minor: 63_625_000,
+        paid_exponent: 6,
+        basis: Some("usd parity".into()),
     }
 }
 

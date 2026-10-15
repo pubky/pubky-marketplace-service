@@ -58,7 +58,8 @@ pub fn convert(refund: &RefundRecord, amount: i64) -> Result<Converted, Provider
                 .into(),
         });
     };
-    let amount = u128::try_from(amount).map_err(|_| unavailable("The refund amount is negative."))?;
+    let amount =
+        u128::try_from(amount).map_err(|_| unavailable("The refund amount is negative."))?;
     let currency = refund.order_currency.to_ascii_uppercase();
     let exponent = refund.order_exponent;
     let overflow = || unavailable("The refund amount is out of range.");
@@ -79,7 +80,8 @@ pub fn convert(refund: &RefundRecord, amount: i64) -> Result<Converted, Provider
                     "The order's Bitcoin quote is in another currency than the order.",
                 ));
             }
-            let decimal = Decimal::parse(rate).ok_or_else(|| unavailable("The order's rate is unreadable."))?;
+            let decimal = Decimal::parse(rate)
+                .ok_or_else(|| unavailable("The order's rate is unreadable."))?;
             let exponent_scale = 10u128
                 .checked_pow(u32::try_from(exponent).map_err(|_| overflow())?)
                 .ok_or_else(overflow)?;
@@ -88,7 +90,9 @@ pub fn convert(refund: &RefundRecord, amount: i64) -> Result<Converted, Provider
                 .checked_mul(exponent_scale)
                 .and_then(|value| value.checked_mul(decimal.mantissa))
                 .ok_or_else(overflow)?;
-            let denominator = 100_000_000u128.checked_mul(rate_scale).ok_or_else(overflow)?;
+            let denominator = 100_000_000u128
+                .checked_mul(rate_scale)
+                .ok_or_else(overflow)?;
             let minor = round_div(numerator, denominator).ok_or_else(overflow)?;
             let when = fetched_at
                 .map(|at| at.to_rfc3339_opts(SecondsFormat::Secs, true))
@@ -125,7 +129,10 @@ pub fn convert(refund: &RefundRecord, amount: i64) -> Result<Converted, Provider
                 .and_then(|numerator| round_div(numerator, paid))
                 .ok_or_else(overflow)?;
             let display = |value: u128, exponent: i32| -> Result<String, ProviderError> {
-                Ok(money::format_minor(i64::try_from(value).map_err(|_| overflow())?, exponent))
+                Ok(money::format_minor(
+                    i64::try_from(value).map_err(|_| overflow())?,
+                    exponent,
+                ))
             };
             (
                 minor,
@@ -207,9 +214,21 @@ mod tests {
     #[test]
     fn sats_round_half_up_and_a_full_quote_returns_the_total() {
         let refund = record("sat", Some(bitcoin("58000", "CHF")));
-        assert_eq!(convert(&refund, 87_759).unwrap().minor, 5090, "the quoted sats are the order total");
-        assert_eq!(convert(&refund, 1).unwrap().minor, 0, "0.058 cents rounds down");
-        assert_eq!(convert(&refund, 863).unwrap().minor, 50, "50.05 cents rounds down");
+        assert_eq!(
+            convert(&refund, 87_759).unwrap().minor,
+            5090,
+            "the quoted sats are the order total"
+        );
+        assert_eq!(
+            convert(&refund, 1).unwrap().minor,
+            0,
+            "0.058 cents rounds down"
+        );
+        assert_eq!(
+            convert(&refund, 863).unwrap().minor,
+            50,
+            "50.05 cents rounds down"
+        );
         let half = record("sat", Some(bitcoin("50000", "CHF")));
         assert_eq!(convert(&half, 1000).unwrap().minor, 50, "exactly 50.0");
         assert_eq!(convert(&half, 1001).unwrap().minor, 50);
@@ -217,9 +236,27 @@ mod tests {
         assert_eq!(convert(&tie, 500).unwrap().minor, 50, "50.00025 cents");
         let rounds_up = record("sat", Some(bitcoin("100000", "CHF")));
         assert_eq!(convert(&rounds_up, 1_500).unwrap().minor, 150);
-        assert_eq!(convert(&record("sat", Some(bitcoin("65000", "CHF"))), 77).unwrap().minor, 5, "5.005 rounds to 5");
-        assert_eq!(convert(&record("sat", Some(bitcoin("65000", "CHF"))), 78).unwrap().minor, 5, "5.07 rounds to 5");
-        assert_eq!(convert(&record("sat", Some(bitcoin("100000", "CHF"))), 5).unwrap().minor, 1, "0.5 rounds up");
+        assert_eq!(
+            convert(&record("sat", Some(bitcoin("65000", "CHF"))), 77)
+                .unwrap()
+                .minor,
+            5,
+            "5.005 rounds to 5"
+        );
+        assert_eq!(
+            convert(&record("sat", Some(bitcoin("65000", "CHF"))), 78)
+                .unwrap()
+                .minor,
+            5,
+            "5.07 rounds to 5"
+        );
+        assert_eq!(
+            convert(&record("sat", Some(bitcoin("100000", "CHF"))), 5)
+                .unwrap()
+                .minor,
+            1,
+            "0.5 rounds up"
+        );
     }
 
     #[test]
@@ -231,18 +268,28 @@ mod tests {
             converted.basis,
             "10.000000 USDT = 8.00 CHF at the order's payment of 63.625000 USDT for 50.90 CHF (usd parity)"
         );
-        assert_eq!(convert(&refund, 3_333_333).unwrap().minor, 267, "266.66 rounds up");
+        assert_eq!(
+            convert(&refund, 3_333_333).unwrap().minor,
+            267,
+            "266.66 rounds up"
+        );
         assert_eq!(convert(&refund, 63_625_000).unwrap().minor, 5090);
     }
 
     #[test]
     fn without_a_matching_basis_nothing_is_guessed() {
         let none = record("sat", None);
-        assert!(matches!(convert(&none, 1000), Err(ProviderError::Rejected { code, .. }) if code == "refund_not_in_store_currency"));
+        assert!(
+            matches!(convert(&none, 1000), Err(ProviderError::Rejected { code, .. }) if code == "refund_not_in_store_currency")
+        );
         let usd_quote = record("sat", Some(bitcoin("65000", "USD")));
-        assert!(matches!(convert(&usd_quote, 1000), Err(ProviderError::Rejected { code, .. }) if code == "refund_basis_unavailable"));
+        assert!(
+            matches!(convert(&usd_quote, 1000), Err(ProviderError::Rejected { code, .. }) if code == "refund_basis_unavailable")
+        );
         let wrong_unit = record("usdt", Some(bitcoin("65000", "CHF")));
-        assert!(matches!(convert(&wrong_unit, 1000), Err(ProviderError::Rejected { code, .. }) if code == "refund_basis_unavailable"));
+        assert!(
+            matches!(convert(&wrong_unit, 1000), Err(ProviderError::Rejected { code, .. }) if code == "refund_basis_unavailable")
+        );
         let bad_rate = record("sat", Some(bitcoin("not-a-rate", "CHF")));
         assert!(convert(&bad_rate, 1000).is_err());
         assert!(convert(&record("sat", Some(bitcoin("58000", "CHF"))), -1).is_err());
@@ -257,8 +304,14 @@ mod tests {
     fn huge_amounts_are_computed_exactly_or_refused_never_wrapped() {
         let usdt_refund = record("usdt", Some(usdt()));
         let exact = (u128::from(i64::MAX.unsigned_abs()) * 5090 + 63_625_000 / 2) / 63_625_000;
-        assert_eq!(convert(&usdt_refund, i64::MAX).unwrap().minor as u128, exact);
-        let absurd = record("sat", Some(bitcoin("99999999999999999999999999999.99999999", "CHF")));
+        assert_eq!(
+            convert(&usdt_refund, i64::MAX).unwrap().minor as u128,
+            exact
+        );
+        let absurd = record(
+            "sat",
+            Some(bitcoin("99999999999999999999999999999.99999999", "CHF")),
+        );
         assert!(convert(&absurd, i64::MAX).is_err());
     }
 }
