@@ -130,6 +130,38 @@ async fn migration_0060_is_rerunnable_and_checks_the_new_shapes(pool: PgPool) {
         .unwrap_or_else(|error| panic!("{finality}: {error}"));
     }
 
+    // A refund of a USDT-paid order is recorded in the paid asset's units, so
+    // the refund bound admits the amount that was paid and no more.
+    update(
+        &pool,
+        order_id,
+        "payment_asset = 'USDT', payment_network = 'arbitrum-one', \
+         payment_amount_minor = 40500000, payment_exponent = 6, \
+         payment_quote_basis = 'fixed_rate'",
+    )
+    .await
+    .expect("the paid rail");
+    update(
+        &pool,
+        order_id,
+        "external_refund = '{\"amount_minor\": 40500000}'::jsonb",
+    )
+    .await
+    .expect("a refund up to the amount paid");
+    assert!(
+        update(
+            &pool,
+            order_id,
+            "external_refund = '{\"amount_minor\": 40500001}'::jsonb"
+        )
+        .await
+        .is_err(),
+        "more than was paid"
+    );
+    update(&pool, order_id, "external_refund = NULL")
+        .await
+        .expect("cleared");
+
     // A released attempt that offered no Bitcoin has no satoshi total.
     let insert = |total: Option<i64>| {
         let pool = pool.clone();
