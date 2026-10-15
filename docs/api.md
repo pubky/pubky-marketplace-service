@@ -1016,6 +1016,18 @@ Two ways to finish the connection:
   WooCommerce connection (the Shop's credentials form); a body with
   `client_id` and `client_secret` still answers `credentials_not_supported`.
   `200` is the same `connector_connected` answer as the callback.
+  The same body on a **connected**, `needs_attention` or rejected (`error`)
+  WooCommerce connection replaces its keys ("Replace credentials"): the new
+  pair is verified like a connect (the authenticated read, the store still
+  answering at the address the connection is for, our webhooks created with a
+  fresh per-connection secret and the old ones deleted after), then sealed over
+  the old pair in one transaction under a lock on the connection, which also
+  clears a `needs_attention` or `error` state. A refusal changes nothing (old
+  keys, secret, webhooks and status stay) and is typed: `invalid_keys`,
+  `credentials_rejected`, `keys_read_only`, `wrong_store` (the store at this
+  address reports another WordPress address), or `502 provider_unavailable`.
+  The old key pair is not revoked on the store (WooCommerce has no call for it):
+  the merchant deletes it under WooCommerce > Settings > Advanced > REST API.
   Errors: `422 invalid_keys` (wrong shape), `422 credentials_rejected` (the
   store refuses the pair), `422 keys_read_only`, `409 not_pending` (no draft
   waiting, or it expired), `409 shop_in_use`, `404 connection_not_found`,

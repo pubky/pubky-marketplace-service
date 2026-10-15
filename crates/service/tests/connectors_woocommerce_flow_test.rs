@@ -531,8 +531,9 @@ async fn pasted_keys_connect_a_pending_store_and_wrong_ones_do_not(pool: PgPool)
     )
     .await;
     assert_eq!(
-        (status, again["error"]["code"].as_str()),
-        (StatusCode::CONFLICT, Some("not_pending"))
+        (status, again["connection"]["status"].as_str()),
+        (StatusCode::OK, Some("connected")),
+        "keys on a connected store replace its keys"
     );
 
     let (status, catalog) = api(
@@ -717,8 +718,9 @@ async fn the_shops_credentials_form_connects_a_woocommerce_store_with_its_key_pa
     assert!(!body.to_string().contains("ck_") && !body.to_string().contains("cs_"));
     let (status, again) = api(&app, "PUT", &path, Some(&seller.token), &right).await;
     assert_eq!(
-        (status, again["error"]["code"].as_str()),
-        (StatusCode::CONFLICT, Some("not_pending"))
+        (status, again["connection"]["status"].as_str()),
+        (StatusCode::OK, Some("connected")),
+        "keys on a connected store replace its keys"
     );
     let (status, catalog) = api(
         &app,

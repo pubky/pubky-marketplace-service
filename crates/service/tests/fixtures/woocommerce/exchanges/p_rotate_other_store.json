@@ -1,0 +1,20 @@
+{
+ "label": "p_rotate_other_store",
+ "exchanges": [
+  {
+   "method": "GET",
+   "path": "/wp-json/",
+   "query": [],
+   "auth": "none",
+   "request_body": null,
+   "status": 200,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "$blob": "7815651c67bd935d"
+   }
+  }
+ ]
+}

@@ -35,6 +35,7 @@ Scenarios (`p_` = provider only, `flow_` = through the service and PostgreSQL):
 | `p_bad_keys` | a key pair the store does not know: both ways answer 401 |
 | `p_read_only` | a `scope=read` key: WooCommerce's 401 "does not have write permissions" |
 | `p_refused` | plain permalinks (`/wp-json/` redirects to itself, `/?rest_route=/` works), WooCommerce deactivated (no `wc/v3` namespace) |
+| `p_rotate_other_store` | valid keys for a connection whose store answers at another address: `wrong_store`, and no key is sent |
 | `p_home_mismatch` | the store answers at an address other than its WordPress address |
 | `p_catalog` | the full catalog in pages of seven, variations, stock, images |
 | `p_orders` | order create (with the opted-in address), find by id, cancel (and again), refunds mirrored as the difference from what the store shows refunded (a later larger record adds only the rest, a smaller one nothing, one above the payment is capped, a merchant's own refund counts), each with `api_refund: false` |
@@ -44,6 +45,7 @@ Scenarios (`p_` = provider only, `flow_` = through the service and PostgreSQL):
 | `flow_d` | a Pubky refund is recorded in the store; its webhook echo raises no alert |
 | `flow_e` | pasted keys: wrong shape, wrong keys, another seller's connection, right keys, repeat |
 | `flow_f` | WooCommerce inactive: six refused connects leave no draft behind (the limit is five), a restart reuses its draft |
+| `flow_i` | replace credentials on a connected store: wrong shape, unknown keys, a read-only key and another seller change nothing; a new pair swaps keys, secret and webhooks; a store needing attention is recovered; a disconnected one is refused |
 | `flow_h` | completed without tracking, tracking added later, tracking changed (the newest item counts), a repeat |
 | `flow_g` | the Shop's `PUT /credentials` form with `consumer_key` and `consumer_secret` |
 
