@@ -652,6 +652,18 @@ async fn racing_issuers_cannot_exceed_the_live_cap(pool: PgPool) {
         assert_eq!(status, StatusCode::CREATED);
     }
 
+    let tokens = || async {
+        sqlx::query_scalar::<_, f64>(
+            "SELECT tokens FROM automation_rate_limits \
+             WHERE seller_pubky = $1 AND endpoint_class = 'grant_session.mint'",
+        )
+        .bind(grant.pubky())
+        .fetch_one(&app.pool)
+        .await
+        .expect("bucket")
+    };
+    let before = tokens().await;
+
     let mut tasks = tokio::task::JoinSet::new();
     for _ in 0..8 {
         let router = app.router.clone();
@@ -685,6 +697,10 @@ async fn racing_issuers_cannot_exceed_the_live_cap(pool: PgPool) {
             .await
             .expect("live challenges");
     assert_eq!(live, MAX_LIVE_CHALLENGES);
+    // The winner spends a token; a loser that passed the pre-check before the
+    // winner committed spends one too (documented), one caught by it does not.
+    let spent = before - tokens().await;
+    assert!((1.0..=8.0).contains(&spent), "spent {spent}");
 }
 
 /// Kimi delta P3-3(b): issuing a challenge spends the `grant_session.mint`

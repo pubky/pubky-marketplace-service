@@ -1067,7 +1067,7 @@ The `201` body is the same as `POST /v1/auth/sessions`.
 | 404 | `grant_session_unavailable` | The feature is off |
 | 413 | none (plain text) | Body over 16 KB; the router refuses it before the handler, so the body is not the JSON envelope |
 | 429 | `retry_later` | Challenge only: `grant_session.mint` rate limit, with `Retry-After` |
-| 429 | `too_many_challenges` | Challenge only: 5 live challenges already; spends no rate token |
+| 429 | `too_many_challenges` | Challenge only: 5 live challenges already. Refused before the rate check, so it spends no token, except for a concurrent request that passed that check and lost the slot under the lock |
 | 500 | `session_unavailable` | Database failure |
 | 503 | `homeserver_unavailable` | Mint only: the homeserver could not be read; nothing was burned, so the same proof can be retried while young |
 
