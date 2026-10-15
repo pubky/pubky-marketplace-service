@@ -1,0 +1,19 @@
+query OrderTransactions($id: ID!) {
+  order(id: $id) {
+    id
+    currencyCode
+    cancelledAt
+    transactions(first: 20) {
+      id
+      kind
+      status
+      gateway
+      amountSet {
+        shopMoney {
+          amount
+          currencyCode
+        }
+      }
+    }
+  }
+}

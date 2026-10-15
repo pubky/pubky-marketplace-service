@@ -11,8 +11,12 @@
 //! through an in-process session that carries only the inventory capability;
 //! no seller bearer exists or is stored.
 //!
-//! Only mapped variants are applied. A listing the connection maps to more
-//! than one store variant is skipped. The service has no per-variant stock:
+//! Only mapped variants are applied. A listing the connection maps to exactly
+//! one store variant (every `split` connection, and a `native` listing with a
+//! single variant) syncs at listing level, which the service tracks. A
+//! `native` listing mapped to several store variants needs per-variant stock
+//! and goes through [`VariantInventory`]; until the service has that, the
+//! default [`NoVariantInventory`] skips it. The service has no per-variant stock:
 //! the seller's listing record carries a quantity per variant, but
 //! registration sums them into the listing's `total_quantity`
 //! (`registration_payload_from_record`), `listings` holds only total,
@@ -25,6 +29,8 @@ use axum::body::Bytes;
 use axum::http::StatusCode;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+
+use async_trait::async_trait;
 
 use crate::auth::{Actor, AuthSession, INVENTORY_SERVICE_SCOPE};
 use crate::AppState;
@@ -43,6 +49,51 @@ pub enum StockOutcome {
     Ignored(&'static str),
     /// Try again later: a concurrent change or a rate limit.
     Retry(String),
+}
+
+/// One store variant's sellable stock, to be applied to the Pubky variant it
+/// is mapped to.
+#[derive(Debug, Clone)]
+pub struct VariantStockRequest<'a> {
+    pub connection: &'a ConnectionRow,
+    /// The mapping row: `listing_id` and `variant_id` name the Pubky side.
+    pub mapping: &'a MappingRow,
+    /// What the store can sell now (never negative).
+    pub available: i64,
+    /// The provider's webhook event id, or `None` for a poll. Use it as the
+    /// adjustment's external reference so a replay cannot apply twice.
+    pub event_id: Option<&'a str>,
+}
+
+/// Where per-variant store stock lands. The service has listing-level
+/// inventory only today, so the default skips it. When per-variant inventory
+/// exists, implement this once (set the Pubky variant's available quantity to
+/// `available` through the new per-variant adjust path, idempotent on the
+/// request's key) and pass it to
+/// [`super::ConnectorRuntime::with_variant_inventory`]; nothing else in the
+/// connector changes.
+#[async_trait]
+pub trait VariantInventory: Send + Sync + 'static {
+    async fn apply_variant_stock(
+        &self,
+        state: &AppState,
+        request: VariantStockRequest<'_>,
+    ) -> Result<StockOutcome, sqlx::Error>;
+}
+
+/// The default: no per-variant stock exists, so a listing mapped to several
+/// store variants is skipped.
+pub struct NoVariantInventory;
+
+#[async_trait]
+impl VariantInventory for NoVariantInventory {
+    async fn apply_variant_stock(
+        &self,
+        _state: &AppState,
+        _request: VariantStockRequest<'_>,
+    ) -> Result<StockOutcome, sqlx::Error> {
+        Ok(StockOutcome::Ignored("multi_variant_listing"))
+    }
 }
 
 fn worker_session(seller_pubky: &str) -> AuthSession {
@@ -67,7 +118,21 @@ pub async fn apply_stock_level(
 ) -> Result<StockOutcome, sqlx::Error> {
     if store::mapping_count_for_listing(&state.pool, connection.id, &mapping.listing_id).await? > 1
     {
-        return Ok(StockOutcome::Ignored("multi_variant_listing"));
+        let Some(runtime) = state.connectors.as_ref() else {
+            return Ok(StockOutcome::Ignored("multi_variant_listing"));
+        };
+        return runtime
+            .variant_inventory
+            .apply_variant_stock(
+                state,
+                VariantStockRequest {
+                    connection,
+                    mapping,
+                    available: level.max(0),
+                    event_id,
+                },
+            )
+            .await;
     }
     let listing: Option<(i64, i64)> = sqlx::query_as(
         "SELECT server_revision, available_quantity FROM listings \

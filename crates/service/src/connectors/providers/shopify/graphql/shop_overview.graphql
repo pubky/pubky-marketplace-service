@@ -1,0 +1,17 @@
+query ShopOverview {
+  shop {
+    name
+    currencyCode
+  }
+  locations(first: 50) {
+    nodes {
+      id
+      isActive
+    }
+  }
+  currentAppInstallation {
+    accessScopes {
+      handle
+    }
+  }
+}

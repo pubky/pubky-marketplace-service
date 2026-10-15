@@ -1,0 +1,49 @@
+query ProductsPage($first: Int!, $after: String) {
+  shop {
+    currencyCode
+  }
+  products(first: $first, after: $after, query: "status:active") {
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+    nodes {
+      id
+      title
+      description
+      onlineStoreUrl
+      options {
+        name
+        values
+      }
+      images(first: 10) {
+        nodes {
+          url
+        }
+      }
+      variants(first: 50) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          id
+          title
+          sku
+          price
+          selectedOptions {
+            name
+            value
+          }
+          image {
+            url
+          }
+          inventoryQuantity
+          inventoryItem {
+            tracked
+          }
+        }
+      }
+    }
+  }
+}

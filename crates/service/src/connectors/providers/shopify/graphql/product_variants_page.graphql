@@ -1,0 +1,28 @@
+query ProductVariantsPage($id: ID!, $after: String) {
+  product(id: $id) {
+    id
+    variants(first: 50, after: $after) {
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+      nodes {
+        id
+        title
+        sku
+        price
+        selectedOptions {
+          name
+          value
+        }
+        image {
+          url
+        }
+        inventoryQuantity
+        inventoryItem {
+          tracked
+        }
+      }
+    }
+  }
+}

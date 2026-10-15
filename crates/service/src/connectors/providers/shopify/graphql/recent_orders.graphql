@@ -1,0 +1,9 @@
+query RecentOrders($first: Int!) {
+  orders(first: $first, sortKey: CREATED_AT, reverse: true) {
+    nodes {
+      id
+      tags
+      cancelledAt
+    }
+  }
+}

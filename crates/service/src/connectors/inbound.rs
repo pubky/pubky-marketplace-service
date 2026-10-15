@@ -119,7 +119,7 @@ pub async fn process_due(
             break;
         };
         let handled = match serde_json::from_value::<InboundEvent>(due.event.clone()) {
-            Ok(event) => handle(state, &due, event).await?,
+            Ok(event) => handle(state, runtime, &due, event).await?,
             Err(_) => Handled::Ignored("unreadable_event".to_string()),
         };
         let now = state.clock.now();
@@ -189,6 +189,7 @@ async fn settle(
 
 async fn handle(
     state: &AppState,
+    runtime: &ConnectorRuntime,
     due: &DueEvent,
     event: InboundEvent,
 ) -> Result<Handled, sqlx::Error> {
@@ -202,6 +203,15 @@ async fn handle(
     if !connection.is_live() {
         return Ok(Handled::Ignored("connection_not_live".to_string()));
     }
+    let event = match event {
+        InboundEvent::InventoryChanged { inventory_item_id } => {
+            match resolve_inventory(state, runtime, &connection, &inventory_item_id).await? {
+                Ok(resolved) => resolved,
+                Err(handled) => return Ok(handled),
+            }
+        }
+        other => other,
+    };
     match event {
         InboundEvent::StockLevel {
             provider_product_id,
@@ -258,6 +268,9 @@ async fn handle(
             let Some(order_id) = resolve_order(&state.pool, &connection, &order).await? else {
                 return Ok(Handled::Ignored("unknown_order".to_string()));
             };
+            if mirrored(&state.pool, &connection, order_id, "cancel").await? {
+                return Ok(Handled::Ignored("pubky_cancel_echo".to_string()));
+            }
             let why = reason
                 .map(|reason| format!(" Reason given: {reason}."))
                 .unwrap_or_default();
@@ -287,6 +300,9 @@ async fn handle(
             let Some(order_id) = resolve_order(&state.pool, &connection, &order).await? else {
                 return Ok(Handled::Ignored("unknown_order".to_string()));
             };
+            if mirrored(&state.pool, &connection, order_id, "refund").await? {
+                return Ok(Handled::Ignored("pubky_refund_echo".to_string()));
+            }
             let amount = match (amount_minor, currency) {
                 (Some(amount), Some(currency)) => format!(" ({amount} minor units {currency})"),
                 (Some(amount), None) => format!(" ({amount} minor units)"),
@@ -325,7 +341,9 @@ async fn handle(
             .await?;
             Ok(Handled::Applied("connection closed".to_string()))
         }
-        InboundEvent::Compliance { .. } => unreachable!("handled above"),
+        InboundEvent::Compliance { .. } | InboundEvent::InventoryChanged { .. } => {
+            unreachable!("handled above")
+        }
         InboundEvent::Ignored { reason } => Ok(Handled::Ignored(reason)),
     }
 }
@@ -357,6 +375,77 @@ async fn compliance(
             Ok(Handled::Applied("store data deleted".to_string()))
         }
     }
+}
+
+/// Whether Pubky itself mirrored a cancel or refund of this order to the
+/// store. The store reports that back as a webhook; it is an echo, not the
+/// merchant acting, so it raises no alert.
+async fn mirrored(
+    pool: &PgPool,
+    connection: &ConnectionRow,
+    order_id: Uuid,
+    kind: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM connector_order_actions a \
+         JOIN connector_order_push p ON p.id = a.push_id \
+         WHERE p.connection_id = $1 AND p.pubky_order_id = $2 AND a.kind = $3)",
+    )
+    .bind(connection.id)
+    .bind(order_id)
+    .bind(kind)
+    .fetch_one(pool)
+    .await
+}
+
+/// Turns a store inventory-item change into the variant and stock it means.
+/// `Err` carries the final disposition when there is nothing to apply.
+async fn resolve_inventory(
+    state: &AppState,
+    runtime: &ConnectorRuntime,
+    connection: &ConnectionRow,
+    inventory_item_id: &str,
+) -> Result<Result<InboundEvent, Handled>, sqlx::Error> {
+    let Some(provider) = connection
+        .provider_kind()
+        .and_then(|kind| runtime.providers.get(kind))
+    else {
+        return Ok(Err(Handled::Ignored("provider_unavailable".to_string())));
+    };
+    let context = match runtime.open(&state.pool, connection).await {
+        Ok(context) => context,
+        Err(store::OpenError::Database(error)) => return Err(error),
+        Err(_) => return Ok(Err(Handled::Retry("connection_unavailable".to_string()))),
+    };
+    let resolved = tokio::time::timeout(
+        runtime.settings.provider_timeout,
+        provider.resolve_inventory(&context, inventory_item_id),
+    )
+    .await;
+    Ok(match resolved {
+        Ok(Ok(Some(stock))) => match stock.available {
+            Some(available) => Ok(InboundEvent::StockLevel {
+                provider_product_id: stock.provider_product_id,
+                provider_variant_id: stock.provider_variant_id,
+                available,
+            }),
+            None => Err(Handled::Ignored("stock_not_tracked".to_string())),
+        },
+        Ok(Ok(None)) => Err(Handled::Ignored("not_a_variant".to_string())),
+        Ok(Err(super::provider::ProviderError::Unauthorized)) => {
+            Err(Handled::Ignored("credentials_rejected".to_string()))
+        }
+        Ok(Err(
+            super::provider::ProviderError::Rejected { .. }
+            | super::provider::ProviderError::Invalid(_),
+        )) => Err(Handled::Ignored("provider_rejected".to_string())),
+        Ok(Err(super::provider::ProviderError::RateLimited { .. })) => {
+            Err(Handled::Retry("rate_limited".to_string()))
+        }
+        Ok(Err(super::provider::ProviderError::Unknown(_))) | Err(_) => {
+            Err(Handled::Retry("provider_unavailable".to_string()))
+        }
+    })
 }
 
 fn retention_end(now: DateTime<Utc>) -> DateTime<Utc> {

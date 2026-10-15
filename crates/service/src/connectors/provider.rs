@@ -436,6 +436,25 @@ pub enum ComplianceTopic {
     ShopRedact,
 }
 
+/// A store variant's current sellable stock, found from an inventory item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedStock {
+    pub provider_product_id: String,
+    pub provider_variant_id: String,
+    /// Units the store can sell, summed over its locations; `None` when the
+    /// store does not track this variant's stock.
+    pub available: Option<i64>,
+}
+
+/// What a live check of a connection found, for the Shop's status page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectionCheck {
+    pub shop_name: String,
+    pub granted_scopes: Vec<String>,
+    pub location_count: i64,
+    pub catalog_readable: bool,
+}
+
 /// What an inbound webhook means to Pubky.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -447,6 +466,11 @@ pub enum InboundEvent {
         provider_variant_id: String,
         available: i64,
     },
+    /// A store inventory item changed. The webhook names the item, not the
+    /// variant or the total, so the framework asks the provider
+    /// ([`ConnectorProvider::resolve_inventory`]) which variant it is and
+    /// what the store can now sell, then applies it like a `StockLevel`.
+    InventoryChanged { inventory_item_id: String },
     /// A shipment with tracking for an order the push created.
     Fulfillment {
         order: OrderRef,
@@ -581,6 +605,30 @@ pub trait ConnectorProvider: Send + Sync + 'static {
         connection: &ConnectionContext,
         page: Option<&str>,
     ) -> Result<CatalogPage, ProviderError>;
+
+    /// The variant, and its total sellable stock, behind a store inventory
+    /// item (see [`InboundEvent::InventoryChanged`]). `Ok(None)` when the
+    /// item is not a product variant. Providers whose stock webhooks already
+    /// name the variant keep the default.
+    async fn resolve_inventory(
+        &self,
+        _connection: &ConnectionContext,
+        _inventory_item_id: &str,
+    ) -> Result<Option<ResolvedStock>, ProviderError> {
+        Ok(None)
+    }
+
+    /// A live look at the connection for the Shop's status page: the store's
+    /// name, the scopes it granted, how many locations it has and whether a
+    /// catalog read works. Providers without one keep the default.
+    async fn check_connection(
+        &self,
+        _connection: &ConnectionContext,
+    ) -> Result<ConnectionCheck, ProviderError> {
+        Err(ProviderError::Invalid(
+            "this provider has no connection check".into(),
+        ))
+    }
 
     /// Creates the store order. Called only after the ledger row is
     /// `sending`.

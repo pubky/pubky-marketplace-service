@@ -1,0 +1,9 @@
+query WebhookSubscriptions {
+  webhookSubscriptions(first: 100) {
+    nodes {
+      id
+      topic
+      uri
+    }
+  }
+}

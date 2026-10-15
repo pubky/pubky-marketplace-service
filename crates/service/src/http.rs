@@ -111,6 +111,14 @@ pub fn build_router(state: AppState) -> Router {
             put(crate::connectors::routes::put_credentials),
         )
         .route(
+            "/v1/connectors/{id}/settings",
+            put(crate::connectors::routes::put_settings),
+        )
+        .route(
+            "/v1/connectors/{id}/check",
+            get(crate::connectors::routes::check_connection),
+        )
+        .route(
             "/v1/connectors/{id}/catalog",
             get(crate::connectors::routes::get_catalog),
         )

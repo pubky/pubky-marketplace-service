@@ -26,6 +26,7 @@ pub struct ConnectionRow {
     pub provider: String,
     pub shop: String,
     pub app_kind: String,
+    pub variant_mode: String,
     pub status: String,
     pub scopes: Vec<String>,
     pub missing_scopes: Vec<String>,
@@ -39,8 +40,8 @@ pub struct ConnectionRow {
     pub updated_at: DateTime<Utc>,
 }
 
-pub const CONNECTION_COLUMNS: &str = "id, seller_pubky, provider, shop, app_kind, status, scopes, \
-     missing_scopes, connect_state_hash, state_expires_at, connect_expires_at, connected_at, \
+pub const CONNECTION_COLUMNS: &str = "id, seller_pubky, provider, shop, app_kind, variant_mode, status, \
+     scopes, missing_scopes, connect_state_hash, state_expires_at, connect_expires_at, connected_at, \
      last_error, last_error_at, created_at, updated_at";
 
 /// The states in which a connection holds an access credential for the store.
@@ -53,6 +54,10 @@ impl ConnectionRow {
 
     pub fn app_kind(&self) -> AppKind {
         AppKind::parse(&self.app_kind).unwrap_or(AppKind::None)
+    }
+
+    pub fn is_split(&self) -> bool {
+        self.variant_mode == "split"
     }
 
     pub fn is_live(&self) -> bool {
@@ -792,6 +797,60 @@ pub fn truncate(text: &str, max_chars: usize) -> String {
     text.chars().take(max_chars).collect()
 }
 
+#[derive(Debug)]
+pub enum VariantModeError {
+    /// Switching to `split` while a listing is mapped to more than one store
+    /// variant.
+    SharedListing(String),
+    Database(sqlx::Error),
+}
+
+impl From<sqlx::Error> for VariantModeError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Database(error)
+    }
+}
+
+/// Sets how the connection's store variants relate to Pubky listings
+/// (`native` or `split`). `split` is refused while a listing is mapped to
+/// more than one store variant.
+pub async fn set_variant_mode(
+    pool: &PgPool,
+    connection: &ConnectionRow,
+    split: bool,
+    now: DateTime<Utc>,
+) -> Result<ConnectionRow, VariantModeError> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('connector-map|' || $1::text, 0))")
+        .bind(connection.id)
+        .execute(&mut *tx)
+        .await?;
+    if split {
+        let shared: Option<String> = sqlx::query_scalar(
+            "SELECT listing_id FROM connector_variant_map WHERE connection_id = $1 \
+             GROUP BY listing_id HAVING COUNT(*) > 1 LIMIT 1",
+        )
+        .bind(connection.id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(listing_id) = shared {
+            return Err(VariantModeError::SharedListing(listing_id));
+        }
+    }
+    let row: ConnectionRow = sqlx::query_as(&format!(
+        "UPDATE connector_connections SET variant_mode = $2, updated_at = $3 \
+         WHERE id = $1 AND seller_pubky = $4 RETURNING {CONNECTION_COLUMNS}"
+    ))
+    .bind(connection.id)
+    .bind(if split { "split" } else { "native" })
+    .bind(now)
+    .bind(&connection.seller_pubky)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(row)
+}
+
 // === Mappings and product selection ==========================================
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, sqlx::FromRow)]
@@ -823,6 +882,9 @@ pub enum MappingError {
     UnknownListing(String),
     /// A uniqueness violation: the pair is already mapped to something else.
     Conflict,
+    /// In `split` mode each store variant has its own listing, so a listing
+    /// appears in the mapping once.
+    SharedListing(String),
     Database(sqlx::Error),
 }
 
@@ -847,18 +909,28 @@ pub async fn replace_mappings(
         .bind(connection.id)
         .execute(&mut *tx)
         .await?;
-    let still_live: Option<String> = sqlx::query_scalar(
-        "SELECT status FROM connector_connections WHERE id = $1 AND seller_pubky = $2 FOR UPDATE",
+    let still_live: Option<(String, String)> = sqlx::query_as(
+        "SELECT status, variant_mode FROM connector_connections \
+         WHERE id = $1 AND seller_pubky = $2 FOR UPDATE",
     )
     .bind(connection.id)
     .bind(&connection.seller_pubky)
     .fetch_optional(&mut *tx)
     .await?;
-    if !matches!(
-        still_live.as_deref(),
-        Some("connected" | "needs_attention" | "error")
-    ) {
+    let Some((status, variant_mode)) = still_live else {
         return Err(MappingError::Database(sqlx::Error::RowNotFound));
+    };
+    if !matches!(status.as_str(), "connected" | "needs_attention" | "error") {
+        return Err(MappingError::Database(sqlx::Error::RowNotFound));
+    }
+    if variant_mode == "split" {
+        let mut seen = std::collections::HashSet::new();
+        if let Some(shared) = mappings
+            .iter()
+            .find(|mapping| !seen.insert(mapping.listing_id.as_str()))
+        {
+            return Err(MappingError::SharedListing(shared.listing_id.clone()));
+        }
     }
     let listing_ids: Vec<String> = mappings
         .iter()
@@ -1115,6 +1187,10 @@ pub struct AlertRow {
     pub detail: String,
     pub created_at: DateTime<Utc>,
     pub resolved_at: Option<DateTime<Utc>>,
+    /// The Pubky order's state now, to say which existing flow applies.
+    pub order_state: Option<String>,
+    pub order_fulfillment: Option<String>,
+    pub refund_recorded: Option<bool>,
 }
 
 pub async fn list_alerts(
@@ -1124,10 +1200,12 @@ pub async fn list_alerts(
     limit: i64,
 ) -> Result<Vec<AlertRow>, sqlx::Error> {
     sqlx::query_as(
-        "SELECT id, connection_id, kind, pubky_order_id, detail, created_at, resolved_at \
-         FROM connector_alerts \
-         WHERE seller_pubky = $1 AND (NOT $2 OR resolved_at IS NULL) \
-         ORDER BY created_at DESC, id LIMIT $3",
+        "SELECT a.id, a.connection_id, a.kind, a.pubky_order_id, a.detail, a.created_at, \
+                a.resolved_at, o.state AS order_state, o.fulfillment AS order_fulfillment, \
+                (o.external_refund IS NOT NULL) AS refund_recorded \
+         FROM connector_alerts a LEFT JOIN orders o ON o.id = a.pubky_order_id \
+         WHERE a.seller_pubky = $1 AND (NOT $2 OR a.resolved_at IS NULL) \
+         ORDER BY a.created_at DESC, a.id LIMIT $3",
     )
     .bind(seller_pubky)
     .bind(unresolved_only)
