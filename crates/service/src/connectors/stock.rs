@@ -12,8 +12,14 @@
 //! no seller bearer exists or is stored.
 //!
 //! Only mapped variants are applied. A listing the connection maps to more
-//! than one store variant is skipped, because the service tracks stock per
-//! listing, not per variant, and summing store variants would be a guess.
+//! than one store variant is skipped. The service has no per-variant stock:
+//! the seller's listing record carries a quantity per variant, but
+//! registration sums them into the listing's `total_quantity`
+//! (`registration_payload_from_record`), `listings` holds only total,
+//! available, reserved and sold, and checkout, holds, cancellations, drops and
+//! `inventory.adjust` all move that one listing-level number. Giving a store
+//! variant a stock to land on would mean new per-variant inventory in the
+//! service itself; see the connector contract's stock note for what that takes.
 
 use axum::body::Bytes;
 use axum::http::StatusCode;

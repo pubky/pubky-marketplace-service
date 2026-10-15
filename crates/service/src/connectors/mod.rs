@@ -5,7 +5,10 @@
 //! Pubky: sealed store credentials, the connection's address-recipient key,
 //! the listing <-> product mapping, an idempotent order-push ledger, the
 //! durable cursor over the service's event feed, inbound webhook dedupe and
-//! the seller-authenticated routes. A provider (Shopify, WooCommerce)
+//! the seller-authenticated routes. A Shopify store is connected through an app
+//! the merchant creates in their own account: the service keeps that app's
+//! client id and secret sealed per connection and exposes per-connection URLs
+//! for the merchant to configure. A provider (Shopify, WooCommerce)
 //! implements [`provider::ConnectorProvider`] and is registered in the
 //! [`provider::ProviderRegistry`]; nothing else changes.
 //!
@@ -20,7 +23,6 @@
 //! instead of a refund. A delivery address reaches the store only when the
 //! buyer opted in at checkout, and is deleted once the store order exists.
 
-pub mod apps;
 pub mod config;
 pub mod inbound;
 pub mod keys;
@@ -41,7 +43,6 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-pub use apps::AppRegistry;
 pub use config::{ConnectorSettings, MAX_CATALOG_PAGES_PER_POLL};
 pub use keys::ConnectorKeys;
 pub use provider::{ConnectorProvider, ProviderKind, ProviderRegistry};
@@ -50,7 +51,6 @@ pub use provider::{ConnectorProvider, ProviderKind, ProviderRegistry};
 pub struct ConnectorRuntime {
     pub keys: Arc<ConnectorKeys>,
     pub providers: ProviderRegistry,
-    pub apps: AppRegistry,
     pub settings: ConnectorSettings,
 }
 
@@ -63,31 +63,32 @@ impl ConnectorRuntime {
         Self {
             keys,
             providers,
-            apps: AppRegistry::new(),
             settings,
         }
     }
 
-    pub fn with_apps(mut self, apps: AppRegistry) -> Self {
-        self.apps = apps;
-        self
+    /// The merchant's own app credentials for a connection, opened for one
+    /// call. A public-app connection ([`provider::AppKind::Public`]) is a
+    /// reserved slot with no implementation: it has no app to open.
+    pub async fn app_for(
+        &self,
+        pool: &PgPool,
+        connection: &store::ConnectionRow,
+    ) -> Result<Option<provider::AppContext>, store::OpenError> {
+        match connection.app_kind() {
+            provider::AppKind::Custom => store::open_app(pool, &self.keys, connection).await,
+            provider::AppKind::None | provider::AppKind::Public => Ok(None),
+        }
     }
 
-    /// The provider app a connection recorded, resolved for one call.
-    pub fn app_for(&self, connection: &store::ConnectionRow) -> Option<provider::AppContext> {
-        let kind = connection.provider_kind()?;
-        let key = connection.app_key.as_deref()?;
-        self.apps.context(kind, key)
-    }
-
-    /// Opens a connection's credential and attaches its provider app.
+    /// Opens a connection's store credential and attaches its own app.
     pub async fn open(
         &self,
         pool: &PgPool,
         connection: &store::ConnectionRow,
     ) -> Result<provider::ConnectionContext, store::OpenError> {
         let mut context = store::open_connection(pool, &self.keys, connection).await?;
-        context.app = self.app_for(connection);
+        context.app = self.app_for(pool, connection).await?;
         Ok(context)
     }
 }
@@ -109,10 +110,9 @@ pub fn runtime_from_env(
             config::ENV_CONNECTORS_ENABLED
         );
     };
-    let apps = AppRegistry::from_env()?;
-    Ok(Some(Arc::new(
-        ConnectorRuntime::new(keys, providers, settings).with_apps(apps),
-    )))
+    Ok(Some(Arc::new(ConnectorRuntime::new(
+        keys, providers, settings,
+    ))))
 }
 
 /// The providers this build knows, configured from the environment. This is
@@ -136,6 +136,7 @@ pub fn deterministic_uuid(seed: &str) -> Uuid {
 #[derive(Clone, Copy)]
 enum SealedTable {
     Credential,
+    AppCredential,
     RecipientKey,
 }
 
@@ -146,8 +147,8 @@ struct SealedRow {
     sealed: Vec<u8>,
 }
 
-/// Every sealed value the connector family holds: store credentials and
-/// recipient secrets.
+/// Every sealed value the connector family holds: store credentials, merchant
+/// app credentials and recipient secrets.
 async fn sealed_rows(pool: &PgPool) -> Result<Vec<SealedRow>, sqlx::Error> {
     let credentials: Vec<(Uuid, String, String, String, Vec<u8>)> = sqlx::query_as(
         "SELECT c.connection_id, k.seller_pubky, k.provider, k.shop, c.sealed \
@@ -163,6 +164,13 @@ async fn sealed_rows(pool: &PgPool) -> Result<Vec<SealedRow>, sqlx::Error> {
     )
     .fetch_all(pool)
     .await?;
+    let apps: Vec<(Uuid, String, String, String, Vec<u8>)> = sqlx::query_as(
+        "SELECT a.connection_id, k.seller_pubky, k.provider, k.shop, a.sealed \
+         FROM connector_app_credentials a JOIN connector_connections k ON k.id = a.connection_id \
+         ORDER BY a.connection_id",
+    )
+    .fetch_all(pool)
+    .await?;
     let mut rows: Vec<SealedRow> = credentials
         .into_iter()
         .map(
@@ -174,6 +182,16 @@ async fn sealed_rows(pool: &PgPool) -> Result<Vec<SealedRow>, sqlx::Error> {
             },
         )
         .collect();
+    rows.extend(
+        apps.into_iter().map(
+            |(connection_id, seller, provider, shop, sealed)| SealedRow {
+                table: SealedTable::AppCredential,
+                connection_id,
+                aad: keys::app_credential_aad(&seller, &provider, &shop, &connection_id),
+                sealed,
+            },
+        ),
+    );
     rows.extend(recipients.into_iter().map(
         |(connection_id, seller, provider, shop, key_id, sealed)| SealedRow {
             table: SealedTable::RecipientKey,
@@ -254,6 +272,10 @@ pub async fn reseal_previous_key(
         let statement = match row.table {
             SealedTable::Credential => {
                 "UPDATE connector_credentials SET sealed = $3, updated_at = $4 \
+                 WHERE connection_id = $1 AND sealed = $2"
+            }
+            SealedTable::AppCredential => {
+                "UPDATE connector_app_credentials SET sealed = $3, updated_at = $4 \
                  WHERE connection_id = $1 AND sealed = $2"
             }
             SealedTable::RecipientKey => {

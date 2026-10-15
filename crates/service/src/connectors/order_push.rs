@@ -167,7 +167,11 @@ pub async fn build_push(
             "The order has no lines.",
         )));
     };
-    let mut pushed = Vec::with_capacity(lines.len());
+    // Resolve every line first. An order with no line in this store is a
+    // Pubky-only sale and is not the store's business; an order with some
+    // lines mapped and some not cannot be pushed whole and needs the seller.
+    let mut resolved = Vec::with_capacity(lines.len());
+    let mut unmapped: Vec<String> = Vec::new();
     for line in lines {
         let aggregate = line
             .get("listing_aggregate_id")
@@ -188,17 +192,36 @@ pub async fn build_push(
         if mapping.is_none() && !variant_id.is_empty() {
             mapping = store::mapping_for_pubky_line(pool, connection.id, &listing_id, "").await?;
         }
-        let Some(mapping) = mapping else {
-            let which = if variant_id.is_empty() {
+        match mapping {
+            Some(mapping) => resolved.push((line, mapping)),
+            None => unmapped.push(if variant_id.is_empty() {
                 format!("listing {listing_id}")
             } else {
                 format!("listing {listing_id}, variant {variant_id}")
-            };
-            return Ok(Err(withheld(
-                reason::UNMAPPED_VARIANT,
-                format!("{which} is not mapped to a product in the store."),
-            )));
-        };
+            }),
+        }
+    }
+    if resolved.is_empty() {
+        return Ok(Err(withheld(
+            reason::NO_MAPPED_LINES,
+            "None of the order's lines is mapped to a product in this store.",
+        )));
+    }
+    if !unmapped.is_empty() {
+        return Ok(Err(withheld(
+            reason::UNMAPPED_VARIANT,
+            format!(
+                "{} not mapped to a product in the store.",
+                if unmapped.len() == 1 {
+                    format!("{} is", unmapped[0])
+                } else {
+                    format!("{} are", unmapped.join("; "))
+                }
+            ),
+        )));
+    }
+    let mut pushed = Vec::with_capacity(resolved.len());
+    for (line, mapping) in resolved {
         let quantity = line.get("quantity").and_then(Value::as_i64).unwrap_or(0);
         let unit_price_minor = line
             .get("unit_price")

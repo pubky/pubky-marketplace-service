@@ -8,6 +8,7 @@ use std::sync::Arc;
 use axum::http::StatusCode;
 use common::connector_provider::*;
 use common::{create_paid_order, new_actor, TestActor, TestApp};
+use marketplace_service::clock::Clock;
 use marketplace_service::connectors::provider::{
     CatalogOption, CatalogProduct, CatalogVariant, Price,
 };
@@ -68,8 +69,11 @@ async fn inbound(app: &TestApp, event_id: &str) -> (String, Option<String>) {
 async fn without_the_right_secret_every_failure_looks_the_same(pool: PgPool) {
     let s = shop(pool).await;
     let body = serde_json::to_vec(&json!({ "type": "stock" })).expect("body");
-    let (bad_status, bad) = signed_webhook(
+    let connection = connection_for(&s.app, SHOP).await;
+    let url = format!("/v1/connectors/shopify/c/{connection}/webhooks");
+    let (bad_status, bad) = post_signed(
         &s.app,
+        &url,
         SHOP,
         "evt-bad",
         "stock",
@@ -77,37 +81,66 @@ async fn without_the_right_secret_every_failure_looks_the_same(pool: PgPool) {
         "wrong-secret",
     )
     .await;
-    let (unknown_status, unknown) = signed_webhook(
+    // Another merchant's connection, with its own app secret.
+    let other = new_actor(&s.app).await;
+    let other_shop = "other.test-store.example";
+    let other_connection =
+        connect_shop_with(&s.app, &other, other_shop, "other-client", "other-secret").await;
+    let (cross_status, cross) = post_signed(
         &s.app,
-        "nobody.test-store.example",
-        "evt-unknown",
-        "stock",
-        body.clone(),
-        "wrong-secret",
-    )
-    .await;
-    // The pilot app's secret signs correctly for its own path, but the store
-    // installed the other app.
-    let (wrong_app_status, wrong_app) = post_signed(
-        &s.app,
-        "/v1/connectors/webhooks/shopify/pilot-1",
+        &url,
         SHOP,
-        "evt-wrong-app",
+        "evt-cross",
         "stock",
         body.clone(),
-        "pilot-secret",
+        "other-secret",
     )
     .await;
-    assert_eq!(bad_status, StatusCode::UNAUTHORIZED);
-    assert_eq!(unknown_status, StatusCode::UNAUTHORIZED);
-    assert_eq!(wrong_app_status, StatusCode::UNAUTHORIZED);
-    assert_eq!(bad, unknown, "the response does not say which stores exist");
-    assert_eq!(bad, wrong_app);
+    // A connection that does not exist, and this connection's secret on a
+    // different shop's header.
+    let (missing_status, missing) = post_signed(
+        &s.app,
+        &format!("/v1/connectors/shopify/c/{}/webhooks", Uuid::new_v4()),
+        SHOP,
+        "evt-missing",
+        "stock",
+        body.clone(),
+        TEST_APP_SECRET,
+    )
+    .await;
+    let (wrong_shop_status, wrong_shop) = post_signed(
+        &s.app,
+        &url,
+        other_shop,
+        "evt-shop",
+        "stock",
+        body.clone(),
+        TEST_APP_SECRET,
+    )
+    .await;
+    for status in [bad_status, cross_status, missing_status, wrong_shop_status] {
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+    assert_eq!(bad, cross, "the response does not say which part failed");
+    assert_eq!(bad, missing);
+    assert_eq!(bad, wrong_shop);
 
+    // Each connection accepts exactly its own secret.
+    let (status, accepted) = post_signed(
+        &s.app,
+        &format!("/v1/connectors/shopify/c/{other_connection}/webhooks"),
+        other_shop,
+        "evt-own",
+        "stock",
+        body.clone(),
+        "other-secret",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{accepted}");
     let (status, _, response) = raw(
         s.app.router.clone(),
         "POST",
-        &format!("/v1/connectors/webhooks/shopify/{APP_KEY}"),
+        &url,
         &[("x-test-shop", SHOP), ("x-test-event-id", "evt-nosig")],
         body,
     )
@@ -115,15 +148,28 @@ async fn without_the_right_secret_every_failure_looks_the_same(pool: PgPool) {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(as_json(&response), bad);
     assert_eq!(
-        common::count(&s.app.pool, "SELECT COUNT(*) FROM connector_inbound_events").await,
+        common::count(
+            &s.app.pool,
+            "SELECT COUNT(*) FROM connector_inbound_events WHERE provider_event_id <> 'evt-own'"
+        )
+        .await,
         0
     );
+    // The old registry-style paths are gone.
     for path in [
+        "/v1/connectors/webhooks/shopify/john",
+        "/v1/connectors/webhooks/shopify",
         "/v1/connectors/webhooks/etsy",
-        "/v1/connectors/webhooks/shopify/no-such-app",
+        "/v1/connectors/shopify/apps/john/launch",
     ] {
         let (status, _, _) = raw(s.app.router.clone(), "POST", path, &[], b"{}".to_vec()).await;
-        assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+        assert!(
+            matches!(
+                status,
+                StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+            ),
+            "{path}: {status}"
+        );
     }
 }
 
@@ -489,6 +535,15 @@ async fn uninstalling_the_app_deletes_the_credential_and_the_recipient_key(pool:
             "{table}"
         );
     }
+    assert_eq!(
+        common::count(
+            &s.app.pool,
+            "SELECT COUNT(*) FROM connector_app_credentials WHERE retain_until IS NOT NULL"
+        )
+        .await,
+        1,
+        "the app secret is retained, with an end date, for the privacy topics"
+    );
     let (_, list) = api(
         &s.app,
         "GET",
@@ -507,15 +562,6 @@ async fn uninstalling_the_app_deletes_the_credential_and_the_recipient_key(pool:
     )
     .await;
     assert_eq!(alerts["alerts"][0]["kind"], "store_uninstalled");
-    let (status, _, _) = raw(
-        s.app.router.clone(),
-        "GET",
-        &format!("/v0/sellers/{}/connector-status", s.seller.pubky),
-        &[],
-        Vec::new(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
     let (_, status_body) = api(
         &s.app,
         "GET",
@@ -533,9 +579,10 @@ async fn uninstalling_the_app_deletes_the_credential_and_the_recipient_key(pool:
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn the_privacy_webhooks_are_honoured_even_after_the_store_disconnected(pool: PgPool) {
+async fn the_privacy_webhooks_are_verified_with_the_retained_secret_after_an_uninstall(
+    pool: PgPool,
+) {
     let s = shop(pool).await;
-    // Customer topics: nothing to return or erase, acknowledged and recorded.
     for (event, kind) in [
         ("evt-data", "data_request"),
         ("evt-customer", "customer_redact"),
@@ -575,9 +622,8 @@ async fn the_privacy_webhooks_are_honoured_even_after_the_store_disconnected(poo
         "customer topics change nothing"
     );
 
-    // The merchant uninstalls; 48 hours later Shopify sends shop/redact. The
-    // credential is long gone, and the webhook is verified with the app
-    // secret alone.
+    // The merchant uninstalls: the store credential goes, the app secret is
+    // retained (with an end date) for the privacy topics that follow.
     webhook(
         &s.app,
         SHOP,
@@ -589,6 +635,25 @@ async fn the_privacy_webhooks_are_honoured_even_after_the_store_disconnected(poo
     worker::drive_inbound(&s.app.state, 10)
         .await
         .expect("drive");
+    assert_eq!(
+        common::count(&s.app.pool, "SELECT COUNT(*) FROM connector_credentials").await,
+        0
+    );
+    let retained: (i64, Option<chrono::DateTime<chrono::Utc>>) =
+        sqlx::query_as("SELECT COUNT(*), MAX(retain_until) FROM connector_app_credentials")
+            .fetch_one(&s.app.pool)
+            .await
+            .expect("retention");
+    assert_eq!(retained.0, 1, "the secret is kept after the uninstall");
+    let until = retained.1.expect("a retention end is recorded");
+    assert_eq!(
+        (until - s.app.clock.now()).num_days(),
+        30,
+        "retention is capped at 30 days"
+    );
+
+    // 48 hours later Shopify sends shop/redact: verified with the retained
+    // secret, handled, and then the secret is deleted.
     s.app.clock.advance_seconds(48 * 3600);
     let (status, body) = webhook(
         &s.app,
@@ -610,6 +675,15 @@ async fn the_privacy_webhooks_are_honoured_even_after_the_store_disconnected(poo
             Some("store data deleted".to_string())
         )
     );
+    assert_eq!(
+        common::count(
+            &s.app.pool,
+            "SELECT COUNT(*) FROM connector_app_credentials"
+        )
+        .await,
+        0,
+        "shop/redact ends the retention"
+    );
     let leftover: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM connector_inbound_events WHERE event <> '{}'::jsonb AND provider_event_id <> 'evt-redact'",
     )
@@ -617,26 +691,53 @@ async fn the_privacy_webhooks_are_honoured_even_after_the_store_disconnected(poo
     .await
     .expect("count");
     assert_eq!(leftover, 0, "stored event payloads are emptied");
-
-    // A shop that was never connected, with a valid app signature, is
-    // acknowledged and ignored; a bad signature is still refused.
-    let (status, body) = webhook(
+    // With the secret gone nothing can be verified for this connection.
+    let (status, _) = webhook(
         &s.app,
-        "never-connected.test-store.example",
-        "evt-stranger",
+        SHOP,
+        "evt-late",
         "shop/redact",
         &json!({ "type": "shop_redact" }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["status"], "ignored");
-    let (status, _) = signed_webhook(
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_retained_secret_is_deleted_when_its_thirty_days_end(pool: PgPool) {
+    let s = shop(pool).await;
+    webhook(
         &s.app,
-        "never-connected.test-store.example",
-        "evt-stranger-2",
-        "shop/redact",
-        b"{}".to_vec(),
-        "wrong",
+        SHOP,
+        "evt-uninstall",
+        "app/uninstalled",
+        &json!({ "type": "uninstalled" }),
+    )
+    .await;
+    worker::drive_inbound(&s.app.state, 10)
+        .await
+        .expect("drive");
+    s.app.clock.advance_seconds(29 * 24 * 3600);
+    let report = worker::run_pass(&s.app.state).await.expect("pass");
+    assert_eq!(report.app_secrets_purged, 0);
+    let (status, _) = webhook(
+        &s.app,
+        SHOP,
+        "evt-day-29",
+        "customers/redact",
+        &json!({ "type": "customer_redact" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "still verifiable on day 29");
+    s.app.clock.advance_seconds(2 * 24 * 3600);
+    let report = worker::run_pass(&s.app.state).await.expect("pass");
+    assert_eq!(report.app_secrets_purged, 1);
+    let (status, _) = webhook(
+        &s.app,
+        SHOP,
+        "evt-day-31",
+        "customers/redact",
+        &json!({ "type": "customer_redact" }),
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);

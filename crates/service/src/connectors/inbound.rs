@@ -18,9 +18,11 @@
 //! * privacy topics (`customers/data_request`, `customers/redact`,
 //!   `shop/redact`): the service keeps no store customer data, so the first
 //!   two have nothing to return or erase; `shop/redact` closes the
-//!   connection if it is still open and empties the stored event payloads.
-//!   They are applied even for a connection that already disconnected,
-//!   because Shopify sends `shop/redact` 48 hours after an uninstall.
+//!   connection if it is still open, deletes the retained app secret and
+//!   empties the stored event payloads. They are applied even for a
+//!   connection that already disconnected, because Shopify sends `shop/redact`
+//!   48 hours after an uninstall; the connection keeps its app secret for up
+//!   to 30 days after a disconnect so those webhooks can be verified.
 
 use chrono::{DateTime, Utc};
 use serde_json::json;
@@ -197,8 +199,8 @@ async fn handle(
     if let InboundEvent::Compliance { topic } = event {
         return compliance(state, &connection, due, topic, now).await;
     }
-    if connection.status == "disconnected" {
-        return Ok(Handled::Ignored("connection_disconnected".to_string()));
+    if !connection.is_live() {
+        return Ok(Handled::Ignored("connection_not_live".to_string()));
     }
     match event {
         InboundEvent::StockLevel {
@@ -309,7 +311,7 @@ async fn handle(
             Ok(Handled::Applied("seller alerted".to_string()))
         }
         InboundEvent::AppUninstalled => {
-            store::disconnect(&state.pool, connection.id, now).await?;
+            store::disconnect(&state.pool, connection.id, now, retention_end(now)).await?;
             store::raise_alert(
                 &state.pool,
                 now,
@@ -340,7 +342,10 @@ async fn compliance(
             Handled::Applied("no store customer data is held".to_string()),
         ),
         ComplianceTopic::ShopRedact => {
-            store::disconnect(&state.pool, connection.id, now).await?;
+            store::disconnect(&state.pool, connection.id, now, retention_end(now)).await?;
+            // The privacy topics that matter for this store are handled: the
+            // retained app secret has done its job.
+            store::delete_app_credentials(&state.pool, connection.id).await?;
             sqlx::query(
                 "UPDATE connector_inbound_events SET event = '{}'::jsonb \
                  WHERE connection_id = $1 AND id <> $2",
@@ -352,6 +357,10 @@ async fn compliance(
             Ok(Handled::Applied("store data deleted".to_string()))
         }
     }
+}
+
+fn retention_end(now: DateTime<Utc>) -> DateTime<Utc> {
+    now + chrono::Duration::seconds(super::config::APP_SECRET_RETENTION_SECONDS)
 }
 
 /// The Pubky order a store order refers to, only when the ledger shows this

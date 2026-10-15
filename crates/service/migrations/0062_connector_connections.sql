@@ -5,19 +5,39 @@
 -- here depends on another pending migration number. Additive and rerunnable.
 --
 --   connector_connections      one row per (seller, provider, shop). A row is
---                              `pending` from the seller's connect request
---                              until the store's callback (a one-time state
---                              hash, 30 minutes). A disconnected row stays so
---                              the push ledger keeps its owner; its
---                              credential, key and mappings are gone. A store
---                              has at most one live (connected or error)
---                              connection, so a webhook names one seller.
---                              `app_key` names which configured provider app
---                              (SHOPIFY_APPS) the store installed.
---   connector_credentials      the provider secret, sealed with the shared
---                              seal construction under
+--                              a `draft` from the seller's connect request
+--                              (POST /v1/connectors) until the store's
+--                              install completes; a draft that is never
+--                              completed expires after 24 hours. A connected
+--                              store whose grant lacks a required scope is
+--                              `needs_attention` with the missing names. A
+--                              disconnected row stays so the push ledger keeps
+--                              its owner; its credential, key and mappings are
+--                              gone. A store has at most one live (connected,
+--                              needs_attention or error) connection, so a
+--                              webhook names one seller. `app_kind` says whose
+--                              app the store installed: `none` (WooCommerce),
+--                              `custom` (the merchant's own Shopify custom
+--                              app, its client id and secret in
+--                              connector_app_credentials) or `public` (the
+--                              reserved slot for Pubky's own public app).
+--   connector_app_credentials  a merchant's own app client id and secret, one
+--                              pair per connection, sealed with the shared seal
+--                              construction under
 --                              CONNECTOR_CREDENTIAL_ENCRYPTION_KEY. Associated
---                              data: connector-cred|v1|{seller}|{provider}|{shop}.
+--                              data: connector-cred|v1|{seller}|{provider}|
+--                              {shop}|{connection_id}. They verify the launch,
+--                              OAuth and webhook signatures of that connection
+--                              only. After a disconnect or an uninstall the pair
+--                              is kept until `retain_until` (30 days) or until
+--                              Shopify's `shop/redact` is handled, so the
+--                              privacy webhooks that arrive after an uninstall
+--                              can still be verified; it is deleted at once for
+--                              a draft that was never installed.
+--   connector_credentials      the store's access secret (an offline token, an
+--                              API key pair), sealed under the same key.
+--                              Associated data: connector-cred|v1|{seller}|
+--                              {provider}|{shop}. Deleted on disconnect.
 --   connector_recipient_keys   the X25519 key buyers seal an opted-in delivery
 --                              address to. The public half is published in the
 --                              seller's connector status; the secret half is
@@ -41,19 +61,19 @@ CREATE TABLE IF NOT EXISTS connector_connections (
         CONSTRAINT connector_connections_shop_shape CHECK (
             char_length(shop) BETWEEN 1 AND 255 AND shop !~ '[|[:cntrl:]]'
         ),
-    app_key TEXT
-        CONSTRAINT connector_connections_app_key_shape CHECK (
-            app_key IS NULL OR app_key ~ '^[a-z0-9][a-z0-9-]{0,31}$'
-        ),
+    app_kind TEXT NOT NULL DEFAULT 'none'
+        CONSTRAINT connector_connections_app_kind CHECK (app_kind IN ('none', 'custom', 'public')),
     status TEXT NOT NULL
         CONSTRAINT connector_connections_status CHECK (
-            status IN ('pending', 'connected', 'error', 'disconnected')
+            status IN ('draft', 'connected', 'needs_attention', 'error', 'disconnected')
         ),
     scopes TEXT[] NOT NULL DEFAULT '{}',
+    missing_scopes TEXT[] NOT NULL DEFAULT '{}',
     connect_state_hash BYTEA
         CONSTRAINT connector_connections_state_len CHECK (
             connect_state_hash IS NULL OR octet_length(connect_state_hash) = 32
         ),
+    state_expires_at TIMESTAMPTZ,
     connect_expires_at TIMESTAMPTZ,
     connected_at TIMESTAMPTZ,
     last_error TEXT
@@ -64,11 +84,11 @@ CREATE TABLE IF NOT EXISTS connector_connections (
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL,
     CONSTRAINT connector_connections_one_per_shop UNIQUE (seller_pubky, provider, shop),
-    CONSTRAINT connector_connections_state_only_pending CHECK (
-        connect_state_hash IS NULL OR status = 'pending'
+    CONSTRAINT connector_connections_draft_expiry CHECK (
+        status <> 'draft' OR connect_expires_at IS NOT NULL
     ),
     CONSTRAINT connector_connections_connected_stamp CHECK (
-        status NOT IN ('connected', 'error') OR connected_at IS NOT NULL
+        status NOT IN ('connected', 'needs_attention', 'error') OR connected_at IS NOT NULL
     )
 );
 
@@ -81,10 +101,27 @@ CREATE UNIQUE INDEX IF NOT EXISTS connector_connections_state_idx
 
 CREATE UNIQUE INDEX IF NOT EXISTS connector_connections_live_idx
     ON connector_connections (provider, shop)
-    WHERE status IN ('connected', 'error');
+    WHERE status IN ('connected', 'needs_attention', 'error');
+
+CREATE INDEX IF NOT EXISTS connector_connections_draft_idx
+    ON connector_connections (connect_expires_at)
+    WHERE status = 'draft';
 
 CREATE INDEX IF NOT EXISTS connector_connections_shop_idx
     ON connector_connections (provider, shop, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS connector_app_credentials (
+    connection_id UUID PRIMARY KEY REFERENCES connector_connections (id) ON DELETE CASCADE,
+    sealed BYTEA NOT NULL
+        CONSTRAINT connector_app_credentials_sealed_len CHECK (octet_length(sealed) > 24),
+    retain_until TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS connector_app_credentials_retain_idx
+    ON connector_app_credentials (retain_until)
+    WHERE retain_until IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS connector_credentials (
     connection_id UUID PRIMARY KEY REFERENCES connector_connections (id) ON DELETE CASCADE,

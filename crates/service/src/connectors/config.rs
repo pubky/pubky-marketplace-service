@@ -4,9 +4,15 @@
 
 use std::time::Duration;
 
+use uuid::Uuid;
+
 pub const ENV_CONNECTORS_ENABLED: &str = "CONNECTORS_ENABLED";
 pub const ENV_CONNECTOR_PUBLIC_BASE_URL: &str = "CONNECTOR_PUBLIC_BASE_URL";
 pub const ENV_CONNECTOR_RETURN_URL: &str = "CONNECTOR_RETURN_URL";
+/// Reserved for Pubky's own public Shopify app, the one app type whose
+/// credentials will live in the environment. Nothing reads them yet.
+pub const ENV_SHOPIFY_PUBLIC_APP_CLIENT_ID: &str = "SHOPIFY_PUBLIC_APP_CLIENT_ID";
+pub const ENV_SHOPIFY_PUBLIC_APP_CLIENT_SECRET: &str = "SHOPIFY_PUBLIC_APP_CLIENT_SECRET";
 pub const ENV_CONNECTOR_PUSH_LEASE_SECONDS: &str = "CONNECTOR_PUSH_LEASE_SECONDS";
 pub const ENV_CONNECTOR_PROVIDER_TIMEOUT_SECONDS: &str = "CONNECTOR_PROVIDER_TIMEOUT_SECONDS";
 pub const ENV_CONNECTOR_MAX_ATTEMPTS: &str = "CONNECTOR_MAX_ATTEMPTS";
@@ -18,8 +24,16 @@ pub const ENV_CONNECTOR_WORKER_TICK_MILLIS: &str = "CONNECTOR_WORKER_TICK_MILLIS
 pub const MAX_CONNECTIONS_PER_SELLER: i64 = 5;
 pub const MAX_MAPPINGS_PER_REQUEST: usize = 5_000;
 pub const MAX_SELECTED_PRODUCTS: usize = 5_000;
-/// A pending connect lives 30 minutes from the seller's request.
-pub const CONNECT_STATE_TTL_SECONDS: i64 = 1_800;
+/// A draft connection lives 24 hours from the seller's request; a draft that
+/// is never completed is deleted with whatever was saved on it.
+pub const DRAFT_TTL_SECONDS: i64 = 24 * 3600;
+/// A single-use OAuth `state` lives 15 minutes from the launch that issued it
+/// (a WooCommerce nonce lives as long as its draft).
+pub const OAUTH_STATE_TTL_SECONDS: i64 = 900;
+/// A merchant app's secret outlives a disconnect or an uninstall by at most
+/// this long, so Shopify's privacy webhooks that follow an uninstall can still
+/// be verified. `shop/redact` ends it sooner.
+pub const APP_SECRET_RETENTION_SECONDS: i64 = 30 * 24 * 3600;
 pub const WEBHOOK_BODY_LIMIT: usize = 256 * 1024;
 pub const CALLBACK_BODY_LIMIT: usize = 64 * 1024;
 pub const MAX_CATALOG_PAGES_PER_POLL: usize = 50;
@@ -122,30 +136,43 @@ impl ConnectorSettings {
         Ok(())
     }
 
-    /// The Shopify webhook URL of an app, as configured in the Dev Dashboard.
-    pub fn webhook_url(&self, provider: &str, app_key: Option<&str>) -> String {
-        match app_key {
-            Some(app_key) => format!(
-                "{}/v1/connectors/webhooks/{provider}/{app_key}",
-                self.public_base_url
-            ),
-            None => format!("{}/v1/connectors/webhooks/{provider}", self.public_base_url),
-        }
+    /// A Shopify connection's own URLs, shown to the merchant to configure
+    /// their app: `launch` (App URL), `oauth/callback` (allowed redirection
+    /// URL) and `webhooks`. The connection id is random and unguessable.
+    pub fn shopify_launch_url(&self, connection_id: Uuid) -> String {
+        format!(
+            "{}/v1/connectors/shopify/c/{connection_id}/launch",
+            self.public_base_url
+        )
     }
 
-    /// The URL the store calls back to: the app's OAuth callback for Shopify,
-    /// the WooCommerce `callback_url`.
-    pub fn callback_url(&self, provider: &str, app_key: Option<&str>) -> String {
-        match app_key {
-            Some(app_key) => format!(
-                "{}/v1/connectors/{provider}/apps/{app_key}/oauth/callback",
-                self.public_base_url
-            ),
-            None => format!(
-                "{}/v1/connectors/{provider}/oauth/callback",
-                self.public_base_url
-            ),
-        }
+    pub fn shopify_callback_url(&self, connection_id: Uuid) -> String {
+        format!(
+            "{}/v1/connectors/shopify/c/{connection_id}/oauth/callback",
+            self.public_base_url
+        )
+    }
+
+    pub fn shopify_webhook_url(&self, connection_id: Uuid) -> String {
+        format!(
+            "{}/v1/connectors/shopify/c/{connection_id}/webhooks",
+            self.public_base_url
+        )
+    }
+
+    /// WooCommerce's fixed callback and webhook URLs.
+    pub fn woocommerce_callback_url(&self) -> String {
+        format!(
+            "{}/v1/connectors/woocommerce/oauth/callback",
+            self.public_base_url
+        )
+    }
+
+    pub fn woocommerce_webhook_url(&self) -> String {
+        format!(
+            "{}/v1/connectors/webhooks/woocommerce",
+            self.public_base_url
+        )
     }
 
     /// Delay before the next attempt after `attempts` failed ones:
@@ -206,27 +233,34 @@ mod tests {
         assert!(ConnectorSettings::new("not a url").is_err());
         assert!(ConnectorSettings::new("ftp://service.example").is_err());
         let settings = ConnectorSettings::new("https://service.example/").expect("settings");
+        let id = Uuid::nil();
         assert_eq!(
-            settings.callback_url("shopify", Some("john")),
-            "https://service.example/v1/connectors/shopify/apps/john/oauth/callback"
+            settings.shopify_launch_url(id),
+            "https://service.example/v1/connectors/shopify/c/00000000-0000-0000-0000-000000000000/launch"
         );
         assert_eq!(
-            settings.callback_url("woocommerce", None),
+            settings.shopify_callback_url(id),
+            "https://service.example/v1/connectors/shopify/c/00000000-0000-0000-0000-000000000000/oauth/callback"
+        );
+        assert_eq!(
+            settings.shopify_webhook_url(id),
+            "https://service.example/v1/connectors/shopify/c/00000000-0000-0000-0000-000000000000/webhooks"
+        );
+        assert_eq!(
+            settings.woocommerce_callback_url(),
             "https://service.example/v1/connectors/woocommerce/oauth/callback"
         );
         assert_eq!(
-            settings.webhook_url("shopify", Some("john")),
-            "https://service.example/v1/connectors/webhooks/shopify/john"
-        );
-        assert_eq!(
-            settings.webhook_url("woocommerce", None),
+            settings.woocommerce_webhook_url(),
             "https://service.example/v1/connectors/webhooks/woocommerce"
         );
     }
 
     #[test]
-    fn a_pending_connect_lives_thirty_minutes() {
-        assert_eq!(CONNECT_STATE_TTL_SECONDS, 30 * 60);
+    fn a_draft_lives_a_day_and_an_oauth_state_a_quarter_hour() {
+        assert_eq!(DRAFT_TTL_SECONDS, 24 * 3600);
+        assert_eq!(OAUTH_STATE_TTL_SECONDS, 15 * 60);
+        assert_eq!(APP_SECRET_RETENTION_SECONDS, 30 * 24 * 3600);
     }
 
     #[test]

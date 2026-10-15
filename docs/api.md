@@ -96,11 +96,11 @@ and write. "Automation" means the inventory capability plus the
 | POST | `/v1/auth/grant-flows/{flow_id}/claim` | Grant-flow (Shop BFF). |
 | GET | `/v0/sellers/{pubky}/payment-config` | Public payment configuration of a seller. |
 | GET | `/v0/sellers/{pubky}/connector-status` | The stores a buyer may share an address with and each store's recipient public key. Public; answers an empty list while connectors are off. See [Store connectors](#store-connectors). |
-| POST | `/v1/connectors/webhooks/{provider}` | Store webhook (WooCommerce). Authenticity is the provider's signature. See [Store connectors](#store-connectors). |
-| POST | `/v1/connectors/webhooks/{provider}/{app_key}` | Store webhook (Shopify app `app_key`), including the privacy topics. |
-| GET | `/v1/connectors/shopify/apps/{app_key}/launch` | The Shopify app's App URL: verifies the launch, matches the pending connect, redirects to authorize. |
-| GET | `/v1/connectors/shopify/apps/{app_key}/oauth/callback` | The Shopify app's OAuth callback. |
-| POST | `/v1/connectors/woocommerce/oauth/callback` | WooCommerce's key callback, `user_id` is the pending-connect nonce. |
+| POST | `/v1/connectors/webhooks/woocommerce` | WooCommerce store webhook. Authenticity is the store's own signature. See [Store connectors](#store-connectors). |
+| POST | `/v1/connectors/shopify/c/{connection_id}/webhooks` | Webhook from a merchant's own Shopify app, including the privacy topics; verified with that connection's app secret. |
+| GET | `/v1/connectors/shopify/c/{connection_id}/launch` | The connection's App URL: verified with its app secret, then redirects to authorize. |
+| GET | `/v1/connectors/shopify/c/{connection_id}/oauth/callback` | The connection's OAuth callback. |
+| POST | `/v1/connectors/woocommerce/oauth/callback` | WooCommerce's key callback, `user_id` is the draft's nonce. |
 | GET | `/v0/drops/{seller_pubky}/{drop_id}` | Public drop read. |
 | GET | `/v0/listings/{seller_pubky}/{listing_id}/availability` | Stock state of one listing, state only. See [Public listing availability](#public-listing-availability). |
 | POST | `/v0/address/suggest` | Address autocomplete. |
@@ -144,6 +144,7 @@ and write. "Automation" means the inventory capability plus the
 | POST | `/v1/connectors/alerts/{id}/resolve` |
 | DELETE | `/v1/connectors/{id}` |
 | GET | `/v1/connectors/{id}/catalog` |
+| PUT | `/v1/connectors/{id}/credentials` |
 | GET, PUT | `/v1/connectors/{id}/mappings` |
 | GET, PUT | `/v1/connectors/{id}/selection` |
 | GET | `/v1/connectors/{id}/pushes` |
@@ -325,7 +326,7 @@ request failed, so clients should branch on HTTP status first, and parse
    | `NOT_FOUND` | 404 |
    | `REVISION_CONFLICT`, `IDEMPOTENCY_CONFLICT`, `INSUFFICIENT_INVENTORY`, `INVARIANT_VIOLATION`, `OFFER_EXPIRED`, `INVALID_STATE`, `AUCTION_CLOSED`, `BID_TOO_LOW`, `SELLER_REGISTRATION_REQUIRED` | 409 |
    | `AWARD_EXPIRED`, `AWARD_ALREADY_CONVERTED`, `AWARD_QUANTITY_MISMATCH`, `AWARD_VARIANT_MISMATCH`, `AWARD_LISTING_CHANGED`, `AWARD_HOLD_MISSING` | 409 |
-   | `LISTING_MODERATED` | 409 |
+   | `LISTING_MODERATED`, `LISTING_NOT_ACTIVE` | 409 |
    | `UPSTREAM_UNAVAILABLE` | 503 (retriable) |
 
    A command error may also carry `issues` and `reason` fields.
@@ -338,6 +339,17 @@ request failed, so clients should branch on HTTP status first, and parse
    when the marketplace index reports the listing, or its seller, as
    moderated (see [Listing moderation](../README.md#listing-moderation)). It is a
    409, not a 403, because clients read a 403 on a command as a session problem.
+
+   `LISTING_NOT_ACTIVE` refuses `checkout.create`, `offer.create`,
+   `offer.counter`, `offer.accept` and `auction.place_bid` when the seller's
+   current homeserver record for a listing is not `active`. `reason` is
+   `listing_paused`, `listing_ended` or `listing_removed` (also used when the
+   homeserver no longer has the record), or `listing_not_active` for any other
+   state. `offer.checkout`, the first `payment.prepare_locks`, `auction.close`
+   and `POST /v0/orders/{id}/payment-method` are refused only for
+   `listing_removed`. When the homeserver cannot answer, those commands are
+   refused with `UPSTREAM_UNAVAILABLE` instead (see
+   [Listing lifecycle](../README.md#listing-lifecycle)).
 
 ### Automation error codes
 
@@ -940,20 +952,34 @@ The seller routes take the same session bearer as the other seller routes and
 act only on the session's own connections (another seller's id answers like an
 unknown one, `404 connection_not_found`). The provider routes are public and
 authenticated by the provider's signature or the single-use connect state.
-Credentials are never returned and never logged. The full contract, with JSON
+Credentials and app secrets are never returned and never logged. The full contract, with JSON
 shapes and error codes, is `connector-contract.md` in the commerce
 integrations workstream; the behaviour is described in
 `crates/service/src/connectors/`.
 
+A Shopify store is connected through an app the merchant creates in their own
+Shopify account. `POST /v1/connectors` creates a **draft connection** (random
+id, 24 hours to live) and returns the connection's own URLs (launch, OAuth
+callback, webhooks) under `/v1/connectors/shopify/c/{connection_id}/`, built
+from `CONNECTOR_PUBLIC_BASE_URL`. The merchant pastes the app's client id and
+secret, which `PUT /v1/connectors/{id}/credentials` seals per connection
+(associated data `connector-cred|v1|{seller}|shopify|{shop}|{connection_id}`);
+that connection's launch, OAuth and webhook signatures are verified with that
+secret only. After a disconnect or an uninstall the secret is kept for up to
+30 days (or until `shop/redact` is handled) so Shopify's privacy webhooks can
+still be verified, and deleted at once for a draft that never installed. No
+Shopify values live in the environment.
+
 Environment names: `CONNECTORS_ENABLED`, `CONNECTOR_PUBLIC_BASE_URL`,
 `CONNECTOR_RETURN_URL`, `CONNECTOR_CREDENTIAL_ENCRYPTION_KEY`,
-`CONNECTOR_CREDENTIAL_ENCRYPTION_KEY_PREVIOUS`, `SHOPIFY_APPS`,
-`SHOPIFY_APP_<KEY>_CLIENT_ID`, `SHOPIFY_APP_<KEY>_CLIENT_SECRET`, and the
-tuning values `CONNECTOR_PUSH_LEASE_SECONDS`,
-`CONNECTOR_PROVIDER_TIMEOUT_SECONDS`, `CONNECTOR_MAX_ATTEMPTS`,
-`CONNECTOR_BACKOFF_BASE_SECONDS`, `CONNECTOR_BACKOFF_MAX_SECONDS`,
-`CONNECTOR_STOCK_POLL_SECONDS`, `CONNECTOR_WORKER_TICK_MILLIS`. The worker is
-the `connector-worker` binary of the same image.
+`CONNECTOR_CREDENTIAL_ENCRYPTION_KEY_PREVIOUS`, and the tuning values
+`CONNECTOR_PUSH_LEASE_SECONDS`, `CONNECTOR_PROVIDER_TIMEOUT_SECONDS`,
+`CONNECTOR_MAX_ATTEMPTS`, `CONNECTOR_BACKOFF_BASE_SECONDS`,
+`CONNECTOR_BACKOFF_MAX_SECONDS`, `CONNECTOR_STOCK_POLL_SECONDS`,
+`CONNECTOR_WORKER_TICK_MILLIS`. `SHOPIFY_PUBLIC_APP_CLIENT_ID` and
+`SHOPIFY_PUBLIC_APP_CLIENT_SECRET` are reserved for Pubky's own public app and
+are not read yet. The worker is the `connector-worker` binary of the same
+image.
 
 ## Operational endpoints
 

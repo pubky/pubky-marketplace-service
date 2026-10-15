@@ -98,7 +98,7 @@ async fn a_paid_order_is_pushed_once_with_no_buyer_or_address(pool: PgPool) {
     assert!(!format!("{pushed:?}").contains(&s.buyer.pubky));
     assert_eq!(
         s.store.last_app.lock().expect("app lock").as_deref(),
-        Some(APP_KEY),
+        Some(TEST_CLIENT_ID),
         "the provider call carries the connection's own app"
     );
 }
@@ -434,17 +434,41 @@ async fn a_refused_push_is_quarantined_alerted_and_retried_after_a_lookup(pool: 
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn an_unmapped_line_is_quarantined_until_the_seller_maps_it(pool: PgPool) {
+async fn a_mapping_removed_before_the_push_sets_the_order_aside_until_it_is_restored(pool: PgPool) {
     let (app, store) = connector_app(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let connection = connect_shop(&app, &seller, SHOP).await;
     let order = create_paid_order(&app, &seller, &buyer).await;
-    worker::run_pass(&app.state).await.expect("pass");
+    map_listing(&app, &seller, connection, "boots_01", "prod-1", "var-1").await;
+    worker::consume_events(&app.state).await.expect("consume");
+    // The seller removes the mapping between the event and the push.
+    api(
+        &app,
+        "PUT",
+        &format!("/v1/connectors/{connection}/mappings"),
+        Some(&seller.token),
+        &json!({ "mappings": [] }),
+    )
+    .await;
+    worker::drive_pushes(&app.state, 10).await.expect("drive");
     let (state, _, reason, _) = push_state(&app.pool, &order.order_id).await;
     assert_eq!(state, "quarantined");
-    assert_eq!(reason.as_deref(), Some("unmapped_variant"));
+    assert_eq!(reason.as_deref(), Some("no_mapped_lines"));
     assert_eq!(store.pushes(), 0);
+    assert_eq!(
+        common::count(&app.pool, "SELECT COUNT(*) FROM connector_alerts").await,
+        0
+    );
+    let (_, pushes) = api(
+        &app,
+        "GET",
+        &format!("/v1/connectors/{connection}/pushes"),
+        Some(&seller.token),
+        &json!(null),
+    )
+    .await;
+    assert_eq!(pushes["pushes"][0]["quarantine_severity"], "info");
 
     map_listing(&app, &seller, connection, "boots_01", "prod-1", "var-1").await;
     let (status, _) = api(
@@ -461,6 +485,134 @@ async fn an_unmapped_line_is_quarantined_until_the_seller_maps_it(pool: PgPool) 
     assert_eq!(status, StatusCode::ACCEPTED);
     worker::run_pass(&app.state).await.expect("pass");
     assert_eq!(push_state(&app.pool, &order.order_id).await.0, "created");
+}
+
+/// A second listing of the same seller, registered next to `boots_01`.
+fn second_listing_command(seller: &str) -> serde_json::Value {
+    let mut command = common::register_command(seller, 2);
+    command["command_id"] = json!("018f47d2-6a27-7c23-a49d-6b21bb770121");
+    command["aggregate_id"] = json!(format!("listing:{seller}_socks_01"));
+    command["payload"]["listing_id"] = json!("socks_01");
+    command
+}
+
+/// One checkout with a line for each of the seller's two listings, paid.
+async fn two_line_order(app: &TestApp, seller: &TestActor, buyer: &TestActor) -> String {
+    for command in [
+        common::register_command(&seller.pubky, 3),
+        second_listing_command(&seller.pubky),
+    ] {
+        let (status, body) = execute(app, &seller.token, &command).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let mut checkout = common::checkout_command(&seller.pubky);
+    checkout["payload"]["lines"] = json!([
+        { "listing_aggregate_id": common::listing_aggregate(&seller.pubky), "expected_revision": 1, "quantity": 1 },
+        { "listing_aggregate_id": format!("listing:{}_socks_01", seller.pubky), "expected_revision": 1, "quantity": 1 },
+    ]);
+    let (status, body) = execute(app, &buyer.token, &checkout).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let order_id = body["result"]["orders"][0]["id"]
+        .as_str()
+        .expect("order")
+        .to_string();
+    let payment_id = body["result"]["payments"][0]["id"]
+        .as_str()
+        .expect("payment")
+        .to_string();
+    let (status, body) = execute(
+        app,
+        &buyer.token,
+        &common::payment_command(&payment_id, 1, "confirmed", 1, 1_050),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    order_id
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_order_with_no_mapped_line_is_a_pubky_only_sale_and_is_not_pushed(pool: PgPool) {
+    let (app, store) = connector_app(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let connection = connect_shop(&app, &seller, SHOP).await;
+    let order = create_paid_order(&app, &seller, &buyer).await;
+    // The store maps some other listing, so the connection has mappings but
+    // none for this order.
+    let (status, body) = execute(&app, &seller.token, &second_listing_command(&seller.pubky)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    map_listing(&app, &seller, connection, "socks_01", "prod-9", "var-9").await;
+    worker::run_pass(&app.state).await.expect("pass");
+    assert_eq!(
+        common::count(&app.pool, "SELECT COUNT(*) FROM connector_order_push").await,
+        0,
+        "{}",
+        order.order_id
+    );
+    assert_eq!(
+        common::count(&app.pool, "SELECT COUNT(*) FROM connector_alerts").await,
+        0
+    );
+    assert_eq!(store.pushes(), 0);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_order_with_only_some_lines_mapped_is_quarantined_with_an_alert(pool: PgPool) {
+    let (app, store) = connector_app(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let connection = connect_shop(&app, &seller, SHOP).await;
+    let order_id = two_line_order(&app, &seller, &buyer).await;
+    map_listing(&app, &seller, connection, "boots_01", "prod-1", "var-1").await;
+    worker::run_pass(&app.state).await.expect("pass");
+    let (state, _, reason, _) = push_state(&app.pool, &order_id).await;
+    assert_eq!(state, "quarantined");
+    assert_eq!(reason.as_deref(), Some("unmapped_variant"));
+    assert_eq!(store.pushes(), 0);
+    let (_, alerts) = api(
+        &app,
+        "GET",
+        "/v1/connectors/alerts?unresolved=true",
+        Some(&seller.token),
+        &json!(null),
+    )
+    .await;
+    assert_eq!(alerts["alerts"].as_array().expect("alerts").len(), 1);
+    assert!(alerts["alerts"][0]["detail"]
+        .as_str()
+        .expect("detail")
+        .contains("socks_01"));
+
+    // Mapping the other line and retrying pushes the whole order.
+    let (status, _) = api(
+        &app,
+        "PUT",
+        &format!("/v1/connectors/{connection}/mappings"),
+        Some(&seller.token),
+        &json!({ "mappings": [
+            { "listing_id": "boots_01", "provider_product_id": "prod-1", "provider_variant_id": "var-1" },
+            { "listing_id": "socks_01", "provider_product_id": "prod-2", "provider_variant_id": "var-2" },
+        ] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    api(
+        &app,
+        "POST",
+        &format!("/v1/connectors/{connection}/pushes/{order_id}/retry"),
+        Some(&seller.token),
+        &json!(null),
+    )
+    .await;
+    worker::run_pass(&app.state).await.expect("pass");
+    assert_eq!(push_state(&app.pool, &order_id).await.0, "created");
+    let pushed = store
+        .last_order_push
+        .lock()
+        .expect("lock")
+        .clone()
+        .expect("push");
+    assert_eq!(pushed.lines.len(), 2);
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]

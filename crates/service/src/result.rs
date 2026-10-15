@@ -89,6 +89,10 @@ impl CommandFailure {
         &self.message
     }
 
+    pub(crate) const fn reason(&self) -> Option<&'static str> {
+        self.reason
+    }
+
     pub(crate) const fn current_revision(&self) -> Option<i64> {
         self.current_revision
     }

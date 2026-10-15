@@ -3,24 +3,25 @@
 //! Seller routes sit behind `auth::require_session`, the same layer as the
 //! other seller routes, and act only on connections the session's pubky
 //! owns: another seller's connection id answers exactly like an unknown id.
-//! The provider routes (Shopify launch and OAuth callback, WooCommerce
-//! callback, webhooks) and the public connector status are unauthenticated by
-//! nature; their authenticity is the provider's signature (launch, webhook)
-//! or the single-use `state` issued when the seller asked to connect
-//! (callbacks). The paths are fixed because merchants' provider apps point at
-//! them:
+//! The provider routes (a Shopify connection's launch, OAuth callback and
+//! webhooks, WooCommerce's callback and webhooks) and the public connector
+//! status are unauthenticated by nature. Their authenticity is the provider's
+//! signature (launch, webhook), checked with that connection's own app secret
+//! for Shopify, or the single-use `state` issued when the install began
+//! (callbacks). The paths are fixed because merchants configure their apps
+//! with them; a Shopify connection's are keyed by its random, unguessable id:
 //!
 //! ```text
-//! GET  /v1/connectors/shopify/apps/{app_key}/launch
-//! GET  /v1/connectors/shopify/apps/{app_key}/oauth/callback
+//! GET  /v1/connectors/shopify/c/{connection_id}/launch
+//! GET  /v1/connectors/shopify/c/{connection_id}/oauth/callback
+//! POST /v1/connectors/shopify/c/{connection_id}/webhooks
 //! POST /v1/connectors/woocommerce/oauth/callback
-//! POST /v1/connectors/webhooks/shopify/{app_key}
 //! POST /v1/connectors/webhooks/woocommerce
 //! ```
 //!
 //! No response carries a credential, and no handler logs one: the plaintext
-//! exists only inside a [`provider::ConnectionContext`] handed to a provider
-//! call.
+//! exists only inside a [`provider::ConnectionContext`] or
+//! [`provider::AppContext`] handed to a provider call.
 
 // A handler's early return is the `Response` it would send, so the helpers
 // that can refuse return it as their `Err`.
@@ -45,18 +46,20 @@ use crate::auth::Actor;
 use crate::clock::format_timestamp;
 use crate::AppState;
 
-use super::apps::valid_app_key;
-use super::config::{CONNECT_STATE_TTL_SECONDS, MAX_MAPPINGS_PER_REQUEST, MAX_SELECTED_PRODUCTS};
+use super::config::{
+    APP_SECRET_RETENTION_SECONDS, DRAFT_TTL_SECONDS, MAX_MAPPINGS_PER_REQUEST,
+    MAX_SELECTED_PRODUCTS, OAUTH_STATE_TTL_SECONDS,
+};
 use super::inbound::{self, Recorded};
 use super::ledger::{self, reason_is_informational, PushView, RetryOutcome};
 use super::provider::{
-    AuthorizeRequest, CallbackParams, CompleteRequest, ConnectRequest, ConnectorProvider,
+    AppKind, AuthorizeRequest, CallbackParams, CompleteRequest, ConnectRequest, ConnectorProvider,
     PendingConnection, ProviderError, ProviderKind, WebhookContext, WebhookHeaders,
 };
 use super::recipient;
 use super::store::{
     self, AlertRow, CompleteError, ConnectError, ConnectionRow, MappingError, MappingRow,
-    OpenError, SelectionError,
+    OpenError, SaveAppError, SelectionError,
 };
 use super::ConnectorRuntime;
 
@@ -126,7 +129,7 @@ async fn owned(state: &AppState, actor: &Actor, raw_id: &str) -> Result<Connecti
 }
 
 fn live(row: &ConnectionRow) -> Result<(), Response> {
-    if matches!(row.status.as_str(), "connected" | "error") {
+    if row.is_live() {
         Ok(())
     } else {
         Err(error(
@@ -151,14 +154,6 @@ fn provider_unavailable() -> Response {
         StatusCode::NOT_FOUND,
         "provider_unavailable",
         "That provider is not configured on this deployment.",
-    )
-}
-
-fn unknown_app() -> Response {
-    error(
-        StatusCode::NOT_FOUND,
-        "unknown_app",
-        "That app is not configured on this deployment.",
     )
 }
 
@@ -264,16 +259,45 @@ fn ts(value: DateTime<Utc>) -> String {
     format_timestamp(value)
 }
 
-fn connection_json(row: &ConnectionRow, mappings: i64, pushes: &BTreeMap<String, i64>) -> Value {
-    let count = |name: &str| pushes.get(name).copied().unwrap_or(0);
+/// The URLs a merchant configures their store with, built from
+/// `CONNECTOR_PUBLIC_BASE_URL`. A Shopify connection's carry its own id.
+fn urls_json(runtime: &ConnectorRuntime, row: &ConnectionRow) -> Value {
+    match row.provider_kind() {
+        Some(ProviderKind::Shopify) => json!({
+            "launch": runtime.settings.shopify_launch_url(row.id),
+            "oauth_callback": runtime.settings.shopify_callback_url(row.id),
+            "webhooks": runtime.settings.shopify_webhook_url(row.id),
+        }),
+        _ => json!({
+            "oauth_callback": runtime.settings.woocommerce_callback_url(),
+            "webhooks": runtime.settings.woocommerce_webhook_url(),
+        }),
+    }
+}
+
+struct ConnectionFacts {
+    mappings: i64,
+    pushes: BTreeMap<String, i64>,
+    credentials_saved: bool,
+}
+
+fn connection_json(
+    runtime: &ConnectorRuntime,
+    row: &ConnectionRow,
+    facts: &ConnectionFacts,
+) -> Value {
+    let count = |name: &str| facts.pushes.get(name).copied().unwrap_or(0);
     json!({
         "id": row.id,
         "provider": row.provider,
         "domain": row.shop,
-        "app_key": row.app_key,
+        "app_kind": row.app_kind,
         "status": row.status,
         "scopes": row.scopes,
-        "expires_at": (row.status == "pending")
+        "missing_scopes": row.missing_scopes,
+        "credentials_saved": facts.credentials_saved,
+        "urls": urls_json(runtime, row),
+        "expires_at": (row.status == "draft")
             .then(|| row.connect_expires_at.map(ts))
             .flatten(),
         "connected_at": row.connected_at.map(ts),
@@ -283,7 +307,7 @@ fn connection_json(row: &ConnectionRow, mappings: i64, pushes: &BTreeMap<String,
             "message": message,
             "at": row.last_error_at.map(ts),
         })),
-        "mapping_count": mappings,
+        "mapping_count": facts.mappings,
         "pushes": {
             "pending": count("pending"),
             "sending": count("sending"),
@@ -293,14 +317,22 @@ fn connection_json(row: &ConnectionRow, mappings: i64, pushes: &BTreeMap<String,
     })
 }
 
-async fn connection_view(state: &AppState, row: &ConnectionRow) -> Result<Value, sqlx::Error> {
+async fn connection_view(
+    state: &AppState,
+    runtime: &ConnectorRuntime,
+    row: &ConnectionRow,
+) -> Result<Value, sqlx::Error> {
     let mappings: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM connector_variant_map WHERE connection_id = $1")
             .bind(row.id)
             .fetch_one(&state.pool)
             .await?;
-    let pushes = ledger::push_counts(&state.pool, row.id).await?;
-    Ok(connection_json(row, mappings, &pushes))
+    let facts = ConnectionFacts {
+        mappings,
+        pushes: ledger::push_counts(&state.pool, row.id).await?,
+        credentials_saved: store::has_app_credentials(&state.pool, row.id).await?,
+    };
+    Ok(connection_json(runtime, row, &facts))
 }
 
 fn push_json(view: &PushView) -> Value {
@@ -365,16 +397,17 @@ pub async fn list_connections(
     State(state): State<AppState>,
     Extension(actor): Extension<Actor>,
 ) -> Response {
-    if let Err(response) = runtime(&state) {
-        return response;
-    }
-    let rows = match store::list_for_seller(&state.pool, &actor.0).await {
+    let runtime = match runtime(&state) {
+        Ok(runtime) => runtime,
+        Err(response) => return response,
+    };
+    let rows = match store::list_for_seller(&state.pool, &actor.0, state.clock.now()).await {
         Ok(rows) => rows,
         Err(cause) => return internal("connection list", &cause),
     };
     let mut connections = Vec::with_capacity(rows.len());
     for row in &rows {
-        match connection_view(&state, row).await {
+        match connection_view(&state, runtime, row).await {
             Ok(view) => connections.push(view),
             Err(cause) => return internal("connection summary", &cause),
         }
@@ -394,17 +427,27 @@ pub async fn list_connections(
 pub struct StartConnectRequest {
     provider: String,
     domain: String,
+    /// Reserved: `public` is the slot for Pubky's own Shopify app and is
+    /// refused until it exists. Omitted means the provider's own kind.
     #[serde(default)]
-    app_key: Option<String>,
+    app_kind: Option<String>,
     #[serde(default)]
     params: Option<Value>,
 }
 
-/// `POST /v1/connectors`: the signed-in seller asks to connect a store. This
-/// creates the pending connect (a one-time nonce, 30 minutes). WooCommerce's
-/// answer carries the `authorize_url` to open; a Shopify store is installed
-/// from its own admin (the app's App URL), so `authorize_url` is `null` and
-/// the launch matches this pending connect by domain.
+/// `POST /v1/connectors`: the signed-in seller starts connecting a store.
+///
+/// This creates the **draft connection**: a random, unguessable id and an
+/// expiry 24 hours out. Asking again for the same store returns the same
+/// draft (renewed), so the URLs the merchant already configured keep
+/// working. The answer carries the URLs to show (`connection.urls`).
+///
+/// * Shopify (a merchant's own custom app): `authorize_url` is `null`. The
+///   merchant saves the app's client id and secret with
+///   `PUT /v1/connectors/{id}/credentials`, then installs from Shopify; the
+///   connection's launch URL begins the authorization.
+/// * WooCommerce: `authorize_url` is the store's `wc-auth` URL, whose
+///   `user_id` is the draft's single-use nonce.
 pub async fn start_connect(
     State(state): State<AppState>,
     Extension(actor): Extension<Actor>,
@@ -424,6 +467,25 @@ pub async fn start_connect(
     let Some(provider) = runtime.providers.get(kind) else {
         return provider_unavailable();
     };
+    let app_kind = provider.app_kind();
+    match request.app_kind.as_deref().map(AppKind::parse) {
+        None => {}
+        Some(Some(AppKind::Public)) => {
+            return error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "public_app_unavailable",
+                "The Pubky Shopify app is not available yet.",
+            )
+        }
+        Some(Some(requested)) if requested == app_kind => {}
+        Some(_) => {
+            return error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_app_kind",
+                "That app kind does not fit this provider.",
+            )
+        }
+    }
     let params = request.params.unwrap_or_else(|| json!({}));
     if !params.is_object() || params.to_string().len() > 4096 {
         return error(
@@ -432,17 +494,6 @@ pub async fn start_connect(
             "params must be a small JSON object.",
         );
     }
-    let app_key = match request.app_key.as_deref() {
-        None => None,
-        Some(key) if valid_app_key(key) && runtime.apps.context(kind, key).is_some() => Some(key),
-        Some(_) => {
-            return error(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "unknown_app",
-                "That app is not configured for this provider.",
-            )
-        }
-    };
     let shop = match provider.normalize_shop(&request.domain) {
         Ok(shop) if !shop.is_empty() && shop.len() <= 255 && !shop.contains(['|', '\n', '\r']) => {
             shop
@@ -455,19 +506,24 @@ pub async fn start_connect(
             )
         }
     };
-    let mut nonce = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut nonce);
-    let connect_state = URL_SAFE_NO_PAD.encode(nonce);
+    // A provider that sends the merchant straight to the store (WooCommerce)
+    // carries a nonce in that request; one installed from the store's own
+    // admin (Shopify) gets its OAuth state at launch.
+    let nonce = (app_kind == AppKind::None).then(|| {
+        let mut bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        URL_SAFE_NO_PAD.encode(bytes)
+    });
     let now = state.clock.now();
-    let row = match store::begin_connect(
+    let row = match store::begin_draft(
         &state.pool,
         now,
         &actor.0,
         kind,
         &shop,
-        app_key,
-        &store::hash_state(&connect_state),
-        now + chrono::Duration::seconds(CONNECT_STATE_TTL_SECONDS),
+        app_kind,
+        nonce.as_deref().map(store::hash_state).as_deref(),
+        now + chrono::Duration::seconds(DRAFT_TTL_SECONDS),
     )
     .await
     {
@@ -488,21 +544,36 @@ pub async fn start_connect(
         }
         Err(ConnectError::Database(cause)) => return internal("connect start", &cause),
     };
+    let app = match runtime.app_for(&state.pool, &row).await {
+        Ok(app) => app,
+        Err(OpenError::Database(cause)) => return internal("app credentials read", &cause),
+        Err(_) => None,
+    };
+    let (callback_url, webhook_url) = match kind {
+        ProviderKind::Shopify => (
+            runtime.settings.shopify_callback_url(row.id),
+            runtime.settings.shopify_webhook_url(row.id),
+        ),
+        ProviderKind::Woocommerce => (
+            runtime.settings.woocommerce_callback_url(),
+            runtime.settings.woocommerce_webhook_url(),
+        ),
+    };
     let connect = ConnectRequest {
         connection_id: row.id,
         seller_pubky: actor.0.clone(),
         shop: shop.clone(),
-        state: connect_state,
-        app: app_key.and_then(|key| runtime.apps.context(kind, key)),
-        callback_url: runtime.settings.callback_url(kind.as_str(), app_key),
-        webhook_url: runtime.settings.webhook_url(kind.as_str(), app_key),
+        state: nonce.unwrap_or_default(),
+        app,
+        callback_url,
+        webhook_url,
         params,
     };
     let started = match call(runtime, provider.connect(&connect)).await {
         Ok(started) => started,
         Err(failure) => return provider_failure(StatusCode::BAD_GATEWAY, failure),
     };
-    let view = match connection_view(&state, &row).await {
+    let view = match connection_view(&state, runtime, &row).await {
         Ok(view) => view,
         Err(cause) => return internal("connection summary", &cause),
     };
@@ -517,6 +588,99 @@ pub async fn start_connect(
     )
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PutCredentialsRequest {
+    client_id: String,
+    client_secret: String,
+}
+
+impl std::fmt::Debug for PutCredentialsRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PutCredentialsRequest(<redacted>)")
+    }
+}
+
+fn clean_secret(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().count() <= MAX_FIELD_CHARS
+        && !value.chars().any(|c| c.is_control() || c.is_whitespace())
+}
+
+/// `PUT /v1/connectors/{id}/credentials`: the merchant's own app client id
+/// and secret, sealed for this connection. Saving again replaces the pair
+/// ("replace credentials"). They verify this connection's launch, OAuth and
+/// webhook signatures only; they are never returned, never logged and never
+/// written to the homeserver. The answer is the connection with
+/// `credentials_saved: true`.
+pub async fn put_credentials(
+    State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<String>,
+    Json(request): Json<PutCredentialsRequest>,
+) -> Response {
+    let runtime = match runtime(&state) {
+        Ok(runtime) => runtime,
+        Err(response) => return response,
+    };
+    let row = match owned(&state, &actor, &id).await {
+        Ok(row) => row,
+        Err(response) => return response,
+    };
+    let supported = row
+        .provider_kind()
+        .and_then(|kind| runtime.providers.get(kind))
+        .is_some_and(|provider| provider.app_kind() == AppKind::Custom);
+    if !supported || row.app_kind() != AppKind::Custom {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "credentials_not_supported",
+            "This connection does not take app credentials.",
+        );
+    }
+    if !clean_secret(&request.client_id) || !clean_secret(&request.client_secret) {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_credentials",
+            "The client id and client secret must be non-empty values without spaces.",
+        );
+    }
+    match store::save_app_credentials(
+        &state.pool,
+        &runtime.keys,
+        state.clock.now(),
+        &row,
+        &request.client_id,
+        &request.client_secret,
+    )
+    .await
+    {
+        Ok(()) => match connection_view(&state, runtime, &row).await {
+            Ok(view) => respond(
+                StatusCode::OK,
+                json!({
+                    "schema_version": 1,
+                    "kind": "connector_credentials",
+                    "connection": view,
+                }),
+            ),
+            Err(cause) => internal("connection summary", &cause),
+        },
+        Err(SaveAppError::NotAvailable) => error(
+            StatusCode::CONFLICT,
+            "connection_not_available",
+            "The draft expired or the connection was disconnected. Start again.",
+        ),
+        Err(SaveAppError::Database(cause)) => internal("credentials save", &cause),
+    }
+}
+
+/// `DELETE /v1/connectors/{id}`: asks the provider to revoke (best effort)
+/// and deletes the store credential, the recipient key, the mappings and the
+/// product selection. A merchant app's secret is deleted at once for a draft
+/// that never installed, and otherwise kept for at most 30 days (or until
+/// `shop/redact`) so Shopify's privacy webhooks after an uninstall can be
+/// verified.
 pub async fn disconnect(
     State(state): State<AppState>,
     Extension(actor): Extension<Actor>,
@@ -544,7 +708,9 @@ pub async fn disconnect(
             }
         }
     }
-    match store::disconnect(&state.pool, row.id, state.clock.now()).await {
+    let now = state.clock.now();
+    let retain_until = now + chrono::Duration::seconds(APP_SECRET_RETENTION_SECONDS);
+    match store::disconnect(&state.pool, row.id, now, retain_until).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(cause) => internal("disconnect", &cause),
     }
@@ -1158,114 +1324,132 @@ fn invalid_webhook() -> Response {
     )
 }
 
-/// `POST /v1/connectors/webhooks/{provider}` (WooCommerce) and
-/// `POST /v1/connectors/webhooks/{provider}/{app_key}` (Shopify): a store's
-/// webhook. Unknown store, bad signature and unreadable credential all
-/// answer the same 401, so the route does not reveal which stores are
-/// connected. A store that already disconnected is still recognised so its
-/// privacy webhooks are honoured; the provider verifies those with the app
-/// secret alone.
-pub async fn receive_webhook(
+/// `POST /v1/connectors/webhooks/woocommerce`: a WooCommerce store's webhook,
+/// found by the shop it names and verified with the store's own secret.
+/// Unknown store, bad signature and unreadable credential all answer the
+/// same 401, so the route does not reveal which stores are connected.
+pub async fn receive_woocommerce_webhook(
     State(state): State<AppState>,
-    Path(provider_name): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    webhook_inner(&state, &provider_name, None, &headers, &body).await
-}
-
-pub async fn receive_app_webhook(
-    State(state): State<AppState>,
-    Path((provider_name, app_key)): Path<(String, String)>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    webhook_inner(&state, &provider_name, Some(app_key), &headers, &body).await
-}
-
-async fn webhook_inner(
-    state: &AppState,
-    provider_name: &str,
-    app_key: Option<String>,
-    headers: &HeaderMap,
-    body: &Bytes,
-) -> Response {
-    let runtime = match runtime(state) {
+    let runtime = match runtime(&state) {
         Ok(runtime) => runtime,
         Err(response) => return response,
     };
-    let Some(kind) = ProviderKind::parse(provider_name) else {
-        return provider_unavailable();
-    };
+    let kind = ProviderKind::Woocommerce;
     let Some(provider) = runtime.providers.get(kind) else {
         return provider_unavailable();
     };
-    let app = match app_key.as_deref() {
-        None => None,
-        Some(key) => match runtime.apps.context(kind, key) {
-            Some(app) => Some(app),
-            None => return unknown_app(),
-        },
-    };
-    let headers = headers_of(headers);
-    let Ok(shop) = provider.webhook_shop(&headers, body) else {
+    let headers = headers_of(&headers);
+    let Ok(shop) = provider.webhook_shop(&headers, &body) else {
         return invalid_webhook();
     };
-    let live_connection = match store::live_for_shop(&state.pool, kind, &shop).await {
-        Ok(connection) => connection,
+    let connection = match store::live_for_shop(&state.pool, kind, &shop).await {
+        Ok(Some(connection)) => connection,
+        Ok(None) => return invalid_webhook(),
         Err(cause) => return internal("webhook connection lookup", &cause),
     };
-    let connection = match live_connection {
-        Some(connection) => Some(connection),
-        None => match store::latest_for_shop(&state.pool, kind, &shop).await {
-            Ok(connection) => connection,
-            Err(cause) => return internal("webhook connection lookup", &cause),
-        },
+    accept_webhook(&state, runtime, provider, connection, &headers, &body).await
+}
+
+/// `POST /v1/connectors/shopify/c/{connection_id}/webhooks`: a webhook from
+/// the merchant's own Shopify app, including the privacy topics. It is
+/// verified with that connection's own app secret, which is kept for a while
+/// after an uninstall for exactly these topics. An unknown or draft
+/// connection, a missing secret, a different shop and a bad signature all
+/// answer the same 401.
+pub async fn receive_shopify_webhook(
+    State(state): State<AppState>,
+    Path(connection_id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let runtime = match runtime(&state) {
+        Ok(runtime) => runtime,
+        Err(response) => return response,
     };
-    if let (Some(connection), Some(key)) = (&connection, app_key.as_deref()) {
-        if connection
-            .app_key
-            .as_deref()
-            .is_some_and(|bound| bound != key)
+    let Some(provider) = runtime.providers.get(ProviderKind::Shopify) else {
+        return provider_unavailable();
+    };
+    let connection = match shopify_connection(&state, &connection_id).await {
+        Some(Ok(connection)) => connection,
+        Some(Err(response)) => return response,
+        None => return invalid_webhook(),
+    };
+    if connection.status == "draft" {
+        return invalid_webhook();
+    }
+    let headers = headers_of(&headers);
+    match provider.webhook_shop(&headers, &body) {
+        Ok(shop) if shop == connection.shop => {}
+        _ => return invalid_webhook(),
+    }
+    accept_webhook(&state, runtime, provider, connection, &headers, &body).await
+}
+
+/// The Shopify connection a path names: one of this deployment's own
+/// custom-app connections, in any state.
+async fn shopify_connection(
+    state: &AppState,
+    raw_id: &str,
+) -> Option<Result<ConnectionRow, Response>> {
+    let id = Uuid::parse_str(raw_id).ok()?;
+    match store::get(&state.pool, id).await {
+        Ok(Some(row))
+            if row.provider_kind() == Some(ProviderKind::Shopify)
+                && row.app_kind() == AppKind::Custom =>
         {
+            Some(Ok(row))
+        }
+        Ok(_) => None,
+        Err(cause) => Some(Err(internal("connection lookup", &cause))),
+    }
+}
+
+async fn accept_webhook(
+    state: &AppState,
+    runtime: &ConnectorRuntime,
+    provider: &std::sync::Arc<dyn ConnectorProvider>,
+    connection: ConnectionRow,
+    headers: &WebhookHeaders,
+    body: &Bytes,
+) -> Response {
+    let app = match runtime.app_for(&state.pool, &connection).await {
+        Ok(app) => app,
+        Err(OpenError::Unreadable) => {
+            tracing::error!(
+                connection_id = %connection.id,
+                "connector app credential is unreadable; webhook refused"
+            );
             return invalid_webhook();
         }
-    }
-    let context = match &connection {
-        Some(connection) if matches!(connection.status.as_str(), "connected" | "error") => {
-            match runtime.open(&state.pool, connection).await {
-                Ok(mut opened) => {
-                    opened.app = None;
-                    Some(opened)
-                }
-                Err(OpenError::Unavailable) => None,
-                Err(OpenError::Unreadable) => {
-                    tracing::error!(
-                        connection_id = %connection.id,
-                        "connector credential is unreadable; webhook refused"
-                    );
-                    return invalid_webhook();
-                }
-                Err(OpenError::Database(cause)) => {
-                    return internal("webhook credential read", &cause)
-                }
+        Err(OpenError::Unavailable) => None,
+        Err(OpenError::Database(cause)) => return internal("webhook app read", &cause),
+    };
+    let context = if connection.is_live() {
+        match store::open_connection(&state.pool, &runtime.keys, &connection).await {
+            Ok(opened) => Some(opened),
+            Err(OpenError::Unavailable) => None,
+            Err(OpenError::Unreadable) => {
+                tracing::error!(
+                    connection_id = %connection.id,
+                    "connector credential is unreadable; webhook refused"
+                );
+                return invalid_webhook();
             }
+            Err(OpenError::Database(cause)) => return internal("webhook credential read", &cause),
         }
-        _ => None,
+    } else {
+        None
     };
     let webhook_context = WebhookContext {
         app,
         connection: context,
     };
-    let verified = match provider.verify_webhook(&webhook_context, body, &headers) {
+    let verified = match provider.verify_webhook(&webhook_context, body, headers) {
         Ok(verified) => verified,
         Err(_) => return invalid_webhook(),
-    };
-    let Some(connection) = connection else {
-        return respond(
-            StatusCode::OK,
-            json!({ "schema_version": 1, "status": "ignored" }),
-        );
     };
     let event = match provider.parse_inbound(&verified, body) {
         Ok(event) => event,
@@ -1329,31 +1513,34 @@ fn browser_outcome(
 fn browser_error(
     runtime: &ConnectorRuntime,
     redirect: bool,
+    connection: Option<Uuid>,
     status: StatusCode,
     code: &str,
     message: &str,
 ) -> Response {
     if redirect {
-        browser_outcome(
-            runtime,
-            &[("status", "error"), ("code", code)],
-            status,
-            code,
-            message,
-        )
+        let id = connection.map(|id| id.to_string());
+        let mut pairs = vec![("status", "error"), ("code", code)];
+        if let Some(id) = &id {
+            pairs.push(("connector", id));
+        }
+        browser_outcome(runtime, &pairs, status, code, message)
     } else {
         error(status, code, message)
     }
 }
 
-/// `GET /v1/connectors/shopify/apps/{app_key}/launch`: the app's App URL,
-/// where the store sends the merchant after Install. Verifies the launch
-/// signature with the app's secret, matches the pending connect for that
-/// domain, and sends the merchant on to authorize. An install with no pending
-/// connect goes to the Shop's connect page with the domain prefilled.
+/// `GET /v1/connectors/shopify/c/{connection_id}/launch`: the merchant's app
+/// URL for this connection, where Shopify sends the merchant after Install
+/// and every time the app is opened.
+///
+/// The launch is matched by the connection id in the path, verified with that
+/// connection's own app secret, and must name the connection's store. A draft
+/// or a connection that needs another install is sent on to authorize; one
+/// that is already connected is sent back to the Shop's status page.
 pub async fn shopify_launch(
     State(state): State<AppState>,
-    Path(app_key): Path<String>,
+    Path(connection_id): Path<String>,
     RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
 ) -> Response {
@@ -1361,12 +1548,54 @@ pub async fn shopify_launch(
         Ok(runtime) => runtime,
         Err(response) => return response,
     };
-    let kind = ProviderKind::Shopify;
-    let Some(provider) = runtime.providers.get(kind) else {
+    let Some(provider) = runtime.providers.get(ProviderKind::Shopify) else {
         return provider_unavailable();
     };
-    let Some(app) = runtime.apps.context(kind, &app_key) else {
-        return unknown_app();
+    let connection = match shopify_connection(&state, &connection_id).await {
+        Some(Ok(connection)) => connection,
+        Some(Err(response)) => return response,
+        None => return not_found(),
+    };
+    let now = state.clock.now();
+    let gone = connection.status == "disconnected"
+        || (connection.status == "draft"
+            && connection
+                .connect_expires_at
+                .is_none_or(|expiry| expiry <= now));
+    if gone {
+        return browser_error(
+            runtime,
+            true,
+            Some(connection.id),
+            StatusCode::GONE,
+            "draft_expired",
+            "This connection expired or was disconnected. Start again from the Shop.",
+        );
+    }
+    let app = match runtime.app_for(&state.pool, &connection).await {
+        Ok(Some(app)) => app,
+        Ok(None) => {
+            return browser_error(
+                runtime,
+                true,
+                Some(connection.id),
+                StatusCode::CONFLICT,
+                "credentials_missing",
+                "Save the app's client id and secret in the Shop first.",
+            )
+        }
+        Err(OpenError::Database(cause)) => return internal("launch app read", &cause),
+        Err(_) => {
+            tracing::error!(connection_id = %connection.id, "connector app credential is unreadable");
+            return browser_error(
+                runtime,
+                true,
+                Some(connection.id),
+                StatusCode::CONFLICT,
+                "credentials_unreadable",
+                "The saved app credentials cannot be read. Save them again in the Shop.",
+            );
+        }
     };
     let params = callback_params(raw_query, &headers, &Bytes::new());
     let shop = match provider.verify_launch(&app, &params) {
@@ -1379,57 +1608,39 @@ pub async fn shopify_launch(
             )
         }
     };
-    let now = state.clock.now();
-    let pending = match store::pending_for_shop(&state.pool, kind, &shop, now).await {
-        Ok(pending) => pending,
-        Err(cause) => return internal("launch lookup", &cause),
-    };
-    let pending = match pending.as_slice() {
-        [] => {
-            return browser_outcome(
-                runtime,
-                &[
-                    ("status", "install_unclaimed"),
-                    ("provider", kind.as_str()),
-                    ("domain", &shop),
-                ],
-                StatusCode::NOT_FOUND,
-                "no_pending_connect",
-                "No seller asked to connect this store. Connect it from the Shop first.",
-            )
-        }
-        [only] => only,
-        _ => {
-            return browser_error(
-                runtime,
-                true,
-                StatusCode::CONFLICT,
-                "ambiguous_connect",
-                "More than one seller asked to connect this store.",
-            )
-        }
-    };
-    if pending
-        .app_key
-        .as_deref()
-        .is_some_and(|bound| bound != app_key)
-    {
+    if shop != connection.shop {
         return browser_error(
             runtime,
             true,
+            Some(connection.id),
             StatusCode::CONFLICT,
-            "app_mismatch",
-            "This connection was started for a different app.",
+            "shop_mismatch",
+            "The app was installed on a different store than this connection's.",
         );
+    }
+    if connection.status == "connected" {
+        if runtime.settings.return_url.is_some() {
+            return browser_outcome(
+                runtime,
+                &[
+                    ("status", "connected"),
+                    ("connector", &connection.id.to_string()),
+                ],
+                StatusCode::OK,
+                "connected",
+                "",
+            );
+        }
+        return connected_json(&state, runtime, &connection).await;
     }
     let mut nonce = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut nonce);
     let authorize_state = URL_SAFE_NO_PAD.encode(nonce);
     match store::bind_launch(
         &state.pool,
-        pending.id,
-        &app_key,
+        connection.id,
         &store::hash_state(&authorize_state),
+        now + chrono::Duration::seconds(OAUTH_STATE_TTL_SECONDS),
         now,
     )
     .await
@@ -1439,6 +1650,7 @@ pub async fn shopify_launch(
             return browser_error(
                 runtime,
                 true,
+                Some(connection.id),
                 StatusCode::BAD_REQUEST,
                 "invalid_state",
                 "The connection request has expired.",
@@ -1450,7 +1662,7 @@ pub async fn shopify_launch(
         app,
         shop,
         state: authorize_state,
-        callback_url: runtime.settings.callback_url(kind.as_str(), Some(&app_key)),
+        callback_url: runtime.settings.shopify_callback_url(connection.id),
     };
     match provider.authorize_url(&authorize) {
         Ok(url) => Redirect::to(&url).into_response(),
@@ -1471,19 +1683,22 @@ fn callback_params(raw_query: Option<String>, headers: &HeaderMap, body: &Bytes)
     }
 }
 
-/// `GET /v1/connectors/shopify/apps/{app_key}/oauth/callback`.
+/// `GET /v1/connectors/shopify/c/{connection_id}/oauth/callback`.
 pub async fn shopify_callback(
     State(state): State<AppState>,
-    Path(app_key): Path<String>,
+    Path(connection_id): Path<String>,
     RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
 ) -> Response {
+    let Ok(id) = Uuid::parse_str(&connection_id) else {
+        return not_found();
+    };
     let params = callback_params(raw_query, &headers, &Bytes::new());
-    complete_callback(&state, ProviderKind::Shopify, Some(app_key), true, params).await
+    complete_callback(&state, ProviderKind::Shopify, Some(id), true, params).await
 }
 
 /// `POST /v1/connectors/woocommerce/oauth/callback`: WooCommerce posts the
-/// store's keys here, with `user_id` set to the pending connect's nonce.
+/// store's keys here, with `user_id` set to the draft's nonce.
 pub async fn woocommerce_callback(
     State(state): State<AppState>,
     RawQuery(raw_query): RawQuery,
@@ -1497,7 +1712,7 @@ pub async fn woocommerce_callback(
 async fn complete_callback(
     state: &AppState,
     kind: ProviderKind,
-    app_key: Option<String>,
+    path_connection: Option<Uuid>,
     redirect: bool,
     params: CallbackParams,
 ) -> Response {
@@ -1508,34 +1723,47 @@ async fn complete_callback(
     let Some(provider) = runtime.providers.get(kind) else {
         return provider_unavailable();
     };
-    let app = match app_key.as_deref() {
-        None => None,
-        Some(key) => match runtime.apps.context(kind, key) {
-            Some(app) => Some(app),
-            None => return unknown_app(),
-        },
-    };
-    let invalid = || {
+    let invalid = |connection: Option<Uuid>| {
         browser_error(
             runtime,
             redirect,
+            connection,
             StatusCode::BAD_REQUEST,
             "invalid_state",
             "The connection request is not valid or has expired.",
         )
     };
     let Ok(connect_state) = provider.callback_state(&params) else {
-        return invalid();
+        return invalid(path_connection);
     };
     let now = state.clock.now();
     let pending = match store::pending_by_state(&state.pool, kind, &connect_state, now).await {
         Ok(Some(pending)) => pending,
-        Ok(None) => return invalid(),
+        Ok(None) => return invalid(path_connection),
         Err(cause) => return internal("callback lookup", &cause),
     };
-    if pending.app_key.as_deref() != app_key.as_deref() {
-        return invalid();
+    if path_connection.is_some_and(|id| id != pending.id) {
+        return invalid(path_connection);
     }
+    let app = match runtime.app_for(&state.pool, &pending).await {
+        Ok(app) => app,
+        Err(OpenError::Database(cause)) => return internal("callback app read", &cause),
+        Err(_) => None,
+    };
+    if provider.app_kind() == AppKind::Custom && app.is_none() {
+        return browser_error(
+            runtime,
+            redirect,
+            Some(pending.id),
+            StatusCode::CONFLICT,
+            "credentials_missing",
+            "Save the app's client id and secret in the Shop first.",
+        );
+    }
+    let webhook_url = match kind {
+        ProviderKind::Shopify => runtime.settings.shopify_webhook_url(pending.id),
+        ProviderKind::Woocommerce => runtime.settings.woocommerce_webhook_url(),
+    };
     let request = CompleteRequest {
         pending: PendingConnection {
             connection_id: pending.id,
@@ -1545,9 +1773,7 @@ async fn complete_callback(
         },
         app,
         callback: params,
-        webhook_url: runtime
-            .settings
-            .webhook_url(kind.as_str(), app_key.as_deref()),
+        webhook_url: webhook_url.clone(),
     };
     let completed = match call(runtime, provider.complete_connect(&request)).await {
         Ok(completed) => completed,
@@ -1566,53 +1792,110 @@ async fn complete_callback(
             return browser_error(
                 runtime,
                 redirect,
+                Some(pending.id),
                 status,
                 code,
                 "The store did not complete the connection.",
             );
         }
     };
+    let missing: Vec<String> = provider
+        .required_scopes()
+        .into_iter()
+        .filter(|scope| !completed.scopes.contains(scope))
+        .collect();
     let recipient_key = recipient::generate();
-    match store::complete_connect(
+    let connected = match store::complete_connect(
         &state.pool,
         &runtime.keys,
         state.clock.now(),
         &pending,
         &completed.credentials,
         &completed.scopes,
+        &missing,
         &recipient_key,
     )
     .await
     {
-        Ok(connected) => {
-            if redirect && runtime.settings.return_url.is_some() {
-                return browser_outcome(
-                    runtime,
-                    &[
-                        ("status", "connected"),
-                        ("connector", &connected.id.to_string()),
-                    ],
-                    StatusCode::OK,
-                    "connected",
-                    "",
-                );
-            }
-            connected_json(state, &connected).await
+        Ok(connected) => connected,
+        Err(CompleteError::ShopInUse) => {
+            return browser_error(
+                runtime,
+                redirect,
+                Some(pending.id),
+                StatusCode::CONFLICT,
+                "shop_in_use",
+                "Another seller already has this store connected.",
+            )
         }
-        Err(CompleteError::ShopInUse) => browser_error(
+        Err(CompleteError::Stale) => return invalid(path_connection),
+        Err(CompleteError::Database(cause)) => return internal("connection completion", &cause),
+    };
+    // The install is stored; now the provider subscribes the store's webhooks
+    // to this connection's URL. A failure leaves the connection needing the
+    // seller rather than undoing the install.
+    let connected =
+        match register_webhooks(state, runtime, provider, &connected, &webhook_url).await {
+            Ok(row) => row,
+            Err(response) => return response,
+        };
+    if redirect && runtime.settings.return_url.is_some() {
+        return browser_outcome(
             runtime,
-            redirect,
-            StatusCode::CONFLICT,
-            "shop_in_use",
-            "Another seller already has this store connected.",
-        ),
-        Err(CompleteError::Stale) => invalid(),
-        Err(CompleteError::Database(cause)) => internal("connection completion", &cause),
+            &[
+                ("status", connected.status.as_str()),
+                ("connector", &connected.id.to_string()),
+            ],
+            StatusCode::OK,
+            "connected",
+            "",
+        );
+    }
+    connected_json(state, runtime, &connected).await
+}
+
+async fn register_webhooks(
+    state: &AppState,
+    runtime: &ConnectorRuntime,
+    provider: &std::sync::Arc<dyn ConnectorProvider>,
+    connected: &ConnectionRow,
+    webhook_url: &str,
+) -> Result<ConnectionRow, Response> {
+    let context = match runtime.open(&state.pool, connected).await {
+        Ok(context) => context,
+        Err(OpenError::Database(cause)) => return Err(internal("webhook registration", &cause)),
+        Err(_) => return Ok(connected.clone()),
+    };
+    match call(runtime, provider.register_webhooks(&context, webhook_url)).await {
+        Ok(()) => Ok(connected.clone()),
+        Err(failure) => {
+            tracing::warn!(
+                connection_id = %connected.id,
+                error = %failure,
+                "the provider could not register the store's webhooks"
+            );
+            store::set_attention(
+                &state.pool,
+                connected.id,
+                "webhook_registration_failed",
+                state.clock.now(),
+            )
+            .await
+            .map_err(|cause| internal("webhook registration", &cause))?;
+            store::get(&state.pool, connected.id)
+                .await
+                .map_err(|cause| internal("webhook registration", &cause))?
+                .ok_or_else(not_found)
+        }
     }
 }
 
-async fn connected_json(state: &AppState, connected: &ConnectionRow) -> Response {
-    match connection_view(state, connected).await {
+async fn connected_json(
+    state: &AppState,
+    runtime: &ConnectorRuntime,
+    connected: &ConnectionRow,
+) -> Response {
+    match connection_view(state, runtime, connected).await {
         Ok(view) => respond(
             StatusCode::OK,
             json!({

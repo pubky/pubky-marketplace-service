@@ -6,7 +6,9 @@
 //! shared [`crate::seal`] construction. Associated data binds each sealed
 //! value to its owner so a ciphertext cannot be moved to another connection:
 //!
-//! * credential: `connector-cred|v1|{seller}|{provider}|{shop}`
+//! * store credential (token, API keys): `connector-cred|v1|{seller}|{provider}|{shop}`
+//! * a merchant's own app credentials (client id and secret), one pair per
+//!   connection: `connector-cred|v1|{seller}|{provider}|{shop}|{connection_id}`
 //! * recipient key: `connector-recipient|v1|{seller}|{provider}|{shop}|{key_id}`
 //!
 //! None of the fields can contain `|`: a pubky is z-base-32, the provider is
@@ -38,6 +40,15 @@ pub type ConnectorKeys = RotatingKeys<ConnectorCredentialFamily>;
 
 pub fn credential_aad(seller_pubky: &str, provider: &str, shop: &str) -> Vec<u8> {
     format!("connector-cred|v1|{seller_pubky}|{provider}|{shop}").into_bytes()
+}
+
+pub fn app_credential_aad(
+    seller_pubky: &str,
+    provider: &str,
+    shop: &str,
+    connection_id: &uuid::Uuid,
+) -> Vec<u8> {
+    format!("connector-cred|v1|{seller_pubky}|{provider}|{shop}|{connection_id}").into_bytes()
 }
 
 pub fn recipient_key_aad(seller_pubky: &str, provider: &str, shop: &str, key_id: &str) -> Vec<u8> {
@@ -118,6 +129,18 @@ mod tests {
             credential,
             "connector-cred|v1|seller|shopify|shop.myshopify.com"
         );
+        let app = String::from_utf8(app_credential_aad(
+            "seller",
+            "shopify",
+            "shop.myshopify.com",
+            &uuid::Uuid::nil(),
+        ))
+        .expect("aad is utf-8");
+        assert_eq!(
+            app,
+            "connector-cred|v1|seller|shopify|shop.myshopify.com|00000000-0000-0000-0000-000000000000"
+        );
+        assert_ne!(app.as_bytes(), credential.as_bytes());
         let recipient = String::from_utf8(recipient_key_aad(
             "seller",
             "shopify",

@@ -196,10 +196,10 @@ Railway IaC `preserve()`):
 | `BUYER_EMAIL_UNPAID_RETENTION_DAYS` | `7` | days the sealed delivery email of a cancelled or expired unpaid checkout is kept before the purge deletes it (≥ 1) |
 | `PRIV_DATA_KEY_ENCRYPTION_KEY` | unset | 32-byte hex key sealing per-user `/priv` data keys at rest (XChaCha20-Poly1305); must differ from the Locks, pickup and digital delivery keys; `GET /v1/me/priv-keys` answers `priv_keys_unavailable` without it, and the service refuses to boot while sealed rows exist without it |
 | `PRIV_DATA_KEY_ENCRYPTION_KEY_PREVIOUS` | unset | optional previous priv data key sealing key for the dual-key read window during rotation; the re-seal worker moves every row to the current key. Keep it set until the pass reports zero rows under the previous key |
-| `CONNECTORS_ENABLED` | `false` | Turns on the store connectors (Shopify, WooCommerce): the `/v1/connectors` routes, the connector status and the `connector-worker` binary (same image, its own command). Off, every connector route answers `connectors_disabled` and nothing else changes. Needs `CONNECTOR_PUBLIC_BASE_URL` and `CONNECTOR_CREDENTIAL_ENCRYPTION_KEY`. Optional `CONNECTOR_RETURN_URL` (the Shop's connection page). Worker tuning: `CONNECTOR_PUSH_LEASE_SECONDS`, `CONNECTOR_PROVIDER_TIMEOUT_SECONDS`, `CONNECTOR_MAX_ATTEMPTS`, `CONNECTOR_BACKOFF_BASE_SECONDS`, `CONNECTOR_BACKOFF_MAX_SECONDS`, `CONNECTOR_STOCK_POLL_SECONDS`, `CONNECTOR_WORKER_TICK_MILLIS` |
-| `CONNECTOR_CREDENTIAL_ENCRYPTION_KEY` | unset | 32-byte hex key sealing store credentials and connector recipient keys at rest (XChaCha20-Poly1305); must differ from every other sealing key (checked at boot); the service and the worker refuse to boot while sealed connector values exist and no configured key opens them |
+| `CONNECTORS_ENABLED` | `false` | Turns on the store connectors (Shopify, WooCommerce): the `/v1/connectors` routes, the connector status and the `connector-worker` binary (same image, its own command). Off, every connector route answers `connectors_disabled` and nothing else changes. Needs `CONNECTOR_PUBLIC_BASE_URL` and `CONNECTOR_CREDENTIAL_ENCRYPTION_KEY`. Optional `CONNECTOR_RETURN_URL` (the Shop's connection page). Connection URLs handed to merchants are built from `CONNECTOR_PUBLIC_BASE_URL`. Worker tuning: `CONNECTOR_PUSH_LEASE_SECONDS`, `CONNECTOR_PROVIDER_TIMEOUT_SECONDS`, `CONNECTOR_MAX_ATTEMPTS`, `CONNECTOR_BACKOFF_BASE_SECONDS`, `CONNECTOR_BACKOFF_MAX_SECONDS`, `CONNECTOR_STOCK_POLL_SECONDS`, `CONNECTOR_WORKER_TICK_MILLIS` |
+| `CONNECTOR_CREDENTIAL_ENCRYPTION_KEY` | unset | 32-byte hex key sealing store credentials, a merchant's own app credentials and connector recipient keys at rest (XChaCha20-Poly1305); must differ from every other sealing key (checked at boot); the service and the worker refuse to boot while sealed connector values exist and no configured key opens them |
 | `CONNECTOR_CREDENTIAL_ENCRYPTION_KEY_PREVIOUS` | unset | optional previous connector key for the dual-key read window during rotation; the worker re-seals every value to the current key |
-| `SHOPIFY_APPS` | unset | comma-separated Shopify app keys (`a-z0-9-`, up to 32 characters), one per configured app (interim custom-distribution apps are one per merchant store); each key needs `SHOPIFY_APP_<KEY>_CLIENT_ID` and `SHOPIFY_APP_<KEY>_CLIENT_SECRET` (`<KEY>` upper-cased, `-` as `_`) |
+| `SHOPIFY_PUBLIC_APP_CLIENT_ID`, `SHOPIFY_PUBLIC_APP_CLIENT_SECRET` | unset | reserved for Pubky's own public Shopify app, the only Shopify values that will ever live in the environment; not read yet. A merchant's own custom app brings its client id and secret through `PUT /v1/connectors/{id}/credentials`, sealed per connection, never in the environment |
 | `PICKUP_DISPUTE_RETENTION_DAYS` | `30` | days a cancelled-after-payment order's pinned pickup snapshot is retained as the dispute exhibit when no refund evidence ever lands, before the ordinary terminal-order purge takes it (≥ 1) |
 
 ### Listing moderation
@@ -239,6 +239,51 @@ answers are cached (5 minutes, per listing); a "clear" answer is never cached,
 so a moderation placed meanwhile is seen on the next command and lifting one
 takes effect once the cached answer expires. Orders created before a listing
 was moderated are not cancelled by this check.
+
+### Listing lifecycle
+
+A seller pauses, ends or removes a listing by rewriting `state` in its record
+at `/pub/pubky.app/marketplace/v1/listings/{listing_id}` on their homeserver;
+the listing aggregate tracks stock only. Before the service accepts a command
+that sells a listing it reads the record of every listing involved, from
+`HOMESERVER_URL`, and refuses with `LISTING_NOT_ACTIVE` (HTTP 409, audited as
+`invalid_state`) and `reason` `listing_paused`, `listing_ended`,
+`listing_removed` or `listing_not_active`. A record the homeserver answers
+404 for is `listing_removed`; a record with no `state` field predates the
+field and counts as `active`. A listing the service has already tombstoned is
+not read and keeps its `NOT_FOUND` refusal.
+
+- A new commitment (`checkout.create`, `offer.create`, `offer.counter`,
+  `offer.accept`, `auction.place_bid`) is refused unless every record is
+  `active`.
+- A continuation of a commitment made while the listing was on sale
+  (`offer.checkout`, the first `payment.prepare_locks` of a payment,
+  `auction.close`, and `POST /v0/orders/{id}/payment-method`, which answers
+  with the same code and `reason`) is refused only when a record is removed:
+  the seller cannot fulfil it, so no payment may start. A pause or an end
+  passes, so a seller who pauses to stop new buyers does not strand an
+  accepted offer or an order awaiting payment.
+- The auction close worker closes a removed listing's due auction unsold, as
+  it does a deleted one. When the homeserver cannot answer, it closes on
+  stored state: closing takes no payment, and the winner's payment start
+  refuses a removal on its own.
+
+Withdrawing or rejecting an offer and the rest of the payment flow are not
+checked. Each `(seller, listing)` is read once per command, a checkout's
+records concurrently (at most 8 at a time).
+
+The record is the seller's authority over whether the listing is for sale, so
+the check **fails closed**: when the homeserver cannot answer (transport
+failure, a non-success status other than 404, a non-JSON body, or no answer
+to all of the command's reads within 12 s) the command is refused with the
+retriable `UPSTREAM_UNAVAILABLE` (HTTP 503) and nothing is written. Like the
+moderation check it runs before the command's transaction, so a slow
+homeserver never holds a domain connection, and a command id with a stored
+result is answered from it without a read.
+
+Before deploying this check, sweep for sellable listings whose record is
+missing (they would start refusing as `listing_removed`) with
+[`scripts/listing-record-sweep.sh`](scripts/listing-record-sweep.sh).
 
 ### Public payment configuration availability
 
@@ -1856,7 +1901,7 @@ This service is canonical and resolves them as follows:
 | Area | Client contracts said | Canonical (this service) | Rationale |
 | --- | --- | --- | --- |
 | Wire casing | camelCase (prototype engine) | snake_case | ADR-0019 §3 shows the envelope in snake_case; the ADR is the authority. |
-| Listing states | `draft/active/paused/reserved/sold/expired/removed` | `available/reserved/sold` | Catalog lifecycle belongs to seller-signed homeserver records; the transaction authority tracks inventory availability only (prototype engine semantics). |
+| Listing states | `draft/active/paused/reserved/sold/expired/removed` | `available/reserved/sold` | Catalog lifecycle belongs to seller-signed homeserver records; the transaction authority tracks inventory availability only (prototype engine semantics) and reads the record's state before it sells (see [Listing lifecycle](#listing-lifecycle)). |
 | Reservation states | none (engine only had `active`) | `active/converted/released/expired` | The engine stored `expiresAt` but never swept it; this service implements server-time expiry, so the terminal states are modeled. |
 | Payment states | missing `detected`, extra `created/window_elapsed/external_refund_required/refunded_external` | `awaiting_entitlement/detected/confirmed/expired/manual_review` | Prototype engine enums are the executable spec (ADR-0022). |
 | Order states | extra `ready_for_pickup/return_in_transit/return_inspection`, missing `return_approved/return_received` | the prototype engine states minus `disputed` (operator adjudication removed) | Same; transitions are derived from the engine's command handlers. |

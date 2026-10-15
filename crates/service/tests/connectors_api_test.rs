@@ -14,6 +14,7 @@ use base64::Engine;
 use common::connector_provider::*;
 use common::{create_paid_order, new_actor, test_app};
 use marketplace_service::connectors::keys::ConnectorKeys;
+use marketplace_service::connectors::provider::AppKind;
 use marketplace_service::connectors::provider::{
     CatalogOption, CatalogProduct, CatalogVariant, Price,
 };
@@ -81,10 +82,19 @@ async fn connectors_are_off_by_default(pool: PgPool) {
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["error"]["code"], "connectors_disabled");
     for (method, path) in [
-        ("POST", "/v1/connectors/webhooks/shopify/john"),
+        (
+            "POST",
+            "/v1/connectors/shopify/c/00000000-0000-4000-8000-000000000001/webhooks",
+        ),
         ("POST", "/v1/connectors/webhooks/woocommerce"),
-        ("GET", "/v1/connectors/shopify/apps/john/launch"),
-        ("GET", "/v1/connectors/shopify/apps/john/oauth/callback"),
+        (
+            "GET",
+            "/v1/connectors/shopify/c/00000000-0000-4000-8000-000000000001/launch",
+        ),
+        (
+            "GET",
+            "/v1/connectors/shopify/c/00000000-0000-4000-8000-000000000001/oauth/callback",
+        ),
         ("POST", "/v1/connectors/woocommerce/oauth/callback"),
     ] {
         let (status, _, _) = raw(app.router.clone(), method, path, &[], b"{}".to_vec()).await;
@@ -132,6 +142,7 @@ async fn every_seller_route_requires_a_session(pool: PgPool) {
         ("GET", format!("/v1/connectors/{id}/catalog")),
         ("GET", format!("/v1/connectors/{id}/mappings")),
         ("PUT", format!("/v1/connectors/{id}/mappings")),
+        ("PUT", format!("/v1/connectors/{id}/credentials")),
         ("GET", format!("/v1/connectors/{id}/selection")),
         ("PUT", format!("/v1/connectors/{id}/selection")),
         ("GET", format!("/v1/connectors/{id}/pushes")),
@@ -167,6 +178,11 @@ async fn another_seller_can_neither_read_nor_use_a_connection(pool: PgPool) {
         ("GET", format!("{base}/catalog"), json!(null)),
         ("GET", format!("{base}/mappings"), json!(null)),
         ("PUT", format!("{base}/mappings"), json!({ "mappings": [] })),
+        (
+            "PUT",
+            format!("{base}/credentials"),
+            json!({ "client_id": "stolen", "client_secret": "stolen" }),
+        ),
         ("GET", format!("{base}/selection"), json!(null)),
         (
             "PUT",
@@ -233,7 +249,13 @@ async fn another_seller_can_neither_read_nor_use_a_connection(pool: PgPool) {
     .await;
     assert_eq!(owner_list["connections"][0]["status"], "connected");
     assert_eq!(owner_list["connections"][0]["mapping_count"], 1);
-    assert_eq!(owner_list["connections"][0]["app_key"], APP_KEY);
+    assert_eq!(owner_list["connections"][0]["app_kind"], "custom");
+    assert_eq!(owner_list["connections"][0]["credentials_saved"], true);
+    let kept: Vec<u8> = sqlx::query_scalar("SELECT sealed FROM connector_app_credentials")
+        .fetch_one(&app.pool)
+        .await
+        .expect("the owner's credentials are untouched");
+    assert!(!kept.is_empty());
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
@@ -277,7 +299,7 @@ async fn another_seller_cannot_resolve_an_alert_they_do_not_own(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn a_pending_connect_holds_a_one_time_nonce_for_thirty_minutes(pool: PgPool) {
+async fn a_draft_connection_has_an_unguessable_id_urls_and_a_day_to_live(pool: PgPool) {
     let (app, _store) = connector_app(pool).await;
     let seller = new_actor(&app).await;
     for (body, code) in [
@@ -290,8 +312,12 @@ async fn a_pending_connect_holds_a_one_time_nonce_for_thirty_minutes(pool: PgPoo
             "invalid_domain",
         ),
         (
-            json!({ "provider": "shopify", "domain": SHOP, "app_key": "nobody" }),
-            "unknown_app",
+            json!({ "provider": "shopify", "domain": SHOP, "app_kind": "public" }),
+            "public_app_unavailable",
+        ),
+        (
+            json!({ "provider": "shopify", "domain": SHOP, "app_kind": "none" }),
+            "invalid_app_kind",
         ),
     ] {
         let (status, response) =
@@ -299,6 +325,21 @@ async fn a_pending_connect_holds_a_one_time_nonce_for_thirty_minutes(pool: PgPoo
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response}");
         assert_eq!(response["error"]["code"], code);
     }
+    // The registry-style field is gone.
+    let (status, _, _) = raw(
+        app.router.clone(),
+        "POST",
+        "/v1/connectors",
+        &[
+            ("content-type", "application/json"),
+            ("authorization", &format!("Bearer {}", seller.token)),
+        ],
+        serde_json::to_vec(&json!({ "provider": "shopify", "domain": SHOP, "app_key": "john" }))
+            .expect("body"),
+    )
+    .await;
+    assert!(status.is_client_error());
+
     let (status, started) = api(
         &app,
         "POST",
@@ -308,138 +349,378 @@ async fn a_pending_connect_holds_a_one_time_nonce_for_thirty_minutes(pool: PgPoo
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{started}");
-    assert_eq!(started["connection"]["status"], "pending");
-    assert_eq!(started["connection"]["domain"], SHOP);
-    assert_eq!(started["connection"]["app_key"], Value::Null);
+    let connection = &started["connection"];
+    assert_eq!(connection["status"], "draft");
+    assert_eq!(connection["domain"], SHOP);
+    assert_eq!(connection["app_kind"], "custom");
+    assert_eq!(connection["credentials_saved"], false);
+    assert_eq!(connection["missing_scopes"], json!([]));
+    assert_eq!(started["authorize_url"], Value::Null);
+    let id: Uuid = connection["id"]
+        .as_str()
+        .expect("id")
+        .parse()
+        .expect("uuid");
+    assert_eq!(id.get_version_num(), 4, "a random id");
+    let base = "https://service.test/v1/connectors/shopify/c";
+    assert_eq!(connection["urls"]["launch"], format!("{base}/{id}/launch"));
     assert_eq!(
-        started["authorize_url"],
-        Value::Null,
-        "Shopify installs from the store's own admin"
+        connection["urls"]["oauth_callback"],
+        format!("{base}/{id}/oauth/callback")
     );
-    let expires: chrono::DateTime<chrono::Utc> = started["connection"]["expires_at"]
+    assert_eq!(
+        connection["urls"]["webhooks"],
+        format!("{base}/{id}/webhooks")
+    );
+    let expires: chrono::DateTime<chrono::Utc> = connection["expires_at"]
         .as_str()
         .expect("expires_at")
         .parse()
         .expect("timestamp");
-    let created: chrono::DateTime<chrono::Utc> = started["connection"]["created_at"]
+    let created: chrono::DateTime<chrono::Utc> = connection["created_at"]
         .as_str()
         .expect("created_at")
         .parse()
         .expect("timestamp");
-    assert_eq!((expires - created).num_minutes(), 30);
-    let hash: Option<Vec<u8>> =
-        sqlx::query_scalar("SELECT connect_state_hash FROM connector_connections")
-            .fetch_one(&app.pool)
-            .await
-            .expect("state hash");
-    assert_eq!(
-        hash.expect("a hash is stored").len(),
-        32,
-        "only the hash of the nonce is kept"
-    );
+    assert_eq!((expires - created).num_hours(), 24);
 
-    // A named app is recorded straight away.
-    let (_, named) = api(
+    // Asking again for the same store returns the same draft, so the URLs
+    // the merchant already configured keep working, and renews the expiry.
+    app.clock.advance_seconds(3600);
+    let (status, again) = api(
         &app,
         "POST",
         "/v1/connectors",
         Some(&seller.token),
-        &json!({ "provider": "shopify", "domain": "other.test-store.example", "app_key": "pilot-1" }),
+        &json!({ "provider": "shopify", "domain": SHOP }),
     )
     .await;
-    assert_eq!(named["connection"]["app_key"], "pilot-1");
+    assert_eq!(status, StatusCode::CREATED, "{again}");
+    assert_eq!(again["connection"]["id"], connection["id"]);
+    let renewed: chrono::DateTime<chrono::Utc> = again["connection"]["expires_at"]
+        .as_str()
+        .expect("expires_at")
+        .parse()
+        .expect("timestamp");
+    assert_eq!((renewed - expires).num_hours(), 1);
 
-    // After thirty minutes the pending connect is gone for a launch.
-    app.clock.advance_seconds(30 * 60 + 1);
-    let (status, _, body) = launch(&app, APP_KEY, SHOP, TEST_APP_SECRET).await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
-    assert_eq!(body["error"]["code"], "no_pending_connect");
+    // Other sellers' drafts get other ids.
+    let other = new_actor(&app).await;
+    let other_id = start_connect(&app, &other, SHOP).await;
+    assert_ne!(other_id, id);
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn the_shopify_launch_and_callback_follow_the_fixed_routes(pool: PgPool) {
-    let (app, store) = connector_app(pool).await;
-    let first = new_actor(&app).await;
-    let second = new_actor(&app).await;
+async fn an_uncompleted_draft_expires_after_a_day_and_takes_its_credentials_with_it(pool: PgPool) {
+    let (app, _store) = connector_app(pool).await;
+    let seller = new_actor(&app).await;
+    let id = start_connect(&app, &seller, SHOP).await;
+    let (status, _) = save_credentials(&app, &seller, id, TEST_CLIENT_ID, TEST_APP_SECRET).await;
+    assert_eq!(status, StatusCode::OK);
 
-    // An install with no pending connect has nowhere to go yet.
-    let (status, _, body) = launch(&app, APP_KEY, SHOP, TEST_APP_SECRET).await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
-    assert_eq!(body["error"]["code"], "no_pending_connect");
+    app.clock.advance_seconds(24 * 3600 - 60);
+    let (_, list) = api(
+        &app,
+        "GET",
+        "/v1/connectors",
+        Some(&seller.token),
+        &json!(null),
+    )
+    .await;
+    assert_eq!(
+        list["connections"][0]["status"], "draft",
+        "still live a minute before"
+    );
 
-    let connection = start_connect(&app, &first, SHOP).await;
+    app.clock.advance_seconds(120);
+    let (_, list) = api(
+        &app,
+        "GET",
+        "/v1/connectors",
+        Some(&seller.token),
+        &json!(null),
+    )
+    .await;
+    assert_eq!(
+        list["connections"],
+        json!([]),
+        "an expired draft is not listed"
+    );
+    let (status, body, _) = {
+        let (status, location, body) = launch(&app, id, SHOP, TEST_APP_SECRET).await;
+        (status, body, location)
+    };
+    assert_eq!(status, StatusCode::GONE, "{body}");
+    assert_eq!(body["error"]["code"], "draft_expired");
+    let (status, body) = save_credentials(&app, &seller, id, TEST_CLIENT_ID, TEST_APP_SECRET).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "connection_not_available");
 
-    // The launch is verified with the app's own secret and app key.
-    let (status, _, body) = launch(&app, APP_KEY, SHOP, "wrong-secret").await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
-    assert_eq!(body["error"]["code"], "invalid_launch");
-    let (status, _, body) = launch(&app, "no-such-app", SHOP, TEST_APP_SECRET).await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
-    assert_eq!(body["error"]["code"], "unknown_app");
-    let (status, _, _) = launch(&app, "pilot-1", SHOP, TEST_APP_SECRET).await;
+    let report = marketplace_service::connectors::worker::run_pass(&app.state)
+        .await
+        .expect("pass");
+    assert_eq!(report.drafts_purged, 1);
+    for table in ["connector_connections", "connector_app_credentials"] {
+        assert_eq!(
+            common::count(&app.pool, &format!("SELECT COUNT(*) FROM {table}")).await,
+            0,
+            "{table}"
+        );
+    }
+    // Expired drafts never count toward the connection limit.
+    for index in 0..5 {
+        let (status, body) = api(
+            &app,
+            "POST",
+            "/v1/connectors",
+            Some(&seller.token),
+            &json!({ "provider": "shopify", "domain": format!("again-{index}.test-store.example") }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn credentials_are_saved_per_connection_replaced_and_never_returned(pool: PgPool) {
+    common::install_log_capture();
+    let (app, _store) = connector_app(pool).await;
+    let seller = new_actor(&app).await;
+    let id = start_connect(&app, &seller, SHOP).await;
+
+    for (client_id, secret) in [("", "x"), ("x", ""), ("has space", "x"), ("x", "tab\there")] {
+        let (status, body) = save_credentials(&app, &seller, id, client_id, secret).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["error"]["code"], "invalid_credentials");
+    }
+    let (status, saved) =
+        save_credentials(&app, &seller, id, TEST_CLIENT_ID, TEST_APP_SECRET).await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    assert_eq!(saved["connection"]["credentials_saved"], true);
+    let text = saved.to_string();
+    assert!(
+        !text.contains(TEST_APP_SECRET) && !text.contains(TEST_CLIENT_ID),
+        "{text}"
+    );
+
+    // Sealed, with the connection id in the associated data.
+    let sealed: Vec<u8> =
+        sqlx::query_scalar("SELECT sealed FROM connector_app_credentials WHERE connection_id = $1")
+            .bind(id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("sealed pair");
+    let shown = String::from_utf8_lossy(&sealed).into_owned();
+    assert!(!shown.contains(TEST_APP_SECRET) && !shown.contains(TEST_CLIENT_ID));
+    let keys = test_keys();
+    let aad = format!("connector-cred|v1|{}|shopify|{SHOP}|{id}", seller.pubky);
+    let opened = keys
+        .open(aad.as_bytes(), &sealed)
+        .expect("opens with its aad");
+    assert!(String::from_utf8_lossy(&opened).contains(TEST_APP_SECRET));
+    for wrong in [
+        format!("connector-cred|v1|{}|shopify|{SHOP}", seller.pubky),
+        format!(
+            "connector-cred|v1|{}|shopify|{SHOP}|{}",
+            seller.pubky,
+            Uuid::new_v4()
+        ),
+    ] {
+        assert!(keys.open(wrong.as_bytes(), &sealed).is_err(), "{wrong}");
+    }
+
+    // Another connection's row cannot be moved here.
+    let other = new_actor(&app).await;
+    let other_id = start_connect(&app, &other, "elsewhere.test-store.example").await;
+    save_credentials(&app, &other, other_id, "other-client", "other-secret").await;
+    sqlx::query("UPDATE connector_app_credentials SET sealed = $2 WHERE connection_id = $1")
+        .bind(other_id)
+        .bind(&sealed)
+        .execute(&app.pool)
+        .await
+        .expect("transplant");
+    let victim = store::get(&app.pool, other_id)
+        .await
+        .expect("read")
+        .expect("row");
+    assert!(matches!(
+        store::open_app(&app.pool, &keys, &victim).await,
+        Err(OpenError::Unreadable)
+    ));
+
+    // Replacing overwrites the pair: the old secret stops verifying.
+    let (status, _) = save_credentials(&app, &seller, id, "client-2", "second-secret").await;
+    assert_eq!(status, StatusCode::OK);
+    let row = store::get(&app.pool, id).await.expect("read").expect("row");
+    let app_context = store::open_app(&app.pool, &keys, &row)
+        .await
+        .expect("opens")
+        .expect("saved");
+    assert_eq!(app_context.client_id, "client-2");
+    assert_eq!(app_context.client_secret.expose(), b"second-secret");
+    assert!(!format!("{app_context:?}").contains("second-secret"));
+    let (status, _, _) = launch(&app, id, SHOP, TEST_APP_SECRET).await;
     assert_eq!(
         status,
         StatusCode::UNAUTHORIZED,
-        "john's secret does not sign pilot-1's launch"
+        "the replaced secret no longer verifies"
     );
+    let (status, _, _) = launch(&app, id, SHOP, "second-secret").await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
 
-    let (status, location, body) = launch(&app, APP_KEY, SHOP, TEST_APP_SECRET).await;
+    // A provider without apps takes no credentials.
+    let woo = {
+        let (_, body) = api(
+            &app,
+            "POST",
+            "/v1/connectors",
+            Some(&seller.token),
+            &json!({ "provider": "woocommerce", "domain": "woo.test-store.example" }),
+        )
+        .await;
+        body["connection"]["id"].as_str().expect("id").to_string()
+    };
+    let (status, body) = api(
+        &app,
+        "PUT",
+        &format!("/v1/connectors/{woo}/credentials"),
+        Some(&seller.token),
+        &json!({ "client_id": "a", "client_secret": "b" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["code"], "credentials_not_supported");
+
+    let logs = common::captured_logs();
+    for secret in [
+        TEST_APP_SECRET,
+        "second-secret",
+        "other-secret",
+        TEST_CLIENT_ID,
+    ] {
+        assert!(!logs.contains(secret), "{secret} reached the logs");
+    }
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn the_launch_is_matched_by_connection_verified_with_its_secret_and_leads_to_authorize(
+    pool: PgPool,
+) {
+    let (app, store) = connector_app(pool).await;
+    let seller = new_actor(&app).await;
+    let connection = start_connect(&app, &seller, SHOP).await;
+
+    // No credentials yet: the merchant is told to save them first.
+    let (status, _, body) = launch(&app, connection, SHOP, TEST_APP_SECRET).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "credentials_missing");
+    save_credentials(&app, &seller, connection, TEST_CLIENT_ID, TEST_APP_SECRET).await;
+
+    let (status, _, body) = launch(&app, connection, SHOP, "wrong-secret").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(body["error"]["code"], "invalid_launch");
+    // A verified launch for a different store is not this connection's.
+    let (status, _, body) = launch(
+        &app,
+        connection,
+        "another.test-store.example",
+        TEST_APP_SECRET,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "shop_mismatch");
+    // An unknown id answers like nothing.
+    let (status, _, body) = launch(&app, Uuid::new_v4(), SHOP, TEST_APP_SECRET).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"]["code"], "connection_not_found");
+    // Another connection's secret does not launch this one.
+    let other = new_actor(&app).await;
+    connect_shop_with(
+        &app,
+        &other,
+        "elsewhere.test-store.example",
+        "other-client",
+        "other-secret",
+    )
+    .await;
+    let (status, _, _) = launch(&app, connection, SHOP, "other-secret").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, location, body) = launch(&app, connection, SHOP, TEST_APP_SECRET).await;
     assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
     let location = location.expect("redirect target");
     assert!(location.starts_with(&format!("https://{SHOP}/admin/oauth/authorize?")));
-    assert_eq!(query_param(&location, "client_id"), "client-john");
+    assert_eq!(query_param(&location, "client_id"), TEST_CLIENT_ID);
     assert_eq!(
         query_param(&location, "redirect_uri"),
-        "https://service.test/v1/connectors/shopify/apps/john/oauth/callback"
+        format!("https://service.test/v1/connectors/shopify/c/{connection}/oauth/callback")
     );
-    let state = query_param(&location, "state");
     assert_eq!(
         store.last_app.lock().expect("app lock").as_deref(),
-        Some(APP_KEY)
+        Some(TEST_CLIENT_ID)
     );
-    let bound: Option<String> =
-        sqlx::query_scalar("SELECT app_key FROM connector_connections WHERE id = $1")
-            .bind(connection)
-            .fetch_one(&app.pool)
-            .await
-            .expect("app key");
-    assert_eq!(
-        bound.as_deref(),
-        Some(APP_KEY),
-        "the launch records the app"
+    assert!(
+        !location.contains(TEST_APP_SECRET),
+        "the secret is never in a redirect"
     );
+}
 
-    let callback = |app_key: &str, query: &str| {
-        let router = app.router.clone();
-        let path = format!("/v1/connectors/shopify/apps/{app_key}/oauth/callback?{query}");
-        async move { raw(router, "GET", &path, &[], Vec::new()).await }
-    };
-    // A wrong code leaves the pending connect usable; a forged state and the
-    // wrong app are both refused as an invalid state.
-    let (status, _, body) = callback(APP_KEY, &format!("state={state}&code=bad")).await;
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn the_oauth_callback_completes_only_its_own_connection_once(pool: PgPool) {
+    let (app, store) = connector_app(pool).await;
+    let first = new_actor(&app).await;
+    let second = new_actor(&app).await;
+    let connection = start_connect(&app, &first, SHOP).await;
+    save_credentials(&app, &first, connection, TEST_CLIENT_ID, TEST_APP_SECRET).await;
+    let (_, location, _) = launch(&app, connection, SHOP, TEST_APP_SECRET).await;
+    let state = query_param(&location.expect("authorize"), "state");
+
+    let (status, _, body) =
+        oauth_callback(&app, connection, &format!("state={state}&code=bad")).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(as_json(&body)["error"]["code"], "connect_rejected");
-    let (status, _, body) = callback(APP_KEY, "state=forged&code=good").await;
+    let (status, _, body) = oauth_callback(&app, connection, "state=forged&code=good").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(as_json(&body)["error"]["code"], "invalid_state");
-    let (status, _, body) = callback("pilot-1", &format!("state={state}&code=good")).await;
+    // The state belongs to this connection only.
+    let elsewhere = start_connect(&app, &second, "elsewhere.test-store.example").await;
+    let (status, _, body) =
+        oauth_callback(&app, elsewhere, &format!("state={state}&code=good")).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(as_json(&body)["error"]["code"], "invalid_state");
 
-    let (status, _, body) = callback(APP_KEY, &format!("state={state}&code=good")).await;
+    let (status, _, body) =
+        oauth_callback(&app, connection, &format!("state={state}&code=good")).await;
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
     let done = as_json(&body);
     assert_eq!(done["connection"]["status"], "connected");
-    assert_eq!(done["connection"]["app_key"], APP_KEY);
+    assert_eq!(done["connection"]["missing_scopes"], json!([]));
     assert_eq!(
         done["connection"]["scopes"],
         json!(["read_products", "write_orders"])
     );
-    let (status, _, _) = callback(APP_KEY, &format!("state={state}&code=good")).await;
+    assert_eq!(done["connection"]["credentials_saved"], true);
+    let (status, _, _) =
+        oauth_callback(&app, connection, &format!("state={state}&code=good")).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "the state is single use");
 
-    // The same seller cannot connect it twice; a second seller can ask, and
-    // the install is then refused because the store is taken.
+    // The framework exposes the registration hook: the provider was asked to
+    // subscribe the store's webhooks to this connection's own URL.
+    assert_eq!(
+        store.webhook_registrations.lock().expect("lock").clone(),
+        vec![format!(
+            "https://service.test/v1/connectors/shopify/c/{connection}/webhooks"
+        )]
+    );
+
+    // A launch from the app after install goes to the Shop, not to authorize.
+    let (status, location, body) = launch(&app, connection, SHOP, TEST_APP_SECRET).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(location.is_none());
+    assert_eq!(body["kind"], "connector_connected");
+
+    // The store is taken: the same seller cannot start it again, and another
+    // seller's install of it is refused.
     let (status, again) = api(
         &app,
         "POST",
@@ -450,60 +731,124 @@ async fn the_shopify_launch_and_callback_follow_the_fixed_routes(pool: PgPool) {
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{again}");
     assert_eq!(again["error"]["code"], "already_connected");
-    start_connect(&app, &second, SHOP).await;
-    let (status, location, _) = launch(&app, APP_KEY, SHOP, TEST_APP_SECRET).await;
-    assert_eq!(status, StatusCode::SEE_OTHER);
-    let state = query_param(&location.expect("redirect"), "state");
-    let (status, _, body) = callback(APP_KEY, &format!("state={state}&code=good")).await;
+    let rival = start_connect(&app, &second, SHOP).await;
+    save_credentials(&app, &second, rival, "rival-client", "rival-secret").await;
+    let (_, location, _) = launch(&app, rival, SHOP, "rival-secret").await;
+    let state = query_param(&location.expect("authorize"), "state");
+    let (status, _, body) = oauth_callback(&app, rival, &format!("state={state}&code=good")).await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(as_json(&body)["error"]["code"], "shop_in_use");
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn two_sellers_pending_for_one_store_make_the_launch_ambiguous(pool: PgPool) {
+async fn a_grant_missing_a_required_scope_needs_attention_with_the_missing_names(pool: PgPool) {
     let (app, _store) = connector_app(pool).await;
-    let first = new_actor(&app).await;
-    let second = new_actor(&app).await;
-    start_connect(&app, &first, SHOP).await;
-    start_connect(&app, &second, SHOP).await;
-    let (status, _, body) = launch(&app, APP_KEY, SHOP, TEST_APP_SECRET).await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert_eq!(body["error"]["code"], "ambiguous_connect");
+    let seller = new_actor(&app).await;
+    let connection = start_connect(&app, &seller, SHOP).await;
+    save_credentials(&app, &seller, connection, TEST_CLIENT_ID, TEST_APP_SECRET).await;
+    let (_, location, _) = launch(&app, connection, SHOP, TEST_APP_SECRET).await;
+    let state = query_param(&location.expect("authorize"), "state");
+    let (status, _, body) = oauth_callback(
+        &app,
+        connection,
+        &format!("state={state}&code=good&granted=read_products"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let view = as_json(&body);
+    assert_eq!(view["connection"]["status"], "needs_attention");
     assert_eq!(
-        common::count(
-            &app.pool,
-            "SELECT COUNT(*) FROM connector_connections WHERE app_key IS NOT NULL"
-        )
-        .await,
-        0,
-        "nothing was bound"
+        view["connection"]["missing_scopes"],
+        json!(["write_orders"])
     );
+    assert_eq!(view["connection"]["scopes"], json!(["read_products"]));
+
+    let (_, list) = api(
+        &app,
+        "GET",
+        "/v1/connectors",
+        Some(&seller.token),
+        &json!(null),
+    )
+    .await;
+    assert_eq!(list["connections"][0]["status"], "needs_attention");
+    assert_eq!(
+        list["connections"][0]["missing_scopes"],
+        json!(["write_orders"])
+    );
+
+    // The merchant adds the scope in Shopify and installs again: the launch
+    // runs the grant once more and the connection is whole.
+    let (status, location, _) = launch(&app, connection, SHOP, TEST_APP_SECRET).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let state = query_param(&location.expect("authorize"), "state");
+    let (status, _, body) =
+        oauth_callback(&app, connection, &format!("state={state}&code=good")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(as_json(&body)["connection"]["status"], "connected");
+    assert_eq!(as_json(&body)["connection"]["missing_scopes"], json!([]));
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_failed_webhook_registration_leaves_the_connection_needing_attention(pool: PgPool) {
+    let (app, store) = connector_app(pool).await;
+    store
+        .fail_webhook_registration
+        .store(true, Ordering::SeqCst);
+    let seller = new_actor(&app).await;
+    let connection = connect_shop(&app, &seller, SHOP).await;
+    let (_, list) = api(
+        &app,
+        "GET",
+        "/v1/connectors",
+        Some(&seller.token),
+        &json!(null),
+    )
+    .await;
+    assert_eq!(list["connections"][0]["status"], "needs_attention");
+    assert_eq!(list["connections"][0]["missing_scopes"], json!([]));
+    assert_eq!(
+        list["connections"][0]["last_error"]["message"],
+        "webhook_registration_failed"
+    );
+    assert!(store.webhook_registrations.lock().expect("lock").is_empty());
+    // The install itself stands: the credential is stored and pushes can go.
+    assert_eq!(
+        common::count(&app.pool, "SELECT COUNT(*) FROM connector_credentials").await,
+        1
+    );
+
+    store
+        .fail_webhook_registration
+        .store(false, Ordering::SeqCst);
+    let (_, location, _) = launch(&app, connection, SHOP, TEST_APP_SECRET).await;
+    let state = query_param(&location.expect("authorize"), "state");
+    let (status, _, body) =
+        oauth_callback(&app, connection, &format!("state={state}&code=good")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(as_json(&body)["connection"]["status"], "connected");
+    assert_eq!(store.webhook_registrations.lock().expect("lock").len(), 1);
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn browser_steps_return_to_the_shop_when_a_return_url_is_configured(pool: PgPool) {
     let (app, _store) = connector_app_with(pool, test_keys(), settings_with_return_url()).await;
     let seller = new_actor(&app).await;
-
-    let (status, location, _) = launch(&app, APP_KEY, SHOP, TEST_APP_SECRET).await;
-    assert_eq!(status, StatusCode::SEE_OTHER);
-    let location = location.expect("redirect to the Shop");
-    assert!(location.starts_with("https://shop.test/settings/connections?"));
-    assert_eq!(query_param(&location, "status"), "install_unclaimed");
-    assert_eq!(query_param(&location, "domain"), SHOP);
-    assert_eq!(query_param(&location, "provider"), "shopify");
-
     let connection = start_connect(&app, &seller, SHOP).await;
-    let (_, location, _) = launch(&app, APP_KEY, SHOP, TEST_APP_SECRET).await;
+
+    let (status, location, _) = launch(&app, connection, SHOP, TEST_APP_SECRET).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let back = location.expect("redirect to the Shop");
+    assert!(back.starts_with("https://shop.test/settings/connections?"));
+    assert_eq!(query_param(&back, "status"), "error");
+    assert_eq!(query_param(&back, "code"), "credentials_missing");
+    assert_eq!(query_param(&back, "connector"), connection.to_string());
+
+    save_credentials(&app, &seller, connection, TEST_CLIENT_ID, TEST_APP_SECRET).await;
+    let (_, location, _) = launch(&app, connection, SHOP, TEST_APP_SECRET).await;
     let state = query_param(&location.expect("authorize"), "state");
-    let (status, headers, _) = raw(
-        app.router.clone(),
-        "GET",
-        &format!("/v1/connectors/shopify/apps/{APP_KEY}/oauth/callback?state={state}&code=good"),
-        &[],
-        Vec::new(),
-    )
-    .await;
+    let (status, headers, _) =
+        oauth_callback(&app, connection, &format!("state={state}&code=good")).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     let back = headers
         .get("location")
@@ -513,14 +858,15 @@ async fn browser_steps_return_to_the_shop_when_a_return_url_is_configured(pool: 
     assert_eq!(query_param(&back, "status"), "connected");
     assert_eq!(query_param(&back, "connector"), connection.to_string());
 
-    let (_, headers, _) = raw(
-        app.router.clone(),
-        "GET",
-        &format!("/v1/connectors/shopify/apps/{APP_KEY}/oauth/callback?state=forged&code=good"),
-        &[],
-        Vec::new(),
-    )
-    .await;
+    // An app opened after install returns to the Shop too.
+    let (status, location, _) = launch(&app, connection, SHOP, TEST_APP_SECRET).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        query_param(&location.expect("redirect"), "status"),
+        "connected"
+    );
+
+    let (_, headers, _) = oauth_callback(&app, connection, "state=forged&code=good").await;
     let failed = headers
         .get("location")
         .and_then(|value| value.to_str().ok())
@@ -531,10 +877,10 @@ async fn browser_steps_return_to_the_shop_when_a_return_url_is_configured(pool: 
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn woocommerce_connects_through_its_own_callback_and_signs_with_a_store_secret(pool: PgPool) {
+async fn woocommerce_uses_the_same_draft_connection_and_signs_with_a_store_secret(pool: PgPool) {
     let (app, stores) = connector_app_full(pool, test_keys(), test_settings()).await;
     let seller = new_actor(&app).await;
-    let woo_shop = "https://shop.example.test".replace("https://", "");
+    let woo_shop = "shop.example.test";
     let (status, started) = api(
         &app,
         "POST",
@@ -544,6 +890,17 @@ async fn woocommerce_connects_through_its_own_callback_and_signs_with_a_store_se
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{started}");
+    assert_eq!(started["connection"]["status"], "draft");
+    assert_eq!(started["connection"]["app_kind"], "none");
+    assert_eq!(
+        started["connection"]["urls"]["oauth_callback"],
+        "https://service.test/v1/connectors/woocommerce/oauth/callback"
+    );
+    assert_eq!(
+        started["connection"]["urls"]["webhooks"],
+        "https://service.test/v1/connectors/webhooks/woocommerce"
+    );
+    assert!(started["connection"]["urls"].get("launch").is_none());
     let authorize = started["authorize_url"].as_str().expect("wc-auth url");
     assert!(authorize.contains("/wc-auth/v1/authorize"));
     assert_eq!(
@@ -557,7 +914,6 @@ async fn woocommerce_connects_through_its_own_callback_and_signs_with_a_store_se
         .parse()
         .expect("uuid");
 
-    // Keys posted with a forged nonce are refused; the real nonce connects.
     let post = |user_id: String| {
         let router = app.router.clone();
         async move {
@@ -581,7 +937,15 @@ async fn woocommerce_connects_through_its_own_callback_and_signs_with_a_store_se
     let (status, _, body) = post(nonce.clone()).await;
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
     assert_eq!(as_json(&body)["connection"]["status"], "connected");
-    assert_eq!(as_json(&body)["connection"]["app_key"], Value::Null);
+    assert_eq!(
+        stores
+            .woocommerce
+            .webhook_registrations
+            .lock()
+            .expect("lock")
+            .clone(),
+        vec!["https://service.test/v1/connectors/webhooks/woocommerce".to_string()]
+    );
     let (status, _, _) = post(nonce).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "the nonce is single use");
     assert!(stores
@@ -591,7 +955,6 @@ async fn woocommerce_connects_through_its_own_callback_and_signs_with_a_store_se
         .expect("app lock")
         .is_none());
 
-    // Webhooks have no app key and are signed with the store's own secret.
     let body = serde_json::to_vec(
         &json!({ "type": "stock", "product": "p", "variant": "", "available": 3 }),
     )
@@ -599,7 +962,7 @@ async fn woocommerce_connects_through_its_own_callback_and_signs_with_a_store_se
     let (status, accepted) = post_signed(
         &app,
         "/v1/connectors/webhooks/woocommerce",
-        &woo_shop,
+        woo_shop,
         "woo-evt-1",
         "product.updated",
         body.clone(),
@@ -611,7 +974,7 @@ async fn woocommerce_connects_through_its_own_callback_and_signs_with_a_store_se
     let (status, _) = post_signed(
         &app,
         "/v1/connectors/webhooks/woocommerce",
-        &woo_shop,
+        woo_shop,
         "woo-evt-2",
         "product.updated",
         body,
@@ -627,6 +990,20 @@ async fn woocommerce_connects_through_its_own_callback_and_signs_with_a_store_se
     .await
     .expect("inbound row");
     assert_eq!(stored, "woocommerce");
+}
+
+#[test]
+fn the_public_app_is_a_reserved_slot_with_no_implementation() {
+    assert_eq!(AppKind::parse("public"), Some(AppKind::Public));
+    assert_eq!(AppKind::Public.as_str(), "public");
+    assert_eq!(
+        connectors::config::ENV_SHOPIFY_PUBLIC_APP_CLIENT_ID,
+        "SHOPIFY_PUBLIC_APP_CLIENT_ID"
+    );
+    assert_eq!(
+        connectors::config::ENV_SHOPIFY_PUBLIC_APP_CLIENT_SECRET,
+        "SHOPIFY_PUBLIC_APP_CLIENT_SECRET"
+    );
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
@@ -1025,9 +1402,9 @@ async fn the_credential_is_sealed_never_returned_and_deleted_on_disconnect(pool:
         .expect("the owner's credential opens");
     assert!(String::from_utf8_lossy(context.credentials.expose()).contains(TEST_TOKEN));
     assert_eq!(
-        context.app.as_ref().map(|app| app.app_key.as_str()),
-        Some(APP_KEY),
-        "the connection's app rides with the credential"
+        context.app.as_ref().map(|app| app.client_id.as_str()),
+        Some(TEST_CLIENT_ID),
+        "the connection's own app rides with the credential"
     );
     assert_eq!(
         format!("{:?}", context.credentials),
@@ -1061,6 +1438,18 @@ async fn the_credential_is_sealed_never_returned_and_deleted_on_disconnect(pool:
             "{table}"
         );
     }
+    assert_eq!(
+        common::count(
+            &app.pool,
+            &format!(
+                "SELECT COUNT(*) FROM connector_app_credentials \
+                 WHERE connection_id = '{connection}' AND retain_until IS NOT NULL"
+            )
+        )
+        .await,
+        1,
+        "the app secret is retained for the privacy webhooks, with an end date"
+    );
     let (status, _) = api(&app, "DELETE", &base, Some(&seller.token), &json!(null)).await;
     assert_eq!(
         status,
@@ -1209,14 +1598,14 @@ async fn rotating_the_credential_key_reseals_credentials_and_recipient_keys(pool
         connectors::assert_credentials_coherent(&pool, Some(&rotated))
             .await
             .expect("probe"),
-        2,
-        "a credential and a recipient key"
+        3,
+        "a credential, an app credential and a recipient key"
     );
 
     let progress = connectors::reseal_previous_key(&pool, &rotated, app.state.clock.now())
         .await
         .expect("reseal");
-    assert_eq!(progress.resealed, 2);
+    assert_eq!(progress.resealed, 3);
     assert_eq!(progress.remaining_under_previous, 0);
     let again = connectors::reseal_previous_key(&pool, &rotated, app.state.clock.now())
         .await
@@ -1260,9 +1649,13 @@ async fn the_boot_probe_refuses_a_missing_or_wrong_key(pool: PgPool) {
         connectors::assert_credentials_coherent(&pool, Some(&right))
             .await
             .expect("probe"),
-        2
+        3
     );
-    for table in ["connector_credentials", "connector_recipient_keys"] {
+    for table in [
+        "connector_credentials",
+        "connector_app_credentials",
+        "connector_recipient_keys",
+    ] {
         sqlx::query(&format!("DELETE FROM {table}"))
             .execute(&pool)
             .await

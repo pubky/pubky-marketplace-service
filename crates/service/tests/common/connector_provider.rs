@@ -9,8 +9,9 @@
 //! a test hold a push open mid-flight to interleave a second worker.
 //!
 //! Two kinds are registered, shaped like the real ones:
-//! * the Shopify-kind provider installs from the store (launch, then OAuth
-//!   callback) and signs webhooks with the app's client secret;
+//! * the Shopify-kind provider installs through a merchant's own custom app
+//!   (launch, then OAuth callback) and signs webhooks with that connection's
+//!   app client secret;
 //! * the WooCommerce-kind provider sends the merchant to the store with the
 //!   pending-connect nonce as `user_id`, is called back with a POST, and
 //!   signs webhooks with a per-store secret held in the credential.
@@ -18,11 +19,12 @@
 //! Wire formats of the fake store:
 //! * credential blob: JSON `{"token": ..., "webhook_secret": ...}`;
 //! * launch: query `shop`, `hmac` = hex HMAC-SHA256 of `shop=<shop>` under
-//!   the app's client secret;
+//!   the connection's app client secret;
 //! * webhook headers `x-test-shop`, `x-test-event-id`, `x-test-topic`, and
 //!   `x-test-signature` = hex HMAC-SHA256 of the raw body;
-//! * callback: query `state` and `code` (`good` completes the connection), or
-//!   a JSON body `{"user_id": <nonce>, "consumer_key": ...}`.
+//! * callback: query `state` and `code` (`good` completes the connection;
+//!   `granted=a,b` narrows the scopes the grant reports), or a JSON body
+//!   `{"user_id": <nonce>, "consumer_key": ...}`.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -33,7 +35,7 @@ use async_trait::async_trait;
 use hmac::{Hmac, Mac};
 use marketplace_service::connectors::keys::ConnectorKeys;
 use marketplace_service::connectors::provider::*;
-use marketplace_service::connectors::{AppRegistry, ConnectorRuntime, ConnectorSettings};
+use marketplace_service::connectors::{ConnectorRuntime, ConnectorSettings};
 use marketplace_service::http::build_router;
 use serde_json::{json, Value};
 use sha2::Sha256;
@@ -45,12 +47,12 @@ use super::{TestActor, TestApp};
 
 pub const TEST_TOKEN: &str = "shpat_test_credential_value_0123456789";
 pub const TEST_WEBHOOK_SECRET: &str = "whsec_test_webhook_secret_value";
+pub const TEST_CLIENT_ID: &str = "client-id-of-the-merchants-own-app";
 pub const TEST_APP_SECRET: &str = "shpss_test_app_client_secret_value";
 pub const CONNECTOR_KEY: &str = "5555555555555555555555555555555555555555555555555555555555555555";
 pub const CONNECTOR_PREVIOUS_KEY: &str =
     "6666666666666666666666666666666666666666666666666666666666666666";
 pub const SHOP: &str = "dezentral.test-store.example";
-pub const APP_KEY: &str = "john";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteOrder {
@@ -95,7 +97,10 @@ pub struct TestStore {
     pub cancel_unknown_once: AtomicBool,
     pub last_order_push: Mutex<Option<OrderPush>>,
     pub last_refund: Mutex<Option<RefundRecord>>,
+    /// The client id of the app the last provider call carried.
     pub last_app: Mutex<Option<String>>,
+    pub webhook_registrations: Mutex<Vec<String>>,
+    pub fail_webhook_registration: AtomicBool,
 }
 
 impl TestStore {
@@ -216,6 +221,20 @@ impl ConnectorProvider for TestProvider {
         }
     }
 
+    fn app_kind(&self) -> AppKind {
+        match self.kind {
+            ProviderKind::Shopify => AppKind::Custom,
+            ProviderKind::Woocommerce => AppKind::None,
+        }
+    }
+
+    fn required_scopes(&self) -> Vec<String> {
+        match self.kind {
+            ProviderKind::Shopify => vec!["read_products".into(), "write_orders".into()],
+            ProviderKind::Woocommerce => vec!["read_write".into()],
+        }
+    }
+
     async fn connect(&self, request: &ConnectRequest) -> Result<ConnectStart, ProviderError> {
         Ok(ConnectStart {
             authorize_url: (self.kind == ProviderKind::Woocommerce).then(|| {
@@ -250,7 +269,7 @@ impl ConnectorProvider for TestProvider {
     }
 
     fn authorize_url(&self, request: &AuthorizeRequest) -> Result<String, ProviderError> {
-        *self.store.last_app.lock().expect("app lock") = Some(request.app.app_key.clone());
+        *self.store.last_app.lock().expect("app lock") = Some(request.app.client_id.clone());
         Ok(format!(
             "https://{}/admin/oauth/authorize?client_id={}&state={}&redirect_uri={}",
             request.shop, request.app.client_id, request.state, request.callback_url
@@ -286,7 +305,15 @@ impl ConnectorProvider for TestProvider {
             });
         }
         *self.store.last_app.lock().expect("app lock") =
-            request.app.as_ref().map(|app| app.app_key.clone());
+            request.app.as_ref().map(|app| app.client_id.clone());
+        let scopes = match request.callback.query.get("granted") {
+            Some(granted) => granted
+                .split(',')
+                .filter(|scope| !scope.is_empty())
+                .map(str::to_string)
+                .collect(),
+            None => self.required_scopes(),
+        };
         Ok(ConnectCompleted {
             credentials: CredentialSecret::new(
                 serde_json::to_vec(&json!({
@@ -295,8 +322,25 @@ impl ConnectorProvider for TestProvider {
                 }))
                 .expect("blob serializes"),
             ),
-            scopes: vec!["read_products".into(), "write_orders".into()],
+            scopes,
         })
+    }
+
+    async fn register_webhooks(
+        &self,
+        connection: &ConnectionContext,
+        webhook_url: &str,
+    ) -> Result<(), ProviderError> {
+        blob(connection)?;
+        if self.store.fail_webhook_registration.load(Ordering::SeqCst) {
+            return Err(ProviderError::Unknown("registration timed out".into()));
+        }
+        self.store
+            .webhook_registrations
+            .lock()
+            .expect("registrations lock")
+            .push(webhook_url.to_string());
+        Ok(())
     }
 
     async fn disconnect(&self, _connection: &ConnectionContext) -> Result<(), ProviderError> {
@@ -331,7 +375,7 @@ impl ConnectorProvider for TestProvider {
         self.store.push_calls.fetch_add(1, Ordering::SeqCst);
         *self.store.last_order_push.lock().expect("push lock") = Some(order.clone());
         *self.store.last_app.lock().expect("app lock") =
-            connection.app.as_ref().map(|app| app.app_key.clone());
+            connection.app.as_ref().map(|app| app.client_id.clone());
         blob(connection)?;
         let gate = self.store.gate.lock().expect("gate lock").clone();
         if let Some(gate) = gate {
@@ -527,29 +571,14 @@ pub fn test_settings() -> ConnectorSettings {
     settings
 }
 
-pub fn test_apps() -> AppRegistry {
-    AppRegistry::new()
-        .with(
-            ProviderKind::Shopify,
-            APP_KEY,
-            "client-john",
-            TEST_APP_SECRET,
-        )
-        .with(
-            ProviderKind::Shopify,
-            "pilot-1",
-            "client-pilot",
-            "pilot-secret",
-        )
-}
-
 pub struct Stores {
     pub shopify: Arc<TestStore>,
     pub woocommerce: Arc<TestStore>,
 }
 
-/// The app with connectors enabled, a Shopify-kind test provider and two
-/// configured Shopify apps (`john`, `pilot-1`).
+/// The app with connectors enabled and a Shopify-kind test provider (and a
+/// WooCommerce-kind one). No app is configured in the environment: a
+/// Shopify connection brings its own client id and secret.
 pub async fn connector_app(pool: PgPool) -> (TestApp, Arc<TestStore>) {
     connector_app_with(pool, test_keys(), test_settings()).await
 }
@@ -575,14 +604,11 @@ pub async fn connector_app_full(
         shopify: shopify.store.clone(),
         woocommerce: woocommerce.store.clone(),
     };
-    let runtime = Arc::new(
-        ConnectorRuntime::new(
-            keys,
-            ProviderRegistry::new().with(shopify).with(woocommerce),
-            settings,
-        )
-        .with_apps(test_apps()),
-    );
+    let runtime = Arc::new(ConnectorRuntime::new(
+        keys,
+        ProviderRegistry::new().with(shopify).with(woocommerce),
+        settings,
+    ));
     let base = super::test_app(pool).await;
     let state = base.state.clone().with_connectors(Some(runtime));
     (rebuild(base, state), stores)
@@ -661,7 +687,7 @@ pub fn query_param(url: &str, name: &str) -> String {
         .unwrap_or_else(|| panic!("{name} in {url}"))
 }
 
-/// The seller asks to connect `shop`. Returns the pending connection id.
+/// The seller starts connecting `shop`: the draft connection.
 pub async fn start_connect(app: &TestApp, seller: &TestActor, shop: &str) -> Uuid {
     let (status, body) = api(
         app,
@@ -672,7 +698,7 @@ pub async fn start_connect(app: &TestApp, seller: &TestActor, shop: &str) -> Uui
     )
     .await;
     assert_eq!(status, axum::http::StatusCode::CREATED, "connect: {body}");
-    assert_eq!(body["connection"]["status"], "pending");
+    assert_eq!(body["connection"]["status"], "draft");
     body["connection"]["id"]
         .as_str()
         .expect("connection id")
@@ -680,11 +706,29 @@ pub async fn start_connect(app: &TestApp, seller: &TestActor, shop: &str) -> Uui
         .expect("uuid")
 }
 
-/// The store's launch to the app's App URL. Returns the status and the
+/// Saves the merchant's app credentials on a connection.
+pub async fn save_credentials(
+    app: &TestApp,
+    seller: &TestActor,
+    connection: Uuid,
+    client_id: &str,
+    client_secret: &str,
+) -> (axum::http::StatusCode, Value) {
+    api(
+        app,
+        "PUT",
+        &format!("/v1/connectors/{connection}/credentials"),
+        Some(&seller.token),
+        &json!({ "client_id": client_id, "client_secret": client_secret }),
+    )
+    .await
+}
+
+/// The store's launch to a connection's App URL. Returns the status and the
 /// `Location` it redirected to, if any.
 pub async fn launch(
     app: &TestApp,
-    app_key: &str,
+    connection: Uuid,
     shop: &str,
     secret: &str,
 ) -> (axum::http::StatusCode, Option<String>, Value) {
@@ -692,7 +736,7 @@ pub async fn launch(
         app.router.clone(),
         "GET",
         &format!(
-            "/v1/connectors/shopify/apps/{app_key}/launch?{}",
+            "/v1/connectors/shopify/c/{connection}/launch?{}",
             launch_query(shop, secret)
         ),
         &[],
@@ -706,21 +750,42 @@ pub async fn launch(
     (status, location, as_json(&body))
 }
 
-/// The full Shopify install: the seller's connect request, the store's
-/// launch, and the OAuth callback with the good code.
-pub async fn connect_shop(app: &TestApp, seller: &TestActor, shop: &str) -> Uuid {
-    let id = start_connect(app, seller, shop).await;
-    let (status, location, body) = launch(app, APP_KEY, shop, TEST_APP_SECRET).await;
-    assert_eq!(status, axum::http::StatusCode::SEE_OTHER, "launch: {body}");
-    let state = query_param(&location.expect("launch redirects"), "state");
-    let (status, headers, bytes) = raw(
+pub async fn oauth_callback(
+    app: &TestApp,
+    connection: Uuid,
+    query: &str,
+) -> (axum::http::StatusCode, axum::http::HeaderMap, Vec<u8>) {
+    raw(
         app.router.clone(),
         "GET",
-        &format!("/v1/connectors/shopify/apps/{APP_KEY}/oauth/callback?state={state}&code=good"),
+        &format!("/v1/connectors/shopify/c/{connection}/oauth/callback?{query}"),
         &[],
         Vec::new(),
     )
-    .await;
+    .await
+}
+
+/// The full Shopify install with the default test app: the seller's connect
+/// request, the saved credentials, the store's launch and the OAuth callback.
+pub async fn connect_shop(app: &TestApp, seller: &TestActor, shop: &str) -> Uuid {
+    connect_shop_with(app, seller, shop, TEST_CLIENT_ID, TEST_APP_SECRET).await
+}
+
+pub async fn connect_shop_with(
+    app: &TestApp,
+    seller: &TestActor,
+    shop: &str,
+    client_id: &str,
+    client_secret: &str,
+) -> Uuid {
+    let id = start_connect(app, seller, shop).await;
+    let (status, body) = save_credentials(app, seller, id, client_id, client_secret).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "credentials: {body}");
+    let (status, location, body) = launch(app, id, shop, client_secret).await;
+    assert_eq!(status, axum::http::StatusCode::SEE_OTHER, "launch: {body}");
+    let state = query_param(&location.expect("launch redirects"), "state");
+    let (status, headers, bytes) =
+        oauth_callback(app, id, &format!("state={state}&code=good")).await;
     assert_eq!(
         status,
         axum::http::StatusCode::OK,
@@ -755,7 +820,20 @@ pub async fn map_listing(
     assert_eq!(status, axum::http::StatusCode::OK, "map: {body}");
 }
 
-/// A Shopify-style webhook, signed with the first app's client secret.
+/// The newest Shopify connection recorded for a shop.
+pub async fn connection_for(app: &TestApp, shop: &str) -> Uuid {
+    sqlx::query_scalar(
+        "SELECT id FROM connector_connections WHERE provider = 'shopify' AND shop = $1 \
+         ORDER BY updated_at DESC LIMIT 1",
+    )
+    .bind(shop)
+    .fetch_one(&app.pool)
+    .await
+    .expect("a connection for the shop")
+}
+
+/// A Shopify-style webhook to the shop's connection URL, signed with the
+/// default test app's client secret.
 pub async fn webhook(
     app: &TestApp,
     shop: &str,
@@ -775,9 +853,10 @@ pub async fn signed_webhook(
     bytes: Vec<u8>,
     secret: &str,
 ) -> (axum::http::StatusCode, Value) {
+    let connection = connection_for(app, shop).await;
     post_signed(
         app,
-        &format!("/v1/connectors/webhooks/shopify/{APP_KEY}"),
+        &format!("/v1/connectors/shopify/c/{connection}/webhooks"),
         shop,
         event_id,
         topic,

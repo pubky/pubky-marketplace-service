@@ -138,6 +138,19 @@ async fn apply(
     }
 }
 
+fn order_listing_ids(seller: &str, lines: &serde_json::Value) -> Vec<String> {
+    lines
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|line| {
+            line.get("listing_aggregate_id")
+                .and_then(serde_json::Value::as_str)
+        })
+        .filter_map(|aggregate| super::order_push::pubky_listing_id(seller, aggregate))
+        .collect()
+}
+
 fn order_id_of(aggregate_id: &str) -> Option<Uuid> {
     aggregate_id
         .strip_prefix("order:")
@@ -149,21 +162,23 @@ async fn on_payment_confirmed(
     now: DateTime<Utc>,
     event: &EventRow,
 ) -> Result<u64, sqlx::Error> {
-    let order: Option<(Uuid, String)> = sqlx::query_as(
-        "SELECT o.id, o.seller_pubky FROM payments p JOIN orders o ON o.id = p.order_id \
+    let order: Option<(Uuid, String, serde_json::Value)> = sqlx::query_as(
+        "SELECT o.id, o.seller_pubky, o.lines FROM payments p JOIN orders o ON o.id = p.order_id \
          WHERE 'payment:' || p.id::text = $1",
     )
     .bind(&event.aggregate_id)
     .fetch_optional(&mut **tx)
     .await?;
-    let Some((order_id, seller)) = order else {
+    let Some((order_id, seller, lines)) = order else {
         return Ok(0);
     };
+    let listing_ids = order_listing_ids(&seller, &lines);
     // Only connections that were live when the payment confirmed: an order
     // paid before the seller connected is never pushed.
     let connections: Vec<ConnectionRow> = sqlx::query_as(&format!(
         "SELECT {} FROM connector_connections \
-         WHERE seller_pubky = $1 AND status = 'connected' AND connected_at <= $2",
+         WHERE seller_pubky = $1 AND status IN ('connected', 'needs_attention') \
+           AND connected_at <= $2",
         store::CONNECTION_COLUMNS
     ))
     .bind(&seller)
@@ -172,6 +187,20 @@ async fn on_payment_confirmed(
     .await?;
     let mut queued = 0;
     for connection in &connections {
+        // An order none of whose lines is mapped in this store is a Pubky-only
+        // sale: no ledger row, no alert. One with only some lines mapped is
+        // queued and quarantined at push time with an alert.
+        let mapped: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM connector_variant_map \
+             WHERE connection_id = $1 AND listing_id = ANY($2))",
+        )
+        .bind(connection.id)
+        .bind(&listing_ids)
+        .fetch_one(&mut **tx)
+        .await?;
+        if !mapped {
+            continue;
+        }
         if ledger::enqueue_push(&mut **tx, now, connection, order_id, Some(event.id)).await? {
             queued += 1;
         }

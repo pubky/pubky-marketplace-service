@@ -1,20 +1,22 @@
-//! Connections, sealed credentials and recipient keys, mappings, product
-//! selection and seller alerts.
+//! Connections, sealed credentials and recipient keys, a merchant's own app
+//! credentials, mappings, product selection and seller alerts.
 //!
 //! Every read that returns a connection to a caller filters by the owning
 //! seller in SQL, so another seller's connection id behaves exactly like an
-//! unknown id. The credential column is read in one place
-//! ([`open_connection`]) and its plaintext only ever reaches a provider call.
+//! unknown id. The credential columns are read in two places
+//! ([`open_connection`], [`open_app`]) and their plaintext only ever reaches a
+//! provider call.
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres};
 use uuid::Uuid;
 
 use super::config::MAX_CONNECTIONS_PER_SELLER;
-use super::keys::{credential_aad, recipient_key_aad, ConnectorKeys};
-use super::provider::{ConnectionContext, CredentialSecret, ProviderKind};
+use super::keys::{app_credential_aad, credential_aad, recipient_key_aad, ConnectorKeys};
+use super::provider::{AppContext, AppKind, ConnectionContext, CredentialSecret, ProviderKind};
 use super::recipient::NewRecipientKey;
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -23,10 +25,12 @@ pub struct ConnectionRow {
     pub seller_pubky: String,
     pub provider: String,
     pub shop: String,
-    pub app_key: Option<String>,
+    pub app_kind: String,
     pub status: String,
     pub scopes: Vec<String>,
+    pub missing_scopes: Vec<String>,
     pub connect_state_hash: Option<Vec<u8>>,
+    pub state_expires_at: Option<DateTime<Utc>>,
     pub connect_expires_at: Option<DateTime<Utc>>,
     pub connected_at: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
@@ -35,13 +39,27 @@ pub struct ConnectionRow {
     pub updated_at: DateTime<Utc>,
 }
 
-pub const CONNECTION_COLUMNS: &str = "id, seller_pubky, provider, shop, app_key, status, scopes, \
-     connect_state_hash, connect_expires_at, connected_at, last_error, last_error_at, \
-     created_at, updated_at";
+pub const CONNECTION_COLUMNS: &str = "id, seller_pubky, provider, shop, app_kind, status, scopes, \
+     missing_scopes, connect_state_hash, state_expires_at, connect_expires_at, connected_at, \
+     last_error, last_error_at, created_at, updated_at";
+
+/// The states in which a connection holds an access credential for the store.
+pub const LIVE_STATES: &str = "'connected', 'needs_attention', 'error'";
 
 impl ConnectionRow {
     pub fn provider_kind(&self) -> Option<ProviderKind> {
         ProviderKind::parse(&self.provider)
+    }
+
+    pub fn app_kind(&self) -> AppKind {
+        AppKind::parse(&self.app_kind).unwrap_or(AppKind::None)
+    }
+
+    pub fn is_live(&self) -> bool {
+        matches!(
+            self.status.as_str(),
+            "connected" | "needs_attention" | "error"
+        )
     }
 }
 
@@ -62,18 +80,24 @@ impl From<sqlx::Error> for ConnectError {
     }
 }
 
-/// Starts (or restarts) a pending connect for `(seller, provider, shop)`. A
-/// shop the seller disconnected, left pending, or whose credential the store
-/// rejected is reused; a live connection is refused.
+/// Creates the draft connection for `(seller, provider, shop)`, or returns
+/// the seller's existing one so the URLs already configured at the store keep
+/// working. An unexpired draft keeps whatever was saved on it and only has its
+/// expiry (and, for WooCommerce, its nonce) renewed. A connection the seller
+/// disconnected, that expired, or whose credential the store rejected starts
+/// a fresh draft on the same id; its store access secret is deleted, and its
+/// app credentials survive only when the pair is still usable. A connected
+/// store is refused. Expired drafts of the seller are deleted first, so they
+/// never count toward the limit.
 #[allow(clippy::too_many_arguments)]
-pub async fn begin_connect(
+pub async fn begin_draft(
     pool: &PgPool,
     now: DateTime<Utc>,
     seller_pubky: &str,
     provider: ProviderKind,
     shop: &str,
-    app_key: Option<&str>,
-    state_hash: &[u8],
+    app_kind: AppKind,
+    state_hash: Option<&[u8]>,
     expires_at: DateTime<Utc>,
 ) -> Result<ConnectionRow, ConnectError> {
     let mut tx = pool.begin().await?;
@@ -81,6 +105,14 @@ pub async fn begin_connect(
         .bind(seller_pubky)
         .execute(&mut *tx)
         .await?;
+    sqlx::query(
+        "DELETE FROM connector_connections \
+         WHERE seller_pubky = $1 AND status = 'draft' AND connect_expires_at <= $2",
+    )
+    .bind(seller_pubky)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
     let existing: Option<(Uuid, String)> = sqlx::query_as(
         "SELECT id, status FROM connector_connections \
          WHERE seller_pubky = $1 AND provider = $2 AND shop = $3 FOR UPDATE",
@@ -90,7 +122,8 @@ pub async fn begin_connect(
     .bind(shop)
     .fetch_optional(&mut *tx)
     .await?;
-    if matches!(&existing, Some((_, status)) if status == "connected") {
+    if matches!(&existing, Some((_, status)) if matches!(status.as_str(), "connected" | "needs_attention"))
+    {
         return Err(ConnectError::AlreadyConnected);
     }
     if existing.is_none() {
@@ -106,42 +139,52 @@ pub async fn begin_connect(
         }
     }
     let row: ConnectionRow = match existing {
-        Some((id, _)) => {
-            sqlx::query("DELETE FROM connector_credentials WHERE connection_id = $1")
+        Some((id, status)) => {
+            if status != "draft" {
+                sqlx::query("DELETE FROM connector_credentials WHERE connection_id = $1")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("DELETE FROM connector_recipient_keys WHERE connection_id = $1")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query(
+                    "UPDATE connector_app_credentials SET retain_until = NULL WHERE connection_id = $1",
+                )
                 .bind(id)
                 .execute(&mut *tx)
                 .await?;
-            sqlx::query("DELETE FROM connector_recipient_keys WHERE connection_id = $1")
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
+            }
             sqlx::query_as(&format!(
-                "UPDATE connector_connections SET status = 'pending', app_key = $5, \
-                 connect_state_hash = $2, connect_expires_at = $3, connected_at = NULL, \
-                 last_error = NULL, last_error_at = NULL, scopes = '{{}}', updated_at = $4 \
+                "UPDATE connector_connections SET status = 'draft', app_kind = $5, \
+                 connect_state_hash = $2, state_expires_at = CASE WHEN $2::bytea IS NULL THEN NULL ELSE $3 END, \
+                 connect_expires_at = $3, connected_at = NULL, last_error = NULL, \
+                 last_error_at = NULL, scopes = '{{}}', missing_scopes = '{{}}', updated_at = $4 \
                  WHERE id = $1 RETURNING {CONNECTION_COLUMNS}"
             ))
             .bind(id)
             .bind(state_hash)
             .bind(expires_at)
             .bind(now)
-            .bind(app_key)
+            .bind(app_kind.as_str())
             .fetch_one(&mut *tx)
             .await?
         }
         None => {
             sqlx::query_as(&format!(
                 "INSERT INTO connector_connections \
-                 (id, seller_pubky, provider, shop, app_key, status, connect_state_hash, \
-                  connect_expires_at, created_at, updated_at) \
-                 VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, $8, $8) \
+                 (id, seller_pubky, provider, shop, app_kind, status, connect_state_hash, \
+                  state_expires_at, connect_expires_at, created_at, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, 'draft', $6, \
+                         CASE WHEN $6::bytea IS NULL THEN NULL ELSE $7 END, $7, $8, $8) \
                  RETURNING {CONNECTION_COLUMNS}"
             ))
             .bind(Uuid::new_v4())
             .bind(seller_pubky)
             .bind(provider.as_str())
             .bind(shop)
-            .bind(app_key)
+            .bind(app_kind.as_str())
             .bind(state_hash)
             .bind(expires_at)
             .bind(now)
@@ -153,7 +196,7 @@ pub async fn begin_connect(
     Ok(row)
 }
 
-/// The pending connect a callback's state value names, if it has not
+/// The connection a callback's state value names, if the state has not
 /// expired. The state is single use: [`complete_connect`] clears it.
 pub async fn pending_by_state(
     pool: &PgPool,
@@ -163,8 +206,8 @@ pub async fn pending_by_state(
 ) -> Result<Option<ConnectionRow>, sqlx::Error> {
     sqlx::query_as(&format!(
         "SELECT {CONNECTION_COLUMNS} FROM connector_connections \
-         WHERE connect_state_hash = $1 AND provider = $2 AND status = 'pending' \
-           AND connect_expires_at > $3"
+         WHERE connect_state_hash = $1 AND provider = $2 \
+           AND status IN ('draft', 'needs_attention', 'error') AND state_expires_at > $3"
     ))
     .bind(hash_state(state))
     .bind(provider.as_str())
@@ -173,44 +216,26 @@ pub async fn pending_by_state(
     .await
 }
 
-/// Unexpired pending connects for a store, newest first. A store's launch
-/// matches exactly one; more than one is ambiguous and refused.
-pub async fn pending_for_shop(
-    pool: &PgPool,
-    provider: ProviderKind,
-    shop: &str,
-    now: DateTime<Utc>,
-) -> Result<Vec<ConnectionRow>, sqlx::Error> {
-    sqlx::query_as(&format!(
-        "SELECT {CONNECTION_COLUMNS} FROM connector_connections \
-         WHERE provider = $1 AND shop = $2 AND status = 'pending' AND connect_expires_at > $3 \
-         ORDER BY created_at DESC, id"
-    ))
-    .bind(provider.as_str())
-    .bind(shop)
-    .bind(now)
-    .fetch_all(pool)
-    .await
-}
-
-/// A verified launch binds the pending connect to the app that was
-/// installed and replaces its single-use state with the one sent to the
-/// store. The expiry stays what it was when the seller asked.
+/// A verified launch replaces the connection's single-use state with the one
+/// sent to the store. Only a live draft, or a connection that needs another
+/// install, accepts one.
 pub async fn bind_launch(
     pool: &PgPool,
     id: Uuid,
-    app_key: &str,
     state_hash: &[u8],
+    state_expires_at: DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> Result<Option<ConnectionRow>, sqlx::Error> {
     sqlx::query_as(&format!(
-        "UPDATE connector_connections SET app_key = $2, connect_state_hash = $3, updated_at = $4 \
-         WHERE id = $1 AND status = 'pending' AND connect_expires_at > $4 \
+        "UPDATE connector_connections SET connect_state_hash = $2, state_expires_at = $3, \
+         updated_at = $4 \
+         WHERE id = $1 AND ((status = 'draft' AND connect_expires_at > $4) \
+                            OR status IN ('needs_attention', 'error')) \
          RETURNING {CONNECTION_COLUMNS}"
     ))
     .bind(id)
-    .bind(app_key)
     .bind(state_hash)
+    .bind(state_expires_at)
     .bind(now)
     .fetch_optional(pool)
     .await
@@ -231,8 +256,10 @@ impl From<sqlx::Error> for CompleteError {
     }
 }
 
-/// Seals the credential, stores a new recipient key and marks the connection
-/// connected, in one transaction that also consumes the state value.
+/// Seals the store credential, stores a new recipient key and marks the
+/// connection `connected` (or `needs_attention` with `missing_scopes`), in one
+/// transaction that also consumes the state value.
+#[allow(clippy::too_many_arguments)]
 pub async fn complete_connect(
     pool: &PgPool,
     keys: &ConnectorKeys,
@@ -240,6 +267,7 @@ pub async fn complete_connect(
     pending: &ConnectionRow,
     secret: &CredentialSecret,
     scopes: &[String],
+    missing_scopes: &[String],
     recipient: &NewRecipientKey,
 ) -> Result<ConnectionRow, CompleteError> {
     let aad = credential_aad(&pending.seller_pubky, &pending.provider, &pending.shop);
@@ -251,18 +279,26 @@ pub async fn complete_connect(
         &recipient.key_id,
     );
     let sealed_secret = keys.seal(&key_aad, recipient.secret());
+    let status = if missing_scopes.is_empty() {
+        "connected"
+    } else {
+        "needs_attention"
+    };
     let mut tx = pool.begin().await?;
     let claimed = sqlx::query_as::<_, ConnectionRow>(&format!(
-        "UPDATE connector_connections SET status = 'connected', connect_state_hash = NULL, \
-         connect_expires_at = NULL, scopes = $3, connected_at = $4, last_error = NULL, \
-         last_error_at = NULL, updated_at = $4 \
-         WHERE id = $1 AND status = 'pending' AND connect_state_hash = $2 \
+        "UPDATE connector_connections SET status = $5, connect_state_hash = NULL, \
+         state_expires_at = NULL, connect_expires_at = NULL, scopes = $3, missing_scopes = $6, \
+         connected_at = $4, last_error = NULL, last_error_at = NULL, updated_at = $4 \
+         WHERE id = $1 AND status IN ('draft', 'needs_attention', 'error') \
+           AND connect_state_hash = $2 AND (status <> 'draft' OR connect_expires_at > $4) \
          RETURNING {CONNECTION_COLUMNS}"
     ))
     .bind(pending.id)
     .bind(pending.connect_state_hash.as_deref())
     .bind(scopes)
     .bind(now)
+    .bind(status)
+    .bind(missing_scopes)
     .fetch_optional(&mut *tx)
     .await;
     let claimed = match claimed {
@@ -305,6 +341,178 @@ pub async fn complete_connect(
     Ok(connected)
 }
 
+/// The install completed but something still needs the seller (a webhook
+/// subscription that could not be registered).
+pub async fn set_attention(
+    pool: &PgPool,
+    id: Uuid,
+    message: &str,
+    now: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE connector_connections SET status = 'needs_attention', last_error = $2, \
+         last_error_at = $3, updated_at = $3 WHERE id = $1 AND status IN ('connected', 'needs_attention')",
+    )
+    .bind(id)
+    .bind(truncate(message, 500))
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+// === A merchant's own app credentials ========================================
+
+#[derive(Debug)]
+pub enum SaveAppError {
+    /// The connection is not one that takes a merchant's app credentials, or
+    /// it is gone, expired or disconnected.
+    NotAvailable,
+    Database(sqlx::Error),
+}
+
+impl From<sqlx::Error> for SaveAppError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Database(error)
+    }
+}
+
+/// Seals the merchant's client id and secret for this connection, replacing
+/// any pair already saved. Allowed on an unexpired draft and on a live
+/// connection ("replace credentials").
+pub async fn save_app_credentials(
+    pool: &PgPool,
+    keys: &ConnectorKeys,
+    now: DateTime<Utc>,
+    connection: &ConnectionRow,
+    client_id: &str,
+    client_secret: &str,
+) -> Result<(), SaveAppError> {
+    let plaintext = serde_json::to_vec(&json!({
+        "client_id": client_id,
+        "client_secret": client_secret,
+    }))
+    .expect("app credentials serialize");
+    let aad = app_credential_aad(
+        &connection.seller_pubky,
+        &connection.provider,
+        &connection.shop,
+        &connection.id,
+    );
+    let sealed = keys.seal(&aad, &plaintext);
+    let mut tx = pool.begin().await?;
+    let usable: Option<(String, String)> = sqlx::query_as(
+        "SELECT status, app_kind FROM connector_connections \
+         WHERE id = $1 AND seller_pubky = $2 \
+           AND (status <> 'draft' OR connect_expires_at > $3) FOR UPDATE",
+    )
+    .bind(connection.id)
+    .bind(&connection.seller_pubky)
+    .bind(now)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((status, app_kind)) = usable else {
+        return Err(SaveAppError::NotAvailable);
+    };
+    if status == "disconnected" || app_kind != AppKind::Custom.as_str() {
+        return Err(SaveAppError::NotAvailable);
+    }
+    sqlx::query(
+        "INSERT INTO connector_app_credentials (connection_id, sealed, retain_until, created_at, updated_at) \
+         VALUES ($1, $2, NULL, $3, $3) \
+         ON CONFLICT (connection_id) DO UPDATE SET sealed = EXCLUDED.sealed, retain_until = NULL, \
+             updated_at = EXCLUDED.updated_at",
+    )
+    .bind(connection.id)
+    .bind(&sealed)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn has_app_credentials(pool: &PgPool, connection_id: Uuid) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM connector_app_credentials WHERE connection_id = $1)",
+    )
+    .bind(connection_id)
+    .fetch_one(pool)
+    .await
+}
+
+/// Opens the connection's own app credentials, whatever the connection's
+/// state: a webhook that follows an uninstall still needs them. `None` when
+/// none are saved (or they were deleted).
+pub async fn open_app(
+    pool: &PgPool,
+    keys: &ConnectorKeys,
+    row: &ConnectionRow,
+) -> Result<Option<AppContext>, OpenError> {
+    let sealed: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT sealed FROM connector_app_credentials WHERE connection_id = $1")
+            .bind(row.id)
+            .fetch_optional(pool)
+            .await?;
+    let Some(sealed) = sealed else {
+        return Ok(None);
+    };
+    let aad = app_credential_aad(&row.seller_pubky, &row.provider, &row.shop, &row.id);
+    let mut opened = keys
+        .open(&aad, &sealed)
+        .map_err(|_| OpenError::Unreadable)?;
+    #[derive(serde::Deserialize)]
+    struct Pair {
+        client_id: String,
+        client_secret: String,
+    }
+    let parsed = serde_json::from_slice::<Pair>(&opened);
+    opened.fill(0);
+    let pair = parsed.map_err(|_| OpenError::Unreadable)?;
+    Ok(Some(AppContext {
+        connection_id: row.id,
+        client_id: pair.client_id,
+        client_secret: CredentialSecret::new(pair.client_secret.into_bytes()),
+    }))
+}
+
+pub async fn delete_app_credentials(pool: &PgPool, id: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM connector_app_credentials WHERE connection_id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct PurgeReport {
+    pub drafts: u64,
+    pub app_secrets: u64,
+}
+
+/// Deletes drafts that expired (with everything saved on them) and app
+/// credentials whose retention after a disconnect or uninstall ended.
+pub async fn purge_expired(pool: &PgPool, now: DateTime<Utc>) -> Result<PurgeReport, sqlx::Error> {
+    let drafts = sqlx::query(
+        "DELETE FROM connector_connections WHERE status = 'draft' AND connect_expires_at <= $1",
+    )
+    .bind(now)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    let app_secrets = sqlx::query(
+        "DELETE FROM connector_app_credentials WHERE retain_until IS NOT NULL AND retain_until <= $1",
+    )
+    .bind(now)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(PurgeReport {
+        drafts,
+        app_secrets,
+    })
+}
+
 pub async fn get_owned(
     pool: &PgPool,
     seller_pubky: &str,
@@ -329,15 +537,20 @@ pub async fn get(pool: &PgPool, id: Uuid) -> Result<Option<ConnectionRow>, sqlx:
     .await
 }
 
+/// The seller's connections that are not gone: drafts that have not expired
+/// and every live one.
 pub async fn list_for_seller(
     pool: &PgPool,
     seller_pubky: &str,
+    now: DateTime<Utc>,
 ) -> Result<Vec<ConnectionRow>, sqlx::Error> {
     sqlx::query_as(&format!(
         "SELECT {CONNECTION_COLUMNS} FROM connector_connections \
-         WHERE seller_pubky = $1 AND status <> 'disconnected' ORDER BY created_at, id"
+         WHERE seller_pubky = $1 AND status <> 'disconnected' \
+           AND (status <> 'draft' OR connect_expires_at > $2) ORDER BY created_at, id"
     ))
     .bind(seller_pubky)
+    .bind(now)
     .fetch_all(pool)
     .await
 }
@@ -350,25 +563,7 @@ pub async fn live_for_shop(
 ) -> Result<Option<ConnectionRow>, sqlx::Error> {
     sqlx::query_as(&format!(
         "SELECT {CONNECTION_COLUMNS} FROM connector_connections \
-         WHERE provider = $1 AND shop = $2 AND status IN ('connected', 'error')"
-    ))
-    .bind(provider.as_str())
-    .bind(shop)
-    .fetch_optional(pool)
-    .await
-}
-
-/// The newest connection of any state for a store: the home of a
-/// compliance webhook that arrives after the store disconnected.
-pub async fn latest_for_shop(
-    pool: &PgPool,
-    provider: ProviderKind,
-    shop: &str,
-) -> Result<Option<ConnectionRow>, sqlx::Error> {
-    sqlx::query_as(&format!(
-        "SELECT {CONNECTION_COLUMNS} FROM connector_connections \
-         WHERE provider = $1 AND shop = $2 AND status <> 'pending' \
-         ORDER BY updated_at DESC, id LIMIT 1"
+         WHERE provider = $1 AND shop = $2 AND status IN ({LIVE_STATES})"
     ))
     .bind(provider.as_str())
     .bind(shop)
@@ -380,7 +575,7 @@ pub async fn latest_for_shop(
 pub async fn connected_with_mappings(pool: &PgPool) -> Result<Vec<ConnectionRow>, sqlx::Error> {
     sqlx::query_as(&format!(
         "SELECT {CONNECTION_COLUMNS} FROM connector_connections c \
-         WHERE c.status = 'connected' \
+         WHERE c.status IN ('connected', 'needs_attention') \
            AND EXISTS (SELECT 1 FROM connector_variant_map m WHERE m.connection_id = c.id) \
          ORDER BY c.id"
     ))
@@ -390,7 +585,7 @@ pub async fn connected_with_mappings(pool: &PgPool) -> Result<Vec<ConnectionRow>
 
 #[derive(Debug)]
 pub enum OpenError {
-    /// The connection has no credential (pending or disconnected).
+    /// The connection has no credential (draft or disconnected).
     Unavailable,
     /// The stored credential opens under neither configured key.
     Unreadable,
@@ -403,14 +598,15 @@ impl From<sqlx::Error> for OpenError {
     }
 }
 
-/// Opens the connection's credential for one provider call. The provider
-/// app is added by [`super::ConnectorRuntime::open`].
+/// Opens the connection's store credential for one provider call. The app
+/// (a merchant's own client id and secret) is added by
+/// [`super::ConnectorRuntime::open`].
 pub async fn open_connection(
     pool: &PgPool,
     keys: &ConnectorKeys,
     row: &ConnectionRow,
 ) -> Result<ConnectionContext, OpenError> {
-    if !matches!(row.status.as_str(), "connected" | "error") {
+    if !row.is_live() {
         return Err(OpenError::Unavailable);
     }
     let sealed: Option<Vec<u8>> =
@@ -511,9 +707,20 @@ pub async fn public_stores(
         .collect())
 }
 
-/// Deletes the credential, the recipient key, the mappings and the product
-/// selection and marks the connection disconnected. Idempotent.
-pub async fn disconnect(pool: &PgPool, id: Uuid, now: DateTime<Utc>) -> Result<bool, sqlx::Error> {
+/// Deletes the store credential, the recipient key, the mappings and the
+/// product selection and marks the connection disconnected. Idempotent.
+///
+/// The merchant's own app credentials are deleted at once when the
+/// connection never completed an install (nothing can arrive for it), and
+/// otherwise kept until `retain_app_secret_until`: Shopify sends its privacy
+/// webhooks to the connection's URL after an uninstall and they can only be
+/// verified with that secret. `shop/redact` ends the retention early.
+pub async fn disconnect(
+    pool: &PgPool,
+    id: Uuid,
+    now: DateTime<Utc>,
+    retain_app_secret_until: DateTime<Utc>,
+) -> Result<bool, sqlx::Error> {
     let mut tx = pool.begin().await?;
     for table in [
         "connector_credentials",
@@ -526,9 +733,30 @@ pub async fn disconnect(pool: &PgPool, id: Uuid, now: DateTime<Utc>) -> Result<b
             .execute(&mut *tx)
             .await?;
     }
+    let installed: Option<bool> = sqlx::query_scalar(
+        "SELECT connected_at IS NOT NULL FROM connector_connections WHERE id = $1 FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if installed == Some(true) {
+        sqlx::query(
+            "UPDATE connector_app_credentials SET \
+             retain_until = COALESCE(retain_until, $2) WHERE connection_id = $1",
+        )
+        .bind(id)
+        .bind(retain_app_secret_until)
+        .execute(&mut *tx)
+        .await?;
+    } else {
+        sqlx::query("DELETE FROM connector_app_credentials WHERE connection_id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
     let changed = sqlx::query(
         "UPDATE connector_connections SET status = 'disconnected', connect_state_hash = NULL, \
-         connect_expires_at = NULL, updated_at = $2 \
+         state_expires_at = NULL, connect_expires_at = NULL, updated_at = $2 \
          WHERE id = $1 AND status <> 'disconnected'",
     )
     .bind(id)
@@ -548,10 +776,10 @@ pub async fn mark_error(
     message: &str,
     now: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
+    sqlx::query(&format!(
         "UPDATE connector_connections SET status = 'error', last_error = $2, \
-         last_error_at = $3, updated_at = $3 WHERE id = $1 AND status IN ('connected', 'error')",
-    )
+         last_error_at = $3, updated_at = $3 WHERE id = $1 AND status IN ({LIVE_STATES})"
+    ))
     .bind(id)
     .bind(truncate(message, 500))
     .bind(now)
@@ -626,7 +854,10 @@ pub async fn replace_mappings(
     .bind(&connection.seller_pubky)
     .fetch_optional(&mut *tx)
     .await?;
-    if !matches!(still_live.as_deref(), Some("connected" | "error")) {
+    if !matches!(
+        still_live.as_deref(),
+        Some("connected" | "needs_attention" | "error")
+    ) {
         return Err(MappingError::Database(sqlx::Error::RowNotFound));
     }
     let listing_ids: Vec<String> = mappings
@@ -732,7 +963,10 @@ pub async fn replace_selection(
     .bind(&connection.seller_pubky)
     .fetch_optional(&mut *tx)
     .await?;
-    if !matches!(status.as_deref(), Some("connected" | "error")) {
+    if !matches!(
+        status.as_deref(),
+        Some("connected" | "needs_attention" | "error")
+    ) {
         return Err(SelectionError::Database(sqlx::Error::RowNotFound));
     }
     let blocked: Option<String> = sqlx::query_scalar(
