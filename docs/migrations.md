@@ -146,8 +146,12 @@ for connectors. None depends on 0060 or 0061, so they apply cleanly whether
 or not those have landed. All three are additive and rerunnable.
 
 - 0062 creates `connector_connections` (one row per seller, provider and
-  shop, with a pending state hash and the app key), `connector_credentials`
-  (the sealed store secret), `connector_recipient_keys` (the sealed X25519
+  shop: a `draft` that expires after 24 hours, then `connected`,
+  `needs_attention` with the missing scopes, `error` or `disconnected`; its
+  `app_kind` is `none`, `custom` or the reserved `public`),
+  `connector_app_credentials` (a merchant's own app client id and secret,
+  sealed per connection, with an optional `retain_until` after a disconnect),
+  `connector_credentials` (the sealed store secret), `connector_recipient_keys` (the sealed X25519
   key a buyer's opted-in address is sealed to, and its public half),
   `connector_variant_map` and `connector_product_selection`. Every index is
   built on a table the same file creates, so none blocks writes. One live

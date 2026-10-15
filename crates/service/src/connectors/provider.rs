@@ -5,8 +5,9 @@
 //! API calls and back. Providers hold no state of their own: every call that
 //! needs the merchant's secret receives it in a [`ConnectionContext`], opened
 //! by the framework from `connector_credentials` for that one call, and every
-//! call that needs the provider app's identity receives an [`AppContext`]
-//! resolved from the deployment's configured apps (`SHOPIFY_APPS`).
+//! call that needs the app's identity receives an [`AppContext`]: for a
+//! Shopify custom app, the merchant's own client id and secret, sealed per
+//! connection when they pasted them into the Shop.
 //!
 //! Outcome rules every implementation must honour (the ledger relies on
 //! them):
@@ -92,12 +93,50 @@ impl Drop for CredentialSecret {
     }
 }
 
-/// One configured provider app: `SHOPIFY_APPS=john` with
-/// `SHOPIFY_APP_JOHN_CLIENT_ID` and `SHOPIFY_APP_JOHN_CLIENT_SECRET`. The
-/// secret verifies launch, callback and webhook signatures for stores that
-/// installed this app.
+/// The kind of app a connection is installed through.
+///
+/// * `None`: no app; the provider authenticates with the store's own keys
+///   (WooCommerce).
+/// * `Custom`: the merchant created their own app (a Shopify Dev Dashboard
+///   custom app) and gave the service its client id and secret. Both live
+///   sealed per connection and verify that connection's signatures only.
+/// * `Public`: Pubky's own public app, whose credentials will be the only
+///   Shopify values in the deployment's environment
+///   (`SHOPIFY_PUBLIC_APP_CLIENT_ID`, `SHOPIFY_PUBLIC_APP_CLIENT_SECRET`).
+///   Reserved: the type, the column and the environment names exist, nothing
+///   creates or reads a public-app connection yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppKind {
+    None,
+    Custom,
+    Public,
+}
+
+impl AppKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AppKind::None => "none",
+            AppKind::Custom => "custom",
+            AppKind::Public => "public",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "none" => Some(AppKind::None),
+            "custom" => Some(AppKind::Custom),
+            "public" => Some(AppKind::Public),
+            _ => None,
+        }
+    }
+}
+
+/// An app's client identity for one connection. The secret verifies launch,
+/// OAuth and webhook signatures; it is opened from its sealed row for one call
+/// and never printed.
 pub struct AppContext {
-    pub app_key: String,
+    pub connection_id: Uuid,
     pub client_id: String,
     pub client_secret: CredentialSecret,
 }
@@ -106,7 +145,7 @@ impl std::fmt::Debug for AppContext {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("AppContext")
-            .field("app_key", &self.app_key)
+            .field("connection_id", &self.connection_id)
             .field("client_id", &self.client_id)
             .field("client_secret", &"<redacted>")
             .finish()
@@ -134,11 +173,11 @@ pub struct ConnectRequest {
     pub connection_id: Uuid,
     pub seller_pubky: String,
     pub shop: String,
-    /// The single-use nonce of the pending connect. A provider that sends the
+    /// The single-use nonce of the draft connection. A provider that sends the
     /// merchant straight to the store (WooCommerce) puts it in `user_id`; the
     /// framework stores only its hash.
     pub state: String,
-    /// The app the seller named, if any and configured.
+    /// The connection's app, when its credentials were already saved.
     pub app: Option<AppContext>,
     pub callback_url: String,
     pub webhook_url: String,
@@ -164,7 +203,7 @@ pub struct CallbackParams {
     pub body: Vec<u8>,
 }
 
-/// The pending connection a callback completes.
+/// The draft connection a callback completes.
 #[derive(Debug)]
 pub struct PendingConnection {
     pub connection_id: Uuid,
@@ -222,7 +261,7 @@ impl WebhookHeaders {
 }
 
 /// What a provider may use to verify a webhook: the app (Shopify signs with
-/// the app's secret) and, while the store is connected, its opened
+/// the connection's app secret) and, while the store is connected, its opened
 /// credential (WooCommerce signs with a per-store secret). A store that
 /// already disconnected has no credential, but Shopify's compliance webhooks
 /// still arrive for it.
@@ -467,15 +506,28 @@ pub trait ConnectorProvider: Send + Sync + 'static {
     /// the credential's associated data. Must never contain `|`.
     fn normalize_shop(&self, raw: &str) -> Result<String, ProviderError>;
 
+    /// Whether a connection of this provider is installed through an app the
+    /// merchant owns ([`AppKind::Custom`]) or none ([`AppKind::None`]).
+    fn app_kind(&self) -> AppKind {
+        AppKind::None
+    }
+
+    /// The scopes a connection needs. A grant missing any of them puts the
+    /// connection in `needs_attention` with the missing names.
+    fn required_scopes(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Starts a connection after the seller's connect request. Returns where
     /// the merchant approves it, or `None` when the install starts from the
     /// store (see [`Self::verify_launch`]).
     async fn connect(&self, request: &ConnectRequest) -> Result<ConnectStart, ProviderError>;
 
-    /// Verifies the signature of the store's launch request to the app's App
-    /// URL (`GET /v1/connectors/shopify/apps/{app_key}/launch`) with the app's
-    /// secret, and returns the canonical shop it names. Providers without an
-    /// install-from-store flow keep the default.
+    /// Verifies the signature of the store's launch request to the
+    /// connection's App URL (`GET /v1/connectors/shopify/c/{connection_id}/launch`)
+    /// with the connection's own app secret, and returns the canonical shop
+    /// it names (the framework then checks it is the connection's shop).
+    /// Providers without an install-from-store flow keep the default.
     fn verify_launch(
         &self,
         _app: &AppContext,
@@ -487,7 +539,7 @@ pub trait ConnectorProvider: Send + Sync + 'static {
     }
 
     /// The URL the merchant's browser is sent to after a verified launch that
-    /// matched a pending connect.
+    /// matched the connection.
     fn authorize_url(&self, _request: &AuthorizeRequest) -> Result<String, ProviderError> {
         Err(ProviderError::Invalid(
             "this provider has no launch flow".into(),
@@ -495,7 +547,7 @@ pub trait ConnectorProvider: Send + Sync + 'static {
     }
 
     /// Extracts the single-use `state` value from a callback so the
-    /// framework can find the pending connection. No authentication happens
+    /// framework can find the draft connection. No authentication happens
     /// here.
     fn callback_state(&self, callback: &CallbackParams) -> Result<String, ProviderError>;
 
@@ -505,6 +557,19 @@ pub trait ConnectorProvider: Send + Sync + 'static {
         &self,
         request: &CompleteRequest,
     ) -> Result<ConnectCompleted, ProviderError>;
+
+    /// Called once after an install completed and its credential is stored:
+    /// subscribe the store's webhooks (stock, fulfilments, cancels, refunds,
+    /// uninstall) to `webhook_url`, the connection's own webhooks URL. A
+    /// failure leaves the connection in `needs_attention`; the next install
+    /// runs it again. Providers that register nothing keep the default.
+    async fn register_webhooks(
+        &self,
+        _connection: &ConnectionContext,
+        _webhook_url: &str,
+    ) -> Result<(), ProviderError> {
+        Ok(())
+    }
 
     /// Revokes the credential at the store, best effort. The framework
     /// deletes its own copy whatever this returns.

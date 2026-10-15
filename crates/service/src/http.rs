@@ -107,6 +107,10 @@ pub fn build_router(state: AppState) -> Router {
             delete(crate::connectors::routes::disconnect),
         )
         .route(
+            "/v1/connectors/{id}/credentials",
+            put(crate::connectors::routes::put_credentials),
+        )
+        .route(
             "/v1/connectors/{id}/catalog",
             get(crate::connectors::routes::get_catalog),
         )
@@ -139,19 +143,19 @@ pub fn build_router(state: AppState) -> Router {
     // fixed: merchants' provider apps point at them.
     let connector_ingress = Router::new()
         .route(
-            "/v1/connectors/webhooks/{provider}",
-            post(crate::connectors::routes::receive_webhook),
+            "/v1/connectors/webhooks/woocommerce",
+            post(crate::connectors::routes::receive_woocommerce_webhook),
         )
         .route(
-            "/v1/connectors/webhooks/{provider}/{app_key}",
-            post(crate::connectors::routes::receive_app_webhook),
+            "/v1/connectors/shopify/c/{connection_id}/webhooks",
+            post(crate::connectors::routes::receive_shopify_webhook),
         )
         .route(
-            "/v1/connectors/shopify/apps/{app_key}/launch",
+            "/v1/connectors/shopify/c/{connection_id}/launch",
             get(crate::connectors::routes::shopify_launch),
         )
         .route(
-            "/v1/connectors/shopify/apps/{app_key}/oauth/callback",
+            "/v1/connectors/shopify/c/{connection_id}/oauth/callback",
             get(crate::connectors::routes::shopify_callback),
         )
         .route(

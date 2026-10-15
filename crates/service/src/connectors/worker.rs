@@ -40,6 +40,8 @@ pub struct PassReport {
     pub pushes_handled: u64,
     pub actions_handled: u64,
     pub inbound_handled: u64,
+    pub drafts_purged: u64,
+    pub app_secrets_purged: u64,
 }
 
 fn runtime_of(state: &AppState) -> Option<&std::sync::Arc<ConnectorRuntime>> {
@@ -60,7 +62,8 @@ fn after(now: DateTime<Utc>, delay: Duration) -> DateTime<Utc> {
 }
 
 /// One full pass in dependency order: events first so a payment confirmed a
-/// moment ago is pushed in the same pass.
+/// moment ago is pushed in the same pass. It ends by deleting drafts that
+/// expired and app secrets whose retention ended.
 pub async fn run_pass(state: &AppState) -> Result<PassReport, sqlx::Error> {
     let mut report = PassReport::default();
     if runtime_of(state).is_none() {
@@ -72,6 +75,9 @@ pub async fn run_pass(state: &AppState) -> Result<PassReport, sqlx::Error> {
     report.pushes_handled = drive_pushes(state, MAX_ITEMS_PER_PASS).await?;
     report.actions_handled = drive_actions(state, MAX_ITEMS_PER_PASS).await?;
     report.inbound_handled = drive_inbound(state, MAX_ITEMS_PER_PASS).await?;
+    let purged = store::purge_expired(&state.pool, state.clock.now()).await?;
+    report.drafts_purged = purged.drafts;
+    report.app_secrets_purged = purged.app_secrets;
     Ok(report)
 }
 

@@ -74,7 +74,7 @@ pub struct ClaimedPush {
 /// Quarantine reasons that are not faults: the push was withheld on
 /// purpose. The Shop shows these as information, not as a to-do.
 pub fn reason_is_informational(reason: &str) -> bool {
-    matches!(reason, "order_cancelled_before_push")
+    matches!(reason, "order_cancelled_before_push" | "no_mapped_lines")
 }
 
 pub mod reason {
@@ -82,6 +82,9 @@ pub mod reason {
     pub const ORDER_NOT_PAID: &str = "order_not_paid";
     pub const ORDER_NOT_FOUND: &str = "order_not_found";
     pub const UNMAPPED_VARIANT: &str = "unmapped_variant";
+    /// No line of the order is mapped to this store: a Pubky-only sale. Not
+    /// pushed, no alert.
+    pub const NO_MAPPED_LINES: &str = "no_mapped_lines";
     pub const CONNECTION_UNAVAILABLE: &str = "connection_unavailable";
     pub const CREDENTIALS_REJECTED: &str = "credentials_rejected";
     pub const PROVIDER_REJECTED: &str = "provider_rejected";
