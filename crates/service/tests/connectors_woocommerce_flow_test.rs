@@ -732,3 +732,206 @@ async fn the_shops_credentials_form_connects_a_woocommerce_store_with_its_key_pa
         replay.assert_no_misses();
     }
 }
+
+/// Whether this build of the service has `fulfillment.update_tracking` (and a
+/// `fulfillment.ship` without a tracking number). The connector works on a
+/// build without them: the store's shipment is then applied only once it has a
+/// number, and a later change of the number is ignored with a stable reason.
+fn service_has_optional_tracking() -> bool {
+    include_str!("../../../contracts/state-machines.json").contains("fulfillment.update_tracking")
+}
+
+fn tracking_numbers(body: &Value) -> Vec<String> {
+    body["meta_data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry["key"] == "_wc_shipment_tracking_items")
+        .flat_map(|entry| entry["value"].as_array().cloned().unwrap_or_default())
+        .filter_map(|item| item["tracking_number"].as_str().map(str::to_string))
+        .collect()
+}
+
+async fn shipment_of(shop: &Shop) -> (String, Value) {
+    let (state, shipment): (String, Option<Value>) =
+        sqlx::query_as("SELECT state, shipment FROM orders WHERE id = $1::uuid")
+            .bind(&shop.order.order_id)
+            .fetch_one(&shop.app.pool)
+            .await
+            .expect("order");
+    (state, shipment.unwrap_or(Value::Null))
+}
+
+async fn last_outcome(shop: &Shop) -> (String, Option<String>) {
+    let outcomes = inbound_outcomes(&shop.app).await;
+    let (_, state, outcome) = outcomes.last().expect("an inbound event").clone();
+    (state, outcome)
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn completed_without_tracking_ships_as_other_and_later_tracking_follows(pool: PgPool) {
+    let shop = pushed_shop(pool, "flow_h").await;
+    let external = shop.external.clone();
+    let supported = service_has_optional_tracking();
+
+    // Completed in the store with no tracking.
+    let completed = shop
+        .side
+        .deliver(
+            "completed_untracked",
+            &shop.secret,
+            async {
+                shop.side
+                    .live()
+                    .rest(
+                        "PUT",
+                        &format!("/wc/v3/orders/{external}"),
+                        Some(json!({"status": "completed"})),
+                    )
+                    .await;
+            },
+            |topic, body| {
+                topic == "order.updated"
+                    && body["id"].as_i64() == external.parse().ok()
+                    && body["status"] == "completed"
+                    && tracking_numbers(body).is_empty()
+            },
+        )
+        .await;
+    shop.app.clock.advance_seconds(5);
+    let (status, _) = deliver_and_apply(&shop, &completed).await;
+    assert_eq!(status, StatusCode::OK);
+    let (state, shipment) = shipment_of(&shop).await;
+    if supported {
+        assert_eq!(state, "shipped");
+        assert_eq!(shipment["carrier"], "Other");
+        assert!(shipment["tracking_number"].is_null());
+        assert_eq!(last_outcome(&shop).await.1.as_deref(), Some("shipped"));
+    } else {
+        assert_eq!(
+            state, "paid",
+            "this service cannot ship without a number yet"
+        );
+        assert_eq!(
+            last_outcome(&shop).await,
+            (
+                "ignored".to_string(),
+                Some("tracking_optional_not_supported".to_string())
+            )
+        );
+    }
+
+    // A tracking plugin adds a number later: the same order, updated.
+    let added = shop
+        .side
+        .deliver(
+            "tracking_added",
+            &shop.secret,
+            async {
+                shop.side
+                    .live()
+                    .rest(
+                        "POST",
+                        &format!("/wc/v3/orders/{external}/shipment-trackings"),
+                        Some(json!({"tracking_provider": "Swiss Post", "tracking_number": "99.60.123456.12345678"})),
+                    )
+                    .await;
+            },
+            |topic, body| {
+                topic == "order.updated"
+                    && body["id"].as_i64() == external.parse().ok()
+                    && tracking_numbers(body) == ["99.60.123456.12345678"]
+            },
+        )
+        .await;
+    shop.app.clock.advance_seconds(5);
+    let (status, _) = deliver_and_apply(&shop, &added).await;
+    assert_eq!(status, StatusCode::OK);
+    let (state, shipment) = shipment_of(&shop).await;
+    assert_eq!(state, "shipped");
+    assert_eq!(shipment["tracking_number"], "99.60.123456.12345678");
+    assert_eq!(shipment["carrier"], "swiss-post");
+    assert_eq!(
+        last_outcome(&shop).await.1.as_deref(),
+        Some(if supported {
+            "tracking_updated"
+        } else {
+            "shipped"
+        })
+    );
+
+    // The same delivery again changes nothing.
+    let (status, again) = post_delivery(&shop.app, &added).await;
+    assert_eq!(
+        (status, again["status"].as_str()),
+        (StatusCode::OK, Some("duplicate"))
+    );
+
+    // The number is changed: the newest item counts.
+    let changed = shop
+        .side
+        .deliver(
+            "tracking_changed",
+            &shop.secret,
+            async {
+                shop.side
+                    .live()
+                    .rest(
+                        "POST",
+                        &format!("/wc/v3/orders/{external}/shipment-trackings"),
+                        Some(
+                            json!({"tracking_provider": "DHL", "tracking_number": "JD0146000555"}),
+                        ),
+                    )
+                    .await;
+            },
+            |topic, body| {
+                topic == "order.updated"
+                    && body["id"].as_i64() == external.parse().ok()
+                    && tracking_numbers(body).last().map(String::as_str) == Some("JD0146000555")
+            },
+        )
+        .await;
+    shop.app.clock.advance_seconds(5);
+    let (status, _) = deliver_and_apply(&shop, &changed).await;
+    assert_eq!(status, StatusCode::OK);
+    let (state, shipment) = shipment_of(&shop).await;
+    assert_eq!(state, "shipped");
+    if supported {
+        assert_eq!(shipment["tracking_number"], "JD0146000555");
+        assert_eq!(
+            shipment["carrier"]
+                .as_str()
+                .map(str::to_lowercase)
+                .as_deref(),
+            Some("dhl")
+        );
+        assert_eq!(
+            shipment["tracking_history"].as_array().map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(
+            last_outcome(&shop).await.1.as_deref(),
+            Some("tracking_updated")
+        );
+    } else {
+        assert_eq!(
+            shipment["tracking_number"], "99.60.123456.12345678",
+            "this service cannot change a number yet"
+        );
+        assert_eq!(
+            last_outcome(&shop).await,
+            (
+                "ignored".to_string(),
+                Some("tracking_update_not_supported".to_string())
+            )
+        );
+    }
+    assert!(
+        alerts(&shop).await.is_empty(),
+        "a shipment is never an alert"
+    );
+    if let Some(replay) = &shop.side.replay {
+        replay.assert_no_misses();
+    }
+}
