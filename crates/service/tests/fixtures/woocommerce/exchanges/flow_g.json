@@ -1,0 +1,1381 @@
+{
+ "label": "flow_g",
+ "exchanges": [
+  {
+   "method": "GET",
+   "path": "/wp-json/",
+   "query": [],
+   "auth": "none",
+   "request_body": null,
+   "status": 200,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "$blob": "212ba14bc01d72fc"
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/wp-json/wc/v3/settings/general/woocommerce_currency",
+   "query": [
+    [
+     "_fields",
+     "id,value"
+    ]
+   ],
+   "auth": "basic",
+   "request_body": null,
+   "status": 401,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "code": "woocommerce_rest_cannot_view",
+    "message": "Sorry, you cannot list resources.",
+    "data": {
+     "status": 401
+    }
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/wp-json/wc/v3/settings/general/woocommerce_currency",
+   "query": [
+    [
+     "_fields",
+     "id,value"
+    ]
+   ],
+   "auth": "query",
+   "request_body": null,
+   "status": 401,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "code": "woocommerce_rest_cannot_view",
+    "message": "Sorry, you cannot list resources.",
+    "data": {
+     "status": 401
+    }
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/wp-json/wc/v3/settings/general/woocommerce_currency",
+   "query": [
+    [
+     "_fields",
+     "id,value"
+    ]
+   ],
+   "auth": "basic",
+   "request_body": null,
+   "status": 200,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "id": "woocommerce_currency",
+    "value": "CHF",
+    "_links": {
+     "self": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/settings/general/woocommerce_currency",
+       "targetHints": {
+        "allow": [
+         "GET",
+         "POST",
+         "PUT",
+         "PATCH"
+        ]
+       }
+      }
+     ],
+     "collection": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/settings/general"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/wp-json/wc/v3/webhooks",
+   "query": [],
+   "auth": "basic",
+   "request_body": {
+    "name": "Pubky Shop access check",
+    "topic": "pubky.access_check",
+    "delivery_url": "https://pubky.invalid/access-check",
+    "status": "disabled"
+   },
+   "status": 400,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "code": "woocommerce_rest_shop_webhook_invalid_topic",
+    "message": "Webhook topic is required and must be valid.",
+    "data": {
+     "status": 400
+    }
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/wp-json/wc/v3/webhooks",
+   "query": [],
+   "auth": "basic",
+   "request_body": {
+    "name": "Pubky Shop product.updated",
+    "topic": "product.updated",
+    "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce/c/9e9ce23d-d62a-456b-b280-c68ee33985e8",
+    "secret": "<secret>",
+    "status": "active"
+   },
+   "status": 201,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8",
+    "location": "https://localhost:8443/wp-json/wc/v3/webhooks/43"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "id": 43,
+    "name": "Pubky Shop product.updated",
+    "status": "active",
+    "topic": "product.updated",
+    "resource": "product",
+    "event": "updated",
+    "hooks": [
+     "woocommerce_process_product_meta",
+     "woocommerce_update_product",
+     "woocommerce_update_product_variation"
+    ],
+    "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce/c/9e9ce23d-d62a-456b-b280-c68ee33985e8",
+    "date_created": "2026-10-15T21:00:03",
+    "date_created_gmt": "2026-10-15T21:00:03",
+    "date_modified": null,
+    "date_modified_gmt": null,
+    "_links": {
+     "self": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/webhooks/43",
+       "targetHints": {
+        "allow": [
+         "GET",
+         "POST",
+         "PUT",
+         "PATCH",
+         "DELETE"
+        ]
+       }
+      }
+     ],
+     "collection": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/webhooks"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/wp-json/wc/v3/webhooks",
+   "query": [],
+   "auth": "basic",
+   "request_body": {
+    "name": "Pubky Shop order.updated",
+    "topic": "order.updated",
+    "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce/c/9e9ce23d-d62a-456b-b280-c68ee33985e8",
+    "secret": "<secret>",
+    "status": "active"
+   },
+   "status": 201,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8",
+    "location": "https://localhost:8443/wp-json/wc/v3/webhooks/44"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "id": 44,
+    "name": "Pubky Shop order.updated",
+    "status": "active",
+    "topic": "order.updated",
+    "resource": "order",
+    "event": "updated",
+    "hooks": [
+     "woocommerce_update_order",
+     "woocommerce_order_refunded"
+    ],
+    "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce/c/9e9ce23d-d62a-456b-b280-c68ee33985e8",
+    "date_created": "2026-10-15T21:00:05",
+    "date_created_gmt": "2026-10-15T21:00:05",
+    "date_modified": null,
+    "date_modified_gmt": null,
+    "_links": {
+     "self": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/webhooks/44",
+       "targetHints": {
+        "allow": [
+         "GET",
+         "POST",
+         "PUT",
+         "PATCH",
+         "DELETE"
+        ]
+       }
+      }
+     ],
+     "collection": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/webhooks"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/wp-json/wc/v3/webhooks",
+   "query": [],
+   "auth": "basic",
+   "request_body": {
+    "name": "Pubky Shop order.deleted",
+    "topic": "order.deleted",
+    "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce/c/9e9ce23d-d62a-456b-b280-c68ee33985e8",
+    "secret": "<secret>",
+    "status": "active"
+   },
+   "status": 201,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8",
+    "location": "https://localhost:8443/wp-json/wc/v3/webhooks/45"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "id": 45,
+    "name": "Pubky Shop order.deleted",
+    "status": "active",
+    "topic": "order.deleted",
+    "resource": "order",
+    "event": "deleted",
+    "hooks": [
+     "wp_trash_post",
+     "woocommerce_trash_order"
+    ],
+    "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce/c/9e9ce23d-d62a-456b-b280-c68ee33985e8",
+    "date_created": "2026-10-15T21:00:06",
+    "date_created_gmt": "2026-10-15T21:00:06",
+    "date_modified": null,
+    "date_modified_gmt": null,
+    "_links": {
+     "self": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/webhooks/45",
+       "targetHints": {
+        "allow": [
+         "GET",
+         "POST",
+         "PUT",
+         "PATCH",
+         "DELETE"
+        ]
+       }
+      }
+     ],
+     "collection": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/webhooks"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/wp-json/wc/v3/webhooks",
+   "query": [
+    [
+     "orderby",
+     "id"
+    ],
+    [
+     "order",
+     "asc"
+    ],
+    [
+     "_fields",
+     "id,name,delivery_url"
+    ],
+    [
+     "per_page",
+     "100"
+    ],
+    [
+     "page",
+     "1"
+    ]
+   ],
+   "auth": "basic",
+   "request_body": null,
+   "status": 200,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8",
+    "x-wp-total": "3",
+    "x-wp-totalpages": "1"
+   },
+   "response_kind": "json",
+   "response_body": [
+    {
+     "id": 43,
+     "name": "Pubky Shop product.updated",
+     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce/c/9e9ce23d-d62a-456b-b280-c68ee33985e8"
+    },
+    {
+     "id": 44,
+     "name": "Pubky Shop order.updated",
+     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce/c/9e9ce23d-d62a-456b-b280-c68ee33985e8"
+    },
+    {
+     "id": 45,
+     "name": "Pubky Shop order.deleted",
+     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce/c/9e9ce23d-d62a-456b-b280-c68ee33985e8"
+    }
+   ]
+  },
+  {
+   "method": "GET",
+   "path": "/wp-json/",
+   "query": [],
+   "auth": "none",
+   "request_body": null,
+   "status": 200,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "$blob": "212ba14bc01d72fc"
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/wp-json/wc/v3/settings/general/woocommerce_currency",
+   "query": [
+    [
+     "_fields",
+     "id,value"
+    ]
+   ],
+   "auth": "basic",
+   "request_body": null,
+   "status": 200,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "id": "woocommerce_currency",
+    "value": "CHF",
+    "_links": {
+     "self": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/settings/general/woocommerce_currency",
+       "targetHints": {
+        "allow": [
+         "GET",
+         "POST",
+         "PUT",
+         "PATCH"
+        ]
+       }
+      }
+     ],
+     "collection": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/settings/general"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/wp-json/wc/v3/webhooks",
+   "query": [],
+   "auth": "basic",
+   "request_body": {
+    "name": "Pubky Shop access check",
+    "topic": "pubky.access_check",
+    "delivery_url": "https://pubky.invalid/access-check",
+    "status": "disabled"
+   },
+   "status": 400,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "code": "woocommerce_rest_shop_webhook_invalid_topic",
+    "message": "Webhook topic is required and must be valid.",
+    "data": {
+     "status": 400
+    }
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/wp-json/wc/v3/webhooks",
+   "query": [],
+   "auth": "basic",
+   "request_body": {
+    "name": "Pubky Shop product.updated",
+    "topic": "product.updated",
+    "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce/c/9e9ce23d-d62a-456b-b280-c68ee33985e8",
+    "secret": "<secret>",
+    "status": "active"
+   },
+   "status": 201,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8",
+    "location": "https://localhost:8443/wp-json/wc/v3/webhooks/46"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "id": 46,
+    "name": "Pubky Shop product.updated",
+    "status": "active",
+    "topic": "product.updated",
+    "resource": "product",
+    "event": "updated",
+    "hooks": [
+     "woocommerce_process_product_meta",
+     "woocommerce_update_product",
+     "woocommerce_update_product_variation"
+    ],
+    "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce/c/9e9ce23d-d62a-456b-b280-c68ee33985e8",
+    "date_created": "2026-10-15T21:00:14",
+    "date_created_gmt": "2026-10-15T21:00:14",
+    "date_modified": null,
+    "date_modified_gmt": null,
+    "_links": {
+     "self": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/webhooks/46",
+       "targetHints": {
+        "allow": [
+         "GET",
+         "POST",
+         "PUT",
+         "PATCH",
+         "DELETE"
+        ]
+       }
+      }
+     ],
+     "collection": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/webhooks"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/wp-json/wc/v3/webhooks",
+   "query": [],
+   "auth": "basic",
+   "request_body": {
+    "name": "Pubky Shop order.updated",
+    "topic": "order.updated",
+    "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce/c/9e9ce23d-d62a-456b-b280-c68ee33985e8",
+    "secret": "<secret>",
+    "status": "active"
+   },
+   "status": 201,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8",
+    "location": "https://localhost:8443/wp-json/wc/v3/webhooks/47"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "id": 47,
+    "name": "Pubky Shop order.updated",
+    "status": "active",
+    "topic": "order.updated",
+    "resource": "order",
+    "event": "updated",
+    "hooks": [
+     "woocommerce_update_order",
+     "woocommerce_order_refunded"
+    ],
+    "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce/c/9e9ce23d-d62a-456b-b280-c68ee33985e8",
+    "date_created": "2026-10-15T21:00:15",
+    "date_created_gmt": "2026-10-15T21:00:15",
+    "date_modified": null,
+    "date_modified_gmt": null,
+    "_links": {
+     "self": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/webhooks/47",
+       "targetHints": {
+        "allow": [
+         "GET",
+         "POST",
+         "PUT",
+         "PATCH",
+         "DELETE"
+        ]
+       }
+      }
+     ],
+     "collection": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/webhooks"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/wp-json/wc/v3/webhooks",
+   "query": [],
+   "auth": "basic",
+   "request_body": {
+    "name": "Pubky Shop order.deleted",
+    "topic": "order.deleted",
+    "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce/c/9e9ce23d-d62a-456b-b280-c68ee33985e8",
+    "secret": "<secret>",
+    "status": "active"
+   },
+   "status": 201,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8",
+    "location": "https://localhost:8443/wp-json/wc/v3/webhooks/48"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "id": 48,
+    "name": "Pubky Shop order.deleted",
+    "status": "active",
+    "topic": "order.deleted",
+    "resource": "order",
+    "event": "deleted",
+    "hooks": [
+     "wp_trash_post",
+     "woocommerce_trash_order"
+    ],
+    "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce/c/9e9ce23d-d62a-456b-b280-c68ee33985e8",
+    "date_created": "2026-10-15T21:00:17",
+    "date_created_gmt": "2026-10-15T21:00:17",
+    "date_modified": null,
+    "date_modified_gmt": null,
+    "_links": {
+     "self": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/webhooks/48",
+       "targetHints": {
+        "allow": [
+         "GET",
+         "POST",
+         "PUT",
+         "PATCH",
+         "DELETE"
+        ]
+       }
+      }
+     ],
+     "collection": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/webhooks"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/wp-json/wc/v3/webhooks",
+   "query": [
+    [
+     "orderby",
+     "id"
+    ],
+    [
+     "order",
+     "asc"
+    ],
+    [
+     "_fields",
+     "id,name,delivery_url"
+    ],
+    [
+     "per_page",
+     "100"
+    ],
+    [
+     "page",
+     "1"
+    ]
+   ],
+   "auth": "basic",
+   "request_body": null,
+   "status": 200,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8",
+    "x-wp-total": "6",
+    "x-wp-totalpages": "1"
+   },
+   "response_kind": "json",
+   "response_body": [
+    {
+     "id": 43,
+     "name": "Pubky Shop product.updated",
+     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce/c/9e9ce23d-d62a-456b-b280-c68ee33985e8"
+    },
+    {
+     "id": 44,
+     "name": "Pubky Shop order.updated",
+     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce/c/9e9ce23d-d62a-456b-b280-c68ee33985e8"
+    },
+    {
+     "id": 45,
+     "name": "Pubky Shop order.deleted",
+     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce/c/9e9ce23d-d62a-456b-b280-c68ee33985e8"
+    },
+    {
+     "id": 46,
+     "name": "Pubky Shop product.updated",
+     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce/c/9e9ce23d-d62a-456b-b280-c68ee33985e8"
+    },
+    {
+     "id": 47,
+     "name": "Pubky Shop order.updated",
+     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce/c/9e9ce23d-d62a-456b-b280-c68ee33985e8"
+    },
+    {
+     "id": 48,
+     "name": "Pubky Shop order.deleted",
+     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce/c/9e9ce23d-d62a-456b-b280-c68ee33985e8"
+    }
+   ]
+  },
+  {
+   "method": "DELETE",
+   "path": "/wp-json/wc/v3/webhooks/43",
+   "query": [
+    [
+     "force",
+     "true"
+    ]
+   ],
+   "auth": "basic",
+   "request_body": null,
+   "status": 200,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "id": 43,
+    "name": "Pubky Shop product.updated",
+    "status": "active",
+    "topic": "product.updated",
+    "resource": "product",
+    "event": "updated",
+    "hooks": [
+     "woocommerce_process_product_meta",
+     "woocommerce_update_product",
+     "woocommerce_update_product_variation"
+    ],
+    "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce/c/9e9ce23d-d62a-456b-b280-c68ee33985e8",
+    "date_created": "2026-10-15T21:00:03",
+    "date_created_gmt": "2026-10-15T21:00:03",
+    "date_modified": "2026-10-15T21:00:03",
+    "date_modified_gmt": "2026-10-15T21:00:03",
+    "_links": {
+     "self": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/webhooks/43",
+       "targetHints": {
+        "allow": [
+         "GET",
+         "POST",
+         "PUT",
+         "PATCH",
+         "DELETE"
+        ]
+       }
+      }
+     ],
+     "collection": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/webhooks"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "method": "DELETE",
+   "path": "/wp-json/wc/v3/webhooks/44",
+   "query": [
+    [
+     "force",
+     "true"
+    ]
+   ],
+   "auth": "basic",
+   "request_body": null,
+   "status": 200,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "id": 44,
+    "name": "Pubky Shop order.updated",
+    "status": "active",
+    "topic": "order.updated",
+    "resource": "order",
+    "event": "updated",
+    "hooks": [
+     "woocommerce_update_order",
+     "woocommerce_order_refunded"
+    ],
+    "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce/c/9e9ce23d-d62a-456b-b280-c68ee33985e8",
+    "date_created": "2026-10-15T21:00:05",
+    "date_created_gmt": "2026-10-15T21:00:05",
+    "date_modified": "2026-10-15T21:00:05",
+    "date_modified_gmt": "2026-10-15T21:00:05",
+    "_links": {
+     "self": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/webhooks/44",
+       "targetHints": {
+        "allow": [
+         "GET",
+         "POST",
+         "PUT",
+         "PATCH",
+         "DELETE"
+        ]
+       }
+      }
+     ],
+     "collection": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/webhooks"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "method": "DELETE",
+   "path": "/wp-json/wc/v3/webhooks/45",
+   "query": [
+    [
+     "force",
+     "true"
+    ]
+   ],
+   "auth": "basic",
+   "request_body": null,
+   "status": 200,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "id": 45,
+    "name": "Pubky Shop order.deleted",
+    "status": "active",
+    "topic": "order.deleted",
+    "resource": "order",
+    "event": "deleted",
+    "hooks": [
+     "wp_trash_post",
+     "woocommerce_trash_order"
+    ],
+    "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce/c/9e9ce23d-d62a-456b-b280-c68ee33985e8",
+    "date_created": "2026-10-15T21:00:06",
+    "date_created_gmt": "2026-10-15T21:00:06",
+    "date_modified": "2026-10-15T21:00:06",
+    "date_modified_gmt": "2026-10-15T21:00:06",
+    "_links": {
+     "self": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/webhooks/45",
+       "targetHints": {
+        "allow": [
+         "GET",
+         "POST",
+         "PUT",
+         "PATCH",
+         "DELETE"
+        ]
+       }
+      }
+     ],
+     "collection": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/webhooks"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/wp-json/wc/v3/settings/general/woocommerce_currency",
+   "query": [
+    [
+     "_fields",
+     "id,value"
+    ]
+   ],
+   "auth": "basic",
+   "request_body": null,
+   "status": 200,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "id": "woocommerce_currency",
+    "value": "CHF",
+    "_links": {
+     "self": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/settings/general/woocommerce_currency",
+       "targetHints": {
+        "allow": [
+         "GET",
+         "POST",
+         "PUT",
+         "PATCH"
+        ]
+       }
+      }
+     ],
+     "collection": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/settings/general"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/wp-json/wc/v3/products",
+   "query": [
+    [
+     "per_page",
+     "7"
+    ],
+    [
+     "page",
+     "1"
+    ],
+    [
+     "orderby",
+     "id"
+    ],
+    [
+     "order",
+     "asc"
+    ],
+    [
+     "_fields",
+     "id,name,type,status,permalink,description,short_description,sku,price,manage_stock,stock_quantity,stock_status,images,categories,attributes,variations,parent_id"
+    ]
+   ],
+   "auth": "basic",
+   "request_body": null,
+   "status": 200,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8",
+    "x-wp-total": "20",
+    "x-wp-totalpages": "3"
+   },
+   "response_kind": "json",
+   "response_body": [
+    {
+     "id": 10,
+     "name": "V-Neck T-Shirt",
+     "type": "variable",
+     "status": "publish",
+     "permalink": "https://localhost:8443/product/v-neck-t-shirt/",
+     "description": "<p>Pellentesque habitant morbi tristique senectus et netus et malesuada fames ac turpis egestas. Vestibulum tortor quam, feugiat vitae, ultricies eget, tempor sit amet, ante. Donec eu libero sit amet quam egestas semper. Aenean ultricies mi vitae est. Mauris placerat eleifend leo.</p>\n",
+     "short_description": "<p>This is a variable product.</p>\n",
+     "sku": "woo-vneck-tee",
+     "price": "15",
+     "manage_stock": false,
+     "stock_quantity": null,
+     "images": [],
+     "categories": [
+      {
+       "id": 17,
+       "name": "Tshirts",
+       "slug": "tshirts"
+      }
+     ],
+     "attributes": [
+      {
+       "id": 0,
+       "name": "Color",
+       "slug": "Color",
+       "position": 0,
+       "visible": true,
+       "variation": true,
+       "options": [
+        "Blue",
+        "Green",
+        "Red"
+       ]
+      },
+      {
+       "id": 0,
+       "name": "Size",
+       "slug": "Size",
+       "position": 1,
+       "visible": true,
+       "variation": true,
+       "options": [
+        "Large",
+        "Medium",
+        "Small"
+       ]
+      }
+     ],
+     "variations": [
+      24,
+      25,
+      26
+     ],
+     "parent_id": 0,
+     "stock_status": "instock"
+    },
+    {
+     "id": 11,
+     "name": "Hoodie",
+     "type": "variable",
+     "status": "publish",
+     "permalink": "https://localhost:8443/product/hoodie/",
+     "description": "<p>Pellentesque habitant morbi tristique senectus et netus et malesuada fames ac turpis egestas. Vestibulum tortor quam, feugiat vitae, ultricies eget, tempor sit amet, ante. Donec eu libero sit amet quam egestas semper. Aenean ultricies mi vitae est. Mauris placerat eleifend leo.</p>\n",
+     "short_description": "<p>This is a variable product.</p>\n",
+     "sku": "woo-hoodie",
+     "price": "42",
+     "manage_stock": false,
+     "stock_quantity": null,
+     "images": [],
+     "categories": [
+      {
+       "id": 18,
+       "name": "Hoodies",
+       "slug": "hoodies"
+      }
+     ],
+     "attributes": [
+      {
+       "id": 0,
+       "name": "Color",
+       "slug": "Color",
+       "position": 0,
+       "visible": true,
+       "variation": true,
+       "options": [
+        "Blue",
+        "Green",
+        "Red"
+       ]
+      },
+      {
+       "id": 0,
+       "name": "Logo",
+       "slug": "Logo",
+       "position": 1,
+       "visible": true,
+       "variation": true,
+       "options": [
+        "Yes",
+        "No"
+       ]
+      }
+     ],
+     "variations": [
+      27,
+      28,
+      29,
+      34
+     ],
+     "parent_id": 0,
+     "stock_status": "instock"
+    },
+    {
+     "id": 12,
+     "name": "Hoodie with Logo",
+     "type": "simple",
+     "status": "publish",
+     "permalink": "https://localhost:8443/product/hoodie-with-logo/",
+     "description": "<p>Pellentesque habitant morbi tristique senectus et netus et malesuada fames ac turpis egestas. Vestibulum tortor quam, feugiat vitae, ultricies eget, tempor sit amet, ante. Donec eu libero sit amet quam egestas semper. Aenean ultricies mi vitae est. Mauris placerat eleifend leo.</p>\n",
+     "short_description": "<p>This is a simple product.</p>\n",
+     "sku": "woo-hoodie-with-logo",
+     "price": "45",
+     "manage_stock": false,
+     "stock_quantity": null,
+     "images": [],
+     "categories": [
+      {
+       "id": 18,
+       "name": "Hoodies",
+       "slug": "hoodies"
+      }
+     ],
+     "attributes": [],
+     "variations": [],
+     "parent_id": 0,
+     "stock_status": "instock"
+    },
+    {
+     "id": 13,
+     "name": "T-Shirt",
+     "type": "simple",
+     "status": "publish",
+     "permalink": "https://localhost:8443/product/t-shirt/",
+     "description": "<p>Pellentesque habitant morbi tristique senectus et netus et malesuada fames ac turpis egestas. Vestibulum tortor quam, feugiat vitae, ultricies eget, tempor sit amet, ante. Donec eu libero sit amet quam egestas semper. Aenean ultricies mi vitae est. Mauris placerat eleifend leo.</p>\n",
+     "short_description": "<p>This is a simple product.</p>\n",
+     "sku": "woo-tshirt",
+     "price": "18",
+     "manage_stock": false,
+     "stock_quantity": null,
+     "images": [],
+     "categories": [
+      {
+       "id": 17,
+       "name": "Tshirts",
+       "slug": "tshirts"
+      }
+     ],
+     "attributes": [],
+     "variations": [],
+     "parent_id": 0,
+     "stock_status": "instock"
+    },
+    {
+     "id": 14,
+     "name": "Beanie",
+     "type": "simple",
+     "status": "publish",
+     "permalink": "https://localhost:8443/product/beanie/",
+     "description": "<p>Pellentesque habitant morbi tristique senectus et netus et malesuada fames ac turpis egestas. Vestibulum tortor quam, feugiat vitae, ultricies eget, tempor sit amet, ante. Donec eu libero sit amet quam egestas semper. Aenean ultricies mi vitae est. Mauris placerat eleifend leo.</p>\n",
+     "short_description": "<p>This is a simple product.</p>\n",
+     "sku": "woo-beanie",
+     "price": "18",
+     "manage_stock": false,
+     "stock_quantity": null,
+     "images": [],
+     "categories": [
+      {
+       "id": 19,
+       "name": "Accessories",
+       "slug": "accessories"
+      }
+     ],
+     "attributes": [],
+     "variations": [],
+     "parent_id": 0,
+     "stock_status": "instock"
+    },
+    {
+     "id": 15,
+     "name": "Belt",
+     "type": "simple",
+     "status": "publish",
+     "permalink": "https://localhost:8443/product/belt/",
+     "description": "<p>Pellentesque habitant morbi tristique senectus et netus et malesuada fames ac turpis egestas. Vestibulum tortor quam, feugiat vitae, ultricies eget, tempor sit amet, ante. Donec eu libero sit amet quam egestas semper. Aenean ultricies mi vitae est. Mauris placerat eleifend leo.</p>\n",
+     "short_description": "<p>This is a simple product.</p>\n",
+     "sku": "woo-belt",
+     "price": "55",
+     "manage_stock": false,
+     "stock_quantity": null,
+     "images": [],
+     "categories": [
+      {
+       "id": 19,
+       "name": "Accessories",
+       "slug": "accessories"
+      }
+     ],
+     "attributes": [],
+     "variations": [],
+     "parent_id": 0,
+     "stock_status": "instock"
+    },
+    {
+     "id": 16,
+     "name": "Cap",
+     "type": "simple",
+     "status": "publish",
+     "permalink": "https://localhost:8443/product/cap/",
+     "description": "<p>Pellentesque habitant morbi tristique senectus et netus et malesuada fames ac turpis egestas. Vestibulum tortor quam, feugiat vitae, ultricies eget, tempor sit amet, ante. Donec eu libero sit amet quam egestas semper. Aenean ultricies mi vitae est. Mauris placerat eleifend leo.</p>\n",
+     "short_description": "<p>This is a simple product.</p>\n",
+     "sku": "woo-cap",
+     "price": "16",
+     "manage_stock": false,
+     "stock_quantity": null,
+     "images": [],
+     "categories": [
+      {
+       "id": 19,
+       "name": "Accessories",
+       "slug": "accessories"
+      }
+     ],
+     "attributes": [],
+     "variations": [],
+     "parent_id": 0,
+     "stock_status": "instock"
+    }
+   ]
+  },
+  {
+   "method": "GET",
+   "path": "/wp-json/wc/v3/products/10/variations",
+   "query": [
+    [
+     "per_page",
+     "100"
+    ],
+    [
+     "page",
+     "1"
+    ],
+    [
+     "orderby",
+     "id"
+    ],
+    [
+     "order",
+     "asc"
+    ],
+    [
+     "_fields",
+     "id,status,sku,price,manage_stock,stock_quantity,stock_status,attributes,image"
+    ]
+   ],
+   "auth": "basic",
+   "request_body": null,
+   "status": 200,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8",
+    "x-wp-total": "3",
+    "x-wp-totalpages": "1"
+   },
+   "response_kind": "json",
+   "response_body": [
+    {
+     "id": 24,
+     "sku": "woo-vneck-tee-red",
+     "price": "20",
+     "status": "publish",
+     "manage_stock": false,
+     "stock_quantity": null,
+     "stock_status": "instock",
+     "image": null,
+     "attributes": [
+      {
+       "id": 0,
+       "name": "Color",
+       "slug": "color",
+       "option": "Red"
+      }
+     ]
+    },
+    {
+     "id": 25,
+     "sku": "woo-vneck-tee-green",
+     "price": "20",
+     "status": "publish",
+     "manage_stock": false,
+     "stock_quantity": null,
+     "stock_status": "instock",
+     "image": null,
+     "attributes": [
+      {
+       "id": 0,
+       "name": "Color",
+       "slug": "color",
+       "option": "Green"
+      }
+     ]
+    },
+    {
+     "id": 26,
+     "sku": "woo-vneck-tee-blue",
+     "price": "15",
+     "status": "publish",
+     "manage_stock": false,
+     "stock_quantity": null,
+     "stock_status": "instock",
+     "image": null,
+     "attributes": [
+      {
+       "id": 0,
+       "name": "Color",
+       "slug": "color",
+       "option": "Blue"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "method": "GET",
+   "path": "/wp-json/wc/v3/products/11/variations",
+   "query": [
+    [
+     "per_page",
+     "100"
+    ],
+    [
+     "page",
+     "1"
+    ],
+    [
+     "orderby",
+     "id"
+    ],
+    [
+     "order",
+     "asc"
+    ],
+    [
+     "_fields",
+     "id,status,sku,price,manage_stock,stock_quantity,stock_status,attributes,image"
+    ]
+   ],
+   "auth": "basic",
+   "request_body": null,
+   "status": 200,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8",
+    "x-wp-total": "4",
+    "x-wp-totalpages": "1"
+   },
+   "response_kind": "json",
+   "response_body": [
+    {
+     "id": 27,
+     "sku": "woo-hoodie-red",
+     "price": "42",
+     "status": "publish",
+     "manage_stock": false,
+     "stock_quantity": null,
+     "stock_status": "instock",
+     "image": null,
+     "attributes": [
+      {
+       "id": 0,
+       "name": "Color",
+       "slug": "color",
+       "option": "Red"
+      },
+      {
+       "id": 0,
+       "name": "Logo",
+       "slug": "logo",
+       "option": "No"
+      }
+     ]
+    },
+    {
+     "id": 28,
+     "sku": "woo-hoodie-green",
+     "price": "45",
+     "status": "publish",
+     "manage_stock": false,
+     "stock_quantity": null,
+     "stock_status": "instock",
+     "image": null,
+     "attributes": [
+      {
+       "id": 0,
+       "name": "Color",
+       "slug": "color",
+       "option": "Green"
+      },
+      {
+       "id": 0,
+       "name": "Logo",
+       "slug": "logo",
+       "option": "No"
+      }
+     ]
+    },
+    {
+     "id": 29,
+     "sku": "woo-hoodie-blue",
+     "price": "45",
+     "status": "publish",
+     "manage_stock": false,
+     "stock_quantity": null,
+     "stock_status": "instock",
+     "image": null,
+     "attributes": [
+      {
+       "id": 0,
+       "name": "Color",
+       "slug": "color",
+       "option": "Blue"
+      },
+      {
+       "id": 0,
+       "name": "Logo",
+       "slug": "logo",
+       "option": "No"
+      }
+     ]
+    },
+    {
+     "id": 34,
+     "sku": "woo-hoodie-blue-logo",
+     "price": "45",
+     "status": "publish",
+     "manage_stock": false,
+     "stock_quantity": null,
+     "stock_status": "instock",
+     "image": null,
+     "attributes": [
+      {
+       "id": 0,
+       "name": "Color",
+       "slug": "color",
+       "option": "Blue"
+      },
+      {
+       "id": 0,
+       "name": "Logo",
+       "slug": "logo",
+       "option": "Yes"
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

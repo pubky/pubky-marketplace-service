@@ -3,3 +3,4 @@
 //! [`super::providers_from_env`].
 
 pub mod shopify;
+pub mod woocommerce;

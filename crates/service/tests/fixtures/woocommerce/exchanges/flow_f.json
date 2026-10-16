@@ -1,0 +1,125 @@
+{
+ "label": "flow_f",
+ "exchanges": [
+  {
+   "method": "GET",
+   "path": "/wp-json/",
+   "query": [],
+   "auth": "none",
+   "request_body": null,
+   "status": 200,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "$blob": "29655abdb92dc40b"
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/wp-json/",
+   "query": [],
+   "auth": "none",
+   "request_body": null,
+   "status": 200,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "$blob": "29655abdb92dc40b"
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/wp-json/",
+   "query": [],
+   "auth": "none",
+   "request_body": null,
+   "status": 200,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "$blob": "29655abdb92dc40b"
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/wp-json/",
+   "query": [],
+   "auth": "none",
+   "request_body": null,
+   "status": 200,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "$blob": "29655abdb92dc40b"
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/wp-json/",
+   "query": [],
+   "auth": "none",
+   "request_body": null,
+   "status": 200,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "$blob": "29655abdb92dc40b"
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/wp-json/",
+   "query": [],
+   "auth": "none",
+   "request_body": null,
+   "status": 200,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "$blob": "29655abdb92dc40b"
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/wp-json/",
+   "query": [],
+   "auth": "none",
+   "request_body": null,
+   "status": 200,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "$blob": "212ba14bc01d72fc"
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/wp-json/",
+   "query": [],
+   "auth": "none",
+   "request_body": null,
+   "status": 200,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "$blob": "212ba14bc01d72fc"
+   }
+  }
+ ]
+}

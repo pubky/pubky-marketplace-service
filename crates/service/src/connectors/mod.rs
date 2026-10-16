@@ -162,9 +162,14 @@ pub fn runtime_from_env(
 /// The providers this build knows, configured from the environment. This is
 /// the one place a provider registers itself: the service and the worker both
 /// call it, so they always serve the same set. Shopify needs no deployment
-/// configuration: each connection carries its own app credentials.
+/// configuration (each connection carries its own app credentials); WooCommerce
+/// reads only `CONNECTOR_RETURN_URL`.
 pub fn providers_from_env() -> anyhow::Result<ProviderRegistry> {
-    Ok(ProviderRegistry::new().with(Arc::new(providers::shopify::ShopifyProvider::new())))
+    Ok(ProviderRegistry::new()
+        .with(Arc::new(providers::shopify::ShopifyProvider::new()))
+        .with(Arc::new(
+            providers::woocommerce::WooCommerceProvider::from_env(),
+        )))
 }
 
 /// A strictly valid version 8 UUID derived from a seed: the same seed gives

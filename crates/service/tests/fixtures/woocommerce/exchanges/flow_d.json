@@ -1,0 +1,788 @@
+{
+ "label": "flow_d",
+ "exchanges": [
+  {
+   "method": "GET",
+   "path": "/wp-json/",
+   "query": [],
+   "auth": "none",
+   "request_body": null,
+   "status": 200,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "$blob": "e5f4a1feb131f0ab"
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/wp-json/wc/v3/settings/general/woocommerce_currency",
+   "query": [
+    [
+     "_fields",
+     "id,value"
+    ]
+   ],
+   "auth": "basic",
+   "request_body": null,
+   "status": 200,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "id": "woocommerce_currency",
+    "value": "CHF",
+    "_links": {
+     "self": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/settings/general/woocommerce_currency",
+       "targetHints": {
+        "allow": [
+         "GET",
+         "POST",
+         "PUT",
+         "PATCH"
+        ]
+       }
+      }
+     ],
+     "collection": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/settings/general"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/wp-json/wc/v3/webhooks",
+   "query": [],
+   "auth": "basic",
+   "request_body": {
+    "name": "Pubky Shop access check",
+    "topic": "pubky.access_check",
+    "delivery_url": "https://pubky.invalid/access-check",
+    "status": "disabled"
+   },
+   "status": 400,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "code": "woocommerce_rest_shop_webhook_invalid_topic",
+    "message": "Webhook topic is required and must be valid.",
+    "data": {
+     "status": 400
+    }
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/wp-json/wc/v3/webhooks",
+   "query": [],
+   "auth": "basic",
+   "request_body": {
+    "name": "Pubky Shop product.updated",
+    "topic": "product.updated",
+    "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce/c/25d5c69c-7208-4e53-961f-520e7b136b40",
+    "secret": "<secret>",
+    "status": "active"
+   },
+   "status": 201,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8",
+    "location": "https://localhost:8443/wp-json/wc/v3/webhooks/22"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "id": 22,
+    "name": "Pubky Shop product.updated",
+    "status": "active",
+    "topic": "product.updated",
+    "resource": "product",
+    "event": "updated",
+    "hooks": [
+     "woocommerce_process_product_meta",
+     "woocommerce_update_product",
+     "woocommerce_update_product_variation"
+    ],
+    "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce/c/25d5c69c-7208-4e53-961f-520e7b136b40",
+    "date_created": "2026-10-15T20:57:36",
+    "date_created_gmt": "2026-10-15T20:57:36",
+    "date_modified": null,
+    "date_modified_gmt": null,
+    "_links": {
+     "self": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/webhooks/22",
+       "targetHints": {
+        "allow": [
+         "GET",
+         "POST",
+         "PUT",
+         "PATCH",
+         "DELETE"
+        ]
+       }
+      }
+     ],
+     "collection": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/webhooks"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/wp-json/wc/v3/webhooks",
+   "query": [],
+   "auth": "basic",
+   "request_body": {
+    "name": "Pubky Shop order.updated",
+    "topic": "order.updated",
+    "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce/c/25d5c69c-7208-4e53-961f-520e7b136b40",
+    "secret": "<secret>",
+    "status": "active"
+   },
+   "status": 201,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8",
+    "location": "https://localhost:8443/wp-json/wc/v3/webhooks/23"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "id": 23,
+    "name": "Pubky Shop order.updated",
+    "status": "active",
+    "topic": "order.updated",
+    "resource": "order",
+    "event": "updated",
+    "hooks": [
+     "woocommerce_update_order",
+     "woocommerce_order_refunded"
+    ],
+    "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce/c/25d5c69c-7208-4e53-961f-520e7b136b40",
+    "date_created": "2026-10-15T20:57:37",
+    "date_created_gmt": "2026-10-15T20:57:37",
+    "date_modified": null,
+    "date_modified_gmt": null,
+    "_links": {
+     "self": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/webhooks/23",
+       "targetHints": {
+        "allow": [
+         "GET",
+         "POST",
+         "PUT",
+         "PATCH",
+         "DELETE"
+        ]
+       }
+      }
+     ],
+     "collection": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/webhooks"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "method": "POST",
+   "path": "/wp-json/wc/v3/webhooks",
+   "query": [],
+   "auth": "basic",
+   "request_body": {
+    "name": "Pubky Shop order.deleted",
+    "topic": "order.deleted",
+    "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce/c/25d5c69c-7208-4e53-961f-520e7b136b40",
+    "secret": "<secret>",
+    "status": "active"
+   },
+   "status": 201,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8",
+    "location": "https://localhost:8443/wp-json/wc/v3/webhooks/24"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "id": 24,
+    "name": "Pubky Shop order.deleted",
+    "status": "active",
+    "topic": "order.deleted",
+    "resource": "order",
+    "event": "deleted",
+    "hooks": [
+     "wp_trash_post",
+     "woocommerce_trash_order"
+    ],
+    "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce/c/25d5c69c-7208-4e53-961f-520e7b136b40",
+    "date_created": "2026-10-15T20:57:37",
+    "date_created_gmt": "2026-10-15T20:57:37",
+    "date_modified": null,
+    "date_modified_gmt": null,
+    "_links": {
+     "self": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/webhooks/24",
+       "targetHints": {
+        "allow": [
+         "GET",
+         "POST",
+         "PUT",
+         "PATCH",
+         "DELETE"
+        ]
+       }
+      }
+     ],
+     "collection": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/webhooks"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/wp-json/wc/v3/webhooks",
+   "query": [
+    [
+     "orderby",
+     "id"
+    ],
+    [
+     "order",
+     "asc"
+    ],
+    [
+     "_fields",
+     "id,name,delivery_url"
+    ],
+    [
+     "per_page",
+     "100"
+    ],
+    [
+     "page",
+     "1"
+    ]
+   ],
+   "auth": "basic",
+   "request_body": null,
+   "status": 200,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8",
+    "x-wp-total": "3",
+    "x-wp-totalpages": "1"
+   },
+   "response_kind": "json",
+   "response_body": [
+    {
+     "id": 22,
+     "name": "Pubky Shop product.updated",
+     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce/c/25d5c69c-7208-4e53-961f-520e7b136b40"
+    },
+    {
+     "id": 23,
+     "name": "Pubky Shop order.updated",
+     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce/c/25d5c69c-7208-4e53-961f-520e7b136b40"
+    },
+    {
+     "id": 24,
+     "name": "Pubky Shop order.deleted",
+     "delivery_url": "https://host.docker.internal:18443/v1/connectors/webhooks/woocommerce/c/25d5c69c-7208-4e53-961f-520e7b136b40"
+    }
+   ]
+  },
+  {
+   "method": "POST",
+   "path": "/wp-json/wc/v3/orders",
+   "query": [],
+   "auth": "basic",
+   "request_body": {
+    "status": "processing",
+    "set_paid": true,
+    "currency": "USD",
+    "payment_method": "pubky",
+    "payment_method_title": "Pubky",
+    "customer_note": "Pubky order 9a322a87-925a-41a1-acb3-f668e0bf1065, paid with Pubky. Details and the buyer's messages: https://shop.test/marketplace/orders",
+    "line_items": [
+     {
+      "product_id": 39,
+      "quantity": 1,
+      "subtotal": "125.00",
+      "total": "125.00",
+      "tax_class": "zero-rate"
+     }
+    ],
+    "fee_lines": [
+     {
+      "name": "Pubky order 9a322a87-925a-41a1-acb3-f668e0bf1065",
+      "total": "0.00",
+      "tax_status": "none"
+     },
+     {
+      "name": "Pubky shipping",
+      "total": "12.00",
+      "tax_status": "none"
+     }
+    ],
+    "meta_data": [
+     {
+      "key": "pubky_order_id",
+      "value": "9a322a87-925a-41a1-acb3-f668e0bf1065"
+     },
+     {
+      "key": "pubky_payment_rail",
+      "value": "unknown"
+     },
+     {
+      "key": "pubky_paid_at",
+      "value": "2026-08-19T22:00:00Z"
+     }
+    ]
+   },
+   "status": 201,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8",
+    "location": "https://localhost:8443/wp-json/wc/v3/orders/46"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "id": 46,
+    "parent_id": 0,
+    "status": "processing",
+    "currency": "USD",
+    "version": "11.2.1",
+    "prices_include_tax": true,
+    "date_created": "2026-10-15T20:57:39",
+    "date_modified": "2026-10-15T20:57:39",
+    "discount_total": "0.00",
+    "discount_tax": "0.00",
+    "shipping_total": "0.00",
+    "shipping_tax": "0.00",
+    "cart_tax": "0.00",
+    "total": "137.00",
+    "total_tax": "0.00",
+    "customer_id": 0,
+    "order_key": "wc_order_OUAzGJ1VjFNTT",
+    "billing": {
+     "first_name": "",
+     "last_name": "",
+     "company": "",
+     "address_1": "",
+     "address_2": "",
+     "city": "",
+     "state": "",
+     "postcode": "",
+     "country": "",
+     "email": "",
+     "phone": ""
+    },
+    "shipping": {
+     "first_name": "",
+     "last_name": "",
+     "company": "",
+     "address_1": "",
+     "address_2": "",
+     "city": "",
+     "state": "",
+     "postcode": "",
+     "country": "",
+     "phone": ""
+    },
+    "payment_method": "pubky",
+    "payment_method_title": "Pubky",
+    "transaction_id": "",
+    "customer_ip_address": "",
+    "customer_user_agent": "",
+    "created_via": "rest-api",
+    "customer_note": "Pubky order 9a322a87-925a-41a1-acb3-f668e0bf1065, paid with Pubky. Details and the buyer's messages: https://shop.test/marketplace/orders",
+    "date_completed": null,
+    "date_paid": "2026-10-15T20:57:39",
+    "cart_hash": "",
+    "number": "46",
+    "meta_data": [
+     {
+      "id": 741,
+      "key": "pubky_order_id",
+      "value": "9a322a87-925a-41a1-acb3-f668e0bf1065"
+     },
+     {
+      "id": 742,
+      "key": "pubky_payment_rail",
+      "value": "unknown"
+     },
+     {
+      "id": 743,
+      "key": "pubky_paid_at",
+      "value": "2026-08-19T22:00:00Z"
+     }
+    ],
+    "line_items": [
+     {
+      "id": 10,
+      "name": "Pubky Test Item",
+      "product_id": 39,
+      "variation_id": 0,
+      "quantity": 1,
+      "tax_class": "zero-rate",
+      "subtotal": "125.00",
+      "subtotal_tax": "0.00",
+      "total": "125.00",
+      "total_tax": "0.00",
+      "taxes": [],
+      "meta_data": [
+       {
+        "id": 88,
+        "key": "_reduced_stock",
+        "value": "1",
+        "display_key": "_reduced_stock",
+        "display_value": "1"
+       }
+      ],
+      "sku": "PUBKY-TEST",
+      "global_unique_id": "",
+      "price": 125,
+      "image": {
+       "id": "42",
+       "src": "https://localhost:8443/wp-content/uploads/2026/10/pubky-test-item.png"
+      },
+      "parent_name": null
+     }
+    ],
+    "tax_lines": [],
+    "shipping_lines": [],
+    "fee_lines": [
+     {
+      "id": 11,
+      "name": "Pubky order 9a322a87-925a-41a1-acb3-f668e0bf1065",
+      "tax_class": "",
+      "tax_status": "none",
+      "amount": "",
+      "total": "0.00",
+      "total_tax": "0.00",
+      "taxes": [],
+      "meta_data": []
+     },
+     {
+      "id": 12,
+      "name": "Pubky shipping",
+      "tax_class": "",
+      "tax_status": "none",
+      "amount": "",
+      "total": "12.00",
+      "total_tax": "0.00",
+      "taxes": [],
+      "meta_data": []
+     }
+    ],
+    "coupon_lines": [],
+    "refunds": [],
+    "payment_url": "https://localhost:8443/checkout/order-pay/46/?pay_for_order=true&key=wc_order_OUAzGJ1VjFNTT",
+    "is_editable": false,
+    "needs_payment": false,
+    "needs_processing": true,
+    "date_created_gmt": "2026-10-15T20:57:39",
+    "date_modified_gmt": "2026-10-15T20:57:39",
+    "date_completed_gmt": null,
+    "date_paid_gmt": "2026-10-15T20:57:39",
+    "currency_symbol": "$",
+    "_links": {
+     "self": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/orders/46",
+       "targetHints": {
+        "allow": [
+         "GET",
+         "POST",
+         "PUT",
+         "PATCH",
+         "DELETE"
+        ]
+       }
+      }
+     ],
+     "collection": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/orders"
+      }
+     ],
+     "email_templates": [
+      {
+       "embeddable": true,
+       "href": "https://localhost:8443/wp-json/wc/v3/orders/46/actions/email_templates"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/wp-json/wc/v3/orders",
+   "query": [
+    [
+     "search",
+     "9a322a87-925a-41a1-acb3-f668e0bf1065"
+    ],
+    [
+     "orderby",
+     "id"
+    ],
+    [
+     "order",
+     "asc"
+    ],
+    [
+     "_fields",
+     "id,status,meta_data"
+    ],
+    [
+     "per_page",
+     "100"
+    ],
+    [
+     "page",
+     "1"
+    ]
+   ],
+   "auth": "basic",
+   "request_body": null,
+   "status": 200,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8",
+    "x-wp-total": "1",
+    "x-wp-totalpages": "1"
+   },
+   "response_kind": "json",
+   "response_body": [
+    {
+     "id": 46,
+     "status": "processing",
+     "meta_data": [
+      {
+       "id": 741,
+       "key": "pubky_order_id",
+       "value": "9a322a87-925a-41a1-acb3-f668e0bf1065"
+      },
+      {
+       "id": 742,
+       "key": "pubky_payment_rail",
+       "value": "unknown"
+      },
+      {
+       "id": 743,
+       "key": "pubky_paid_at",
+       "value": "2026-08-19T22:00:00Z"
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "method": "GET",
+   "path": "/wp-json/wc/v3/orders/46",
+   "query": [
+    [
+     "_fields",
+     "id,total,currency,refunds"
+    ]
+   ],
+   "auth": "basic",
+   "request_body": null,
+   "status": 200,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "id": 46,
+    "currency": "USD",
+    "total": "137.00",
+    "refunds": [],
+    "_links": {
+     "self": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/orders/46",
+       "targetHints": {
+        "allow": [
+         "GET",
+         "POST",
+         "PUT",
+         "PATCH",
+         "DELETE"
+        ]
+       }
+      }
+     ],
+     "collection": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/orders"
+      }
+     ],
+     "email_templates": [
+      {
+       "embeddable": true,
+       "href": "https://localhost:8443/wp-json/wc/v3/orders/46/actions/email_templates"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/wp-json/wc/v3/orders/46/refunds",
+   "query": [
+    [
+     "_fields",
+     "id,reason,meta_data"
+    ],
+    [
+     "per_page",
+     "100"
+    ],
+    [
+     "page",
+     "1"
+    ]
+   ],
+   "auth": "basic",
+   "request_body": null,
+   "status": 200,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8",
+    "x-wp-total": "0",
+    "x-wp-totalpages": "0"
+   },
+   "response_kind": "json",
+   "response_body": []
+  },
+  {
+   "method": "POST",
+   "path": "/wp-json/wc/v3/orders/46/refunds",
+   "query": [],
+   "auth": "basic",
+   "request_body": {
+    "amount": "137.00",
+    "reason": "Pubky refund [pubky:9b775218-b7cc-e601-7bf0-69bc397718b4]",
+    "api_refund": false,
+    "meta_data": [
+     {
+      "key": "pubky_refund_id",
+      "value": "9b775218-b7cc-e601-7bf0-69bc397718b4"
+     }
+    ]
+   },
+   "status": 201,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8",
+    "location": "https://localhost:8443/wp-json/wc/v3/orders/(?P<order_id>[\\d]+)/refunds/47"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "id": 47,
+    "date_created": "2026-10-15T20:57:42",
+    "date_created_gmt": "2026-10-15T20:57:42",
+    "amount": "137.00",
+    "reason": "Pubky refund [pubky:9b775218-b7cc-e601-7bf0-69bc397718b4]",
+    "refunded_by": 1,
+    "refunded_payment": false,
+    "meta_data": [
+     {
+      "id": 759,
+      "key": "_refund_type",
+      "value": "full"
+     },
+     {
+      "id": 760,
+      "key": "pubky_refund_id",
+      "value": "9b775218-b7cc-e601-7bf0-69bc397718b4"
+     }
+    ],
+    "line_items": [],
+    "shipping_lines": [],
+    "tax_lines": [],
+    "fee_lines": [],
+    "_links": {
+     "self": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/orders/46/refunds/47",
+       "targetHints": {
+        "allow": [
+         "GET",
+         "DELETE"
+        ]
+       }
+      }
+     ],
+     "collection": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/orders/46/refunds"
+      }
+     ],
+     "up": [
+      {
+       "href": "https://localhost:8443/wp-json/wc/v3/orders/46"
+      }
+     ]
+    }
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/wp-json/wc/v3/orders/46/refunds",
+   "query": [
+    [
+     "_fields",
+     "id,reason,meta_data"
+    ],
+    [
+     "per_page",
+     "100"
+    ],
+    [
+     "page",
+     "1"
+    ]
+   ],
+   "auth": "basic",
+   "request_body": null,
+   "status": 200,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8",
+    "x-wp-total": "1",
+    "x-wp-totalpages": "1"
+   },
+   "response_kind": "json",
+   "response_body": [
+    {
+     "id": 47,
+     "reason": "Pubky refund [pubky:9b775218-b7cc-e601-7bf0-69bc397718b4]",
+     "meta_data": [
+      {
+       "id": 759,
+       "key": "_refund_type",
+       "value": "full"
+      },
+      {
+       "id": 760,
+       "key": "pubky_refund_id",
+       "value": "9b775218-b7cc-e601-7bf0-69bc397718b4"
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

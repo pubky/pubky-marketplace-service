@@ -818,3 +818,50 @@ async fn the_stock_poll_applies_catalog_stock_to_mapped_variants(pool: PgPool) {
     assert_eq!(worker::poll_stock(&s.app.state).await.expect("poll"), 0);
     assert_eq!(listing_available(&s.app, &s.seller.pubky).await.0, 4);
 }
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_shipment_the_marketplace_refuses_is_not_dropped_quietly(pool: PgPool) {
+    let s = shop(pool).await;
+    // A tracking number with a control character is refused by the command's
+    // validation: the store says the order shipped, Pubky would not record it.
+    webhook(
+        &s.app,
+        SHOP,
+        "evt-ship-bad",
+        "fulfillments/create",
+        &json!({ "type": "fulfillment", "order": "ext-1", "carrier": "DHL", "tracking": "JD\u{7}1" }),
+    )
+    .await;
+    worker::drive_inbound(&s.app.state, 10)
+        .await
+        .expect("drive");
+    assert_eq!(
+        inbound(&s.app, "evt-ship-bad").await,
+        (
+            "ignored".to_string(),
+            Some("refused_invalid_command".to_string())
+        )
+    );
+    let (_, alerts) = api(
+        &s.app,
+        "GET",
+        "/v1/connectors/alerts?unresolved=true",
+        Some(&s.seller.token),
+        &json!(null),
+    )
+    .await;
+    let alerts = alerts["alerts"].as_array().expect("alerts");
+    assert_eq!(alerts.len(), 1, "{alerts:?}");
+    assert_eq!(alerts[0]["kind"], "inbound_failed");
+    assert_eq!(alerts[0]["pubky_order_id"], s.order_id);
+    assert!(alerts[0]["detail"]
+        .as_str()
+        .expect("detail")
+        .contains("refused to record"));
+    let state: String = sqlx::query_scalar("SELECT state FROM orders WHERE id = $1::uuid")
+        .bind(&s.order_id)
+        .fetch_one(&s.app.pool)
+        .await
+        .expect("order");
+    assert_eq!(state, "paid", "nothing was shipped");
+}

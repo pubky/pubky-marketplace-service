@@ -1,0 +1,68 @@
+{
+ "label": "p_bad_keys",
+ "exchanges": [
+  {
+   "method": "GET",
+   "path": "/wp-json/",
+   "query": [],
+   "auth": "none",
+   "request_body": null,
+   "status": 200,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "$blob": "212ba14bc01d72fc"
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/wp-json/wc/v3/settings/general/woocommerce_currency",
+   "query": [
+    [
+     "_fields",
+     "id,value"
+    ]
+   ],
+   "auth": "basic",
+   "request_body": null,
+   "status": 401,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "code": "woocommerce_rest_cannot_view",
+    "message": "Sorry, you cannot list resources.",
+    "data": {
+     "status": 401
+    }
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/wp-json/wc/v3/settings/general/woocommerce_currency",
+   "query": [
+    [
+     "_fields",
+     "id,value"
+    ]
+   ],
+   "auth": "query",
+   "request_body": null,
+   "status": 401,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "code": "woocommerce_rest_cannot_view",
+    "message": "Sorry, you cannot list resources.",
+    "data": {
+     "status": 401
+    }
+   }
+  }
+ ]
+}

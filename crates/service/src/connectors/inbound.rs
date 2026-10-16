@@ -826,15 +826,32 @@ async fn apply_tracking(
         .pointer("/error/reason")
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
-    Ok(match (code.as_str(), reason) {
-        ("revision_conflict", _) => Handled::Retry("revision_conflict".to_string()),
-        ("invalid_state", "payment_not_final") => Handled::Retry("payment_not_final".to_string()),
-        ("invalid_state", "order_not_shipped") => Handled::Ignored("order_not_shipped".to_string()),
-        ("invalid_state", "tracking_update_limit") => {
-            Handled::Ignored("tracking_update_limit".to_string())
+    let outcome = match (code.as_str(), reason) {
+        ("revision_conflict", _) => return Ok(Handled::Retry("revision_conflict".to_string())),
+        ("invalid_state", "payment_not_final") => {
+            return Ok(Handled::Retry("payment_not_final".to_string()))
         }
-        ("invalid_state", _) => Handled::Ignored("order_not_shippable".to_string()),
-        ("", _) => Handled::Retry(format!("status_{}", status.as_u16())),
-        (other, _) => Handled::Ignored(format!("refused_{other}")),
-    })
+        ("", _) => return Ok(Handled::Retry(format!("status_{}", status.as_u16()))),
+        ("invalid_state", "order_not_shipped") => "order_not_shipped".to_string(),
+        ("invalid_state", "tracking_update_limit") => "tracking_update_limit".to_string(),
+        ("invalid_state", _) => "order_not_shippable".to_string(),
+        (other, _) => format!("refused_{other}"),
+    };
+    // Any other refusal is final, and it is not quiet: the store says the order
+    // shipped (or its tracking changed) and the marketplace would not record it,
+    // which the seller has to see.
+    store::raise_alert(
+        &state.pool,
+        state.clock.now(),
+        connection,
+        AlertKind::InboundFailed,
+        Some(order_id),
+        &format!(
+            "The store reports this order as shipped, but the marketplace refused to record \
+             it ({code}). Mark the order shipped here yourself."
+        ),
+        &format!("inbound|{}", due.id),
+    )
+    .await?;
+    Ok(Handled::Ignored(outcome))
 }

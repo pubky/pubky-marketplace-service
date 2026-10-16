@@ -246,6 +246,23 @@ pub async fn bind_launch(
     .await
 }
 
+/// Removes a draft that [`begin_draft`] just inserted when the provider then
+/// refused the connect, so a refused attempt leaves nothing behind and never
+/// counts toward the seller's limit. A draft that already existed (a restart
+/// of the same store, whose row `begin_draft` reuses and updates) is kept: it
+/// has `updated_at` after `created_at`, a fresh insert has them equal.
+pub async fn discard_new_draft(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
+    let removed = sqlx::query(
+        "DELETE FROM connector_connections \
+         WHERE id = $1 AND status = 'draft' AND created_at = updated_at",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(removed == 1)
+}
+
 #[derive(Debug)]
 pub enum CompleteError {
     /// The state was already used or the connection changed meanwhile.
@@ -727,6 +744,15 @@ pub async fn disconnect(
     retain_app_secret_until: DateTime<Utc>,
 ) -> Result<bool, sqlx::Error> {
     let mut tx = pool.begin().await?;
+    // The connection row first: anything that swaps the credential holds this
+    // lock while it does, so a swap either completes before the delete below
+    // or finds the connection disconnected.
+    let installed: Option<bool> = sqlx::query_scalar(
+        "SELECT connected_at IS NOT NULL FROM connector_connections WHERE id = $1 FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
     for table in [
         "connector_credentials",
         "connector_recipient_keys",
@@ -738,12 +764,6 @@ pub async fn disconnect(
             .execute(&mut *tx)
             .await?;
     }
-    let installed: Option<bool> = sqlx::query_scalar(
-        "SELECT connected_at IS NOT NULL FROM connector_connections WHERE id = $1 FOR UPDATE",
-    )
-    .bind(id)
-    .fetch_optional(&mut *tx)
-    .await?;
     if installed == Some(true) {
         sqlx::query(
             "UPDATE connector_app_credentials SET \

@@ -1,0 +1,54 @@
+{
+ "label": "p_refused",
+ "exchanges": [
+  {
+   "method": "GET",
+   "path": "/wp-json/",
+   "query": [],
+   "auth": "none",
+   "request_body": null,
+   "status": 301,
+   "response_headers": {
+    "content-type": "text/html; charset=UTF-8",
+    "location": "https://localhost:8443/wp-json/"
+   },
+   "response_kind": null,
+   "response_body": null
+  },
+  {
+   "method": "GET",
+   "path": "/",
+   "query": [
+    [
+     "rest_route",
+     "/"
+    ]
+   ],
+   "auth": "none",
+   "request_body": null,
+   "status": 200,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "$blob": "52ebbeb962e2c502"
+   }
+  },
+  {
+   "method": "GET",
+   "path": "/wp-json/",
+   "query": [],
+   "auth": "none",
+   "request_body": null,
+   "status": 200,
+   "response_headers": {
+    "content-type": "application/json; charset=UTF-8"
+   },
+   "response_kind": "json",
+   "response_body": {
+    "$blob": "29655abdb92dc40b"
+   }
+  }
+ ]
+}
