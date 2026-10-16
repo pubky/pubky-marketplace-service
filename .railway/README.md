@@ -54,21 +54,22 @@ healthcheck configuration.
 
 ### Image pins
 
-Both graphs pin `ghcr.io/bitcoinerrorlog/pubky-marketplace-service@sha256:...`
-(`LIVE_IMAGE` in `railway.ts`, `STAGING_IMAGE` in `railway.staging.ts`). The pin
-moves only when a release closeout PR edits it (last bumped by the
-address-search image pin, PR #81), so it normally trails `main`, and it is
-not the source of truth for what is running: read the image digest of the
-service's active deployment (Railway deployment details, or the revision's
-image on GCP) and the `org.opencontainers.image.revision` label of that image to
-see the deployed commit, or read `commit` from `GET /health` on images built by
-the workflow below (the 12-character source SHA; `unknown` otherwise). The
-image workflow `.github/workflows/production-image.yml` now publishes to
+Both graphs pin `ghcr.io/pubky/pubky-marketplace-service@sha256:...`
+(`STAGING_IMAGE` and `PRODUCTION_IMAGE` in `railway.ts`, `STAGING_IMAGE` in
+`railway.staging.ts`). The pin is not the source of truth for what is
+running: read the image digest of the service's active deployment (Railway
+deployment details, or the revision's image on GCP) and the
+`org.opencontainers.image.revision` label of that image to see the deployed
+commit, or read `commit` from `GET /health` (the 12-character source SHA; `unknown`
+for images built without it). The image workflow
+`.github/workflows/production-image.yml` publishes to
 `ghcr.io/<repository owner>/pubky-marketplace-service` (lowercased, tagged
-`sha-<commit>`), which for this repository is `ghcr.io/pubky/...`; the pins
-above still name the `bitcoinerrorlog` namespace. Before bumping a pin, check
-that the digest exists in the namespace the running service pulls from, and
-make `railway config plan` 0/0/0 before applying.
+`sha-<commit>`), which for this repository is `ghcr.io/pubky/...`. Bump the pin
+in the same PR as every IMAGE connect, and make `railway config plan` 0/0/0
+before applying.
+
+`paykit-server-upstream` and the other services in these projects are not in
+this graph, so their images are not pinned here.
 
 ### Connector worker (staging)
 

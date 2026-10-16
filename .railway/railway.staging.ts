@@ -6,7 +6,7 @@ const STAGING_PROJECT_ID = "c991d768-4a3c-42ea-b5ed-eaa22d4916ed";
 const STAGING_ENVIRONMENT_ID = "c67a6435-bb23-453b-9169-764bfa0312e1";
 // `image()` takes a string only. Bump in the same PR as every staging IMAGE connect.
 const STAGING_IMAGE =
-  "ghcr.io/pubky/pubky-marketplace-service@sha256:561952624a5a8e3b0417ae27bb082ecc444bf0ebc560bc0936e8d628b73de7ce";
+  "ghcr.io/pubky/pubky-marketplace-service@sha256:bb3aae7531694b341aabcb34a7843838d18870f763fae727aef51cd57efabcea";
 
 const stagingEnv = {
   ADDRESS_SEARCH_CLIENT_IP_HEADER: preserve(),
@@ -47,6 +47,7 @@ const stagingEnv = {
   MARKETPLACE_GRANT_REAPER_BATCH_SIZE: preserve(),
   MARKETPLACE_GRANT_RELAY_POLL_MILLISECONDS: preserve(),
   MARKETPLACE_GRANT_RELAY_URL: preserve(),
+  MARKETPLACE_GRANT_SESSION_CLIENT_IDS: preserve(),
   MARKETPLACE_GRANT_SESSION_ENABLED: preserve(),
   MARKETPLACE_GRANT_RESULT_PER_PRINCIPAL_PER_MINUTE: preserve(),
   MARKETPLACE_GRANT_STATUS_PER_FLOW_PER_MINUTE: preserve(),
@@ -86,6 +87,15 @@ const stagingEnv = {
   STRIPE_KEY_ENCRYPTION_KEY: preserve(),
 };
 
+// The multi-asset Paykit contract and the USDT rail. The connector worker
+// does not hold these, so they stay out of `stagingEnv`, which the worker
+// graph is derived from.
+const usdtEnv = {
+  PAYKIT_MARKETPLACE_ASSETS: preserve(),
+  PAYKIT_MARKETPLACE_CONTRACT: preserve(),
+  USDT_PAYMENTS_ENABLED: preserve(),
+};
+
 export default defineRailway((ctx) => {
   const projectId = ctx.projectId ?? process.env.RAILWAY_PROJECT_ID;
   const environmentId = ctx.environmentId ?? process.env.RAILWAY_ENVIRONMENT_ID;
@@ -108,7 +118,7 @@ export default defineRailway((ctx) => {
       overlapSeconds: 60,
       drainingSeconds: 15,
     },
-    env: stagingEnv,
+    env: { ...stagingEnv, ...usdtEnv },
     domains: ["staging-api.pubky.app"],
   });
 
