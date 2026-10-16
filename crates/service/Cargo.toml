@@ -56,3 +56,4 @@ http-body-util.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tower.workspace = true
 marketplace-service = { path = ".", features = ["test-faults"] }
+apollo-compiler = "1.33.0"

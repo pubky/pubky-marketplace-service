@@ -275,6 +275,32 @@ fn urls_json(runtime: &ConnectorRuntime, row: &ConnectionRow) -> Value {
     }
 }
 
+/// How the merchant installs the app (see
+/// [`ConnectorProvider::install_guidance`]); `null` once the connection is
+/// disconnected or when the provider needs no install step. `install_url`
+/// beside it is `null` for Shopify, whose install happens in the Dev
+/// Dashboard.
+fn install_json(runtime: &ConnectorRuntime, row: &ConnectionRow) -> Value {
+    if row.status == "disconnected" {
+        return Value::Null;
+    }
+    let Some(kind) = row.provider_kind() else {
+        return Value::Null;
+    };
+    let (app_url, redirect_url) = match kind {
+        ProviderKind::Shopify => (
+            runtime.settings.shopify_launch_url(row.id),
+            runtime.settings.shopify_callback_url(row.id),
+        ),
+        ProviderKind::Woocommerce => return Value::Null,
+    };
+    runtime
+        .providers
+        .get(kind)
+        .and_then(|provider| provider.install_guidance(&app_url, &redirect_url))
+        .unwrap_or(Value::Null)
+}
+
 struct ConnectionFacts {
     mappings: i64,
     pushes: BTreeMap<String, i64>,
@@ -292,11 +318,14 @@ fn connection_json(
         "provider": row.provider,
         "domain": row.shop,
         "app_kind": row.app_kind,
+        "variant_mode": row.variant_mode,
         "status": row.status,
         "scopes": row.scopes,
         "missing_scopes": row.missing_scopes,
         "credentials_saved": facts.credentials_saved,
         "urls": urls_json(runtime, row),
+        "install_url": Value::Null,
+        "install": install_json(runtime, row),
         "expires_at": (row.status == "draft")
             .then(|| row.connect_expires_at.map(ts))
             .flatten(),
@@ -379,8 +408,49 @@ fn mapping_json(mapping: &MappingRow) -> Value {
     })
 }
 
+/// The one-click entry into the existing Pubky flow that applies to an order
+/// a merchant cancelled or refunded in the store, read from the order's state
+/// now. `None` where no flow applies (the seller has no cancel command of
+/// their own yet). The Shop links `command` on `order_id`; nothing here is
+/// ever done automatically.
+fn alert_action(alert: &AlertRow) -> Option<Value> {
+    if !matches!(
+        alert.kind.as_str(),
+        "merchant_cancelled" | "merchant_refunded"
+    ) {
+        return None;
+    }
+    let order_id = alert.pubky_order_id?;
+    let state = alert.order_state.as_deref()?;
+    let refunded = alert.refund_recorded.unwrap_or(false);
+    let digital = alert.order_fulfillment.as_deref() == Some("digital");
+    match state {
+        "cancel_requested" => Some(json!({
+            "kind": "approve_cancellation",
+            "command": "order.cancel_approve",
+            "order_id": order_id,
+            "label": "Approve the buyer's cancellation request",
+        })),
+        "cancelled" | "return_received" if !refunded => Some(json!({
+            "kind": "record_refund",
+            "command": "refund.record_external",
+            "order_id": order_id,
+            "label": "Record the refund you sent the buyer",
+        })),
+        "delivered" | "completed" if digital && !refunded => Some(json!({
+            "kind": "record_refund",
+            "command": "refund.record_external",
+            "order_id": order_id,
+            "label": "Record the refund you sent the buyer",
+        })),
+        _ => None,
+    }
+}
+
 fn alert_json(alert: &AlertRow) -> Value {
     json!({
+        "action": alert_action(alert),
+        "order_state": alert.order_state,
         "id": alert.id,
         "connection_id": alert.connection_id,
         "kind": alert.kind,
@@ -431,6 +501,10 @@ pub struct StartConnectRequest {
     /// refused until it exists. Omitted means the provider's own kind.
     #[serde(default)]
     app_kind: Option<String>,
+    /// `native` (default) or `split`: whether a store product's variants are
+    /// the variants of one Pubky listing or each its own listing.
+    #[serde(default)]
+    variant_mode: Option<String>,
     #[serde(default)]
     params: Option<Value>,
 }
@@ -486,6 +560,18 @@ pub async fn start_connect(
             )
         }
     }
+    let variant_mode = match request.variant_mode.as_deref() {
+        None => None,
+        Some("native") => Some(false),
+        Some("split") => Some(true),
+        Some(_) => {
+            return error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_variant_mode",
+                "variant_mode must be native or split.",
+            )
+        }
+    };
     let params = request.params.unwrap_or_else(|| json!({}));
     if !params.is_object() || params.to_string().len() > 4096 {
         return error(
@@ -544,6 +630,15 @@ pub async fn start_connect(
         }
         Err(ConnectError::Database(cause)) => return internal("connect start", &cause),
     };
+    let (row, unmapped) = match variant_mode {
+        Some(split) => {
+            match store::set_variant_mode(&state.pool, &row, split, state.clock.now()).await {
+                Ok(switch) => (switch.connection, switch.unmapped),
+                Err(cause) => return internal("variant mode", &cause),
+            }
+        }
+        None => (row, Vec::new()),
+    };
     let app = match runtime.app_for(&state.pool, &row).await {
         Ok(app) => app,
         Err(OpenError::Database(cause)) => return internal("app credentials read", &cause),
@@ -584,6 +679,7 @@ pub async fn start_connect(
             "kind": "connector_connect",
             "connection": view,
             "authorize_url": started.authorize_url,
+            "unmapped_listings": unmapped,
         }),
     )
 }
@@ -952,6 +1048,18 @@ pub async fn put_mappings(
                 },
             }),
         ),
+        Err(MappingError::SharedListing(listing_id)) => respond(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            json!({
+                "schema_version": 1,
+                "ok": false,
+                "error": {
+                    "code": "split_mode_listing_shared",
+                    "message": "In split mode each store variant has its own listing, so a listing can be mapped only once.",
+                    "listing_id": listing_id,
+                },
+            }),
+        ),
         Err(MappingError::Conflict) => error(
             StatusCode::CONFLICT,
             "mapping_conflict",
@@ -963,6 +1071,125 @@ pub async fn put_mappings(
             "The store is not connected.",
         ),
         Err(MappingError::Database(cause)) => internal("mapping save", &cause),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PutSettingsRequest {
+    variant_mode: String,
+}
+
+/// `PUT /v1/connectors/{id}/settings`: how the connection's store variants
+/// relate to Pubky listings. `split` maps each store variant to its own
+/// listing (stock then syncs per listing). Switching to it unmaps every listing
+/// that combines several store variants, in the same step, and says which in
+/// the response (`unmapped_listings`) and in a `listings_unmapped` alert.
+pub async fn put_settings(
+    State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<String>,
+    Json(request): Json<PutSettingsRequest>,
+) -> Response {
+    let runtime = match runtime(&state) {
+        Ok(runtime) => runtime,
+        Err(response) => return response,
+    };
+    let row = match owned(&state, &actor, &id).await {
+        Ok(row) => row,
+        Err(response) => return response,
+    };
+    let split = match request.variant_mode.as_str() {
+        "native" => false,
+        "split" => true,
+        _ => {
+            return error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_variant_mode",
+                "variant_mode must be native or split.",
+            )
+        }
+    };
+    if row.status == "disconnected" {
+        return error(
+            StatusCode::CONFLICT,
+            "connection_not_available",
+            "The connection was disconnected.",
+        );
+    }
+    match store::set_variant_mode(&state.pool, &row, split, state.clock.now()).await {
+        Ok(switch) => match connection_view(&state, runtime, &switch.connection).await {
+            Ok(view) => respond(
+                StatusCode::OK,
+                json!({
+                    "schema_version": 1,
+                    "kind": "connector_settings",
+                    "connection": view,
+                    "unmapped_listings": switch.unmapped,
+                }),
+            ),
+            Err(cause) => internal("connection summary", &cause),
+        },
+        Err(cause) => internal("variant mode", &cause),
+    }
+}
+
+/// `GET /v1/connectors/{id}/check`: a live look at the connection for the
+/// Shop's status page: the store's name, the scopes it granted (and which
+/// required ones are missing), how many locations it has and whether a
+/// catalog read works. Provider errors map like the catalog's.
+pub async fn check_connection(
+    State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<String>,
+) -> Response {
+    let runtime = match runtime(&state) {
+        Ok(runtime) => runtime,
+        Err(response) => return response,
+    };
+    let row = match owned(&state, &actor, &id).await {
+        Ok(row) => row,
+        Err(response) => return response,
+    };
+    if let Err(response) = live(&row) {
+        return response;
+    }
+    let provider = match provider_for(runtime, &row) {
+        Ok(provider) => provider,
+        Err(response) => return response,
+    };
+    let context = match open_or_respond(&state, runtime, &row).await {
+        Ok(context) => context,
+        Err(response) => return response,
+    };
+    match call(runtime, provider.check_connection(&context)).await {
+        Ok(check) => {
+            let missing: Vec<String> = provider
+                .required_scopes()
+                .into_iter()
+                .filter(|scope| !check.granted_scopes.contains(scope))
+                .collect();
+            respond(
+                StatusCode::OK,
+                json!({
+                    "schema_version": 1,
+                    "kind": "connector_check",
+                    "connection_id": row.id,
+                    "shop_name": check.shop_name,
+                    "granted_scopes": check.granted_scopes,
+                    "missing_scopes": missing,
+                    "location_count": check.location_count,
+                    "catalog_readable": check.catalog_readable,
+                    "checked_at": ts(state.clock.now()),
+                }),
+            )
+        }
+        Err(failure) => {
+            if matches!(failure, ProviderError::Unauthorized) {
+                on_unauthorized(&state, &row).await;
+            }
+            provider_failure(StatusCode::BAD_GATEWAY, failure)
+        }
     }
 }
 

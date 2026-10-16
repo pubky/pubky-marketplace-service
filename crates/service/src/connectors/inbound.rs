@@ -33,7 +33,9 @@ use crate::clock::format_timestamp;
 use crate::AppState;
 
 use super::deterministic_uuid;
-use super::provider::{ComplianceTopic, InboundEvent, OrderRef, VerifiedWebhook};
+use super::provider::{
+    ComplianceTopic, InboundEvent, OrderRef, PubkyRefundMark, RefundAmount, VerifiedWebhook,
+};
 use super::stock::{self, StockOutcome};
 use super::store::{self, AlertKind, ConnectionRow};
 use super::ConnectorRuntime;
@@ -82,6 +84,7 @@ struct DueEvent {
     provider_event_id: String,
     event: serde_json::Value,
     attempts: i32,
+    received_at: DateTime<Utc>,
 }
 
 enum Handled {
@@ -109,7 +112,7 @@ pub async fn process_due(
                  WHERE state = 'pending' AND next_attempt_at <= $1 \
                    AND (lease_until IS NULL OR lease_until <= $1) \
                  ORDER BY next_attempt_at, id FOR UPDATE SKIP LOCKED LIMIT 1) \
-             RETURNING id, connection_id, provider_event_id, event, attempts",
+             RETURNING id, connection_id, provider_event_id, event, attempts, received_at",
         )
         .bind(now)
         .bind(lease_until)
@@ -119,7 +122,7 @@ pub async fn process_due(
             break;
         };
         let handled = match serde_json::from_value::<InboundEvent>(due.event.clone()) {
-            Ok(event) => handle(state, &due, event).await?,
+            Ok(event) => handle(state, runtime, &due, event).await?,
             Err(_) => Handled::Ignored("unreadable_event".to_string()),
         };
         let now = state.clock.now();
@@ -189,6 +192,7 @@ async fn settle(
 
 async fn handle(
     state: &AppState,
+    runtime: &ConnectorRuntime,
     due: &DueEvent,
     event: InboundEvent,
 ) -> Result<Handled, sqlx::Error> {
@@ -202,6 +206,15 @@ async fn handle(
     if !connection.is_live() {
         return Ok(Handled::Ignored("connection_not_live".to_string()));
     }
+    let event = match event {
+        InboundEvent::InventoryChanged { inventory_item_id } => {
+            match resolve_inventory(state, runtime, &connection, &inventory_item_id).await? {
+                Ok(resolved) => resolved,
+                Err(handled) => return Ok(handled),
+            }
+        }
+        other => other,
+    };
     match event {
         InboundEvent::StockLevel {
             provider_product_id,
@@ -233,6 +246,9 @@ async fn handle(
                     StockOutcome::Unchanged => Handled::Ignored("unchanged".to_string()),
                     StockOutcome::Ignored(reason) => Handled::Ignored(reason.to_string()),
                     StockOutcome::Retry(reason) => Handled::Retry(reason),
+                    StockOutcome::MappingError(reason) => {
+                        Handled::Ignored(format!("variant_mapping_error: {reason}"))
+                    }
                 },
             )
         }
@@ -244,13 +260,35 @@ async fn handle(
             let Some(order_id) = resolve_order(&state.pool, &connection, &order).await? else {
                 return Ok(Handled::Ignored("unknown_order".to_string()));
             };
-            ship(
+            apply_tracking(
                 state,
+                runtime,
                 &connection,
                 due,
                 order_id,
                 &carrier,
                 &tracking_number,
+                false,
+            )
+            .await
+        }
+        InboundEvent::TrackingUpdated {
+            order,
+            carrier,
+            tracking_number,
+        } => {
+            let Some(order_id) = resolve_order(&state.pool, &connection, &order).await? else {
+                return Ok(Handled::Ignored("unknown_order".to_string()));
+            };
+            apply_tracking(
+                state,
+                runtime,
+                &connection,
+                due,
+                order_id,
+                &carrier,
+                &tracking_number,
+                true,
             )
             .await
         }
@@ -258,6 +296,19 @@ async fn handle(
             let Some(order_id) = resolve_order(&state.pool, &connection, &order).await? else {
                 return Ok(Handled::Ignored("unknown_order".to_string()));
             };
+            match mirror_echo(
+                &state.pool,
+                &connection,
+                order_id,
+                EchoOf::Cancel,
+                due.received_at,
+            )
+            .await?
+            {
+                Echo::Yes => return Ok(Handled::Ignored("pubky_cancel_echo".to_string())),
+                Echo::InFlight => return Ok(Handled::Retry("pubky_cancel_in_flight".to_string())),
+                Echo::No => {}
+            }
             let why = reason
                 .map(|reason| format!(" Reason given: {reason}."))
                 .unwrap_or_default();
@@ -284,31 +335,33 @@ async fn handle(
             amount_minor,
             currency,
         } => {
-            let Some(order_id) = resolve_order(&state.pool, &connection, &order).await? else {
-                return Ok(Handled::Ignored("unknown_order".to_string()));
+            let amounts = match (amount_minor, currency) {
+                (Some(amount_minor), Some(currency)) => vec![RefundAmount {
+                    currency,
+                    amount_minor,
+                }],
+                _ => Vec::new(),
             };
-            let amount = match (amount_minor, currency) {
-                (Some(amount), Some(currency)) => format!(" ({amount} minor units {currency})"),
-                (Some(amount), None) => format!(" ({amount} minor units)"),
-                _ => String::new(),
+            let echo = EchoOf::Refund {
+                mark: None,
+                amounts: &amounts,
+                by_amount: true,
+                amount_known: amount_minor.is_some(),
             };
-            store::raise_alert(
-                &state.pool,
-                now,
-                &connection,
-                AlertKind::MerchantRefunded,
-                Some(order_id),
-                &format!(
-                    "The order was refunded in the store{amount}. Nothing was sent to the \
-                     buyer from here: record or send the refund yourself."
-                ),
-                &format!(
-                    "merchant-refund|{}|{}",
-                    connection.id, due.provider_event_id
-                ),
-            )
-            .await?;
-            Ok(Handled::Applied("seller alerted".to_string()))
+            store_refund(state, &connection, due, &order, &amounts, echo, now).await
+        }
+        InboundEvent::StoreRefund {
+            order,
+            amounts,
+            mark,
+        } => {
+            let echo = EchoOf::Refund {
+                mark: mark.as_ref(),
+                amounts: &amounts,
+                by_amount: false,
+                amount_known: true,
+            };
+            store_refund(state, &connection, due, &order, &amounts, echo, now).await
         }
         InboundEvent::AppUninstalled => {
             store::disconnect(&state.pool, connection.id, now, retention_end(now)).await?;
@@ -325,7 +378,9 @@ async fn handle(
             .await?;
             Ok(Handled::Applied("connection closed".to_string()))
         }
-        InboundEvent::Compliance { .. } => unreachable!("handled above"),
+        InboundEvent::Compliance { .. } | InboundEvent::InventoryChanged { .. } => {
+            unreachable!("handled above")
+        }
         InboundEvent::Ignored { reason } => Ok(Handled::Ignored(reason)),
     }
 }
@@ -357,6 +412,272 @@ async fn compliance(
             Ok(Handled::Applied("store data deleted".to_string()))
         }
     }
+}
+
+/// How long after a mirrored cancel or refund finished the store's webhook for
+/// it is still treated as its echo. The store reports its own change within
+/// seconds; this allows for the webhook queue and a few delivery retries while
+/// keeping the window in which a real merchant action could be mistaken for the
+/// echo short. A webhook later than this raises an alert even if it was the
+/// echo: a spurious alert is cheap, a swallowed refund is not.
+pub const ECHO_WINDOW: chrono::Duration = chrono::Duration::hours(6);
+
+enum EchoOf<'a> {
+    Cancel,
+    Refund {
+        /// What the provider wrote on a refund it created, read back from the
+        /// webhook.
+        mark: Option<&'a PubkyRefundMark>,
+        amounts: &'a [RefundAmount],
+        /// A provider with no mark (the simple `Refund` event): match on the
+        /// recorded amount instead.
+        by_amount: bool,
+        amount_known: bool,
+    },
+}
+
+enum Echo {
+    /// The webhook reports a change this connector applied.
+    Yes,
+    /// The mirror that would explain it is still running; look again later.
+    InFlight,
+    /// Not an echo: the merchant acted.
+    No,
+}
+
+#[derive(sqlx::FromRow)]
+struct MirrorRow {
+    action_key: String,
+    state: String,
+    payload: serde_json::Value,
+}
+
+/// Whether a store cancel or refund webhook is the echo of a mirror this
+/// connector applied. Only a mirror that was **applied** (state `done`),
+/// whose action existed before the webhook arrived and finished at most
+/// [`ECHO_WINDOW`] before it, counts; a mirror that never reached the store
+/// (pending, quarantined) explains nothing. For a refund the store's refund
+/// must also carry the Pubky refund id this connector wrote on it and the
+/// amount it created. A mirror still running when the webhook is handled
+/// answers [`Echo::InFlight`], so the webhook is looked at again once it is
+/// settled instead of being judged on a half-written state.
+async fn mirror_echo(
+    pool: &PgPool,
+    connection: &ConnectionRow,
+    order_id: Uuid,
+    of: EchoOf<'_>,
+    received_at: DateTime<Utc>,
+) -> Result<Echo, sqlx::Error> {
+    let kind = match of {
+        EchoOf::Cancel => "cancel",
+        EchoOf::Refund { .. } => "refund",
+    };
+    let rows: Vec<MirrorRow> = sqlx::query_as(
+        "SELECT a.action_key, a.state, a.payload \
+         FROM connector_order_actions a \
+         JOIN connector_order_push p ON p.id = a.push_id \
+         WHERE p.connection_id = $1 AND p.pubky_order_id = $2 AND a.kind = $3 \
+           AND a.created_at <= $4 \
+           AND (a.state = 'sending' \
+                OR (a.state = 'done' AND a.updated_at >= $5)) \
+         ORDER BY a.updated_at DESC",
+    )
+    .bind(connection.id)
+    .bind(order_id)
+    .bind(kind)
+    .bind(received_at)
+    .bind(received_at - ECHO_WINDOW)
+    .fetch_all(pool)
+    .await?;
+    let mut in_flight = false;
+    for row in &rows {
+        let applies = match &of {
+            EchoOf::Cancel => true,
+            EchoOf::Refund {
+                mark: Some(mark), ..
+            } => row.action_key == mark.refund_id,
+            EchoOf::Refund {
+                mark: None,
+                by_amount: true,
+                ..
+            } => true,
+            EchoOf::Refund {
+                mark: None,
+                by_amount: false,
+                ..
+            } => false,
+        };
+        if !applies {
+            continue;
+        }
+        if row.state == "sending" {
+            in_flight = true;
+            continue;
+        }
+        let matches = match &of {
+            EchoOf::Cancel => true,
+            EchoOf::Refund {
+                mark: Some(mark),
+                amounts,
+                ..
+            } => {
+                amounts.len() == 1
+                    && amounts[0]
+                        .currency
+                        .eq_ignore_ascii_case(&mark.amount.currency)
+                    && amounts[0].amount_minor == mark.amount.amount_minor
+            }
+            EchoOf::Refund {
+                mark: None,
+                amounts,
+                amount_known,
+                ..
+            } => {
+                !*amount_known
+                    || match (*amounts, row.payload.get("amount_minor")) {
+                        ([only], Some(recorded)) => {
+                            recorded.as_i64() == Some(only.amount_minor)
+                                && row
+                                    .payload
+                                    .get("order_currency")
+                                    .and_then(serde_json::Value::as_str)
+                                    .is_none_or(|currency| {
+                                        currency.eq_ignore_ascii_case(&only.currency)
+                                    })
+                        }
+                        _ => false,
+                    }
+            }
+        };
+        if matches {
+            return Ok(Echo::Yes);
+        }
+    }
+    Ok(if in_flight { Echo::InFlight } else { Echo::No })
+}
+
+/// The seller alert for a refund made in the store, unless it is the echo of
+/// one this connector mirrored.
+async fn store_refund(
+    state: &AppState,
+    connection: &ConnectionRow,
+    due: &DueEvent,
+    order: &OrderRef,
+    amounts: &[RefundAmount],
+    echo: EchoOf<'_>,
+    now: DateTime<Utc>,
+) -> Result<Handled, sqlx::Error> {
+    let Some(order_id) = resolve_order(&state.pool, connection, order).await? else {
+        return Ok(Handled::Ignored("unknown_order".to_string()));
+    };
+    match mirror_echo(&state.pool, connection, order_id, echo, due.received_at).await? {
+        Echo::Yes => return Ok(Handled::Ignored("pubky_refund_echo".to_string())),
+        Echo::InFlight => return Ok(Handled::Retry("pubky_refund_in_flight".to_string())),
+        Echo::No => {}
+    }
+    let order_currency: Option<String> =
+        sqlx::query_scalar("SELECT currency FROM orders WHERE id = $1")
+            .bind(order_id)
+            .fetch_optional(&state.pool)
+            .await?;
+    let amount = describe_refund(amounts, order_currency.as_deref());
+    store::raise_alert(
+        &state.pool,
+        now,
+        connection,
+        AlertKind::MerchantRefunded,
+        Some(order_id),
+        &format!(
+            "The order was refunded in the store{amount}. Nothing was sent to the \
+             buyer from here: record or send the refund yourself."
+        ),
+        &format!(
+            "merchant-refund|{}|{}",
+            connection.id, due.provider_event_id
+        ),
+    )
+    .await?;
+    Ok(Handled::Applied("seller alerted".to_string()))
+}
+
+/// " (125.00 USD)" style text for the alert; says so when the store refunded
+/// in a currency other than the order's, or in several.
+fn describe_refund(amounts: &[RefundAmount], order_currency: Option<&str>) -> String {
+    if amounts.is_empty() {
+        return String::new();
+    }
+    let listed = amounts
+        .iter()
+        .map(|amount| format!("{} minor units {}", amount.amount_minor, amount.currency))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let foreign = order_currency.is_some_and(|order| {
+        amounts
+            .iter()
+            .any(|amount| !amount.currency.eq_ignore_ascii_case(order))
+    });
+    if amounts.len() > 1 {
+        format!(
+            " ({listed}); the store refunded in more than one currency, so check the amounts before recording anything"
+        )
+    } else if foreign {
+        format!(
+            " ({listed}); the order is in {}, so the amount is not directly comparable",
+            order_currency.unwrap_or_default()
+        )
+    } else {
+        format!(" ({listed})")
+    }
+}
+
+/// Turns a store inventory-item change into the variant and stock it means.
+/// `Err` carries the final disposition when there is nothing to apply.
+async fn resolve_inventory(
+    state: &AppState,
+    runtime: &ConnectorRuntime,
+    connection: &ConnectionRow,
+    inventory_item_id: &str,
+) -> Result<Result<InboundEvent, Handled>, sqlx::Error> {
+    let Some(provider) = connection
+        .provider_kind()
+        .and_then(|kind| runtime.providers.get(kind))
+    else {
+        return Ok(Err(Handled::Ignored("provider_unavailable".to_string())));
+    };
+    let context = match runtime.open(&state.pool, connection).await {
+        Ok(context) => context,
+        Err(store::OpenError::Database(error)) => return Err(error),
+        Err(_) => return Ok(Err(Handled::Retry("connection_unavailable".to_string()))),
+    };
+    let resolved = tokio::time::timeout(
+        runtime.settings.provider_timeout,
+        provider.resolve_inventory(&context, inventory_item_id),
+    )
+    .await;
+    Ok(match resolved {
+        Ok(Ok(Some(stock))) => match stock.available {
+            Some(available) => Ok(InboundEvent::StockLevel {
+                provider_product_id: stock.provider_product_id,
+                provider_variant_id: stock.provider_variant_id,
+                available,
+            }),
+            None => Err(Handled::Ignored("stock_not_tracked".to_string())),
+        },
+        Ok(Ok(None)) => Err(Handled::Ignored("not_a_variant".to_string())),
+        Ok(Err(super::provider::ProviderError::Unauthorized)) => {
+            Err(Handled::Ignored("credentials_rejected".to_string()))
+        }
+        Ok(Err(
+            super::provider::ProviderError::Rejected { .. }
+            | super::provider::ProviderError::Invalid(_),
+        )) => Err(Handled::Ignored("provider_rejected".to_string())),
+        Ok(Err(super::provider::ProviderError::RateLimited { .. })) => {
+            Err(Handled::Retry("rate_limited".to_string()))
+        }
+        Ok(Err(super::provider::ProviderError::Unknown(_))) | Err(_) => {
+            Err(Handled::Retry("provider_unavailable".to_string()))
+        }
+    })
 }
 
 fn retention_end(now: DateTime<Utc>) -> DateTime<Utc> {
@@ -394,18 +715,31 @@ async fn resolve_order(
     .await
 }
 
-async fn ship(
+/// Marks the Pubky order shipped, or adds or changes its tracking, from what
+/// the store reports.
+///
+/// * A paid order is shipped. Without a tracking number (the store fulfilled
+///   it with none) it is shipped with whatever carrier the store named, or
+///   `Other`, when this service has optional tracking
+///   ([`ConnectorRuntime::optional_tracking`]); a service without it ignores
+///   such a fulfilment, as before.
+/// * A shipped order whose tracking the store adds or changes gets
+///   `fulfillment.update_tracking`. A second fulfilment (a later parcel) never
+///   replaces tracking the order already has: only an update does.
+/// * Anything else is ignored: the order is not in a shippable state.
+#[allow(clippy::too_many_arguments)]
+async fn apply_tracking(
     state: &AppState,
+    runtime: &ConnectorRuntime,
     connection: &ConnectionRow,
     due: &DueEvent,
     order_id: Uuid,
     carrier: &str,
     tracking_number: &str,
+    replace_existing: bool,
 ) -> Result<Handled, sqlx::Error> {
     let tracking: String = tracking_number.trim().chars().take(200).collect();
-    if tracking.is_empty() {
-        return Ok(Handled::Ignored("no_tracking_number".to_string()));
-    }
+    let tracking = (!tracking.is_empty()).then_some(tracking);
     let carrier: String = {
         let trimmed: String = carrier.trim().chars().take(100).collect();
         if trimmed.is_empty() {
@@ -414,39 +748,93 @@ async fn ship(
             trimmed
         }
     };
-    let revision: Option<i64> = sqlx::query_scalar("SELECT revision FROM orders WHERE id = $1")
-        .bind(order_id)
-        .fetch_optional(&state.pool)
-        .await?;
-    let Some(revision) = revision else {
+    let order: Option<(i64, String, Option<serde_json::Value>)> =
+        sqlx::query_as("SELECT revision, state, shipment FROM orders WHERE id = $1")
+            .bind(order_id)
+            .fetch_optional(&state.pool)
+            .await?;
+    let Some((revision, order_state, shipment)) = order else {
         return Ok(Handled::Ignored("order_missing".to_string()));
+    };
+    let (kind, payload, applied) = match order_state.as_str() {
+        "paid" | "processing" => {
+            if tracking.is_none() && !runtime.optional_tracking {
+                return Ok(Handled::Ignored(
+                    "tracking_commands_unavailable".to_string(),
+                ));
+            }
+            let mut payload = json!({ "order_id": order_id, "carrier": carrier });
+            if let Some(number) = &tracking {
+                payload["tracking_number"] = json!(number);
+            }
+            ("fulfillment.ship", payload, "shipped")
+        }
+        "shipped" => {
+            let Some(number) = tracking else {
+                return Ok(Handled::Ignored("no_tracking_number".to_string()));
+            };
+            let existing = shipment
+                .as_ref()
+                .and_then(|shipment| shipment.get("tracking_number"))
+                .and_then(serde_json::Value::as_str);
+            let existing_carrier = shipment
+                .as_ref()
+                .and_then(|shipment| shipment.get("carrier"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if existing == Some(number.as_str()) && existing_carrier.eq_ignore_ascii_case(&carrier)
+            {
+                return Ok(Handled::Ignored("tracking_unchanged".to_string()));
+            }
+            if existing.is_some() && !replace_existing {
+                return Ok(Handled::Ignored(
+                    "already_shipped_with_tracking".to_string(),
+                ));
+            }
+            if !runtime.optional_tracking {
+                return Ok(Handled::Ignored(
+                    "tracking_commands_unavailable".to_string(),
+                ));
+            }
+            (
+                "fulfillment.update_tracking",
+                json!({ "order_id": order_id, "carrier": carrier, "tracking_number": number }),
+                "tracking updated",
+            )
+        }
+        _ => return Ok(Handled::Ignored("order_not_shippable".to_string())),
     };
     let raw = json!({
         "version": 1,
-        "command_id": deterministic_uuid(&format!("connector-ship|{}", due.id)),
+        "command_id": deterministic_uuid(&format!("connector-tracking|{}", due.id)),
         "aggregate_id": marketplace_domain::ids::order_aggregate_id(order_id),
         "expected_revision": revision,
         "issued_at": format_timestamp(state.clock.now()),
-        "kind": "fulfillment.ship",
-        "payload": {
-            "order_id": order_id,
-            "carrier": carrier,
-            "tracking_number": tracking,
-        },
+        "kind": kind,
+        "payload": payload,
     });
     let (status, body) = crate::executor::execute(state, &connection.seller_pubky, &raw).await?;
     if status.is_success() {
-        return Ok(Handled::Applied("shipped".to_string()));
+        return Ok(Handled::Applied(applied.to_string()));
     }
     let code = body
         .pointer("/error/code")
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default()
         .to_ascii_lowercase();
-    Ok(match code.as_str() {
-        "revision_conflict" => Handled::Retry("revision_conflict".to_string()),
-        "invalid_state" => Handled::Ignored("order_not_shippable".to_string()),
-        "" => Handled::Retry(format!("status_{}", status.as_u16())),
-        other => Handled::Ignored(format!("refused_{other}")),
+    let reason = body
+        .pointer("/error/reason")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    Ok(match (code.as_str(), reason) {
+        ("revision_conflict", _) => Handled::Retry("revision_conflict".to_string()),
+        ("invalid_state", "payment_not_final") => Handled::Retry("payment_not_final".to_string()),
+        ("invalid_state", "order_not_shipped") => Handled::Ignored("order_not_shipped".to_string()),
+        ("invalid_state", "tracking_update_limit") => {
+            Handled::Ignored("tracking_update_limit".to_string())
+        }
+        ("invalid_state", _) => Handled::Ignored("order_not_shippable".to_string()),
+        ("", _) => Handled::Retry(format!("status_{}", status.as_u16())),
+        (other, _) => Handled::Ignored(format!("refused_{other}")),
     })
 }

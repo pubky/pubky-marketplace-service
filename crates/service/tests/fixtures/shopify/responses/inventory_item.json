@@ -1,0 +1,14 @@
+{
+  "_provenance": "spec-derived: shape of the InventoryItemVariant document against the 2026-10 schema; not a capture",
+  "data": {
+    "inventoryItem": {
+      "id": "gid://shopify/InventoryItem/4242",
+      "tracked": true,
+      "variant": {
+        "id": "gid://shopify/ProductVariant/50003",
+        "inventoryQuantity": 3,
+        "product": { "id": "gid://shopify/Product/9001" }
+      }
+    }
+  }
+}

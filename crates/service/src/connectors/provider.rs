@@ -472,6 +472,42 @@ pub enum ComplianceTopic {
     ShopRedact,
 }
 
+/// An amount a store refunded, in one currency's minor units.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefundAmount {
+    pub currency: String,
+    pub amount_minor: i64,
+}
+
+/// What a provider wrote on a store refund it created for a Pubky refund, read
+/// back from the store's refund webhook: the Pubky refund id
+/// ([`RefundRecord::refund_id`]) and the amount it created, so an echo is
+/// matched on identity **and** amount.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PubkyRefundMark {
+    pub refund_id: String,
+    pub amount: RefundAmount,
+}
+
+/// A store variant's current sellable stock, found from an inventory item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedStock {
+    pub provider_product_id: String,
+    pub provider_variant_id: String,
+    /// Units the store can sell, summed over its locations; `None` when the
+    /// store does not track this variant's stock.
+    pub available: Option<i64>,
+}
+
+/// What a live check of a connection found, for the Shop's status page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectionCheck {
+    pub shop_name: String,
+    pub granted_scopes: Vec<String>,
+    pub location_count: i64,
+    pub catalog_readable: bool,
+}
+
 /// What an inbound webhook means to Pubky.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -483,8 +519,23 @@ pub enum InboundEvent {
         provider_variant_id: String,
         available: i64,
     },
-    /// A shipment with tracking for an order the push created.
+    /// A store inventory item changed. The webhook names the item, not the
+    /// variant or the total, so the framework asks the provider
+    /// ([`ConnectorProvider::resolve_inventory`]) which variant it is and
+    /// what the store can now sell, then applies it like a `StockLevel`.
+    InventoryChanged { inventory_item_id: String },
+    /// A shipment for an order the push created. `tracking_number` is empty
+    /// when the store fulfilled the order without one (carrier `Other` then):
+    /// the Pubky order is still marked shipped, and the number is added later
+    /// by a [`InboundEvent::TrackingUpdated`].
     Fulfillment {
+        order: OrderRef,
+        carrier: String,
+        tracking_number: String,
+    },
+    /// Tracking added or changed in the store after the shipment. Syncs to the
+    /// Pubky order through `fulfillment.update_tracking`.
+    TrackingUpdated {
         order: OrderRef,
         carrier: String,
         tracking_number: String,
@@ -501,6 +552,16 @@ pub enum InboundEvent {
         order: OrderRef,
         amount_minor: Option<i64>,
         currency: Option<String>,
+    },
+    /// The same event for a provider that can say more: what the store
+    /// refunded **per currency**, and the mark of a refund this service
+    /// itself created there ([`PubkyRefundMark`]), which is what lets the
+    /// framework tell an echo of its own mirrored refund from a refund the
+    /// merchant made. Raises a seller alert, never a refund.
+    StoreRefund {
+        order: OrderRef,
+        amounts: Vec<RefundAmount>,
+        mark: Option<PubkyRefundMark>,
     },
     /// The merchant removed the app. The credential is deleted.
     AppUninstalled,
@@ -552,6 +613,16 @@ pub trait ConnectorProvider: Send + Sync + 'static {
     /// connection in `needs_attention` with the missing names.
     fn required_scopes(&self) -> Vec<String> {
         Vec::new()
+    }
+
+    /// How the merchant installs the app on their store, for the Shop to show
+    /// next to the connection's URLs: a JSON object (`method`, `where`,
+    /// `app_url`, `redirect_url`, `note`) or `None` for a provider that needs
+    /// no merchant-side install (WooCommerce sends the merchant straight to the
+    /// store). The service builds no install link when the provider's own
+    /// documentation does not confirm that one would install the app.
+    fn install_guidance(&self, _app_url: &str, _redirect_url: &str) -> Option<serde_json::Value> {
+        None
     }
 
     /// Starts a connection after the seller's connect request. Returns where
@@ -618,6 +689,30 @@ pub trait ConnectorProvider: Send + Sync + 'static {
         page: Option<&str>,
     ) -> Result<CatalogPage, ProviderError>;
 
+    /// The variant, and its total sellable stock, behind a store inventory
+    /// item (see [`InboundEvent::InventoryChanged`]). `Ok(None)` when the
+    /// item is not a product variant. Providers whose stock webhooks already
+    /// name the variant keep the default.
+    async fn resolve_inventory(
+        &self,
+        _connection: &ConnectionContext,
+        _inventory_item_id: &str,
+    ) -> Result<Option<ResolvedStock>, ProviderError> {
+        Ok(None)
+    }
+
+    /// A live look at the connection for the Shop's status page: the store's
+    /// name, the scopes it granted, how many locations it has and whether a
+    /// catalog read works. Providers without one keep the default.
+    async fn check_connection(
+        &self,
+        _connection: &ConnectionContext,
+    ) -> Result<ConnectionCheck, ProviderError> {
+        Err(ProviderError::Invalid(
+            "this provider has no connection check".into(),
+        ))
+    }
+
     /// Creates the store order. Called only after the ledger row is
     /// `sending`.
     async fn push_order(
@@ -625,6 +720,21 @@ pub trait ConnectorProvider: Send + Sync + 'static {
         connection: &ConnectionContext,
         order: &OrderPush,
     ) -> Result<ExternalOrder, ProviderError>;
+
+    /// Called once after a push created the store order: a provider that can
+    /// read the order back says whether it is what the buyer paid (the total,
+    /// and no tax the store added). `Ok(Some(message))` is a sentence for the
+    /// seller, who gets an alert; the order stays created. Providers that do
+    /// not check keep the default. An error is logged and ignored: the order
+    /// exists either way.
+    async fn verify_pushed_order(
+        &self,
+        _connection: &ConnectionContext,
+        _created: &ExternalOrder,
+        _pushed: &OrderPush,
+    ) -> Result<Option<String>, ProviderError> {
+        Ok(None)
+    }
 
     /// Looks up an order a push may already have created, by the Pubky order
     /// id the push stamped on it.

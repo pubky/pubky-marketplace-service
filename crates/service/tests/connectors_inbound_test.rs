@@ -377,7 +377,7 @@ async fn a_fulfillment_webhook_ships_the_pubky_order_with_its_tracking(pool: PgP
         inbound(&s.app, "evt-ship-2").await,
         (
             "ignored".to_string(),
-            Some("order_not_shippable".to_string())
+            Some("already_shipped_with_tracking".to_string())
         )
     );
     let tracking: String =

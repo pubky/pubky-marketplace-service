@@ -8,6 +8,7 @@ pub mod fx_feed;
 pub mod paykit_review;
 pub mod paykit_server_67_75;
 pub mod paykit_server_u4;
+pub mod shopify_fake;
 
 use std::sync::Arc;
 

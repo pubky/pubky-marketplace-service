@@ -1,0 +1,14 @@
+query RecentOrders($first: Int!, $after: String) {
+  orders(first: $first, after: $after, sortKey: CREATED_AT, reverse: true) {
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+    nodes {
+      id
+      tags
+      cancelledAt
+      createdAt
+    }
+  }
+}

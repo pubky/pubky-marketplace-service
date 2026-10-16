@@ -1,0 +1,25 @@
+query OrderTransactions($id: ID!) {
+  order(id: $id) {
+    id
+    currencyCode
+    cancelledAt
+    totalRefundedSet {
+      shopMoney {
+        amount
+        currencyCode
+      }
+    }
+    transactions(first: 50) {
+      id
+      kind
+      status
+      gateway
+      amountSet {
+        shopMoney {
+          amount
+          currencyCode
+        }
+      }
+    }
+  }
+}
