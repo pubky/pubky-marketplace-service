@@ -378,6 +378,9 @@ def self_check() -> None:
             raise RuntimeError(f"digital listing query must skip tombstoned listings ({kind})")
         if "c.paypal_merchant_email IS NOT NULL" not in query:
             raise RuntimeError(f"digital listing query must require a seller payment rail ({kind})")
+    for shipping_case in (True, False):
+        if "l.deleted_at IS NULL" not in listing_pick_query(shipping=shipping_case)[0]:
+            raise RuntimeError("shipping and pickup listing picks must skip tombstoned listings")
     for bad in (
         lambda: checkout_body(
             digital_listing, str(uuid.uuid4()), fulfillment="digital", address=SHIPPING_ADDRESSES["ca_iso_suffix"]
@@ -658,9 +661,7 @@ def parse_listing_rows(raw: str) -> list[dict[str, Any]]:
     return rows
 
 
-def pick_listing(
-    *, shipping: bool, exclude: set[str] | None = None, require_bind: bool = False
-) -> dict[str, Any]:
+def listing_pick_query(*, shipping: bool, exclude: set[str] | None = None) -> tuple[str, str]:
     if shipping:
         clause = "AND l.fulfillment_methods::text LIKE '%shipping%'"
         label = "shipping"
@@ -674,7 +675,7 @@ def pick_listing(
     if exclude:
         ids = ",".join(f"'{quote(item)}'" for item in sorted(exclude))
         excluded = f"AND l.aggregate_id NOT IN ({ids}) "
-    raw = sql(
+    query = (
         "SELECT l.aggregate_id || '|' || l.seller_pubky || '|' || l.server_revision::text "
         "|| '|' || l.available_quantity::text || '|' || l.fulfillment_methods::text "
         "|| '|' || CASE "
@@ -682,13 +683,22 @@ def pick_listing(
         "ELSE '' END "
         "FROM listings l "
         "LEFT JOIN seller_payment_configs c ON c.seller_pubky = l.seller_pubky "
-        "WHERE l.sale_format='fixed_price' AND l.state='available' AND l.available_quantity=1 "
+        "WHERE l.deleted_at IS NULL "
+        "AND l.sale_format='fixed_price' AND l.state='available' AND l.available_quantity=1 "
         "AND l.reserved_quantity=0 "
         f"{clause} {excluded}"
         "ORDER BY (CASE "
         "WHEN c.paypal_merchant_email IS NOT NULL AND btrim(c.paypal_merchant_email) <> '' THEN 0 "
         "ELSE 1 END), l.updated_at DESC NULLS LAST LIMIT 5;"
     )
+    return query, label
+
+
+def pick_listing(
+    *, shipping: bool, exclude: set[str] | None = None, require_bind: bool = False
+) -> dict[str, Any]:
+    query, label = listing_pick_query(shipping=shipping, exclude=exclude)
+    raw = sql(query)
     rows = parse_listing_rows(raw)
     if require_bind:
         rows = [row for row in rows if row.get("bind_method") == "paypal"]
