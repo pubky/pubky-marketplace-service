@@ -30,7 +30,7 @@ if [ "${KEEP:-0}" != 1 ]; then
   $DOCKER compose --profile tools down -v
   rm -f .local/admin-key
 fi
-$DOCKER compose up -d
+$DOCKER compose up -d --wait
 echo "waiting for WordPress..."
 for _ in $(seq 1 60); do
   curl -s --cacert certs/ca.pem -o /dev/null https://localhost:8444/ && break

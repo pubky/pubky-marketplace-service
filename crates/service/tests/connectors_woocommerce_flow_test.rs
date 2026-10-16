@@ -1445,3 +1445,155 @@ async fn two_replacements_of_the_same_keys_never_both_apply(pool: PgPool) {
         side.replay.as_ref().expect("replay").assert_no_misses();
     }
 }
+
+/// Converts the listing to per-variant rows the way migration 0070's tables
+/// hold them: one keyed row per variant replaces the implicit row, and the
+/// listing's committed units stay on the first variant.
+async fn convert_to_variant_rows(app: &common::TestApp, aggregate: &str, rows: &[(&str, i64)]) {
+    let mut tx = app.pool.begin().await.expect("tx");
+    let (reserved, sold): (i64, i64) = sqlx::query_as(
+        "SELECT reserved_quantity, sold_quantity FROM listings WHERE aggregate_id = $1",
+    )
+    .bind(aggregate)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("listing");
+    for (index, (variant, available)) in rows.iter().enumerate() {
+        let (held, gone) = if index == 0 { (reserved, sold) } else { (0, 0) };
+        sqlx::query(
+            "INSERT INTO listing_variant_inventory (listing_aggregate_id, variant_id, position, \
+             total_quantity, available_quantity, reserved_quantity, sold_quantity) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(aggregate)
+        .bind(variant)
+        .bind(index as i32)
+        .bind(available + held + gone)
+        .bind(available)
+        .bind(held)
+        .bind(gone)
+        .execute(&mut *tx)
+        .await
+        .expect("variant row");
+    }
+    sqlx::query(
+        "DELETE FROM listing_variant_inventory WHERE listing_aggregate_id = $1 AND variant_id = ''",
+    )
+    .bind(aggregate)
+    .execute(&mut *tx)
+    .await
+    .expect("drop the implicit row");
+    tx.commit().await.expect("commit");
+}
+
+async fn variant_rows(app: &common::TestApp, aggregate: &str) -> Vec<(String, i64)> {
+    sqlx::query_as(
+        "SELECT variant_id, available_quantity FROM listing_variant_inventory \
+         WHERE listing_aggregate_id = $1 ORDER BY position",
+    )
+    .bind(aggregate)
+    .fetch_all(&app.pool)
+    .await
+    .expect("variant rows")
+}
+
+async fn set_variation_stock(side: &StoreSide, quantity: i64) {
+    if side.is_live() {
+        side.live()
+            .rest(
+                "PUT",
+                &format!("/wc/v3/products/{SOCKS}/variations/{SOCKS_S}"),
+                Some(json!({"manage_stock": true, "stock_quantity": quantity})),
+            )
+            .await;
+    }
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_variable_product_on_a_keyed_listing_lands_on_each_variations_own_row(pool: PgPool) {
+    let side = StoreSide::open("flow_n").await;
+    if side.is_live() {
+        reset_store(side.live()).await;
+    }
+    let app = woo_app(pool, side.provider(7)).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (connection, _) = connect_via_routes(&app, &seller, &side).await;
+    create_paid_order(&app, &seller, &buyer).await;
+    let aggregate = format!("listing:{}_boots_01", seller.pubky);
+    convert_to_variant_rows(&app, &aggregate, &[("a", 1), ("b", 1)]).await;
+
+    // Two variations of the store's variable product (36 and 37) are mapped to the
+    // listing's two variants.
+    let mappings = format!("/v1/connectors/{connection}/mappings");
+    let (status, body) = api(
+        &app,
+        "PUT",
+        &mappings,
+        Some(&seller.token),
+        &json!({ "mappings": [
+            { "listing_id": "boots_01", "variant_id": "a", "provider_product_id": SOCKS.to_string(), "provider_variant_id": SOCKS_S.to_string() },
+            { "listing_id": "boots_01", "variant_id": "b", "provider_product_id": SOCKS.to_string(), "provider_variant_id": "37" },
+        ] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // The poll reads the catalog's per-variation stock (5 and 3); each lands on
+    // its own variant row, judged against that row and not the listing's total.
+    worker::poll_stock(&app.state).await.expect("poll");
+    assert_eq!(
+        variant_rows(&app, &aggregate).await,
+        vec![("a".to_string(), 5), ("b".to_string(), 3)]
+    );
+    let listing: i64 =
+        sqlx::query_scalar("SELECT available_quantity FROM listings WHERE aggregate_id = $1")
+            .bind(&aggregate)
+            .fetch_one(&app.pool)
+            .await
+            .expect("listing");
+    assert_eq!(listing, 8, "the listing's total is the sum of its variants");
+
+    // The store sells one: variation 36 drops to 4, and only row `a` follows.
+    set_variation_stock(&side, 4).await;
+    worker::poll_stock(&app.state).await.expect("poll");
+    assert_eq!(
+        variant_rows(&app, &aggregate).await,
+        vec![("a".to_string(), 4), ("b".to_string(), 3)]
+    );
+
+    // Mapping only one variation of a keyed listing still addresses that
+    // variant's row (the listing's own number is never touched): no alert.
+    let (status, body) = api(
+        &app,
+        "PUT",
+        &mappings,
+        Some(&seller.token),
+        &json!({ "mappings": [
+            { "listing_id": "boots_01", "variant_id": "a", "provider_product_id": SOCKS.to_string(), "provider_variant_id": SOCKS_S.to_string() },
+        ] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    set_variation_stock(&side, 2).await;
+    worker::poll_stock(&app.state).await.expect("poll");
+    assert_eq!(
+        variant_rows(&app, &aggregate).await,
+        vec![("a".to_string(), 2), ("b".to_string(), 3)]
+    );
+    let (_, alerts) = api(
+        &app,
+        "GET",
+        "/v1/connectors/alerts?unresolved=true",
+        Some(&seller.token),
+        &json!(null),
+    )
+    .await;
+    assert!(
+        alerts["alerts"].as_array().expect("alerts").is_empty(),
+        "{alerts}"
+    );
+    if let Some(replay) = &side.replay {
+        replay.assert_no_misses();
+    }
+}

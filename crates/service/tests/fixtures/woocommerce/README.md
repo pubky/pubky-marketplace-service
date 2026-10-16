@@ -55,6 +55,7 @@ Scenarios (`p_` = provider only, `flow_` = through the service and PostgreSQL):
 | `flow_k` | a disconnect while new keys are being verified goes through at once; the keys are not stored; no webhook is left |
 | `flow_l` | a disconnect between the credential swap and the webhook registration: the late registration removes what it created |
 | `flow_m` | two replacements of the keys: the slow one writes nothing (`credentials_changed`) and the store's webhooks carry the winner's secret |
+| `flow_n` | a variable product on a listing with per-variant rows: the stock poll lands each variation on its own variant row (judged against that row, not the listing's total), and a single mapped variation of the keyed listing still addresses its own row, with no alert |
 | `flow_g` | the Shop's `PUT /credentials` form with `consumer_key` and `consumer_secret` |
 
 ## How a replay works
