@@ -13,11 +13,10 @@ const PRODUCTION_ENVIRONMENT_ID = "404919ad-fb95-4621-9f45-b7f993dfa8ae";
 // source. Do not read this from process.env: a 0/0/0 plan must be a property
 // of git, not of the operator's shell. The release train MUST bump each
 // constant in the same PR as the IMAGE connect for that seat.
-const LIVE_IMAGE =
-  "ghcr.io/bitcoinerrorlog/pubky-marketplace-service@sha256:bd5466011f2bd520b1f310ce4c1416d7de98b1b9382068ebf6bb6f1ea46c887c";
 const STAGING_IMAGE =
-  "ghcr.io/pubky/pubky-marketplace-service@sha256:58cd50bfccf96d96d0577ee0fac65fd60a513fa28026245c80b11d36a8196e43";
-const PRODUCTION_IMAGE = LIVE_IMAGE;
+  "ghcr.io/pubky/pubky-marketplace-service@sha256:bb3aae7531694b341aabcb34a7843838d18870f763fae727aef51cd57efabcea";
+const PRODUCTION_IMAGE =
+  "ghcr.io/pubky/pubky-marketplace-service@sha256:bb3aae7531694b341aabcb34a7843838d18870f763fae727aef51cd57efabcea";
 
 const sharedDeploy = {
   healthcheckPath: "/ready",
@@ -33,7 +32,10 @@ const sharedEnv = {
   CHECKOUT_HOLD_WINDOW_SECONDS: preserve(),
   CONNECTOR_CREDENTIAL_ENCRYPTION_KEY: preserve(),
   CONNECTOR_CREDENTIAL_ENCRYPTION_KEY_PREVIOUS: preserve(),
+  CONNECTOR_PUBLIC_BASE_URL: preserve(),
+  CONNECTORS_ENABLED: preserve(),
   FIAT_PAYMENT_WINDOW_SECONDS: preserve(),
+  LISTING_AVAILABILITY_CLIENT_IP_HEADER: preserve(),
   ATTESTOR_ORDER_SALT: preserve(),
   ATTESTOR_SECRET_KEY: preserve(),
   DATABASE_URL: preserve(),
@@ -46,6 +48,7 @@ const sharedEnv = {
   NEXUS_URL: preserve(),
   PAYKIT_REQUEST_SIGNING_KEY: preserve(),
   PAYKIT_MAX_PREPARE_TTL_SECONDS: preserve(),
+  PAYKIT_SERVER_API: preserve(),
   PAYKIT_SERVER_URL: preserve(),
   PICKUP_DETAILS_ENCRYPTION_KEY: preserve(),
   PICKUP_DETAILS_ENCRYPTION_KEY_PREVIOUS: preserve(),
@@ -53,6 +56,7 @@ const sharedEnv = {
   PRIV_DATA_KEY_ENCRYPTION_KEY_PREVIOUS: preserve(),
   PUBLIC_APP_ORIGIN: preserve(),
   PUBLIC_SERVICE_ORIGIN: preserve(),
+  REQUIRE_ENCRYPTED_DELIVERY_ADDRESS: preserve(),
   REFUSAL_AUDIT_BACKUP_EXPIRY_ATTESTED: preserve(),
   REFUSAL_AUDIT_DATABASE_URL: preserve(),
   REFUSAL_AUDIT_HMAC_KEY_EPOCH: preserve(),
@@ -104,26 +108,35 @@ const stagingPaypalSandboxEnv = {
   PAYPAL_IPN_VERIFY_URL: "https://ipnpb.sandbox.paypal.com/cgi-bin/webscr",
 };
 
-const stagingOnlyEnv = {
-  CONNECTOR_PUBLIC_BASE_URL: preserve(),
-  CONNECTORS_ENABLED: preserve(),
-  LISTING_AVAILABILITY_CLIENT_IP_HEADER: preserve(),
+// Sign-in-minted marketplace sessions (GS1). Both seats hold them; the staging
+// connector worker references the service's values, so they sit in
+// `stagingEnv` and not in a service-only group.
+const grantSessionEnv = {
+  MARKETPLACE_GRANT_SESSION_CLIENT_IDS: preserve(),
   MARKETPLACE_GRANT_SESSION_ENABLED: preserve(),
-  PAYKIT_SERVER_API: preserve(),
-  REQUIRE_ENCRYPTED_DELIVERY_ADDRESS: preserve(),
+};
+
+// The multi-asset Paykit contract and the USDT rail. The connector worker
+// does not hold these, so they stay out of `stagingEnv`, which the worker
+// graph is derived from.
+const usdtEnv = {
+  PAYKIT_MARKETPLACE_ASSETS: preserve(),
+  PAYKIT_MARKETPLACE_CONTRACT: preserve(),
+  USDT_PAYMENTS_ENABLED: preserve(),
 };
 
 const stagingEnv = {
   ...sharedEnv,
   ...grantAndGatewayEnv,
   ...stagingPaypalSandboxEnv,
-  ...stagingOnlyEnv,
+  ...grantSessionEnv,
   AUTH_SESSION_TTL_SECONDS: preserve(),
 };
 
 const productionEnv = {
   ...sharedEnv,
   ...grantAndGatewayEnv,
+  ...grantSessionEnv,
 };
 
 function resolvedProjectId(ctx: { projectId?: string }): string | undefined {
@@ -162,25 +175,25 @@ export default defineRailway((ctx) => {
     // no builder; declaring one would add it.
     ...(isProduction ? { build: { builder: "DOCKERFILE" as const } } : {}),
     deploy: sharedDeploy,
-    env: isStaging ? stagingEnv : productionEnv,
+    env: { ...(isStaging ? stagingEnv : productionEnv), ...usdtEnv },
     // Staging custom host is CLI-attached. Omitting this list deletes it.
     // Generated *.up.railway.app stays CLI.
     domains: isStaging ? ["staging-api.pubky.app"] : [],
   });
 
-  // Staging only. The binary exits while CONNECTORS_ENABLED is off, so
-  // production declares no worker until it turns connectors on. Every variable
-  // is preserved: the live worker holds `${{marketplace-service.NAME}}`
+  // Same image and environment as marketplace-service, its own start command,
+  // on both seats. The binary exits while CONNECTORS_ENABLED is off. Every
+  // variable is preserved: the live worker holds `${{marketplace-service.NAME}}`
   // references to the service's variables, and an apply must not rewrite them.
-  const connector_worker = isStaging
-    ? service("connector-worker", {
-        source: image(STAGING_IMAGE),
-        deploy: { startCommand: "connector-worker" },
-        env: Object.fromEntries(Object.keys(stagingEnv).map((name) => [name, preserve()])),
-      })
-    : undefined;
+  const connector_worker = service("connector-worker", {
+    source: image(isStaging ? STAGING_IMAGE : PRODUCTION_IMAGE),
+    deploy: { startCommand: "connector-worker" },
+    env: Object.fromEntries(
+      Object.keys(isStaging ? stagingEnv : productionEnv).map((name) => [name, preserve()]),
+    ),
+  });
 
   return project(isStaging ? "pubky-marketplace-staging" : "pubky-marketplace-production", {
-    resources: connector_worker ? [marketplace_service, connector_worker] : [marketplace_service],
+    resources: [marketplace_service, connector_worker],
   });
 });

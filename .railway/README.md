@@ -54,33 +54,37 @@ healthcheck configuration.
 
 ### Image pins
 
-Both graphs pin `ghcr.io/bitcoinerrorlog/pubky-marketplace-service@sha256:...`
-(`LIVE_IMAGE` in `railway.ts`, `STAGING_IMAGE` in `railway.staging.ts`). The pin
-moves only when a release closeout PR edits it (last bumped by the
-address-search image pin, PR #81), so it normally trails `main`, and it is
-not the source of truth for what is running: read the image digest of the
-service's active deployment (Railway deployment details, or the revision's
-image on GCP) and the `org.opencontainers.image.revision` label of that image to
-see the deployed commit, or read `commit` from `GET /health` on images built by
-the workflow below (the 12-character source SHA; `unknown` otherwise). The
-image workflow `.github/workflows/production-image.yml` now publishes to
+Both graphs pin `ghcr.io/pubky/pubky-marketplace-service@sha256:...`
+(`STAGING_IMAGE` and `PRODUCTION_IMAGE` in `railway.ts`, `STAGING_IMAGE` in
+`railway.staging.ts`). The pin is not the source of truth for what is
+running: read the image digest of the service's active deployment (Railway
+deployment details, or the revision's image on GCP) and the
+`org.opencontainers.image.revision` label of that image to see the deployed
+commit, or read `commit` from `GET /health` (the 12-character source SHA; `unknown`
+for images built without it). The image workflow
+`.github/workflows/production-image.yml` publishes to
 `ghcr.io/<repository owner>/pubky-marketplace-service` (lowercased, tagged
-`sha-<commit>`), which for this repository is `ghcr.io/pubky/...`; the pins
-above still name the `bitcoinerrorlog` namespace. Before bumping a pin, check
-that the digest exists in the namespace the running service pulls from, and
-make `railway config plan` 0/0/0 before applying.
+`sha-<commit>`), which for this repository is `ghcr.io/pubky/...`. Bump the pin
+in the same PR as every IMAGE connect, and make `railway config plan` 0/0/0
+before applying.
 
-### Connector worker (staging)
+`paykit-server-upstream` and the other services in these projects are not in
+this graph, so their images are not pinned here.
 
-The staging graphs declare a second service, `connector-worker`: the same
+### Connector worker
+
+Both seats' graphs declare a second service, `connector-worker`: the same
 image as `marketplace-service` with start command `connector-worker`, no
 healthcheck and no domain. Its variables are references to the service's
 (`${{marketplace-service.NAME}}`), so the worker always sees the same
 `DATABASE_URL`, sealing keys and `CONNECTORS_ENABLED`. Every variable is
 `preserve()` here, so an apply keeps those references. The worker exits at
-startup while `CONNECTORS_ENABLED` is not `true`, so production declares no
-worker until production turns connectors on. Bump the worker's image in the
-same PR as the service's (both read `STAGING_IMAGE`).
+startup while `CONNECTORS_ENABLED` is not `true`. Production turned connectors
+on 16 Oct 2026 (`CONNECTORS_ENABLED`, `CONNECTOR_PUBLIC_BASE_URL` and
+`CONNECTOR_CREDENTIAL_ENCRYPTION_KEY` on the service, the worker created with
+references to them), so it declares the worker too. Bump the worker's image in
+the same PR as the service's (each seat's worker reads that seat's image
+constant).
 
 ### Variables an apply would delete
 
