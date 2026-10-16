@@ -1394,6 +1394,46 @@ async fn a_disconnect_between_the_swap_and_the_registration_leaves_no_keys_and_n
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_live_connection_whose_keys_cannot_be_read_mid_registration_keeps_its_webhooks(
+    pool: PgPool,
+) {
+    // Replays flow_l up to the held registration; this test then takes the
+    // credential away instead of disconnecting, so it runs on the replay only.
+    let side = StoreSide::open("flow_l").await;
+    if side.is_live() {
+        return;
+    }
+    let app = woo_app(pool, side.provider(7)).await;
+    let seller = new_actor(&app).await;
+    let (connection, _) = connect_via_routes(&app, &seller, &side).await;
+    let good = minted(&side, "read_write", "keys_new");
+
+    side.delay_next("register", std::time::Duration::from_secs(4));
+    let replacing = spawn_replace(&app, &seller.token, connection, &good);
+    side.wait_until_held("register", 2).await;
+    sqlx::query("DELETE FROM connector_credentials WHERE connection_id = $1")
+        .bind(connection)
+        .execute(&app.pool)
+        .await
+        .expect("credential gone");
+
+    let (status, body) = replacing.await.expect("replace finished");
+    assert_eq!(
+        (status, body["error"]["code"].as_str()),
+        (StatusCode::CONFLICT, Some("credentials_unavailable")),
+        "{body}"
+    );
+    assert_eq!(status_of(&app, connection).await, "connected");
+    // The registration replaces the connect's three webhooks with three new
+    // ones; nothing removes the new ones afterwards.
+    assert_eq!(
+        replayed_webhook_writes(&side),
+        (6, 3),
+        "a live connection's webhooks are never removed because its keys could not be read"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn two_replacements_of_the_same_keys_never_both_apply(pool: PgPool) {
     let side = StoreSide::open("flow_m").await;
     let app = woo_app(pool, side.provider(7)).await;

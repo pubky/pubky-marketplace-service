@@ -2218,6 +2218,16 @@ async fn register_webhooks(
                 return Ok(row)
             }
             (Some(_), Some(next)) => context = next,
+            // Still live, but its credential cannot be read right now: the
+            // webhooks just registered may be the current ones, so nothing is
+            // removed from the store.
+            (Some(_), None) => {
+                return Err(error(
+                    StatusCode::CONFLICT,
+                    "credentials_unavailable",
+                    "The store's keys could not be read just now. Try again.",
+                ));
+            }
             _ => {
                 if let Err(failure) = call(runtime, provider.disconnect(&context)).await {
                     tracing::warn!(
