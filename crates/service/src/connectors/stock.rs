@@ -123,30 +123,36 @@ pub async fn apply_stock_level(
     level: i64,
     event_id: Option<&str>,
 ) -> Result<StockOutcome, sqlx::Error> {
-    let outcome =
-        if store::mapping_count_for_listing(&state.pool, connection.id, &mapping.listing_id).await?
+    // A listing that tracks stock per variant is always addressed by variant,
+    // even when the seller mapped only one store variant to it: its listing
+    // `available` is the sum across sizes, and the service refuses an
+    // `inventory.adjust` without a variant on it.
+    let per_variant =
+        store::mapping_count_for_listing(&state.pool, connection.id, &mapping.listing_id).await?
             > 1
-        {
-            match state.connectors.as_ref() {
-                Some(runtime) => {
-                    runtime
-                        .variant_inventory
-                        .apply_variant_stock(
-                            state,
-                            VariantStockRequest {
-                                connection,
-                                mapping,
-                                available: level.max(0),
-                                event_id,
-                            },
-                        )
-                        .await?
-                }
-                None => StockOutcome::Ignored("multi_variant_listing"),
+            || listing_tracks_variants(state, &connection.seller_pubky, &mapping.listing_id)
+                .await?;
+    let outcome = if per_variant {
+        match state.connectors.as_ref() {
+            Some(runtime) => {
+                runtime
+                    .variant_inventory
+                    .apply_variant_stock(
+                        state,
+                        VariantStockRequest {
+                            connection,
+                            mapping,
+                            available: level.max(0),
+                            event_id,
+                        },
+                    )
+                    .await?
             }
-        } else {
-            apply_listing_stock(state, connection, mapping, level, event_id).await?
-        };
+            None => StockOutcome::Ignored("multi_variant_listing"),
+        }
+    } else {
+        apply_listing_stock(state, connection, mapping, level, event_id).await?
+    };
     if let StockOutcome::MappingError(reason) = &outcome {
         raise_mapping_alert(state, connection, mapping, reason).await?;
     }
@@ -175,6 +181,21 @@ async fn raise_mapping_alert(
             connection.id, mapping.listing_id, mapping.variant_id
         ),
     )
+    .await
+}
+
+async fn listing_tracks_variants(
+    state: &AppState,
+    seller_pubky: &str,
+    listing_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let aggregate = marketplace_domain::ids::listing_aggregate_id(seller_pubky, listing_id);
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM listing_variant_inventory \
+         WHERE listing_aggregate_id = $1 AND variant_id <> '')",
+    )
+    .bind(&aggregate)
+    .fetch_one(&state.pool)
     .await
 }
 
