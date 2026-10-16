@@ -4,7 +4,7 @@ Status: accepted consumer design for H1 (`pubky/paykit-server#26`).
 
 ## Invariant
 
-Marketplace must not publish an upstream Paykit payment request after inventory has been released. One bind creates one fixed inventory deadline. Activation retries never move that deadline.
+Marketplace must not publish an upstream Paykit payment request after inventory has been released. One bind creates one inventory deadline. Activation retries never move it later; a successful activation only shortens it to the request's own deadline.
 
 Fork Paykit behavior is unchanged: its prepare request already carries Marketplace's hold deadline. This design applies only to `PAYKIT_SERVER_API=upstream`.
 
@@ -27,7 +27,17 @@ Marketplace therefore fixes the original hold after successful prepare to:
 
 The extra 60 seconds is a bounded clock/reaper margin. It is not sent to Paykit and does not alter Paykit's immutable payment window. It only prevents Marketplace's clock or expiry sweep from releasing stock at the producer's latest valid payment deadline.
 
-Marketplace persists this deadline in the same transaction as the prepared invoice and activation outbox row. Activation success records Paykit's returned deadline but never rewrites the inventory deadline. Every activation response must fit inside the original hold.
+Marketplace persists this deadline in the same transaction as the prepared invoice and activation outbox row. Every activation response must fit inside the original hold.
+
+## After activation
+
+Once activation succeeds, Paykit's `payment_deadline` is known and immutable, and the wallet refuses the request after it. Marketplace then shortens the hold to:
+
+`min(original hold, payment_deadline + 60 seconds)`
+
+so the order is released when its request expires, not up to `prepare_expires_at - activated_at` later (about 15 minutes with the defaults, since activation normally lands seconds after the bind). The Shop's "Pay by" and the seller's "restocks" time show this hold, so they match the wallet. A status poll that recovers a lost activation response applies the same rule. Auction orders keep their reservation hold.
+
+One exception keeps the original hold: an order whose payment Paykit has already seen (`paykit_request_state = 'detected'`). Bitcoin is on time by its first sighting, so a payment seen before the deadline can still confirm and pay after it. The expiry sweep keeps such an order until `prepare_expires_at + payment_window_seconds + 60 seconds`, the original hold, recomputed from the persisted columns.
 
 ## Auction orders
 
@@ -52,7 +62,7 @@ Before each signed upstream activation, worker locks payment then order and requ
 
 A failed guard never sends activation. Existing prepared-invoice release handling records attempt for reconciliation, releases inventory atomically, and leaves producer prepare reaper/void handling to close unpublished invoice.
 
-Pre-call check is defense in depth, not cross-service atomicity. H1 relies on Paykit's reviewed atomic activation transaction: it locks preparation, samples database time, refuses at/after `prepare_expires_at`, and creates publication outbox work only in same transaction as activation. Since Marketplace hold extends beyond producer's latest possible payment deadline, local expiry cannot race a valid publication.
+Pre-call check is defense in depth, not cross-service atomicity. H1 relies on Paykit's reviewed atomic activation transaction: it locks preparation, samples database time, refuses at/after `prepare_expires_at`, and creates publication outbox work only in same transaction as activation. Since Marketplace hold extends beyond producer's latest possible payment deadline until activation, local expiry cannot race a valid publication; after activation the hold still ends after the producer's actual deadline.
 
 Activation transport failure or lost response leaves fixed original hold unchanged and activation row retryable. It never extends hold. Existing `paykit_superseded_attempts` records attempts released after ambiguous delivery and polls signed status; confirmed money follows late-money/manual-review path. Marketplace never blindly voids a known active invoice.
 

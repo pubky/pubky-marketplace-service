@@ -1279,16 +1279,19 @@ async fn deliver_paykit_activation(
                 );
             }
             // Conditional on `preparing` under the row lock: a redelivered
-            // row cannot apply the flip twice.
-            let flipped = sqlx::query(
+            // row cannot apply the flip twice. An upstream hold shrinks to
+            // the request's deadline plus the skew margin, so stock is not
+            // held for a request the wallet already treats as expired.
+            let flipped = sqlx::query(&format!(
                 "UPDATE orders SET paykit_activation_state = 'active', \
                  paykit_request_state = 'pending', paykit_expires_at = $3, \
                  bitcoin_quote_expires_at = CASE \
                      WHEN bitcoin_quote_rate IS NULL THEN NULL ELSE $3 END, \
-                 hold_expires_at = CASE WHEN paykit_api = 'fork' THEN $3 ELSE hold_expires_at END, \
+                 hold_expires_at = CASE WHEN paykit_api = 'fork' THEN $3 \
+                     ELSE {UPSTREAM_ACTIVATED_HOLD} END, \
                  updated_at = $2 \
-                 WHERE id = $1 AND paykit_activation_state = 'preparing'",
-            )
+                 WHERE id = $1 AND paykit_activation_state = 'preparing'"
+            ))
             .bind(payload.order_id)
             .bind(now)
             .bind(payment_deadline)
@@ -3134,13 +3137,14 @@ async fn apply_paykit_status_outcome(
     };
     if row.paykit_api == "upstream" && row.paykit_expires_at.is_none() {
         if let Some(deadline) = recovered_deadline {
-            sqlx::query(
+            sqlx::query(&format!(
                 "UPDATE orders SET paykit_expires_at = $3, \
                  bitcoin_quote_expires_at = CASE \
-                     WHEN bitcoin_quote_rate IS NULL THEN NULL ELSE $3 END \
+                     WHEN bitcoin_quote_rate IS NULL THEN NULL ELSE $3 END, \
+                 hold_expires_at = {UPSTREAM_ACTIVATED_HOLD} \
                  WHERE id = $1 \
-                 AND paykit_invoice_id = $2 AND paykit_expires_at IS NULL",
-            )
+                 AND paykit_invoice_id = $2 AND paykit_expires_at IS NULL"
+            ))
             .bind(row.id)
             .bind(row.paykit_invoice_id)
             .bind(deadline)
@@ -4071,11 +4075,24 @@ async fn expire_held_order(
     Ok(())
 }
 
-/// The order half of the held-window expiry predicate; `$1` is `now`.
+/// An upstream order's hold once its request is active, given its deadline
+/// as `$3`: the deadline plus `UPSTREAM_HOLD_CLOCK_SKEW_SECONDS`, never
+/// later than the bind hold. An auction order keeps its reservation hold.
+const UPSTREAM_ACTIVATED_HOLD: &str = "CASE WHEN auction_aggregate_id IS NULL \
+     THEN LEAST(hold_expires_at, $3 + INTERVAL '60 seconds') ELSE hold_expires_at END";
+
+/// The order half of the held-window expiry predicate; `$1` is `now`. An
+/// upstream order whose payment Paykit has already seen keeps the bind hold
+/// (latest prepare expiry + payment window + skew margin): Bitcoin is on time
+/// by first sighting, so it may still confirm and pay after the request's
+/// deadline.
 const HELD_DUE_ORDER: &str = "o.state = 'pending_payment' AND o.stock_held \
      AND (o.hold_expires_at IS NULL OR o.hold_expires_at <= $1) \
      AND o.paykit_activation_state IS DISTINCT FROM 'preparing' \
-     AND o.paykit_request_state IS DISTINCT FROM 'awaiting_seller_confirmation'";
+     AND o.paykit_request_state IS DISTINCT FROM 'awaiting_seller_confirmation' \
+     AND (o.paykit_api = 'upstream' AND o.paykit_request_state = 'detected' \
+         AND o.paykit_prepare_expires_at \
+             + make_interval(secs => o.paykit_payment_window_seconds + 60) > $1) IS NOT TRUE";
 
 /// The order half of the lapsed auction-winner predicate; `$1` is `now`. The
 /// winning reservation must be `expired` (swept) with no live one left, and
