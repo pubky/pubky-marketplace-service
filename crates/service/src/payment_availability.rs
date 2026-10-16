@@ -183,6 +183,50 @@ impl PaymentAvailabilityCache {
     }
 }
 
+/// The last `ready` answer per seller for the seller's own `bitcoin_setup`.
+/// It is never a substitute for asking paykit-server: it is consulted only
+/// when the ask itself failed, so one slow or failed call does not tell a
+/// ready seller to set up Bitkit. Only `ready` is remembered; a
+/// `setup_required` answer forgets the seller at once.
+#[derive(Clone, Debug, Default)]
+pub struct BitcoinSetupReadyCache {
+    ready_at: Arc<std::sync::Mutex<HashMap<String, DateTime<Utc>>>>,
+}
+
+impl BitcoinSetupReadyCache {
+    /// Records a `ready` answer, dropping entries older than `ttl_seconds`
+    /// so the map holds only sellers seen ready within the window.
+    pub fn remember_ready(&self, seller: &str, now: DateTime<Utc>, ttl_seconds: i64) {
+        let mut ready_at = self.ready_at.lock().expect("bitcoin setup cache lock");
+        ready_at.retain(|_, at| now - *at < Duration::seconds(ttl_seconds));
+        ready_at.insert(seller.to_string(), now);
+    }
+
+    /// Forgets the seller after an authoritative `setup_required`.
+    pub fn forget(&self, seller: &str) {
+        self.ready_at
+            .lock()
+            .expect("bitcoin setup cache lock")
+            .remove(seller);
+    }
+
+    /// The age in seconds of the seller's last `ready`, when it is younger
+    /// than `ttl_seconds`.
+    pub fn ready_age_seconds(
+        &self,
+        seller: &str,
+        now: DateTime<Utc>,
+        ttl_seconds: i64,
+    ) -> Option<i64> {
+        let ready_at = self.ready_at.lock().expect("bitcoin setup cache lock");
+        ready_at
+            .get(seller)
+            .map(|at| now - *at)
+            .filter(|age| *age >= Duration::zero() && *age < Duration::seconds(ttl_seconds))
+            .map(|age| age.num_seconds())
+    }
+}
+
 fn is_fresh(entry: &CacheEntry, now: DateTime<Utc>, ttl_seconds: i64) -> bool {
     entry
         .fetched_at
@@ -234,8 +278,42 @@ mod tests {
 
     use crate::clock::{AdjustableClock, Clock};
 
-    use super::PaymentAvailabilityCache;
+    use super::{BitcoinSetupReadyCache, PaymentAvailabilityCache};
     use crate::payments::SetupAsset;
+
+    #[test]
+    fn a_ready_answer_is_remembered_for_the_window_only() {
+        let cache = BitcoinSetupReadyCache::default();
+        let start = now();
+        assert_eq!(cache.ready_age_seconds("seller", start, 60), None);
+        cache.remember_ready("seller", start, 60);
+        assert_eq!(cache.ready_age_seconds("seller", start, 60), Some(0));
+        assert_eq!(
+            cache.ready_age_seconds("seller", start + chrono::Duration::seconds(59), 60),
+            Some(59)
+        );
+        assert_eq!(
+            cache.ready_age_seconds("seller", start + chrono::Duration::seconds(60), 60),
+            None
+        );
+        assert_eq!(cache.ready_age_seconds("other", start, 60), None);
+    }
+
+    #[test]
+    fn setup_required_forgets_and_old_entries_are_pruned() {
+        let cache = BitcoinSetupReadyCache::default();
+        let start = now();
+        cache.remember_ready("seller", start, 60);
+        cache.forget("seller");
+        assert_eq!(cache.ready_age_seconds("seller", start, 60), None);
+
+        cache.remember_ready("old", start, 60);
+        cache.remember_ready("new", start + chrono::Duration::seconds(61), 60);
+        assert_eq!(
+            cache.ready_at.lock().unwrap().keys().collect::<Vec<_>>(),
+            vec!["new"]
+        );
+    }
 
     fn now() -> chrono::DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()

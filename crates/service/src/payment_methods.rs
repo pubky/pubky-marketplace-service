@@ -280,18 +280,52 @@ impl BitcoinSetup {
     }
 }
 
-/// Asks paykit-server, uncached, whether the seller can receive Bitcoin: the
-/// signed `POST /setup/status {asset: "BTC"}` upstream, the claimed watch-only
-/// account on the fork (both through [`PaykitClient::seller_ready`], the same
-/// question `bitcoin_available` caches). Any failure is `unavailable`.
-async fn lookup_bitcoin_setup(paykit: Option<&PaykitClient>, seller_pubky: &str) -> BitcoinSetup {
-    let Some(paykit) = paykit else {
+/// How long a seller's last `ready` answer stands in for a failed ask.
+const BITCOIN_SETUP_READY_GRACE_SECONDS: i64 = 60;
+
+/// Asks paykit-server on every call whether the seller can receive Bitcoin:
+/// the signed `POST /setup/status {asset: "BTC"}` upstream, the claimed
+/// watch-only account on the fork (both through
+/// [`PaykitClient::seller_ready`], the same question `bitcoin_available`
+/// caches). A failed ask (each logged by the client with its reason) is
+/// `ready` when paykit-server answered `ready` for this seller within
+/// [`BITCOIN_SETUP_READY_GRACE_SECONDS`], and `unavailable` otherwise.
+/// `setup_required` is always passed through and forgets the last `ready`;
+/// `unavailable` is never remembered. A deployment without Paykit is
+/// `unavailable`.
+async fn lookup_bitcoin_setup(state: &AppState, seller_pubky: &str) -> BitcoinSetup {
+    let Some(paykit) = own_paykit(state) else {
         return BitcoinSetup::Unavailable;
     };
+    let ready = &state.bitcoin_setup_ready;
     match paykit.seller_ready(seller_pubky).await {
-        Ok(true) => BitcoinSetup::Ready,
-        Ok(false) => BitcoinSetup::SetupRequired,
-        Err(_) => BitcoinSetup::Unavailable,
+        Ok(true) => {
+            ready.remember_ready(
+                seller_pubky,
+                state.clock.now(),
+                BITCOIN_SETUP_READY_GRACE_SECONDS,
+            );
+            BitcoinSetup::Ready
+        }
+        Ok(false) => {
+            ready.forget(seller_pubky);
+            BitcoinSetup::SetupRequired
+        }
+        Err(_) => match ready.ready_age_seconds(
+            seller_pubky,
+            state.clock.now(),
+            BITCOIN_SETUP_READY_GRACE_SECONDS,
+        ) {
+            Some(age_seconds) => {
+                tracing::info!(
+                    seller = %crate::logging::actor_prefix(seller_pubky),
+                    age_seconds,
+                    "bitcoin_setup answered from the last ready; paykit lookup failed"
+                );
+                BitcoinSetup::Ready
+            }
+            None => BitcoinSetup::Unavailable,
+        },
     }
 }
 
@@ -544,14 +578,13 @@ pub async fn put_payment_config(
         Ok(row) => row,
         Err(error) => return internal("payment config upsert", &error),
     };
-    let (bitcoin_setup, usdt) =
-        tokio::join!(lookup_bitcoin_setup(own_paykit(&state), &actor.0), async {
-            if usdt_flag {
-                own_usdt_view(&state, &actor.0).await.map(Some)
-            } else {
-                Ok(None)
-            }
-        },);
+    let (bitcoin_setup, usdt) = tokio::join!(lookup_bitcoin_setup(&state, &actor.0), async {
+        if usdt_flag {
+            own_usdt_view(&state, &actor.0).await.map(Some)
+        } else {
+            Ok(None)
+        }
+    },);
     let usdt = match usdt {
         Ok(view) => view,
         Err(error) => return internal("payment config upsert", &error),
@@ -595,7 +628,9 @@ async fn store_config_with_usdt(
 /// while `USDT_PAYMENTS_ENABLED` is on, `usdt_enabled`, `usdt_setup` and
 /// `usdt_setup_action` (see [`lookup_usdt_setup`]). Both are read from
 /// paykit-server on every call, never from the availability cache, so the
-/// Shop sees a Bitkit setup or reconnect the moment it completes. A seller
+/// Shop sees a Bitkit setup or reconnect the moment it completes; only a
+/// failed Bitcoin ask falls back to the seller's last `ready` within a
+/// minute (see [`lookup_bitcoin_setup`]). A seller
 /// who never saved anything has no row; that read is the empty configuration
 /// (epoch `updated_at`) instead of `null`, because that seller is exactly
 /// who needs to see `bitcoin_setup: "setup_required"`.
@@ -607,14 +642,13 @@ pub async fn get_own_payment_config(
         Ok(row) => row,
         Err(error) => return internal("payment config read", &error),
     };
-    let (bitcoin_setup, usdt) =
-        tokio::join!(lookup_bitcoin_setup(own_paykit(&state), &actor.0), async {
-            if state.config.usdt_payments_enabled {
-                own_usdt_view(&state, &actor.0).await.map(Some)
-            } else {
-                Ok(None)
-            }
-        },);
+    let (bitcoin_setup, usdt) = tokio::join!(lookup_bitcoin_setup(&state, &actor.0), async {
+        if state.config.usdt_payments_enabled {
+            own_usdt_view(&state, &actor.0).await.map(Some)
+        } else {
+            Ok(None)
+        }
+    },);
     let usdt = match usdt {
         Ok(view) => view,
         Err(error) => return internal("payment config read", &error),
