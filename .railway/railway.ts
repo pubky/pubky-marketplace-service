@@ -16,7 +16,7 @@ const PRODUCTION_ENVIRONMENT_ID = "404919ad-fb95-4621-9f45-b7f993dfa8ae";
 const LIVE_IMAGE =
   "ghcr.io/bitcoinerrorlog/pubky-marketplace-service@sha256:bd5466011f2bd520b1f310ce4c1416d7de98b1b9382068ebf6bb6f1ea46c887c";
 const STAGING_IMAGE =
-  "ghcr.io/pubky/pubky-marketplace-service@sha256:58cd50bfccf96d96d0577ee0fac65fd60a513fa28026245c80b11d36a8196e43";
+  "ghcr.io/pubky/pubky-marketplace-service@sha256:561952624a5a8e3b0417ae27bb082ecc444bf0ebc560bc0936e8d628b73de7ce";
 const PRODUCTION_IMAGE = LIVE_IMAGE;
 
 const sharedDeploy = {

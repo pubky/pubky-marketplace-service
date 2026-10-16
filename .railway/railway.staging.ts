@@ -6,7 +6,7 @@ const STAGING_PROJECT_ID = "c991d768-4a3c-42ea-b5ed-eaa22d4916ed";
 const STAGING_ENVIRONMENT_ID = "c67a6435-bb23-453b-9169-764bfa0312e1";
 // `image()` takes a string only. Bump in the same PR as every staging IMAGE connect.
 const STAGING_IMAGE =
-  "ghcr.io/pubky/pubky-marketplace-service@sha256:58cd50bfccf96d96d0577ee0fac65fd60a513fa28026245c80b11d36a8196e43";
+  "ghcr.io/pubky/pubky-marketplace-service@sha256:561952624a5a8e3b0417ae27bb082ecc444bf0ebc560bc0936e8d628b73de7ce";
 
 const stagingEnv = {
   ADDRESS_SEARCH_CLIENT_IP_HEADER: preserve(),
