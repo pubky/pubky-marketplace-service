@@ -31,6 +31,17 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Config::from_env()?;
     let grant = marketplace_service::grant::GrantRuntime::from_env(config.session_ttl_seconds)?;
+    let grant_session = marketplace_service::grant_session::GrantSessionConfig::from_env(
+        config.public_service_origin.as_deref(),
+    )?;
+    tracing::info!(
+        grant_sessions = if grant_session.is_some() {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        "grant session mode resolved"
+    );
     marketplace_service::inventory::validate_rate_config_from_env()?;
     // Fail closed before serving: a partial Locks configuration (URL without
     // keys, or keys without URL) refuses to start rather than running with
@@ -217,6 +228,7 @@ async fn main() -> anyhow::Result<()> {
         .with_refusal_audit(refusal_audit)
         .with_refusal_audit_retention_pool(audit_retention_pool)
         .with_grant(grant)
+        .with_grant_session(grant_session)
         .with_address_search(address_search)
         .with_listing_availability(listing_availability);
     workers::spawn(state.clone());
