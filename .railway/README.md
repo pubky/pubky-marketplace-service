@@ -70,6 +70,18 @@ above still name the `bitcoinerrorlog` namespace. Before bumping a pin, check
 that the digest exists in the namespace the running service pulls from, and
 make `railway config plan` 0/0/0 before applying.
 
+### Connector worker (staging)
+
+The staging graphs declare a second service, `connector-worker`: the same
+image as `marketplace-service` with start command `connector-worker`, no
+healthcheck and no domain. Its variables are references to the service's
+(`${{marketplace-service.NAME}}`), so the worker always sees the same
+`DATABASE_URL`, sealing keys and `CONNECTORS_ENABLED`. Every variable is
+`preserve()` here, so an apply keeps those references. The worker exits at
+startup while `CONNECTORS_ENABLED` is not `true`, so production declares no
+worker until production turns connectors on. Bump the worker's image in the
+same PR as the service's (both read `STAGING_IMAGE`).
+
 ### Variables an apply would delete
 
 Only the variables in the graphs' `preserve()` lists survive an apply. The

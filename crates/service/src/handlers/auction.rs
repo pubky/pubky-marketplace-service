@@ -306,7 +306,7 @@ pub async fn close(
     }
 
     let outcome =
-        close_locked_auction(tx, &listing, auction, actor, command.command_id, now).await?;
+        close_locked_auction(tx, &listing, auction, actor, command.command_id, false, now).await?;
     Ok(Ok(HandlerSuccess {
         revision: outcome.listing.server_revision,
         event_ids: outcome.event_ids.clone(),
@@ -355,24 +355,27 @@ impl AuctionCloseOutcome {
 /// (the seller command and the server-time worker) must have verified the
 /// auction is active and its end time has passed. Sold auctions get exactly
 /// one winning reservation, order, and sandbox payment.
+/// `withdrawn` is true when the seller's record says the listing was
+/// removed; like a deleted auction, it then closes unsold.
 pub async fn close_locked_auction(
     tx: &mut Transaction<'_, Postgres>,
     listing: &ListingRow,
     auction: AuctionState,
     actor: &str,
     command_id: Uuid,
+    withdrawn: bool,
     now: DateTime<Utc>,
 ) -> Result<AuctionCloseOutcome, sqlx::Error> {
     let reserve = fetch_auction_reserve_for_update(tx, &listing.aggregate_id)
         .await?
         .ok_or_else(|| sqlx::Error::Protocol("auction reserve authority is missing".to_string()))?;
     let reserve_satisfied = reserve_satisfied(listing, &auction, &reserve)?;
-    // A deleted auction closes unsold: its leader never becomes a buyer of a
-    // listing the seller withdrew.
+    // A deleted or removed auction closes unsold: its leader never becomes a
+    // buyer of a listing the seller withdrew.
     let winner = auction
         .leader_pubky
         .clone()
-        .filter(|_| reserve_satisfied && !listing.is_deleted());
+        .filter(|_| reserve_satisfied && !listing.is_deleted() && !withdrawn);
     let sold = winner.is_some();
     let auction_status = if sold { "sold" } else { "unsold" };
     debug_assert!(can_transition(&auction_machine(), "active", auction_status));
@@ -384,16 +387,29 @@ pub async fn close_locked_auction(
     } else {
         ("available", 0i64)
     };
+    // An auction sells its one unit from the listing's single implicit row.
+    if sold {
+        let rows = crate::variant_stock::lock_rows(tx, &listing.aggregate_id).await?;
+        if crate::variant_stock::tracks_variants(&rows)
+            || !crate::variant_stock::reserve(
+                tx,
+                &listing.aggregate_id,
+                crate::variant_stock::IMPLICIT_VARIANT_ID,
+                quantity_delta,
+            )
+            .await?
+        {
+            return Err(sqlx::Error::RowNotFound);
+        }
+    }
     let updated_listing: ListingRow = sqlx::query_as(&format!(
         "UPDATE listings SET server_revision = server_revision + 1, state = $2, \
-         available_quantity = available_quantity - $3, \
-         reserved_quantity = reserved_quantity + $3, auction = $4, updated_at = $5 \
+         auction = $3, updated_at = $4 \
          WHERE aggregate_id = $1 AND auction->>'status' = 'active' \
          RETURNING {LISTING_COLUMNS}"
     ))
     .bind(&listing.aggregate_id)
     .bind(new_state)
-    .bind(quantity_delta)
     .bind(closed_auction.to_value())
     .bind(now)
     .fetch_one(&mut **tx)

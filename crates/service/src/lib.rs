@@ -17,6 +17,7 @@ pub mod bitcoin_review;
 pub mod clock;
 pub mod command_flight;
 pub mod config;
+pub mod connectors;
 pub mod content_lock;
 pub mod contracts;
 pub mod digital;
@@ -30,6 +31,7 @@ pub mod http;
 pub mod inventory;
 pub mod listing_availability;
 pub mod listing_deletion;
+pub mod listing_lifecycle;
 pub mod listing_moderation;
 pub mod locks;
 pub(crate) mod logging;
@@ -52,6 +54,7 @@ pub mod result;
 pub mod rotating_keys;
 pub mod seal;
 pub mod seller_terms;
+pub mod variant_stock;
 pub mod workers;
 
 use std::sync::Arc;
@@ -65,7 +68,7 @@ use crate::digital::DigitalKeys;
 use crate::homeserver::HomeserverListingClient;
 use crate::listing_moderation::ListingModerationGate;
 use crate::locks::LocksRuntime;
-use crate::payment_availability::PaymentAvailabilityCache;
+use crate::payment_availability::{BitcoinSetupReadyCache, PaymentAvailabilityCache};
 use crate::payments::PaymentsRuntime;
 use crate::pickup::PickupKeys;
 use crate::priv_keys::PrivKeys;
@@ -109,6 +112,9 @@ pub struct AppState {
     pub payments: Option<Arc<PaymentsRuntime>>,
     /// Cached Paykit rail and seller claim availability.
     pub payment_availability: PaymentAvailabilityCache,
+    /// The last `ready` per seller for the seller's own `bitcoin_setup`,
+    /// served only when the paykit-server ask fails.
+    pub bitcoin_setup_ready: BitcoinSetupReadyCache,
     /// The pickup-details sealing keys (local pickup design §A1). `None`
     /// when `PICKUP_DETAILS_ENCRYPTION_KEY` is unset: pickup is OFF —
     /// `pickup_details.set` is refused, no details are ever stored
@@ -149,6 +155,10 @@ pub struct AppState {
     /// (`GET /v0/listings/{seller}/{listing_id}/availability`). Always
     /// installed; `new` uses the defaults and no trusted client header.
     pub listing_availability: Arc<listing_availability::AvailabilityLimiter>,
+    /// Store connectors (Shopify, WooCommerce). `None` unless
+    /// `CONNECTORS_ENABLED` is true: the `/v1/connectors` routes then answer
+    /// `connectors_disabled` and the health body does not mention them.
+    pub connectors: Option<Arc<connectors::ConnectorRuntime>>,
 }
 
 impl AppState {
@@ -187,6 +197,7 @@ impl AppState {
             command_flights: command_flight::CommandFlights::default(),
             payments: None,
             payment_availability: PaymentAvailabilityCache::default(),
+            bitcoin_setup_ready: BitcoinSetupReadyCache::default(),
             pickup: None,
             digital: None,
             priv_keys: None,
@@ -197,6 +208,7 @@ impl AppState {
             address_search: None,
             listing_moderation: None,
             listing_availability: Arc::new(listing_availability::AvailabilityLimiter::default()),
+            connectors: None,
         }
     }
 
@@ -266,6 +278,14 @@ impl AppState {
         listing_availability: Arc<listing_availability::AvailabilityLimiter>,
     ) -> Self {
         self.listing_availability = listing_availability;
+        self
+    }
+
+    pub fn with_connectors(
+        mut self,
+        connectors: Option<Arc<connectors::ConnectorRuntime>>,
+    ) -> Self {
+        self.connectors = connectors;
         self
     }
 

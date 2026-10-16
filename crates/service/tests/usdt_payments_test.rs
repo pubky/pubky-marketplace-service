@@ -223,7 +223,7 @@ async fn usdt_is_an_invalid_method_with_the_flag_off(pool: PgPool) {
     assert_refusal(status, &body, ErrorCode::InvalidCommand, "invalid_method");
     assert_eq!(
         body["error"]["message"],
-        json!("The payment method must be bitcoin or paypal.")
+        json!("The payment method must be paykit, bitcoin, or paypal.")
     );
     assert_eq!(bind_facts(&pool, &order.order_id).await, before);
     assert_eq!(event_count(&pool, &order.order_id).await, events);
@@ -248,13 +248,13 @@ async fn an_unknown_method_is_refused_with_or_without_the_flag(pool: PgPool) {
         assert_refusal(status, &body, ErrorCode::InvalidCommand, "invalid_method");
         assert_eq!(
             body["error"]["message"],
-            json!("The payment method must be bitcoin or paypal.")
+            json!("The payment method must be paykit, bitcoin, or paypal.")
         );
         let (status, body) = bind(&on, &buyer_on, &order.order_id, method).await;
         assert_refusal(status, &body, ErrorCode::InvalidCommand, "invalid_method");
         assert_eq!(
             body["error"]["message"],
-            json!("The payment method must be bitcoin, usdt, or paypal.")
+            json!("The payment method must be paykit, bitcoin, usdt, or paypal.")
         );
     }
 }

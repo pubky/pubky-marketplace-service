@@ -89,6 +89,92 @@ pub fn build_router(state: AppState) -> Router {
         ))
         .layer(DefaultBodyLimit::max(64 * 1024));
 
+    let connectors = Router::new()
+        .route(
+            "/v1/connectors",
+            get(crate::connectors::routes::list_connections)
+                .post(crate::connectors::routes::start_connect),
+        )
+        .route(
+            "/v1/connectors/alerts",
+            get(crate::connectors::routes::list_alerts),
+        )
+        .route(
+            "/v1/connectors/alerts/{id}/resolve",
+            post(crate::connectors::routes::resolve_alert),
+        )
+        .route(
+            "/v1/connectors/{id}",
+            delete(crate::connectors::routes::disconnect),
+        )
+        .route(
+            "/v1/connectors/{id}/credentials",
+            put(crate::connectors::routes::put_credentials),
+        )
+        .route(
+            "/v1/connectors/{id}/settings",
+            put(crate::connectors::routes::put_settings),
+        )
+        .route(
+            "/v1/connectors/{id}/check",
+            get(crate::connectors::routes::check_connection),
+        )
+        .route(
+            "/v1/connectors/{id}/catalog",
+            get(crate::connectors::routes::get_catalog),
+        )
+        .route(
+            "/v1/connectors/{id}/mappings",
+            get(crate::connectors::routes::get_mappings)
+                .put(crate::connectors::routes::put_mappings),
+        )
+        .route(
+            "/v1/connectors/{id}/selection",
+            get(crate::connectors::routes::get_selection)
+                .put(crate::connectors::routes::put_selection),
+        )
+        .route(
+            "/v1/connectors/{id}/pushes",
+            get(crate::connectors::routes::list_pushes),
+        )
+        .route(
+            "/v1/connectors/{id}/pushes/{order}/retry",
+            post(crate::connectors::routes::retry_push),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_session,
+        ))
+        .layer(DefaultBodyLimit::max(512 * 1024));
+
+    // Public by nature: authenticity is the provider's signature (launch,
+    // webhook) or the single-use connect state (callbacks). These paths are
+    // fixed: merchants' provider apps point at them.
+    let connector_ingress = Router::new()
+        .route(
+            "/v1/connectors/webhooks/woocommerce",
+            post(crate::connectors::routes::receive_woocommerce_webhook),
+        )
+        .route(
+            "/v1/connectors/shopify/c/{connection_id}/webhooks",
+            post(crate::connectors::routes::receive_shopify_webhook),
+        )
+        .route(
+            "/v1/connectors/shopify/c/{connection_id}/launch",
+            get(crate::connectors::routes::shopify_launch),
+        )
+        .route(
+            "/v1/connectors/shopify/c/{connection_id}/oauth/callback",
+            get(crate::connectors::routes::shopify_callback),
+        )
+        .route(
+            "/v1/connectors/woocommerce/oauth/callback",
+            post(crate::connectors::routes::woocommerce_callback),
+        )
+        .layer(DefaultBodyLimit::max(
+            crate::connectors::config::WEBHOOK_BODY_LIMIT,
+        ));
+
     let protected = Router::new()
         .route("/v1/commands", post(execute_command))
         .route("/v1/listings/{aggregate_id}", get(queries::get_listing))
@@ -219,6 +305,12 @@ pub fn build_router(state: AppState) -> Router {
             "/v0/sellers/{pubky}/payment-config",
             get(crate::payment_methods::get_payment_config),
         )
+        // Public: the stores a buyer may share an address with, and each
+        // store's recipient public key. Names no credential.
+        .route(
+            "/v0/sellers/{pubky}/connector-status",
+            get(crate::connectors::routes::connector_status),
+        )
         // Public: anyone reads a drop's schedule and redacted stock; clients
         // correct countdowns from the projection's server_time.
         .route(
@@ -242,6 +334,8 @@ pub fn build_router(state: AppState) -> Router {
         .merge(protected)
         .merge(inventory)
         .merge(automation)
+        .merge(connectors)
+        .merge(connector_ingress)
         .layer(cors)
         .layer(middleware::from_fn(log_request))
         .with_state(state)
@@ -283,6 +377,18 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
     // to a build without USDT otherwise. The Shop reads exactly this key.
     if state.config.usdt_payments_enabled {
         body["usdt_payments"] = json!({ "available": true });
+    }
+    // Present only while connectors are enabled, for the same reason.
+    if let Some(connectors) = &state.connectors {
+        body["connectors"] = json!({
+            "available": true,
+            "providers": connectors
+                .providers
+                .kinds()
+                .into_iter()
+                .map(|kind| kind.as_str())
+                .collect::<Vec<_>>(),
+        });
     }
     Json(body)
 }

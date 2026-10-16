@@ -1,0 +1,11 @@
+mutation RefundCreate($input: RefundInput!) {
+  refundCreate(input: $input) @idempotent(key: "{{KEY}}") {
+    refund {
+      id
+    }
+    userErrors {
+      field
+      message
+    }
+  }
+}

@@ -818,6 +818,7 @@
         "order.cancel_request",
         "order.cancel_approve",
         "fulfillment.ship",
+        "fulfillment.update_tracking",
         "fulfillment.confirm_delivery",
         "fulfillment.mark_ready",
         "fulfillment.confirm_pickup",

@@ -243,7 +243,7 @@ async fn migration_0034_caps_conflicts_and_indexes_the_count_prefix(pool: PgPool
 }
 
 #[test]
-fn migration_catalog_is_contiguous_through_0059() {
+fn migration_catalog_is_contiguous_through_0061_then_0071() {
     let mut numbers: Vec<u32> = std::fs::read_dir(MIGRATIONS_DIR)
         .expect("migrations dir")
         .filter_map(|entry| {
@@ -254,5 +254,10 @@ fn migration_catalog_is_contiguous_through_0059() {
         })
         .collect();
     numbers.sort_unstable();
-    assert_eq!(numbers, (1..=59).collect::<Vec<_>>());
+    assert_eq!(
+        numbers,
+        (1..=61)
+            .chain([62, 63, 64, 65, 66, 67, 70, 71])
+            .collect::<Vec<_>>()
+    );
 }

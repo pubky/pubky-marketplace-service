@@ -14,7 +14,7 @@ use axum::http::StatusCode;
 use common::paykit_server_u4 as u4;
 use common::*;
 use marketplace_service::config::Config;
-use marketplace_service::payment_attempt::MarketplaceAssets;
+use marketplace_service::payment_attempt::{MarketplaceAssets, MarketplaceContract};
 use marketplace_service::payments::{
     PaykitApi, PaykitClient, PaykitRequestError, SetupAsset, SetupStatus,
 };
@@ -29,6 +29,7 @@ fn usdt_config() -> Config {
     let mut config = usdt_config_btc_only();
     config.paykit_marketplace_assets =
         MarketplaceAssets::parse(Some("BTC,USDT"), PaykitApi::Upstream).expect("assets parse");
+    config.paykit_marketplace_contract = MarketplaceContract::MultiAsset;
     config
 }
 
@@ -110,12 +111,22 @@ fn usdt_fields(body: &Value) -> (Value, Value, Value) {
     )
 }
 
-fn setup_status_calls(paykit: &FakePaykit) -> Vec<Value> {
+fn all_setup_status_calls(paykit: &FakePaykit) -> Vec<Value> {
     paykit
         .calls()
         .into_iter()
         .filter(|call| call.path == "/setup/status")
         .map(|call| call.body)
+        .collect()
+}
+
+/// The USDT readiness questions: every `/setup/status` call except the own
+/// config's Bitcoin question (`bitcoin_setup`, asked on each own read and
+/// save; see `own_config_bitcoin_setup_test`).
+fn setup_status_calls(paykit: &FakePaykit) -> Vec<Value> {
+    all_setup_status_calls(paykit)
+        .into_iter()
+        .filter(|body| body.get("asset") != Some(&json!("BTC")))
         .collect()
 }
 
@@ -386,6 +397,7 @@ async fn a_seller_who_never_saved_gets_the_usdt_fields_without_a_stored_row(pool
         body["payment_config"],
         json!({
             "bitcoin_enabled": false,
+            "bitcoin_setup": "setup_required",
             "paypal_merchant_email": null,
             "updated_at": EPOCH,
             "usdt_enabled": false,
@@ -951,12 +963,13 @@ async fn readiness_is_cached_per_seller_and_asset(pool: PgPool) {
 
     // The save asked once for the seller's own view; public reads use the cache.
     let count = |field: &str, asset: &str| {
-        setup_status_calls(&paykit)
+        all_setup_status_calls(&paykit)
             .iter()
             .filter(|body| body[field] == json!(asset))
             .count()
     };
     let usdt_before = count("accepted_asset", "USDT");
+    let btc_before = count("asset", "BTC");
     get_public(&app, &seller.pubky).await;
     get_public(&app, &seller.pubky).await;
     assert_eq!(
@@ -964,7 +977,11 @@ async fn readiness_is_cached_per_seller_and_asset(pool: PgPool) {
         1,
         "one USDT lookup for two reads inside the TTL"
     );
-    assert_eq!(count("asset", "BTC"), 1, "Bitcoin keeps its own entry");
+    assert_eq!(
+        count("asset", "BTC") - btc_before,
+        1,
+        "Bitcoin keeps its own entry"
+    );
 
     // The seller leaves USDT; the public read follows after the TTL.
     paykit.replay_setup_status(
@@ -987,7 +1004,12 @@ async fn readiness_is_cached_per_seller_and_asset(pool: PgPool) {
 // Flag off and the fork
 // ---------------------------------------------------------------------------
 
-const RAIL_KEYS: [&str; 3] = ["bitcoin_enabled", "paypal_merchant_email", "updated_at"];
+const RAIL_KEYS: [&str; 4] = [
+    "bitcoin_enabled",
+    "bitcoin_setup",
+    "paypal_merchant_email",
+    "updated_at",
+];
 
 fn keys(value: &Value) -> Vec<String> {
     let mut keys: Vec<String> = value.as_object().expect("object").keys().cloned().collect();
@@ -996,7 +1018,9 @@ fn keys(value: &Value) -> Vec<String> {
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn with_the_flag_off_nothing_usdt_exists_and_paykit_is_never_asked(pool: PgPool) {
+async fn with_the_flag_off_nothing_usdt_exists_and_paykit_is_asked_only_about_bitcoin(
+    pool: PgPool,
+) {
     let (app, paykit) =
         test_app_with_paykit_api_config(pool.clone(), Config::for_tests(), PaykitApi::Upstream)
             .await;
@@ -1004,7 +1028,17 @@ async fn with_the_flag_off_nothing_usdt_exists_and_paykit_is_never_asked(pool: P
     paykit.set_claimed(&seller.pubky);
 
     let (_, body) = get_own(&app, &seller.token).await;
-    assert_eq!(body, json!({ "payment_config": null }));
+    assert_eq!(
+        body,
+        json!({
+            "payment_config": {
+                "bitcoin_enabled": false,
+                "bitcoin_setup": "ready",
+                "paypal_merchant_email": null,
+                "updated_at": EPOCH,
+            }
+        })
+    );
 
     let (status, body) = put(&app, &seller.token, &rails(true)).await;
     assert_eq!(status, StatusCode::OK);
@@ -1048,7 +1082,7 @@ async fn with_the_flag_off_nothing_usdt_exists_and_paykit_is_never_asked(pool: P
             "paypal_available"
         ]
     );
-    for call in setup_status_calls(&paykit) {
+    for call in all_setup_status_calls(&paykit) {
         assert_eq!(
             call["asset"],
             json!("BTC"),

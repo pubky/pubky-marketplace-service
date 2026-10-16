@@ -43,6 +43,19 @@ fn refusal_envelopes_terminal(runtime: &RefusalAuditRuntime) -> u64 {
         .saturating_add(metrics.dropped_writer_unverified)
 }
 
+/// Envelopes the audit lost to a writer that cannot take them: dropped after
+/// the attempt loop gave up, or refused up front because the five-second
+/// authority probe could not acquire the writer connection and so marked the
+/// writer unverified. A writer whose only connection is held or stuck reaches
+/// either outcome depending on where the probe tick falls in the burst, so
+/// tests that starve the writer count both.
+fn envelopes_lost(runtime: &RefusalAuditRuntime) -> u64 {
+    let metrics = runtime.metrics();
+    metrics
+        .dropped_after_retries
+        .saturating_add(metrics.dropped_writer_unverified)
+}
+
 /// Waits until `target` envelopes have reached any terminal path. The writer
 /// signals as each accepted envelope's attempt loop returns; producer-side
 /// drops are read from the outcome counters. The only clock is a stall guard.
@@ -271,12 +284,22 @@ struct RefusalAuditLocksHomeserver {
 }
 
 impl HomeserverListingClient for RefusalAuditLocksHomeserver {
+    /// Registered listings answer their mirrored record; any other listing
+    /// read is an upstream outage.
     fn fetch_listing<'a>(
         &'a self,
-        _seller_pubky: &'a str,
-        _listing_id: &'a str,
+        seller_pubky: &'a str,
+        listing_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
-        Box::pin(async { HomeserverFetchOutcome::Unavailable })
+        Box::pin(async move {
+            match common::CommandMirrorHomeserver
+                .fetch_listing(seller_pubky, listing_id)
+                .await
+            {
+                HomeserverFetchOutcome::Found(record) => HomeserverFetchOutcome::Found(record),
+                _ => HomeserverFetchOutcome::Unavailable,
+            }
+        })
     }
 
     fn fetch_drop<'a>(
@@ -1990,6 +2013,86 @@ async fn refusal_audit_forbidden_plaintext_inverse_scan(pool: PgPool) {
     }
 }
 
+/// Every lifecycle refusal is audited like any other command refusal: a
+/// paused listing as `invalid_state`, an unreachable homeserver as
+/// `upstream_unavailable`. The audit carries the kind only; the reason is not
+/// part of the frozen kind catalog.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn refusal_audit_records_listing_lifecycle_refusals(pool: PgPool) {
+    let mut app = common::test_app(pool.clone()).await;
+    let seller = common::new_actor(&app).await;
+    let buyer = common::new_actor(&app).await;
+    let (status, body) = common::execute(
+        &app,
+        &seller.token,
+        &common::register_command(&seller.pubky, 2),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    let writer = actual_writer_fixture(&pool).await;
+    let runtime = &writer.runtime;
+    app.state = app.state.clone().with_refusal_audit(Arc::clone(runtime));
+    app.router = build_router(app.state.clone());
+
+    common::set_command_mirror_record_state(&seller.pubky, "boots_01", "paused");
+    let (status, body) =
+        common::execute(&app, &buyer.token, &common::checkout_command(&seller.pubky)).await;
+    assert_eq!(status, axum::http::StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "LISTING_NOT_ACTIVE");
+
+    let count_of = async |kind: RefusalKind| -> i64 {
+        sqlx::query_scalar(
+            "SELECT COALESCE(sum(occurrence_count), 0)::bigint \
+             FROM command_refusal_audit_buckets \
+             WHERE surface_kind = $1 AND command_kind = $2 AND refusal_kind = $3",
+        )
+        .bind(SurfaceKind::V1Command as i16)
+        .bind(CommandKind::CreateCheckout as i16)
+        .bind(kind as i16)
+        .fetch_one(&pool)
+        .await
+        .expect("lifecycle refusal count")
+    };
+    let recorded = poll_until(StdDuration::from_secs(5), async || {
+        count_of(RefusalKind::InvalidState).await == 1 && runtime.metrics().delivered == 1
+    })
+    .await;
+    assert!(
+        recorded,
+        "the paused-listing refusal was not recorded: {:?}",
+        runtime.metrics()
+    );
+
+    // This double answers an unmirrored listing read as an outage.
+    common::drop_command_mirror_record(&seller.pubky, "boots_01");
+    let unavailable = Arc::new(RefusalAuditLocksHomeserver {
+        documents: HashMap::new(),
+        unavailable_content: false,
+    });
+    app.state = app.state.clone().with_homeserver(Some(unavailable));
+    app.router = build_router(app.state.clone());
+    let (status, body) = common::execute(
+        &app,
+        &buyer.token,
+        &common::checkout_command_with_id(&seller.pubky, "00000000-0000-4000-8000-000000001001"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        "{body}"
+    );
+    let recorded = poll_until(StdDuration::from_secs(5), async || {
+        count_of(RefusalKind::UpstreamUnavailable).await == 1 && runtime.metrics().delivered == 2
+    })
+    .await;
+    assert!(
+        recorded,
+        "the unreachable-homeserver refusal was not recorded: {:?}",
+        runtime.metrics()
+    );
+}
+
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn refusal_audit_manual_resolve_missing_pin_is_recorded_after_domain_release(pool: PgPool) {
     use common::paykit_review::{into_manual_review_held, resolve_call};
@@ -2745,7 +2848,8 @@ async fn refusal_audit_real_fixture_is_invariant_across_writer_states(pool: PgPo
 
     sqlx::raw_sql("CREATE FUNCTION refusal_audit_timeout_fixture() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(1); RETURN NEW; END $$; CREATE TRIGGER refusal_audit_timeout_fixture BEFORE INSERT OR UPDATE ON command_refusal_audit_buckets FOR EACH ROW EXECUTE FUNCTION refusal_audit_timeout_fixture();")
         .execute(&pool).await.expect("timeout writer fixture");
-    let timeout_drops_before = writer.runtime.metrics().dropped_after_retries;
+    let timeout_lost_before = envelopes_lost(&writer.runtime);
+    let timeout_delivered_before = writer.runtime.metrics().delivered;
     let timeout_terminal_before = refusal_envelopes_terminal(&writer.runtime);
     for (case, expected) in cases.iter().zip(&golden) {
         let actual = tokio::time::timeout(
@@ -2776,14 +2880,11 @@ async fn refusal_audit_real_fixture_is_invariant_across_writer_states(pool: PgPo
     )
     .await;
     assert_eq!(
-        writer
-            .runtime
-            .metrics()
-            .dropped_after_retries
-            .saturating_sub(timeout_drops_before),
+        envelopes_lost(&writer.runtime).saturating_sub(timeout_lost_before),
         cases.len() as u64,
-        "every timed-out envelope exhausts three attempts"
+        "every timed-out envelope is lost, none is delivered"
     );
+    assert_eq!(writer.runtime.metrics().delivered, timeout_delivered_before);
     sqlx::raw_sql("DROP TRIGGER refusal_audit_timeout_fixture ON command_refusal_audit_buckets; DROP FUNCTION refusal_audit_timeout_fixture();")
         .execute(&pool).await.expect("remove timeout fixture");
 
@@ -2792,7 +2893,8 @@ async fn refusal_audit_real_fixture_is_invariant_across_writer_states(pool: PgPo
         .acquire()
         .await
         .expect("only writer slot on a pool of 1");
-    let exhausted_drops_before = writer.runtime.metrics().dropped_after_retries;
+    let exhausted_lost_before = envelopes_lost(&writer.runtime);
+    let exhausted_delivered_before = writer.runtime.metrics().delivered;
     let exhausted_terminal_before = refusal_envelopes_terminal(&writer.runtime);
     for (case, expected) in cases.iter().zip(&golden) {
         // Domain work under load exceeds 250ms. A handler that awaited the
@@ -2827,13 +2929,13 @@ async fn refusal_audit_real_fixture_is_invariant_across_writer_states(pool: PgPo
     )
     .await;
     assert_eq!(
-        writer
-            .runtime
-            .metrics()
-            .dropped_after_retries
-            .saturating_sub(exhausted_drops_before),
+        envelopes_lost(&writer.runtime).saturating_sub(exhausted_lost_before),
         cases.len() as u64,
-        "every exhausted envelope exhausts three attempts"
+        "every envelope of an exhausted writer is lost, none is delivered"
+    );
+    assert_eq!(
+        writer.runtime.metrics().delivered,
+        exhausted_delivered_before
     );
     drop(held_writer);
 

@@ -1,21 +1,57 @@
-//! Fulfillment commands (`fulfillment.ship`, `fulfillment.confirm_delivery`),
-//! ported from the TypeScript prototype engine. The seller ships with a
-//! carrier and tracking number; the buyer confirms receipt, which marks the
-//! shipment delivered. Tracking numbers are participant-visible; the
-//! delivery address never appears in any response (ADR-0019 §8).
+//! Fulfillment commands (`fulfillment.ship`, `fulfillment.update_tracking`,
+//! `fulfillment.confirm_delivery`), ported from the TypeScript prototype
+//! engine. The seller ships with a carrier and, optionally, a tracking
+//! number, and may add or edit both while the order is shipped; the buyer
+//! confirms receipt, which marks the shipment delivered. Tracking numbers
+//! are participant-visible; the delivery address never appears in any
+//! response (ADR-0019 §8).
 
 use chrono::{DateTime, Utc};
-use marketplace_domain::commands::{OrderActionPayload, ShipOrderPayload};
+use marketplace_domain::commands::{OrderActionPayload, ShipOrderPayload, UpdateTrackingPayload};
 use marketplace_domain::state_machines::{can_transition, order_machine};
 use marketplace_domain::{Command, ErrorCode};
-use serde_json::json;
+use serde_json::{json, Value};
 use sqlx::{Postgres, Transaction};
 
 use crate::clock::format_timestamp;
 use crate::handlers::{fetch_order_for_update, finish_order_action, guard_order_action};
 use crate::model::OrderRow;
 use crate::queries::ORDER_COLUMNS;
-use crate::result::{CommandFailure, HandlerResult};
+use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
+
+/// Why a command that starts physical fulfilment refuses while the order's
+/// USDT payment is not final.
+pub const REASON_PAYMENT_NOT_FINAL: &str = "payment_not_final";
+
+/// Why `fulfillment.update_tracking` refuses an order that is not currently
+/// shipped (not yet shipped, already delivered, closed, cancelled, or a
+/// pickup or digital order that has no shipment).
+pub const REASON_ORDER_NOT_SHIPPED: &str = "order_not_shipped";
+
+/// Why `fulfillment.update_tracking` refuses once the shipment already
+/// carries [`TRACKING_HISTORY_MAX`] recorded changes.
+pub const REASON_TRACKING_UPDATE_LIMIT: &str = "tracking_update_limit";
+
+/// Upper bound on recorded tracking changes per shipment. The history rides
+/// in the order's `shipment` JSON, so it is bounded rather than silently
+/// truncated.
+pub const TRACKING_HISTORY_MAX: usize = 100;
+
+/// A USDT payment is paid at verified inclusion, but physical fulfilment
+/// waits for the transfer to be final: shipping, marking ready and handing
+/// over are refused while its finality is `pending` or `reverted`. Orders
+/// paid any other way carry no finality and are never refused here.
+fn guard_payment_final(order: &OrderRow) -> Option<CommandFailure> {
+    match order.payment_finality.as_deref() {
+        Some("pending" | "reverted") => Some(CommandFailure::refused_with_reason(
+            crate::refusal_audit::RefusalKind::InvalidState,
+            ErrorCode::InvalidState,
+            "The USDT payment is not final yet, so this order cannot be fulfilled.",
+            REASON_PAYMENT_NOT_FINAL,
+        )),
+        _ => None,
+    }
+}
 
 pub async fn ship(
     tx: &mut Transaction<'_, Postgres>,
@@ -64,6 +100,9 @@ pub async fn ship(
             "The order is not ready to ship.",
         )));
     }
+    if let Some(failure) = guard_payment_final(&order) {
+        return Ok(Err(failure));
+    }
     debug_assert!(can_transition(&order_machine(), &order.state, "shipped"));
 
     let shipment = json!({
@@ -72,6 +111,8 @@ pub async fn ship(
         "state": "shipped",
         "shipped_at": format_timestamp(now),
         "delivered_at": null,
+        "tracking_updated_at": null,
+        "tracking_history": [],
     });
     let updated: OrderRow = sqlx::query_as(&format!(
         "UPDATE orders SET revision = revision + 1, state = 'shipped', shipment = $3, \
@@ -95,6 +136,127 @@ pub async fn ship(
         now,
     )
     .await
+}
+
+/// `fulfillment.update_tracking` (seller, own order, state `shipped`): adds
+/// or edits the carrier and tracking number of the shipment. The order stays
+/// `shipped`. A change bumps the order revision, appends
+/// `{at, from, to}` to `shipment.tracking_history`, stamps
+/// `shipment.tracking_updated_at`, and emits `fulfillment.tracking_updated`
+/// with a `tracking_updated` notification to the buyer — the same path the
+/// ship event takes. Identical values change nothing: the current order is
+/// returned with `changed: false`, no revision bump and no event. The
+/// envelope `expected_revision` is the compare-and-swap, as for every order
+/// command, so a racing `fulfillment.confirm_delivery` or second update
+/// loses with `REVISION_CONFLICT`.
+pub async fn update_tracking(
+    tx: &mut Transaction<'_, Postgres>,
+    actor: &str,
+    command: &Command,
+    payload: &UpdateTrackingPayload,
+    now: DateTime<Utc>,
+) -> Result<HandlerResult, sqlx::Error> {
+    let Some(order) = fetch_order_for_update(tx, payload.order_id).await? else {
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::NotFound,
+            ErrorCode::NotFound,
+            "The order was not found.",
+        )));
+    };
+    if let Some(failure) = guard_order_action(actor, command, &order) {
+        return Ok(Err(failure));
+    }
+    if order.seller_pubky != actor {
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::Unauthorized,
+            ErrorCode::Unauthorized,
+            "Only the seller may update tracking.",
+        )));
+    }
+    let Some(shipment) = order.shipment.clone().filter(|_| order.state == "shipped") else {
+        return Ok(Err(CommandFailure::refused_with_reason(
+            crate::refusal_audit::RefusalKind::InvalidState,
+            ErrorCode::InvalidState,
+            "Tracking can be updated only while the order is shipped.",
+            REASON_ORDER_NOT_SHIPPED,
+        )));
+    };
+    if let Some(failure) = guard_payment_final(&order) {
+        return Ok(Err(failure));
+    }
+
+    let current = tracking_of(&shipment);
+    let next = json!({
+        "carrier": payload.carrier,
+        "tracking_number": payload.tracking_number,
+    });
+    if current == next {
+        let reviews = crate::handlers::fetch_order_reviews(tx, order.id).await?;
+        return Ok(Ok(HandlerSuccess {
+            revision: order.revision,
+            event_ids: vec![],
+            result: json!({
+                "kind": "order",
+                "order": crate::handlers::order_json_with_reviews(&order, &reviews),
+                "changed": false,
+            }),
+        }));
+    }
+    let mut history = shipment["tracking_history"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if history.len() >= TRACKING_HISTORY_MAX {
+        return Ok(Err(CommandFailure::refused_with_reason(
+            crate::refusal_audit::RefusalKind::InvalidState,
+            ErrorCode::InvalidState,
+            "This shipment has reached the limit of recorded tracking changes.",
+            REASON_TRACKING_UPDATE_LIMIT,
+        )));
+    }
+    let at = format_timestamp(now);
+    history.push(json!({ "at": at, "from": current, "to": next }));
+
+    let mut updated_shipment = shipment;
+    updated_shipment["carrier"] = json!(payload.carrier);
+    updated_shipment["tracking_number"] = json!(payload.tracking_number);
+    updated_shipment["tracking_updated_at"] = json!(at);
+    updated_shipment["tracking_history"] = Value::Array(history);
+    let updated: OrderRow = sqlx::query_as(&format!(
+        "UPDATE orders SET revision = revision + 1, shipment = $3, updated_at = $4 \
+         WHERE id = $1 AND revision = $2 AND state = 'shipped' RETURNING {ORDER_COLUMNS}"
+    ))
+    .bind(order.id)
+    .bind(order.revision)
+    .bind(&updated_shipment)
+    .bind(now)
+    .fetch_one(&mut **tx)
+    .await?;
+
+    let recipient = updated.buyer_pubky.clone();
+    let mut outcome = finish_order_action(
+        tx,
+        actor,
+        command,
+        &updated,
+        "fulfillment.tracking_updated",
+        ("tracking_updated", &recipient),
+        now,
+    )
+    .await?;
+    if let Ok(success) = outcome.as_mut() {
+        success.result["changed"] = json!(true);
+    }
+    Ok(outcome)
+}
+
+/// The `{carrier, tracking_number}` pair a shipment currently carries; a
+/// shipment shipped without tracking reads `null` for the number.
+fn tracking_of(shipment: &Value) -> Value {
+    json!({
+        "carrier": shipment["carrier"],
+        "tracking_number": shipment["tracking_number"],
+    })
 }
 
 pub async fn confirm_delivery(
@@ -224,6 +386,9 @@ pub async fn mark_ready(
             "The order is not awaiting pickup readiness.",
         )));
     }
+    if let Some(failure) = guard_payment_final(&order) {
+        return Ok(Err(failure));
+    }
     debug_assert!(can_transition(
         &order_machine(),
         &order.state,
@@ -295,6 +460,9 @@ pub async fn confirm_pickup(
             ErrorCode::InvalidState,
             "The order is not awaiting a pickup handover.",
         )));
+    }
+    if let Some(failure) = guard_payment_final(&order) {
+        return Ok(Err(failure));
     }
     let confirming_role = if actor == order.buyer_pubky {
         "buyer"

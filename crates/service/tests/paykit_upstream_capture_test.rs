@@ -1,7 +1,7 @@
-//! Consumer compatibility against verbatim exchanges captured from the real
-//! Paykit producer. Unlike the programmable fake suites, this pins request
-//! bytes/signatures plus response bytes for prepare, activate, status,
-//! resolve, and void.
+//! Historical producer captures pin old request bytes, signatures, response
+//! bytes, and provenance. Current prepare behavior is exercised elsewhere
+//! against the signature-verifying producer double because these captures
+//! predate `description` support and must not be treated as compatible.
 
 mod common;
 
@@ -10,11 +10,10 @@ use common::{paykit_server_67_75, TEST_PAYKIT_SIGNING_SEED};
 use ed25519_dalek::{Signature, SigningKey, Verifier};
 use marketplace_service::payments::{
     paykit_signature_preimage, PaykitApi, PaykitClient, PaykitDeliveryState, PaykitLifecycleTarget,
-    PaykitPrepared, PaykitStatusOutcome,
+    PaykitStatusOutcome,
 };
 
 const SELLER: &str = "buuk6nr1caaumhms4tph5oa656z9f5k9q867h4u8ze441mpfuhyo";
-const BUYER: &str = "7ahm9mquyezn4ny85baxqo43r8epijtwo6h8149yxsm7eiu155uy";
 
 fn captured_signature_verifies(fixture: &paykit_server_67_75::Fixture) -> bool {
     let seed: [u8; 32] = hex::decode(TEST_PAYKIT_SIGNING_SEED)
@@ -37,6 +36,16 @@ fn captured_signature_verifies(fixture: &paykit_server_67_75::Fixture) -> bool {
             &Signature::from_bytes(&signature),
         )
         .is_ok()
+}
+
+fn captured_invoice_id(prepare_fixture: &str) -> uuid::Uuid {
+    let fixture = paykit_server_67_75::load(prepare_fixture);
+    serde_json::from_str::<serde_json::Value>(&fixture.response_body)
+        .expect("captured prepare response is JSON")["invoice_id"]
+        .as_str()
+        .expect("captured prepare response carries invoice_id")
+        .parse()
+        .expect("captured prepare invoice_id is UUID")
 }
 
 #[test]
@@ -81,6 +90,12 @@ fn captured_exchanges_pin_routes_auth_headers_and_canonical_bytes() {
         );
         let request: serde_json::Value =
             serde_json::from_str(&fixture.request_body).expect("captured request is JSON");
+        if fixture.path == "/marketplace/payment-requests/prepare" {
+            assert!(
+                request.get("description").is_none(),
+                "legacy capture predates provider description support"
+            );
+        }
         assert_eq!(
             serde_json_canonicalizer::to_string(&request).expect("request canonicalizes"),
             fixture.request_body,
@@ -98,11 +113,21 @@ fn captured_exchanges_pin_routes_auth_headers_and_canonical_bytes() {
 }
 
 #[tokio::test]
-async fn captured_producer_lifecycle_exchanges_replay_through_the_consumer() {
-    let fixtures = paykit_server_67_75::load_all();
+async fn captured_producer_lifecycle_responses_replay_through_the_consumer() {
+    // Prepare now carries `description`, so its legacy request bytes cannot be
+    // replayed. Seed the unchanged commands from the invoice ids in the real
+    // prepare response captures, then replay the producer's exact response
+    // bytes for activate, status, resolve, and void through current parsers.
+    let activate = paykit_server_67_75::load("activate");
+    let status = paykit_server_67_75::load("status_active");
+    let resolve = paykit_server_67_75::load("resolve_paid_manually");
+    let void = paykit_server_67_75::load("void");
+    let invoice_id = captured_invoice_id("prepare_new");
+    let second_invoice = captured_invoice_id("prepare_for_void");
+    let fixtures = vec![activate, status, resolve, void];
     assert!(fixtures
         .iter()
-        .all(|fixture| { fixture.server_revision == paykit_server_67_75::SERVER_REVISION }));
+        .all(|fixture| fixture.server_revision == paykit_server_67_75::SERVER_REVISION));
     let replay = paykit_server_67_75::spawn_replay(fixtures).await;
     let client = PaykitClient::new(&replay.base_url, TEST_PAYKIT_SIGNING_SEED)
         .expect("Paykit client")
@@ -111,43 +136,8 @@ async fn captured_producer_lifecycle_exchanges_replay_through_the_consumer() {
         creator: SELLER.to_string(),
     };
 
-    let first_order = uuid::Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
-    let prepared = client
-        .create_payment_request(
-            SELLER,
-            BUYER,
-            first_order,
-            1,
-            50_000,
-            chrono::DateTime::UNIX_EPOCH,
-            3_600,
-        )
-        .await
-        .expect("captured prepare response parses");
-    let replayed = client
-        .create_payment_request(
-            SELLER,
-            BUYER,
-            first_order,
-            1,
-            50_000,
-            chrono::DateTime::UNIX_EPOCH,
-            3_600,
-        )
-        .await
-        .expect("captured prepare replay parses");
-    assert_eq!(replayed, prepared, "producer replayed exact prepared body");
-    let PaykitPrepared::Upstream {
-        invoice_id,
-        total_sats,
-        ..
-    } = prepared
-    else {
-        panic!("captured upstream response stays typed upstream")
-    };
-
     let activated = client
-        .activate_payment_request(&target, invoice_id, total_sats, 1)
+        .activate_payment_request(&target, invoice_id, 50_000, 1)
         .await
         .expect("captured activation parses");
     assert_eq!(activated.invoice_id, invoice_id);
@@ -175,28 +165,11 @@ async fn captured_producer_lifecycle_exchanges_replay_through_the_consumer() {
     assert_eq!(resolved.status, reqwest::StatusCode::OK);
     let resolved = resolved.resolved.expect("captured resolve body parses");
     assert_eq!(resolved.invoice_id, invoice_id);
-    assert_eq!(resolved.outcome, "paid_manually");
+    assert_eq!(
+        resolved.outcome, "paid_manually",
+        "captured producer outcome remains typed"
+    );
 
-    let second_order = uuid::Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
-    let prepared = client
-        .create_payment_request(
-            SELLER,
-            BUYER,
-            second_order,
-            1,
-            50_000,
-            chrono::DateTime::UNIX_EPOCH,
-            3_600,
-        )
-        .await
-        .expect("captured second prepare response parses");
-    let PaykitPrepared::Upstream {
-        invoice_id: second_invoice,
-        ..
-    } = prepared
-    else {
-        panic!("captured upstream response stays typed upstream")
-    };
     let voided = client
         .void_payment_request(&target, second_invoice, "not serialized upstream")
         .await

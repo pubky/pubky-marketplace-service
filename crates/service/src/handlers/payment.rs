@@ -364,13 +364,17 @@ pub(crate) async fn confirm_order(
                 "An order line's listing is missing.",
             )));
         };
-        if listing.reserved_quantity < quantity {
+        let rows = crate::variant_stock::lock_rows(tx, aggregate_id).await?;
+        let reserved_here = crate::variant_stock::resolve_held(&rows, line["variant_id"].as_str())
+            .ok()
+            .filter(|row| row.reserved_quantity >= quantity);
+        let Some(row) = reserved_here else {
             return Ok(Err(CommandFailure::refused(
                 crate::refusal_audit::RefusalKind::InvalidState,
                 ErrorCode::InvalidState,
                 "The reserved inventory for this order is no longer held.",
             )));
-        }
+        };
         let new_state = if listing.available_quantity > 0 {
             "available"
         } else if listing.reserved_quantity > quantity {
@@ -383,14 +387,19 @@ pub(crate) async fn confirm_order(
             &listing.state,
             new_state
         ));
+        if !crate::variant_stock::confirm_sale(tx, aggregate_id, &row.variant_id, quantity).await? {
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::InvalidState,
+                ErrorCode::InvalidState,
+                "The reserved inventory for this order is no longer held.",
+            )));
+        }
         sqlx::query(
             "UPDATE listings SET server_revision = server_revision + 1, state = $2, \
-             reserved_quantity = reserved_quantity - $3, sold_quantity = sold_quantity + $3, \
-             updated_at = $4 WHERE aggregate_id = $1",
+             updated_at = $3 WHERE aggregate_id = $1",
         )
         .bind(aggregate_id)
         .bind(new_state)
-        .bind(quantity)
         .bind(now)
         .execute(&mut **tx)
         .await?;
@@ -400,16 +409,19 @@ pub(crate) async fn confirm_order(
     // fixed field order, BLAKE3 like the prototype engine. A bitcoin-bound
     // order's recorded total is the paykit total (price + nonce, §B.11.3):
     // the figure the marketplace charged, displayed and recorded.
-    let receipt_total = order.paykit_total_sats.unwrap_or(order.total_minor);
-    let receipt_currency = if order.paykit_total_sats.is_some() {
-        "SAT"
-    } else {
-        &order.currency
-    };
-    let receipt_exponent = if order.paykit_total_sats.is_some() {
-        0
-    } else {
-        order.exponent
+    // An order settled in USDT records the USDT0 amount that was paid.
+    let (receipt_total, receipt_currency, receipt_exponent) = match (
+        order.payment_asset.as_deref(),
+        order.payment_amount_minor,
+        order.payment_exponent,
+    ) {
+        (Some("USDT"), Some(amount), Some(exponent)) => (amount, "USDT", i32::from(exponent)),
+        _ if order.paykit_total_sats.is_some() => (
+            order.paykit_total_sats.unwrap_or(order.total_minor),
+            "SAT",
+            0,
+        ),
+        _ => (order.total_minor, order.currency.as_str(), order.exponent),
     };
     let receipt_id = Uuid::new_v4();
     let total = money_json(receipt_total, receipt_currency, receipt_exponent);

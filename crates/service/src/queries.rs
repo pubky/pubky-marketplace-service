@@ -49,10 +49,13 @@ pub const MAX_LIMIT: i64 = 200;
 
 pub const ORDER_COLUMNS: &str =
     "id, auction_aggregate_id, drop_aggregate_id, buyer_pubky, seller_pubky, \
-     EXISTS (SELECT 1 FROM seller_payment_configs AS seller_config \
+     (EXISTS (SELECT 1 FROM seller_payment_configs AS seller_config \
        WHERE seller_config.seller_pubky = orders.seller_pubky \
        AND (seller_config.bitcoin_enabled \
-         OR seller_config.paypal_merchant_email IS NOT NULL)) AS seller_has_rail, revision, \
+         OR seller_config.paypal_merchant_email IS NOT NULL)) \
+      OR EXISTS (SELECT 1 FROM seller_accepted_payment_options AS seller_option \
+       WHERE seller_option.seller_pubky = orders.seller_pubky \
+       AND seller_option.enabled)) AS seller_has_rail, revision, \
      state, lines, delivery_address, checkout_command_id, delivery_address_envelope, \
      delivery_key_id, subtotal_minor, shipping_minor, total_minor, \
      currency, exponent, payment_id, receipt_id, edition, \
@@ -75,7 +78,11 @@ pub const ORDER_COLUMNS: &str =
      paykit_seller_confirmation_deadline, \
      fulfillment, first_revealed_at, created_at, updated_at, offer_award_id, priced_from, \
      payment_asset, payment_network, payment_amount_minor, payment_exponent, \
-     payment_quote_basis";
+     payment_quote_basis, paykit_amount_minor, paykit_accepted_assets, \
+     paykit_payment_amounts, payment_finality, payment_finality_at, \
+     paykit_second_rail_at, usd_conversion_pair, usd_conversion_source, \
+     usd_conversion_usd_rate, usd_conversion_currency_rate, usd_conversion_fetched_at, \
+     usd_conversion_cents";
 
 pub const PAYMENT_COLUMNS: &str = "id, order_id, buyer_pubky, seller_pubky, revision, adapter, \
      state, confirmations, amount_minor, currency, exponent, \
@@ -92,7 +99,9 @@ pub async fn seller_has_rail(
         "SELECT EXISTS (SELECT 1 FROM seller_payment_configs \
          WHERE seller_pubky = $1 \
          AND (bitcoin_enabled \
-           OR paypal_merchant_email IS NOT NULL))",
+           OR paypal_merchant_email IS NOT NULL)) \
+         OR EXISTS (SELECT 1 FROM seller_accepted_payment_options \
+         WHERE seller_pubky = $1 AND enabled)",
     )
     .bind(seller_pubky)
     .fetch_one(&mut **tx)
@@ -966,8 +975,8 @@ pub async fn get_public_listing_availability(
         );
         return response;
     }
-    let row: Result<Option<(String, String)>, sqlx::Error> = sqlx::query_as(
-        "SELECT aggregate_id, state FROM listings \
+    let row: Result<Option<(String, String, Option<Value>)>, sqlx::Error> = sqlx::query_as(
+        "SELECT aggregate_id, state, variant_availability FROM listings \
          WHERE seller_pubky = $1 AND listing_id = $2 AND deleted_at IS NULL",
     )
     .bind(&seller_pubky)
@@ -975,16 +984,28 @@ pub async fn get_public_listing_availability(
     .fetch_optional(&state.pool)
     .await;
     match row {
-        Ok(Some((aggregate_id, listing_state))) => {
-            let mut response = (
-                StatusCode::OK,
-                Json(json!({
-                    "aggregate_id": aggregate_id,
-                    "state": listing_state,
-                    "server_time": format_timestamp(now),
-                })),
-            )
-                .into_response();
+        Ok(Some((aggregate_id, listing_state, variant_availability))) => {
+            let mut body = json!({
+                "aggregate_id": aggregate_id,
+                "state": listing_state,
+                "server_time": format_timestamp(now),
+            });
+            // A listing that tracks stock per variant says which variants
+            // are sold out, never how many units are left.
+            if let Some(Value::Array(variants)) = variant_availability {
+                body["variants"] = Value::Array(
+                    variants
+                        .iter()
+                        .map(|variant| {
+                            json!({
+                                "variant_id": variant["variant_id"],
+                                "sold_out": variant["sold_out"],
+                            })
+                        })
+                        .collect(),
+                );
+            }
+            let mut response = (StatusCode::OK, Json(body)).into_response();
             response.headers_mut().insert(
                 axum::http::header::CACHE_CONTROL,
                 axum::http::HeaderValue::from_static(

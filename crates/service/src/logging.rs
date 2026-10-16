@@ -91,6 +91,7 @@ pub(crate) fn error_code_name(code: Option<ErrorCode>) -> &'static str {
         Some(ErrorCode::AwardListingChanged) => "AWARD_LISTING_CHANGED",
         Some(ErrorCode::AwardHoldMissing) => "AWARD_HOLD_MISSING",
         Some(ErrorCode::ListingModerated) => "LISTING_MODERATED",
+        Some(ErrorCode::ListingNotActive) => "LISTING_NOT_ACTIVE",
         None => "",
     }
 }

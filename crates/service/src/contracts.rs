@@ -29,6 +29,8 @@ pub enum ReviewReason {
     StockUnavailable,
     RefundRequired,
     RefundDestinationRequired,
+    RefundRailUnknown,
+    RefundAmountUnrecordable,
 }
 
 impl ReviewReason {
@@ -51,6 +53,8 @@ impl ReviewReason {
             Self::StockUnavailable => "stock_unavailable",
             Self::RefundRequired => "refund_required",
             Self::RefundDestinationRequired => "refund_destination_required",
+            Self::RefundRailUnknown => "refund_rail_unknown",
+            Self::RefundAmountUnrecordable => "refund_amount_unrecordable",
         }
     }
 
@@ -73,6 +77,8 @@ impl ReviewReason {
             Self::StockUnavailable,
             Self::RefundRequired,
             Self::RefundDestinationRequired,
+            Self::RefundRailUnknown,
+            Self::RefundAmountUnrecordable,
         ]
     }
 
@@ -101,6 +107,8 @@ impl ReviewReason {
                 Self::StockUnavailable,
                 Self::RefundRequired,
                 Self::RefundDestinationRequired,
+                Self::RefundRailUnknown,
+                Self::RefundAmountUnrecordable,
             ],
             _ => &[],
         }

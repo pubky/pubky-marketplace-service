@@ -1,0 +1,99 @@
+{
+  "_provenance": "spec-derived: shape of the ProductsPage document against the 2026-10 schema; not a capture",
+  "data": {
+    "shop": {
+      "currencyCode": "USD"
+    },
+    "products": {
+      "pageInfo": {
+        "hasNextPage": true,
+        "endCursor": "cursor-page-1"
+      },
+      "nodes": [
+        {
+          "id": "gid://shopify/Product/9001",
+          "title": "Trail Boots",
+          "description": "Waterproof leather boots.",
+          "onlineStoreUrl": "https://dezentral.myshopify.com/products/trail-boots",
+          "options": [
+            {
+              "name": "Size",
+              "values": [
+                "40",
+                "41",
+                "42"
+              ]
+            }
+          ],
+          "images": {
+            "nodes": [
+              {
+                "url": "https://cdn.shopify.com/s/files/boots-1.jpg"
+              }
+            ]
+          },
+          "variants": {
+            "pageInfo": {
+              "hasNextPage": true,
+              "endCursor": "variants-cursor-1"
+            },
+            "nodes": [
+              {
+                "id": "gid://shopify/ProductVariant/50001",
+                "title": "40",
+                "sku": "BOOT-40",
+                "price": "125.00",
+                "selectedOptions": [
+                  {
+                    "name": "Size",
+                    "value": "40"
+                  }
+                ],
+                "image": {
+                  "url": "https://cdn.shopify.com/s/files/boots-40.jpg"
+                },
+                "inventoryQuantity": 7,
+                "inventoryItem": {
+                  "tracked": true
+                }
+              },
+              {
+                "id": "gid://shopify/ProductVariant/50002",
+                "title": "41",
+                "sku": "BOOT-41",
+                "price": "125.00",
+                "selectedOptions": [
+                  {
+                    "name": "Size",
+                    "value": "41"
+                  }
+                ],
+                "image": null,
+                "inventoryQuantity": 0,
+                "inventoryItem": {
+                  "tracked": true
+                }
+              }
+            ]
+          },
+          "productType": "Footwear",
+          "vendor": "Dezentral Goods",
+          "category": {
+            "fullName": "Apparel & Accessories > Shoes > Boots"
+          }
+        }
+      ]
+    }
+  },
+  "extensions": {
+    "cost": {
+      "requestedQueryCost": 142,
+      "actualQueryCost": 12,
+      "throttleStatus": {
+        "maximumAvailable": 2000.0,
+        "currentlyAvailable": 1988,
+        "restoreRate": 100.0
+      }
+    }
+  }
+}

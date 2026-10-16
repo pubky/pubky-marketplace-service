@@ -44,6 +44,11 @@ impl CommandFailure {
         }
     }
 
+    pub(crate) fn with_reason(mut self, reason: &'static str) -> Self {
+        self.reason = Some(reason);
+        self
+    }
+
     pub(crate) fn refused_with_revision(
         kind: RefusalKind,
         code: ErrorCode,
@@ -69,12 +74,19 @@ impl CommandFailure {
     }
 
     pub(crate) fn invalid_envelope(issues: Vec<ValidationIssue>) -> Self {
-        Self::refused_with_issues(
-            RefusalKind::InvalidEnvelope,
-            ErrorCode::InvalidCommand,
-            "The marketplace command is invalid.",
-            issues,
-        )
+        let reason = issues
+            .iter()
+            .find_map(|issue| issue.reason.as_deref())
+            .and_then(static_refusal_reason);
+        Self {
+            reason,
+            ..Self::refused_with_issues(
+                RefusalKind::InvalidEnvelope,
+                ErrorCode::InvalidCommand,
+                "The marketplace command is invalid.",
+                issues,
+            )
+        }
     }
 
     pub(crate) const fn code(&self) -> ErrorCode {
@@ -87,6 +99,10 @@ impl CommandFailure {
 
     pub(crate) fn message(&self) -> &str {
         &self.message
+    }
+
+    pub(crate) const fn reason(&self) -> Option<&'static str> {
+        self.reason
     }
 
     pub(crate) const fn current_revision(&self) -> Option<i64> {
@@ -113,6 +129,21 @@ impl CommandFailure {
     pub fn http_status(&self) -> u16 {
         self.code.http_status()
     }
+}
+
+/// The currency refusal tokens a validation issue can carry, as the static
+/// strings `error.reason` holds.
+fn static_refusal_reason(reason: &str) -> Option<&'static str> {
+    use marketplace_domain::currency::{
+        REASON_CURRENCY_EXPONENT, REASON_CURRENCY_UNSUPPORTED, REASON_LOCKS_CURRENCY_UNSUPPORTED,
+    };
+    [
+        REASON_CURRENCY_UNSUPPORTED,
+        REASON_CURRENCY_EXPONENT,
+        REASON_LOCKS_CURRENCY_UNSUPPORTED,
+    ]
+    .into_iter()
+    .find(|known| *known == reason)
 }
 
 /// The state written by a successful handler, before the response envelope

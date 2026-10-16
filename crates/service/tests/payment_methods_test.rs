@@ -586,8 +586,9 @@ async fn own_config_returns_the_stored_row_verbatim(pool: PgPool) {
     assert_eq!(status, StatusCode::OK, "config put failed: {put_body}");
 
     // The seller has NOT claimed a watch-only account on paykit-server, yet
-    // the own view still reports bitcoin_enabled as stored: this endpoint is
-    // the raw row, not availability, and performs no paykit lookup.
+    // the own view still reports bitcoin_enabled as stored: `bitcoin_enabled`
+    // is the raw row, not availability. Readiness is the separate
+    // `bitcoin_setup`.
     let (status, body) = get_own_config(&app, Some(&seller.token)).await;
     assert_eq!(status, StatusCode::OK, "own config read failed: {body}");
     assert_eq!(body["payment_config"], put_body["payment_config"]);
@@ -601,23 +602,40 @@ async fn own_config_returns_the_stored_row_verbatim(pool: PgPool) {
         config["updated_at"].as_str().is_some(),
         "updated_at must be present: {config}"
     );
+    assert_eq!(config["bitcoin_setup"], json!("setup_required"));
 
-    // The row is scoped to the session identity: another seller sees nothing.
+    // The row is scoped to the session identity: another seller sees only the
+    // empty configuration.
     let stranger = new_actor(&app).await;
     let (status, body) = get_own_config(&app, Some(&stranger.token)).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["payment_config"], Value::Null);
+    assert_eq!(body["payment_config"]["paypal_merchant_email"], Value::Null);
+    assert_eq!(body["payment_config"]["bitcoin_enabled"], json!(false));
+    assert_eq!(
+        body["payment_config"]["updated_at"],
+        json!("1970-01-01T00:00:00.000Z")
+    );
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn own_config_is_null_before_the_first_save(pool: PgPool) {
+async fn own_config_is_empty_before_the_first_save(pool: PgPool) {
     // Deliberately without the payments runtime: reading the stored row must
     // not be gated on payment rails being configured.
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
     let (status, body) = get_own_config(&app, Some(&seller.token)).await;
     assert_eq!(status, StatusCode::OK, "own config read failed: {body}");
-    assert_eq!(body, json!({ "payment_config": Value::Null }));
+    assert_eq!(
+        body,
+        json!({
+            "payment_config": {
+                "bitcoin_enabled": false,
+                "bitcoin_setup": "unavailable",
+                "paypal_merchant_email": null,
+                "updated_at": "1970-01-01T00:00:00.000Z",
+            }
+        })
+    );
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
@@ -713,11 +731,12 @@ async fn binding_rejections_cover_role_availability_and_currency(pool: PgPool) {
         );
     }
 
-    // A JPY/0 order is outside the initial USD/2 FX contract even when
-    // Bitcoin is enabled; the rejection must happen before feed/Paykit work.
+    // An order in a currency outside the registry (SEK/2) has no FX contract
+    // even when Bitcoin is enabled; the rejection must happen before
+    // feed/Paykit work.
     put_config(&app, &seller.token, &json!({ "bitcoin_enabled": true })).await;
     paykit.set_claimed(&seller.pubky);
-    sqlx::query("UPDATE orders SET currency = 'JPY', exponent = 0 WHERE id = $1")
+    sqlx::query("UPDATE orders SET currency = 'SEK', exponent = 2 WHERE id = $1")
         .bind(Uuid::parse_str(&order.order_id).expect("order id is a UUID"))
         .execute(&app.pool)
         .await

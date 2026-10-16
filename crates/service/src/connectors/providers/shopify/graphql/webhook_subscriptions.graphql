@@ -1,0 +1,13 @@
+query WebhookSubscriptions($after: String) {
+  webhookSubscriptions(first: 100, after: $after) {
+    pageInfo {
+      hasNextPage
+      endCursor
+    }
+    nodes {
+      id
+      topic
+      uri
+    }
+  }
+}

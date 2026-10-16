@@ -114,6 +114,9 @@ pub async fn handle(
     )
     .await?;
     let mut resolved: Vec<(&CheckoutLine, ListingRow)> = Vec::with_capacity(peeked.len());
+    // The variant row each line takes its units from, kept for a listing that
+    // tracks stock per variant (a listing that sells one variant needs none).
+    let mut stock_variants: Vec<Option<String>> = Vec::with_capacity(peeked.len());
     for (line, _) in peeked {
         let Some(listing) = fetch_live_listing_for_update(tx, &line.listing_aggregate_id).await?
         else {
@@ -155,7 +158,40 @@ pub async fn handle(
                 listing.server_revision,
             )));
         }
-        if line.quantity > listing.available_quantity {
+        let rows = crate::variant_stock::lock_rows(tx, &line.listing_aggregate_id).await?;
+        let keyed = crate::variant_stock::tracks_variants(&rows);
+        let row = match crate::variant_stock::resolve(&rows, line.variant_id.as_deref()) {
+            Ok(row) => row,
+            Err(refusal) => return Ok(Err(refusal.failure())),
+        };
+        if keyed {
+            match crate::variant_stock::shortfall(row, line.quantity) {
+                None => {}
+                Some(crate::variant_stock::Shortfall::Held) => {
+                    return Ok(Err(CommandFailure::refused(
+                        crate::refusal_audit::RefusalKind::InvalidState,
+                        ErrorCode::InvalidState,
+                        HOLDING_COPY,
+                    )));
+                }
+                Some(crate::variant_stock::Shortfall::SoldOut) => {
+                    return Ok(Err(CommandFailure::refused_with_reason(
+                        crate::refusal_audit::RefusalKind::InvalidState,
+                        ErrorCode::InvalidState,
+                        "This variant has sold out.",
+                        crate::variant_stock::REASON_VARIANT_SOLD_OUT,
+                    )));
+                }
+                Some(crate::variant_stock::Shortfall::Insufficient) => {
+                    return Ok(Err(CommandFailure::refused_with_revision(
+                        crate::refusal_audit::RefusalKind::InsufficientInventory,
+                        ErrorCode::InsufficientInventory,
+                        "Checkout quantity is unavailable.",
+                        listing.server_revision,
+                    )));
+                }
+            }
+        } else if line.quantity > listing.available_quantity {
             return Ok(Err(CommandFailure::refused_with_revision(
                 crate::refusal_audit::RefusalKind::InsufficientInventory,
                 ErrorCode::InsufficientInventory,
@@ -163,6 +199,7 @@ pub async fn handle(
                 listing.server_revision,
             )));
         }
+        stock_variants.push(keyed.then(|| row.variant_id.clone()));
         resolved.push((line, listing));
     }
     let first = &resolved[0].1;
@@ -274,6 +311,16 @@ pub async fn handle(
         Ok(envelopes) => envelopes,
         Err(failure) => return Ok(Err(failure)),
     };
+    let connector_shares = match crate::handlers::connector_share::match_checkout_shares(
+        tx,
+        payload.connector_shares.as_deref(),
+        &shipped_sellers,
+    )
+    .await?
+    {
+        Ok(shares) => shares,
+        Err(failure) => return Ok(Err(failure)),
+    };
 
     // The delivery email is required exactly when a line is email-kind, and
     // refused otherwise, so no client can store an address the order does
@@ -355,7 +402,12 @@ pub async fn handle(
                 // bought. It is display data validated for shape only:
                 // registration carries no variant inventory, so the service
                 // cannot check it against the owner-signed listing content.
-                if let Some(variant_id) = &line.variant_id {
+                // A listing that tracks stock per variant records the variant
+                // the units are held on, so a line that named none (it took
+                // the sole offered variant) releases the same row later.
+                if let Some(variant_id) =
+                    stock_variants[index].as_ref().or(line.variant_id.as_ref())
+                {
                     line_json["variant_id"] = json!(variant_id);
                 }
                 if let Some(options) = &line.variant_options {
@@ -467,6 +519,21 @@ pub async fn handle(
         .bind(sealed.map(|stored| stored.key_id.as_str()))
         .execute(&mut **tx)
         .await?;
+        if let Some(share) = connector_shares.get(seller_pubky).filter(|_| !unshipped) {
+            sqlx::query(
+                "UPDATE orders SET connector_share_domain = $2, \
+                 connector_share_consent_version = $3, connector_share_consented_at = $4, \
+                 connector_address_envelope = $5, connector_key_id = $6 WHERE id = $1",
+            )
+            .bind(order.id)
+            .bind(&share.shop_domain)
+            .bind(&share.consent_version)
+            .bind(now)
+            .bind(&share.envelope)
+            .bind(&share.key_id)
+            .execute(&mut **tx)
+            .await?;
+        }
         // One sealed address per email-kind order, in the order-create
         // transaction; two email-kind sellers each get their own row.
         if *group_method == FulfillmentMethod::Digital && indices.iter().any(is_email_line) {
@@ -612,7 +679,7 @@ pub async fn handle(
     // transaction as the drop debit above. Ordinary checkouts hold nothing
     // until payment-method bind.
     if drop_aggregate_id.is_some() {
-        for (line, listing) in &resolved {
+        for (index, (line, listing)) in resolved.iter().enumerate() {
             let new_state = if listing.available_quantity == line.quantity {
                 "reserved"
             } else {
@@ -626,20 +693,28 @@ pub async fn handle(
                     listing.server_revision,
                 )));
             }
-            let updated = sqlx::query(
-                "UPDATE listings SET server_revision = server_revision + 1, state = $3, \
-                 available_quantity = available_quantity - $4, \
-                 reserved_quantity = reserved_quantity + $4, updated_at = $5 \
-                 WHERE aggregate_id = $1 AND server_revision = $2 AND available_quantity >= $4",
-            )
-            .bind(&listing.aggregate_id)
-            .bind(line.expected_revision)
-            .bind(new_state)
-            .bind(line.quantity)
-            .bind(now)
-            .execute(&mut **tx)
-            .await?;
-            if updated.rows_affected() != 1 {
+            let variant_id = stock_variants[index]
+                .as_deref()
+                .unwrap_or(crate::variant_stock::IMPLICIT_VARIANT_ID);
+            let held =
+                crate::variant_stock::reserve(tx, &listing.aggregate_id, variant_id, line.quantity)
+                    .await?;
+            let updated = if held {
+                sqlx::query(
+                    "UPDATE listings SET server_revision = server_revision + 1, state = $3, \
+                     updated_at = $4 WHERE aggregate_id = $1 AND server_revision = $2",
+                )
+                .bind(&listing.aggregate_id)
+                .bind(line.expected_revision)
+                .bind(new_state)
+                .bind(now)
+                .execute(&mut **tx)
+                .await?
+                .rows_affected()
+            } else {
+                0
+            };
+            if updated != 1 {
                 let latest = current_listing_revision(tx, &listing.aggregate_id).await?;
                 return Ok(Err(CommandFailure::refused_with_revision(
                     crate::refusal_audit::RefusalKind::RevisionConflict,

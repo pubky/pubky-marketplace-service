@@ -18,12 +18,25 @@ pub const COMMERCE_CONTRACT_VERSION: u64 = 1;
 pub struct ValidationIssue {
     pub path: String,
     pub message: String,
+    /// A stable snake_case token a client can branch on (the currency
+    /// refusals); absent for ordinary shape issues so their wire form is
+    /// unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 fn issue(path: &str, message: &str) -> ValidationIssue {
     ValidationIssue {
         path: path.to_string(),
         message: message.to_string(),
+        reason: None,
+    }
+}
+
+fn issue_with_reason(path: &str, message: &str, reason: &str) -> ValidationIssue {
+    ValidationIssue {
+        reason: Some(reason.to_string()),
+        ..issue(path, message)
     }
 }
 
@@ -75,6 +88,7 @@ pub enum CommandPayload {
     RequestCancellation(RequestCancellationPayload),
     ApproveCancellation(OrderActionPayload),
     ShipOrder(ShipOrderPayload),
+    UpdateTracking(UpdateTrackingPayload),
     ConfirmDelivery(OrderActionPayload),
     SetPickupDetails(SetPickupDetailsPayload),
     ClearPickupDetails(ClearPickupDetailsPayload),
@@ -118,6 +132,7 @@ impl Command {
             CommandPayload::RequestCancellation(_) => "order.cancel_request",
             CommandPayload::ApproveCancellation(_) => "order.cancel_approve",
             CommandPayload::ShipOrder(_) => "fulfillment.ship",
+            CommandPayload::UpdateTracking(_) => "fulfillment.update_tracking",
             CommandPayload::ConfirmDelivery(_) => "fulfillment.confirm_delivery",
             CommandPayload::SetPickupDetails(_) => "pickup_details.set",
             CommandPayload::ClearPickupDetails(_) => "pickup_details.clear",
@@ -163,6 +178,7 @@ impl Command {
             CommandPayload::RegisterLocks(p) => serde_json::to_value(p),
             CommandPayload::RequestCancellation(p) => serde_json::to_value(p),
             CommandPayload::ShipOrder(p) => serde_json::to_value(p),
+            CommandPayload::UpdateTracking(p) => serde_json::to_value(p),
             CommandPayload::SetPickupDetails(p) => serde_json::to_value(p),
             CommandPayload::ClearPickupDetails(p) => serde_json::to_value(p),
             CommandPayload::SetDigitalDelivery(p) => serde_json::to_value(p),
@@ -317,7 +333,30 @@ pub struct RegisterListingPayload {
     /// correlation, so it is never snapshotted onto projected order lines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digital_lock: Option<DigitalLockMetadata>,
+    /// The record's enabled variants with their stock, in record order. Empty
+    /// for a client that predates per-variant stock, which registers the
+    /// listing as one implicit variant holding `quantity`. With two or more
+    /// entries the listing tracks stock per variant and `quantity` is
+    /// ignored (it stays the sum of ALL record variants, enabled or not).
+    /// Serialized only when non-empty so older clients keep byte-identical
+    /// canonical JSON (the idempotency hash input).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub variants: Vec<VariantStock>,
 }
+
+/// One enabled variant of a listing record and the units the seller holds of
+/// it (`variants[].id`, `.sku`, `.quantity` in the owner-signed record).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VariantStock {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sku: Option<String>,
+    pub quantity: i64,
+}
+
+/// Most variants one listing may carry (the reference client's limit).
+pub const MAX_LISTING_VARIANTS: usize = 100;
 
 /// The quantity Shop stores Unlimited digital stock as (digital delivery
 /// design §2 "Stock"). On a listing that ships or offers pickup it would sell
@@ -335,7 +374,11 @@ impl RegisterListingPayload {
     /// digital like any other digital listing, so it is not at the cap with a
     /// physical method.
     pub fn registers_unlimited_cap_with_physical_methods(&self) -> bool {
-        self.quantity == UNLIMITED_STOCK_QUANTITY
+        (self.quantity == UNLIMITED_STOCK_QUANTITY
+            || self
+                .variants
+                .iter()
+                .any(|variant| variant.quantity == UNLIMITED_STOCK_QUANTITY))
             && self.fulfillment_methods.iter().any(|method| {
                 matches!(
                     method,
@@ -404,6 +447,10 @@ pub struct ReleaseDropListingsPayload {}
 pub struct ReserveInventoryPayload {
     pub quantity: i64,
     pub reservation_ttl_seconds: i64,
+    /// The variant to hold. Required on a listing that tracks stock per
+    /// variant, ignored (and accepted) on a listing that sells one variant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant_id: Option<String>,
 }
 
 /// One `name → value` pair of a chosen listing variant, carried as an
@@ -516,6 +563,39 @@ impl SellerDeliveryEnvelope {
     }
 }
 
+/// A buyer's opt-in to share their delivery address with one seller's
+/// connected store (Shopify, WooCommerce). The address is sealed a second
+/// time, to the connection's recipient key published in the seller's
+/// connector status, with the delivery envelope's construction. The service
+/// stores the bytes and the consent (shop domain, consent copy version, time
+/// of the checkout) on the order, opens the envelope only when it pushes the
+/// order to the store, and deletes it once the store order exists.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SellerConnectorShare {
+    pub seller_pubky: String,
+    /// The store the buyer agreed to share with, as the seller's connector
+    /// status names it.
+    pub shop_domain: String,
+    /// The version of the consent copy the buyer saw.
+    pub consent_version: String,
+    /// The connection's recipient key the envelope is sealed to.
+    pub key_id: String,
+    pub envelope: String,
+}
+
+impl std::fmt::Debug for SellerConnectorShare {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SellerConnectorShare")
+            .field("seller_pubky", &self.seller_pubky)
+            .field("shop_domain", &self.shop_domain)
+            .field("consent_version", &self.consent_version)
+            .field("key_id", &self.key_id)
+            .field("envelope", &"<sealed>")
+            .finish()
+    }
+}
+
 /// Decodes an envelope that already passed [`validate_delivery_envelope`]
 /// into its 2,096 bytes. `None` if the text is not canonical unpadded
 /// base64url of exactly that length.
@@ -589,6 +669,12 @@ pub struct CreateCheckoutPayload {
     /// The service cannot open it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery_address_envelopes: Option<Vec<SellerDeliveryEnvelope>>,
+    /// The buyer's opt-in to share the address with a seller's connected
+    /// store, one entry per opted-in seller. Only with
+    /// `delivery_address_envelopes`: the service never takes a plaintext
+    /// address for a store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connector_shares: Option<Vec<SellerConnectorShare>>,
     /// Where the seller of an email-kind digital line sends the purchase
     /// (digital delivery design §4.3). Required exactly when a line is
     /// email-kind; the handler refuses it otherwise.
@@ -889,6 +975,26 @@ pub struct ShipOrderPayload {
     /// `La Poste`, `An Post`, `Deutsche Post`, plus free text for anything
     /// else (rendered as plain text, no tracking link).
     pub carrier: String,
+    /// The parcel's tracking number, 1–200 printable characters. Absent,
+    /// `null` and empty (after trimming) all mean "no tracking yet": the
+    /// order is shipped and the seller adds the number later with
+    /// `fulfillment.update_tracking`. A caller with no carrier sends
+    /// `"Other"`.
+    #[serde(default)]
+    pub tracking_number: Option<String>,
+}
+
+/// `fulfillment.update_tracking` (seller, own order, state `shipped`): adds
+/// or edits the carrier and tracking number of a shipment already made.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateTrackingPayload {
+    pub order_id: Uuid,
+    /// Same rules as `ShipOrderPayload.carrier`: 1–100 printable
+    /// characters, free text with a soft vocabulary.
+    pub carrier: String,
+    /// 1–200 printable characters. Required: this command adds or edits a
+    /// number and cannot clear one.
     pub tracking_number: String,
 }
 
@@ -1217,11 +1323,6 @@ fn content_hash_regex() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"^[a-f0-9]{64}$").expect("valid regex"))
 }
 
-fn currency_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^[A-Z][A-Z0-9]{2,11}$").expect("valid regex"))
-}
-
 fn country_code_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"^[A-Z]{2}$").expect("valid regex"))
@@ -1319,6 +1420,9 @@ pub fn parse_command(raw: &Value) -> Result<Command, Vec<ValidationIssue>> {
             parse_payload(&envelope.payload).map(CommandPayload::ApproveCancellation)?
         }
         "fulfillment.ship" => parse_payload(&envelope.payload).and_then(validate_ship_order)?,
+        "fulfillment.update_tracking" => {
+            parse_payload(&envelope.payload).and_then(validate_update_tracking)?
+        }
         "fulfillment.confirm_delivery" => {
             parse_payload(&envelope.payload).map(CommandPayload::ConfirmDelivery)?
         }
@@ -1386,17 +1490,21 @@ fn validate_money(path: &str, money: &Money, issues: &mut Vec<ValidationIssue>) 
             "Expected a non-negative safe integer amount",
         ));
     }
-    if !currency_regex().is_match(&money.currency) {
-        issues.push(issue(
+    match crate::currency::refusal_reason(&money.currency, money.exponent) {
+        Some(crate::currency::REASON_CURRENCY_UNSUPPORTED) => issues.push(issue_with_reason(
             &format!("{path}.currency"),
-            "Expected an uppercase asset code",
-        ));
-    }
-    if !(0..=18).contains(&money.exponent) {
-        issues.push(issue(
+            &format!(
+                "Unsupported currency. Supported: {}",
+                crate::currency::SUPPORTED_CODES
+            ),
+            crate::currency::REASON_CURRENCY_UNSUPPORTED,
+        )),
+        Some(reason) => issues.push(issue_with_reason(
             &format!("{path}.exponent"),
-            "Expected an exponent between 0 and 18",
-        ));
+            "The exponent does not match the currency (JPY and SAT use 0, BTC 8, the others 2)",
+            reason,
+        )),
+        None => {}
     }
 }
 
@@ -1502,6 +1610,41 @@ pub fn validate_public_listing_payload(
     validate_listing_payload(payload, false)
 }
 
+fn validate_variant_stock(variants: &[VariantStock], issues: &mut Vec<ValidationIssue>) {
+    if variants.len() > MAX_LISTING_VARIANTS {
+        issues.push(issue("payload.variants", "Expected at most 100 variants"));
+        return;
+    }
+    let mut seen = std::collections::HashSet::new();
+    for (index, variant) in variants.iter().enumerate() {
+        if !entity_id_regex().is_match(&variant.id) {
+            issues.push(issue(
+                &format!("payload.variants.{index}.id"),
+                "Expected a path-safe commerce identifier",
+            ));
+        } else if !seen.insert(variant.id.as_str()) {
+            issues.push(issue(
+                &format!("payload.variants.{index}.id"),
+                "Variant ids must be unique",
+            ));
+        }
+        if !(0..=1_000_000).contains(&variant.quantity) {
+            issues.push(issue(
+                &format!("payload.variants.{index}.quantity"),
+                "Expected a quantity between 0 and 1000000",
+            ));
+        }
+        if variant.sku.as_deref().is_some_and(|sku| {
+            sku.is_empty() || sku.len() > 128 || sku.chars().any(char::is_control)
+        }) {
+            issues.push(issue(
+                &format!("payload.variants.{index}.sku"),
+                "Expected a sku of 1 to 128 printable characters",
+            ));
+        }
+    }
+}
+
 fn validate_listing_payload(
     mut payload: RegisterListingPayload,
     require_auction_reserve: bool,
@@ -1538,6 +1681,7 @@ fn validate_listing_payload(
             "Expected a quantity between 1 and 1000000",
         ));
     }
+    validate_variant_stock(&payload.variants, &mut issues);
     validate_positive_money("payload.unit_price", &payload.unit_price, &mut issues);
     if !(0..=MAX_SAFE_INTEGER).contains(&payload.shipping_minor) {
         issues.push(issue(
@@ -1681,6 +1825,27 @@ fn validate_listing_payload(
                 "Expected a path-safe commerce identifier",
             ));
         }
+        // The Lock Server counts USD in cents and BTC in sats only, so a
+        // Locks price in any other currency could never be paid or verified.
+        // A currency that fails the registry check above has already been
+        // reported.
+        let locks_countable = crate::currency::Currency::for_money(
+            &payload.unit_price.currency,
+            payload.unit_price.exponent,
+        )
+        .is_some_and(crate::currency::Currency::locks_supported);
+        let already_reported = crate::currency::refusal_reason(
+            &payload.unit_price.currency,
+            payload.unit_price.exponent,
+        )
+        .is_some();
+        if !locks_countable && !already_reported {
+            issues.push(issue_with_reason(
+                "payload.unit_price.currency",
+                "A Locks listing can be priced only in USD, BTC or SAT",
+                crate::currency::REASON_LOCKS_CURRENCY_UNSUPPORTED,
+            ));
+        }
     }
 
     if issues.is_empty() {
@@ -1705,6 +1870,14 @@ fn validate_reserve_inventory(
             "payload.reservation_ttl_seconds",
             "Expected a reservation TTL between 60 and 1800 seconds",
         ));
+    }
+    if let Some(variant_id) = &payload.variant_id {
+        if !entity_id_regex().is_match(variant_id) {
+            issues.push(issue(
+                "payload.variant_id",
+                "Expected a path-safe commerce identifier",
+            ));
+        }
     }
     if issues.is_empty() {
         Ok(CommandPayload::ReserveInventory(payload))
@@ -1933,6 +2106,46 @@ fn validate_ship_order(
     let mut issues = Vec::new();
     validate_trimmed("payload.carrier", &mut payload.carrier, 1, 100, &mut issues);
     validate_printable("payload.carrier", &payload.carrier, &mut issues);
+    // Blank means "no tracking", but the length bound still applies to what
+    // the caller sent: a blank value over the bound is refused, not read as
+    // an absent number.
+    if payload
+        .tracking_number
+        .as_deref()
+        .is_some_and(|number| number.chars().count() > 200 && number.trim().is_empty())
+    {
+        issues.push(issue(
+            "payload.tracking_number",
+            "Expected between 1 and 200 characters",
+        ));
+    }
+    if let Some(number) = payload.tracking_number.as_mut() {
+        *number = number.trim().to_string();
+    }
+    if payload
+        .tracking_number
+        .as_deref()
+        .is_some_and(|number| number.is_empty())
+    {
+        payload.tracking_number = None;
+    }
+    if let Some(number) = payload.tracking_number.as_mut() {
+        validate_trimmed("payload.tracking_number", number, 1, 200, &mut issues);
+        validate_printable("payload.tracking_number", number, &mut issues);
+    }
+    if issues.is_empty() {
+        Ok(CommandPayload::ShipOrder(payload))
+    } else {
+        Err(issues)
+    }
+}
+
+fn validate_update_tracking(
+    mut payload: UpdateTrackingPayload,
+) -> Result<CommandPayload, Vec<ValidationIssue>> {
+    let mut issues = Vec::new();
+    validate_trimmed("payload.carrier", &mut payload.carrier, 1, 100, &mut issues);
+    validate_printable("payload.carrier", &payload.carrier, &mut issues);
     validate_trimmed(
         "payload.tracking_number",
         &mut payload.tracking_number,
@@ -1946,7 +2159,7 @@ fn validate_ship_order(
         &mut issues,
     );
     if issues.is_empty() {
-        Ok(CommandPayload::ShipOrder(payload))
+        Ok(CommandPayload::UpdateTracking(payload))
     } else {
         Err(issues)
     }
@@ -2506,6 +2719,71 @@ fn validate_create_checkout(
             validate_delivery_envelope(&path, &sealed.key_id, &sealed.envelope, &mut issues);
         }
     }
+    if let Some(shares) = &payload.connector_shares {
+        let envelope_sellers: std::collections::HashSet<&str> = payload
+            .delivery_address_envelopes
+            .iter()
+            .flatten()
+            .map(|sealed| sealed.seller_pubky.as_str())
+            .collect();
+        if payload.delivery_address_envelopes.is_none() {
+            issues.push(issue(
+                "payload.connector_shares",
+                "Sharing an address with a store needs the sealed delivery envelopes",
+            ));
+        }
+        if shares.is_empty() || shares.len() > payload.lines.len() {
+            issues.push(issue(
+                "payload.connector_shares",
+                "Expected one entry per opted-in seller",
+            ));
+        }
+        let mut sellers = std::collections::HashSet::new();
+        for (index, share) in shares.iter().enumerate() {
+            let path = format!("payload.connector_shares.{index}");
+            if !is_valid_pubky(&share.seller_pubky) {
+                issues.push(issue(
+                    &format!("{path}.seller_pubky"),
+                    "Expected a 52-character z-base-32 Pubky",
+                ));
+            } else if !sellers.insert(share.seller_pubky.as_str()) {
+                issues.push(issue(
+                    &format!("{path}.seller_pubky"),
+                    "Expected one entry per seller",
+                ));
+            } else if !envelope_sellers.contains(share.seller_pubky.as_str()) {
+                issues.push(issue(
+                    &format!("{path}.seller_pubky"),
+                    "Expected a seller that also has a delivery envelope",
+                ));
+            }
+            if share.shop_domain.is_empty()
+                || share.shop_domain.chars().count() > 255
+                || share
+                    .shop_domain
+                    .chars()
+                    .any(|c| c.is_control() || c == '|')
+            {
+                issues.push(issue(
+                    &format!("{path}.shop_domain"),
+                    "Expected the store domain, 1 to 255 characters",
+                ));
+            }
+            if share.consent_version.is_empty()
+                || share.consent_version.len() > 32
+                || !share
+                    .consent_version
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            {
+                issues.push(issue(
+                    &format!("{path}.consent_version"),
+                    "Expected a consent version of 1 to 32 characters (letters, digits, . _ -)",
+                ));
+            }
+            validate_delivery_envelope(&path, &share.key_id, &share.envelope, &mut issues);
+        }
+    }
     match (
         &mut payload.delivery_address,
         any_shipping,
@@ -2573,6 +2851,93 @@ mod tests {
         })
     }
 
+    fn register_in(currency: &str, exponent: i32) -> Result<Command, Vec<ValidationIssue>> {
+        let mut command = register_command_json();
+        command["payload"]["unit_price"]["currency"] = json!(currency);
+        command["payload"]["unit_price"]["exponent"] = json!(exponent);
+        parse_command(&command)
+    }
+
+    #[test]
+    fn listing_prices_accept_exactly_the_registry_denominations() {
+        for (code, exponent) in [
+            ("USD", 2),
+            ("EUR", 2),
+            ("CHF", 2),
+            ("GBP", 2),
+            ("JPY", 0),
+            ("CAD", 2),
+            ("AUD", 2),
+            ("BTC", 8),
+            ("SAT", 0),
+        ] {
+            assert!(register_in(code, exponent).is_ok(), "{code}/{exponent}");
+        }
+        for (code, exponent, reason, path) in [
+            (
+                "SEK",
+                2,
+                "currency_unsupported",
+                "payload.unit_price.currency",
+            ),
+            (
+                "USDT",
+                6,
+                "currency_unsupported",
+                "payload.unit_price.currency",
+            ),
+            (
+                "eur",
+                2,
+                "currency_unsupported",
+                "payload.unit_price.currency",
+            ),
+            (
+                "EUR",
+                3,
+                "currency_exponent_mismatch",
+                "payload.unit_price.exponent",
+            ),
+            (
+                "JPY",
+                2,
+                "currency_exponent_mismatch",
+                "payload.unit_price.exponent",
+            ),
+            (
+                "SAT",
+                8,
+                "currency_exponent_mismatch",
+                "payload.unit_price.exponent",
+            ),
+            (
+                "BTC",
+                2,
+                "currency_exponent_mismatch",
+                "payload.unit_price.exponent",
+            ),
+        ] {
+            let issues = register_in(code, exponent).expect_err(code);
+            assert_eq!(issues.len(), 1, "{code}/{exponent}: {issues:?}");
+            assert_eq!(issues[0].path, path);
+            assert_eq!(issues[0].reason.as_deref(), Some(reason));
+        }
+    }
+
+    #[test]
+    fn shape_issues_keep_their_wire_form_without_a_reason() {
+        let issue = issue("payload.title", "Expected a title");
+        assert_eq!(
+            serde_json::to_value(&issue).unwrap(),
+            json!({ "path": "payload.title", "message": "Expected a title" })
+        );
+        let typed = issue_with_reason("p", "m", "currency_unsupported");
+        assert_eq!(
+            serde_json::to_value(&typed).unwrap(),
+            json!({ "path": "p", "message": "m", "reason": "currency_unsupported" })
+        );
+    }
+
     #[test]
     fn the_unlimited_cap_registers_with_physical_methods_only_on_shipping_or_pickup() {
         let command = parse_command(&register_command_json()).expect("valid command");
@@ -2605,6 +2970,139 @@ mod tests {
         }
         assert!(!with(&[Digital], UNLIMITED_STOCK_QUANTITY)
             .registers_unlimited_cap_with_physical_methods());
+    }
+
+    fn register_with_variants(variants: Value) -> Result<Command, Vec<ValidationIssue>> {
+        let mut command = register_command_json();
+        command["payload"]["variants"] = variants;
+        parse_command(&command)
+    }
+
+    #[test]
+    fn variants_are_carried_in_record_order_and_omitted_when_empty() {
+        let plain = parse_command(&register_command_json()).expect("valid command");
+        let CommandPayload::RegisterListing(plain) = &plain.payload else {
+            panic!("expected register payload");
+        };
+        assert!(plain.variants.is_empty());
+        let serialized = serde_json::to_value(plain).expect("payload serializes");
+        assert!(
+            serialized.get("variants").is_none(),
+            "an empty variant list never reaches the canonical JSON"
+        );
+
+        let command = register_with_variants(json!([
+            { "id": "size_s", "quantity": 0, "sku": "SKU-S" },
+            { "id": "size_m", "quantity": 3 },
+        ]))
+        .expect("valid variants");
+        let CommandPayload::RegisterListing(payload) = &command.payload else {
+            panic!("expected register payload");
+        };
+        assert_eq!(
+            payload.variants,
+            vec![
+                VariantStock {
+                    id: "size_s".to_string(),
+                    sku: Some("SKU-S".to_string()),
+                    quantity: 0
+                },
+                VariantStock {
+                    id: "size_m".to_string(),
+                    sku: None,
+                    quantity: 3
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_variant_stock_is_refused_by_path() {
+        for (variants, path) in [
+            (
+                json!([{ "id": "bad id!", "quantity": 1 }]),
+                "payload.variants.0.id",
+            ),
+            (
+                json!([{ "id": "a", "quantity": 1 }, { "id": "a", "quantity": 2 }]),
+                "payload.variants.1.id",
+            ),
+            (
+                json!([{ "id": "a", "quantity": -1 }]),
+                "payload.variants.0.quantity",
+            ),
+            (
+                json!([{ "id": "a", "quantity": 1_000_001 }]),
+                "payload.variants.0.quantity",
+            ),
+            (
+                json!([{ "id": "a", "quantity": 1, "sku": "" }]),
+                "payload.variants.0.sku",
+            ),
+        ] {
+            let issues = register_with_variants(variants).expect_err(path);
+            assert!(
+                issues.iter().any(|issue| issue.path == path),
+                "{path}: {issues:?}"
+            );
+        }
+        let too_many: Vec<Value> = (0..=MAX_LISTING_VARIANTS)
+            .map(|index| json!({ "id": format!("v{index}"), "quantity": 1 }))
+            .collect();
+        let issues = register_with_variants(json!(too_many)).expect_err("101 variants");
+        assert!(issues.iter().any(|issue| issue.path == "payload.variants"));
+        let mut unknown = register_command_json();
+        unknown["payload"]["variants"] = json!([{ "id": "a", "quantity": 1, "price": 5 }]);
+        assert!(
+            parse_command(&unknown).is_err(),
+            "unknown variant fields are refused"
+        );
+    }
+
+    #[test]
+    fn a_variant_at_the_unlimited_cap_makes_a_physical_listing_unregisterable() {
+        let mut command = register_command_json();
+        command["payload"]["variants"] = json!([
+            { "id": "a", "quantity": UNLIMITED_STOCK_QUANTITY },
+            { "id": "b", "quantity": 0 },
+        ]);
+        let command = parse_command(&command).expect("valid command");
+        let CommandPayload::RegisterListing(payload) = &command.payload else {
+            panic!("expected register payload");
+        };
+        assert!(payload.registers_unlimited_cap_with_physical_methods());
+    }
+
+    #[test]
+    fn a_reserve_names_its_variant_only_when_it_has_one() {
+        let reserve = |variant: Option<Value>| {
+            let mut payload = json!({ "quantity": 1, "reservation_ttl_seconds": 600 });
+            if let Some(variant) = variant {
+                payload["variant_id"] = variant;
+            }
+            let mut command = register_command_json();
+            command["kind"] = json!("inventory.reserve");
+            command["payload"] = payload;
+            parse_command(&command)
+        };
+        let plain = reserve(None).expect("valid reserve");
+        let CommandPayload::ReserveInventory(plain) = &plain.payload else {
+            panic!("expected reserve payload");
+        };
+        assert_eq!(plain.variant_id, None);
+        assert!(serde_json::to_value(plain)
+            .unwrap()
+            .get("variant_id")
+            .is_none());
+        let named = reserve(Some(json!("size_m"))).expect("valid reserve");
+        let CommandPayload::ReserveInventory(named) = &named.payload else {
+            panic!("expected reserve payload");
+        };
+        assert_eq!(named.variant_id.as_deref(), Some("size_m"));
+        let issues = reserve(Some(json!("not valid!"))).expect_err("malformed variant");
+        assert!(issues
+            .iter()
+            .any(|issue| issue.path == "payload.variant_id"));
     }
 
     #[test]
@@ -3176,6 +3674,210 @@ mod tests {
         );
         let issues = parse_command(&with_tab_tracking).expect_err("embedded tab invalid");
         assert!(issues.iter().any(|i| i.path == "payload.tracking_number"));
+    }
+
+    #[test]
+    fn ship_treats_absent_null_empty_and_blank_tracking_as_none() {
+        let order_id = "00000000-0000-4000-8000-00000000aaaa";
+        for payload in [
+            json!({ "order_id": order_id, "carrier": "Other" }),
+            json!({ "order_id": order_id, "carrier": "Other", "tracking_number": null }),
+            json!({ "order_id": order_id, "carrier": "Other", "tracking_number": "" }),
+            json!({ "order_id": order_id, "carrier": " Other ", "tracking_number": " \t " }),
+        ] {
+            let command = parse_command(&order_command_json("fulfillment.ship", payload.clone()))
+                .unwrap_or_else(|issues| panic!("{payload} should be valid: {issues:?}"));
+            let CommandPayload::ShipOrder(ship) = &command.payload else {
+                panic!("expected ship payload");
+            };
+            assert_eq!(ship.carrier, "Other");
+            assert_eq!(ship.tracking_number, None, "{payload}");
+        }
+    }
+
+    #[test]
+    fn ship_without_tracking_hashes_the_same_for_every_spelling() {
+        let order_id = "00000000-0000-4000-8000-00000000aaaa";
+        let hash = |payload: Value| {
+            parse_command(&order_command_json("fulfillment.ship", payload))
+                .expect("valid ship")
+                .request_hash()
+        };
+        let absent = hash(json!({ "order_id": order_id, "carrier": "Other" }));
+        assert_eq!(
+            absent,
+            hash(json!({ "order_id": order_id, "carrier": "Other", "tracking_number": null }))
+        );
+        assert_eq!(
+            absent,
+            hash(json!({ "order_id": order_id, "carrier": "Other", "tracking_number": "" }))
+        );
+        assert_ne!(
+            absent,
+            hash(json!({ "order_id": order_id, "carrier": "Other", "tracking_number": "T-1" }))
+        );
+    }
+
+    #[test]
+    fn ship_still_validates_a_present_tracking_number_and_the_carrier() {
+        let order_id = "00000000-0000-4000-8000-00000000aaaa";
+        let command = parse_command(&order_command_json(
+            "fulfillment.ship",
+            json!({ "order_id": order_id, "carrier": "USPS", "tracking_number": " 9400 " }),
+        ))
+        .expect("valid ship");
+        let CommandPayload::ShipOrder(ship) = &command.payload else {
+            panic!("expected ship payload");
+        };
+        assert_eq!(ship.tracking_number.as_deref(), Some("9400"));
+
+        let too_long = "9".repeat(201);
+        for (payload, path) in [
+            (
+                json!({ "order_id": order_id, "carrier": "USPS", "tracking_number": too_long }),
+                "payload.tracking_number",
+            ),
+            (
+                json!({ "order_id": order_id, "carrier": "" }),
+                "payload.carrier",
+            ),
+        ] {
+            let issues = parse_command(&order_command_json("fulfillment.ship", payload.clone()))
+                .expect_err("invalid ship");
+            assert!(issues.iter().any(|i| i.path == path), "{payload}");
+        }
+        assert!(parse_command(&order_command_json(
+            "fulfillment.ship",
+            json!({ "order_id": order_id }),
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn blank_tracking_over_the_length_bound_is_refused_not_read_as_none() {
+        let order_id = "00000000-0000-4000-8000-00000000aaaa";
+        for blank in [" ".repeat(201), "\t".repeat(500), " ".repeat(10_000)] {
+            for kind in ["fulfillment.ship", "fulfillment.update_tracking"] {
+                let issues = parse_command(&order_command_json(
+                    kind,
+                    json!({ "order_id": order_id, "carrier": "Other", "tracking_number": blank }),
+                ))
+                .expect_err("over-length blank tracking is invalid");
+                assert!(
+                    issues.iter().any(|i| i.path == "payload.tracking_number"),
+                    "{kind}: {issues:?}"
+                );
+            }
+        }
+        // Exactly at the bound a blank value is still "no tracking" on ship.
+        let command = parse_command(&order_command_json(
+            "fulfillment.ship",
+            json!({ "order_id": order_id, "carrier": "Other", "tracking_number": " ".repeat(200) }),
+        ))
+        .expect("200 blanks ship without tracking");
+        let CommandPayload::ShipOrder(ship) = &command.payload else {
+            panic!("expected ship payload");
+        };
+        assert_eq!(ship.tracking_number, None);
+        // A real number padded past the bound is trimmed first, as before.
+        let padded = format!("{}T-1{}", " ".repeat(150), " ".repeat(150));
+        let command = parse_command(&order_command_json(
+            "fulfillment.ship",
+            json!({ "order_id": order_id, "carrier": "Other", "tracking_number": padded }),
+        ))
+        .expect("padded number is valid");
+        let CommandPayload::ShipOrder(ship) = &command.payload else {
+            panic!("expected ship payload");
+        };
+        assert_eq!(ship.tracking_number.as_deref(), Some("T-1"));
+    }
+
+    #[test]
+    fn ship_tracking_issues_are_independent_of_carrier_issues() {
+        let order_id = "00000000-0000-4000-8000-00000000aaaa";
+        let issues = parse_command(&order_command_json(
+            "fulfillment.ship",
+            json!({ "order_id": order_id, "carrier": "", "tracking_number": "   " }),
+        ))
+        .expect_err("an empty carrier is invalid");
+        assert!(
+            issues.iter().any(|i| i.path == "payload.carrier"),
+            "{issues:?}"
+        );
+        assert!(
+            issues.iter().all(|i| i.path != "payload.tracking_number"),
+            "a blank number within the bound is no tracking: {issues:?}"
+        );
+
+        let issues = parse_command(&order_command_json(
+            "fulfillment.ship",
+            json!({ "order_id": order_id, "carrier": "Other", "tracking_number": " ".repeat(201) }),
+        ))
+        .expect_err("over-length blank tracking is invalid");
+        assert_eq!(
+            issues
+                .iter()
+                .filter(|i| i.path == "payload.tracking_number")
+                .count(),
+            1,
+            "{issues:?}"
+        );
+    }
+
+    #[test]
+    fn parses_and_validates_update_tracking() {
+        let order_id = "00000000-0000-4000-8000-00000000aaaa";
+        let command = parse_command(&order_command_json(
+            "fulfillment.update_tracking",
+            json!({ "order_id": order_id, "carrier": " UPS ", "tracking_number": " 1Z-9 " }),
+        ))
+        .expect("valid update");
+        assert_eq!(command.kind(), "fulfillment.update_tracking");
+        let CommandPayload::UpdateTracking(update) = &command.payload else {
+            panic!("expected update_tracking payload");
+        };
+        assert_eq!(update.carrier, "UPS");
+        assert_eq!(update.tracking_number, "1Z-9");
+
+        for payload in [
+            json!({ "order_id": order_id, "carrier": "UPS" }),
+            json!({ "order_id": order_id, "carrier": "UPS", "tracking_number": null }),
+            json!({ "order_id": order_id, "carrier": "UPS", "tracking_number": "x", "extra": 1 }),
+        ] {
+            assert!(
+                parse_command(&order_command_json(
+                    "fulfillment.update_tracking",
+                    payload.clone()
+                ))
+                .is_err(),
+                "{payload}"
+            );
+        }
+        for (payload, path) in [
+            (
+                json!({ "order_id": order_id, "carrier": "UPS", "tracking_number": "  " }),
+                "payload.tracking_number",
+            ),
+            (
+                json!({ "order_id": order_id, "carrier": "UPS", "tracking_number": "A\tB" }),
+                "payload.tracking_number",
+            ),
+            (
+                json!({ "order_id": order_id, "carrier": " ", "tracking_number": "x" }),
+                "payload.carrier",
+            ),
+            (
+                json!({ "order_id": order_id, "carrier": "U".repeat(101), "tracking_number": "x" }),
+                "payload.carrier",
+            ),
+        ] {
+            let issues = parse_command(&order_command_json(
+                "fulfillment.update_tracking",
+                payload.clone(),
+            ))
+            .expect_err("invalid update");
+            assert!(issues.iter().any(|i| i.path == path), "{payload}");
+        }
     }
 
     #[test]
@@ -3833,6 +4535,69 @@ mod tests {
         let debug = format!("{:?}", command.payload);
         assert!(debug.contains("<sealed>"));
         assert!(!debug.contains(&sealed_envelope()));
+    }
+
+    fn shared_checkout_json() -> Value {
+        let mut raw = sealed_checkout_json();
+        raw["payload"]["connector_shares"] = json!([{
+            "seller_pubky": SELLER_ONE,
+            "shop_domain": "dezentral.myshopify.com",
+            "consent_version": "2026-10-a",
+            "key_id": "fedcba9876543210fedcba9876543210",
+            "envelope": sealed_envelope(),
+        }]);
+        raw
+    }
+
+    #[test]
+    fn checkout_accepts_an_opt_in_to_share_the_address_with_a_store() {
+        let command = parse_command(&shared_checkout_json()).expect("opt-in parses");
+        let CommandPayload::CreateCheckout(payload) = &command.payload else {
+            panic!("expected checkout payload");
+        };
+        let shares = payload.connector_shares.as_ref().expect("shares present");
+        assert_eq!(shares[0].shop_domain, "dezentral.myshopify.com");
+        let debug = format!("{:?}", command.payload);
+        assert!(!debug.contains(&sealed_envelope()));
+    }
+
+    #[test]
+    fn an_opt_in_needs_sealed_envelopes_and_a_well_formed_entry() {
+        let mut plaintext = shared_checkout_json();
+        plaintext["payload"]
+            .as_object_mut()
+            .expect("payload object")
+            .remove("delivery_address_envelopes");
+        plaintext["payload"]["delivery_address"] =
+            checkout_command_json()["payload"]["delivery_address"].clone();
+        assert!(envelope_issue_paths(&plaintext).contains(&"payload.connector_shares".to_string()));
+
+        let mut other_seller = shared_checkout_json();
+        other_seller["payload"]["connector_shares"][0]["seller_pubky"] = json!(SELLER_TWO);
+        assert!(envelope_issue_paths(&other_seller)
+            .contains(&"payload.connector_shares.0.seller_pubky".to_string()));
+
+        for (field, value) in [
+            ("shop_domain", json!("bad|shop")),
+            ("shop_domain", json!("")),
+            ("consent_version", json!("has space")),
+            ("consent_version", json!("")),
+            ("key_id", json!("short")),
+            ("envelope", json!("A")),
+        ] {
+            let mut raw = shared_checkout_json();
+            raw["payload"]["connector_shares"][0][field] = value;
+            assert!(
+                envelope_issue_paths(&raw).contains(&format!("payload.connector_shares.0.{field}")),
+                "{field}"
+            );
+        }
+
+        let mut twice = shared_checkout_json();
+        let entry = twice["payload"]["connector_shares"][0].clone();
+        twice["payload"]["connector_shares"] = json!([entry.clone(), entry]);
+        assert!(envelope_issue_paths(&twice)
+            .contains(&"payload.connector_shares.1.seller_pubky".to_string()));
     }
 
     #[test]

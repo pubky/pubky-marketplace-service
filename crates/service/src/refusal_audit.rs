@@ -289,10 +289,11 @@ pub enum CommandKind {
     SetDeliveryEmail = 37,
     DeliverDigital = 38,
     ConfirmRefundDestination = 39,
+    UpdateTracking = 40,
 }
 
 impl CommandKind {
-    pub const ALL: [Self; 40] = [
+    pub const ALL: [Self; 41] = [
         Self::InvalidEnvelope,
         Self::RegisterListing,
         Self::SyncListing,
@@ -333,6 +334,7 @@ impl CommandKind {
         Self::SetDeliveryEmail,
         Self::DeliverDigital,
         Self::ConfirmRefundDestination,
+        Self::UpdateTracking,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -377,6 +379,7 @@ impl CommandKind {
             Self::SetDeliveryEmail => "set_delivery_email",
             Self::DeliverDigital => "deliver_digital",
             Self::ConfirmRefundDestination => "confirm_refund_destination",
+            Self::UpdateTracking => "update_tracking",
         }
     }
 }
@@ -1289,9 +1292,10 @@ pub const fn refusal_kind_for_review_reason(
         ReviewReason::AlreadyResolved => Some(RefusalKind::ManualResolveAlreadyResolved),
         ReviewReason::NotInManualReview => Some(RefusalKind::ManualResolveNotInReview),
         ReviewReason::StockUnavailable => Some(RefusalKind::ManualResolveStockUnavailable),
-        ReviewReason::RefundRequired | ReviewReason::RefundDestinationRequired => {
-            Some(RefusalKind::InvalidState)
-        }
+        ReviewReason::RefundRequired
+        | ReviewReason::RefundDestinationRequired
+        | ReviewReason::RefundRailUnknown
+        | ReviewReason::RefundAmountUnrecordable => Some(RefusalKind::InvalidState),
     }
 }
 

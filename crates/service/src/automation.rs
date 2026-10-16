@@ -714,12 +714,35 @@ pub async fn sync_many(
                         Ok(body) => (status, body),
                         Err(body) => (StatusCode::INTERNAL_SERVER_ERROR, body),
                     };
-                results.push(json!({
+                let mut entry = json!({
                     "seller_pubky": item.seller_pubky,
                     "listing_id": item.listing_id,
                     "status": status.as_u16(),
                     "result": body
-                }));
+                });
+                // A listing whose record lists several variants but that cannot
+                // convert to per-variant stock yet says why.
+                match sqlx::query_as::<_, (String, i32)>(
+                    "SELECT reason, attempts FROM listing_variant_conversion_blocks \
+                     WHERE listing_aggregate_id = $1",
+                )
+                .bind(&aggregate_id)
+                .fetch_optional(&state.pool)
+                .await
+                {
+                    Ok(Some((reason, attempts))) => {
+                        entry["variant_conversion"] = json!({
+                            "state": crate::variant_stock::conversion_state(&reason),
+                            "reason": reason,
+                            "attempts": attempts
+                        });
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::error!(error = %error, "listing.sync_many conversion marker read failed");
+                    }
+                }
+                results.push(entry);
             }
             Err(error) => {
                 tracing::error!(error = %error, "listing.sync_many item failed");

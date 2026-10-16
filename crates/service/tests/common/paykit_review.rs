@@ -425,7 +425,7 @@ pub async fn auction_winning_order(
     let (status, body) = execute(app, &winner.token, &bid).await;
     assert_eq!(status, StatusCode::OK, "bid: {body}");
     app.clock.advance_seconds(660);
-    let closed = close_due_auctions(&app.pool, app.clock.now())
+    let closed = close_due_auctions(&app.pool, app.state.homeserver.as_deref(), app.clock.now())
         .await
         .expect("close runs");
     assert_eq!(closed.closed, 1, "the auction closed");

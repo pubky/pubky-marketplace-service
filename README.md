@@ -166,9 +166,11 @@ Railway IaC `preserve()`):
 | `PAYKIT_SERVER_URL` | unset | paykit-server base URL; setting it enables the bitcoin method |
 | `PAYKIT_REQUEST_SIGNING_KEY` | unset | 32-byte hex ed25519 seed signing paykit-server requests. Its pubky-formatted public key goes into paykit-server's `[signed_services] trusted_public_keys`, beside the Locks key, when `PAYKIT_SERVER_API=upstream`; on the fork (`fork`, the default) it is `marketplace.trusted_public_key`. See [Paykit server API](#paykit-server-api) |
 | `PAYKIT_SERVER_API` | `fork` | which paykit-server the service speaks to: `fork` (today's production server) or `upstream` (`pubky/paykit-server` with the signed-services allowlist, first shipped in v0.1.0-rc9, #55; the latest tagged release is v0.1.0-rc11). Set only together with `PAYKIT_SERVER_URL`. See [Paykit server API](#paykit-server-api) |
+| `PAYKIT_SETUP_STATUS_TIMEOUT_SECONDS` | `8` | how long the signed upstream `POST /setup/status` may take, in whole seconds (1–30). paykit-server answers `ready` for a set-up seller in 2 to 3.5 s, so it does not share the 3 s timeout of the other availability reads. Set only together with `PAYKIT_SERVER_URL` |
 | `PAYKIT_MAX_PREPARE_TTL_SECONDS` | `900` | largest remaining upstream Paykit preparation TTL Marketplace accepts (60–86400). Align with producer `prepare_ttl_seconds`; a longer response is voided and its bind/inventory transaction rolls back. Up to 60 additional seconds are accepted only for bounded cross-service clock skew |
-| `USDT_PAYMENTS_ENABLED` | `false` | the USDT feature flag (`true`/`1` or `false`/`0`). On, `/health` reports `usdt_payments.available` and the `usdt` bind method exists; off, neither does and every Bitcoin and PayPal response is unchanged. See [USDT payments](#usdt-payments-flagged-default-off) |
-| `PAYKIT_MARKETPLACE_ASSETS` | `BTC` | the assets the deployed paykit-server's Marketplace prepare accepts: comma-separated `BTC` (required) and `USDT`. `USDT` is accepted only with `PAYKIT_SERVER_API=upstream`, and only once the deployed contract carries it |
+| `USDT_PAYMENTS_ENABLED` | `false` | the USDT feature flag (`true`/`1` or `false`/`0`). On, `/health` reports `usdt_payments.available`, the seller consent and readiness keys exist, and a `paykit` order may be paid in USDT; off, none of that exists and every Bitcoin and PayPal response is unchanged. See [USDT payments](#usdt-payments-flagged-default-off) |
+| `PAYKIT_MARKETPLACE_ASSETS` | `BTC` | the assets the deployed paykit-server's Marketplace prepare can carry: comma-separated `BTC` (required) and `USDT`. `USDT` is accepted only with `PAYKIT_SERVER_API=upstream`, and USDT is offered only when `PAYKIT_MARKETPLACE_CONTRACT` is `multi_asset` too. See [The single Paykit bind](#the-single-paykit-bind) |
+| `PAYKIT_MARKETPLACE_CONTRACT` | `legacy` | which request body the service sends to paykit-server's Marketplace prepare and activate: `legacy` (rc16 `amount_sats`, Bitcoin only) or `multi_asset` (a denomination and amount, optionally narrowed). `multi_asset` needs `PAYKIT_SERVER_API=upstream` and is independent of USDT: set it as soon as the deployed paykit-server speaks the multi-asset contract (which refuses the legacy body), with USDT still off |
 | `PAYKIT_POLL_SECONDS` | `15` | minimum interval between paykit status polls per pending bitcoin order |
 | `PAYKIT_RAIL_STALE_SECONDS` | `60` | stale-out window for cached Paykit rail and seller claim availability; must be at least `PAYKIT_POLL_SECONDS` |
 | `DELIVERY_ASSUME_DAYS` | `14` | default for the days after shipment when the worker marks a `shipped` order `delivered` on server time (no carrier tracking feed), flagging the projection `delivery_assumed` (≥ 1). The same period counts from payment for a paid manual digital order the seller never marks delivered. Applies only to an order whose seller left `deliveryAssumeDays` unset on their shop record; see [Seller-set periods](#seller-set-periods) |
@@ -196,6 +198,10 @@ Railway IaC `preserve()`):
 | `BUYER_EMAIL_UNPAID_RETENTION_DAYS` | `7` | days the sealed delivery email of a cancelled or expired unpaid checkout is kept before the purge deletes it (≥ 1) |
 | `PRIV_DATA_KEY_ENCRYPTION_KEY` | unset | 32-byte hex key sealing per-user `/priv` data keys at rest (XChaCha20-Poly1305); must differ from the Locks, pickup and digital delivery keys; `GET /v1/me/priv-keys` answers `priv_keys_unavailable` without it, and the service refuses to boot while sealed rows exist without it |
 | `PRIV_DATA_KEY_ENCRYPTION_KEY_PREVIOUS` | unset | optional previous priv data key sealing key for the dual-key read window during rotation; the re-seal worker moves every row to the current key. Keep it set until the pass reports zero rows under the previous key |
+| `CONNECTORS_ENABLED` | `false` | Turns on the store connectors (Shopify, WooCommerce): the `/v1/connectors` routes, the connector status and the `connector-worker` binary (same image, its own command). Off, every connector route answers `connectors_disabled` and nothing else changes. Needs `CONNECTOR_PUBLIC_BASE_URL` and `CONNECTOR_CREDENTIAL_ENCRYPTION_KEY`. Optional `CONNECTOR_RETURN_URL` (the Shop's connection page). Connection URLs handed to merchants are built from `CONNECTOR_PUBLIC_BASE_URL`. The Shopify provider is built in (GraphQL Admin API 2026-10) and needs no Shopify environment values; the merchant sets the three privacy webhook topics in their app's own configuration (see "Shopify" in `docs/api.md`). Worker tuning: `CONNECTOR_PUSH_LEASE_SECONDS`, `CONNECTOR_PROVIDER_TIMEOUT_SECONDS`, `CONNECTOR_MAX_ATTEMPTS`, `CONNECTOR_BACKOFF_BASE_SECONDS`, `CONNECTOR_BACKOFF_MAX_SECONDS`, `CONNECTOR_STOCK_POLL_SECONDS`, `CONNECTOR_WORKER_TICK_MILLIS` |
+| `CONNECTOR_CREDENTIAL_ENCRYPTION_KEY` | unset | 32-byte hex key sealing store credentials, a merchant's own app credentials and connector recipient keys at rest (XChaCha20-Poly1305); must differ from every other sealing key (checked at boot); the service and the worker refuse to boot while sealed connector values exist and no configured key opens them |
+| `CONNECTOR_CREDENTIAL_ENCRYPTION_KEY_PREVIOUS` | unset | optional previous connector key for the dual-key read window during rotation; the worker re-seals every value to the current key |
+| `SHOPIFY_PUBLIC_APP_CLIENT_ID`, `SHOPIFY_PUBLIC_APP_CLIENT_SECRET` | unset | reserved for Pubky's own public Shopify app, the only Shopify values that will ever live in the environment; not read yet. A merchant's own custom app brings its client id and secret through `PUT /v1/connectors/{id}/credentials`, sealed per connection, never in the environment |
 | `PICKUP_DISPUTE_RETENTION_DAYS` | `30` | days a cancelled-after-payment order's pinned pickup snapshot is retained as the dispute exhibit when no refund evidence ever lands, before the ordinary terminal-order purge takes it (≥ 1) |
 
 ### Listing moderation
@@ -236,6 +242,51 @@ so a moderation placed meanwhile is seen on the next command and lifting one
 takes effect once the cached answer expires. Orders created before a listing
 was moderated are not cancelled by this check.
 
+### Listing lifecycle
+
+A seller pauses, ends or removes a listing by rewriting `state` in its record
+at `/pub/pubky.app/marketplace/v1/listings/{listing_id}` on their homeserver;
+the listing aggregate tracks stock only. Before the service accepts a command
+that sells a listing it reads the record of every listing involved, from
+`HOMESERVER_URL`, and refuses with `LISTING_NOT_ACTIVE` (HTTP 409, audited as
+`invalid_state`) and `reason` `listing_paused`, `listing_ended`,
+`listing_removed` or `listing_not_active`. A record the homeserver answers
+404 for is `listing_removed`; a record with no `state` field predates the
+field and counts as `active`. A listing the service has already tombstoned is
+not read and keeps its `NOT_FOUND` refusal.
+
+- A new commitment (`checkout.create`, `offer.create`, `offer.counter`,
+  `offer.accept`, `auction.place_bid`) is refused unless every record is
+  `active`.
+- A continuation of a commitment made while the listing was on sale
+  (`offer.checkout`, the first `payment.prepare_locks` of a payment,
+  `auction.close`, and `POST /v0/orders/{id}/payment-method`, which answers
+  with the same code and `reason`) is refused only when a record is removed:
+  the seller cannot fulfil it, so no payment may start. A pause or an end
+  passes, so a seller who pauses to stop new buyers does not strand an
+  accepted offer or an order awaiting payment.
+- The auction close worker closes a removed listing's due auction unsold, as
+  it does a deleted one. When the homeserver cannot answer, it closes on
+  stored state: closing takes no payment, and the winner's payment start
+  refuses a removal on its own.
+
+Withdrawing or rejecting an offer and the rest of the payment flow are not
+checked. Each `(seller, listing)` is read once per command, a checkout's
+records concurrently (at most 8 at a time).
+
+The record is the seller's authority over whether the listing is for sale, so
+the check **fails closed**: when the homeserver cannot answer (transport
+failure, a non-success status other than 404, a non-JSON body, or no answer
+to all of the command's reads within 12 s) the command is refused with the
+retriable `UPSTREAM_UNAVAILABLE` (HTTP 503) and nothing is written. Like the
+moderation check it runs before the command's transaction, so a slow
+homeserver never holds a domain connection, and a command id with a stored
+result is answered from it without a read.
+
+Before deploying this check, sweep for sellable listings whose record is
+missing (they would start refusing as `listing_removed`) with
+[`scripts/listing-record-sweep.sh`](scripts/listing-record-sweep.sh).
+
 ### Public payment configuration availability
 
 `GET /v0/sellers/{pubky}/payment-config` always returns HTTP 200. Its
@@ -255,6 +306,25 @@ The PayPal email reaches a buyer only inside the `fiat_checkout_url` of an
 order they bound to PayPal (`POST /v0/orders/{id}/payment-method`), which only
 that order's buyer and seller can read. The seller reads their own stored
 values from the authenticated `GET /v0/sellers/me/payment-config`.
+
+The seller's own view (`GET` and `PUT /v0/sellers/me/payment-config`) also
+carries `bitcoin_setup`: `ready`, `setup_required` or `unavailable`, asked of
+paykit-server on every call (the same question as `bitcoin_available`, not
+read from the availability cache, and answered whether or not Bitcoin is
+switched on). The Shop uses it to confirm a Bitkit setup without a Lock Server
+session. `unavailable` covers a Paykit outage, an answer outside the contract,
+and a deployment without Paykit; it is never a reason to start an
+authorization flow. When the ask fails but paykit-server answered `ready` for
+this seller within the last 60 seconds, the answer is `ready`, so one slow or
+failed call does not tell a ready seller to set up Bitkit. Only `ready` is
+remembered: `setup_required` is always passed through and forgets it, and
+`unavailable` is never remembered. Every failed readiness ask is logged at
+warn as `paykit setup status unavailable` (upstream) or
+`paykit account lookup unavailable` (fork), with a `reason` (`timeout`,
+`transport`, `signing`, `non_2xx`, `body_not_json`, `out_of_contract`,
+`paykit_unavailable`; the fork's `bad_body`), the seller's 8-character prefix
+and the elapsed time. A seller who never saved anything reads the empty
+configuration (epoch `updated_at`) instead of `null`.
 
 Stripe is not a payment method: the service has no Stripe client, binding
 `stripe` answers `invalid_method`, and `PUT /v0/sellers/me/payment-config`
@@ -389,8 +459,9 @@ SELECT
 
 The service can carry USDT (USDT0 on Arbitrum One) as a payment method beside
 Bitcoin and PayPal. It is built behind `USDT_PAYMENTS_ENABLED`, default off.
-The asset model, the flag and seller readiness are in; status and finality,
-the Paykit bind and refunds are separate slices.
+USDT is paid through the one `paykit` method (see
+[The single Paykit bind](#the-single-paykit-bind)); the separate `usdt` method
+stays refused.
 
 - **Model.** `orders.payment_method` stays the buyer-facing label and gains
   `usdt`. What the buyer sends and where it settles live in
@@ -433,7 +504,7 @@ the Paykit bind and refunds are separate slices.
   and the public config (`GET /v0/sellers/{pubky}/payment-config`) carries
   `usdt_available`. With the flag off none of these keys exists, a `PUT`
   carrying `usdt_enabled` is refused as the unknown field it is, and
-  paykit-server is only ever asked about Bitcoin.
+  paykit-server is only ever asked about Bitcoin (`bitcoin_setup`).
   - Readiness comes only from paykit-server's signed `POST /setup/status`
     (`PAYKIT_SERVER_API=upstream`): `{accepted_asset: "USDT"}` for the seller, and the
     authority-only `{}` body to tell a seller with no Paykit account
@@ -444,15 +515,15 @@ the Paykit bind and refunds are separate slices.
     into an authorization flow. On the fork, or without Paykit, `usdt_setup`
     is `unavailable` and paykit-server is not asked.
   - `usdt_available` is true only when the deployment speaks to upstream
-    paykit-server, `PAYKIT_MARKETPLACE_ASSETS` lists `USDT` (the bind's own
-    precondition, so a buyer is never offered an option every bind refuses),
+    paykit-server, `PAYKIT_MARKETPLACE_ASSETS` lists `USDT` and
+    `PAYKIT_MARKETPLACE_CONTRACT` is `multi_asset` (the bind's own
+    preconditions, so a buyer is never offered an option every bind refuses),
     the seller consented, and the USDT status is `ready`. It
     is cached per (seller, asset) like Bitcoin's. The seller's own `GET` and
     `PUT` read paykit-server uncached, so a Bitkit setup or reconnect shows
     at once.
   - A seller who never saved anything reads the empty configuration (epoch
-    `updated_at`) instead of `null` while the flag is on, because that seller
-    is who needs `setup`.
+    `updated_at`) instead of `null`, flag on or off.
   - `PUT` replaces the rails, but an absent or `null` `usdt_enabled` leaves
     the stored consent unchanged; only an explicit boolean changes it. The
     consent is not gated on readiness, and a seller who is not ready is never
@@ -474,11 +545,118 @@ the Paykit bind and refunds are separate slices.
     `accepted_asset` first (a paykit-server release containing #70), then switch `USDT_PAYMENTS_ENABLED` on. The
     captured exchanges, including that refusal, are in
     `crates/service/tests/fixtures/paykit-server-u4/`.
-- **Bind.** Until the upstream Marketplace prepare can carry a USDT request,
-  every `usdt` bind is refused with `usdt_unavailable` and leaves the order
-  untouched (unbound, unheld, no attempt spent). The log says which
-  prerequisite is missing: not the upstream API, USDT absent from
-  `PAYKIT_MARKETPLACE_ASSETS`, or the Bitcoin-only prepare body.
+- **Bind.** A legacy `{"method":"usdt"}` bind is always refused with
+  `usdt_unavailable` and leaves the order untouched (unbound, unheld, no
+  attempt spent): USDT is paid through `paykit`, whose request carries every
+  asset the seller accepts. The log says which prerequisite is missing: not
+  the upstream API, USDT absent from `PAYKIT_MARKETPLACE_ASSETS`, or that the
+  method to bind is `paykit`.
+
+### The single Paykit bind
+
+`POST /v0/orders/{id}/payment-method` with `{"method":"paykit"}` creates one
+Paykit payment request that carries every asset the seller accepts (Bitcoin
+and USDT). The buyer picks the rail in Bitkit and the order settles on the
+rail that was actually paid. The older `{"method":"bitcoin"}` bind keeps
+working unchanged (Bitcoin only, its projection unchanged).
+
+- **Which request.** With `PAYKIT_MARKETPLACE_CONTRACT=multi_asset` (upstream
+  only) the prepare body is `{amount, asset, creator, description,
+  operation_id, payment_window_seconds, reader, reference}` plus an optional
+  `accepted_assets`: the denomination (`asset` is `USD` for a `USD/2` order,
+  `BTC` for a `SAT/0` or `BTC/8` order) and its amount in base units as a
+  digit string (cents, satoshis). paykit-server derives every asset the
+  seller can receive and fixes the Bitcoin rate once, at prepare. The service
+  sends `accepted_assets` only to narrow: `["BTC"]` when USDT is not wanted
+  (the seller's consent or `USDT_PAYMENTS_ENABLED` is off, or
+  `PAYKIT_MARKETPLACE_ASSETS` does not list `USDT`: the new body with USDT
+  off); `["USDT"]` when the seller's Bitcoin switch is off (a seller who takes
+  only USDT) or the FX quote or rate cannot be read but USDT is available (a
+  `["BTC"]` request is the fallback when only the USDT amount cannot be
+  checked, see below). Activation names the same denomination and amount
+  (`{amount, asset, creator, invoice_id}`), and the response must echo the
+  persisted terms. Against the fork, or with `legacy`, `paykit` is the legacy
+  Bitcoin request exactly as the `bitcoin` bind sends it (`amount_sats`, the
+  service FX quote for USD orders).
+- **Guards.** Whatever paykit-server offers is checked before the bind
+  records anything: a USD order's USDT amount is exactly the order total at
+  parity (`cents x 10_000` millionths) and its Bitcoin amount must sit within
+  the FX deviation bound (`MAX_DEVIATION_BPS`) of the service's own quote and
+  inside the 1,000-sat minimum and the cap; a satoshi-priced order's Bitcoin
+  amount is exactly the price and its USDT amount must sit within the same
+  bound of what the price is worth at the service's own rate. A mismatch
+  refuses the bind and voids the prepared invoice. Every order currency the
+  service converts (`USD/2`, `SAT/0`, `BTC/8`) offers every rail the seller
+  enabled. A `paykit` bind needs the seller's Bitcoin switch or the USDT
+  consent; neither is `method_unavailable`.
+- **Order projection.** A `paykit` order carries `payment_method: "paykit"`,
+  `accepted_assets` (what the request offers: `["BTC"]`, `["USDT"]` or
+  `["BTC","USDT"]`) and `payment_amounts` (what each asset costs in its own
+  base units: satoshis, USDT0 millionths). Once paid, `payment_asset`,
+  `payment_network`, `payment_amount_minor`, `payment_exponent` and
+  `payment_quote_basis` name the observed rail (`BTC` / `bitcoin`, exponent 8,
+  basis `native` or `fixed_rate`; `USDT` / `arbitrum-one`, exponent 6, basis
+  `parity` or `fixed_rate`); they are absent until then. A USDT payment also
+  carries `payment_finality`. Legacy `bitcoin` and `usdt` orders keep their
+  projection.
+- **Public seller config** (flag on only). `paykit_available` (the seller can
+  receive Bitcoin or USDT through Paykit) and
+  `accepted_assets` beside the existing `bitcoin_available` and
+  `usdt_available`. With the flag off the keys are absent.
+- **Settlement.** Bitcoin settles exactly as before. USDT is paid at verified
+  inclusion (at least one confirmation, the amount matched, on time); a
+  transfer for the wrong amount or after the window goes to manual review and
+  never pays the order. The paid rail's asset and amount are recorded when
+  the payment settles (or enters review) and the payment row is retyped to it;
+  the receipt of a USDT order records the USDT0 amount. A matched USDT
+  transfer whose reported amount is not the one offered for the request goes
+  to review as well.
+- **Finality (USDT).** `payment_finality` is `pending` from inclusion,
+  `final` once paykit-server reports the transfer finalized, `reverted` when
+  an included transfer disappears before it is final (it returns to `pending`
+  or `final` if it reappears; `final` is terminal). It never changes whether
+  the order is paid. While it is `pending` or `reverted`, `fulfillment.ship`,
+  `fulfillment.mark_ready` and `fulfillment.confirm_pickup` are refused with
+  `INVALID_STATE` and `error.reason: "payment_not_final"`. The poller keeps
+  polling a paid `paykit` order for finality, and for money on the rail that
+  did not pay it until the request's observation tail ends.
+- **Both rails paid.** Money confirmed on both rails before the order settled
+  routes the payment to the existing manual-review path (`amount_mismatch`,
+  the seller notified, the hold kept): the rail paykit-server names as paid
+  first is the order's paid rail, the other rail is named beside it in the
+  seller's `paykit_observation` (`other_rail_asset`, `other_rail_amount`,
+  `other_rail_reference`), and nothing is refunded or settled automatically.
+  Money on the other rail after the order settled is held for an operator as
+  `needs_review` (`payment_settled`) like money on a released attempt, once
+  per order. USDT on a released attempt is held for an operator
+  (`other_rail`) and never restored automatically.
+- **Refund refusals** (`bitcoin/resolve` with `refunded`, 409, closed
+  `error.reason`): `refund_rail_unknown` (both rails were paid and
+  paykit-server named no first one, so no rail was recorded and a refund has
+  none to follow: resolve as `paid` or `abandoned` and return each payment
+  from the seller's wallet) and `refund_amount_unrecordable` (a USDT amount on
+  a USD order that is not a whole number of cents, so it cannot be recorded as
+  a refund: return it from the wallet and resolve as `abandoned`).
+- **Finality bound.** A USDT payment is polled for finality for 7 days from
+  `payment_finality_at` while `pending` or `reverted`. A payment still in either state past
+  that bound is held for an operator (`needs_review`, `detected_unconfirmed`,
+  `observation.status` `usdt_finality_pending` or `usdt_finality_reverted`,
+  `ALERT usdt_finality_pending_too_long`, listed by `paykit-attempts-admin
+  list`; the operator checks the transfer on Arbitrum and dismisses or
+  refunds, see `docs/paykit-released-attempts.md`); the order stays paid and
+  fulfilment stays blocked. A reappearing transfer restarts the clock.
+- **Refunds follow the paid rail.** A USDT-paid order (`payment_asset` `USDT`,
+  or the legacy `usdt` method) takes the buyer-confirmed Arbitrum address and
+  an Arbitrum transaction hash; a Bitcoin-paid order refunds as before.
+- **Deploy order.** Deploy paykit-server with the multi-asset Marketplace
+  contract first (prepare and activate, and USDT on the status route), then
+  this service. Until `PAYKIT_MARKETPLACE_CONTRACT` is set the service speaks
+  the legacy request and behaves as before, so it can be deployed ahead of
+  paykit-server. Once paykit-server is live set
+  `PAYKIT_MARKETPLACE_CONTRACT=multi_asset` (the legacy body is refused from
+  then on); USDT stays off until `PAYKIT_MARKETPLACE_ASSETS=BTC,USDT` and
+  `USDT_PAYMENTS_ENABLED=true` are set too, so the release and the USDT
+  switch roll out separately. Migration 0060 is additive.
 
 ### USDT refund destination
 
@@ -487,7 +665,8 @@ send in Bitkit): the service never holds or moves funds, and Paykit has no
 refunds. The seller needs an address to send to, and the address a payment came
 from is not assumed to take a refund (the buyer may have paid from an
 exchange). So the buyer confirms one on the order. This applies to orders paid
-with the `usdt` method only; every other order is unchanged. It is not gated by
+in USDT only (the legacy `usdt` method, or a `paykit` order that settled on the
+USDT rail); every other order is unchanged. It is not gated by
 `USDT_PAYMENTS_ENABLED`: an order that already exists can always be refunded.
 
 - **`refund.confirm_destination`** (buyer of the order). Payload
@@ -495,8 +674,8 @@ with the `usdt` method only; every other order is unchanged. It is not gated by
   The address is `0x` and 40 hex digits; a mixed-case address must match its
   EIP-55 checksum, while an all-lower or all-upper one carries none and is
   accepted. Surrounding whitespace is trimmed and the address is stored as
-  entered. The order needs `payment_method = 'usdt'` and a payment that is
-  received (`confirmed`) or in manual review. The buyer may replace the address
+  entered. The order needs to be paid in USDT and the payment received
+  (`confirmed`) or in manual review. The buyer may replace the address
   until a refund is recorded; every confirmation advances the order revision,
   appends the event `refund.destination_confirmed` and sends the seller the
   `refund_destination_confirmed` notification. There is no way to ask for "the
@@ -518,7 +697,8 @@ with the `usdt` method only; every other order is unchanged. It is not gated by
   66-character hash instead. The address is copied into `external_refund` as
   `destination_address`, so a later change cannot rewrite the record. A
   manual-review USDT refund records the quoted USDT amount in order units
-  (cents for a USD order).
+  (cents) for a USD order, and in the paid asset's own units (USDT0
+  millionths) for an order priced in anything else.
 - **What it does not do.** It never verifies the refund on Arbitrum, so the
   record is what the seller said they did. A `refunded` resolution toward Paykit
   is an annotation only (it does not verify or execute a refund).
@@ -921,6 +1101,7 @@ compare it.
 | `order.cancel_request` | CAS 409 vs order `revision` | `cancellation.rs:51` |
 | `order.cancel_approve` | CAS 409 vs order `revision` | `cancellation.rs:185` |
 | `fulfillment.ship` | CAS 409 vs order `revision` | `fulfillment.rs:34` |
+| `fulfillment.update_tracking` | CAS 409 vs order `revision` | `fulfillment.rs` (`update_tracking`) |
 | `fulfillment.confirm_delivery` | CAS 409 vs order `revision` | `fulfillment.rs:107` |
 | `pickup_details.set` | Envelope ignored; `payload.expected_version` is CAS 409 vs the pickup version counter | `pickup.rs:270` |
 | `pickup_details.clear` | Envelope ignored; `payload.expected_version` is CAS 409 vs the pickup version counter | `pickup.rs:346` |
@@ -947,7 +1128,8 @@ actor may sync), `drop.sync` (convergent; any actor may sync),
 `offer.checkout`, `offer.reject`, `offer.withdraw`, `auction.place_bid`,
 `auction.close`, `payment.sandbox_advance`, `payment.prepare_locks`,
 `payment.register_locks`, `order.cancel_request`, `order.cancel_approve`,
-`fulfillment.ship`, `fulfillment.confirm_delivery`, `pickup_details.set`,
+`fulfillment.ship`, `fulfillment.update_tracking`,
+`fulfillment.confirm_delivery`, `pickup_details.set`,
 `pickup_details.clear`, `fulfillment.mark_ready`,
 `fulfillment.confirm_pickup` (see Local pickup), `return.request`,
 `return.approve`, `return.receive`, `refund.record_external`,
@@ -1092,10 +1274,15 @@ and refund branches):
   succeeds without double-releasing. A cancelled order refuses every
   subsequent payment, fulfillment, return, and cancellation
   command.
-- **Fulfillment.** `fulfillment.ship` (seller, with carrier and tracking
-  number — both trimmed printable strings, deliberately not enums; the soft
-  carrier vocabulary the reference client writes is documented on
-  `ShipOrderPayload.carrier`) and `fulfillment.confirm_delivery` (buyer) drive
+- **Fulfillment.** `fulfillment.ship` (seller, with a carrier and an optional
+  tracking number — both trimmed printable strings, deliberately not enums;
+  the soft carrier vocabulary the reference client writes is documented on
+  `ShipOrderPayload.carrier`; an absent, null or empty number ships the order
+  without tracking), `fulfillment.update_tracking` (seller; adds or edits the
+  carrier and number while the order is `shipped`, records each change in
+  `shipment.tracking_history` and notifies the buyer; see
+  [docs/api.md](docs/api.md#shipping-and-tracking-commands)) and
+  `fulfillment.confirm_delivery` (buyer) drive
   `paid/processing → shipped → delivered`. There is no separate
   seller-marks-delivered command: the buyer's confirmation is the delivery
   transition, as in the prototype. `delivered → completed` is reached
@@ -1173,7 +1360,8 @@ Every post-purchase command is participant-scoped, enforces
 idempotently by `command_id`, appends one immutable event per accepted
 command, and emits outbox notifications exactly where the prototype did
 (`payment_confirmed`, `order_cancelled` — to the seller on a cancellation
-request, to the buyer on approval — `order_shipped`, `order_delivered`,
+request, to the buyer on approval — `order_shipped`, `tracking_updated`,
+`order_delivered`,
 `return_updated`,
 `refund_recorded`,
 `review_received`). `review.update` emits none — the
@@ -1852,7 +2040,7 @@ This service is canonical and resolves them as follows:
 | Area | Client contracts said | Canonical (this service) | Rationale |
 | --- | --- | --- | --- |
 | Wire casing | camelCase (prototype engine) | snake_case | ADR-0019 §3 shows the envelope in snake_case; the ADR is the authority. |
-| Listing states | `draft/active/paused/reserved/sold/expired/removed` | `available/reserved/sold` | Catalog lifecycle belongs to seller-signed homeserver records; the transaction authority tracks inventory availability only (prototype engine semantics). |
+| Listing states | `draft/active/paused/reserved/sold/expired/removed` | `available/reserved/sold` | Catalog lifecycle belongs to seller-signed homeserver records; the transaction authority tracks inventory availability only (prototype engine semantics) and reads the record's state before it sells (see [Listing lifecycle](#listing-lifecycle)). |
 | Reservation states | none (engine only had `active`) | `active/converted/released/expired` | The engine stored `expiresAt` but never swept it; this service implements server-time expiry, so the terminal states are modeled. |
 | Payment states | missing `detected`, extra `created/window_elapsed/external_refund_required/refunded_external` | `awaiting_entitlement/detected/confirmed/expired/manual_review` | Prototype engine enums are the executable spec (ADR-0022). |
 | Order states | extra `ready_for_pickup/return_in_transit/return_inspection`, missing `return_approved/return_received` | the prototype engine states minus `disputed` (operator adjudication removed) | Same; transitions are derived from the engine's command handlers. |

@@ -502,7 +502,7 @@ async fn marketplace_status_distinguishes_acceptance_lag_from_manual_review_stat
 async fn upstream_lifecycle_uses_the_closed_four_command_contract() {
     let paykit = upstream_paykit().await;
     let client = upstream_client(&paykit);
-    let order_id = uuid::Uuid::new_v4();
+    let order_id = uuid::Uuid::parse_str("8f3a91b2-1111-4111-8111-111111111111").unwrap();
     let prepared = client
         .create_payment_request(
             SELLER,
@@ -543,6 +543,7 @@ async fn upstream_lifecycle_uses_the_closed_four_command_contract() {
         [
             "amount_sats",
             "creator",
+            "description",
             "operation_id",
             "payment_window_seconds",
             "reader",
@@ -551,6 +552,10 @@ async fn upstream_lifecycle_uses_the_closed_four_command_contract() {
         .into_iter()
         .map(str::to_string)
         .collect()
+    );
+    assert_eq!(
+        prepare.body["description"],
+        json!("Pubky Shop order 8F3A91")
     );
     let reference = prepare.body["reference"].as_str().unwrap();
     assert_eq!(
@@ -607,6 +612,11 @@ async fn upstream_lifecycle_uses_the_closed_four_command_contract() {
     else {
         panic!("upstream response stays typed upstream")
     };
+    assert_eq!(
+        paykit.calls()[3].body["description"],
+        json!("Pubky Shop order 8F3A91"),
+        "new attempts use stable order id, not attempt reference"
+    );
     client
         .void_payment_request(
             &target,
@@ -621,6 +631,33 @@ async fn upstream_lifecycle_uses_the_closed_four_command_contract() {
         void.body,
         json!({"creator": format!("pubky{SELLER}"), "invoice_id": second_invoice})
     );
+}
+
+#[tokio::test]
+async fn upstream_order_labels_vary_only_with_the_stable_order_id() {
+    let paykit = upstream_paykit().await;
+    let client = upstream_client(&paykit);
+    let order_id = uuid::Uuid::parse_str("abcdef12-2222-4222-8222-222222222222").unwrap();
+
+    client
+        .create_payment_request(
+            SELLER,
+            "w3g1m3s5rbuyer1111111111111111111111111111111111111111",
+            order_id,
+            7,
+            42_000,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+            3_600,
+        )
+        .await
+        .expect("prepare accepted");
+
+    let prepare = &paykit.calls()[0];
+    assert_eq!(
+        prepare.body["description"],
+        json!("Pubky Shop order ABCDEF")
+    );
+    assert_eq!(prepare.body.as_object().unwrap().len(), 7);
 }
 
 #[tokio::test]
@@ -712,6 +749,14 @@ async fn durable_target_not_current_config_selects_lifecycle_signature_framing()
     else {
         panic!("fork response")
     };
+    assert!(
+        !fork_server.calls()[0]
+            .body
+            .as_object()
+            .unwrap()
+            .contains_key("description"),
+        "fork prepare body stays unchanged"
+    );
     let cutover_client = PaykitClient::new(&fork_server.base_url, TEST_PAYKIT_SIGNING_SEED)
         .expect("client")
         .with_api(PaykitApi::Upstream);
@@ -2541,13 +2586,20 @@ async fn setup_status_is_not_called_for_a_seller_who_disabled_bitcoin(pool: PgPo
     )
     .await;
     assert_eq!(status, StatusCode::OK, "config put failed: {body}");
+    // The seller's own save asks only `bitcoin_setup`; buyers' reads ask nothing.
+    assert_eq!(
+        body["payment_config"]["bitcoin_setup"],
+        json!("setup_required")
+    );
     paykit.set_claimed(&seller.pubky);
+    let before = paykit.calls().len();
 
     let (_, body) = get_public_config(&app, &seller.pubky).await;
     assert_eq!(body["bitcoin_available"], json!(false));
     assert_eq!(body["paypal_available"], json!(true));
-    assert!(
-        paykit.calls().is_empty(),
-        "PayPal-only sellers never reach paykit-server"
+    assert_eq!(
+        paykit.calls().len(),
+        before,
+        "PayPal-only sellers never reach paykit-server from a public read"
     );
 }

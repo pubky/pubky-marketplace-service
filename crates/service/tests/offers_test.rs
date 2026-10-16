@@ -1191,7 +1191,8 @@ async fn award_expiry_worker_retries_when_it_is_the_deadlock_victim(pool: PgPool
             "SELECT EXISTS ( \
                  SELECT 1 FROM pg_stat_activity \
                  WHERE wait_event_type = 'Lock' \
-                   AND query LIKE '%UPDATE listings SET server_revision%' \
+                   AND (query LIKE '%UPDATE listings SET server_revision%' \
+                        OR query LIKE '%SELECT 1 FROM listings WHERE aggregate_id = $1 FOR UPDATE%') \
              )",
         )
         .fetch_one(&app.pool)

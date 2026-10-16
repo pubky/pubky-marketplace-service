@@ -119,7 +119,7 @@ pub fn observation_json(
     now: DateTime<Utc>,
     disappeared: bool,
 ) -> Value {
-    json!({
+    let mut document = json!({
         "state": state,
         "observed_sats": observation.observed_sats,
         "confirmations": observation.confirmations,
@@ -127,7 +127,14 @@ pub fn observation_json(
         "txid": observation.txid,
         "observed_at": format_timestamp(now),
         "disappeared": disappeared,
-    })
+    });
+    // Only a USDT leg names its rail and amount, so every Bitcoin
+    // observation document stays byte for byte what it was.
+    if let Some(asset) = observation.asset {
+        document["asset"] = json!(asset);
+        document["observed_units"] = json!(observation.observed_units);
+    }
+    document
 }
 
 /// Adds `days` business days (Mon–Fri) to `start`: the two-business-day
@@ -813,7 +820,7 @@ pub async fn resolve_bitcoin_payment(
     // Paykit rail, with both pins persisted. Locks, PayPal, sandbox, and
     // missing-pin rows are out of scope.
     let usdt_order = is_usdt_order(&order);
-    if order.payment_method.as_deref() != Some("bitcoin") && !usdt_order {
+    if !matches!(order.payment_method.as_deref(), Some("bitcoin" | "paykit")) && !usdt_order {
         return audited_resolve_refusal(
             &state,
             &actor.0,
@@ -861,6 +868,36 @@ pub async fn resolve_bitcoin_payment(
                 ErrorCode::InvalidCommand,
                 ReviewReason::InvalidRefundReference,
                 "A refunded resolution requires a valid external refund reference.",
+            );
+        }
+    }
+    if body.outcome == "refunded" {
+        // Both rails were paid and paykit-server named no first one: a refund
+        // has no rail to follow.
+        if order.paykit_second_rail_at.is_some() && order.payment_asset.is_none() {
+            return audited_resolve_refusal(
+                &state,
+                &actor.0,
+                Some(resolution_id),
+                ErrorCode::InvalidState,
+                ReviewReason::RefundRailUnknown,
+                "Both the Bitcoin and the USDT payment were confirmed and the payment server \
+                 did not say which came first, so a refund cannot follow one rail. Resolve \
+                 this order as paid or abandoned and return each payment from your own wallet.",
+            );
+        }
+        // A USDT refund is recorded in order units: an amount that is not a
+        // whole number of them cannot be.
+        if usdt_order && refund_destination::quoted_refund_amount_minor(&order).is_none() {
+            return audited_resolve_refusal(
+                &state,
+                &actor.0,
+                Some(resolution_id),
+                ErrorCode::InvalidState,
+                ReviewReason::RefundAmountUnrecordable,
+                "The USDT amount received is not a whole number of cents, so it cannot be \
+                 recorded as a refund here. Return the payment from your own wallet and \
+                 resolve this order as abandoned.",
             );
         }
     }
@@ -1408,24 +1445,51 @@ pub(crate) async fn reacquire_hold(
             .as_str()
             .expect("order line carries its listing aggregate id");
         let quantity = line["quantity"].as_i64().expect("line quantity");
-        let reacquired = sqlx::query(
-            "UPDATE listings SET server_revision = server_revision + 1, \
-             state = CASE WHEN available_quantity = $2 THEN 'reserved' ELSE 'available' END, \
-             available_quantity = available_quantity - $2, \
-             reserved_quantity = reserved_quantity + $2, updated_at = $3 \
-             WHERE aggregate_id = $1 AND available_quantity >= $2 \
-             AND deleted_at IS NULL AND (recreated_at IS NULL OR recreated_at <= $4)",
+        let live: Option<(i64, Option<chrono::DateTime<Utc>>)> = sqlx::query_as(
+            "SELECT available_quantity, recreated_at FROM listings \
+             WHERE aggregate_id = $1 AND deleted_at IS NULL FOR UPDATE",
         )
         .bind(aggregate_id)
-        .bind(quantity)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|e| ResolutionFailure::Internal("listing reacquire".into(), e.to_string()))?;
+        let Some((listing_available, recreated_at)) = live else {
+            return Err(ResolutionFailure::StockUnavailable);
+        };
+        if recreated_at.is_some_and(|recreated| recreated > order.created_at) {
+            return Err(ResolutionFailure::StockUnavailable);
+        }
+        let rows = crate::variant_stock::lock_rows(tx, aggregate_id)
+            .await
+            .map_err(|e| ResolutionFailure::Internal("variant rows".into(), e.to_string()))?;
+        let Ok(row) = crate::variant_stock::resolve_held(&rows, line["variant_id"].as_str()) else {
+            return Err(ResolutionFailure::StockUnavailable);
+        };
+        if row.available_quantity < quantity || !row.enabled {
+            return Err(ResolutionFailure::StockUnavailable);
+        }
+        let variant_id = row.variant_id.clone();
+        let reacquired = crate::variant_stock::reserve(tx, aggregate_id, &variant_id, quantity)
+            .await
+            .map_err(|e| ResolutionFailure::Internal("variant reacquire".into(), e.to_string()))?;
+        if !reacquired {
+            return Err(ResolutionFailure::StockUnavailable);
+        }
+        let state = if listing_available == quantity {
+            "reserved"
+        } else {
+            "available"
+        };
+        sqlx::query(
+            "UPDATE listings SET server_revision = server_revision + 1, state = $2, \
+             updated_at = $3 WHERE aggregate_id = $1",
+        )
+        .bind(aggregate_id)
+        .bind(state)
         .bind(now)
-        .bind(order.created_at)
         .execute(&mut **tx)
         .await
         .map_err(|e| ResolutionFailure::Internal("listing reacquire".into(), e.to_string()))?;
-        if reacquired.rows_affected() != 1 {
-            return Err(ResolutionFailure::StockUnavailable);
-        }
     }
 
     if order.auction_aggregate_id.is_none() {
@@ -2142,7 +2206,7 @@ pub async fn watch_manual_reviews(
     let rows: Vec<(Uuid, DateTime<Utc>, Option<DateTime<Utc>>)> = sqlx::query_as(
         "SELECT p.order_id, p.manual_review_entered_at, p.manual_review_sla_alerted_at \
          FROM payments p JOIN orders o ON o.id = p.order_id \
-         WHERE p.adapter = 'paykit' AND o.payment_method = 'bitcoin' \
+         WHERE p.adapter = 'paykit' AND o.payment_method IN ('bitcoin', 'paykit') \
          AND p.state = 'manual_review' AND p.resolution_outcome IS NULL \
          AND o.paykit_request_reference IS NOT NULL \
          AND ((o.paykit_api = 'fork' AND o.paykit_stack_id IS NOT NULL \

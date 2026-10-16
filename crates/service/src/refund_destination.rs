@@ -9,8 +9,10 @@
 //! wallet, and records the Arbitrum transaction hash. Nothing here verifies
 //! the refund on Arbitrum: it is a record of what the seller said they did.
 //!
-//! Everything in this module applies to orders paid with the `usdt` method
-//! only; an order of any other method never reads or writes it.
+//! Everything in this module applies to orders paid in USDT only: the legacy
+//! `usdt` method, and an order bound through `paykit` whose payment settled
+//! on the USDT rail (`payment_asset`). An order paid any other way never
+//! reads or writes it, so a refund always follows the rail that was paid.
 
 use std::collections::HashMap;
 
@@ -32,9 +34,11 @@ pub const REFUND_NETWORK: &str = "arbitrum-one";
 /// The only address source today: the buyer typed it.
 pub const SOURCE_BUYER_ENTERED: &str = "buyer_entered";
 
-/// Whether the order was paid with USDT.
+/// Whether the order was paid with USDT: bound to the legacy `usdt` method,
+/// or settled on the USDT rail of a Paykit request.
 pub fn is_usdt_order(order: &OrderRow) -> bool {
     order.payment_method.as_deref() == Some(USDT_PAYMENT_METHOD)
+        || order.payment_asset.as_deref() == Some(REFUND_ASSET)
 }
 
 fn hex_body(address: &str) -> Option<&str> {
@@ -198,15 +202,33 @@ pub async fn attach_to_views(
     Ok(())
 }
 
-/// The USDT amount the order was quoted, in order minor units (cents for a
-/// USD order): what a refund of the whole payment is. `None` when the order
-/// carries no USDT terms or the quote is not a whole number of order units.
+/// The USDT amount the order was quoted, as a refund of the whole payment
+/// records it. A USD order records it in order units (cents); an order priced
+/// in anything else records the paid asset's own units (USDT0 millionths),
+/// because its price is not in a unit a USDT refund can be expressed in.
+/// `None` when the order carries no USDT terms or a USD quote is not a whole
+/// number of order units.
 pub fn quoted_refund_amount_minor(order: &OrderRow) -> Option<i64> {
     let sent = order.payment_amount_minor?;
+    if order.currency != "USD" {
+        return Some(sent);
+    }
     let sent_exponent = i32::from(order.payment_exponent?);
     let steps = u32::try_from(sent_exponent.checked_sub(order.exponent)?).ok()?;
     let divisor = 10_i64.checked_pow(steps)?;
     (sent % divisor == 0).then_some(sent / divisor)
+}
+
+/// The most a refund of this order may record, in the units the refund is
+/// recorded in: the order total, or for a USDT-paid order priced in anything
+/// but USD the USDT0 amount that was paid.
+pub fn refund_cap_minor(order: &OrderRow) -> i64 {
+    match (is_usdt_order(order), order.currency.as_str()) {
+        (true, currency) if currency != "USD" => {
+            order.payment_amount_minor.unwrap_or(order.total_minor)
+        }
+        _ => order.total_minor,
+    }
 }
 
 #[cfg(test)]
