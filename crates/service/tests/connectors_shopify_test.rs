@@ -1245,6 +1245,84 @@ async fn convert_to_variant_rows(r: &Rig, aggregate: &str, rows: &[(&str, i64)])
     tx.commit().await.expect("commit");
 }
 
+async fn one_variant_mapping(r: &Rig, seller: &TestActor, connection: Uuid, variant: &str) {
+    let (status, body) = api(
+        &r.app,
+        "PUT",
+        &format!("/v1/connectors/{connection}/mappings"),
+        Some(&seller.token),
+        &json!({ "mappings": [
+            { "listing_id": "boots_01", "variant_id": variant, "provider_product_id": PRODUCT, "provider_variant_id": "gid://shopify/ProductVariant/50003" },
+        ] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn one_mapped_variant_on_a_listing_that_tracks_variants_moves_that_variant_only(
+    pool: PgPool,
+) {
+    let r = rig(pool).await;
+    let seller = new_actor(&r.app).await;
+    let buyer = new_actor(&r.app).await;
+    let connection = r.install(&seller).await;
+    create_paid_order(&r.app, &seller, &buyer).await;
+    let aggregate = format!("listing:{}_boots_01", seller.pubky);
+    convert_to_variant_rows(&r, &aggregate, &[("a", 3), ("other", 9)]).await;
+
+    // Only size `a` is mapped. The store says 3 and `a` shows 3: nothing is
+    // sent, although the listing as a whole has 12 available.
+    one_variant_mapping(&r, &seller, connection, "a").await;
+    let (state, outcome) = inventory_event(&r, connection, "evt-one-same").await;
+    assert_eq!(
+        (state.as_str(), outcome.as_deref()),
+        ("ignored", Some("unchanged"))
+    );
+
+    // `a` drops to 1: the change is judged against `a`, and the other size
+    // is untouched whatever the service answers.
+    sqlx::query(
+        "UPDATE listing_variant_inventory SET available_quantity = available_quantity - 2, \
+         total_quantity = total_quantity - 2 WHERE listing_aggregate_id = $1 AND variant_id = 'a'",
+    )
+    .bind(&aggregate)
+    .execute(&r.app.pool)
+    .await
+    .expect("less stock");
+    let (state, outcome) = inventory_event(&r, connection, "evt-one-adjust").await;
+    assert_ne!(state, "pending", "{outcome:?}");
+    assert!(
+        !outcome
+            .as_deref()
+            .is_some_and(|text| text.starts_with("variant_mapping_error")),
+        "{outcome:?}"
+    );
+    let other: i64 = sqlx::query_scalar(
+        "SELECT available_quantity FROM listing_variant_inventory \
+         WHERE listing_aggregate_id = $1 AND variant_id = 'other'",
+    )
+    .bind(&aggregate)
+    .fetch_one(&r.app.pool)
+    .await
+    .expect("other size");
+    assert_eq!(other, 9);
+
+    // A single mapping that names no variant cannot be addressed on such a
+    // listing, and says so instead of moving the listing total.
+    one_variant_mapping(&r, &seller, connection, "").await;
+    let (_, outcome) = inventory_event(&r, connection, "evt-one-empty").await;
+    assert_eq!(
+        outcome.as_deref(),
+        Some("variant_mapping_error: variant_required")
+    );
+    assert!(r
+        .alerts(&seller)
+        .await
+        .iter()
+        .all(|alert| alert["kind"] == "variant_mapping_error"));
+}
+
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn the_default_seam_reads_the_variants_own_available_and_refuses_what_it_cannot_address(
     pool: PgPool,
