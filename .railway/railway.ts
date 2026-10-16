@@ -32,6 +32,8 @@ const sharedEnv = {
   CHECKOUT_HOLD_WINDOW_SECONDS: preserve(),
   CONNECTOR_CREDENTIAL_ENCRYPTION_KEY: preserve(),
   CONNECTOR_CREDENTIAL_ENCRYPTION_KEY_PREVIOUS: preserve(),
+  CONNECTOR_PUBLIC_BASE_URL: preserve(),
+  CONNECTORS_ENABLED: preserve(),
   FIAT_PAYMENT_WINDOW_SECONDS: preserve(),
   LISTING_AVAILABILITY_CLIENT_IP_HEADER: preserve(),
   ATTESTOR_ORDER_SALT: preserve(),
@@ -106,11 +108,6 @@ const stagingPaypalSandboxEnv = {
   PAYPAL_IPN_VERIFY_URL: "https://ipnpb.sandbox.paypal.com/cgi-bin/webscr",
 };
 
-const stagingOnlyEnv = {
-  CONNECTOR_PUBLIC_BASE_URL: preserve(),
-  CONNECTORS_ENABLED: preserve(),
-};
-
 // Sign-in-minted marketplace sessions (GS1). Both seats hold them; the staging
 // connector worker references the service's values, so they sit in
 // `stagingEnv` and not in a service-only group.
@@ -132,7 +129,6 @@ const stagingEnv = {
   ...sharedEnv,
   ...grantAndGatewayEnv,
   ...stagingPaypalSandboxEnv,
-  ...stagingOnlyEnv,
   ...grantSessionEnv,
   AUTH_SESSION_TTL_SECONDS: preserve(),
 };
@@ -185,19 +181,19 @@ export default defineRailway((ctx) => {
     domains: isStaging ? ["staging-api.pubky.app"] : [],
   });
 
-  // Staging only. The binary exits while CONNECTORS_ENABLED is off, so
-  // production declares no worker until it turns connectors on. Every variable
-  // is preserved: the live worker holds `${{marketplace-service.NAME}}`
+  // Same image and environment as marketplace-service, its own start command,
+  // on both seats. The binary exits while CONNECTORS_ENABLED is off. Every
+  // variable is preserved: the live worker holds `${{marketplace-service.NAME}}`
   // references to the service's variables, and an apply must not rewrite them.
-  const connector_worker = isStaging
-    ? service("connector-worker", {
-        source: image(STAGING_IMAGE),
-        deploy: { startCommand: "connector-worker" },
-        env: Object.fromEntries(Object.keys(stagingEnv).map((name) => [name, preserve()])),
-      })
-    : undefined;
+  const connector_worker = service("connector-worker", {
+    source: image(isStaging ? STAGING_IMAGE : PRODUCTION_IMAGE),
+    deploy: { startCommand: "connector-worker" },
+    env: Object.fromEntries(
+      Object.keys(isStaging ? stagingEnv : productionEnv).map((name) => [name, preserve()]),
+    ),
+  });
 
   return project(isStaging ? "pubky-marketplace-staging" : "pubky-marketplace-production", {
-    resources: connector_worker ? [marketplace_service, connector_worker] : [marketplace_service],
+    resources: [marketplace_service, connector_worker],
   });
 });

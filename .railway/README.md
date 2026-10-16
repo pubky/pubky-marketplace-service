@@ -71,17 +71,20 @@ before applying.
 `paykit-server-upstream` and the other services in these projects are not in
 this graph, so their images are not pinned here.
 
-### Connector worker (staging)
+### Connector worker
 
-The staging graphs declare a second service, `connector-worker`: the same
+Both seats' graphs declare a second service, `connector-worker`: the same
 image as `marketplace-service` with start command `connector-worker`, no
 healthcheck and no domain. Its variables are references to the service's
 (`${{marketplace-service.NAME}}`), so the worker always sees the same
 `DATABASE_URL`, sealing keys and `CONNECTORS_ENABLED`. Every variable is
 `preserve()` here, so an apply keeps those references. The worker exits at
-startup while `CONNECTORS_ENABLED` is not `true`, so production declares no
-worker until production turns connectors on. Bump the worker's image in the
-same PR as the service's (both read `STAGING_IMAGE`).
+startup while `CONNECTORS_ENABLED` is not `true`. Production turned connectors
+on 16 Oct 2026 (`CONNECTORS_ENABLED`, `CONNECTOR_PUBLIC_BASE_URL` and
+`CONNECTOR_CREDENTIAL_ENCRYPTION_KEY` on the service, the worker created with
+references to them), so it declares the worker too. Bump the worker's image in
+the same PR as the service's (each seat's worker reads that seat's image
+constant).
 
 ### Variables an apply would delete
 
