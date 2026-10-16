@@ -35,9 +35,9 @@ Once activation succeeds, Paykit's `payment_deadline` is known and immutable, an
 
 `min(original hold, payment_deadline + 60 seconds)`
 
-so the order is released when its request expires, not up to `prepare_expires_at - activated_at` later (about 15 minutes with the defaults, since activation normally lands seconds after the bind). The Shop's "Pay by" and the seller's "restocks" time show this hold, so they match the wallet. A status poll that recovers a lost activation response applies the same rule. Auction orders keep their reservation hold.
+so the order is released when its request expires, not up to `prepare_expires_at - activated_at` later (about 15 minutes with the defaults, since activation normally lands seconds after the bind). The Shop's "Pay by" and the seller's "restocks" time show this hold, so they match the wallet. Auction orders keep their reservation hold.
 
-One exception keeps the original hold: an order whose payment Paykit has already seen (`paykit_request_state = 'detected'`). Bitcoin is on time by its first sighting, so a payment seen before the deadline can still confirm and pay after it. The expiry sweep keeps such an order until `prepare_expires_at + payment_window_seconds + 60 seconds`, the original hold, recomputed from the persisted columns.
+One exception keeps the original hold: an order whose payment Paykit has already seen (`paykit_request_state = 'detected'`). Bitcoin is on time by its first sighting, so a payment seen before the deadline can still confirm and pay after it. Marking the order `detected` restores its hold to `prepare_expires_at + payment_window_seconds + 60 seconds`, the original hold, recomputed from the persisted columns, so order reads show the time the sweep uses.
 
 ## Auction orders
 

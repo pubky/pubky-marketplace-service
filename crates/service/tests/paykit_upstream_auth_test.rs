@@ -1401,13 +1401,17 @@ async fn upstream_detected_payment_keeps_bind_hold_and_pays_after_request_deadli
     detected["resolved_at"] = Value::Null;
     paykit.set_marketplace_status(invoice_id, detected);
     poll_now(&app, deadline - chrono::Duration::seconds(1)).await;
-    let request_state: String =
-        sqlx::query_scalar("SELECT paykit_request_state FROM orders WHERE id = $1")
+    let (request_state, detected_hold): (String, chrono::DateTime<chrono::Utc>) =
+        sqlx::query_as("SELECT paykit_request_state, hold_expires_at FROM orders WHERE id = $1")
             .bind(order_id)
             .fetch_one(&pool)
             .await
             .unwrap();
     assert_eq!(request_state, "detected");
+    assert_eq!(
+        detected_hold, bind_hold,
+        "a seen payment restores the bind hold, so reads show it"
+    );
 
     assert_eq!(
         expire_due_payment_windows(&app.state, hold).await.unwrap(),

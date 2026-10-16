@@ -2721,14 +2721,11 @@ async fn mark_paykit_detected(
     now: DateTime<Utc>,
 ) -> anyhow::Result<bool> {
     if row.paykit_request_state != "detected" {
-        sqlx::query(
-            "UPDATE orders SET paykit_request_state = 'detected', updated_at = $2 \
-             WHERE id = $1 AND paykit_request_state = 'pending'",
-        )
-        .bind(row.id)
-        .bind(now)
-        .execute(pool)
-        .await?;
+        sqlx::query(MARK_PAYKIT_DETECTED)
+            .bind(row.id)
+            .bind(now)
+            .execute(pool)
+            .await?;
     }
     Ok(false)
 }
@@ -2784,14 +2781,11 @@ async fn apply_shared_manual_observation(
             .await;
         }
         if row.paykit_request_state != "detected" {
-            sqlx::query(
-                "UPDATE orders SET paykit_request_state = 'detected', updated_at = $2 \
-                 WHERE id = $1 AND paykit_request_state = 'pending'",
-            )
-            .bind(row.id)
-            .bind(now)
-            .execute(pool)
-            .await?;
+            sqlx::query(MARK_PAYKIT_DETECTED)
+                .bind(row.id)
+                .bind(now)
+                .execute(pool)
+                .await?;
         }
         return Ok(false);
     }
@@ -3137,14 +3131,13 @@ async fn apply_paykit_status_outcome(
     };
     if row.paykit_api == "upstream" && row.paykit_expires_at.is_none() {
         if let Some(deadline) = recovered_deadline {
-            sqlx::query(&format!(
+            sqlx::query(
                 "UPDATE orders SET paykit_expires_at = $3, \
                  bitcoin_quote_expires_at = CASE \
-                     WHEN bitcoin_quote_rate IS NULL THEN NULL ELSE $3 END, \
-                 hold_expires_at = {UPSTREAM_ACTIVATED_HOLD} \
+                     WHEN bitcoin_quote_rate IS NULL THEN NULL ELSE $3 END \
                  WHERE id = $1 \
-                 AND paykit_invoice_id = $2 AND paykit_expires_at IS NULL"
-            ))
+                 AND paykit_invoice_id = $2 AND paykit_expires_at IS NULL",
+            )
             .bind(row.id)
             .bind(row.paykit_invoice_id)
             .bind(deadline)
@@ -4081,18 +4074,24 @@ async fn expire_held_order(
 const UPSTREAM_ACTIVATED_HOLD: &str = "CASE WHEN auction_aggregate_id IS NULL \
      THEN LEAST(hold_expires_at, $3 + INTERVAL '60 seconds') ELSE hold_expires_at END";
 
-/// The order half of the held-window expiry predicate; `$1` is `now`. An
-/// upstream order whose payment Paykit has already seen keeps the bind hold
-/// (latest prepare expiry + payment window + skew margin): Bitcoin is on time
-/// by first sighting, so it may still confirm and pay after the request's
-/// deadline.
+/// Marks a pending Paykit order `detected`; `$1` is the order, `$2` now. A
+/// held upstream order gets its bind hold back (latest prepare expiry +
+/// payment window + skew margin): Bitcoin is on time by first sighting, so a
+/// payment seen before the request's deadline may still confirm after it.
+const MARK_PAYKIT_DETECTED: &str = "UPDATE orders SET paykit_request_state = 'detected', \
+     hold_expires_at = CASE WHEN paykit_api = 'upstream' AND auction_aggregate_id IS NULL \
+         AND state = 'pending_payment' AND stock_held \
+         THEN GREATEST(hold_expires_at, paykit_prepare_expires_at \
+             + make_interval(secs => paykit_payment_window_seconds + 60)) \
+         ELSE hold_expires_at END, \
+     updated_at = $2 \
+     WHERE id = $1 AND paykit_request_state = 'pending'";
+
+/// The order half of the held-window expiry predicate; `$1` is `now`.
 const HELD_DUE_ORDER: &str = "o.state = 'pending_payment' AND o.stock_held \
      AND (o.hold_expires_at IS NULL OR o.hold_expires_at <= $1) \
      AND o.paykit_activation_state IS DISTINCT FROM 'preparing' \
-     AND o.paykit_request_state IS DISTINCT FROM 'awaiting_seller_confirmation' \
-     AND (o.paykit_api = 'upstream' AND o.paykit_request_state = 'detected' \
-         AND o.paykit_prepare_expires_at \
-             + make_interval(secs => o.paykit_payment_window_seconds + 60) > $1) IS NOT TRUE";
+     AND o.paykit_request_state IS DISTINCT FROM 'awaiting_seller_confirmation'";
 
 /// The order half of the lapsed auction-winner predicate; `$1` is `now`. The
 /// winning reservation must be `expired` (swept) with no live one left, and
