@@ -166,6 +166,7 @@ Railway IaC `preserve()`):
 | `PAYKIT_SERVER_URL` | unset | paykit-server base URL; setting it enables the bitcoin method |
 | `PAYKIT_REQUEST_SIGNING_KEY` | unset | 32-byte hex ed25519 seed signing paykit-server requests. Its pubky-formatted public key goes into paykit-server's `[signed_services] trusted_public_keys`, beside the Locks key, when `PAYKIT_SERVER_API=upstream`; on the fork (`fork`, the default) it is `marketplace.trusted_public_key`. See [Paykit server API](#paykit-server-api) |
 | `PAYKIT_SERVER_API` | `fork` | which paykit-server the service speaks to: `fork` (today's production server) or `upstream` (`pubky/paykit-server` with the signed-services allowlist, first shipped in v0.1.0-rc9, #55; the latest tagged release is v0.1.0-rc11). Set only together with `PAYKIT_SERVER_URL`. See [Paykit server API](#paykit-server-api) |
+| `PAYKIT_SETUP_STATUS_TIMEOUT_SECONDS` | `8` | how long the signed upstream `POST /setup/status` may take, in whole seconds (1–30). paykit-server answers `ready` for a set-up seller in 2 to 3.5 s, so it does not share the 3 s timeout of the other availability reads. Set only together with `PAYKIT_SERVER_URL` |
 | `PAYKIT_MAX_PREPARE_TTL_SECONDS` | `900` | largest remaining upstream Paykit preparation TTL Marketplace accepts (60–86400). Align with producer `prepare_ttl_seconds`; a longer response is voided and its bind/inventory transaction rolls back. Up to 60 additional seconds are accepted only for bounded cross-service clock skew |
 | `USDT_PAYMENTS_ENABLED` | `false` | the USDT feature flag (`true`/`1` or `false`/`0`). On, `/health` reports `usdt_payments.available`, the seller consent and readiness keys exist, and a `paykit` order may be paid in USDT; off, none of that exists and every Bitcoin and PayPal response is unchanged. See [USDT payments](#usdt-payments-flagged-default-off) |
 | `PAYKIT_MARKETPLACE_ASSETS` | `BTC` | the assets the deployed paykit-server's Marketplace prepare can carry: comma-separated `BTC` (required) and `USDT`. `USDT` is accepted only with `PAYKIT_SERVER_API=upstream`, and USDT is offered only when `PAYKIT_MARKETPLACE_CONTRACT` is `multi_asset` too. See [The single Paykit bind](#the-single-paykit-bind) |
@@ -308,12 +309,22 @@ values from the authenticated `GET /v0/sellers/me/payment-config`.
 
 The seller's own view (`GET` and `PUT /v0/sellers/me/payment-config`) also
 carries `bitcoin_setup`: `ready`, `setup_required` or `unavailable`, asked of
-paykit-server on every call (the same question as `bitcoin_available`,
-uncached, and answered whether or not Bitcoin is switched on). The Shop uses it
-to confirm a Bitkit setup without a Lock Server session. `unavailable` covers a
-Paykit outage, an answer outside the contract, and a deployment without Paykit;
-it is never a reason to start an authorization flow. A seller who never saved
-anything reads the empty configuration (epoch `updated_at`) instead of `null`.
+paykit-server on every call (the same question as `bitcoin_available`, not
+read from the availability cache, and answered whether or not Bitcoin is
+switched on). The Shop uses it to confirm a Bitkit setup without a Lock Server
+session. `unavailable` covers a Paykit outage, an answer outside the contract,
+and a deployment without Paykit; it is never a reason to start an
+authorization flow. When the ask fails but paykit-server answered `ready` for
+this seller within the last 60 seconds, the answer is `ready`, so one slow or
+failed call does not tell a ready seller to set up Bitkit. Only `ready` is
+remembered: `setup_required` is always passed through and forgets it, and
+`unavailable` is never remembered. Every failed readiness ask is logged at
+warn as `paykit setup status unavailable` (upstream) or
+`paykit account lookup unavailable` (fork), with a `reason` (`timeout`,
+`transport`, `signing`, `non_2xx`, `body_not_json`, `out_of_contract`,
+`paykit_unavailable`; the fork's `bad_body`), the seller's 8-character prefix
+and the elapsed time. A seller who never saved anything reads the empty
+configuration (epoch `updated_at`) instead of `null`.
 
 Stripe is not a payment method: the service has no Stripe client, binding
 `stripe` answers `invalid_method`, and `PUT /v0/sellers/me/payment-config`
