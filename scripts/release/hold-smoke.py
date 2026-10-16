@@ -9,11 +9,23 @@ Exercises checkout.create with the deployed Shop v0.6.25 wire shape
 (shop-v0.6.25 @ 5e7fc0e6433e8535ca0444607e7864d79ff4f73c, checkout wire
 unchanged since v0.6.22): the v0.6.17 keys
 plus the line's `variant_id`, which the Shop sends for every line whose
-listing variant it resolved. Hold semantics are Option B:
+listing variant it resolved. Shipped checkouts carry sealed delivery
+addresses as the current Shop sends them (Shop master deb3c7f7,
+`sealDeliveryAddressForSellers`): one RFC 9180 HPKE envelope per shipped
+seller in `delivery_address_envelopes`, which is what a service running
+REQUIRE_ENCRYPTED_DELIVERY_ADDRESS=true accepts. Hold semantics are
+Option B:
 
-  (a) shipping listing + full delivery_address, region as free text
-      ("California"), ISO suffix ("CA"), and empty for PT;
-  (b) pickup-only (no delivery_address);
+  (0) a plaintext `delivery_address` is refused 422
+      `encrypted_delivery_required` and creates no order (proves the flag
+      is on; a service with the flag off fails this case on purpose, since
+      production runs with it on);
+  (a) shipping listing + a sealed envelope for the listing's seller, for
+      each of three address classes (free-text region "California", ISO
+      suffix "CA", empty region for PT). The service stores the envelope
+      unopened and holds no plaintext address, so each order must have a
+      NULL `delivery_address`, the 2096 sent bytes and the sent key id;
+  (b) pickup-only (no address of any kind);
   (c) two unheld checkout.create 200s, then bind exclusivity (first
       POST /v0/orders/{id}/payment-method holds; loser 409 HOLDING_COPY);
   (d) hold TTL equals live FIAT_PAYMENT_WINDOW_SECONDS (exact-key read);
@@ -38,6 +50,18 @@ Every created order is cancelled and verified cancelled at the end.
     python3 scripts/release/hold-smoke.py
 
     python3 scripts/release/hold-smoke.py --self-check
+
+Sealing runs `hold-smoke-seal.mjs` under node with the same `hpke-js`
+packages and pins the Shop uses. Install them once (the default HPKE_CWD):
+
+    mkdir -p /Volumes/t7/vibes-dev/.deps/hold-smoke-hpke && cd "$_" && npm init -y \\
+      && npm install --save-exact @hpke/core@1.9.0 @hpke/chacha20poly1305@1.8.0 \\
+         @hpke/dhkem-x25519@1.8.0
+
+Staging sellers publish no delivery key we hold and the service never opens
+an envelope, so each address is sealed to a fresh throwaway recipient key.
+`--self-check` proves the framing by opening a Shop-made envelope
+(`shop-delivery-envelope.json`) and by round-tripping its own.
 """
 
 from __future__ import annotations
@@ -80,9 +104,18 @@ PRODUCTION_HOST_MARKERS = (
 
 NODE = "/Users/johncarvalho/.nvm/versions/node/v22.14.0/bin/node"
 PUBKY_CWD = "/Users/johncarvalho/work/.deps/pubky-app-ci-green"
+HPKE_CWD = os.environ.get("HPKE_CWD", "/Volumes/t7/vibes-dev/.deps/hold-smoke-hpke")
+SEAL_HELPER = Path(__file__).with_name("hold-smoke-seal.mjs")
+ENVELOPE_FIXTURE_NAME = "shop-delivery-envelope.json"
+ENVELOPE_FIXTURE_SHOP_SHA = "deb3c7f71b8b915bc960b3a799bf2af286062ff0"
+DELIVERY_ENVELOPE_BYTES = 2096
+DELIVERY_ENVELOPE_CHARS = 2795
+DELIVERY_KEY_ID_CHARS = 32
+ENCRYPTED_REQUIRED_REASON = "encrypted_delivery_required"
 
-# Shop v0.6.17 shipping address object after toSnakeCaseWire. Region values
-# are the three classes the 2026-09-22 hold-smoke missed (NY/pickup-only).
+# The address the Shop seals (its snake_case wire form). Region values are the
+# three classes the 2026-09-22 hold-smoke missed (NY/pickup-only); under
+# sealed delivery they vary the sealed content, which the service never reads.
 SHIPPING_ADDRESSES: dict[str, dict[str, str]] = {
     "california_free_text": {
         "name": "Alice Buyer",
@@ -113,15 +146,6 @@ SHIPPING_ADDRESSES: dict[str, dict[str, str]] = {
     },
 }
 
-# Service canonicalize_region after hotfix #25 stores California as CA.
-# Pre-#23 stored the free-text value as-is. Either proves the 422 is gone;
-# HTTP 422 on this payload is STOP.
-EXPECTED_STORED_REGION = {
-    "california_free_text": {"CA", "California"},
-    "ca_iso_suffix": {"CA"},
-    "pt_empty_region": {""},
-}
-
 ENVELOPE_KEYS = {
     "version",
     "command_id",
@@ -131,7 +155,9 @@ ENVELOPE_KEYS = {
     "kind",
     "payload",
 }
-SHIPPING_PAYLOAD_KEYS = {"lines", "delivery_address"}
+PLAINTEXT_SHIPPING_PAYLOAD_KEYS = {"lines", "delivery_address"}
+SEALED_SHIPPING_PAYLOAD_KEYS = {"lines", "delivery_address_envelopes"}
+ENVELOPE_ENTRY_KEYS = {"seller_pubky", "key_id", "envelope"}
 PICKUP_PAYLOAD_KEYS = {"lines"}
 ADDRESS_KEYS = {"name", "line1", "line2", "city", "region", "postal_code", "country_code"}
 LINE_KEYS = {"listing_aggregate_id", "expected_revision", "quantity", "variant_id", "fulfillment"}
@@ -178,9 +204,14 @@ def checkout_body(
     *,
     fulfillment: str,
     address: dict[str, str] | None,
+    envelopes: list[dict[str, str]] | None = None,
     delivery_email: str | None = None,
 ) -> dict[str, Any]:
-    """Shop v0.6.25 checkout.create after toSnakeCaseWire."""
+    """Shop checkout.create after toSnakeCaseWire.
+
+    A shipped line carries either sealed `envelopes` (what the Shop sends) or
+    a plaintext `address` (only the refusal case sends that), never both.
+    """
     line: dict[str, Any] = {
         "listing_aggregate_id": listing["aggregate_id"],
         "expected_revision": listing["server_revision"],
@@ -190,11 +221,14 @@ def checkout_body(
     }
     payload: dict[str, Any] = {"lines": [line]}
     if fulfillment == "shipping":
-        if address is None:
-            raise RuntimeError("shipping checkout requires delivery_address")
-        payload["delivery_address"] = dict(address)
-    elif address is not None:
-        raise RuntimeError(f"{fulfillment} checkout must omit delivery_address")
+        if (address is None) == (envelopes is None):
+            raise RuntimeError("shipping checkout carries exactly one of delivery_address or sealed envelopes")
+        if address is not None:
+            payload["delivery_address"] = dict(address)
+        else:
+            payload["delivery_address_envelopes"] = [dict(entry) for entry in envelopes or []]
+    elif address is not None or envelopes is not None:
+        raise RuntimeError(f"{fulfillment} checkout must omit delivery_address and envelopes")
     if delivery_email is not None:
         if fulfillment != "digital":
             raise RuntimeError("delivery_email rides only a digital checkout")
@@ -222,7 +256,91 @@ def cancel_body(order_id: str, revision: int, reason: str) -> dict[str, Any]:
     }
 
 
-def assert_shape(body: dict[str, Any], *, shipping: bool) -> None:
+def assert_envelopes(envelopes: Any, sellers: list[str] | None = None) -> None:
+    """Shape of `delivery_address_envelopes`, as the service checks it.
+
+    Never put an envelope in an error message; only counts and key positions.
+    """
+    if not isinstance(envelopes, list) or not envelopes:
+        raise RuntimeError("delivery_address_envelopes must be a non-empty list")
+    seen: list[str] = []
+    for index, entry in enumerate(envelopes):
+        if not isinstance(entry, dict) or set(entry) != ENVELOPE_ENTRY_KEYS:
+            raise RuntimeError(f"envelope {index} keys must be {sorted(ENVELOPE_ENTRY_KEYS)}")
+        key_id = entry["key_id"]
+        if len(key_id) != DELIVERY_KEY_ID_CHARS or any(c not in "0123456789abcdef" for c in key_id):
+            raise RuntimeError(f"envelope {index} key_id must be {DELIVERY_KEY_ID_CHARS} lowercase hex chars")
+        sealed = entry["envelope"]
+        if len(sealed) != DELIVERY_ENVELOPE_CHARS:
+            raise RuntimeError(f"envelope {index} is {len(sealed)} chars, want {DELIVERY_ENVELOPE_CHARS}")
+        decoded = decode_envelope(sealed)
+        if len(decoded) != DELIVERY_ENVELOPE_BYTES:
+            raise RuntimeError(f"envelope {index} decodes to {len(decoded)} bytes, want {DELIVERY_ENVELOPE_BYTES}")
+        seen.append(entry["seller_pubky"])
+    if len(set(seen)) != len(seen):
+        raise RuntimeError("one envelope per seller; a seller repeats")
+    if sellers is not None and sorted(seen) != sorted(sellers):
+        raise RuntimeError("envelope sellers must equal the shipped sellers")
+
+
+def decode_envelope(envelope: str) -> bytes:
+    """Canonical unpadded base64url, or RuntimeError (the service refuses anything else)."""
+    if not envelope or any(c not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_" for c in envelope):
+        raise RuntimeError("envelope is not unpadded base64url")
+    raw = base64.urlsafe_b64decode(envelope + "=" * (-len(envelope) % 4))
+    if base64.urlsafe_b64encode(raw).rstrip(b"=").decode() != envelope:
+        raise RuntimeError("envelope is not canonical base64url")
+    return raw
+
+
+def node_seal(mode: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Run hold-smoke-seal.mjs. The Shop's HPKE library lives under HPKE_CWD."""
+    result = subprocess.run(
+        [NODE, str(SEAL_HELPER), mode],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        env={**os.environ, "HPKE_CWD": HPKE_CWD},
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"seal helper {mode} failed rc={result.returncode}: {result.stderr.strip()[-300:]}")
+    return json.loads(result.stdout)
+
+
+def seal_address(
+    address: dict[str, str], *, command_id: str, buyer_pubky: str, sellers: list[str]
+) -> list[dict[str, str]]:
+    """One HPKE envelope per shipped seller, bound to this checkout command and buyer."""
+    out = node_seal(
+        "seal",
+        {
+            "address": address,
+            "checkout_command_id": command_id,
+            "buyer_pubky": buyer_pubky,
+            "sellers": sellers,
+        },
+    )
+    envelopes = out["envelopes"]
+    assert_envelopes(envelopes, sellers)
+    return envelopes
+
+
+def build_checkout(
+    listing: dict[str, Any], command_id: str, *, buyer_pubky: str, fulfillment: str, address: dict[str, str] | None
+) -> dict[str, Any]:
+    """What the Shop sends: a shipped checkout seals `address`; every other kind carries none."""
+    if fulfillment != "shipping":
+        return checkout_body(listing, command_id, fulfillment=fulfillment, address=None)
+    if address is None:
+        raise RuntimeError("shipping checkout requires an address to seal")
+    envelopes = seal_address(
+        address, command_id=command_id, buyer_pubky=buyer_pubky, sellers=[listing["seller_pubky"]]
+    )
+    return checkout_body(listing, command_id, fulfillment="shipping", address=None, envelopes=envelopes)
+
+
+def assert_shape(body: dict[str, Any], *, shipping: bool, sealed: bool = True) -> None:
     missing = ENVELOPE_KEYS - body.keys()
     extra = body.keys() - ENVELOPE_KEYS
     if missing or extra:
@@ -230,20 +348,23 @@ def assert_shape(body: dict[str, Any], *, shipping: bool) -> None:
     if body["kind"] != "checkout.create":
         raise RuntimeError(f"kind {body['kind']!r}")
     payload = body["payload"]
-    expected_payload = SHIPPING_PAYLOAD_KEYS if shipping else PICKUP_PAYLOAD_KEYS
+    shipping_keys = SEALED_SHIPPING_PAYLOAD_KEYS if sealed else PLAINTEXT_SHIPPING_PAYLOAD_KEYS
+    expected_payload = shipping_keys if shipping else PICKUP_PAYLOAD_KEYS
     if set(payload) != expected_payload:
         raise RuntimeError(f"payload keys {set(payload)} != {expected_payload}")
     line = payload["lines"][0]
     if set(line) != LINE_KEYS:
         raise RuntimeError(f"line keys {set(line)} != {LINE_KEYS}")
     if shipping:
-        if set(payload["delivery_address"]) != ADDRESS_KEYS:
+        if sealed:
+            assert_envelopes(payload["delivery_address_envelopes"])
+        elif set(payload["delivery_address"]) != ADDRESS_KEYS:
             raise RuntimeError(f"address keys {set(payload['delivery_address'])}")
         if line["fulfillment"] != "shipping":
             raise RuntimeError("shipping line fulfillment")
     else:
-        if "delivery_address" in payload:
-            raise RuntimeError("pickup must omit delivery_address")
+        if "delivery_address" in payload or "delivery_address_envelopes" in payload:
+            raise RuntimeError("pickup must omit delivery_address and envelopes")
         if line["fulfillment"] != "pickup":
             raise RuntimeError("pickup line fulfillment")
     dumped = json.dumps(body)
@@ -313,38 +434,132 @@ def refusal_reason(body: dict | str) -> str | None:
 def self_check() -> None:
     listing = {
         "aggregate_id": "listing:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "seller_pubky": z32_pubky(),
         "server_revision": 3,
         "fulfillment_methods": "{shipping}",
     }
     pickup_listing = {**listing, "fulfillment_methods": "{pickup}"}
-    california = checkout_body(
+    plaintext = checkout_body(
         listing,
         str(uuid.uuid4()),
         fulfillment="shipping",
         address=SHIPPING_ADDRESSES["california_free_text"],
     )
-    assert_shape(california, shipping=True)
-    if california["payload"]["delivery_address"]["region"] != "California":
-        raise RuntimeError("California free-text region missing from payload")
-    ca = checkout_body(
-        listing, str(uuid.uuid4()), fulfillment="shipping", address=SHIPPING_ADDRESSES["ca_iso_suffix"]
+    assert_shape(plaintext, shipping=True, sealed=False)
+    if "delivery_address_envelopes" in plaintext["payload"]:
+        raise RuntimeError("the refusal payload must be plaintext only")
+    buyer = z32_pubky()
+    sealed_bodies = {}
+    for name, address in SHIPPING_ADDRESSES.items():
+        sealed_bodies[name] = build_checkout(
+            listing, str(uuid.uuid4()), buyer_pubky=buyer, fulfillment="shipping", address=address
+        )
+        assert_shape(sealed_bodies[name], shipping=True)
+        if "delivery_address" in sealed_bodies[name]["payload"]:
+            raise RuntimeError(f"sealed shipping checkout leaked a plaintext address ({name})")
+        entry = sealed_entry(sealed_bodies[name])
+        if entry is None or entry["seller_pubky"] != listing["seller_pubky"]:
+            raise RuntimeError(f"sealed envelope must be for the listing's seller ({name})")
+        dumped = json.dumps(sealed_bodies[name])
+        for value in address.values():
+            if len(value) >= 8 and value in dumped:
+                raise RuntimeError(f"sealed checkout carries address text in the clear ({name})")
+        if address_class(address) != name:
+            raise RuntimeError(f"address class lookup ({name})")
+    first = sealed_entry(sealed_bodies["ca_iso_suffix"])
+    second = sealed_entry(
+        build_checkout(
+            listing,
+            str(uuid.uuid4()),
+            buyer_pubky=buyer,
+            fulfillment="shipping",
+            address=SHIPPING_ADDRESSES["ca_iso_suffix"],
+        )
     )
-    assert_shape(ca, shipping=True)
-    if ca["payload"]["delivery_address"]["region"] != "CA":
-        raise RuntimeError("CA ISO suffix missing from payload")
-    pt = checkout_body(
-        listing, str(uuid.uuid4()), fulfillment="shipping", address=SHIPPING_ADDRESSES["pt_empty_region"]
-    )
-    assert_shape(pt, shipping=True)
-    if pt["payload"]["delivery_address"]["region"] != "":
-        raise RuntimeError("PT empty region missing from payload")
-    if pt["payload"]["delivery_address"]["country_code"] != "PT":
-        raise RuntimeError("PT country_code")
+    if first is None or second is None:
+        raise RuntimeError("sealed checkout carries no envelope")
+    if first["envelope"] == second["envelope"] or first["key_id"] == second["key_id"]:
+        raise RuntimeError("every seal must use fresh randomness and a fresh recipient key")
+    roundtrip = node_seal(
+        "roundtrip",
+        {
+            "address": SHIPPING_ADDRESSES["pt_empty_region"],
+            "checkout_command_id": str(uuid.uuid4()),
+            "buyer_pubky": buyer,
+            "seller_pubky": listing["seller_pubky"],
+        },
+    )["address"]
+    if roundtrip != SHIPPING_ADDRESSES["pt_empty_region"]:
+        raise RuntimeError("sealed address did not round-trip through the helper")
+    shop = json.loads(Path(__file__).with_name(ENVELOPE_FIXTURE_NAME).read_text())
+    if shop["captured_from"]["shop_sha"] != ENVELOPE_FIXTURE_SHOP_SHA:
+        raise RuntimeError("envelope fixture sha drift")
+    shop_entry = {
+        "seller_pubky": shop["binding"]["seller_pubky"],
+        "key_id": shop["binding"]["key_id"],
+        "envelope": shop["envelope"],
+    }
+    assert_envelopes([shop_entry], [shop["binding"]["seller_pubky"]])
+    shop_open = {
+        "envelope": shop["envelope"],
+        "recipient_private_key_b64url": shop["recipient_private_key_b64url"],
+        "binding": shop["binding"],
+    }
+    if node_seal("open", shop_open)["address"] != shop["address"]:
+        raise RuntimeError("the helper cannot open the Shop's own envelope; the framing has drifted")
+    try:
+        node_seal("open", {**shop_open, "binding": {**shop["binding"], "checkout_command_id": str(uuid.uuid4())}})
+    except RuntimeError:
+        pass
+    else:
+        raise RuntimeError("an envelope opened under another checkout command id; the AAD is not bound")
+    good_entry = {"seller_pubky": "s1", "key_id": "0" * DELIVERY_KEY_ID_CHARS, "envelope": shop["envelope"]}
+    for bad_envelopes in (
+        [],
+        [{**good_entry, "envelope": shop["envelope"][:-1]}],
+        [{**good_entry, "envelope": shop["envelope"][:-1] + "="}],
+        [{**good_entry, "key_id": "XYZ"}],
+        [{**good_entry, "key_id": "A" * DELIVERY_KEY_ID_CHARS}],
+        [{**good_entry}, {**good_entry}],
+        [{"seller_pubky": "s1", "key_id": good_entry["key_id"]}],
+    ):
+        try:
+            assert_envelopes(bad_envelopes)
+        except RuntimeError:
+            continue
+        raise RuntimeError("a malformed envelope list was accepted")
+    try:
+        assert_envelopes([good_entry], ["s2"])
+    except RuntimeError:
+        pass
+    else:
+        raise RuntimeError("envelopes for the wrong seller set were accepted")
+    trailing_bits = shop["envelope"][:-1] + ("B" if shop["envelope"][-1] != "B" else "C")
+    try:
+        decode_envelope(trailing_bits)
+    except RuntimeError:
+        pass
+    else:
+        raise RuntimeError("an envelope with trailing bits set was accepted as canonical")
     chatter = 'Output format is unaligned.\nField separator is "|".\n'
-    if sql_scalar(chatter + "region=\n") != "region=":
-        raise RuntimeError("empty stored region marker must survive psql chatter")
-    if sql_scalar(chatter + "region=CA\n") != "region=CA":
-        raise RuntimeError("CA stored region marker")
+    if sql_scalar(chatter + "address=true|0||\n") != "address=true|0||":
+        raise RuntimeError("stored address marker must survive psql chatter")
+    facts = parse_address_facts("address=true|2096|ab|0123456789abcdef0123456789abcdef", "order")
+    if facts != {
+        "plaintext_null": True,
+        "envelope_bytes": 2096,
+        "envelope_sha256": "ab",
+        "key_id": "0123456789abcdef0123456789abcdef",
+    }:
+        raise RuntimeError("stored address facts parse")
+    for bad_token in ("region=CA", "address=true|0|"):
+        try:
+            parse_address_facts(bad_token, "order")
+        except RuntimeError:
+            continue
+        raise RuntimeError("a malformed stored address marker was accepted")
+    if refusal_reason({"ok": False, "error": {"reason": ENCRYPTED_REQUIRED_REASON}}) != ENCRYPTED_REQUIRED_REASON:
+        raise RuntimeError("encrypted_delivery_required reason parse")
     pickup = checkout_body(pickup_listing, str(uuid.uuid4()), fulfillment="pickup", address=None)
     assert_shape(pickup, shipping=False)
     if bind_body("paypal") != {"method": "paypal"}:
@@ -378,6 +593,9 @@ def self_check() -> None:
             raise RuntimeError(f"digital listing query must skip tombstoned listings ({kind})")
         if "c.paypal_merchant_email IS NOT NULL" not in query:
             raise RuntimeError(f"digital listing query must require a seller payment rail ({kind})")
+    for shipping_case in (True, False):
+        if "l.deleted_at IS NULL" not in listing_pick_query(shipping=shipping_case)[0]:
+            raise RuntimeError("shipping and pickup listing picks must skip tombstoned listings")
     for bad in (
         lambda: checkout_body(
             digital_listing, str(uuid.uuid4()), fulfillment="digital", address=SHIPPING_ADDRESSES["ca_iso_suffix"]
@@ -387,6 +605,14 @@ def self_check() -> None:
             address=SHIPPING_ADDRESSES["ca_iso_suffix"], delivery_email=DIGITAL_SMOKE_EMAIL,
         ),
         lambda: digital_listing_query("file' OR '1'='1", set()),
+        lambda: checkout_body(
+            listing, str(uuid.uuid4()), fulfillment="shipping",
+            address=SHIPPING_ADDRESSES["ca_iso_suffix"], envelopes=[good_entry],
+        ),
+        lambda: checkout_body(listing, str(uuid.uuid4()), fulfillment="shipping", address=None),
+        lambda: checkout_body(
+            pickup_listing, str(uuid.uuid4()), fulfillment="pickup", address=None, envelopes=[good_entry]
+        ),
     ):
         try:
             bad()
@@ -410,9 +636,10 @@ def self_check() -> None:
             {
                 "shop_tag": SHOP_TAG,
                 "shop_sha": SHOP_SHA,
-                "california_region": california["payload"]["delivery_address"]["region"],
-                "ca_region": ca["payload"]["delivery_address"]["region"],
-                "pt_region": pt["payload"]["delivery_address"]["region"],
+                "sealed_envelope_chars": len(first["envelope"]),
+                "sealed_envelope_bytes": DELIVERY_ENVELOPE_BYTES,
+                "shop_envelope_sha": ENVELOPE_FIXTURE_SHOP_SHA,
+                "shop_envelope_opened_by_helper": True,
                 "pickup_has_address": "delivery_address" in pickup["payload"],
                 "bind_paypal": bind_body("paypal"),
                 "ttl_590_vs_600": ttl_matches_window(590.0, 600),
@@ -658,9 +885,7 @@ def parse_listing_rows(raw: str) -> list[dict[str, Any]]:
     return rows
 
 
-def pick_listing(
-    *, shipping: bool, exclude: set[str] | None = None, require_bind: bool = False
-) -> dict[str, Any]:
+def listing_pick_query(*, shipping: bool, exclude: set[str] | None = None) -> tuple[str, str]:
     if shipping:
         clause = "AND l.fulfillment_methods::text LIKE '%shipping%'"
         label = "shipping"
@@ -674,7 +899,7 @@ def pick_listing(
     if exclude:
         ids = ",".join(f"'{quote(item)}'" for item in sorted(exclude))
         excluded = f"AND l.aggregate_id NOT IN ({ids}) "
-    raw = sql(
+    query = (
         "SELECT l.aggregate_id || '|' || l.seller_pubky || '|' || l.server_revision::text "
         "|| '|' || l.available_quantity::text || '|' || l.fulfillment_methods::text "
         "|| '|' || CASE "
@@ -682,13 +907,22 @@ def pick_listing(
         "ELSE '' END "
         "FROM listings l "
         "LEFT JOIN seller_payment_configs c ON c.seller_pubky = l.seller_pubky "
-        "WHERE l.sale_format='fixed_price' AND l.state='available' AND l.available_quantity=1 "
+        "WHERE l.deleted_at IS NULL "
+        "AND l.sale_format='fixed_price' AND l.state='available' AND l.available_quantity=1 "
         "AND l.reserved_quantity=0 "
         f"{clause} {excluded}"
         "ORDER BY (CASE "
         "WHEN c.paypal_merchant_email IS NOT NULL AND btrim(c.paypal_merchant_email) <> '' THEN 0 "
         "ELSE 1 END), l.updated_at DESC NULLS LAST LIMIT 5;"
     )
+    return query, label
+
+
+def pick_listing(
+    *, shipping: bool, exclude: set[str] | None = None, require_bind: bool = False
+) -> dict[str, Any]:
+    query, label = listing_pick_query(shipping=shipping, exclude=exclude)
+    raw = sql(query)
     rows = parse_listing_rows(raw)
     if require_bind:
         rows = [row for row in rows if row.get("bind_method") == "paypal"]
@@ -762,21 +996,84 @@ def sql_scalar(raw: str) -> str:
     raise RuntimeError(f"scalar unparseable {raw!r}")
 
 
-def stored_region_of(order_id: str) -> str:
-    """Read orders.delivery_address.region, including the empty PT value.
+def stored_address_facts(order_id: str) -> dict[str, Any]:
+    """What the order row keeps of the address, without reading any of it.
 
-    psql tuples_only unaligned prints nothing for '' so sql_scalar cannot
-    see it. Prefix a non-empty marker; a missing row still raises.
+    A psql NULL prints as nothing, so each column is wrapped in a marker the
+    parser can see. The envelope is compared by SHA-256, not echoed.
     """
     token = sql_scalar(
         sql(
-            "SELECT 'region=' || coalesce(delivery_address->>'region','') "
+            "SELECT 'address=' || (delivery_address IS NULL)::text "
+            "|| '|' || coalesce(octet_length(delivery_address_envelope), 0)::text "
+            "|| '|' || coalesce(encode(sha256(delivery_address_envelope), 'hex'), '') "
+            "|| '|' || coalesce(delivery_key_id, '') "
             f"FROM orders WHERE id='{quote(order_id)}'::uuid;"
         )
     )
-    if not token.startswith("region="):
-        raise RuntimeError(f"stored region marker missing {token!r}")
-    return token[len("region=") :]
+    return parse_address_facts(token, order_id)
+
+
+def parse_address_facts(token: str, order_id: str) -> dict[str, Any]:
+    if not token.startswith("address="):
+        raise RuntimeError(f"stored address marker missing for {order_id}")
+    cols = token[len("address=") :].split("|")
+    if len(cols) != 4:
+        raise RuntimeError(f"stored address facts unparseable for {order_id}")
+    return {
+        "plaintext_null": cols[0] == "true",
+        "envelope_bytes": int(cols[1]),
+        "envelope_sha256": cols[2],
+        "key_id": cols[3],
+    }
+
+
+def assert_stored_address(order_id: str, entry: dict[str, str] | None, *, case: str) -> dict[str, Any]:
+    """The order keeps exactly the sent envelope and no plaintext (or nothing, for pickup and digital)."""
+    facts = stored_address_facts(order_id)
+    if not facts["plaintext_null"]:
+        raise RuntimeError(f"{case}: order {order_id} stored a plaintext delivery address")
+    if entry is None:
+        if facts["envelope_bytes"] or facts["key_id"]:
+            raise RuntimeError(f"{case}: order {order_id} stored an envelope it was never sent")
+        return facts
+    sent_sha = hashlib.sha256(decode_envelope(entry["envelope"])).hexdigest()
+    if facts["envelope_bytes"] != DELIVERY_ENVELOPE_BYTES:
+        raise RuntimeError(f"{case}: stored envelope is {facts['envelope_bytes']} bytes")
+    if facts["envelope_sha256"] != sent_sha:
+        raise RuntimeError(f"{case}: stored envelope differs from the one sent")
+    if facts["key_id"] != entry["key_id"]:
+        raise RuntimeError(f"{case}: stored key id differs from the one sent")
+    return facts
+
+
+def sealed_entry(body: dict[str, Any]) -> dict[str, str] | None:
+    """The one envelope a single-seller checkout carries, or None when it carries none."""
+    entries = body["payload"].get("delivery_address_envelopes")
+    if entries is None:
+        return None
+    if len(entries) != 1:
+        raise RuntimeError(f"single-seller checkout sent {len(entries)} envelopes")
+    return entries[0]
+
+
+def address_class(address: dict[str, str] | None) -> str | None:
+    if address is None:
+        return None
+    for name, candidate in SHIPPING_ADDRESSES.items():
+        if candidate == address:
+            return name
+    raise RuntimeError("address is not one of the smoke addresses")
+
+
+def redacted_facts(facts: dict[str, Any]) -> dict[str, Any]:
+    """Row facts with the envelope hash and key id cut to a prefix for the log."""
+    return {
+        "plaintext_null": facts["plaintext_null"],
+        "envelope_bytes": facts["envelope_bytes"],
+        "envelope_sha256_prefix": facts["envelope_sha256"][:8],
+        "key_id_prefix": facts["key_id"][:6],
+    }
 
 
 def parse_hold_row(raw: str) -> dict[str, Any]:
@@ -963,7 +1260,6 @@ class Smoke:
         fulfillment: str,
         address: dict[str, str] | None,
         case: str,
-        expected_stored_region: set[str] | None,
     ) -> dict[str, Any]:
         method = listing.get("bind_method") or ""
         if method != "paypal":
@@ -978,9 +1274,12 @@ class Smoke:
         self.sessions.extend([sid_a, sid_b])
         cmd_a = str(uuid.uuid4())
         cmd_b = str(uuid.uuid4())
-        body_a = checkout_body(listing, cmd_a, fulfillment=fulfillment, address=address)
-        body_b = checkout_body(listing, cmd_b, fulfillment=fulfillment, address=address)
+        body_a = build_checkout(listing, cmd_a, buyer_pubky=buyer_a, fulfillment=fulfillment, address=address)
+        body_b = build_checkout(listing, cmd_b, buyer_pubky=buyer_b, fulfillment=fulfillment, address=address)
         assert_shape(body_a, shipping=fulfillment == "shipping")
+        assert_shape(body_b, shipping=fulfillment == "shipping")
+        entry_a = sealed_entry(body_a)
+        entry_b = sealed_entry(body_b)
         status_a, resp_a = self.command(token_a, body_a, allowed={200}, case=f"{case}.first_create")
         status_b, resp_b = self.command(token_b, body_b, allowed={200}, case=f"{case}.second_create")
         first_ok = isinstance(resp_a, dict) and resp_a.get("ok") is True
@@ -1005,10 +1304,10 @@ class Smoke:
         if bind_a_status == 200 and bind_b_status == 200:
             raise RuntimeError(f"{case}: both binds succeeded")
         if bind_a_status == 200:
-            winner_order, winner_token = order_a, token_a
+            winner_order, winner_token, winner_entry = order_a, token_a, entry_a
             loser_status, loser_body = bind_b_status, bind_b
         elif bind_b_status == 200:
-            winner_order, winner_token = order_b, token_b
+            winner_order, winner_token, winner_entry = order_b, token_b, entry_b
             loser_status, loser_body = bind_a_status, bind_a
         else:
             raise RuntimeError(
@@ -1032,13 +1331,7 @@ class Smoke:
         )
         if not ttl_matches_window(ttl, window):
             raise RuntimeError(f"{case}: ttl {ttl} window={window}")
-        stored_region = None
-        if expected_stored_region is not None:
-            stored_region = stored_region_of(winner_order)
-            if stored_region not in expected_stored_region:
-                raise RuntimeError(
-                    f"{case}: stored region {stored_region!r} not in {sorted(expected_stored_region)!r}"
-                )
+        stored = assert_stored_address(winner_order, winner_entry, case=case)
         cancel = self.cancel_order(winner_token, winner_order, f"hold-smoke {case} restock")
         loser_order = order_b if winner_order == order_a else order_a
         loser_token = token_b if winner_order == order_a else token_a
@@ -1054,7 +1347,8 @@ class Smoke:
             "shop_tag": SHOP_TAG,
             "shop_sha": SHOP_SHA,
             "fulfillment": fulfillment,
-            "delivery_address": address,
+            "address_class": address_class(address),
+            "stored_address": redacted_facts(stored),
             "bind_method": method,
             "fiat_window_seconds": window,
             "first_http": status_a,
@@ -1066,7 +1360,6 @@ class Smoke:
             "winner_order_id": winner_order,
             "hold": hold,
             "ttl_seconds": ttl,
-            "stored_region": stored_region,
             "cancel": cancel,
             "listing_qty_after": listing_after["available_quantity"],
         }
@@ -1078,14 +1371,13 @@ class Smoke:
         fulfillment: str,
         address: dict[str, str] | None,
         case: str,
-        expected_stored_region: set[str] | None,
     ) -> dict[str, Any]:
         buyer = z32_pubky()
         if buyer == listing["seller_pubky"]:
             raise RuntimeError("buyer collides with seller")
         token, sid = insert_session(buyer)
         self.sessions.append(sid)
-        body = checkout_body(listing, str(uuid.uuid4()), fulfillment=fulfillment, address=address)
+        body = build_checkout(listing, str(uuid.uuid4()), buyer_pubky=buyer, fulfillment=fulfillment, address=address)
         assert_shape(body, shipping=fulfillment == "shipping")
         status, resp = self.command(token, body, allowed={200}, case=case)
         ok = isinstance(resp, dict) and resp.get("ok") is True
@@ -1096,13 +1388,7 @@ class Smoke:
         hold = self.order_hold(order_id)
         if hold["stock_held"] or hold["hold_source"]:
             raise RuntimeError(f"{case}: checkout must not hold {hold!r}")
-        stored_region = None
-        if expected_stored_region is not None:
-            stored_region = stored_region_of(order_id)
-            if stored_region not in expected_stored_region:
-                raise RuntimeError(
-                    f"{case}: stored region {stored_region!r} not in {sorted(expected_stored_region)!r}"
-                )
+        stored = assert_stored_address(order_id, sealed_entry(body), case=case)
         cancel = self.cancel_order(token, order_id, f"hold-smoke {case} restock")
         listing_after = refresh_listing(listing["aggregate_id"])
         if listing_after["available_quantity"] != 1:
@@ -1113,14 +1399,48 @@ class Smoke:
             "shop_tag": SHOP_TAG,
             "shop_sha": SHOP_SHA,
             "fulfillment": fulfillment,
-            "delivery_address": address,
+            "address_class": address_class(address),
+            "stored_address": redacted_facts(stored),
             "http": status,
             "order_id": order_id,
             "hold": hold,
-            "stored_region": stored_region,
             "cancel": cancel,
             "listing_qty_after": listing_after["available_quantity"],
         }
+
+    def plaintext_refusal(self, listing: dict[str, Any], *, case: str) -> dict[str, Any]:
+        """A plaintext address under REQUIRE_ENCRYPTED_DELIVERY_ADDRESS=true is refused and leaves no order."""
+        buyer = z32_pubky()
+        if buyer == listing["seller_pubky"]:
+            raise RuntimeError("buyer collides with seller")
+        token, sid = insert_session(buyer)
+        self.sessions.append(sid)
+        address = SHIPPING_ADDRESSES["california_free_text"]
+        body = checkout_body(listing, str(uuid.uuid4()), fulfillment="shipping", address=address)
+        assert_shape(body, shipping=True, sealed=False)
+        status, resp = api(self.base, "POST", "/v1/commands", token, body)
+        if status == 200:
+            if isinstance(resp, dict) and resp.get("ok") is True:
+                orders = (resp.get("result") or {}).get("orders") or []
+                for order in orders:
+                    self.created_orders.append({"id": order["id"], "token": token, "case": case})
+            raise RuntimeError(
+                f"STOP {case}: the service accepted a plaintext delivery address, so "
+                "REQUIRE_ENCRYPTED_DELIVERY_ADDRESS is not on for this service"
+            )
+        reason = refusal_reason(resp)
+        if status != 422 or reason != ENCRYPTED_REQUIRED_REASON:
+            raise RuntimeError(f"STOP {case}: want 422 {ENCRYPTED_REQUIRED_REASON}, got {status} reason={reason!r}")
+        echoed = json.dumps(resp)
+        for marker in (address["line1"], address["name"], address["postal_code"]):
+            if marker in echoed:
+                raise RuntimeError(f"STOP {case}: the refusal echoed part of the address")
+        created = int(
+            sql_scalar(sql(f"SELECT count(*)::text FROM orders WHERE buyer_pubky='{quote(buyer)}';"))
+        )
+        if created:
+            raise RuntimeError(f"STOP {case}: a refused checkout left {created} order rows")
+        return {"case": case, "listing": listing["aggregate_id"], "http": status, "reason": reason, "orders_created": created}
 
     def refused_read(
         self, token: str, path: str, *, reason: str, case: str, status_expected: int = 409
@@ -1289,13 +1609,14 @@ class Smoke:
         try:
             shipping = pick_listing(shipping=True, require_bind=True)
             pickup, pickup_restore = ensure_pickup_listing({shipping["aggregate_id"]})
+            self.cases.append(self.plaintext_refusal(shipping, case="plaintext_refused_under_flag"))
+            shipping = refresh_listing(shipping["aggregate_id"])
             self.cases.append(
                 self.two_buyer(
                     shipping,
                     fulfillment="shipping",
                     address=SHIPPING_ADDRESSES["california_free_text"],
                     case="shipping_california_free_text",
-                    expected_stored_region=EXPECTED_STORED_REGION["california_free_text"],
                 )
             )
             shipping = refresh_listing(shipping["aggregate_id"])
@@ -1305,7 +1626,6 @@ class Smoke:
                     fulfillment="shipping",
                     address=SHIPPING_ADDRESSES["ca_iso_suffix"],
                     case="shipping_ca_iso_suffix",
-                    expected_stored_region=EXPECTED_STORED_REGION["ca_iso_suffix"],
                 )
             )
             shipping = refresh_listing(shipping["aggregate_id"])
@@ -1316,7 +1636,6 @@ class Smoke:
                     fulfillment="pickup",
                     address=None,
                     case="pickup_two_buyer",
-                    expected_stored_region=None,
                 )
             )
             shipping = refresh_listing(shipping["aggregate_id"])
@@ -1326,7 +1645,6 @@ class Smoke:
                     fulfillment="shipping",
                     address=SHIPPING_ADDRESSES["pt_empty_region"],
                     case="shipping_pt_empty_region",
-                    expected_stored_region=EXPECTED_STORED_REGION["pt_empty_region"],
                 )
             )
             used = {shipping["aggregate_id"], pickup["aggregate_id"]}

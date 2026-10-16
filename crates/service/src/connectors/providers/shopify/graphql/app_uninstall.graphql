@@ -1,0 +1,11 @@
+mutation AppUninstall {
+  appUninstall {
+    app {
+      id
+    }
+    userErrors {
+      field
+      message
+    }
+  }
+}

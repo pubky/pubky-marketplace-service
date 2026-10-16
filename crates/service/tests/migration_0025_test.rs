@@ -108,6 +108,10 @@ async fn migration_0025_preserves_legacy_release_and_enforces_non_null_money() {
         apply(&pool, number).await;
     }
     apply(&pool, 25).await;
+    // The release below is the current worker, which settles stock on the
+    // listing's variant rows; 0070 reads only `listings` and `reservations`
+    // and backfills the legacy listing's implicit row.
+    apply(&pool, 70).await;
 
     let migrated: (String, Option<String>) =
         sqlx::query_as("SELECT state, expiry_reason FROM offers WHERE id = $1")

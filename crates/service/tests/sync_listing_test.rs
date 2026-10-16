@@ -92,7 +92,8 @@ async fn a_buyer_sync_registers_an_unregistered_listing(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    // The client sums ALL variants' quantities, enabled or not: 2 + 3 = 5.
+    // Only the enabled variant's units are for sale: variant_0 is enabled with
+    // 2, variant_1 is disabled with 3.
     homeserver.put_record(&seller.pubky, LISTING_ID, homeserver_record(1, &[2, 3]));
 
     let aggregate_id = format!("listing:{}_{LISTING_ID}", seller.pubky);
@@ -117,8 +118,8 @@ async fn a_buyer_sync_registers_an_unregistered_listing(pool: PgPool) {
     assert_eq!(listing["seller_pubky"], json!(seller.pubky));
     assert_eq!(listing["title"], json!("Winter boots"));
     assert_eq!(listing["listing_revision"], json!(1));
-    assert_eq!(listing["total_quantity"], json!(5));
-    assert_eq!(listing["available_quantity"], json!(5));
+    assert_eq!(listing["total_quantity"], json!(2));
+    assert_eq!(listing["available_quantity"], json!(2));
     assert_eq!(listing["state"], json!("available"));
     assert_eq!(listing["unit_price"]["amount_minor"], json!(12_500));
     // The cheapest PRICEABLE seller-signed option: the $5 flat rate (the
@@ -528,4 +529,154 @@ async fn lock_columns(pool: &PgPool, aggregate_id: &str) -> (Option<String>, Opt
     .fetch_one(pool)
     .await
     .expect("listing row exists")
+}
+
+async fn state_of(app: &TestApp, seller_pubky: &str) -> (String, i64, i64, i64) {
+    sqlx::query_as(
+        "SELECT state, available_quantity, reserved_quantity, sold_quantity FROM listings \
+         WHERE aggregate_id = $1",
+    )
+    .bind(common::listing_aggregate(seller_pubky))
+    .fetch_one(&app.pool)
+    .await
+    .expect("listing row")
+}
+
+/// One unit bought and paid through the sandbox rail.
+async fn sandbox_buy(app: &TestApp, buyer: &common::TestActor, seller_pubky: &str, n: u64) {
+    let revision: i64 =
+        sqlx::query_scalar("SELECT server_revision FROM listings WHERE aggregate_id = $1")
+            .bind(common::listing_aggregate(seller_pubky))
+            .fetch_one(&app.pool)
+            .await
+            .expect("revision");
+    let mut checkout =
+        common::checkout_command_with_id(seller_pubky, &common::indexed_command_id(0x7b00, n));
+    checkout["payload"]["lines"][0]["expected_revision"] = json!(revision);
+    let (status, body) = execute(app, &buyer.token, &checkout).await;
+    assert_eq!(status, StatusCode::OK, "checkout: {body}");
+    let payment_id = body["result"]["payments"][0]["id"]
+        .as_str()
+        .expect("payment id")
+        .to_string();
+    let (status, body) = execute(
+        app,
+        &buyer.token,
+        &common::payment_command(&payment_id, 1, "confirmed", 1, 7_600 + n),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "payment: {body}");
+}
+
+// An edit that leaves a fully sold listing at exactly its sold units used to
+// read `reserved`, so buyers were told another buyer's payment was holding the
+// item. Nothing is held: it is sold.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_edit_that_leaves_a_fully_sold_listing_reads_sold(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let late_buyer = new_actor(&app).await;
+    homeserver.put_record(&seller.pubky, LISTING_ID, homeserver_record(1, &[2]));
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &sync_command(&seller.pubky, LISTING_ID, 1),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    sandbox_buy(&app, &buyer, &seller.pubky, 1).await;
+    sandbox_buy(&app, &buyer, &seller.pubky, 2).await;
+    assert_eq!(
+        state_of(&app, &seller.pubky).await,
+        ("sold".to_string(), 0, 0, 2)
+    );
+
+    // A record edit at a newer revision that keeps the quantity at the 2 sold.
+    homeserver.put_record(&seller.pubky, LISTING_ID, homeserver_record(2, &[2]));
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &sync_command(&seller.pubky, LISTING_ID, 2),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        state_of(&app, &seller.pubky).await,
+        ("sold".to_string(), 0, 0, 2)
+    );
+    assert_eq!(body["result"]["listing"]["state"], json!("sold"));
+
+    let revision = body["revision"].as_i64().expect("revision");
+    let mut checkout =
+        common::checkout_command_with_id(&seller.pubky, &common::indexed_command_id(0x7b01, 1));
+    checkout["payload"]["lines"][0]["expected_revision"] = json!(revision);
+    let (status, body) = execute(&app, &late_buyer.token, &checkout).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        body["error"]["message"],
+        json!("This listing has sold out.")
+    );
+}
+
+// With a payment still holding a unit the edit keeps reading `reserved`, and a
+// quantity above the committed units reads `available`, as before.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_edit_keeps_reserved_while_a_hold_is_open_and_available_above_committed(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let holder = new_actor(&app).await;
+    homeserver.put_record(&seller.pubky, LISTING_ID, homeserver_record(1, &[2]));
+    execute(
+        &app,
+        &buyer.token,
+        &sync_command(&seller.pubky, LISTING_ID, 1),
+    )
+    .await;
+    sandbox_buy(&app, &buyer, &seller.pubky, 1).await;
+    let revision: i64 =
+        sqlx::query_scalar("SELECT server_revision FROM listings WHERE aggregate_id = $1")
+            .bind(common::listing_aggregate(&seller.pubky))
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    let (status, body) = execute(
+        &app,
+        &holder.token,
+        &common::reserve_command(&seller.pubky, 1, 1, revision),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        state_of(&app, &seller.pubky).await,
+        ("reserved".to_string(), 0, 1, 1)
+    );
+
+    homeserver.put_record(&seller.pubky, LISTING_ID, homeserver_record(2, &[2]));
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &sync_command(&seller.pubky, LISTING_ID, 2),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        state_of(&app, &seller.pubky).await,
+        ("reserved".to_string(), 0, 1, 1),
+        "a unit is still held, so the listing is reserved, not sold"
+    );
+
+    homeserver.put_record(&seller.pubky, LISTING_ID, homeserver_record(3, &[5]));
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &sync_command(&seller.pubky, LISTING_ID, 3),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        state_of(&app, &seller.pubky).await,
+        ("available".to_string(), 3, 1, 1)
+    );
 }

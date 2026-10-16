@@ -41,6 +41,37 @@ pub async fn handle(
     homeserver: Option<&dyn HomeserverListingClient>,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
+    let mut outcome = sync(tx, actor, command, payload, homeserver, now).await?;
+    // A sync that converged the listing to its record but could not convert it
+    // to per-variant stock says so: `variant_conversion` names the state
+    // (`deferred`, or `blocked` when the record itself has to change) and why.
+    if let Ok(success) = outcome.as_mut() {
+        let marker: Option<(String, i32)> = sqlx::query_as(
+            "SELECT reason, attempts FROM listing_variant_conversion_blocks \
+             WHERE listing_aggregate_id = $1",
+        )
+        .bind(&command.aggregate_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if let Some((reason, attempts)) = marker {
+            success.result["variant_conversion"] = json!({
+                "state": crate::variant_stock::conversion_state(&reason),
+                "reason": reason,
+                "attempts": attempts,
+            });
+        }
+    }
+    Ok(outcome)
+}
+
+async fn sync(
+    tx: &mut Transaction<'_, Postgres>,
+    actor: &str,
+    command: &Command,
+    payload: &SyncListingPayload,
+    homeserver: Option<&dyn HomeserverListingClient>,
+    now: DateTime<Utc>,
+) -> Result<HandlerResult, sqlx::Error> {
     // Fail closed: without a configured homeserver there is no canonical
     // record to derive registration from.
     let Some(homeserver) = homeserver else {
@@ -182,6 +213,87 @@ pub async fn handle(
         // (quantity, price, state) is touched. Sync carries no pickup
         // DETAILS and can never null them (§A4).
         if registration.listing_revision <= current.listing_revision {
+            // A listing registered before per-variant stock (or by a client
+            // that sent no variants) keeps one shared total while its record
+            // lists several enabled variants. An equal-revision sync moves it
+            // to per-variant rows as soon as its committed stock can be
+            // attributed to variants exactly.
+            if registration.listing_revision == current.listing_revision
+                && registration.sale_format == SaleFormat::FixedPrice
+                && registration.variants.len() >= 2
+            {
+                let rows = crate::variant_stock::lock_rows(tx, &command.aggregate_id).await?;
+                if !crate::variant_stock::tracks_variants(&rows) {
+                    let plan = crate::variant_stock::plan(
+                        tx,
+                        &command.aggregate_id,
+                        &registration.variants,
+                        &rows,
+                        false,
+                        current.server_revision,
+                        Some(crate::variant_stock::UnchangedRecord {
+                            enabled_sum: registration
+                                .variants
+                                .iter()
+                                .map(|variant| variant.quantity)
+                                .sum(),
+                            all_variants_sum: registration.quantity,
+                        }),
+                    )
+                    .await?;
+                    if matches!(plan, Ok(crate::variant_stock::StockPlan::PerVariant { .. })) {
+                        return apply_registration(
+                            tx,
+                            actor,
+                            command.command_id,
+                            &command.aggregate_id,
+                            &registration,
+                            Some(current),
+                            None,
+                            "listing.synced",
+                            now,
+                        )
+                        .await;
+                    }
+                }
+            }
+            // A listing that sells one variant counted the stock of the
+            // record's disabled variants in its total. At the same record
+            // revision the total is recomputed from the enabled variants when
+            // it is still exactly that legacy sum (a seller's adjustment has
+            // moved it otherwise, and stays), never below the units already
+            // reserved or sold.
+            if registration.listing_revision == current.listing_revision
+                && registration.sale_format == SaleFormat::FixedPrice
+                && !registration.variants.is_empty()
+                && current.total_quantity == registration.quantity
+            {
+                let enabled: i64 = registration
+                    .variants
+                    .iter()
+                    .map(|variant| variant.quantity)
+                    .sum();
+                let committed = current.reserved_quantity + current.sold_quantity;
+                let target = enabled.max(committed);
+                if target != current.total_quantity
+                    && !crate::variant_stock::tracks_variants(
+                        &crate::variant_stock::lock_rows(tx, &command.aggregate_id).await?,
+                    )
+                {
+                    return apply_registration(
+                        tx,
+                        actor,
+                        command.command_id,
+                        &command.aggregate_id,
+                        &registration,
+                        Some(current),
+                        None,
+                        "listing.synced",
+                        now,
+                    )
+                    .await;
+                }
+            }
             let registration_methods: Vec<String> = registration
                 .fulfillment_methods
                 .iter()

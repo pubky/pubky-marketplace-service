@@ -17,6 +17,7 @@ pub mod bitcoin_review;
 pub mod clock;
 pub mod command_flight;
 pub mod config;
+pub mod connectors;
 pub mod content_lock;
 pub mod contracts;
 pub mod digital;
@@ -54,6 +55,7 @@ pub mod result;
 pub mod rotating_keys;
 pub mod seal;
 pub mod seller_terms;
+pub mod variant_stock;
 pub mod workers;
 
 use std::sync::Arc;
@@ -154,6 +156,10 @@ pub struct AppState {
     /// (`GET /v0/listings/{seller}/{listing_id}/availability`). Always
     /// installed; `new` uses the defaults and no trusted client header.
     pub listing_availability: Arc<listing_availability::AvailabilityLimiter>,
+    /// Store connectors (Shopify, WooCommerce). `None` unless
+    /// `CONNECTORS_ENABLED` is true: the `/v1/connectors` routes then answer
+    /// `connectors_disabled` and the health body does not mention them.
+    pub connectors: Option<Arc<connectors::ConnectorRuntime>>,
 }
 
 impl AppState {
@@ -203,6 +209,7 @@ impl AppState {
             address_search: None,
             listing_moderation: None,
             listing_availability: Arc::new(listing_availability::AvailabilityLimiter::default()),
+            connectors: None,
         }
     }
 
@@ -272,6 +279,14 @@ impl AppState {
         listing_availability: Arc<listing_availability::AvailabilityLimiter>,
     ) -> Self {
         self.listing_availability = listing_availability;
+        self
+    }
+
+    pub fn with_connectors(
+        mut self,
+        connectors: Option<Arc<connectors::ConnectorRuntime>>,
+    ) -> Self {
+        self.connectors = connectors;
         self
     }
 

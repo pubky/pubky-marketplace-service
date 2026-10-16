@@ -38,6 +38,18 @@ another of these transactions holds. `listing_deletion_test.rs` runs each
 path above against a `drop.sync` over the same two listings, with the
 higher listing first in line order.
 
+## Listing, then its variant rows
+
+A transaction that moves stock locks the listing row first and then the
+listing's `listing_variant_inventory` rows (`variant_stock::lock_rows` does
+both, so a caller that skipped the first lock still takes it). The roll-up
+trigger rewrites the listing row after every variant-row change, so a path that
+locked a variant row before the listing would wait for a listing a concurrent
+path holds while it waits for that path's variant row. Every path above
+(checkout, hold, release, payment confirmation, reserve, offer accept, award
+expiry, reservation expiry, the Bitcoin re-hold, `inventory.adjust`,
+registration and sync) takes the listing row first.
+
 ## Where a retry is enough
 
 `workers::expire_due_payment_windows` and `expiry::expire_due_reservations`

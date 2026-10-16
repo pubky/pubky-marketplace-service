@@ -1076,6 +1076,58 @@ struct RecordMedia {
 struct RecordVariant {
     #[serde(default)]
     quantity: i64,
+    #[serde(default)]
+    id: Option<Value>,
+    #[serde(default)]
+    enabled: Option<Value>,
+    #[serde(default)]
+    sku: Option<Value>,
+}
+
+impl RecordVariant {
+    fn is_enabled(&self) -> bool {
+        self.enabled.as_ref().and_then(Value::as_bool) == Some(true)
+    }
+
+    fn usable_id(&self) -> Option<&str> {
+        self.id
+            .as_ref()
+            .and_then(Value::as_str)
+            .filter(|id| marketplace_domain::commands::is_valid_entity_id(id))
+    }
+}
+
+/// The record's enabled variants as per-variant stock, in record order.
+/// `None` when two or more variants are enabled but their ids cannot key
+/// separate stock (a missing, malformed or repeated id): such a record
+/// cannot back per-variant inventory and must not silently fall back to one
+/// shared total.
+fn enabled_variant_stock(
+    variants: &[RecordVariant],
+) -> Option<Vec<marketplace_domain::commands::VariantStock>> {
+    let enabled: Vec<&RecordVariant> = variants.iter().filter(|v| v.is_enabled()).collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut stock = Vec::with_capacity(enabled.len());
+    for variant in &enabled {
+        let usable = variant
+            .usable_id()
+            .filter(|id| seen.insert((*id).to_string()));
+        match usable {
+            Some(id) => stock.push(marketplace_domain::commands::VariantStock {
+                id: id.to_string(),
+                sku: variant
+                    .sku
+                    .as_ref()
+                    .and_then(Value::as_str)
+                    .filter(|sku| !sku.is_empty())
+                    .map(str::to_string),
+                quantity: variant.quantity,
+            }),
+            None if enabled.len() >= 2 => return None,
+            None => {}
+        }
+    }
+    Some(stock)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1240,6 +1292,14 @@ pub fn registration_payload_from_record(
     };
     let shipping_minor =
         shipping_minor_from_options(&record.shipping_options, &unit_price.currency);
+    let variants = if sale_format == SaleFormat::FixedPrice {
+        match enabled_variant_stock(&record.variants) {
+            Some(variants) => variants,
+            None => return Ok(None),
+        }
+    } else {
+        Vec::new()
+    };
     let mut fulfillment_methods: Vec<marketplace_domain::commands::FulfillmentMethod> = record
         .fulfillment_methods
         .iter()
@@ -1302,6 +1362,7 @@ pub fn registration_payload_from_record(
         auction_reserve: None,
         fulfillment_methods,
         digital_lock,
+        variants,
     }))
 }
 
@@ -1510,6 +1571,94 @@ mod tests {
                 "unitPrice": { "amountMinor": 6_900, "currency": "USD", "exponent": 2 },
             },
         })
+    }
+
+    #[test]
+    fn derives_the_enabled_variants_with_their_stock_in_record_order() {
+        let seller = "y".repeat(52);
+        let mut record = record_json();
+        record["variants"] = json!([
+            { "id": "size_s", "enabled": true, "quantity": 2, "sku": "SKU-S" },
+            { "id": "size_x", "enabled": false, "quantity": 9 },
+            { "id": "size_m", "enabled": true, "quantity": 0, "sku": null },
+        ]);
+        let payload = registration_payload_from_record(&seller, "l", &record)
+            .expect("record parses")
+            .expect("listing record");
+        assert_eq!(
+            payload.variants,
+            vec![
+                marketplace_domain::commands::VariantStock {
+                    id: "size_s".to_string(),
+                    sku: Some("SKU-S".to_string()),
+                    quantity: 2
+                },
+                marketplace_domain::commands::VariantStock {
+                    id: "size_m".to_string(),
+                    sku: None,
+                    quantity: 0
+                },
+            ]
+        );
+        assert_eq!(
+            payload.quantity, 11,
+            "the registration quantity is still the sum of ALL variants"
+        );
+    }
+
+    #[test]
+    fn several_enabled_variants_without_usable_ids_are_not_interpretable() {
+        let seller = "y".repeat(52);
+        for variants in [
+            json!([{ "enabled": true, "quantity": 1 }, { "id": "b", "enabled": true, "quantity": 1 }]),
+            json!([{ "id": "a", "enabled": true, "quantity": 1 }, { "id": "a", "enabled": true, "quantity": 2 }]),
+            json!([{ "id": "bad id!", "enabled": true, "quantity": 1 }, { "id": "b", "enabled": true, "quantity": 1 }]),
+            json!([{ "id": 7, "enabled": true, "quantity": 1 }, { "id": "b", "enabled": true, "quantity": 1 }]),
+        ] {
+            let mut record = record_json();
+            record["variants"] = variants.clone();
+            assert!(
+                matches!(
+                    registration_payload_from_record(&seller, "l", &record),
+                    Ok(None)
+                ),
+                "{variants}"
+            );
+        }
+    }
+
+    #[test]
+    fn one_enabled_variant_and_an_auction_derive_no_per_variant_stock_to_enforce() {
+        let seller = "y".repeat(52);
+        let mut record = record_json();
+        record["variants"] = json!([{ "enabled": true, "quantity": 4 }]);
+        let payload = registration_payload_from_record(&seller, "l", &record)
+            .expect("record parses")
+            .expect("listing record");
+        assert!(
+            payload.variants.is_empty(),
+            "no usable id, one enabled variant"
+        );
+        assert_eq!(payload.quantity, 4);
+
+        let mut auction = record_json();
+        auction["variants"] = json!([
+            { "id": "a", "enabled": true, "quantity": 1 },
+            { "id": "b", "enabled": true, "quantity": 1 },
+        ]);
+        auction["sale"] = json!({
+            "format": "auction",
+            "startingPrice": { "amountMinor": 4_500, "currency": "USD", "exponent": 2 },
+            "startsAt": "2026-08-19T22:00:00Z",
+            "endsAt": "2026-08-19T23:00:00Z",
+            "minimumIncrement": { "amountMinor": 500, "currency": "USD", "exponent": 2 },
+            "antiSnipingWindowSeconds": 60,
+            "antiSnipingExtensionSeconds": 120,
+        });
+        let payload = registration_payload_from_record(&seller, "l", &auction)
+            .expect("record parses")
+            .expect("auction record");
+        assert!(payload.variants.is_empty(), "an auction sells one unit");
     }
 
     #[test]
