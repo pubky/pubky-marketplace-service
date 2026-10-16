@@ -1204,15 +1204,45 @@ async fn a_stale_variant_mapping_settles_as_an_error_alerts_once_and_is_never_re
         .contains("Re-map"));
 }
 
-async fn variant_rows_table(r: &Rig) {
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS listing_variant_inventory ( \
-            listing_aggregate_id TEXT NOT NULL, variant_id TEXT NOT NULL, \
-            available_quantity BIGINT NOT NULL, PRIMARY KEY (listing_aggregate_id, variant_id))",
+/// Converts the listing to per-variant rows the way migration 0070's tables
+/// hold them: one keyed row per variant replaces the implicit row, and the
+/// listing's committed units stay on the first variant so the roll-up keeps
+/// the listing's totals balanced.
+async fn convert_to_variant_rows(r: &Rig, aggregate: &str, rows: &[(&str, i64)]) {
+    let mut tx = r.app.pool.begin().await.expect("tx");
+    let (reserved, sold): (i64, i64) = sqlx::query_as(
+        "SELECT reserved_quantity, sold_quantity FROM listings WHERE aggregate_id = $1",
     )
-    .execute(&r.app.pool)
+    .bind(aggregate)
+    .fetch_one(&mut *tx)
     .await
-    .expect("variant rows table");
+    .expect("listing");
+    for (index, (variant, available)) in rows.iter().enumerate() {
+        let (held, gone) = if index == 0 { (reserved, sold) } else { (0, 0) };
+        sqlx::query(
+            "INSERT INTO listing_variant_inventory (listing_aggregate_id, variant_id, position, \
+             total_quantity, available_quantity, reserved_quantity, sold_quantity) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(aggregate)
+        .bind(variant)
+        .bind(index as i32)
+        .bind(available + held + gone)
+        .bind(available)
+        .bind(held)
+        .bind(gone)
+        .execute(&mut *tx)
+        .await
+        .expect("variant row");
+    }
+    sqlx::query(
+        "DELETE FROM listing_variant_inventory WHERE listing_aggregate_id = $1 AND variant_id = ''",
+    )
+    .bind(aggregate)
+    .execute(&mut *tx)
+    .await
+    .expect("drop the implicit row");
+    tx.commit().await.expect("commit");
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
@@ -1226,7 +1256,8 @@ async fn the_default_seam_reads_the_variants_own_available_and_refuses_what_it_c
     create_paid_order(&r.app, &seller, &buyer).await;
     two_variant_mapping(&r, &seller, connection, "a").await;
 
-    // Without the service's per-variant rows the listing is skipped, as before.
+    // A listing that has not converted to per-variant rows yet holds only its
+    // implicit row: it is skipped, as before, and the seller gets no alert.
     let (state, outcome) = inventory_event(&r, connection, "evt-skip").await;
     assert_eq!(
         (state.as_str(), outcome.as_deref()),
@@ -1235,13 +1266,8 @@ async fn the_default_seam_reads_the_variants_own_available_and_refuses_what_it_c
     assert!(r.alerts(&seller).await.is_empty());
 
     // With them: the store says 3 and the variant already shows 3, so nothing is sent.
-    variant_rows_table(&r).await;
     let aggregate = format!("listing:{}_boots_01", seller.pubky);
-    sqlx::query("INSERT INTO listing_variant_inventory VALUES ($1, 'a', 3), ($1, 'other', 9)")
-        .bind(&aggregate)
-        .execute(&r.app.pool)
-        .await
-        .expect("rows");
+    convert_to_variant_rows(&r, &aggregate, &[("a", 3), ("other", 9)]).await;
     let (state, outcome) = inventory_event(&r, connection, "evt-same").await;
     assert_eq!(
         (state.as_str(), outcome.as_deref()),
@@ -1278,7 +1304,8 @@ async fn the_default_seam_reads_the_variants_own_available_and_refuses_what_it_c
     // event settles and does not loop.
     two_variant_mapping(&r, &seller, connection, "a").await;
     sqlx::query(
-        "UPDATE listing_variant_inventory SET available_quantity = 1 WHERE variant_id = 'a'",
+        "UPDATE listing_variant_inventory SET available_quantity = available_quantity - 2, \
+         total_quantity = total_quantity - 2 WHERE variant_id = 'a'",
     )
     .execute(&r.app.pool)
     .await

@@ -322,7 +322,10 @@ fn classify_adjust(status: StatusCode, code: &str, delta: i64) -> StockOutcome {
 /// the sum across variants), sent as an `inventory.adjust` addressed to the
 /// Pubky variant id the mapping stores. Reading the variant's `available` is a
 /// query on `listing_variant_inventory`, so a service built without it is
-/// detected (`to_regclass`) and the listing is skipped as before.
+/// detected (`to_regclass`) and the listing is skipped as before. A listing
+/// that has not converted to per-variant rows yet (it holds only the implicit
+/// row) is skipped the same way: its mapping is fine, the service just cannot
+/// address one variant's stock until the conversion runs.
 pub struct ServiceVariantInventory;
 
 #[async_trait]
@@ -352,8 +355,10 @@ impl VariantInventory for ServiceVariantInventory {
             &connection.seller_pubky,
             &mapping.listing_id,
         );
-        let row: Option<(i64, Option<i64>)> = sqlx::query_as(
-            "SELECT l.server_revision, v.available_quantity \
+        let row: Option<(i64, Option<i64>, bool)> = sqlx::query_as(
+            "SELECT l.server_revision, v.available_quantity, \
+                    EXISTS (SELECT 1 FROM listing_variant_inventory k \
+                            WHERE k.listing_aggregate_id = l.aggregate_id AND k.variant_id <> '') \
              FROM listings l \
              LEFT JOIN listing_variant_inventory v \
                     ON v.listing_aggregate_id = l.aggregate_id AND v.variant_id = $2 \
@@ -363,9 +368,12 @@ impl VariantInventory for ServiceVariantInventory {
         .bind(&mapping.variant_id)
         .fetch_optional(&state.pool)
         .await?;
-        let Some((revision, variant_available)) = row else {
+        let Some((revision, variant_available, tracks_variants)) = row else {
             return Ok(StockOutcome::Ignored("listing_not_found"));
         };
+        if !tracks_variants {
+            return Ok(StockOutcome::Ignored("multi_variant_listing"));
+        }
         let Some(variant_available) = variant_available else {
             return Ok(StockOutcome::MappingError("variant_not_found"));
         };
