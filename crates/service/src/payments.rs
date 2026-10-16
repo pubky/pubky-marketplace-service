@@ -1194,7 +1194,7 @@ impl PaykitClient {
     /// outside the contract are `Err(Unavailable)`. Every one of those, and
     /// the `unavailable` answer itself, is logged at warn as
     /// `paykit setup status unavailable` with a `reason` (see
-    /// [`SetupStatusFailure`]). Nothing here ever starts a Paykit authorization
+    /// `SetupStatusFailure`). Nothing here ever starts a Paykit authorization
     /// flow: rc10 says callers "must not convert `unavailable` into a new
     /// authorization flow". A server that predates `accepted_asset` refuses
     /// the USDT body with `400 invalid_request`, which is a non-2xx answer
