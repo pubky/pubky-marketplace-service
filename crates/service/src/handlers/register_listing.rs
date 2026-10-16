@@ -383,8 +383,10 @@ pub(crate) async fn apply_registration(
         )));
     }
 
+    // Nothing left to sell: `reserved` while a buyer's payment still holds
+    // units (they may restock), `sold` once every committed unit is sold.
     let state = if payload.quantity == committed {
-        if committed > 0 {
+        if reserved > 0 {
             "reserved"
         } else {
             "sold"
