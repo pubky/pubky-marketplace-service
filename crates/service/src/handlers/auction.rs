@@ -387,16 +387,29 @@ pub async fn close_locked_auction(
     } else {
         ("available", 0i64)
     };
+    // An auction sells its one unit from the listing's single implicit row.
+    if sold {
+        let rows = crate::variant_stock::lock_rows(tx, &listing.aggregate_id).await?;
+        if crate::variant_stock::tracks_variants(&rows)
+            || !crate::variant_stock::reserve(
+                tx,
+                &listing.aggregate_id,
+                crate::variant_stock::IMPLICIT_VARIANT_ID,
+                quantity_delta,
+            )
+            .await?
+        {
+            return Err(sqlx::Error::RowNotFound);
+        }
+    }
     let updated_listing: ListingRow = sqlx::query_as(&format!(
         "UPDATE listings SET server_revision = server_revision + 1, state = $2, \
-         available_quantity = available_quantity - $3, \
-         reserved_quantity = reserved_quantity + $3, auction = $4, updated_at = $5 \
+         auction = $3, updated_at = $4 \
          WHERE aggregate_id = $1 AND auction->>'status' = 'active' \
          RETURNING {LISTING_COLUMNS}"
     ))
     .bind(&listing.aggregate_id)
     .bind(new_state)
-    .bind(quantity_delta)
     .bind(closed_auction.to_value())
     .bind(now)
     .fetch_one(&mut **tx)

@@ -364,13 +364,17 @@ pub(crate) async fn confirm_order(
                 "An order line's listing is missing.",
             )));
         };
-        if listing.reserved_quantity < quantity {
+        let rows = crate::variant_stock::lock_rows(tx, aggregate_id).await?;
+        let reserved_here = crate::variant_stock::resolve_held(&rows, line["variant_id"].as_str())
+            .ok()
+            .filter(|row| row.reserved_quantity >= quantity);
+        let Some(row) = reserved_here else {
             return Ok(Err(CommandFailure::refused(
                 crate::refusal_audit::RefusalKind::InvalidState,
                 ErrorCode::InvalidState,
                 "The reserved inventory for this order is no longer held.",
             )));
-        }
+        };
         let new_state = if listing.available_quantity > 0 {
             "available"
         } else if listing.reserved_quantity > quantity {
@@ -383,14 +387,19 @@ pub(crate) async fn confirm_order(
             &listing.state,
             new_state
         ));
+        if !crate::variant_stock::confirm_sale(tx, aggregate_id, &row.variant_id, quantity).await? {
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::InvalidState,
+                ErrorCode::InvalidState,
+                "The reserved inventory for this order is no longer held.",
+            )));
+        }
         sqlx::query(
             "UPDATE listings SET server_revision = server_revision + 1, state = $2, \
-             reserved_quantity = reserved_quantity - $3, sold_quantity = sold_quantity + $3, \
-             updated_at = $4 WHERE aggregate_id = $1",
+             updated_at = $3 WHERE aggregate_id = $1",
         )
         .bind(aggregate_id)
         .bind(new_state)
-        .bind(quantity)
         .bind(now)
         .execute(&mut **tx)
         .await?;

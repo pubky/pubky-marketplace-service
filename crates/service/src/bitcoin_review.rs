@@ -1445,24 +1445,51 @@ pub(crate) async fn reacquire_hold(
             .as_str()
             .expect("order line carries its listing aggregate id");
         let quantity = line["quantity"].as_i64().expect("line quantity");
-        let reacquired = sqlx::query(
-            "UPDATE listings SET server_revision = server_revision + 1, \
-             state = CASE WHEN available_quantity = $2 THEN 'reserved' ELSE 'available' END, \
-             available_quantity = available_quantity - $2, \
-             reserved_quantity = reserved_quantity + $2, updated_at = $3 \
-             WHERE aggregate_id = $1 AND available_quantity >= $2 \
-             AND deleted_at IS NULL AND (recreated_at IS NULL OR recreated_at <= $4)",
+        let live: Option<(i64, Option<chrono::DateTime<Utc>>)> = sqlx::query_as(
+            "SELECT available_quantity, recreated_at FROM listings \
+             WHERE aggregate_id = $1 AND deleted_at IS NULL FOR UPDATE",
         )
         .bind(aggregate_id)
-        .bind(quantity)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|e| ResolutionFailure::Internal("listing reacquire".into(), e.to_string()))?;
+        let Some((listing_available, recreated_at)) = live else {
+            return Err(ResolutionFailure::StockUnavailable);
+        };
+        if recreated_at.is_some_and(|recreated| recreated > order.created_at) {
+            return Err(ResolutionFailure::StockUnavailable);
+        }
+        let rows = crate::variant_stock::lock_rows(tx, aggregate_id)
+            .await
+            .map_err(|e| ResolutionFailure::Internal("variant rows".into(), e.to_string()))?;
+        let Ok(row) = crate::variant_stock::resolve_held(&rows, line["variant_id"].as_str()) else {
+            return Err(ResolutionFailure::StockUnavailable);
+        };
+        if row.available_quantity < quantity || !row.enabled {
+            return Err(ResolutionFailure::StockUnavailable);
+        }
+        let variant_id = row.variant_id.clone();
+        let reacquired = crate::variant_stock::reserve(tx, aggregate_id, &variant_id, quantity)
+            .await
+            .map_err(|e| ResolutionFailure::Internal("variant reacquire".into(), e.to_string()))?;
+        if !reacquired {
+            return Err(ResolutionFailure::StockUnavailable);
+        }
+        let state = if listing_available == quantity {
+            "reserved"
+        } else {
+            "available"
+        };
+        sqlx::query(
+            "UPDATE listings SET server_revision = server_revision + 1, state = $2, \
+             updated_at = $3 WHERE aggregate_id = $1",
+        )
+        .bind(aggregate_id)
+        .bind(state)
         .bind(now)
-        .bind(order.created_at)
         .execute(&mut **tx)
         .await
         .map_err(|e| ResolutionFailure::Internal("listing reacquire".into(), e.to_string()))?;
-        if reacquired.rows_affected() != 1 {
-            return Err(ResolutionFailure::StockUnavailable);
-        }
     }
 
     if order.auction_aggregate_id.is_none() {

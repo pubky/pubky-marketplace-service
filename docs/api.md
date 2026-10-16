@@ -458,11 +458,16 @@ another buyer holding this item. It exists because the full listing projection
 }
 ```
 
+- A listing that tracks stock per variant adds `variants`, one entry per
+  offered variant: `{ "variant_id": "size_m", "sold_out": true }`. See
+  [per-variant stock](#per-variant-stock). A listing that sells one variant has
+  no `variants` key.
 - `state` is the listing's stock state, `available`, `reserved` or `sold`. It
   is the same `state` the projection carries. `reserved` means a buyer's
   in-flight payment holds the last units; it returns to `available` when the
   hold lapses or is cancelled.
-- Nothing else is exposed: no quantity, buyer, order, hold deadline or price.
+- Nothing else is exposed: no quantity (a variant is `sold_out` or not), buyer,
+  order, hold deadline or price.
   An auction listing returns its stock state like any other.
 - `404 NOT_FOUND` for an unknown or tombstoned listing (a listing whose seller
   deleted its record).
@@ -779,7 +784,18 @@ Semantics:
   older than the projection is a no-op that returns the current revision. A
   re-sync at the same record revision refreshes derived fields (shipping,
   fulfillment methods, digital lock) and bumps the aggregate revision with a
-  `listing.synced` event.
+  `listing.synced` event. A same-revision re-sync also retries a listing that
+  [cannot convert to per-variant stock yet](#per-variant-stock), recomputes a
+  total that counted a disabled variant's stock, and converts a listing that
+  has become convertible.
+- A result carries `"variant_conversion": { "state": "deferred" | "blocked",
+  "reason": "open_holds" | "unattributable_sales" | "adjusted_total" |
+  "below_committed", "attempts": 2 }` while its listing cannot convert to
+  per-variant stock; the key is absent otherwise. A single `listing.sync`
+  carries the same object in its `result`. The sync itself succeeded (the
+  listing matches its record); `state` is the outcome of the conversion:
+  `deferred` waits for time or the next sync, `blocked` (`below_committed`)
+  needs the seller to republish the record.
 - Failure modes per item: `NOT_FOUND` (record missing, or listing tombstoned
   once the seller's event stream confirms deletion); `UPSTREAM_UNAVAILABLE`
   (503; homeserver unreachable, retry later); `INVALID_STATE` (record cannot be
@@ -823,7 +839,7 @@ Unknown fields are rejected (`422 invalid_request`).
 | `expected_revision` | Integer at least 1: the listing revision you last read. |
 | `delta` | Non-zero integer within +/-1,000,000. |
 | `idempotency_key` | UUID, version 1 through 8, RFC 4122 variant. |
-| `variant` | Optional `{id?, sku?}`. It is an assertion against the listing's sole enabled variant, not a selector. |
+| `variant` | Optional `{id?, sku?}`. On a listing that sells one variant it is an assertion against the sole enabled variant. On a listing that tracks stock per variant it is required and selects the variant row the delta moves (`id` and `sku` must both name that row when both are given). |
 | `external_ref` | Optional `{channel, external_id}`; `channel` matches `^[a-z0-9][a-z0-9._-]{0,31}$`, `external_id` at most 128 chars. |
 
 Success, `200`:
@@ -848,6 +864,26 @@ Success, `200`:
 }
 ```
 
+On a listing that tracks stock per variant the numbers are the addressed
+variant's, `authority` is `variant`, `variant_id` (and `sku`, when the record
+has one) name the row, and `listing_total` carries the listing's sums:
+
+```json
+"stock": {
+  "authority": "variant",
+  "variant_id": "size_m",
+  "sku": "SHIRT-M",
+  "total": 5,
+  "available": 5,
+  "reserved": 0,
+  "sold": 0,
+  "listing_total": { "total": 12, "available": 10, "reserved": 1, "sold": 1 }
+}
+```
+
+`expected_revision` is still the listing's revision, and any stock change on
+any variant advances it.
+
 The emitted event kind is `inventory.adjusted`. Replaying the identical body
 with the same `idempotency_key` returns the stored `200` unchanged. The same
 key with a different body is `409 idempotency_conflict`.
@@ -865,11 +901,12 @@ Errors (inventory envelope):
 | 409 | `external_reference_conflict` | The `external_ref` was already used (reported when it was already recorded and `expected_revision` is stale). |
 | 409 | `variant_record_conflict` | The homeserver record's owner, listing id or revision does not match the registered listing. |
 | 409 | `variant_authority_unsupported` | The homeserver record is unreadable as JSON or does not have exactly one valid enabled variant. |
-| 409 | `variant_assertion_mismatch` | `variant.id` / `variant.sku` does not match the enabled variant. |
+| 409 | `variant_assertion_mismatch` | `variant.id` / `variant.sku` does not match the enabled variant, or on a variant-tracked listing names no variant row (or two different rows). |
+| 409 | `variant_required` | The listing tracks stock per variant and the request names no `variant`. |
 | 503 | `variant_lookup_unavailable` | Homeserver lookup failed; retry. |
 | 409 | `inventory_invariant_violation` | The adjustment would break a stock invariant. |
 | 409 | `stock_overflow` | Total would exceed the maximum. |
-| 409 | `negative_stock` | Available stock would go below zero. |
+| 409 | `negative_stock` | Available stock (of the addressed variant, on a variant-tracked listing) would go below zero. |
 | 429 | `rate_limited` | Inventory limiter; `Retry-After: 1`. |
 | 500 | `internal` | Unexpected failure. |
 
@@ -887,12 +924,116 @@ Errors (inventory envelope):
 }
 ```
 
+A listing that tracks stock per variant adds `variants` (every row, in record
+order, including withdrawn variants with `enabled: false`); `stock` stays the
+listing's sums:
+
+```json
+"variants": [
+  { "variant_id": "size_s", "sku": "SHIRT-S", "enabled": true,
+    "total": 4, "available": 0, "reserved": 0, "sold": 4, "sold_out": true },
+  { "variant_id": "size_m", "enabled": true,
+    "total": 14, "available": 15, "reserved": 3, "sold": 0, "sold_out": false }
+]
+```
+
 Any session holding the inventory capability may read any listing's
 projection; this read is not restricted to the listing's seller. `404
 listing_not_found` for an unknown listing. A sample of both documents is kept
 in `contracts/samples/inventory.json`, and the JSON Schemas are generated from
 the Rust types (`inventory_adjust_schema()` and
 `inventory_projection_schema()` in `crates/service/src/inventory.rs`).
+
+## Per-variant stock
+
+A listing whose record has two or more enabled variants tracks stock per
+variant, so a buyer can never buy a sold-out size while another size has
+stock. A listing with one enabled variant keeps one stock total and behaves as
+it always did. Migration 0070 holds the rows
+([migrations](migrations.md#per-variant-inventory-0070)).
+
+**Registration.** `listing.sync` reads each enabled variant's `id`, `sku` and
+`quantity` from the seller's record (`variants[].enabled == true`; a variant
+with no `enabled: true` is not enabled). `listing.register` takes the same
+list as an optional `payload.variants`, `[{ "id", "quantity", "sku"? }]` in
+record order, omitted from the canonical JSON when empty:
+
+- Two or more entries: one stock row per entry; the listing's quantities are
+  their sums and `payload.quantity` is not used for stock (it stays the sum of
+  all the record's variants, enabled or not).
+- Fewer than two: one implicit row, exactly as before. Its stock is the one
+  enabled variant's quantity when `payload.variants` has one entry (stock of the
+  record's disabled variants is not for sale and is not counted), and
+  `payload.quantity` when it has none. An auction always registers one implicit
+  row.
+- A record with two or more enabled variants whose ids are missing, malformed
+  or repeated cannot be interpreted and does not register.
+- A variant-tracked listing whose payload or record lists no enabled variant
+  keeps its rows as they are (a client that predates variants never withdraws a
+  listing's sizes).
+- A listing registered with a total only (a client that predates variants) is
+  converted to per-variant rows by the next sync whose record lists two or more
+  enabled variants, at the same or a newer revision, when its units sold can be
+  attributed exactly to the record's variants by the variant on each paid
+  order line and none are reserved. At a record revision the listing already
+  holds, the listing's own total is the truth: it converts only while that total
+  is still what the record says (the sum of the enabled variants, or of all
+  variants for a listing registered before disabled stock was left out), so a
+  seller's `inventory.adjust` since the deferral can never be undone or
+  invented; a newer record revision is an edit and is the authority, as for
+  any listing. Otherwise it keeps its shared total and the next sync tries
+  again. While it waits it is marked in `listing_variant_conversion_blocks`
+  with the reason: `open_holds` (units reserved), `unattributable_sales`,
+  `adjusted_total` (the record is unchanged but the seller moved the total; it
+  converts when the total matches the record again or the record is edited) or
+  `below_committed` (the record gives a size fewer units than its sales; the
+  seller republishes). The marker is cleared only by a conversion or when the
+  record stops listing several variants. A `warn` is logged once (target
+  `variant_conversion`, fields `aggregate_id`, `reason`, `enabled_variants`,
+  `reserved_quantity`, `sold_quantity`, `attempts`) and again if the reason
+  changes, and `sync-many` reports `variant_conversion` for it (see
+  [Batch sync](#batch-sync-sync-many)). `scripts/variant-conversion-sweep.sh`
+  lists the marked listings and prints the `sync-many` body that retries them.
+- A listing registered before per-variant stock counted the stock of its
+  record's disabled variants in its total. A sync of its record recomputes the
+  total from the enabled variants, never below the units already reserved or
+  sold: at a newer record revision as for any edit, and at the same revision
+  only while the total is still exactly that old sum (a seller's
+  `inventory.adjust` has moved it otherwise, and stays). An edit that lowers
+  the sum of every variant below the committed units is still refused as before.
+
+**Record edits.** A sync that changes a variant's quantity sets the row's total
+to the record's and its available count to total minus reserved and sold. A
+quantity below the units already reserved or sold of that variant is
+`409 INVARIANT_VIOLATION`, `reason: variant_below_committed`, and changes
+nothing. A variant the record no longer enables keeps its reserved and sold
+units and shows no stock (`enabled: false`); units released from it leave its
+total instead of going back on sale.
+
+**Lines.** `checkout.create` lines, `inventory.reserve` and the accepted offer
+take their units from the variant row they name (`variant_id`). A listing that
+sells one variant ignores the name, as before. On a variant-tracked listing:
+
+| HTTP | `code` | `reason` | When |
+| --- | --- | --- | --- |
+| 422 | `INVALID_COMMAND` | `variant_required` | The line names no variant and more than one is offered. A line with none takes the sole offered variant. |
+| 422 | `INVALID_COMMAND` | `unknown_variant` | The listing has no such variant. |
+| 409 | `INVALID_STATE` | `variant_unavailable` | The seller no longer offers the variant. |
+| 409 | `INVALID_STATE` | `variant_sold_out` | Nothing of the variant is available and nothing is held (checkout). The message is the holding copy instead when another buyer's payment holds the last units. |
+| 409 | `INSUFFICIENT_INVENTORY` | | Fewer than asked are available (checkout, reserve, accept). At a payment hold the same code carries `reason: variant_sold_out`. |
+
+The order line records the variant its units are held on (`variant_id`), and
+every release (payment-window expiry, cancel, void, refund, reservation
+expiry, award expiry) and the sale on payment confirmation use that row. A
+refusal is audited with the existing refusal kinds (`InvalidCommand`,
+`InvalidState`, `InsufficientInventory`); no kind was added.
+
+**Projections.** A listing that tracks stock per variant carries `variants` in
+its listing projection, `[{ "variant_id", "available_quantity", "sold_out" }]`
+for the offered variants in record order; the public availability read carries
+`[{ "variant_id", "sold_out" }]` and no quantity. The inventory projection
+(`GET /v1/inventory/listings/{aggregate_id}`) lists every row. A listing that
+sells one variant has no `variants` key anywhere.
 
 ## Webhooks
 

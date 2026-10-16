@@ -92,7 +92,8 @@ async fn a_buyer_sync_registers_an_unregistered_listing(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    // The client sums ALL variants' quantities, enabled or not: 2 + 3 = 5.
+    // Only the enabled variant's units are for sale: variant_0 is enabled with
+    // 2, variant_1 is disabled with 3.
     homeserver.put_record(&seller.pubky, LISTING_ID, homeserver_record(1, &[2, 3]));
 
     let aggregate_id = format!("listing:{}_{LISTING_ID}", seller.pubky);
@@ -117,8 +118,8 @@ async fn a_buyer_sync_registers_an_unregistered_listing(pool: PgPool) {
     assert_eq!(listing["seller_pubky"], json!(seller.pubky));
     assert_eq!(listing["title"], json!("Winter boots"));
     assert_eq!(listing["listing_revision"], json!(1));
-    assert_eq!(listing["total_quantity"], json!(5));
-    assert_eq!(listing["available_quantity"], json!(5));
+    assert_eq!(listing["total_quantity"], json!(2));
+    assert_eq!(listing["available_quantity"], json!(2));
     assert_eq!(listing["state"], json!("available"));
     assert_eq!(listing["unit_price"]["amount_minor"], json!(12_500));
     // The cheapest PRICEABLE seller-signed option: the $5 flat rate (the
