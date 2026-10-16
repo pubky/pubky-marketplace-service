@@ -39,7 +39,7 @@ pub const LISTING_COLUMNS: &str = "aggregate_id, seller_pubky, listing_id, title
      unit_price_currency, unit_price_exponent, shipping_minor, sale_format, auction, \
      fulfillment_methods, digital_lock_policy_uri, digital_lock_criterion_id, updated_at, \
      digital_delivery_kind, digital_delivery_content_type, digital_delivery_size_bytes, \
-     deleted_at, deleted_event_cursor, recreated_at";
+     deleted_at, deleted_event_cursor, recreated_at, variant_availability";
 
 pub const AUCTION_RESERVE_COLUMNS: &str = "listing_aggregate_id, listing_revision, \
      record_revision, reserve_amount_minor, reserve_currency, reserve_exponent, \

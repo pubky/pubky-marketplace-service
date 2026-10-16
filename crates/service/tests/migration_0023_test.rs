@@ -549,8 +549,9 @@ async fn migration_0023_adds_the_shared_manual_resolution_schema() {
 /// per-order delivery terms 0056, sealed delivery addresses 0057, the purge of
 /// retired Stripe values 0058, listing deletion follower backoff 0059, and
 /// the single Paykit bind 0060, multi-currency FX 0061, and the update-tracking
-/// command kind 0071, and the store connectors 0062 to 0067 (0065 and 0067 are
-/// the Shopify provider's; 0068 to 0070 are claimed by other open branches).
+/// command kind 0071, the store connectors 0062 to 0067 (0065 and 0067 are
+/// the Shopify provider's), and per-variant inventory 0070 (0068 and 0069 are
+/// claimed by other open branches).
 fn sorted_migration_catalog(mut numbers: Vec<u32>) -> Vec<u32> {
     numbers.sort_unstable();
     numbers
@@ -567,15 +568,15 @@ fn migration_catalog_is_gapless_through_0061_then_0071() {
                 .and_then(|prefix| prefix.parse::<u32>().ok())
         })
         .collect();
-    // 0001..=0061 gapless, then the connectors' 0062..=0067, then
-    // the tracking command kind 0071.
+    // 0001..=0061 gapless, then the connectors' 0062..=0067, per-variant
+    // inventory 0070, and the tracking command kind 0071.
     let expected = (1..=61)
-        .chain([62, 63, 64, 65, 66, 67, 71])
+        .chain([62, 63, 64, 65, 66, 67, 70, 71])
         .collect::<Vec<_>>();
     assert_eq!(
         sorted_migration_catalog(numbers),
         expected,
-        "the raw catalog is 0001..=0061, gapless, then 0062..=0067 and 0071"
+        "the raw catalog is 0001..=0061, gapless, then 0062..=0067, 0070 and 0071"
     );
 }
 

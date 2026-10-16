@@ -54,6 +54,7 @@ pub mod result;
 pub mod rotating_keys;
 pub mod seal;
 pub mod seller_terms;
+pub mod variant_stock;
 pub mod workers;
 
 use std::sync::Arc;

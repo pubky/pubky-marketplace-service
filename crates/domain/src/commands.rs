@@ -333,7 +333,30 @@ pub struct RegisterListingPayload {
     /// correlation, so it is never snapshotted onto projected order lines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digital_lock: Option<DigitalLockMetadata>,
+    /// The record's enabled variants with their stock, in record order. Empty
+    /// for a client that predates per-variant stock, which registers the
+    /// listing as one implicit variant holding `quantity`. With two or more
+    /// entries the listing tracks stock per variant and `quantity` is
+    /// ignored (it stays the sum of ALL record variants, enabled or not).
+    /// Serialized only when non-empty so older clients keep byte-identical
+    /// canonical JSON (the idempotency hash input).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub variants: Vec<VariantStock>,
 }
+
+/// One enabled variant of a listing record and the units the seller holds of
+/// it (`variants[].id`, `.sku`, `.quantity` in the owner-signed record).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VariantStock {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sku: Option<String>,
+    pub quantity: i64,
+}
+
+/// Most variants one listing may carry (the reference client's limit).
+pub const MAX_LISTING_VARIANTS: usize = 100;
 
 /// The quantity Shop stores Unlimited digital stock as (digital delivery
 /// design §2 "Stock"). On a listing that ships or offers pickup it would sell
@@ -351,7 +374,11 @@ impl RegisterListingPayload {
     /// digital like any other digital listing, so it is not at the cap with a
     /// physical method.
     pub fn registers_unlimited_cap_with_physical_methods(&self) -> bool {
-        self.quantity == UNLIMITED_STOCK_QUANTITY
+        (self.quantity == UNLIMITED_STOCK_QUANTITY
+            || self
+                .variants
+                .iter()
+                .any(|variant| variant.quantity == UNLIMITED_STOCK_QUANTITY))
             && self.fulfillment_methods.iter().any(|method| {
                 matches!(
                     method,
@@ -420,6 +447,10 @@ pub struct ReleaseDropListingsPayload {}
 pub struct ReserveInventoryPayload {
     pub quantity: i64,
     pub reservation_ttl_seconds: i64,
+    /// The variant to hold. Required on a listing that tracks stock per
+    /// variant, ignored (and accepted) on a listing that sells one variant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant_id: Option<String>,
 }
 
 /// One `name → value` pair of a chosen listing variant, carried as an
@@ -1579,6 +1610,41 @@ pub fn validate_public_listing_payload(
     validate_listing_payload(payload, false)
 }
 
+fn validate_variant_stock(variants: &[VariantStock], issues: &mut Vec<ValidationIssue>) {
+    if variants.len() > MAX_LISTING_VARIANTS {
+        issues.push(issue("payload.variants", "Expected at most 100 variants"));
+        return;
+    }
+    let mut seen = std::collections::HashSet::new();
+    for (index, variant) in variants.iter().enumerate() {
+        if !entity_id_regex().is_match(&variant.id) {
+            issues.push(issue(
+                &format!("payload.variants.{index}.id"),
+                "Expected a path-safe commerce identifier",
+            ));
+        } else if !seen.insert(variant.id.as_str()) {
+            issues.push(issue(
+                &format!("payload.variants.{index}.id"),
+                "Variant ids must be unique",
+            ));
+        }
+        if !(0..=1_000_000).contains(&variant.quantity) {
+            issues.push(issue(
+                &format!("payload.variants.{index}.quantity"),
+                "Expected a quantity between 0 and 1000000",
+            ));
+        }
+        if variant.sku.as_deref().is_some_and(|sku| {
+            sku.is_empty() || sku.len() > 128 || sku.chars().any(char::is_control)
+        }) {
+            issues.push(issue(
+                &format!("payload.variants.{index}.sku"),
+                "Expected a sku of 1 to 128 printable characters",
+            ));
+        }
+    }
+}
+
 fn validate_listing_payload(
     mut payload: RegisterListingPayload,
     require_auction_reserve: bool,
@@ -1615,6 +1681,7 @@ fn validate_listing_payload(
             "Expected a quantity between 1 and 1000000",
         ));
     }
+    validate_variant_stock(&payload.variants, &mut issues);
     validate_positive_money("payload.unit_price", &payload.unit_price, &mut issues);
     if !(0..=MAX_SAFE_INTEGER).contains(&payload.shipping_minor) {
         issues.push(issue(
@@ -1803,6 +1870,14 @@ fn validate_reserve_inventory(
             "payload.reservation_ttl_seconds",
             "Expected a reservation TTL between 60 and 1800 seconds",
         ));
+    }
+    if let Some(variant_id) = &payload.variant_id {
+        if !entity_id_regex().is_match(variant_id) {
+            issues.push(issue(
+                "payload.variant_id",
+                "Expected a path-safe commerce identifier",
+            ));
+        }
     }
     if issues.is_empty() {
         Ok(CommandPayload::ReserveInventory(payload))
@@ -2895,6 +2970,139 @@ mod tests {
         }
         assert!(!with(&[Digital], UNLIMITED_STOCK_QUANTITY)
             .registers_unlimited_cap_with_physical_methods());
+    }
+
+    fn register_with_variants(variants: Value) -> Result<Command, Vec<ValidationIssue>> {
+        let mut command = register_command_json();
+        command["payload"]["variants"] = variants;
+        parse_command(&command)
+    }
+
+    #[test]
+    fn variants_are_carried_in_record_order_and_omitted_when_empty() {
+        let plain = parse_command(&register_command_json()).expect("valid command");
+        let CommandPayload::RegisterListing(plain) = &plain.payload else {
+            panic!("expected register payload");
+        };
+        assert!(plain.variants.is_empty());
+        let serialized = serde_json::to_value(plain).expect("payload serializes");
+        assert!(
+            serialized.get("variants").is_none(),
+            "an empty variant list never reaches the canonical JSON"
+        );
+
+        let command = register_with_variants(json!([
+            { "id": "size_s", "quantity": 0, "sku": "SKU-S" },
+            { "id": "size_m", "quantity": 3 },
+        ]))
+        .expect("valid variants");
+        let CommandPayload::RegisterListing(payload) = &command.payload else {
+            panic!("expected register payload");
+        };
+        assert_eq!(
+            payload.variants,
+            vec![
+                VariantStock {
+                    id: "size_s".to_string(),
+                    sku: Some("SKU-S".to_string()),
+                    quantity: 0
+                },
+                VariantStock {
+                    id: "size_m".to_string(),
+                    sku: None,
+                    quantity: 3
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_variant_stock_is_refused_by_path() {
+        for (variants, path) in [
+            (
+                json!([{ "id": "bad id!", "quantity": 1 }]),
+                "payload.variants.0.id",
+            ),
+            (
+                json!([{ "id": "a", "quantity": 1 }, { "id": "a", "quantity": 2 }]),
+                "payload.variants.1.id",
+            ),
+            (
+                json!([{ "id": "a", "quantity": -1 }]),
+                "payload.variants.0.quantity",
+            ),
+            (
+                json!([{ "id": "a", "quantity": 1_000_001 }]),
+                "payload.variants.0.quantity",
+            ),
+            (
+                json!([{ "id": "a", "quantity": 1, "sku": "" }]),
+                "payload.variants.0.sku",
+            ),
+        ] {
+            let issues = register_with_variants(variants).expect_err(path);
+            assert!(
+                issues.iter().any(|issue| issue.path == path),
+                "{path}: {issues:?}"
+            );
+        }
+        let too_many: Vec<Value> = (0..=MAX_LISTING_VARIANTS)
+            .map(|index| json!({ "id": format!("v{index}"), "quantity": 1 }))
+            .collect();
+        let issues = register_with_variants(json!(too_many)).expect_err("101 variants");
+        assert!(issues.iter().any(|issue| issue.path == "payload.variants"));
+        let mut unknown = register_command_json();
+        unknown["payload"]["variants"] = json!([{ "id": "a", "quantity": 1, "price": 5 }]);
+        assert!(
+            parse_command(&unknown).is_err(),
+            "unknown variant fields are refused"
+        );
+    }
+
+    #[test]
+    fn a_variant_at_the_unlimited_cap_makes_a_physical_listing_unregisterable() {
+        let mut command = register_command_json();
+        command["payload"]["variants"] = json!([
+            { "id": "a", "quantity": UNLIMITED_STOCK_QUANTITY },
+            { "id": "b", "quantity": 0 },
+        ]);
+        let command = parse_command(&command).expect("valid command");
+        let CommandPayload::RegisterListing(payload) = &command.payload else {
+            panic!("expected register payload");
+        };
+        assert!(payload.registers_unlimited_cap_with_physical_methods());
+    }
+
+    #[test]
+    fn a_reserve_names_its_variant_only_when_it_has_one() {
+        let reserve = |variant: Option<Value>| {
+            let mut payload = json!({ "quantity": 1, "reservation_ttl_seconds": 600 });
+            if let Some(variant) = variant {
+                payload["variant_id"] = variant;
+            }
+            let mut command = register_command_json();
+            command["kind"] = json!("inventory.reserve");
+            command["payload"] = payload;
+            parse_command(&command)
+        };
+        let plain = reserve(None).expect("valid reserve");
+        let CommandPayload::ReserveInventory(plain) = &plain.payload else {
+            panic!("expected reserve payload");
+        };
+        assert_eq!(plain.variant_id, None);
+        assert!(serde_json::to_value(plain)
+            .unwrap()
+            .get("variant_id")
+            .is_none());
+        let named = reserve(Some(json!("size_m"))).expect("valid reserve");
+        let CommandPayload::ReserveInventory(named) = &named.payload else {
+            panic!("expected reserve payload");
+        };
+        assert_eq!(named.variant_id.as_deref(), Some("size_m"));
+        let issues = reserve(Some(json!("not valid!"))).expect_err("malformed variant");
+        assert!(issues
+            .iter()
+            .any(|issue| issue.path == "payload.variant_id"));
     }
 
     #[test]

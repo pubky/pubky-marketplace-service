@@ -257,7 +257,7 @@ fn migration_catalog_is_contiguous_through_0061_then_0071() {
     assert_eq!(
         numbers,
         (1..=61)
-            .chain([62, 63, 64, 65, 66, 67, 71])
+            .chain([62, 63, 64, 65, 66, 67, 70, 71])
             .collect::<Vec<_>>()
     );
 }
