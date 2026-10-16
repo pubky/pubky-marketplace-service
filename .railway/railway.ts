@@ -15,7 +15,8 @@ const PRODUCTION_ENVIRONMENT_ID = "404919ad-fb95-4621-9f45-b7f993dfa8ae";
 // constant in the same PR as the IMAGE connect for that seat.
 const LIVE_IMAGE =
   "ghcr.io/bitcoinerrorlog/pubky-marketplace-service@sha256:bd5466011f2bd520b1f310ce4c1416d7de98b1b9382068ebf6bb6f1ea46c887c";
-const STAGING_IMAGE = LIVE_IMAGE;
+const STAGING_IMAGE =
+  "ghcr.io/pubky/pubky-marketplace-service@sha256:58cd50bfccf96d96d0577ee0fac65fd60a513fa28026245c80b11d36a8196e43";
 const PRODUCTION_IMAGE = LIVE_IMAGE;
 
 const sharedDeploy = {
@@ -103,10 +104,20 @@ const stagingPaypalSandboxEnv = {
   PAYPAL_IPN_VERIFY_URL: "https://ipnpb.sandbox.paypal.com/cgi-bin/webscr",
 };
 
+const stagingOnlyEnv = {
+  CONNECTOR_PUBLIC_BASE_URL: preserve(),
+  CONNECTORS_ENABLED: preserve(),
+  LISTING_AVAILABILITY_CLIENT_IP_HEADER: preserve(),
+  MARKETPLACE_GRANT_SESSION_ENABLED: preserve(),
+  PAYKIT_SERVER_API: preserve(),
+  REQUIRE_ENCRYPTED_DELIVERY_ADDRESS: preserve(),
+};
+
 const stagingEnv = {
   ...sharedEnv,
   ...grantAndGatewayEnv,
   ...stagingPaypalSandboxEnv,
+  ...stagingOnlyEnv,
   AUTH_SESSION_TTL_SECONDS: preserve(),
 };
 
@@ -157,7 +168,19 @@ export default defineRailway((ctx) => {
     domains: isStaging ? ["staging-api.pubky.app"] : [],
   });
 
+  // Staging only. The binary exits while CONNECTORS_ENABLED is off, so
+  // production declares no worker until it turns connectors on. Every variable
+  // is preserved: the live worker holds `${{marketplace-service.NAME}}`
+  // references to the service's variables, and an apply must not rewrite them.
+  const connector_worker = isStaging
+    ? service("connector-worker", {
+        source: image(STAGING_IMAGE),
+        deploy: { startCommand: "connector-worker" },
+        env: Object.fromEntries(Object.keys(stagingEnv).map((name) => [name, preserve()])),
+      })
+    : undefined;
+
   return project(isStaging ? "pubky-marketplace-staging" : "pubky-marketplace-production", {
-    resources: [marketplace_service],
+    resources: connector_worker ? [marketplace_service, connector_worker] : [marketplace_service],
   });
 });
