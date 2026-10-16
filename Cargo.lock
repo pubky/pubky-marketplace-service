@@ -1795,6 +1795,7 @@ name = "marketplace-service"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "base32",
  "base64 0.22.1",
@@ -1821,6 +1822,7 @@ dependencies = [
  "sha3",
  "sqlx",
  "subtle",
+ "thiserror",
  "tokio",
  "tower",
  "tower-http",

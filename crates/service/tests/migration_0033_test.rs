@@ -86,7 +86,10 @@ async fn migration_0032_applies_after_already_applied_0033(pool: PgPool) {
             .fetch_all(&pool)
             .await
             .expect("final migration versions");
-    assert_eq!(finally_applied, (1..=61).chain([71]).collect::<Vec<_>>());
+    assert_eq!(
+        finally_applied,
+        (1..=61).chain([62, 63, 64, 66, 71]).collect::<Vec<_>>()
+    );
 }
 
 fn aggregate_id(seller: &str, listing_id: &str) -> String {

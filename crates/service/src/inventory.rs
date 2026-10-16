@@ -554,6 +554,21 @@ pub async fn adjust_inventory(
     Extension(session): Extension<AuthSession>,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
+    adjust_inventory_for(&state, &session, body, true).await
+}
+
+/// The adjustment, for an authenticated session or for an in-process caller
+/// acting as the seller (the connector worker). `enforce_rate_limit` is false
+/// only for that caller: the per-session bucket is keyed to a stored bearer
+/// session, which an in-process caller does not have, and the worker is
+/// already paced by its own queue and backoff. Every other check, the
+/// idempotency table and the revision rule are the same.
+pub async fn adjust_inventory_for(
+    state: &AppState,
+    session: &AuthSession,
+    body: Result<Bytes, BytesRejection>,
+    enforce_rate_limit: bool,
+) -> Response {
     if !session.covers_inventory_service() {
         return capability_error();
     }
@@ -575,8 +590,7 @@ pub async fn adjust_inventory(
         Err(_) => return internal_error(),
     };
 
-    let stored = match classify_stored_adjustment(&mut tx, &session, &request, preflight_now).await
-    {
+    let stored = match classify_stored_adjustment(&mut tx, session, &request, preflight_now).await {
         Ok(stored) => stored,
         Err(_) => return internal_error(),
     };
@@ -604,62 +618,60 @@ pub async fn adjust_inventory(
     // the idempotency advisory lock. For a new variant-addressed request it
     // closes before remote I/O; after validation, the mutation transaction
     // re-acquires the same lock and reclassifies to close the concurrency gap.
-    let (variant_binding, rate_consumed, mutation_now) =
-        if let Some(assertion) = &request.wire.variant {
-            let rate_allowed =
-                match consume_rate(&mut tx, &session, "inventory.adjust", preflight_now, config)
-                    .await
-                {
-                    Ok(allowed) => allowed,
-                    Err(_) => return internal_error(),
-                };
-            if !rate_allowed {
-                return finish_without_mutation(tx, rate_limited("inventory.adjust")).await;
-            }
-            if tx.commit().await.is_err() {
-                return internal_error();
-            }
-            let binding = match validate_variant_assertion(
-                &state,
-                &session.actor.0,
-                &request.wire.listing_id,
-                assertion,
-            )
-            .await
-            {
-                Ok(binding) => binding,
-                Err(response) => return response,
-            };
-            // Remote lookup latency must not stale mutation, event, result, or
-            // external-reference timestamps.
-            let mutation_now = state.clock.now();
-            let mut mutation_tx = match state.pool.begin().await {
-                Ok(tx) => tx,
+    let (variant_binding, rate_consumed, mutation_now) = if let Some(assertion) =
+        &request.wire.variant
+    {
+        let rate_allowed = if enforce_rate_limit {
+            match consume_rate(&mut tx, session, "inventory.adjust", preflight_now, config).await {
+                Ok(allowed) => allowed,
                 Err(_) => return internal_error(),
-            };
-            let stored = match classify_stored_adjustment(
-                &mut mutation_tx,
-                &session,
-                &request,
-                mutation_now,
-            )
-            .await
+            }
+        } else {
+            true
+        };
+        if !rate_allowed {
+            return finish_without_mutation(tx, rate_limited("inventory.adjust")).await;
+        }
+        if tx.commit().await.is_err() {
+            return internal_error();
+        }
+        let binding = match validate_variant_assertion(
+            state,
+            &session.actor.0,
+            &request.wire.listing_id,
+            assertion,
+        )
+        .await
+        {
+            Ok(binding) => binding,
+            Err(response) => return response,
+        };
+        // Remote lookup latency must not stale mutation, event, result, or
+        // external-reference timestamps.
+        let mutation_now = state.clock.now();
+        let mut mutation_tx = match state.pool.begin().await {
+            Ok(tx) => tx,
+            Err(_) => return internal_error(),
+        };
+        let stored =
+            match classify_stored_adjustment(&mut mutation_tx, session, &request, mutation_now)
+                .await
             {
                 Ok(stored) => stored,
                 Err(_) => return internal_error(),
             };
-            tx = match continue_or_finish_stored(mutation_tx, stored).await {
-                Ok(tx) => tx,
-                Err(response) => return response,
-            };
-            (Some(binding), true, mutation_now)
-        } else {
-            (None, false, preflight_now)
+        tx = match continue_or_finish_stored(mutation_tx, stored).await {
+            Ok(tx) => tx,
+            Err(response) => return response,
         };
+        (Some(binding), true, mutation_now)
+    } else {
+        (None, false, preflight_now)
+    };
 
-    if !rate_consumed {
+    if enforce_rate_limit && !rate_consumed {
         let rate_allowed =
-            match consume_rate(&mut tx, &session, "inventory.adjust", mutation_now, config).await {
+            match consume_rate(&mut tx, session, "inventory.adjust", mutation_now, config).await {
                 Ok(allowed) => allowed,
                 Err(_) => return internal_error(),
             };

@@ -254,5 +254,8 @@ fn migration_catalog_is_contiguous_through_0061_then_0071() {
         })
         .collect();
     numbers.sort_unstable();
-    assert_eq!(numbers, (1..=61).chain([71]).collect::<Vec<_>>());
+    assert_eq!(
+        numbers,
+        (1..=61).chain([62, 63, 64, 66, 71]).collect::<Vec<_>>()
+    );
 }

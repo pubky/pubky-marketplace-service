@@ -31,6 +31,7 @@ Contents:
 - [Batch sync (`sync-many`)](#batch-sync-sync-many)
 - [Inventory](#inventory)
 - [Webhooks](#webhooks)
+- [Store connectors](#store-connectors)
 - [Operational endpoints](#operational-endpoints)
 - [Grant-flow routes (Shop BFF)](#grant-flow-routes-shop-bff)
 - [OpenAPI](#openapi)
@@ -95,6 +96,12 @@ and write. "Automation" means the inventory capability plus the
 | POST | `/v1/auth/grant-flows/{flow_id}/result-ticket` | Grant-flow (Shop BFF). |
 | POST | `/v1/auth/grant-flows/{flow_id}/claim` | Grant-flow (Shop BFF). |
 | GET | `/v0/sellers/{pubky}/payment-config` | Public payment configuration of a seller. |
+| GET | `/v0/sellers/{pubky}/connector-status` | The stores a buyer may share an address with and each store's recipient public key. Public; answers an empty list while connectors are off. See [Store connectors](#store-connectors). |
+| POST | `/v1/connectors/webhooks/woocommerce` | WooCommerce store webhook. Authenticity is the store's own signature. See [Store connectors](#store-connectors). |
+| POST | `/v1/connectors/shopify/c/{connection_id}/webhooks` | Webhook from a merchant's own Shopify app, including the privacy topics; verified with that connection's app secret. |
+| GET | `/v1/connectors/shopify/c/{connection_id}/launch` | The connection's App URL: verified with its app secret, then redirects to authorize. |
+| GET | `/v1/connectors/shopify/c/{connection_id}/oauth/callback` | The connection's OAuth callback. |
+| POST | `/v1/connectors/woocommerce/oauth/callback` | WooCommerce's key callback, `user_id` is the draft's nonce. |
 | GET | `/v0/drops/{seller_pubky}/{drop_id}` | Public drop read. |
 | GET | `/v0/listings/{seller_pubky}/{listing_id}/availability` | Stock state of one listing, state only. See [Public listing availability](#public-listing-availability). |
 | POST | `/v0/address/suggest` | Address autocomplete. |
@@ -133,6 +140,16 @@ and write. "Automation" means the inventory capability plus the
 | POST | `/v0/orders/{id}/fiat/confirm-received` |
 | POST | `/v0/orders/{id}/confirm-bitcoin-payment` |
 | POST | `/v0/orders/{id}/bitcoin/resolve` |
+| GET, POST | `/v1/connectors` |
+| GET | `/v1/connectors/alerts` |
+| POST | `/v1/connectors/alerts/{id}/resolve` |
+| DELETE | `/v1/connectors/{id}` |
+| GET | `/v1/connectors/{id}/catalog` |
+| PUT | `/v1/connectors/{id}/credentials` |
+| GET, PUT | `/v1/connectors/{id}/mappings` |
+| GET, PUT | `/v1/connectors/{id}/selection` |
+| GET | `/v1/connectors/{id}/pushes` |
+| POST | `/v1/connectors/{id}/pushes/{order}/retry` |
 
 These are the buyer and seller application routes. Authorization on them is
 per resource (participants only) and per command (keyed on the session's
@@ -1051,6 +1068,63 @@ event id `018f47d2-6a27-7c23-a49d-6b21bb770120` and body `{"ok":true}` produce
 reference verifier, `verify_webhook` in `crates/service/src/automation.rs`,
 returns `Malformed`, `Stale`, `WrongKey` or `InvalidSignature` for the failure
 cases above.
+
+## Store connectors
+
+Off unless `CONNECTORS_ENABLED=true`: every `/v1/connectors` route then
+answers `404 connectors_disabled` and `/health` carries no `connectors` key.
+The seller routes take the same session bearer as the other seller routes and
+act only on the session's own connections (another seller's id answers like an
+unknown one, `404 connection_not_found`). The provider routes are public and
+authenticated by the provider's signature or the single-use connect state.
+Credentials and app secrets are never returned and never logged. The full contract, with JSON
+shapes and error codes, is `connector-contract.md` in the commerce
+integrations workstream; the behaviour is described in
+`crates/service/src/connectors/`.
+
+A Shopify store is connected through an app the merchant creates in their own
+Shopify account. `POST /v1/connectors` creates a **draft connection** (random
+id, 24 hours to live) and returns the connection's own URLs (launch, OAuth
+callback, webhooks) under `/v1/connectors/shopify/c/{connection_id}/`, built
+from `CONNECTOR_PUBLIC_BASE_URL`. The merchant pastes the app's client id and
+secret, which `PUT /v1/connectors/{id}/credentials` seals per connection
+(associated data `connector-cred|v1|{seller}|shopify|{shop}|{connection_id}`);
+that connection's launch, OAuth and webhook signatures are verified with that
+secret only. After a disconnect or an uninstall the secret is kept for up to
+30 days (or until `shop/redact` is handled) so Shopify's privacy webhooks can
+still be verified, and deleted at once for a draft that never installed. No
+Shopify values live in the environment.
+
+Environment names: `CONNECTORS_ENABLED`, `CONNECTOR_PUBLIC_BASE_URL`,
+`CONNECTOR_RETURN_URL`, `CONNECTOR_CREDENTIAL_ENCRYPTION_KEY`,
+`CONNECTOR_CREDENTIAL_ENCRYPTION_KEY_PREVIOUS`, and the tuning values
+`CONNECTOR_PUSH_LEASE_SECONDS`, `CONNECTOR_PROVIDER_TIMEOUT_SECONDS`,
+`CONNECTOR_MAX_ATTEMPTS`, `CONNECTOR_BACKOFF_BASE_SECONDS`,
+`CONNECTOR_BACKOFF_MAX_SECONDS`, `CONNECTOR_STOCK_POLL_SECONDS`,
+`CONNECTOR_WORKER_TICK_MILLIS`. `SHOPIFY_PUBLIC_APP_CLIENT_ID` and
+`SHOPIFY_PUBLIC_APP_CLIENT_SECRET` are reserved for Pubky's own public app and
+are not read yet. The worker is the `connector-worker` binary of the same
+image.
+
+### Mirror leases and the refund difference
+
+Cancel and refund mirrors of one store order run one at a time, across every
+worker replica: a mirror is claimed only when no other mirror of that push is
+`sending` with an unexpired lease. A refund mirror reads the store's refunded
+total and then writes only the difference. The lease must exceed twice the
+provider timeout (`CONNECTOR_PUSH_LEASE_SECONDS` against
+`CONNECTOR_PROVIDER_TIMEOUT_SECONDS`, enforced at start-up in
+`connectors/config.rs`), because a refund mirror makes two timed provider
+calls, so a live worker cannot outlive its lease. After a crash a successor
+claims the order only once the lease has lapsed, and re-reads the store's
+refunded total before it writes; a refund that reached the store before the
+crash is then seen and not written again. Shopify also dedupes on the
+`@idempotent` key of `refundCreate`. WooCommerce has no idempotency key, so its
+residual is a store that applies a refund more than the lease minus the
+timeout after our client gave up on the call: that refund is not in the total
+the successor read, and the difference is written a second time. The window is
+bounded by the configured lease; the defaults are 300 seconds against a 30
+second timeout.
 
 ## Operational endpoints
 
