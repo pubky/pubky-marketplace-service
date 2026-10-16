@@ -1,0 +1,30 @@
+{
+  "captured_from": {
+    "shop_repo": "pubky/pubky-marketplace",
+    "shop_sha": "deb3c7f71b8b915bc960b3a799bf2af286062ff0",
+    "module": "src/libs/commerce/delivery-envelope.ts (sealDeliveryAddressForSellers, openDeliveryAddress)",
+    "context": "pubky-marketplace/delivery-address/v1",
+    "notes": [
+      "Produced by the Shop module itself, then opened by the Shop module (round trip) before this file was written.",
+      "The recipient key is a throwaway generated for this fixture; it protects nothing and exists only so tooling can open the envelope."
+    ]
+  },
+  "binding": {
+    "checkout_command_id": "3f1d2c4b-5a6e-4f70-8a91-0b2c3d4e5f60",
+    "buyer_pubky": "8bf1cctd9x9ryhrdie68np7ymsjr6i8nos7ffuyyb5io7ec5odoo",
+    "seller_pubky": "tgwkqz6s6gd8yr1u9m4y7smnc9bo68bu7jr5rjzz4hag7k91wwzo",
+    "key_id": "4f4bdf3ef4ec160790484fab97de60b1"
+  },
+  "recipient_private_key_b64url": "UIGekGa5yI1FOlbdNVl-i-h5ZlsdkOv5PygVHB5zmBs",
+  "recipient_public_key_b64url": "Vgu5YaDZ-82cRXTVf8yeSPDRlR8h9igOaS-z3iCj_U4",
+  "envelope": "fdwIvflfdjLkoFHrfpJYkCRV1cN5NflnC_fp0aA28UiPA6K3vakTlI3xd_RX8EwlKbtex0OJ6JgthjcQHOY8Z1aWLLxqOpovpAfeux9Cly-fGb0_jrPbbFRgLpSgmzn9Egip1Nmeg6zFO77ex06pUXye0tSm54x4p7wP_iokvKDbCziNv922zpp0TYeL4KYEoPdIIWxhObm6Ffuj8zVtRffrWYOh2FM6A7maMtEOG79F2ZXFKy75-0CPXxKUuAgQKSw-_5J1HuWcP0sFyI3Gc3xrhJhtTJggJIRHXP-lZvqSFDTVGRN3PXa0hG4qzJo0gLUquc8guBr5MwpfwjCu1xSYJLW0kG-oh2yeK3RUUL_8h_vnrJKLrJzS14-npjr7ieXV9hrvTkb-fyx0ZE7hVJVgVhVFBUsd1JeXacu4vSxGarWNk6tJSpMiKRc5dRL1yLSHbsMobHa2XwTtsTsTXdbHrklCayJnCKtjftbhujdKG145JttStR-z92z11kolGPKqgguV5F8dn6yi7qhmDW7XZvBfOd0wdRB0W0KDDFxvbrlHs_evHTntCcbt-OTx93zDetDYym9bdguiKTWB7arzKbI6EJ540s3W02rJSkHfe_kZzIO8edYKFCVj92MXzzqqkr1O7DsYzSBDuj1Hagejvyfqk5M6uC86F1pkFkHmWaVHHqG7Yf_U_RzucG8dY6hwQmdAsXcEU8huuBMbzokLGPtyJNogu4y-5vEY9Hve-Ak3K2_St7RyWsqMchIGb-mbA5TM_bbUQo_AEsyRzN3_VsFFlQIjkZ7tbph8m4KxKRbvOAbWwstiDJvHuqOBCiCkxSAWYh1bEqST9NxWCdfUfN0ej8zaxiAYuL5SLlQcqC-jWROYt_3H6PIDsnVYz-gk0QEofjxm13xtZcgn8_EOrb0rcoiAood6rrMZxsIGWFcn-z4lQaUYyg_dlBrNsOJXsOwi7fpTV_IFlvH00wRc8LhyA8w4SNMOkLVx7TGG6GZD0zvsw94XfxAOxBMMwg7pl7gFe9cxRJ0F6WJIfoD67OQOAlziQPmO-KPlrUOEPUgVfr6hP5dkjv3VWA_tYdkVGJjjtcrJNu6LgjinrkhQ2rzFmJUNibwdRbwmiXeSGchQFSaJSbikcNeVm7xDwWn00aGcXDJdEKiC7bjbHM5rwT725I6hwVF13YU8NU6084xKILOcA_C4ciUoEH7sjyndKqH9l045Y8eyzwwLctvleeq0OauMljK6Hxjs6_MghR96N180BRkaF3hzplQm03PvencAxRlFz_PLQLXLM_36kWSKqDBondcHeRHUcDSLLMsQKDjJPBz9ZeXANoPUG-sz-g7UjJVeTxYG5bW3GTlFC5zoMmO5R7dT4a4J8m-B6MurMNm-nJkeYAA-0gJ8Of1RnWVTmq3LBBPslWYQgj5u6B9IMypfGRo8Fxu41MRxtOtAKagI__47Y2HRIw3xhGs9dSW84S4sLF1p5C_ikuwOoi97lM80z1kmuWYlioqh19pgIS0VgO8V5bmr8SyewOpnH34Hv_Hx3pGlBGCC1HQxTHr8cj96oaQoFSzD-V7hdc5b_DBjwpVZUuuTLqFLG6oUP-ryhaQVHf97Clb7ak7yxzG3M3zNwvrd-0io_ytxToN36_eDCwmE_iFEov6ceEPreqmqmIokqlocj7co3gRIH2mtM6dd4oOUzDmk1Y8QOs9XI2ZbNoSVO7G6lG-H3BdI6UShNFZgGAw_YtQ3EM5iecxGCT5gtAHgBGxOkgH3KE-VlRAU9HLb-0x_1wXeQPUE5KZ9bJQLUVnoeI5Sdno52bOvWPf4pYlBjHusi7qE0t4q3N_bxMlsdchNiRzGrraUMPWRKZVO0sWj5iR_uSaDiPWp1st09CvDKP0j5ZVTaUUYw7AGujYNQD9DXPUMZ7FUS-n6QwWYiI3rUN-T8dbU1VWj60WVUgbnObcxzlUcpZF4jFIcRhDgtyZv14Hlgd-VcM9Praw57eUHYQp8hLejeTS3H0GFoj1smsWoWqIFIQaY1NCGEN85j2wDF0ZAfzRBnqG6VsxZPLQKd39jvvVMwsSIYbxYWAgxZBmFlb6uGktjW4JXIGBqU0rD8UWdGrfgvD_elk4nIyXVaXIKmNeUowDhP7RfTyH4X0oZft4KsRocIDhCk2fx6YdHmsPlzebMv0ezKW-S6mwlMGlPaJF6SwmppiKai70fw2ZTKevhQZukeSjDujU_l2QbUz2IHj2ok-h76flV2CD0LUbJCxKXYgU-p_0JvRs5PT-laBkEnd_c1DU5aaLYTYCWMmTZVbfL4uFFWcVC1QkNCIaaWfwMdqIFB8Ul3T9mU7v-XREKVWxF0NWkBEVVEuTC2rpcRv6jMFUs0-1ctHMK-Zd2cNkbZJ-knlDRZ_5x__OKvR5mJ7WP2RXmn0mS35Qy4QHdUg2fqZN_b00zSkFG4K36FKfAtq1w-hPhO-rLmj3VKUblpM411ovwPimMRgU8Vkc8pd9R-TTzvoP47cSx7W1DlxBll9X2GcazZO79W9sQtlI4IAa0uyIrxUB5tgdbLi0pfrk6PaXQrA3117aeKOj6XLmtjI3xDcSO2uCnAhOH3z-2qkcppizm6Ei5k9TaY28iuj2yRlNUrG-AD8_lpf2lmPPiyURA4bY3BlCL0VOAh3pMbMYOrWHiSKvjqnLK45D03YnqxTQnxRZBDCprCfzoepTyCZ90ca70ugtzFGvbKL_Y_6p3MXQXZQGWYvFDY3QnXI3EfxFzOtW12QEZNF3cHL6hfZomj4YEIVOvaZPioPY",
+  "address": {
+    "name": "Alice Buyer",
+    "line1": "1 Market Street",
+    "line2": "",
+    "city": "San Francisco",
+    "region": "CA",
+    "postal_code": "94105",
+    "country_code": "US"
+  }
+}
