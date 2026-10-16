@@ -6,7 +6,7 @@ const STAGING_PROJECT_ID = "c991d768-4a3c-42ea-b5ed-eaa22d4916ed";
 const STAGING_ENVIRONMENT_ID = "c67a6435-bb23-453b-9169-764bfa0312e1";
 // `image()` takes a string only. Bump in the same PR as every staging IMAGE connect.
 const STAGING_IMAGE =
-  "ghcr.io/bitcoinerrorlog/pubky-marketplace-service@sha256:bd5466011f2bd520b1f310ce4c1416d7de98b1b9382068ebf6bb6f1ea46c887c";
+  "ghcr.io/pubky/pubky-marketplace-service@sha256:58cd50bfccf96d96d0577ee0fac65fd60a513fa28026245c80b11d36a8196e43";
 
 const stagingEnv = {
   ADDRESS_SEARCH_CLIENT_IP_HEADER: preserve(),
@@ -18,6 +18,8 @@ const stagingEnv = {
   CHECKOUT_HOLD_WINDOW_SECONDS: preserve(),
   CONNECTOR_CREDENTIAL_ENCRYPTION_KEY: preserve(),
   CONNECTOR_CREDENTIAL_ENCRYPTION_KEY_PREVIOUS: preserve(),
+  CONNECTOR_PUBLIC_BASE_URL: preserve(),
+  CONNECTORS_ENABLED: preserve(),
   FIAT_PAYMENT_WINDOW_SECONDS: preserve(),
   DATABASE_URL: preserve(),
   DIGITAL_DELIVERY_ENCRYPTION_KEY: preserve(),
@@ -31,6 +33,7 @@ const stagingEnv = {
   GRANT_RESULT_HMAC_PREVIOUS_ROOT_B64: preserve(),
   GRANT_RESULT_HMAC_ROOT_B64: preserve(),
   HOMESERVER_URL: preserve(),
+  LISTING_AVAILABILITY_CLIENT_IP_HEADER: preserve(),
   LOCKS_BUNDLE_ENCRYPTION_KEY: preserve(),
   LOCKS_LOOKUP_HMAC_KEY: preserve(),
   LOCKS_SERVER_URL: preserve(),
@@ -44,6 +47,7 @@ const stagingEnv = {
   MARKETPLACE_GRANT_REAPER_BATCH_SIZE: preserve(),
   MARKETPLACE_GRANT_RELAY_POLL_MILLISECONDS: preserve(),
   MARKETPLACE_GRANT_RELAY_URL: preserve(),
+  MARKETPLACE_GRANT_SESSION_ENABLED: preserve(),
   MARKETPLACE_GRANT_RESULT_PER_PRINCIPAL_PER_MINUTE: preserve(),
   MARKETPLACE_GRANT_STATUS_PER_FLOW_PER_MINUTE: preserve(),
   MARKETPLACE_GRANT_TERMINAL_RETENTION_SECONDS: preserve(),
@@ -51,6 +55,7 @@ const stagingEnv = {
   MARKETPLACE_GRANT_WORKER_BATCH_SIZE: preserve(),
   PAYKIT_REQUEST_SIGNING_KEY: preserve(),
   PAYKIT_MAX_PREPARE_TTL_SECONDS: preserve(),
+  PAYKIT_SERVER_API: preserve(),
   PAYKIT_SERVER_URL: preserve(),
   // Staging must never take live PayPal money.
   PAYPAL_CHECKOUT_URL: "https://www.sandbox.paypal.com/cgi-bin/webscr",
@@ -70,6 +75,7 @@ const stagingEnv = {
   REFUSAL_AUDIT_REPLICA_EXPIRY_ATTESTED: preserve(),
   REFUSAL_AUDIT_RESIDUAL_RISK_ACCEPTED: preserve(),
   REFUSAL_AUDIT_RETENTION_DATABASE_URL: preserve(),
+  REQUIRE_ENCRYPTED_DELIVERY_ADDRESS: preserve(),
   RUST_LOG: preserve(),
   SANDBOX_PAYMENTS_ENABLED: preserve(),
   SHIPPO_API_BASE: preserve(),
@@ -106,5 +112,18 @@ export default defineRailway((ctx) => {
     domains: ["staging-api.pubky.app"],
   });
 
-  return project("pubky-marketplace-staging", { resources: [marketplace_service] });
+  // Same image and environment as marketplace-service, its own start command.
+  // The binary exits while CONNECTORS_ENABLED is off, so a graph that declares
+  // this service must also have connectors on. Every variable is preserved:
+  // the live worker holds `${{marketplace-service.NAME}}` references to this
+  // service's variables, and an apply must not rewrite them.
+  const connector_worker = service("connector-worker", {
+    source: image(STAGING_IMAGE),
+    deploy: { startCommand: "connector-worker" },
+    env: Object.fromEntries(Object.keys(stagingEnv).map((name) => [name, preserve()])),
+  });
+
+  return project("pubky-marketplace-staging", {
+    resources: [marketplace_service, connector_worker],
+  });
 });
