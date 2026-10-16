@@ -25,6 +25,7 @@ pub mod executor;
 pub mod expiry;
 pub mod fx;
 pub mod grant;
+pub mod grant_session;
 pub mod handlers;
 pub mod homeserver;
 pub mod http;
@@ -143,6 +144,9 @@ pub struct AppState {
     /// Durable Pubky grant-flow runtime. `None` keeps the rollout surface
     /// disabled; no legacy or in-memory fallback is used.
     pub grant: Option<Arc<grant::GrantRuntime>>,
+    /// Marketplace sessions minted from the Shop's sign-in grant. `None`
+    /// (the default) answers `grant_session_unavailable`.
+    pub grant_session: Option<Arc<grant_session::GrantSessionConfig>>,
     /// The address autocomplete proxy (`POST /v0/address/suggest`). `None`
     /// when `ADDRESS_SEARCH_DISABLED` is set or in tests that do not use it:
     /// the route then answers `address_search_unavailable`.
@@ -205,6 +209,7 @@ impl AppState {
             refusal_audit: None,
             refusal_audit_retention_pool: None,
             grant: None,
+            grant_session: None,
             address_search: None,
             listing_moderation: None,
             listing_availability: Arc::new(listing_availability::AvailabilityLimiter::default()),
@@ -291,6 +296,14 @@ impl AppState {
 
     pub fn with_grant(mut self, grant: Option<Arc<grant::GrantRuntime>>) -> Self {
         self.grant = grant;
+        self
+    }
+
+    pub fn with_grant_session(
+        mut self,
+        grant_session: Option<Arc<grant_session::GrantSessionConfig>>,
+    ) -> Self {
+        self.grant_session = grant_session;
         self
     }
 }

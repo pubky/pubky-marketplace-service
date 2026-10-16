@@ -150,6 +150,7 @@ Railway IaC `preserve()`):
 | `EVENT_RETENTION_DAYS` | `30` | seller event feed retention; older cursors answer `410 cursor_expired` |
 | `WEBHOOK_*` | see docs | webhook delivery tuning (`WEBHOOK_MAX_ATTEMPTS` 12, `WEBHOOK_MAX_AGE_HOURS` 24, `WEBHOOK_RETRY_BASE_SECONDS` 5, `WEBHOOK_RETRY_MAX_SECONDS` 3600, `WEBHOOK_MAX_ENDPOINTS_PER_SELLER` 100, and the worker/purge knobs); full list in [`docs/api.md`](docs/api.md#delivery) |
 | `MARKETPLACE_GRANT_*`, `GRANT_FLOW_*`, `GRANT_RESULT_*`, `SHOP_*` | unset | Shop BFF grant-flow configuration (flow disabled unless `MARKETPLACE_GRANT_FLOW_ENABLED`); see [`docs/api.md`](docs/api.md#grant-flow-routes-shop-bff) |
+| `MARKETPLACE_GRANT_SESSION_ENABLED`, `MARKETPLACE_GRANT_SESSION_CLIENT_IDS`, `MARKETPLACE_GRANT_SESSION_MAX_PROOF_AGE_SECONDS` | `false`, unset, `120` | Marketplace sessions minted from the Shop's sign-in grant (needs `PUBLIC_SERVICE_ORIGIN` when enabled); see [`docs/api.md`](docs/api.md#grant-sessions) |
 | `LOCKS_SERVER_URL` | unset | Lock Server base URL; setting it enables Locks verification |
 | `LOCKS_BUNDLE_ENCRYPTION_KEY` | unset | 32-byte hex key encrypting bundle ids at rest (XChaCha20-Poly1305) |
 | `LOCKS_LOOKUP_HMAC_KEY` | unset | 32-byte hex key for the HMAC-SHA256 correlation lookup token; must differ from the encryption key |

@@ -242,6 +242,15 @@ claimed by other branches); sqlx applies pending migrations in version order
 and does not need the numbers to be contiguous, which `migration_0033_test`
 already exercises with a missing 0032.
 
+0072 (grant sessions) creates `grant_session_challenges` with its primary key,
+two CHECKs, and plain indexes on `expires_at` and on `pubky` for unused rows
+(a new, empty table), adds the nullable `auth_sessions.source_grant_id` and
+`source_client_id` columns, and widens the `automation_rate_limits`
+endpoint-class CHECK with `grant_session.mint` as `NOT VALID`. It builds no
+index on an existing table and sets `lock_timeout` like 0050. A binary from
+before 0072 never reads the new table and its session inserts leave the new
+columns NULL.
+
 ## Numbers claimed by open pull requests
 
 `main` has 0001 to 0054 and 0056 to 0059; 0055 is #92, so the catalog is
@@ -254,6 +263,7 @@ assume it is free:
 | --- | --- | --- |
 | 0055 | `0055_user_priv_key_custody_releases.sql` | #92 (`/priv` Phase 4) |
 | 0071 | `0071_update_tracking_command_kind.sql` | optional tracking (`cursor/optional-tracking-85f6`) |
+| 0072 | `0072_grant_sessions.sql` | #137 (grant sessions) |
 
 This table describes unmerged work and goes stale as pull requests land; trust
 `crates/service/migrations/` on `main` over it.
