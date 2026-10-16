@@ -106,8 +106,8 @@ FIXTURE_SELLER = os.environ.get(
     "HOLD_SMOKE_FIXTURE_SELLER", "ka7q4cmabp6amo13bye9q6iwhb4pxuwr9fo37h5ygx4uk9e63tjy"
 )
 FIXTURE_HINT = (
-    "publish the hold-smoke fixtures on the fixture seller (marketplace-service-release skill, "
-    "scripts/hold-smoke-physical-fixtures.mjs for shipping and pickup)"
+    "publish the hold-smoke fixtures on the fixture seller "
+    "(scripts/release/hold-smoke-fixtures.mjs publish for shipping and pickup)"
 )
 PRODUCTION_HOST_MARKERS = (
     "marketplace-service-production-ce23",
