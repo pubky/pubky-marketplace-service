@@ -311,6 +311,16 @@ pub async fn handle(
         Ok(envelopes) => envelopes,
         Err(failure) => return Ok(Err(failure)),
     };
+    let connector_shares = match crate::handlers::connector_share::match_checkout_shares(
+        tx,
+        payload.connector_shares.as_deref(),
+        &shipped_sellers,
+    )
+    .await?
+    {
+        Ok(shares) => shares,
+        Err(failure) => return Ok(Err(failure)),
+    };
 
     // The delivery email is required exactly when a line is email-kind, and
     // refused otherwise, so no client can store an address the order does
@@ -509,6 +519,21 @@ pub async fn handle(
         .bind(sealed.map(|stored| stored.key_id.as_str()))
         .execute(&mut **tx)
         .await?;
+        if let Some(share) = connector_shares.get(seller_pubky).filter(|_| !unshipped) {
+            sqlx::query(
+                "UPDATE orders SET connector_share_domain = $2, \
+                 connector_share_consent_version = $3, connector_share_consented_at = $4, \
+                 connector_address_envelope = $5, connector_key_id = $6 WHERE id = $1",
+            )
+            .bind(order.id)
+            .bind(&share.shop_domain)
+            .bind(&share.consent_version)
+            .bind(now)
+            .bind(&share.envelope)
+            .bind(&share.key_id)
+            .execute(&mut **tx)
+            .await?;
+        }
         // One sealed address per email-kind order, in the order-create
         // transaction; two email-kind sellers each get their own row.
         if *group_method == FulfillmentMethod::Digital && indices.iter().any(is_email_line) {

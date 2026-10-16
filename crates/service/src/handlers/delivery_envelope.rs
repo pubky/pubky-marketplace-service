@@ -208,7 +208,8 @@ pub(crate) fn match_winner_delivery(
 /// Rows one purge tick clears; a larger backlog drains over the next ticks.
 pub const DELIVERY_ADDRESS_PURGE_BATCH: i64 = 500;
 
-/// Clears the delivery address, plaintext or sealed, from orders in a final
+/// Clears the delivery address, plaintext or sealed (including the envelope
+/// shared with a connected store), from orders in a final
 /// state (design §F). The deadline is the final state itself: an order that
 /// ends has no further use for the address, and the buyer's copy lives on
 /// their own device. Revision and `updated_at` stay as they were, so the
@@ -218,11 +219,12 @@ pub async fn purge_final_delivery_addresses<'e>(
 ) -> Result<u64, sqlx::Error> {
     let purged = sqlx::query(
         "UPDATE orders SET delivery_address = NULL, delivery_address_envelope = NULL, \
-         delivery_key_id = NULL \
+         delivery_key_id = NULL, connector_address_envelope = NULL, connector_key_id = NULL \
          WHERE id IN ( \
            SELECT id FROM orders \
            WHERE state IN ('completed', 'cancelled', 'refunded_external', 'closed') \
-             AND (delivery_address IS NOT NULL OR delivery_address_envelope IS NOT NULL) \
+             AND (delivery_address IS NOT NULL OR delivery_address_envelope IS NOT NULL \
+                  OR connector_address_envelope IS NOT NULL) \
            ORDER BY ended_at NULLS FIRST, id \
            LIMIT $1 \
            FOR UPDATE SKIP LOCKED)",

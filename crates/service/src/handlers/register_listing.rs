@@ -436,12 +436,11 @@ pub(crate) async fn apply_registration(
                     current_revision,
                 )));
             }
-            // A fully committed listing reads `reserved` whenever it has any
-            // committed unit (an old rule, kept for listings that sell one
-            // variant as they were); a recompute that clamped to the committed
-            // units reads `reserved` only while a hold is open.
+            // Nothing left to sell: `reserved` while a buyer's payment still
+            // holds units (they may restock), `sold` once every committed unit
+            // is sold.
             let state = if quantity == committed {
-                if (clamped && reserved_now > 0) || (!clamped && committed > 0) {
+                if reserved_now > 0 {
                     "reserved"
                 } else {
                     "sold"
