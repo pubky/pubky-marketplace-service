@@ -1305,10 +1305,143 @@ async fn upstream_bind_holds_inventory_through_latest_activation_window(pool: Pg
         .await
         .expect("activated order");
     assert_eq!(
-        after_activation_hold, original_hold,
-        "activation never rewrites hold"
+        after_activation_hold,
+        payment_deadline
+            + chrono::Duration::seconds(
+                marketplace_service::payment_methods::UPSTREAM_HOLD_CLOCK_SKEW_SECONDS
+            ),
+        "activation shrinks the hold to the request's deadline + skew"
     );
-    assert!(payment_deadline <= original_hold);
+    assert!(after_activation_hold < original_hold);
+}
+
+/// Activates an upstream order and returns its request deadline and hold.
+async fn activate_upstream_order(
+    app: &TestApp,
+    order_id: uuid::Uuid,
+) -> (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>) {
+    let client = app
+        .state
+        .payments
+        .as_ref()
+        .and_then(|payments| payments.paykit.as_ref());
+    drain_outbox(&app.pool, client, app.clock.now(), 30)
+        .await
+        .unwrap();
+    sqlx::query_as("SELECT paykit_expires_at, hold_expires_at FROM orders WHERE id = $1")
+        .bind(order_id)
+        .fetch_one(&app.pool)
+        .await
+        .expect("activated order")
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn upstream_unpaid_order_releases_stock_when_its_request_expires(pool: PgPool) {
+    let (app, paykit) = test_app_with_upstream_paykit(pool.clone()).await;
+    let (_seller, _buyer, order_id, _invoice_id) = bind_upstream_order(&app, &paykit).await;
+    let (deadline, hold) = activate_upstream_order(&app, order_id).await;
+    assert_eq!(
+        hold,
+        deadline
+            + chrono::Duration::seconds(
+                marketplace_service::payment_methods::UPSTREAM_HOLD_CLOCK_SKEW_SECONDS
+            )
+    );
+
+    assert_eq!(
+        expire_due_payment_windows(&app.state, hold - chrono::Duration::seconds(1))
+            .await
+            .unwrap(),
+        0,
+        "the request is still payable inside the skew margin"
+    );
+    assert_eq!(
+        expire_due_payment_windows(&app.state, hold).await.unwrap(),
+        1,
+        "the hold ends one skew margin after the request's deadline"
+    );
+    let (order_state, payment_state, stock_held): (String, String, bool) = sqlx::query_as(
+        "SELECT o.state, p.state, o.stock_held FROM orders o \
+         JOIN payments p ON p.order_id = o.id WHERE o.id = $1",
+    )
+    .bind(order_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(payment_state, "expired");
+    assert_ne!(order_state, "pending_payment");
+    assert!(!stock_held);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn upstream_detected_payment_keeps_bind_hold_and_pays_after_request_deadline(pool: PgPool) {
+    let (app, paykit) = test_app_with_upstream_paykit(pool.clone()).await;
+    let (_seller, _buyer, order_id, invoice_id) = bind_upstream_order(&app, &paykit).await;
+    let (prepare_expires_at, window): (chrono::DateTime<chrono::Utc>, i32) = sqlx::query_as(
+        "SELECT paykit_prepare_expires_at, paykit_payment_window_seconds FROM orders WHERE id = $1",
+    )
+    .bind(order_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let bind_hold = prepare_expires_at
+        + chrono::Duration::seconds(
+            i64::from(window)
+                + marketplace_service::payment_methods::UPSTREAM_HOLD_CLOCK_SKEW_SECONDS,
+        );
+    let (deadline, hold) = activate_upstream_order(&app, order_id).await;
+
+    // Paykit saw the payment before the deadline; it has not confirmed yet.
+    let mut detected = producer_status_fixture();
+    detected["invoice_id"] = json!(invoice_id);
+    detected["payment_deadline"] = json!(deadline.to_rfc3339());
+    detected["payment_state"] = json!("detected");
+    detected["bitcoin"]["confirmations"] = json!(0);
+    detected["outcome"] = Value::Null;
+    detected["resolved_at"] = Value::Null;
+    paykit.set_marketplace_status(invoice_id, detected);
+    poll_now(&app, deadline - chrono::Duration::seconds(1)).await;
+    let (request_state, detected_hold): (String, chrono::DateTime<chrono::Utc>) =
+        sqlx::query_as("SELECT paykit_request_state, hold_expires_at FROM orders WHERE id = $1")
+            .bind(order_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(request_state, "detected");
+    assert_eq!(
+        detected_hold, bind_hold,
+        "a seen payment restores the bind hold, so reads show it"
+    );
+
+    assert_eq!(
+        expire_due_payment_windows(&app.state, hold).await.unwrap(),
+        0,
+        "a seen payment keeps the bind hold past the request's deadline"
+    );
+    assert_eq!(
+        expire_due_payment_windows(&app.state, bind_hold - chrono::Duration::seconds(1))
+            .await
+            .unwrap(),
+        0
+    );
+
+    let mut confirmed = producer_status_fixture();
+    confirmed["invoice_id"] = json!(invoice_id);
+    confirmed["payment_deadline"] = json!(deadline.to_rfc3339());
+    confirmed["outcome"] = Value::Null;
+    confirmed["resolved_at"] = Value::Null;
+    paykit.set_marketplace_status(invoice_id, confirmed);
+    assert_eq!(
+        poll_now(&app, bind_hold - chrono::Duration::seconds(1)).await,
+        1
+    );
+    let payment_state: String =
+        sqlx::query_scalar("SELECT state FROM payments WHERE order_id = $1")
+            .bind(order_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(payment_state, "confirmed");
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
