@@ -6,6 +6,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post, put};
 use axum::{Extension, Json, Router};
 use serde_json::{json, Value};
+use std::sync::OnceLock;
 use std::time::Instant;
 use tower_http::cors::CorsLayer;
 
@@ -380,6 +381,7 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
         "digital_delivery_available": state.digital_delivery_available(),
         "digital_delivery_max_bytes": state.config.digital_delivery_max_bytes,
         "priv_keys_available": state.priv_keys.is_some(),
+        "commit": build_commit(),
         "paykit_rail": {
             "bitcoin_offer_available": bitcoin_offer_available,
             "age_seconds": age_seconds,
@@ -403,6 +405,26 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
         });
     }
     Json(body)
+}
+
+const COMMIT_UNKNOWN: &str = "unknown";
+const COMMIT_SHORT_LEN: usize = 12;
+
+/// Short git SHA of the running build, from the `GIT_COMMIT` env the image
+/// build bakes in. Anything that is not a hex SHA reports `unknown`, so the
+/// public `/health` body can never echo an arbitrary env value.
+fn build_commit() -> &'static str {
+    static COMMIT: OnceLock<String> = OnceLock::new();
+    COMMIT.get_or_init(|| short_commit(std::env::var("GIT_COMMIT").ok().as_deref()))
+}
+
+fn short_commit(raw: Option<&str>) -> String {
+    match raw.map(str::trim) {
+        Some(sha) if sha.len() >= 7 && sha.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            sha[..sha.len().min(COMMIT_SHORT_LEN)].to_ascii_lowercase()
+        }
+        _ => COMMIT_UNKNOWN.to_string(),
+    }
 }
 
 async fn ready(State(state): State<AppState>) -> Response {
@@ -478,6 +500,37 @@ async fn execute_command(
                 })),
             )
                 .into_response()
+        }
+    }
+}
+
+#[cfg(test)]
+mod commit_tests {
+    use super::short_commit;
+
+    #[test]
+    fn full_sha_is_shortened_and_lowercased() {
+        assert_eq!(
+            short_commit(Some("2F844C1084C432D8DD6D7E66C320DCAEEB9EB02E")),
+            "2f844c1084c4"
+        );
+    }
+
+    #[test]
+    fn short_sha_is_kept_and_whitespace_trimmed() {
+        assert_eq!(short_commit(Some(" 2f844c1\n")), "2f844c1");
+    }
+
+    #[test]
+    fn missing_empty_or_non_hex_values_are_unknown() {
+        for raw in [
+            None,
+            Some(""),
+            Some("abc12"),
+            Some("not-a-sha-at-all"),
+            Some("2f844c1 internal-host.example"),
+        ] {
+            assert_eq!(short_commit(raw), "unknown", "{raw:?}");
         }
     }
 }

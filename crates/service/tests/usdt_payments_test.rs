@@ -22,7 +22,8 @@ use uuid::Uuid;
 const ORDER_TOTAL_CENTS: i64 = 13_700;
 const ORDER_TOTAL_MILLIONTHS: i64 = 137_000_000;
 
-const HEALTH_KEYS: [&str; 7] = [
+const HEALTH_KEYS: [&str; 8] = [
+    "commit",
     "digital_delivery_available",
     "digital_delivery_max_bytes",
     "offer_checkout",

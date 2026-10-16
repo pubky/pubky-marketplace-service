@@ -2077,8 +2077,9 @@ commands, exactly as in the engine.
 - `/health` is liveness plus a capability summary; `/ready` answers 503
   when the refusal-audit pipeline is not ready, the database probe fails, or
   buyer delivery emails are past their retention (the purge worker is not
-  running). The service publishes no version endpoint: the running build is the
-  image digest (and its `org.opencontainers.image.revision` label) recorded for
-  the deploy.
+  running). The service publishes no version endpoint. `/health` carries
+  `commit`, the 12-character source SHA from the `GIT_COMMIT` image build arg
+  (`unknown` when unset); the image digest and its
+  `org.opencontainers.image.revision` label remain the authoritative record.
 - The worker runtime runs in-process; every drain is guarded by leases plus
   `FOR UPDATE SKIP LOCKED`, so multiple service instances are safe.
