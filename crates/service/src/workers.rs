@@ -312,17 +312,17 @@ async fn expire_due_award(
         tx.commit().await?;
         return Ok(false);
     };
-    let reservation: Option<(String, i64)> = sqlx::query_as(
+    let reservation: Option<(String, i64, Option<String>)> = sqlx::query_as(
         "UPDATE reservations SET status = 'expired', updated_at = $2 \
          WHERE id = $1 AND status = 'active' AND offer_award_id = $3 \
-         RETURNING listing_aggregate_id, quantity",
+         RETURNING listing_aggregate_id, quantity, variant_id",
     )
     .bind(offer.reservation_id)
     .bind(now)
     .bind(offer.award_id)
     .fetch_optional(&mut *tx)
     .await?;
-    let Some((reservation_listing, reservation_quantity)) = reservation else {
+    let Some((reservation_listing, reservation_quantity, reservation_variant)) = reservation else {
         return Err(sqlx::Error::Protocol(
             "award reservation is not active".to_string(),
         ));
@@ -332,22 +332,35 @@ async fn expire_due_award(
             "award reservation does not match its locked offer".to_string(),
         ));
     }
-    let listing_locked = sqlx::query(
-        "UPDATE listings SET server_revision = server_revision + 1, \
-         state = CASE WHEN available_quantity = 0 THEN 'available' ELSE state END, \
-         available_quantity = available_quantity + $2, reserved_quantity = reserved_quantity - $2, \
-         updated_at = $3 WHERE aggregate_id = $1 AND reserved_quantity >= $2",
+    let rows = crate::variant_stock::lock_rows(&mut tx, &offer.listing_aggregate_id).await?;
+    let held_row = crate::variant_stock::resolve_held(&rows, reservation_variant.as_deref())
+        .map_err(|refusal| {
+            sqlx::Error::Protocol(format!(
+                "award reservation names no variant row of its listing: {refusal:?}"
+            ))
+        })?;
+    let released = crate::variant_stock::release(
+        &mut tx,
+        &offer.listing_aggregate_id,
+        &held_row.variant_id,
+        offer.quantity,
+        crate::variant_stock::Held::Reserved,
     )
-    .bind(&offer.listing_aggregate_id)
-    .bind(offer.quantity)
-    .bind(now)
-    .execute(&mut *tx)
     .await?;
-    if listing_locked.rows_affected() != 1 {
+    if !released {
         return Err(sqlx::Error::Protocol(
             "award reservation inventory is not held by its listing".to_string(),
         ));
     }
+    sqlx::query(&format!(
+        "UPDATE listings SET server_revision = server_revision + 1, \
+         state = {}, updated_at = $2 WHERE aggregate_id = $1",
+        crate::variant_stock::STATE_FROM_TOTALS_SQL
+    ))
+    .bind(&offer.listing_aggregate_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
     let offer_flipped = sqlx::query(
         "UPDATE offers SET state = 'expired', expiry_reason = 'award_window', \
          revision = revision + 1, updated_at = $2 WHERE id = $1 AND state = 'accepted'",

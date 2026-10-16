@@ -468,10 +468,22 @@ pub fn parse(webhook: &VerifiedWebhook, body: &[u8]) -> Result<InboundEvent, Pro
             let Classified { change, order } = classify(&value)?;
             Ok(match change {
                 Change::NotPubky => ignored("not_a_pubky_order"),
+                // The store's tracking for a completed order is the order's current
+                // newest item, so a number is always the one that should stand
+                // (`TrackingUpdated` ships a paid order with it and replaces what a
+                // shipped one has). Without a number the order is only marked shipped.
                 Change::Fulfillment {
                     carrier,
                     tracking_number,
-                } => InboundEvent::Fulfillment {
+                } if tracking_number.is_empty() => InboundEvent::Fulfillment {
+                    order,
+                    carrier,
+                    tracking_number,
+                },
+                Change::Fulfillment {
+                    carrier,
+                    tracking_number,
+                } => InboundEvent::TrackingUpdated {
                     order,
                     carrier,
                     tracking_number,
@@ -612,7 +624,7 @@ mod tests {
             ]
         }));
         match event(&order) {
-            InboundEvent::Fulfillment {
+            InboundEvent::TrackingUpdated {
                 order,
                 carrier,
                 tracking_number,
@@ -633,14 +645,14 @@ mod tests {
             {"key": "_wc_shipment_tracking_items", "value": [
                 {"tracking_provider": "", "custom_tracking_provider": "Local Courier", "tracking_number": "ZZ9"}]}]}));
         assert!(
-            matches!(event(&custom), InboundEvent::Fulfillment { carrier, .. } if carrier == "Local Courier")
+            matches!(event(&custom), InboundEvent::TrackingUpdated { carrier, .. } if carrier == "Local Courier")
         );
         let aftership = pubky_order(json!({"status": "completed", "meta_data": [
             {"key": "pubky_order_id", "value": "11111111-2222-8333-9444-555555555555"},
             {"key": "_aftership_tracking_number", "value": "AF1"},
             {"key": "_aftership_tracking_provider_name", "value": "dhl"}]}));
         assert!(
-            matches!(event(&aftership), InboundEvent::Fulfillment { tracking_number, carrier, .. } if tracking_number == "AF1" && carrier == "dhl")
+            matches!(event(&aftership), InboundEvent::TrackingUpdated { tracking_number, carrier, .. } if tracking_number == "AF1" && carrier == "dhl")
         );
     }
 
@@ -675,7 +687,7 @@ mod tests {
                 {"tracking_provider": "swiss-post", "tracking_number": "OLD1"},
                 {"tracking_provider": "dhl", "tracking_number": "NEW2"}]}]}));
         assert!(matches!(event(&order),
-            InboundEvent::Fulfillment { carrier, tracking_number, .. } if carrier == "dhl" && tracking_number == "NEW2"));
+            InboundEvent::TrackingUpdated { carrier, tracking_number, .. } if carrier == "dhl" && tracking_number == "NEW2"));
     }
 
     #[test]

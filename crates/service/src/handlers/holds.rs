@@ -33,6 +33,7 @@ use crate::handlers::{fetch_listing_for_update, lock_listings_in_order, order_li
 use crate::model::OrderRow;
 use crate::queries::ORDER_COLUMNS;
 use crate::result::CommandFailure;
+use crate::variant_stock;
 
 /// Refusal copy for a lock point that finds the stock already gone, pinned
 /// by the client contract tests.
@@ -66,26 +67,25 @@ pub(crate) enum HeldQuantity {
 }
 
 impl HeldQuantity {
-    fn column(self) -> &'static str {
+    fn held(self) -> variant_stock::Held {
         match self {
-            HeldQuantity::Reserved => "reserved_quantity",
-            HeldQuantity::Sold => "sold_quantity",
+            HeldQuantity::Reserved => variant_stock::Held::Reserved,
+            HeldQuantity::Sold => variant_stock::Held::Sold,
         }
     }
 }
 
-/// Moves each order line's quantity from the held column back to available
-/// under the listings quantity-balance constraint. The held-quantity guard
-/// is a compare-and-swap against the ledger: nothing else can remove this
-/// order's contribution, so a shortfall is an invariant violation, not a
-/// race to tolerate.
+/// Moves each order line's quantity from the held column back to available,
+/// on the variant row the line names, under the row's quantity-balance
+/// constraint. The held-quantity guard is a compare-and-swap against the
+/// ledger: nothing else can remove this order's contribution, so a shortfall
+/// is an invariant violation, not a race to tolerate.
 pub(crate) async fn release_lines(
     tx: &mut Transaction<'_, Postgres>,
     order: &OrderRow,
     held: HeldQuantity,
     now: DateTime<Utc>,
 ) -> Result<Result<(), CommandFailure>, sqlx::Error> {
-    let column = held.column();
     lock_listings_in_order(tx, order_line_listings(order)).await?;
     let lines = order.lines.as_array().expect("order lines are an array");
     for line in lines {
@@ -107,23 +107,28 @@ pub(crate) async fn release_lines(
             &listing.state,
             "available"
         ));
-        let updated = sqlx::query(&format!(
-            "UPDATE listings SET server_revision = server_revision + 1, state = 'available', \
-             available_quantity = available_quantity + $2, {column} = {column} - $2, \
-             updated_at = $3 WHERE aggregate_id = $1 AND {column} >= $2",
-        ))
-        .bind(aggregate_id)
-        .bind(quantity)
-        .bind(now)
-        .execute(&mut **tx)
-        .await?;
-        if updated.rows_affected() != 1 {
+        let rows = variant_stock::lock_rows(tx, aggregate_id).await?;
+        let row = match variant_stock::resolve_held(&rows, line["variant_id"].as_str()) {
+            Ok(row) => row,
+            Err(refusal) => return Ok(Err(refusal.held_failure())),
+        };
+        if !variant_stock::release(tx, aggregate_id, &row.variant_id, quantity, held.held()).await?
+        {
             return Ok(Err(CommandFailure::refused(
                 crate::refusal_audit::RefusalKind::InvariantViolation,
                 ErrorCode::InvariantViolation,
                 "The inventory held by this order is no longer accounted to its listing.",
             )));
         }
+        sqlx::query(&format!(
+            "UPDATE listings SET server_revision = server_revision + 1, \
+             state = {}, updated_at = $2 WHERE aggregate_id = $1",
+            variant_stock::STATE_FROM_TOTALS_SQL
+        ))
+        .bind(aggregate_id)
+        .bind(now)
+        .execute(&mut **tx)
+        .await?;
     }
     Ok(Ok(()))
 }
@@ -195,19 +200,35 @@ pub async fn acquire_payment_hold(
                 LISTING_REMOVED_COPY,
             )));
         }
-        if listing.available_quantity < quantity {
-            if listing.state == "reserved" || listing.reserved_quantity > 0 {
+        let rows = variant_stock::lock_rows(tx, aggregate_id).await?;
+        let row = match variant_stock::resolve(&rows, line["variant_id"].as_str()) {
+            Ok(row) => row,
+            Err(refusal) => return Ok(Err(refusal.failure())),
+        };
+        let keyed = variant_stock::tracks_variants(&rows);
+        if variant_stock::shortfall(row, quantity).is_some() {
+            let held_by_another = if keyed {
+                row.reserved_quantity > 0
+            } else {
+                listing.state == "reserved" || listing.reserved_quantity > 0
+            };
+            if held_by_another {
                 return Ok(Err(CommandFailure::refused(
                     crate::refusal_audit::RefusalKind::InvalidState,
                     ErrorCode::InvalidState,
                     HOLDING_COPY,
                 )));
             }
-            return Ok(Err(CommandFailure::refused(
+            let refusal = CommandFailure::refused(
                 crate::refusal_audit::RefusalKind::InsufficientInventory,
                 ErrorCode::InsufficientInventory,
                 SOLD_OUT_BEFORE_PAYMENT,
-            )));
+            );
+            return Ok(Err(if keyed {
+                refusal.with_reason(variant_stock::REASON_VARIANT_SOLD_OUT)
+            } else {
+                refusal
+            }));
         }
         let new_state = if listing.available_quantity == quantity {
             "reserved"
@@ -219,25 +240,22 @@ pub async fn acquire_payment_hold(
             &listing.state,
             new_state
         ));
-        let updated = sqlx::query(
-            "UPDATE listings SET server_revision = server_revision + 1, state = $2, \
-             available_quantity = available_quantity - $3, \
-             reserved_quantity = reserved_quantity + $3, updated_at = $4 \
-             WHERE aggregate_id = $1 AND available_quantity >= $3",
-        )
-        .bind(aggregate_id)
-        .bind(new_state)
-        .bind(quantity)
-        .bind(now)
-        .execute(&mut **tx)
-        .await?;
-        if updated.rows_affected() != 1 {
+        if !variant_stock::reserve(tx, aggregate_id, &row.variant_id, quantity).await? {
             return Ok(Err(CommandFailure::refused(
                 crate::refusal_audit::RefusalKind::InsufficientInventory,
                 ErrorCode::InsufficientInventory,
                 SOLD_OUT_BEFORE_PAYMENT,
             )));
         }
+        sqlx::query(
+            "UPDATE listings SET server_revision = server_revision + 1, state = $2, \
+             updated_at = $3 WHERE aggregate_id = $1",
+        )
+        .bind(aggregate_id)
+        .bind(new_state)
+        .bind(now)
+        .execute(&mut **tx)
+        .await?;
     }
 
     let held: OrderRow = sqlx::query_as(&format!(

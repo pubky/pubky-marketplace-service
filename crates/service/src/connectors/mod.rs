@@ -36,7 +36,6 @@ pub mod refund;
 pub mod routes;
 pub mod stock;
 pub mod store;
-pub mod variant_stock;
 pub mod worker;
 
 use std::sync::Arc;
@@ -54,9 +53,35 @@ pub struct ConnectorRuntime {
     pub keys: Arc<ConnectorKeys>,
     pub providers: ProviderRegistry,
     pub settings: ConnectorSettings,
-    /// Where per-variant store stock lands; skips it until the service has
-    /// per-variant inventory ([`stock::VariantInventory`]).
+    /// Where per-variant store stock lands ([`stock::VariantInventory`]): the
+    /// service's own variant rows when it has them, a skip when it does not.
     pub variant_inventory: Arc<dyn stock::VariantInventory>,
+    /// Whether this service can mark an order shipped without a tracking
+    /// number and sync tracking added later (`fulfillment.update_tracking`).
+    /// Detected from the command vocabulary the service was built with, so a
+    /// build without the commands keeps today's behaviour (a fulfilment
+    /// without tracking is ignored) and a build with them uses them.
+    pub optional_tracking: bool,
+}
+
+/// Whether this build of the service has `fulfillment.update_tracking` (and so
+/// `fulfillment.ship` without a tracking number): the domain accepts the
+/// command's envelope.
+pub fn tracking_commands_available() -> bool {
+    let probe = serde_json::json!({
+        "version": 1,
+        "command_id": deterministic_uuid("connector-tracking-probe"),
+        "aggregate_id": marketplace_domain::ids::order_aggregate_id(deterministic_uuid("connector-tracking-probe-order")),
+        "expected_revision": 1,
+        "issued_at": "2026-01-01T00:00:00.000Z",
+        "kind": "fulfillment.update_tracking",
+        "payload": {
+            "order_id": deterministic_uuid("connector-tracking-probe-order"),
+            "carrier": "Other",
+            "tracking_number": "PROBE-0001",
+        },
+    });
+    marketplace_domain::commands::parse_command(&probe).is_ok()
 }
 
 impl ConnectorRuntime {
@@ -69,8 +94,16 @@ impl ConnectorRuntime {
             keys,
             providers,
             settings,
-            variant_inventory: Arc::new(stock::NoVariantInventory),
+            variant_inventory: Arc::new(stock::ServiceVariantInventory),
+            optional_tracking: tracking_commands_available(),
         }
+    }
+
+    /// Overrides the detected optional-tracking support (tests; a deployment
+    /// that wants to hold the feature back).
+    pub fn with_optional_tracking(mut self, available: bool) -> Self {
+        self.optional_tracking = available;
+        self
     }
 
     pub fn with_variant_inventory(mut self, inventory: Arc<dyn stock::VariantInventory>) -> Self {
@@ -121,19 +154,22 @@ pub fn runtime_from_env(
             config::ENV_CONNECTORS_ENABLED
         );
     };
-    Ok(Some(Arc::new(
-        ConnectorRuntime::new(keys, providers, settings)
-            .with_variant_inventory(Arc::new(variant_stock::ServiceVariantInventory)),
-    )))
+    Ok(Some(Arc::new(ConnectorRuntime::new(
+        keys, providers, settings,
+    ))))
 }
 
 /// The providers this build knows, configured from the environment. This is
 /// the one place a provider registers itself: the service and the worker both
-/// call it, so they always serve the same set.
+/// call it, so they always serve the same set. Shopify needs no deployment
+/// configuration (each connection carries its own app credentials); WooCommerce
+/// reads only `CONNECTOR_RETURN_URL`.
 pub fn providers_from_env() -> anyhow::Result<ProviderRegistry> {
-    Ok(ProviderRegistry::new().with(std::sync::Arc::new(
-        providers::woocommerce::WooCommerceProvider::from_env(),
-    )))
+    Ok(ProviderRegistry::new()
+        .with(Arc::new(providers::shopify::ShopifyProvider::new()))
+        .with(Arc::new(
+            providers::woocommerce::WooCommerceProvider::from_env(),
+        )))
 }
 
 /// A strictly valid version 8 UUID derived from a seed: the same seed gives

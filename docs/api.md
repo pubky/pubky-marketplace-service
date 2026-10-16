@@ -145,9 +145,11 @@ and write. "Automation" means the inventory capability plus the
 | POST | `/v1/connectors/alerts/{id}/resolve` |
 | DELETE | `/v1/connectors/{id}` |
 | GET | `/v1/connectors/{id}/catalog` |
+| GET | `/v1/connectors/{id}/check` |
 | PUT | `/v1/connectors/{id}/credentials` |
 | GET, PUT | `/v1/connectors/{id}/mappings` |
 | GET, PUT | `/v1/connectors/{id}/selection` |
+| PUT | `/v1/connectors/{id}/settings` |
 | PUT | `/v1/connectors/{id}/woocommerce/keys` |
 | GET | `/v1/connectors/{id}/pushes` |
 | POST | `/v1/connectors/{id}/pushes/{order}/retry` |
@@ -459,11 +461,16 @@ another buyer holding this item. It exists because the full listing projection
 }
 ```
 
+- A listing that tracks stock per variant adds `variants`, one entry per
+  offered variant: `{ "variant_id": "size_m", "sold_out": true }`. See
+  [per-variant stock](#per-variant-stock). A listing that sells one variant has
+  no `variants` key.
 - `state` is the listing's stock state, `available`, `reserved` or `sold`. It
   is the same `state` the projection carries. `reserved` means a buyer's
   in-flight payment holds the last units; it returns to `available` when the
   hold lapses or is cancelled.
-- Nothing else is exposed: no quantity, buyer, order, hold deadline or price.
+- Nothing else is exposed: no quantity (a variant is `sold_out` or not), buyer,
+  order, hold deadline or price.
   An auction listing returns its stock state like any other.
 - `404 NOT_FOUND` for an unknown or tombstoned listing (a listing whose seller
   deleted its record).
@@ -780,7 +787,18 @@ Semantics:
   older than the projection is a no-op that returns the current revision. A
   re-sync at the same record revision refreshes derived fields (shipping,
   fulfillment methods, digital lock) and bumps the aggregate revision with a
-  `listing.synced` event.
+  `listing.synced` event. A same-revision re-sync also retries a listing that
+  [cannot convert to per-variant stock yet](#per-variant-stock), recomputes a
+  total that counted a disabled variant's stock, and converts a listing that
+  has become convertible.
+- A result carries `"variant_conversion": { "state": "deferred" | "blocked",
+  "reason": "open_holds" | "unattributable_sales" | "adjusted_total" |
+  "below_committed", "attempts": 2 }` while its listing cannot convert to
+  per-variant stock; the key is absent otherwise. A single `listing.sync`
+  carries the same object in its `result`. The sync itself succeeded (the
+  listing matches its record); `state` is the outcome of the conversion:
+  `deferred` waits for time or the next sync, `blocked` (`below_committed`)
+  needs the seller to republish the record.
 - Failure modes per item: `NOT_FOUND` (record missing, or listing tombstoned
   once the seller's event stream confirms deletion); `UPSTREAM_UNAVAILABLE`
   (503; homeserver unreachable, retry later); `INVALID_STATE` (record cannot be
@@ -824,7 +842,7 @@ Unknown fields are rejected (`422 invalid_request`).
 | `expected_revision` | Integer at least 1: the listing revision you last read. |
 | `delta` | Non-zero integer within +/-1,000,000. |
 | `idempotency_key` | UUID, version 1 through 8, RFC 4122 variant. |
-| `variant` | Optional `{id?, sku?}`. It is an assertion against the listing's sole enabled variant, not a selector. |
+| `variant` | Optional `{id?, sku?}`. On a listing that sells one variant it is an assertion against the sole enabled variant. On a listing that tracks stock per variant it is required and selects the variant row the delta moves (`id` and `sku` must both name that row when both are given). |
 | `external_ref` | Optional `{channel, external_id}`; `channel` matches `^[a-z0-9][a-z0-9._-]{0,31}$`, `external_id` at most 128 chars. |
 
 Success, `200`:
@@ -849,6 +867,26 @@ Success, `200`:
 }
 ```
 
+On a listing that tracks stock per variant the numbers are the addressed
+variant's, `authority` is `variant`, `variant_id` (and `sku`, when the record
+has one) name the row, and `listing_total` carries the listing's sums:
+
+```json
+"stock": {
+  "authority": "variant",
+  "variant_id": "size_m",
+  "sku": "SHIRT-M",
+  "total": 5,
+  "available": 5,
+  "reserved": 0,
+  "sold": 0,
+  "listing_total": { "total": 12, "available": 10, "reserved": 1, "sold": 1 }
+}
+```
+
+`expected_revision` is still the listing's revision, and any stock change on
+any variant advances it.
+
 The emitted event kind is `inventory.adjusted`. Replaying the identical body
 with the same `idempotency_key` returns the stored `200` unchanged. The same
 key with a different body is `409 idempotency_conflict`.
@@ -866,11 +904,12 @@ Errors (inventory envelope):
 | 409 | `external_reference_conflict` | The `external_ref` was already used (reported when it was already recorded and `expected_revision` is stale). |
 | 409 | `variant_record_conflict` | The homeserver record's owner, listing id or revision does not match the registered listing. |
 | 409 | `variant_authority_unsupported` | The homeserver record is unreadable as JSON or does not have exactly one valid enabled variant. |
-| 409 | `variant_assertion_mismatch` | `variant.id` / `variant.sku` does not match the enabled variant. |
+| 409 | `variant_assertion_mismatch` | `variant.id` / `variant.sku` does not match the enabled variant, or on a variant-tracked listing names no variant row (or two different rows). |
+| 409 | `variant_required` | The listing tracks stock per variant and the request names no `variant`. |
 | 503 | `variant_lookup_unavailable` | Homeserver lookup failed; retry. |
 | 409 | `inventory_invariant_violation` | The adjustment would break a stock invariant. |
 | 409 | `stock_overflow` | Total would exceed the maximum. |
-| 409 | `negative_stock` | Available stock would go below zero. |
+| 409 | `negative_stock` | Available stock (of the addressed variant, on a variant-tracked listing) would go below zero. |
 | 429 | `rate_limited` | Inventory limiter; `Retry-After: 1`. |
 | 500 | `internal` | Unexpected failure. |
 
@@ -888,12 +927,116 @@ Errors (inventory envelope):
 }
 ```
 
+A listing that tracks stock per variant adds `variants` (every row, in record
+order, including withdrawn variants with `enabled: false`); `stock` stays the
+listing's sums:
+
+```json
+"variants": [
+  { "variant_id": "size_s", "sku": "SHIRT-S", "enabled": true,
+    "total": 4, "available": 0, "reserved": 0, "sold": 4, "sold_out": true },
+  { "variant_id": "size_m", "enabled": true,
+    "total": 14, "available": 15, "reserved": 3, "sold": 0, "sold_out": false }
+]
+```
+
 Any session holding the inventory capability may read any listing's
 projection; this read is not restricted to the listing's seller. `404
 listing_not_found` for an unknown listing. A sample of both documents is kept
 in `contracts/samples/inventory.json`, and the JSON Schemas are generated from
 the Rust types (`inventory_adjust_schema()` and
 `inventory_projection_schema()` in `crates/service/src/inventory.rs`).
+
+## Per-variant stock
+
+A listing whose record has two or more enabled variants tracks stock per
+variant, so a buyer can never buy a sold-out size while another size has
+stock. A listing with one enabled variant keeps one stock total and behaves as
+it always did. Migration 0070 holds the rows
+([migrations](migrations.md#per-variant-inventory-0070)).
+
+**Registration.** `listing.sync` reads each enabled variant's `id`, `sku` and
+`quantity` from the seller's record (`variants[].enabled == true`; a variant
+with no `enabled: true` is not enabled). `listing.register` takes the same
+list as an optional `payload.variants`, `[{ "id", "quantity", "sku"? }]` in
+record order, omitted from the canonical JSON when empty:
+
+- Two or more entries: one stock row per entry; the listing's quantities are
+  their sums and `payload.quantity` is not used for stock (it stays the sum of
+  all the record's variants, enabled or not).
+- Fewer than two: one implicit row, exactly as before. Its stock is the one
+  enabled variant's quantity when `payload.variants` has one entry (stock of the
+  record's disabled variants is not for sale and is not counted), and
+  `payload.quantity` when it has none. An auction always registers one implicit
+  row.
+- A record with two or more enabled variants whose ids are missing, malformed
+  or repeated cannot be interpreted and does not register.
+- A variant-tracked listing whose payload or record lists no enabled variant
+  keeps its rows as they are (a client that predates variants never withdraws a
+  listing's sizes).
+- A listing registered with a total only (a client that predates variants) is
+  converted to per-variant rows by the next sync whose record lists two or more
+  enabled variants, at the same or a newer revision, when its units sold can be
+  attributed exactly to the record's variants by the variant on each paid
+  order line and none are reserved. At a record revision the listing already
+  holds, the listing's own total is the truth: it converts only while that total
+  is still what the record says (the sum of the enabled variants, or of all
+  variants for a listing registered before disabled stock was left out), so a
+  seller's `inventory.adjust` since the deferral can never be undone or
+  invented; a newer record revision is an edit and is the authority, as for
+  any listing. Otherwise it keeps its shared total and the next sync tries
+  again. While it waits it is marked in `listing_variant_conversion_blocks`
+  with the reason: `open_holds` (units reserved), `unattributable_sales`,
+  `adjusted_total` (the record is unchanged but the seller moved the total; it
+  converts when the total matches the record again or the record is edited) or
+  `below_committed` (the record gives a size fewer units than its sales; the
+  seller republishes). The marker is cleared only by a conversion or when the
+  record stops listing several variants. A `warn` is logged once (target
+  `variant_conversion`, fields `aggregate_id`, `reason`, `enabled_variants`,
+  `reserved_quantity`, `sold_quantity`, `attempts`) and again if the reason
+  changes, and `sync-many` reports `variant_conversion` for it (see
+  [Batch sync](#batch-sync-sync-many)). `scripts/variant-conversion-sweep.sh`
+  lists the marked listings and prints the `sync-many` body that retries them.
+- A listing registered before per-variant stock counted the stock of its
+  record's disabled variants in its total. A sync of its record recomputes the
+  total from the enabled variants, never below the units already reserved or
+  sold: at a newer record revision as for any edit, and at the same revision
+  only while the total is still exactly that old sum (a seller's
+  `inventory.adjust` has moved it otherwise, and stays). An edit that lowers
+  the sum of every variant below the committed units is still refused as before.
+
+**Record edits.** A sync that changes a variant's quantity sets the row's total
+to the record's and its available count to total minus reserved and sold. A
+quantity below the units already reserved or sold of that variant is
+`409 INVARIANT_VIOLATION`, `reason: variant_below_committed`, and changes
+nothing. A variant the record no longer enables keeps its reserved and sold
+units and shows no stock (`enabled: false`); units released from it leave its
+total instead of going back on sale.
+
+**Lines.** `checkout.create` lines, `inventory.reserve` and the accepted offer
+take their units from the variant row they name (`variant_id`). A listing that
+sells one variant ignores the name, as before. On a variant-tracked listing:
+
+| HTTP | `code` | `reason` | When |
+| --- | --- | --- | --- |
+| 422 | `INVALID_COMMAND` | `variant_required` | The line names no variant and more than one is offered. A line with none takes the sole offered variant. |
+| 422 | `INVALID_COMMAND` | `unknown_variant` | The listing has no such variant. |
+| 409 | `INVALID_STATE` | `variant_unavailable` | The seller no longer offers the variant. |
+| 409 | `INVALID_STATE` | `variant_sold_out` | Nothing of the variant is available and nothing is held (checkout). The message is the holding copy instead when another buyer's payment holds the last units. |
+| 409 | `INSUFFICIENT_INVENTORY` | | Fewer than asked are available (checkout, reserve, accept). At a payment hold the same code carries `reason: variant_sold_out`. |
+
+The order line records the variant its units are held on (`variant_id`), and
+every release (payment-window expiry, cancel, void, refund, reservation
+expiry, award expiry) and the sale on payment confirmation use that row. A
+refusal is audited with the existing refusal kinds (`InvalidCommand`,
+`InvalidState`, `InsufficientInventory`); no kind was added.
+
+**Projections.** A listing that tracks stock per variant carries `variants` in
+its listing projection, `[{ "variant_id", "available_quantity", "sold_out" }]`
+for the offered variants in record order; the public availability read carries
+`[{ "variant_id", "sold_out" }]` and no quantity. The inventory projection
+(`GET /v1/inventory/listings/{aggregate_id}`) lists every row. A listing that
+sells one variant has no `variants` key anywhere.
 
 ## Webhooks
 
@@ -1095,6 +1238,157 @@ secret only. After a disconnect or an uninstall the secret is kept for up to
 30 days (or until `shop/redact` is handled) so Shopify's privacy webhooks can
 still be verified, and deleted at once for a draft that never installed. No
 Shopify values live in the environment.
+
+### Shopify
+
+The provider speaks the GraphQL Admin API, version `2026-10`
+(`crates/service/src/connectors/providers/shopify/`). Every query and mutation
+is a `.graphql` file there; `tests/shopify_graphql_test.rs` validates each one
+against Shopify's published schema.
+
+**What the merchant configures** in their own app (Dev Dashboard, custom app):
+
+- **Install.** Install the app from the Dev Dashboard: the app's Installs card
+  (an app created in the store's own organization), or Custom distribution, the
+  store's `myshopify.com` domain, Generate link, opened by the store owner. The
+  connection (`POST`/`GET /v1/connectors`, `PUT .../credentials`) carries
+  `install` (`method: "dev_dashboard"`, where to click, `app_url`,
+  `redirect_url`) and `install_url: null`. The service builds no
+  `/admin/oauth/authorize` link of its own: Shopify's authorization-code
+  documentation describes that URL as the step that obtains a token for an app,
+  and nothing in Shopify's documentation says it installs an app the store does
+  not yet have (the documented install paths for such an app are the Installs
+  card and the custom-distribution link). After the install, Shopify opens the
+  App URL, which sends the merchant to approve the connection.
+- App URL: the connection's launch URL,
+  `{CONNECTOR_PUBLIC_BASE_URL}/v1/connectors/shopify/c/{connection_id}/launch`.
+- Allowed redirection URL: the connection's OAuth callback URL.
+- Access scopes: `read_products`, `read_inventory`, `read_locations`,
+  `read_fulfillments`, `write_orders`. A grant missing any puts the connection in
+  `needs_attention` and `missing_scopes` names them.
+- **Privacy webhooks.** `customers/data_request`, `customers/redact` and
+  `shop/redact` are not in the Admin API's `WebhookSubscriptionTopic` enum, so the
+  service cannot subscribe them. They are set in the app's configuration, with the
+  connection's webhooks URL as the address, for example in `shopify.app.toml`:
+
+  ```toml
+  [[webhooks.subscriptions]]
+  compliance_topics = ["customers/data_request", "customers/redact", "shop/redact"]
+  uri = "https://service.example/v1/connectors/shopify/c/{connection_id}/webhooks"
+  ```
+
+  They are signed with the same app secret and are acknowledged (the service
+  keeps no store customer data); `shop/redact` ends the 30-day secret retention.
+  The merchant guide must say this, because nothing else configures them. The
+  six operational topics need no merchant step.
+
+**What the service does.** After a verified launch it redirects to Shopify's
+authorize page; after a verified callback it exchanges the code for an offline
+access token (sealed per connection) and then subscribes `inventory_levels/update`,
+`fulfillments/create`, `fulfillments/update`, `orders/cancelled`, `refunds/create`
+and `app/uninstalled` to the connection's webhooks URL through `webhookSubscriptionCreate`. A repeat
+install reads the subscription list page by page, subscribes nothing twice (a
+create that loses a race to a concurrent install is confirmed by re-reading the
+list, not by interpreting the message) and removes stale subscriptions this
+service made for another address. Webhooks are verified with the base64 HMAC-SHA256 of the raw
+body under the connection's app secret (`X-Shopify-Hmac-Sha256`), and deduplicated
+on `X-Shopify-Event-Id`.
+
+- **Catalog.** Active products, a few per page, with every variant (more than 25
+  variants are read through the product's variant connection). A variant's stock
+  is its total across locations; an untracked variant has none. A product with
+  only Shopify's `Default Title` option has no options.
+- **Orders.** `orderCreate` with the mapped variant ids, financial status `PAID`,
+  one manual `SALE` transaction named `Pubky <rail>`, tags `pubky` and
+  `pubky-order-{id}`, the `pubky_order_id` attribute, inventory decremented
+  ignoring the store's oversell policy, no receipt and no customer. A shipping
+  address is attached only when the buyer opted in. Amounts are formatted with the
+  currency's own exponent, and an order whose exponent differs is refused
+  (`exponent_mismatch`). The order currency must be the store's currency (else
+  `currency_mismatch`: the push is quarantined and the seller alert says why and
+  what to do; Pubky never converts) and lines plus shipping must equal the total
+  (`total_mismatch`). `orderCreate` has no idempotency key, so after an unknown
+  outcome the order is looked up by its tag before any second push: the tag
+  search first, then, because search lags a create, the store's orders created in
+  the last 24 hours newest first, up to 10 pages of 50. If that bound is reached
+  with orders still inside the 24 hours unread, the lookup answers "cannot tell"
+  (an unknown outcome the worker retries) instead of "not found", so a busy store
+  never gets a second copy on a guess.
+- **Cancel and refund.** A Pubky cancel is `orderCancel` with `restock: true`, no
+  refund and no customer email; a store order already cancelled is left alone. A
+  Pubky refund is `refundCreate` with a manual `REFUND` transaction against the
+  order's sale. The framework owns the arithmetic (`connectors/refund.rs`): the
+  recorded amount is the Pubky books' refunded **total** in the order currency's
+  minor units on every rail (a USDT-paid order priced in another currency is
+  converted with the order's own recorded conversion, and the conversion basis
+  goes in the note), and the provider is asked only for the difference to what
+  the store already shows refunded. The Shopify provider reports that figure
+  (`refunded_total`: the sale amount and `totalRefundedSet`, the merchant's own
+  refunds included) and records the difference; the store refuses a refund
+  above the payment, so a concurrent refund cannot push it over. The note ends
+  with a mark `pubky-refund:{refund id}:{minor}:{CUR}` and the `@idempotent` key
+  covers the Pubky refund id and the amount. A store order in another currency
+  than the refund is refused (`currency_mismatch`). A cancel the store
+  refuses is judged by reading the order, not the message: cancelled means done,
+  otherwise it is retried. Actions of one push (a cancel and refunds) run one at
+  a time.
+- **Rate limits.** The cost-based throttle is tracked per shop; a throttled or
+  429 answer is retried a couple of times inside the call, then handed to the
+  worker's own backoff. A throttled call applied nothing, so even a mutation is
+  safe to retry.
+- **What the store reports back.** A store-side cancel or refund raises a seller
+  alert and never an automatic Pubky cancel or refund. The alert's `action` (see
+  the alert JSON) names the existing Pubky command to run when one applies:
+  `order.cancel_approve` once the buyer has asked to cancel,
+  `refund.record_external` for a cancelled, returned or digital order with no
+  refund recorded; otherwise it is `null`. Cancels and refunds Pubky itself
+  mirrored to the store come back as webhooks; one is recognised as that echo,
+  and raises no alert, only if the mirror was **applied** (`done`), finished at
+  most 6 hours before the webhook arrived and existed before it, and, for a
+  refund, the webhook's note carries the Pubky refund mark of that mirror with
+  the same amount. A mirror still running makes the webhook wait and be looked at
+  again; a mirror that never reached the store (pending, quarantined), a refund
+  without the mark, a mark with another amount and a webhook later than the
+  window all raise the alert. Refund amounts are summed per currency and a
+  refund in a currency other than the order's, or in several, says so in the
+  alert.
+- **Variants.** `PUT /v1/connectors/{id}/settings` (or `variant_mode` on
+  `POST /v1/connectors`) with `{"variant_mode": "native" | "split"}` (default
+  `native`). In `native` mode several store variants may map to one Pubky
+  listing's variants. Their stock is applied per variant: the target is what the
+  store can sell, the adjustment is that target minus **that variant's own**
+  `available` (never the listing's, which sums the variants), sent as an
+  `inventory.adjust` addressed to the Pubky variant id the mapping stores. This
+  needs the service's per-variant inventory (`listing_variant_inventory`); a
+  service without it skips the listing (`multi_variant_listing`). A stock change
+  for a variant the service cannot address (no Pubky variant id on the mapping,
+  the variant no longer on the listing, `variant_required`,
+  `variant_assertion_mismatch`) is a permanent mapping error: the event settles
+  as `variant_mapping_error`, is never retried, and raises one
+  `variant_mapping_error` alert per variant. In `split` mode every store variant
+  maps to its own Pubky listing (one mapping per listing, otherwise
+  `422 split_mode_listing_shared`) and stock syncs at listing level. Switching
+  to `split` **unmaps** every listing that combines several store variants (all
+  of its mappings), in the same step; the response lists them
+  (`unmapped_listings: [{listing_id, mappings_removed}]`) and a
+  `listings_unmapped` alert says to re-import each variant as its own listing or
+  end the combined one. Nothing is refused, so there is no unmap-first loop.
+- **Tax.** No tax is added: the pushed order carries `taxesIncluded: false`, no
+  tax lines, lines marked not taxable, so the store total is what the buyer paid.
+  The created order is read back; a total or tax that differs raises a
+  `push_total_mismatch` alert (the order stays created).
+- **Fulfilment and tracking.** A `fulfillments/create` marks the Pubky order
+  shipped: with the tracking the store gives, or, when it has none, with carrier
+  `Other` and no number. Tracking added or changed later in Shopify
+  (`fulfillments/update`; both topics need `read_fulfillments`) syncs through
+  `fulfillment.update_tracking`; an update that beats its create ships the order
+  with that tracking, a second parcel never replaces tracking the order already
+  has, and a cancelled or tracking-less update changes nothing. A service built
+  without `fulfillment.update_tracking` (and ship-without-tracking) is detected
+  from its command vocabulary and keeps the old behaviour: a fulfilment without
+  tracking is ignored (`tracking_commands_unavailable`), one with tracking ships.
+- `GET /v1/connectors/{id}/check` reads the store live: its name, the scopes the
+  token holds, the number of active locations and whether a catalog read works.
 
 Environment names: `CONNECTORS_ENABLED`, `CONNECTOR_PUBLIC_BASE_URL`,
 `CONNECTOR_RETURN_URL`, `CONNECTOR_CREDENTIAL_ENCRYPTION_KEY`,

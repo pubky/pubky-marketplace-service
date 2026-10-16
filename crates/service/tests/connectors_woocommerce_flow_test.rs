@@ -842,7 +842,7 @@ async fn completed_without_tracking_ships_as_other_and_later_tracking_follows(po
     assert_eq!(shipment["carrier"], "swiss-post");
     assert_eq!(
         last_outcome(&shop).await.1.as_deref(),
-        Some("tracking_updated")
+        Some("tracking updated")
     );
 
     // The same delivery again changes nothing.
@@ -896,7 +896,7 @@ async fn completed_without_tracking_ships_as_other_and_later_tracking_follows(po
     );
     assert_eq!(
         last_outcome(&shop).await.1.as_deref(),
-        Some("tracking_updated")
+        Some("tracking updated")
     );
     assert!(
         alerts(&shop).await.is_empty(),

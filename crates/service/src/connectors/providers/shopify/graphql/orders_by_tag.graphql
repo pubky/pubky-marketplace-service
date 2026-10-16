@@ -1,0 +1,9 @@
+query OrdersByTag($query: String!) {
+  orders(first: 5, query: $query) {
+    nodes {
+      id
+      tags
+      cancelledAt
+    }
+  }
+}

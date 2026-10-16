@@ -166,10 +166,10 @@ additive. Orders and payments bound to Stripe are not touched.
 binary from before 0059 ignores the new columns and its inserts take their
 defaults, so a rolling replacement is safe.
 
-## Store connectors (0062 to 0064, 0066)
+## Store connectors (0062 to 0067)
 
 The connector framework uses 0062 to 0064 and 0066 of the 0062 to 0069 range reserved
-for connectors (0065 is the Shopify provider's). They follow 0061 (multi-currency
+for connectors (0065 and 0067 are the Shopify provider's). They follow 0061 (multi-currency
 FX, merged) and read two of its `orders` columns only as optional values
 (`usd_conversion_pair`, `usd_conversion_cents`). All are additive and
 rerunnable.
@@ -213,6 +213,17 @@ converted).
   reversed or reduced in Pubky). The table is small and new; the constraint is
   dropped and re-added under a short `lock_timeout`. A binary from before 0066
   never writes the value.
+
+- 0065 adds `connector_connections.variant_mode` (`native` or `split`, default
+  `native`, a CHECK on the two values). A constant default needs no table rewrite;
+  it sets `lock_timeout` like 0053. A binary from before 0065 ignores the column
+  and treats every connection as `native`, which is what every existing row holds.
+
+- 0067 widens the `connector_alerts` kind check from 0066 by three values
+  (`listings_unmapped`, `variant_mapping_error`, `push_total_mismatch`). Additive
+  and rerunnable; the table is small, so the constraint is replaced in one pass
+  under a short `lock_timeout`. A binary from before 0067 never writes the new
+  kinds.
 
 Roll forward rather than back once a connection exists: a binary that predates
 0062 does not know the tables, but nothing in it reads them.
@@ -275,3 +286,80 @@ stacked on, and reads or writes nothing 0060 creates. A binary from before
 both constraints admit, so a rolling replacement is safe. After 0061 the new
 sampler needs about three minutes of samples before a non-USD price can be
 quoted.
+
+## Per-variant inventory (0070)
+
+`0070_variant_inventory.sql` is additive and directly rerunnable. It takes
+number 0070 and reads and writes nothing from 0060 to 0069 (0062 to 0069 are
+the connectors'): it depends only on `listings` and `reservations`. See [per-variant stock](api.md#per-variant-stock).
+
+- `listing_variant_inventory` (new table): one row per variant,
+  `(listing_aggregate_id, variant_id)` primary key, `enabled`, `position`,
+  `sku`, and `total`/`available`/`reserved`/`sold` quantities with the same
+  balance check as `listings`. `variant_id = ''` is the implicit row of a
+  listing that sells one variant (no sku, enabled, position 0).
+- `listings.variant_availability` (nullable `JSONB`, no default, no rewrite):
+  the public per-variant view, written only by the roll-up trigger.
+- `reservations.variant_id` (nullable `TEXT`): the variant row a reservation
+  holds. `NULL` is the implicit row, which is every reservation that exists.
+- `listing_variant_conversion_blocks` (new table, one row per listing): the
+  operator-visible marker of a listing whose record lists two or more enabled
+  variants but that cannot convert yet. `reason` is `open_holds`,
+  `unattributable_sales`, `adjusted_total` or `below_committed` (see
+  [api.md](api.md#per-variant-stock)); `attempts`, `first_blocked_at` and `last_attempt_at`
+  show how long and how often. A sync upserts it while the listing is blocked
+  and deletes it when the listing converts or its record stops listing several
+  variants. `scripts/variant-conversion-sweep.sh` (read-only, like
+  `listing-record-sweep.sh`) lists it and prints the `sync-many` body that
+  retries those listings; `sync-many` reports the state per item.
+- Backfill: one implicit row per listing that has none, equal to the listing's
+  totals. A rerun adds nothing to a listing that already has rows, so it never
+  re-adds an implicit row beside keyed rows. The statement reads `listings`
+  and inserts into the new table; it takes no lock on `listings`.
+- Three triggers keep the listing's quantity columns the sum of its rows in
+  the same statement as every change: `listing_variant_inventory_roll_up`
+  (rows to listing), `listings_variant_rows_follow` (a direct write of the
+  listing's quantity columns, to the implicit row) and
+  `listings_implicit_variant_row` (every new listing has its implicit row).
+
+No index is built on an existing table. `ALTER TABLE ... ADD COLUMN` adds
+nullable columns without a default, and the file sets `lock_timeout` like 0050,
+so creating the triggers on `listings` fails the start instead of queueing
+behind a long transaction.
+
+**Deploy mode: rolling.** A binary from before 0070 keeps working on a listing
+that sells one variant: its write of the listing's totals is copied into the
+implicit row, and its `INSERT INTO listings` gets an implicit row from the
+insert trigger. It cannot sell a listing that tracks several variants: its
+write of that listing's totals raises `check_violation` (`listing ... tracks
+stock per variant`) and rolls that transaction back, instead of selling units
+the variant rows do not know about. A listing becomes variant-tracked only when
+a new binary reads a record with two or more enabled variants, so during the
+overlap an old replica refuses only those listings. Roll forward rather than
+back once a listing tracks variants: a binary that predates 0070 would refuse
+every sale of it.
+
+The backfill gives every existing listing one implicit row, because a
+migration cannot read the seller's homeserver record. A listing whose record
+lists two or more enabled variants becomes variant-tracked at its next sync.
+After the deploy, run `sync-many` over the live listings that have several
+variants so they convert at once (a listing with open holds, or with sales that
+do not attribute to the record's variants, converts at a later sync and shows
+in `scripts/variant-conversion-sweep.sh` until then).
+
+**Totals that counted a disabled variant.** Before 0070 a listing that sold one
+variant counted the stock of the record's disabled variants in its total. The
+first sync of the record after the deploy recomputes the total from the enabled
+variants: at the same record revision while the total is still exactly the old
+sum (a seller's `inventory.adjust` has moved it otherwise, and stays), and at
+any newer revision as for every edit. The new total is never below the units
+already reserved or sold. For a listing whose enabled stock is below its sold
+units the total becomes the sold units and the listing reads `sold`. Listings
+with no disabled variant are untouched. `sync-many` over the live listings
+applies it at once.
+
+`crates/service/tests/migration_0070_test.rs` (serial: it replays 0032 on a
+scratch database) pins the backfill on a database migrated through 0061 (the last migration
+before 0070 in this tree; 0062 to 0069 are the connectors' and are not here), the
+rerun, each trigger, the old-binary write, and the table's checks.
+

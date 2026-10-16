@@ -26,6 +26,7 @@ pub struct ConnectionRow {
     pub provider: String,
     pub shop: String,
     pub app_kind: String,
+    pub variant_mode: String,
     pub status: String,
     pub scopes: Vec<String>,
     pub missing_scopes: Vec<String>,
@@ -39,8 +40,8 @@ pub struct ConnectionRow {
     pub updated_at: DateTime<Utc>,
 }
 
-pub const CONNECTION_COLUMNS: &str = "id, seller_pubky, provider, shop, app_kind, status, scopes, \
-     missing_scopes, connect_state_hash, state_expires_at, connect_expires_at, connected_at, \
+pub const CONNECTION_COLUMNS: &str = "id, seller_pubky, provider, shop, app_kind, variant_mode, status, \
+     scopes, missing_scopes, connect_state_hash, state_expires_at, connect_expires_at, connected_at, \
      last_error, last_error_at, created_at, updated_at";
 
 /// The states in which a connection holds an access credential for the store.
@@ -53,6 +54,10 @@ impl ConnectionRow {
 
     pub fn app_kind(&self) -> AppKind {
         AppKind::parse(&self.app_kind).unwrap_or(AppKind::None)
+    }
+
+    pub fn is_split(&self) -> bool {
+        self.variant_mode == "split"
     }
 
     pub fn is_live(&self) -> bool {
@@ -812,6 +817,113 @@ pub fn truncate(text: &str, max_chars: usize) -> String {
     text.chars().take(max_chars).collect()
 }
 
+/// A listing that combined several store variants and was unmapped when the
+/// connection switched to `split`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnmappedListing {
+    pub listing_id: String,
+    /// How many variant mappings the listing had.
+    pub mappings_removed: i64,
+}
+
+/// What switching the variant mode did.
+#[derive(Debug)]
+pub struct VariantSwitch {
+    pub connection: ConnectionRow,
+    /// Listings unmapped because they combined several store variants; empty
+    /// unless the connection switched to `split`.
+    pub unmapped: Vec<UnmappedListing>,
+}
+
+/// Sets how the connection's store variants relate to Pubky listings
+/// (`native` or `split`). Switching to `split` unmaps every listing that
+/// combines several store variants (all of its mappings: which one the listing
+/// keeps is the seller's call), in the same transaction, and raises a
+/// `listings_unmapped` alert naming them. The seller then re-imports each
+/// store variant as its own listing or ends the combined one; the product
+/// selection is left as it was, so the catalog still offers them. Nothing is
+/// refused: an unmapped listing is the starting point of that fix, and a
+/// refusal that told the seller to unmap first would send them in a circle.
+pub async fn set_variant_mode(
+    pool: &PgPool,
+    connection: &ConnectionRow,
+    split: bool,
+    now: DateTime<Utc>,
+) -> Result<VariantSwitch, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('connector-map|' || $1::text, 0))")
+        .bind(connection.id)
+        .execute(&mut *tx)
+        .await?;
+    let mut unmapped = Vec::new();
+    if split {
+        let removed: Vec<(String, i64)> = sqlx::query_as(
+            "WITH combined AS ( \
+                 SELECT listing_id FROM connector_variant_map WHERE connection_id = $1 \
+                 GROUP BY listing_id HAVING COUNT(*) > 1), \
+             gone AS ( \
+                 DELETE FROM connector_variant_map m USING combined c \
+                 WHERE m.connection_id = $1 AND m.listing_id = c.listing_id \
+                 RETURNING m.listing_id) \
+             SELECT listing_id, COUNT(*) FROM gone GROUP BY listing_id ORDER BY listing_id",
+        )
+        .bind(connection.id)
+        .fetch_all(&mut *tx)
+        .await?;
+        unmapped = removed
+            .into_iter()
+            .map(|(listing_id, mappings_removed)| UnmappedListing {
+                listing_id,
+                mappings_removed,
+            })
+            .collect();
+    }
+    let row: ConnectionRow = sqlx::query_as(&format!(
+        "UPDATE connector_connections SET variant_mode = $2, updated_at = $3 \
+         WHERE id = $1 AND seller_pubky = $4 RETURNING {CONNECTION_COLUMNS}"
+    ))
+    .bind(connection.id)
+    .bind(if split { "split" } else { "native" })
+    .bind(now)
+    .bind(&connection.seller_pubky)
+    .fetch_one(&mut *tx)
+    .await?;
+    if !unmapped.is_empty() {
+        let names = unmapped
+            .iter()
+            .map(|listing| {
+                format!(
+                    "{} ({} variants)",
+                    listing.listing_id, listing.mappings_removed
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        raise_alert(
+            &mut *tx,
+            now,
+            &row,
+            AlertKind::ListingsUnmapped,
+            None,
+            &format!(
+                "Switching to split variant mode unmapped {} listing{} that combined several store variants: {names}. \
+                 In split mode each store variant is its own Pubky listing: re-import each variant from the store's \
+                 catalog as a separate listing, or end the combined listing. Orders for an unmapped listing are not \
+                 sent to the store until it is mapped again.",
+                unmapped.len(),
+                if unmapped.len() == 1 { "" } else { "s" },
+            ),
+            &format!("listings-unmapped|{}|{}", row.id, crate::clock::format_timestamp(now)),
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(VariantSwitch {
+        connection: row,
+        unmapped,
+    })
+}
+
 // === Mappings and product selection ==========================================
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, sqlx::FromRow)]
@@ -843,6 +955,9 @@ pub enum MappingError {
     UnknownListing(String),
     /// A uniqueness violation: the pair is already mapped to something else.
     Conflict,
+    /// In `split` mode each store variant has its own listing, so a listing
+    /// appears in the mapping once.
+    SharedListing(String),
     Database(sqlx::Error),
 }
 
@@ -867,18 +982,28 @@ pub async fn replace_mappings(
         .bind(connection.id)
         .execute(&mut *tx)
         .await?;
-    let still_live: Option<String> = sqlx::query_scalar(
-        "SELECT status FROM connector_connections WHERE id = $1 AND seller_pubky = $2 FOR UPDATE",
+    let still_live: Option<(String, String)> = sqlx::query_as(
+        "SELECT status, variant_mode FROM connector_connections \
+         WHERE id = $1 AND seller_pubky = $2 FOR UPDATE",
     )
     .bind(connection.id)
     .bind(&connection.seller_pubky)
     .fetch_optional(&mut *tx)
     .await?;
-    if !matches!(
-        still_live.as_deref(),
-        Some("connected" | "needs_attention" | "error")
-    ) {
+    let Some((status, variant_mode)) = still_live else {
         return Err(MappingError::Database(sqlx::Error::RowNotFound));
+    };
+    if !matches!(status.as_str(), "connected" | "needs_attention" | "error") {
+        return Err(MappingError::Database(sqlx::Error::RowNotFound));
+    }
+    if variant_mode == "split" {
+        let mut seen = std::collections::HashSet::new();
+        if let Some(shared) = mappings
+            .iter()
+            .find(|mapping| !seen.insert(mapping.listing_id.as_str()))
+        {
+            return Err(MappingError::SharedListing(shared.listing_id.clone()));
+        }
     }
     let listing_ids: Vec<String> = mappings
         .iter()
@@ -1082,6 +1207,14 @@ pub enum AlertKind {
     /// Pubky. Informational: the seller corrects the store; there is nothing
     /// to retry.
     RefundReversedAfterMirror,
+    /// Switching to split variant mode unmapped listings that combined several
+    /// store variants; the seller re-imports or ends them.
+    ListingsUnmapped,
+    /// A store stock change named a variant the service cannot address: the
+    /// mapping is stale. Permanent until the seller re-maps.
+    VariantMappingError,
+    /// The store order's total is not what the buyer paid.
+    PushTotalMismatch,
 }
 
 impl AlertKind {
@@ -1095,6 +1228,9 @@ impl AlertKind {
             AlertKind::CredentialsRejected => "credentials_rejected",
             AlertKind::InboundFailed => "inbound_failed",
             AlertKind::RefundReversedAfterMirror => "refund_reversed_after_mirror",
+            AlertKind::ListingsUnmapped => "listings_unmapped",
+            AlertKind::VariantMappingError => "variant_mapping_error",
+            AlertKind::PushTotalMismatch => "push_total_mismatch",
         }
     }
 }
@@ -1140,6 +1276,10 @@ pub struct AlertRow {
     pub detail: String,
     pub created_at: DateTime<Utc>,
     pub resolved_at: Option<DateTime<Utc>>,
+    /// The Pubky order's state now, to say which existing flow applies.
+    pub order_state: Option<String>,
+    pub order_fulfillment: Option<String>,
+    pub refund_recorded: Option<bool>,
 }
 
 pub async fn list_alerts(
@@ -1149,10 +1289,12 @@ pub async fn list_alerts(
     limit: i64,
 ) -> Result<Vec<AlertRow>, sqlx::Error> {
     sqlx::query_as(
-        "SELECT id, connection_id, kind, pubky_order_id, detail, created_at, resolved_at \
-         FROM connector_alerts \
-         WHERE seller_pubky = $1 AND (NOT $2 OR resolved_at IS NULL) \
-         ORDER BY created_at DESC, id LIMIT $3",
+        "SELECT a.id, a.connection_id, a.kind, a.pubky_order_id, a.detail, a.created_at, \
+                a.resolved_at, o.state AS order_state, o.fulfillment AS order_fulfillment, \
+                (o.external_refund IS NOT NULL) AS refund_recorded \
+         FROM connector_alerts a LEFT JOIN orders o ON o.id = a.pubky_order_id \
+         WHERE a.seller_pubky = $1 AND (NOT $2 OR a.resolved_at IS NULL) \
+         ORDER BY a.created_at DESC, a.id LIMIT $3",
     )
     .bind(seller_pubky)
     .bind(unresolved_only)

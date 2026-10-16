@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use axum::http::StatusCode;
 use common::connector_provider::*;
-use common::{create_paid_order, execute, new_actor, order_command, TestActor, TestApp};
+use common::{create_paid_order, new_actor, TestActor, TestApp};
 use marketplace_service::clock::Clock;
 use marketplace_service::connectors::provider::{
     CatalogOption, CatalogProduct, CatalogVariant, Price,
@@ -21,7 +21,6 @@ struct Shop {
     app: TestApp,
     store: Arc<TestStore>,
     seller: TestActor,
-    buyer: TestActor,
     connection: Uuid,
     order_id: String,
 }
@@ -40,7 +39,6 @@ async fn shop(pool: PgPool) -> Shop {
         app,
         store,
         seller,
-        buyer,
         connection,
         order_id: order.order_id,
     }
@@ -375,11 +373,12 @@ async fn a_fulfillment_webhook_ships_the_pubky_order_with_its_tracking(pool: PgP
     worker::drive_inbound(&s.app.state, 10)
         .await
         .expect("drive");
-    // A second shipment with another number is a tracking change, applied with
-    // `fulfillment.update_tracking`.
     assert_eq!(
         inbound(&s.app, "evt-ship-2").await,
-        ("applied".to_string(), Some("tracking_updated".to_string()))
+        (
+            "ignored".to_string(),
+            Some("already_shipped_with_tracking".to_string())
+        )
     );
     let tracking: String =
         sqlx::query_scalar("SELECT shipment->>'tracking_number' FROM orders WHERE id = $1::uuid")
@@ -387,7 +386,7 @@ async fn a_fulfillment_webhook_ships_the_pubky_order_with_its_tracking(pool: PgP
             .fetch_one(&s.app.pool)
             .await
             .expect("tracking");
-    assert_eq!(tracking, "1Z999");
+    assert_eq!(tracking, "JD0146000");
 
     webhook(
         &s.app,
@@ -823,44 +822,24 @@ async fn the_stock_poll_applies_catalog_stock_to_mapped_variants(pool: PgPool) {
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_shipment_the_marketplace_refuses_is_not_dropped_quietly(pool: PgPool) {
     let s = shop(pool).await;
-    // The buyer cancelled and the seller approved in Pubky; the merchant then
-    // marks the store order shipped.
-    let (status, body) = execute(
-        &s.app,
-        &s.buyer.token,
-        &order_command(
-            "order.cancel_request",
-            &s.order_id,
-            2,
-            json!({ "reason": "changed my mind" }),
-            9_001,
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let (status, body) = execute(
-        &s.app,
-        &s.seller.token,
-        &order_command("order.cancel_approve", &s.order_id, 3, json!({}), 9_002),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
+    // A tracking number with a control character is refused by the command's
+    // validation: the store says the order shipped, Pubky would not record it.
     webhook(
         &s.app,
         SHOP,
-        "evt-ship-late",
+        "evt-ship-bad",
         "fulfillments/create",
-        &json!({ "type": "fulfillment", "order": "ext-1", "carrier": "DHL", "tracking": "JD1" }),
+        &json!({ "type": "fulfillment", "order": "ext-1", "carrier": "DHL", "tracking": "JD\u{7}1" }),
     )
     .await;
     worker::drive_inbound(&s.app.state, 10)
         .await
         .expect("drive");
     assert_eq!(
-        inbound(&s.app, "evt-ship-late").await,
+        inbound(&s.app, "evt-ship-bad").await,
         (
             "ignored".to_string(),
-            Some("order_not_shippable".to_string())
+            Some("refused_invalid_command".to_string())
         )
     );
     let (_, alerts) = api(
@@ -879,4 +858,10 @@ async fn a_shipment_the_marketplace_refuses_is_not_dropped_quietly(pool: PgPool)
         .as_str()
         .expect("detail")
         .contains("refused to record"));
+    let state: String = sqlx::query_scalar("SELECT state FROM orders WHERE id = $1::uuid")
+        .bind(&s.order_id)
+        .fetch_one(&s.app.pool)
+        .await
+        .expect("order");
+    assert_eq!(state, "paid", "nothing was shipped");
 }

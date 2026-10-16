@@ -1,0 +1,72 @@
+{
+  "_provenance": "spec-derived: shape of the ProductsPage document against the 2026-10 schema; not a capture",
+  "data": {
+    "shop": {
+      "currencyCode": "USD"
+    },
+    "products": {
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": "cursor-page-2"
+      },
+      "nodes": [
+        {
+          "id": "gid://shopify/Product/9002",
+          "title": "Enamel Mug",
+          "description": "",
+          "onlineStoreUrl": null,
+          "options": [
+            {
+              "name": "Title",
+              "values": [
+                "Default Title"
+              ]
+            }
+          ],
+          "images": {
+            "nodes": []
+          },
+          "variants": {
+            "pageInfo": {
+              "hasNextPage": false,
+              "endCursor": "v-end"
+            },
+            "nodes": [
+              {
+                "id": "gid://shopify/ProductVariant/50010",
+                "title": "Default Title",
+                "sku": "",
+                "price": "18.50",
+                "selectedOptions": [
+                  {
+                    "name": "Title",
+                    "value": "Default Title"
+                  }
+                ],
+                "image": null,
+                "inventoryQuantity": 40,
+                "inventoryItem": {
+                  "tracked": false
+                }
+              }
+            ]
+          },
+          "productType": "",
+          "vendor": "Dezentral Goods",
+          "category": null
+        }
+      ]
+    }
+  },
+  "extensions": {
+    "cost": {
+      "requestedQueryCost": 142,
+      "actualQueryCost": 8,
+      "throttleStatus": {
+        "maximumAvailable": 2000.0,
+        "currentlyAvailable": 1990,
+        "restoreRate": 100.0
+      }
+    }
+  }
+}
