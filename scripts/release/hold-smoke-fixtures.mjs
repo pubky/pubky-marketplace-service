@@ -202,7 +202,12 @@ async function main(mode) {
             mimeType: 'image/png', byteSize: png.bytes.length, width: png.width, height: png.height, altText: 'Hold-smoke fixture',
           };
           const record = fixtureRecord(kind, { listingId, pubky: pk, media });
-          await session.storage.putJson(`${LISTINGS}/${listingId}`, record);
+          try {
+            await session.storage.putJson(`${LISTINGS}/${listingId}`, record);
+          } catch (error) {
+            await session.storage.delete(`${MEDIA}/${mediaId}`).catch(() => log(`${kind}: orphan media ${mediaId} left; delete it`));
+            throw error;
+          }
           const reg = await fetch(`${SERVICE}/v1/commands`, {
             method: 'POST', headers: { authorization: `Bearer ${await bearer()}`, 'content-type': 'application/json' },
             body: JSON.stringify(registerCommand(kind, record)),
