@@ -26,11 +26,13 @@ Option B:
       unopened and holds no plaintext address, so each order must have a
       NULL `delivery_address`, the 2096 sent bytes and the sent key id;
   (b) pickup-only (no address of any kind);
+Every listing comes from the dedicated fixture seller (FIXTURE_SELLER, env
+HOLD_SMOKE_FIXTURE_SELLER); no other seller's listing is picked or modified.
   (c) two unheld checkout.create 200s, then bind exclusivity (first
       POST /v0/orders/{id}/payment-method holds; loser 409 HOLDING_COPY);
   (d) hold TTL equals live FIAT_PAYMENT_WINDOW_SECONDS (exact-key read);
   (e) one digital case per delivery kind (file, link, text, email, message)
-      on a staging listing that already has that delivery set: the digital
+      on a fixture listing that already has that delivery set: the digital
       checkout (no address, `delivery_email` only for the email kind), the
       bind hold on the listing's stock, nothing released or logged while the
       payment is pending (buyer download and the email read answer
@@ -71,6 +73,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import uuid
@@ -96,6 +99,16 @@ STAGING_PROJECT = "c991d768-4a3c-42ea-b5ed-eaa22d4916ed"
 STAGING_ENVIRONMENT = "c67a6435-bb23-453b-9169-764bfa0312e1"
 STAGING_SERVICE = "3e98e363-f9a7-4711-b668-d714acee6e32"
 PRODUCTION_PROJECT = "75faa4fe-466c-4277-977f-1d8e4e31df8c"
+# Every listing the smoke holds, buys or cancels belongs to this dedicated staging seller
+# ("Hold-smoke fixtures (staging)"): a shipping, a pickup-only and one digital "SMOKE FIXTURE, do not buy"
+# listing per kind. Other sellers' listings are never picked or modified.
+FIXTURE_SELLER = os.environ.get(
+    "HOLD_SMOKE_FIXTURE_SELLER", "ka7q4cmabp6amo13bye9q6iwhb4pxuwr9fo37h5ygx4uk9e63tjy"
+)
+FIXTURE_HINT = (
+    "publish the hold-smoke fixtures on the fixture seller "
+    "(scripts/release/hold-smoke-fixtures.mjs publish for shipping and pickup)"
+)
 PRODUCTION_HOST_MARKERS = (
     "marketplace-service-production-ce23",
     "shop.pubky.app",
@@ -419,9 +432,17 @@ def digital_listing_query(kind: str, exclude: set[str]) -> str:
         "AND l.fulfillment_methods::text LIKE '%digital%' "
         f"AND l.digital_delivery_kind='{kind}' "
         "AND c.paypal_merchant_email IS NOT NULL AND btrim(c.paypal_merchant_email) <> '' "
+        f"{fixture_seller_clause()}"
         f"{excluded}"
         "ORDER BY l.updated_at DESC NULLS LAST LIMIT 5;"
     )
+
+
+def fixture_seller_clause(seller: str | None = None) -> str:
+    seller = FIXTURE_SELLER if seller is None else seller
+    if not re.fullmatch(r"[ybndrfg8ejkmcpqxot1uwisza345h769]{52}", seller):
+        raise RuntimeError("HOLD_SMOKE_FIXTURE_SELLER must be a 52-character z-base-32 pubky")
+    return f"AND l.seller_pubky='{seller}' "
 
 
 def refusal_reason(body: dict | str) -> str | None:
@@ -596,6 +617,19 @@ def self_check() -> None:
     for shipping_case in (True, False):
         if "l.deleted_at IS NULL" not in listing_pick_query(shipping=shipping_case)[0]:
             raise RuntimeError("shipping and pickup listing picks must skip tombstoned listings")
+    seller_clause = f"AND l.seller_pubky='{FIXTURE_SELLER}'"
+    pick_queries = [listing_pick_query(shipping=case)[0] for case in (True, False)]
+    pick_queries += [digital_listing_query(kind, set()) for kind in DIGITAL_KINDS]
+    if not all(seller_clause in query for query in pick_queries):
+        raise RuntimeError("every listing pick must be limited to the fixture seller")
+    if re.search(r"UPDATE\s+listings", Path(__file__).read_text().replace("UPDATE\\s+listings", "")):
+        raise RuntimeError("the smoke must never rewrite a listing row")
+    for bad_seller in ("", "ka7q4cma", f"{FIXTURE_SELLER[:51]}'", f"{FIXTURE_SELLER}' OR '1'='1", "l" * 52):
+        try:
+            fixture_seller_clause(bad_seller)
+        except RuntimeError:
+            continue
+        raise RuntimeError(f"a malformed fixture seller was accepted: {bad_seller!r}")
     for bad in (
         lambda: checkout_body(
             digital_listing, str(uuid.uuid4()), fulfillment="digital", address=SHIPPING_ADDRESSES["ca_iso_suffix"]
@@ -910,6 +944,7 @@ def listing_pick_query(*, shipping: bool, exclude: set[str] | None = None) -> tu
         "WHERE l.deleted_at IS NULL "
         "AND l.sale_format='fixed_price' AND l.state='available' AND l.available_quantity=1 "
         "AND l.reserved_quantity=0 "
+        f"{fixture_seller_clause()}"
         f"{clause} {excluded}"
         "ORDER BY (CASE "
         "WHEN c.paypal_merchant_email IS NOT NULL AND btrim(c.paypal_merchant_email) <> '' THEN 0 "
@@ -928,7 +963,7 @@ def pick_listing(
         rows = [row for row in rows if row.get("bind_method") == "paypal"]
     if not rows:
         suffix = " with paypal" if require_bind else ""
-        raise RuntimeError(f"no qty-1 available {label} listing{suffix}\n{raw!r}")
+        raise RuntimeError(f"no qty-1 available {label} listing{suffix} from the fixture seller: {FIXTURE_HINT}\n{raw!r}")
     listing = rows[0]
     methods = listing["fulfillment_methods"]
     if shipping and "shipping" not in methods:
@@ -937,50 +972,6 @@ def pick_listing(
         raise RuntimeError(f"picked listing is not pickup-only: {methods!r}")
     return listing
 
-
-def restore_listing_methods(aggregate_id: str, methods: str) -> None:
-    raw = sql(
-        "UPDATE listings SET fulfillment_methods = "
-        f"'{quote(methods)}'::text[], updated_at = now() "
-        f"WHERE aggregate_id='{quote(aggregate_id)}' "
-        "RETURNING fulfillment_methods::text;"
-    )
-    restored = sql_scalar(raw)
-    if restored != methods:
-        raise RuntimeError(f"restore fulfillment_methods {restored!r} != {methods!r}")
-
-
-def ensure_pickup_listing(exclude: set[str]) -> tuple[dict[str, Any], dict[str, str] | None]:
-    """Return a pickup-only qty-1 listing.
-
-    Staging today has shipping-only rows. If no pickup-only listing exists,
-    temporarily retarget a second shipping listing to `{pickup}` and restore
-    the original methods in the caller's finally.
-    """
-    try:
-        return pick_listing(shipping=False, exclude=exclude, require_bind=True), None
-    except RuntimeError as error:
-        if "no qty-1 available pickup-only listing" not in str(error):
-            raise
-    donor = pick_listing(shipping=True, exclude=exclude, require_bind=True)
-    original = donor["fulfillment_methods"]
-    raw = sql(
-        "UPDATE listings SET fulfillment_methods = '{pickup}'::text[], updated_at = now() "
-        f"WHERE aggregate_id='{quote(donor['aggregate_id'])}' "
-        "AND state='available' AND available_quantity=1 AND reserved_quantity=0 "
-        "AND fulfillment_methods::text NOT LIKE '%pickup%' "
-        "RETURNING aggregate_id || '|' || seller_pubky || '|' || server_revision::text "
-        "|| '|' || available_quantity::text || '|' || fulfillment_methods::text;"
-    )
-    rows = parse_listing_rows(raw)
-    if not rows:
-        raise RuntimeError(f"failed to retarget donor listing for pickup\n{raw!r}")
-    listing = rows[0]
-    listing["bind_method"] = donor.get("bind_method", "")
-    if "pickup" not in listing["fulfillment_methods"] or "shipping" in listing["fulfillment_methods"]:
-        restore_listing_methods(donor["aggregate_id"], original)
-        raise RuntimeError(f"donor is not pickup-only after retarget: {listing!r}")
-    return listing, {"aggregate_id": donor["aggregate_id"], "methods": original}
 
 
 def sql_scalar(raw: str) -> str:
@@ -1162,8 +1153,8 @@ def pick_digital_listing(kind: str, exclude: set[str]) -> dict[str, Any]:
     rows = parse_listing_rows(raw)
     if not rows:
         raise RuntimeError(
-            f"no available staging listing with {kind} delivery set and a PayPal rail; "
-            f"publish one on staging (sell with Digital delivery, then set {kind} on the edit page) "
+            f"no available {kind} fixture from the fixture seller with a PayPal rail; "
+            f"{FIXTURE_HINT} (digital kinds: Shop scripts/release/production-digital-fixture.mjs publish) "
             f"or run with --digital-kinds without {kind}\n{raw!r}"
         )
     listing = rows[0]
@@ -1605,10 +1596,9 @@ class Smoke:
                 print(f"session_cleanup_error={error}", file=sys.stderr)
 
     def run(self) -> dict[str, Any]:
-        pickup_restore: dict[str, str] | None = None
         try:
             shipping = pick_listing(shipping=True, require_bind=True)
-            pickup, pickup_restore = ensure_pickup_listing({shipping["aggregate_id"]})
+            pickup = pick_listing(shipping=False, exclude={shipping["aggregate_id"]}, require_bind=True)
             self.cases.append(self.plaintext_refusal(shipping, case="plaintext_refused_under_flag"))
             shipping = refresh_listing(shipping["aggregate_id"])
             self.cases.append(
@@ -1659,7 +1649,7 @@ class Smoke:
                 "marketplace_url": self.base,
                 "railway_project": self.project,
                 "fiat_window_seconds": self.fiat_window,
-                "pickup_methods_retargeted": pickup_restore is not None,
+                "fixture_seller": FIXTURE_SELLER[:8],
                 "digital_kinds": list(self.digital_kinds),
                 "cases": self.cases,
                 "orders_verified_cancelled": verified,
@@ -1691,11 +1681,6 @@ class Smoke:
             print("HOLD_SMOKE=STOP")
             raise
         finally:
-            if pickup_restore is not None:
-                try:
-                    restore_listing_methods(pickup_restore["aggregate_id"], pickup_restore["methods"])
-                except Exception as error:  # noqa: BLE001
-                    print(f"pickup_restore_error={error}", file=sys.stderr)
             self.cleanup_sessions()
 
 
