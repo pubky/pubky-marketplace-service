@@ -43,6 +43,19 @@ fn refusal_envelopes_terminal(runtime: &RefusalAuditRuntime) -> u64 {
         .saturating_add(metrics.dropped_writer_unverified)
 }
 
+/// Envelopes the audit lost to a writer that cannot take them: dropped after
+/// the attempt loop gave up, or refused up front because the five-second
+/// authority probe could not acquire the writer connection and so marked the
+/// writer unverified. A writer whose only connection is held or stuck reaches
+/// either outcome depending on where the probe tick falls in the burst, so
+/// tests that starve the writer count both.
+fn envelopes_lost(runtime: &RefusalAuditRuntime) -> u64 {
+    let metrics = runtime.metrics();
+    metrics
+        .dropped_after_retries
+        .saturating_add(metrics.dropped_writer_unverified)
+}
+
 /// Waits until `target` envelopes have reached any terminal path. The writer
 /// signals as each accepted envelope's attempt loop returns; producer-side
 /// drops are read from the outcome counters. The only clock is a stall guard.
@@ -2835,7 +2848,8 @@ async fn refusal_audit_real_fixture_is_invariant_across_writer_states(pool: PgPo
 
     sqlx::raw_sql("CREATE FUNCTION refusal_audit_timeout_fixture() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(1); RETURN NEW; END $$; CREATE TRIGGER refusal_audit_timeout_fixture BEFORE INSERT OR UPDATE ON command_refusal_audit_buckets FOR EACH ROW EXECUTE FUNCTION refusal_audit_timeout_fixture();")
         .execute(&pool).await.expect("timeout writer fixture");
-    let timeout_drops_before = writer.runtime.metrics().dropped_after_retries;
+    let timeout_lost_before = envelopes_lost(&writer.runtime);
+    let timeout_delivered_before = writer.runtime.metrics().delivered;
     let timeout_terminal_before = refusal_envelopes_terminal(&writer.runtime);
     for (case, expected) in cases.iter().zip(&golden) {
         let actual = tokio::time::timeout(
@@ -2866,14 +2880,11 @@ async fn refusal_audit_real_fixture_is_invariant_across_writer_states(pool: PgPo
     )
     .await;
     assert_eq!(
-        writer
-            .runtime
-            .metrics()
-            .dropped_after_retries
-            .saturating_sub(timeout_drops_before),
+        envelopes_lost(&writer.runtime).saturating_sub(timeout_lost_before),
         cases.len() as u64,
-        "every timed-out envelope exhausts three attempts"
+        "every timed-out envelope is lost, none is delivered"
     );
+    assert_eq!(writer.runtime.metrics().delivered, timeout_delivered_before);
     sqlx::raw_sql("DROP TRIGGER refusal_audit_timeout_fixture ON command_refusal_audit_buckets; DROP FUNCTION refusal_audit_timeout_fixture();")
         .execute(&pool).await.expect("remove timeout fixture");
 
@@ -2882,7 +2893,8 @@ async fn refusal_audit_real_fixture_is_invariant_across_writer_states(pool: PgPo
         .acquire()
         .await
         .expect("only writer slot on a pool of 1");
-    let exhausted_drops_before = writer.runtime.metrics().dropped_after_retries;
+    let exhausted_lost_before = envelopes_lost(&writer.runtime);
+    let exhausted_delivered_before = writer.runtime.metrics().delivered;
     let exhausted_terminal_before = refusal_envelopes_terminal(&writer.runtime);
     for (case, expected) in cases.iter().zip(&golden) {
         // Domain work under load exceeds 250ms. A handler that awaited the
@@ -2917,13 +2929,13 @@ async fn refusal_audit_real_fixture_is_invariant_across_writer_states(pool: PgPo
     )
     .await;
     assert_eq!(
-        writer
-            .runtime
-            .metrics()
-            .dropped_after_retries
-            .saturating_sub(exhausted_drops_before),
+        envelopes_lost(&writer.runtime).saturating_sub(exhausted_lost_before),
         cases.len() as u64,
-        "every exhausted envelope exhausts three attempts"
+        "every envelope of an exhausted writer is lost, none is delivered"
+    );
+    assert_eq!(
+        writer.runtime.metrics().delivered,
+        exhausted_delivered_before
     );
     drop(held_writer);
 
