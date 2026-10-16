@@ -2523,6 +2523,8 @@ struct FakePaykitState {
     /// from paykit-server, replayed verbatim (status and body) for that
     /// seller and asset. Consulted before the per-seller scripted status.
     setup_replays: HashMap<(String, Option<String>), (u16, String)>,
+    /// How long every `/setup/status` answer is held back, when set.
+    setup_status_delay: Option<std::time::Duration>,
 }
 
 /// A local paykit-server double serving the fork's marketplace surface
@@ -2619,6 +2621,15 @@ impl FakePaykit {
             .lock()
             .expect("fake paykit lock")
             .setup_status_failure = None;
+    }
+
+    /// Holds every `/setup/status` answer back by `delay`, as a slow
+    /// paykit-server does for a ready seller.
+    pub fn delay_setup_status(&self, delay: std::time::Duration) {
+        self.state
+            .lock()
+            .expect("fake paykit lock")
+            .setup_status_delay = Some(delay);
     }
 
     /// Makes every `/setup/status` call answer 200 with exactly this body.
@@ -2945,6 +2956,10 @@ async fn serve_paykit_setup_status(
         return paykit_error(StatusCode::BAD_REQUEST, "invalid_request");
     }
     paykit_record_call(&state, "POST", "/setup/status", &host, &parsed);
+    let delay = state.lock().expect("fake paykit lock").setup_status_delay;
+    if let Some(delay) = delay {
+        tokio::time::sleep(delay).await;
+    }
     let guard = state.lock().expect("fake paykit lock");
     if let Some(status) = guard.setup_status_failure {
         return paykit_error(
@@ -4108,6 +4123,7 @@ pub async fn spawn_fake_paykit() -> FakePaykit {
         setup_status_failure: None,
         setup_status_body: None,
         setup_replays: HashMap::new(),
+        setup_status_delay: None,
     }));
     let router = Router::new()
         .route("/health/ready", axum::routing::get(serve_paykit_health))

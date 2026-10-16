@@ -68,7 +68,7 @@ use crate::digital::DigitalKeys;
 use crate::homeserver::HomeserverListingClient;
 use crate::listing_moderation::ListingModerationGate;
 use crate::locks::LocksRuntime;
-use crate::payment_availability::PaymentAvailabilityCache;
+use crate::payment_availability::{BitcoinSetupReadyCache, PaymentAvailabilityCache};
 use crate::payments::PaymentsRuntime;
 use crate::pickup::PickupKeys;
 use crate::priv_keys::PrivKeys;
@@ -112,6 +112,9 @@ pub struct AppState {
     pub payments: Option<Arc<PaymentsRuntime>>,
     /// Cached Paykit rail and seller claim availability.
     pub payment_availability: PaymentAvailabilityCache,
+    /// The last `ready` per seller for the seller's own `bitcoin_setup`,
+    /// served only when the paykit-server ask fails.
+    pub bitcoin_setup_ready: BitcoinSetupReadyCache,
     /// The pickup-details sealing keys (local pickup design §A1). `None`
     /// when `PICKUP_DETAILS_ENCRYPTION_KEY` is unset: pickup is OFF —
     /// `pickup_details.set` is refused, no details are ever stored
@@ -194,6 +197,7 @@ impl AppState {
             command_flights: command_flight::CommandFlights::default(),
             payments: None,
             payment_availability: PaymentAvailabilityCache::default(),
+            bitcoin_setup_ready: BitcoinSetupReadyCache::default(),
             pickup: None,
             digital: None,
             priv_keys: None,

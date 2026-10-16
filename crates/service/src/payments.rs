@@ -36,6 +36,11 @@ pub const ENV_PAYKIT_REQUEST_SIGNING_KEY: &str = "PAYKIT_REQUEST_SIGNING_KEY";
 /// Environment variable selecting the paykit-server API the client speaks:
 /// `fork` (the default) or `upstream`. See [`PaykitApi`].
 pub const ENV_PAYKIT_SERVER_API: &str = "PAYKIT_SERVER_API";
+/// Environment variable overriding how long the signed upstream
+/// `POST /setup/status` may take, in whole seconds (1 to 30, default
+/// [`DEFAULT_SETUP_STATUS_TIMEOUT`]). paykit-server answers it for a ready
+/// seller noticeably slower than the other availability reads.
+pub const ENV_PAYKIT_SETUP_STATUS_TIMEOUT_SECONDS: &str = "PAYKIT_SETUP_STATUS_TIMEOUT_SECONDS";
 /// Environment variable overriding PayPal's IPN validation endpoint.
 /// Production leaves it unset (`https://ipnpb.paypal.com/cgi-bin/webscr`);
 /// tests point it at a local double so the real postback client is
@@ -46,6 +51,13 @@ const XNONCE_LEN: usize = 24;
 const KEY_LEN: usize = 32;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const AVAILABILITY_HTTP_TIMEOUT: Duration = Duration::from_secs(3);
+/// The upstream `POST /setup/status` timeout when
+/// [`ENV_PAYKIT_SETUP_STATUS_TIMEOUT_SECONDS`] is unset. Staging
+/// paykit-server takes 2 to 3.5 s to answer `ready`, so the 3 s
+/// availability timeout turned about one ready answer in five into
+/// `unavailable`.
+pub const DEFAULT_SETUP_STATUS_TIMEOUT: Duration = Duration::from_secs(8);
+const MAX_SETUP_STATUS_TIMEOUT_SECONDS: u64 = 30;
 /// Seals and opens seller secrets (Shippo API tokens).
 pub struct SellerSecretCipher {
     key: [u8; KEY_LEN],
@@ -864,6 +876,97 @@ pub enum SetupStatus {
     Unavailable,
 }
 
+/// Why `POST /setup/status` could not say `ready` or `setup_required`. Each
+/// is one `reason` of the `paykit setup status unavailable` warning, which
+/// carries the seller's 8-character prefix, the question asked and the
+/// elapsed time, never the full creator, the URL or a signature.
+enum SetupStatusFailure {
+    Signing(String),
+    Timeout,
+    Transport(&'static str),
+    Non2xx(u16),
+    BodyNotJson,
+    OutOfContract,
+    PaykitUnavailable,
+}
+
+impl SetupStatusFailure {
+    fn from_transport(error: &reqwest::Error) -> Self {
+        if error.is_timeout() {
+            Self::Timeout
+        } else {
+            Self::Transport(transport_error_class(error))
+        }
+    }
+
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::Signing(_) => "signing",
+            Self::Timeout => "timeout",
+            Self::Transport(_) => "transport",
+            Self::Non2xx(_) => "non_2xx",
+            Self::BodyNotJson => "body_not_json",
+            Self::OutOfContract => "out_of_contract",
+            Self::PaykitUnavailable => "paykit_unavailable",
+        }
+    }
+
+    fn log(&self, seller_pubky: &str, asset: Option<SetupAsset>, elapsed: Duration) {
+        let seller = crate::logging::actor_prefix(seller_pubky);
+        let question = asset.map_or("authority", SetupAsset::as_str);
+        let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+        let reason = self.reason();
+        match self {
+            Self::Signing(detail) => tracing::warn!(
+                reason,
+                seller = %seller,
+                question,
+                elapsed_ms,
+                detail = %detail,
+                "paykit setup status unavailable"
+            ),
+            Self::Transport(detail) => tracing::warn!(
+                reason,
+                seller = %seller,
+                question,
+                elapsed_ms,
+                detail,
+                "paykit setup status unavailable"
+            ),
+            Self::Non2xx(status) => tracing::warn!(
+                reason,
+                seller = %seller,
+                question,
+                elapsed_ms,
+                status,
+                "paykit setup status unavailable"
+            ),
+            _ => tracing::warn!(
+                reason,
+                seller = %seller,
+                question,
+                elapsed_ms,
+                "paykit setup status unavailable"
+            ),
+        }
+    }
+}
+
+/// A transport failure's class, without the URL or any upstream text.
+fn transport_error_class(error: &reqwest::Error) -> &'static str {
+    if error.is_connect() {
+        "connect"
+    } else if error.is_request() {
+        "request"
+    } else if error.is_body() {
+        "body"
+    } else if error.is_decode() {
+        "decode"
+    } else {
+        "other"
+    }
+}
+
 /// The bytes paykit-server verifies the `x-paykit-signature` over:
 /// `"paykit-http-signature-v1\0" + METHOD + "\0" + path + "\0" + raw_body`,
 /// with the method upper-cased and `path` the query-free request path
@@ -890,6 +993,7 @@ pub struct PaykitClient {
     signing_key: SigningKey,
     api: PaykitApi,
     http: reqwest::Client,
+    setup_status_timeout: Duration,
 }
 
 impl std::fmt::Debug for PaykitClient {
@@ -897,6 +1001,7 @@ impl std::fmt::Debug for PaykitClient {
         f.debug_struct("PaykitClient")
             .field("base_url", &self.base_url)
             .field("api", &self.api)
+            .field("setup_status_timeout", &self.setup_status_timeout)
             .field("signing_key", &"<redacted>")
             .finish()
     }
@@ -999,6 +1104,7 @@ impl PaykitClient {
             signing_key: SigningKey::from_bytes(&seed),
             api: PaykitApi::Fork,
             http: reqwest::Client::builder().timeout(HTTP_TIMEOUT).build()?,
+            setup_status_timeout: DEFAULT_SETUP_STATUS_TIMEOUT,
         })
     }
 
@@ -1006,6 +1112,14 @@ impl PaykitClient {
     /// [`PaykitApi::Fork`]).
     pub fn with_api(mut self, api: PaykitApi) -> Self {
         self.api = api;
+        self
+    }
+
+    /// How long the upstream `POST /setup/status` may take (default
+    /// [`DEFAULT_SETUP_STATUS_TIMEOUT`]). Every other availability read keeps
+    /// its 3 s timeout.
+    pub fn with_setup_status_timeout(mut self, timeout: Duration) -> Self {
+        self.setup_status_timeout = timeout;
         self
     }
 
@@ -1074,8 +1188,13 @@ impl PaykitClient {
     /// closed (`{"accepted_asset"? | "asset"?, "creator"}`) and so is the
     /// answer
     /// (`{"status": "ready" | "setup_required" | "unavailable"}`): a non-2xx
-    /// answer, a transport failure, no answer within the 3 s availability
-    /// timeout and anything outside the contract are `Err(Unavailable)`. Nothing here ever starts a Paykit authorization
+    /// answer, a transport failure, no answer within the setup status timeout
+    /// ([`DEFAULT_SETUP_STATUS_TIMEOUT`] unless
+    /// [`ENV_PAYKIT_SETUP_STATUS_TIMEOUT_SECONDS`] overrides it) and anything
+    /// outside the contract are `Err(Unavailable)`. Every one of those, and
+    /// the `unavailable` answer itself, is logged at warn as
+    /// `paykit setup status unavailable` with a `reason` (see
+    /// `SetupStatusFailure`). Nothing here ever starts a Paykit authorization
     /// flow: rc10 says callers "must not convert `unavailable` into a new
     /// authorization flow". A server that predates `accepted_asset` refuses
     /// the USDT body with `400 invalid_request`, which is a non-2xx answer
@@ -1085,32 +1204,43 @@ impl PaykitClient {
         seller_pubky: &str,
         asset: Option<SetupAsset>,
     ) -> Result<SetupStatus, PaykitRequestError> {
+        let started = std::time::Instant::now();
+        let unavailable = |failure: SetupStatusFailure| {
+            failure.log(seller_pubky, asset, started.elapsed());
+            PaykitRequestError::Unavailable
+        };
         let url = format!("{}/setup/status", self.base_url);
         let mut request = serde_json::json!({ "creator": pubky_app_key(seller_pubky) });
         if let Some(asset) = asset {
             request[asset.field()] = serde_json::json!(asset.as_str());
         }
-        let (body, signature) = self.signed_body(&url, &request).map_err(|error| {
-            tracing::error!(error = %error, "paykit setup status request could not be signed");
-            PaykitRequestError::Unavailable
-        })?;
+        let (body, signature) = self
+            .signed_body(&url, &request)
+            .map_err(|error| unavailable(SetupStatusFailure::Signing(error.to_string())))?;
         let response = self
             .http
             .post(url)
             .header("x-paykit-signature", signature)
             .body(body)
-            .timeout(AVAILABILITY_HTTP_TIMEOUT)
+            .timeout(self.setup_status_timeout)
             .send()
             .await
-            .map_err(|_| PaykitRequestError::Unavailable)?;
+            .map_err(|error| unavailable(SetupStatusFailure::from_transport(&error)))?;
         if !response.status().is_success() {
-            tracing::warn!(status = %response.status(), "paykit setup status rejected");
-            return Err(PaykitRequestError::Unavailable);
+            return Err(unavailable(SetupStatusFailure::Non2xx(
+                response.status().as_u16(),
+            )));
         }
         let body = response
             .json::<serde_json::Value>()
             .await
-            .map_err(|_| PaykitRequestError::Unavailable)?;
+            .map_err(|error| {
+                unavailable(if error.is_timeout() {
+                    SetupStatusFailure::Timeout
+                } else {
+                    SetupStatusFailure::BodyNotJson
+                })
+            })?;
         let status = body
             .as_object()
             .filter(|object| object.len() == 1)
@@ -1119,17 +1249,30 @@ impl PaykitClient {
         match status {
             Some("ready") => Ok(SetupStatus::Ready),
             Some("setup_required") => Ok(SetupStatus::SetupRequired),
-            Some("unavailable") => Ok(SetupStatus::Unavailable),
-            _ => {
-                tracing::warn!("paykit setup status answered outside its contract");
-                Err(PaykitRequestError::Unavailable)
+            Some("unavailable") => {
+                SetupStatusFailure::PaykitUnavailable.log(seller_pubky, asset, started.elapsed());
+                Ok(SetupStatus::Unavailable)
             }
+            _ => Err(unavailable(SetupStatusFailure::OutOfContract)),
         }
     }
 
     /// Fork seller readiness: whether the seller has a claimed watch-only
     /// account (`GET /v0/accounts/{creator}`).
+    /// Every failure is logged at warn as `paykit account lookup unavailable`
+    /// with a `reason` (`timeout`, `transport`, `non_2xx`, `bad_body`).
     async fn fork_account_claimed(&self, seller_pubky: &str) -> Result<bool, PaykitRequestError> {
+        let started = std::time::Instant::now();
+        let unavailable = |reason: &'static str, status: Option<u16>| {
+            tracing::warn!(
+                reason,
+                seller = %crate::logging::actor_prefix(seller_pubky),
+                elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                status,
+                "paykit account lookup unavailable"
+            );
+            PaykitRequestError::Unavailable
+        };
         let response = self
             .http
             .get(format!(
@@ -1140,9 +1283,18 @@ impl PaykitClient {
             .timeout(AVAILABILITY_HTTP_TIMEOUT)
             .send()
             .await
-            .map_err(|_| PaykitRequestError::Unavailable)?;
+            .map_err(|error| {
+                unavailable(
+                    if error.is_timeout() {
+                        "timeout"
+                    } else {
+                        "transport"
+                    },
+                    None,
+                )
+            })?;
         if !response.status().is_success() {
-            return Err(PaykitRequestError::Unavailable);
+            return Err(unavailable("non_2xx", Some(response.status().as_u16())));
         }
         #[derive(Deserialize)]
         struct Existence {
@@ -1152,7 +1304,16 @@ impl PaykitClient {
             .json::<Existence>()
             .await
             .map(|existence| existence.claimed)
-            .map_err(|_| PaykitRequestError::Unavailable)
+            .map_err(|error| {
+                unavailable(
+                    if error.is_timeout() {
+                        "timeout"
+                    } else {
+                        "bad_body"
+                    },
+                    None,
+                )
+            })
     }
 
     /// Reads Paykit's rail-wide Bitcoin offer gate (see
@@ -2270,21 +2431,31 @@ impl std::fmt::Debug for PaymentsRuntime {
     }
 }
 
-/// The Paykit client from its three settings. URL and signing key come
-/// together or not at all; the API selector is meaningless without them, so
-/// setting it alone is refused rather than silently ignored.
+/// The Paykit client from its settings. URL and signing key come together
+/// or not at all; the API selector and the setup status timeout are
+/// meaningless without them, so setting either alone is refused rather than
+/// silently ignored.
 fn paykit_client_from_settings(
     url: Option<String>,
     signing_seed: Option<String>,
     api: Option<String>,
+    setup_status_timeout: Option<String>,
 ) -> anyhow::Result<Option<PaykitClient>> {
     match (url, signing_seed) {
         (None, None) => {
-            if api.is_some() {
-                anyhow::bail!(
-                    "{ENV_PAYKIT_SERVER_API} is set without {ENV_PAYKIT_SERVER_URL} and \
-                     {ENV_PAYKIT_REQUEST_SIGNING_KEY}"
-                );
+            for (name, value) in [
+                (ENV_PAYKIT_SERVER_API, &api),
+                (
+                    ENV_PAYKIT_SETUP_STATUS_TIMEOUT_SECONDS,
+                    &setup_status_timeout,
+                ),
+            ] {
+                if value.is_some() {
+                    anyhow::bail!(
+                        "{name} is set without {ENV_PAYKIT_SERVER_URL} and \
+                         {ENV_PAYKIT_REQUEST_SIGNING_KEY}"
+                    );
+                }
             }
             Ok(None)
         }
@@ -2293,13 +2464,37 @@ fn paykit_client_from_settings(
                 .map(|value| PaykitApi::parse(&value))
                 .transpose()?
                 .unwrap_or_default();
-            Ok(Some(PaykitClient::new(&url, &seed)?.with_api(api)))
+            let setup_status_timeout = setup_status_timeout
+                .map(|value| parse_setup_status_timeout(&value))
+                .transpose()?
+                .unwrap_or(DEFAULT_SETUP_STATUS_TIMEOUT);
+            Ok(Some(
+                PaykitClient::new(&url, &seed)?
+                    .with_api(api)
+                    .with_setup_status_timeout(setup_status_timeout),
+            ))
         }
         _ => anyhow::bail!(
             "Paykit is partially configured: set both {ENV_PAYKIT_SERVER_URL} and \
              {ENV_PAYKIT_REQUEST_SIGNING_KEY}, or neither"
         ),
     }
+}
+
+/// [`ENV_PAYKIT_SETUP_STATUS_TIMEOUT_SECONDS`]: whole seconds, 1 to 30.
+fn parse_setup_status_timeout(value: &str) -> anyhow::Result<Duration> {
+    let seconds = value
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|seconds| (1..=MAX_SETUP_STATUS_TIMEOUT_SECONDS).contains(seconds))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{ENV_PAYKIT_SETUP_STATUS_TIMEOUT_SECONDS} must be whole seconds from 1 to \
+                 {MAX_SETUP_STATUS_TIMEOUT_SECONDS}"
+            )
+        })?;
+    Ok(Duration::from_secs(seconds))
 }
 
 /// Builds the production runtime from the environment, failing closed:
@@ -2322,6 +2517,7 @@ pub fn payments_runtime_from_env() -> anyhow::Result<Option<Arc<PaymentsRuntime>
         std::env::var(ENV_PAYKIT_SERVER_URL).ok(),
         std::env::var(ENV_PAYKIT_REQUEST_SIGNING_KEY).ok(),
         std::env::var(ENV_PAYKIT_SERVER_API).ok(),
+        std::env::var(ENV_PAYKIT_SETUP_STATUS_TIMEOUT_SECONDS).ok(),
     )?;
     let ipn_verify_url = std::env::var(ENV_PAYPAL_IPN_VERIFY_URL)
         .unwrap_or_else(|_| "https://ipnpb.paypal.com/cgi-bin/webscr".to_string());
@@ -2594,25 +2790,56 @@ mod tests {
         let api = |client: Option<PaykitClient>| client.expect("configured").api;
 
         assert_eq!(
-            api(paykit_client_from_settings(url.clone(), seed.clone(), None).unwrap()),
+            api(paykit_client_from_settings(url.clone(), seed.clone(), None, None).unwrap()),
             PaykitApi::Fork
         );
         assert_eq!(
-            api(
-                paykit_client_from_settings(url.clone(), seed.clone(), Some("upstream".into()))
-                    .unwrap()
-            ),
+            api(paykit_client_from_settings(
+                url.clone(),
+                seed.clone(),
+                Some("upstream".into()),
+                None
+            )
+            .unwrap()),
             PaykitApi::Upstream
         );
-        assert!(paykit_client_from_settings(None, None, None)
+        assert!(paykit_client_from_settings(None, None, None, None)
             .unwrap()
             .is_none());
         assert!(
-            paykit_client_from_settings(url.clone(), seed.clone(), Some("rc9".into())).is_err()
+            paykit_client_from_settings(url.clone(), seed.clone(), Some("rc9".into()), None)
+                .is_err()
         );
-        assert!(paykit_client_from_settings(None, None, Some("upstream".into())).is_err());
-        assert!(paykit_client_from_settings(url, None, Some("upstream".into())).is_err());
-        assert!(paykit_client_from_settings(None, seed, None).is_err());
+        assert!(paykit_client_from_settings(None, None, Some("upstream".into()), None).is_err());
+        assert!(paykit_client_from_settings(url, None, Some("upstream".into()), None).is_err());
+        assert!(paykit_client_from_settings(None, seed, None, None).is_err());
+    }
+
+    #[test]
+    fn the_setup_status_timeout_defaults_to_eight_seconds_and_takes_whole_seconds() {
+        let url = Some("https://paykit.example".to_string());
+        let seed = Some(UPSTREAM_TEST_SEED.to_string());
+        let timeout = |value: Option<&str>| {
+            paykit_client_from_settings(
+                url.clone(),
+                seed.clone(),
+                Some("upstream".into()),
+                value.map(str::to_string),
+            )
+            .map(|client| client.expect("configured").setup_status_timeout)
+        };
+
+        assert_eq!(timeout(None).unwrap(), Duration::from_secs(8));
+        assert_eq!(timeout(Some(" 12\n")).unwrap(), Duration::from_secs(12));
+        assert_eq!(timeout(Some("1")).unwrap(), Duration::from_secs(1));
+        assert_eq!(timeout(Some("30")).unwrap(), Duration::from_secs(30));
+        for bad in ["", "0", "31", "-1", "2.5", "8s", "eight"] {
+            assert!(timeout(Some(bad)).is_err(), "{bad:?}");
+        }
+        assert!(
+            paykit_client_from_settings(None, None, None, Some("8".into())).is_err(),
+            "the timeout alone is refused, like the API selector"
+        );
     }
 
     #[test]
