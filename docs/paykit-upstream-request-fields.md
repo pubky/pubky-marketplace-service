@@ -12,16 +12,16 @@ the target paykit-server supports the signed optional `description` field.
 | ------------------------ | ------------------------------------------------------------------- |
 | `amount_sats`            | The order's bitcoin price in satoshis.                              |
 | `creator`                | The seller's key (`pubky<key>`).                                    |
-| `description`            | `Pubky Shop order ` plus the first six uppercase hex order-ID chars.|
+| `description`            | `Pubky Shop order ` plus the first eight order-ID chars, lowercase. |
 | `operation_id`           | `marketplace-payment:{reference}:{attempt}`.                        |
 | `payment_window_seconds` | The payment window this attempt arms.                               |
 | `reader`                 | The buyer's key (`pubky<key>`).                                     |
 | `reference`              | `upstream_attempt_reference(order_id, attempt)`, a UUID v4.         |
 
 For order `8f3a91b2-1111-4111-8111-111111111111`, every attempt uses
-`Pubky Shop order 8F3A91`. The label comes from the stable order UUID, not the
-attempt reference. It contains no listing title or seller name. Its six-character
-suffix is a display hint, not a unique ID or lookup key.
+`Pubky Shop order 8f3a91b2`. The label comes from the stable order UUID, not the
+attempt reference. It contains no listing title or seller name. Its eight-character
+suffix is the order reference the Shop shows, a display hint, not a unique ID or lookup key.
 
 The complete canonical JSON body, including `description`, is covered by the
 upstream HTTP signature. paykit-server includes a present description in its

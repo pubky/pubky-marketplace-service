@@ -408,13 +408,9 @@ async fn the_paykit_bind_sends_the_denomination_and_records_every_offered_asset(
     let prepare = prepare_body(&f.paykit);
     assert_eq!(prepare["amount"], json!(TOTAL_CENTS.to_string()));
     assert_eq!(prepare["asset"], json!("USD"));
-    let compact = uuid(&order.order_id).simple().to_string();
     assert_eq!(
         prepare["description"],
-        json!(format!(
-            "Pubky Shop order {}",
-            compact[..6].to_ascii_uppercase()
-        )),
+        json!(format!("Pubky Shop order {}", &order.order_id[..8])),
         "the multi-asset request is labelled like the legacy one"
     );
     assert!(

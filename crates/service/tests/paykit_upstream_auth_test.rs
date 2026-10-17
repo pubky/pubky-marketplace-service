@@ -555,7 +555,7 @@ async fn upstream_lifecycle_uses_the_closed_four_command_contract() {
     );
     assert_eq!(
         prepare.body["description"],
-        json!("Pubky Shop order 8F3A91")
+        json!("Pubky Shop order 8f3a91b2")
     );
     let reference = prepare.body["reference"].as_str().unwrap();
     assert_eq!(
@@ -614,7 +614,7 @@ async fn upstream_lifecycle_uses_the_closed_four_command_contract() {
     };
     assert_eq!(
         paykit.calls()[3].body["description"],
-        json!("Pubky Shop order 8F3A91"),
+        json!("Pubky Shop order 8f3a91b2"),
         "new attempts use stable order id, not attempt reference"
     );
     client
@@ -655,7 +655,7 @@ async fn upstream_order_labels_vary_only_with_the_stable_order_id() {
     let prepare = &paykit.calls()[0];
     assert_eq!(
         prepare.body["description"],
-        json!("Pubky Shop order ABCDEF")
+        json!("Pubky Shop order abcdef12")
     );
     assert_eq!(prepare.body.as_object().unwrap().len(), 7);
 }
