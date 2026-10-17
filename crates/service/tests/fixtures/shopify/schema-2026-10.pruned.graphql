@@ -338,6 +338,7 @@ type PageInfo {
 type Product {
   category: TaxonomyCategory
   description(truncateAt: Int): String!
+  handle: String!
   id: ID!
   images(first: Int, after: String, last: Int, before: String, reverse: Boolean, sortKey: ProductImageSortKeys): ImageConnection!
   onlineStoreUrl: URL

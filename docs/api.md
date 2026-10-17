@@ -1351,7 +1351,9 @@ on `X-Shopify-Event-Id`.
   `made_to_order`, and a mapped one makes its Pubky row
   [made to order](#made-to-order-stock): `inventory_levels/update` and
   `inventory_items/update` (tracking switched on or off) are resolved through
-  the inventory item, and the stock poll reads the same fields. A product with
+  the inventory item, and the stock poll reads the same fields. Each product
+  carries its `handle`, the key a Shopify product CSV names it by, so the Shop
+  can link a CSV-imported listing to it. A product with
   only Shopify's `Default Title` option has no options.
 - **Orders.** `orderCreate` with the mapped variant ids, financial status `PAID`,
   one manual `SALE` transaction named `Pubky <rail>`, tags `pubky` and

@@ -796,6 +796,7 @@ async fn the_stock_poll_applies_catalog_stock_to_mapped_variants(pool: PgPool) {
     };
     let product = |id: &str, variants: Vec<CatalogVariant>| CatalogProduct {
         provider_product_id: id.to_string(),
+        handle: None,
         title: id.to_string(),
         description: None,
         url: None,

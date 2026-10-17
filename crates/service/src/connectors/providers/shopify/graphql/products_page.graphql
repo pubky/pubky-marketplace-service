@@ -9,6 +9,7 @@ query ProductsPage($first: Int!, $after: String) {
     }
     nodes {
       id
+      handle
       title
       description
       onlineStoreUrl

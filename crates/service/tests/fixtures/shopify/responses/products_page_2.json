@@ -12,6 +12,7 @@
       "nodes": [
         {
           "id": "gid://shopify/Product/9002",
+          "handle": "enamel-mug",
           "title": "Enamel Mug",
           "description": "",
           "onlineStoreUrl": null,

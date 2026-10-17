@@ -301,6 +301,7 @@ pub fn normalize_product(
     }
     let title = text::title(&string(product, "name"));
     Some(CatalogProduct {
+        handle: None,
         provider_product_id: id.to_string(),
         title: if title.is_empty() {
             format!("Product {id}")

@@ -171,6 +171,7 @@ fn product(
         .collect::<Result<Vec<_>, _>>()?;
     Ok(CatalogProduct {
         provider_product_id: text(node, "id").ok_or_else(|| malformed("product id"))?,
+        handle: text(node, "handle"),
         title: text(node, "title").unwrap_or_default(),
         description: text(node, "description"),
         url: text(node, "onlineStoreUrl"),

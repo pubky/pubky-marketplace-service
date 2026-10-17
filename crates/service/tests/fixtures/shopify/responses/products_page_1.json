@@ -12,6 +12,7 @@
       "nodes": [
         {
           "id": "gid://shopify/Product/9001",
+          "handle": "trail-boots",
           "title": "Trail Boots",
           "description": "Waterproof leather boots.",
           "onlineStoreUrl": "https://dezentral.myshopify.com/products/trail-boots",

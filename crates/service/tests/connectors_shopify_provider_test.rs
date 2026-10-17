@@ -123,6 +123,7 @@ async fn the_catalog_is_paged_with_whole_products_and_normalised() {
     assert_eq!(boots.attributes[0].name, "Vendor");
     assert_eq!(boots.attributes[0].values, ["Dezentral Goods"]);
     assert_eq!(boots.variants[0].price.amount_minor, 12500);
+    assert_eq!(boots.handle.as_deref(), Some("trail-boots"));
     assert_eq!(boots.variants[0].stock, Some(7));
     assert_eq!(boots.variants[1].stock, Some(0));
     assert!(!boots.variants[0].made_to_order);

@@ -320,6 +320,10 @@ pub struct CatalogVariant {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogProduct {
     pub provider_product_id: String,
+    /// The store's own URL key for the product (Shopify's `handle`, which a
+    /// Shopify product CSV names it by), when the store has one.
+    #[serde(default)]
+    pub handle: Option<String>,
     pub title: String,
     pub description: Option<String>,
     pub url: Option<String>,
