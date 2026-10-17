@@ -1081,6 +1081,11 @@ quantity is not a count for it.
   `DENY`), its next stock level switches the row back: the store's count goes on
   sale less the units Pubky buyers hold now (a paid hold is pushed and comes out
   of that count), so Pubky never offers more than the store has.
+- **Unlinked.** A made-to-order row is orderable only while a live store
+  connection maps it. When its mapping goes (the seller unlinks it, switches to
+  `split`, disconnects, or the store uninstalls the app) it goes back to
+  counted stock with nothing on sale, so Pubky never sells an item no store
+  makes; the seller sets its stock again.
 - Each switch bumps the listing's `server_revision` and appends an
   `inventory.adjusted` event; a switch to the mode the row already has changes
   nothing.
@@ -1440,7 +1445,10 @@ on `X-Shopify-Event-Id`.
   no_mapped_lines`, severity `info`, since it may be a Pubky-only sale), and it
   is never silent: a `listing_not_linked` alert on the order names the
   listings ("Order not sent to the store: listing … is not linked"). The seller
-  links them (`PUT /v1/connectors/{id}/mappings`) and retries the push
+  links them (`PUT /v1/connectors/{id}/mappings`; saving mappings also reads
+  the store's stock for the connection on the worker's next tick, so a listing
+  linked a moment ago shows the store's stock and made-to-order state within
+  seconds) and retries the push
   (`POST /v1/connectors/{id}/pushes/{order}/retry`), or resolves the alert for a
   Pubky-only sale. An order with only some lines mapped stays
   `unmapped_variant` with a `push_quarantined` alert, as before.

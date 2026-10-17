@@ -356,6 +356,80 @@ pub const STATE_FROM_TOTALS_SQL: &str =
     "CASE WHEN available_quantity > 0 OR made_to_order THEN 'available' \
      WHEN reserved_quantity > 0 THEN 'reserved' ELSE 'sold' END";
 
+/// Ends made-to-order stock that no store sells any more: every made-to-order
+/// row of the seller's listings that no live connection maps (the mapping was
+/// removed, its connection disconnected or the store uninstalled the app) goes
+/// back to counted stock with nothing on sale (`available` 0, `total` its
+/// committed units). Without a store behind it a row has no one to make the
+/// item, so it is not left orderable; the seller sets its stock again. Each
+/// changed listing moves one revision with an `inventory.adjusted` event.
+/// Runs in the caller's transaction, after its mapping change. Returns the
+/// listings changed.
+pub async fn end_unlinked_made_to_order(
+    tx: &mut Transaction<'_, Postgres>,
+    seller_pubky: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<String>, sqlx::Error> {
+    const UNLINKED: &str = "v.made_to_order AND NOT EXISTS ( \
+         SELECT 1 FROM connector_variant_map m \
+         JOIN connector_connections c ON c.id = m.connection_id \
+         WHERE c.seller_pubky = l.seller_pubky AND c.status <> 'disconnected' \
+           AND m.listing_id = l.listing_id \
+           AND (v.variant_id = '' OR m.variant_id = v.variant_id))";
+    let candidates: Vec<String> = sqlx::query_scalar(&format!(
+        "SELECT DISTINCT l.aggregate_id FROM listings l \
+         JOIN listing_variant_inventory v ON v.listing_aggregate_id = l.aggregate_id \
+         WHERE l.seller_pubky = $1 AND {UNLINKED} ORDER BY l.aggregate_id"
+    ))
+    .bind(seller_pubky)
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut changed = Vec::new();
+    for aggregate_id in candidates {
+        lock_rows(tx, &aggregate_id).await?;
+        let rows = sqlx::query(&format!(
+            "UPDATE listing_variant_inventory v SET made_to_order = false, \
+                 available_quantity = 0, total_quantity = v.reserved_quantity + v.sold_quantity, \
+                 updated_at = $2 \
+             FROM listings l WHERE l.aggregate_id = v.listing_aggregate_id \
+               AND v.listing_aggregate_id = $1 AND {UNLINKED}"
+        ))
+        .bind(&aggregate_id)
+        .bind(now)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected();
+        if rows == 0 {
+            continue;
+        }
+        let (revision, actor): (i64, String) = sqlx::query_as(&format!(
+            "UPDATE listings SET server_revision = server_revision + 1, state = {STATE_FROM_TOTALS_SQL}, \
+                 updated_at = $2 WHERE aggregate_id = $1 RETURNING server_revision, seller_pubky"
+        ))
+        .bind(&aggregate_id)
+        .bind(now)
+        .fetch_one(&mut **tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO events \
+                 (id, command_id, aggregate_id, revision, actor_pubky, kind, occurred_at) \
+             VALUES ($1, $2, $3, $4, $5, 'inventory.adjusted', $6)",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(crate::connectors::deterministic_uuid(&format!(
+            "made-to-order-ended|{aggregate_id}|{revision}"
+        )))
+        .bind(&aggregate_id)
+        .bind(revision)
+        .bind(&actor)
+        .bind(now)
+        .execute(&mut **tx)
+        .await?;
+        changed.push(aggregate_id);
+    }
+    Ok(changed)
+}
+
 /// One variant's stock after a record edit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlannedRow {

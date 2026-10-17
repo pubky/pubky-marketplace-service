@@ -713,72 +713,99 @@ pub async fn poll_stock(state: &AppState) -> Result<u64, sqlx::Error> {
     };
     let mut applied = 0;
     for connection in store::connected_with_mappings(&state.pool).await? {
-        let Some(provider) = connection
-            .provider_kind()
-            .and_then(|kind| runtime.providers.get(kind))
-        else {
-            continue;
-        };
-        let context = match open_for_call(state, runtime, &connection).await? {
-            Ok(context) => context,
-            Err(_) => continue,
-        };
-        let mut page: Option<String> = None;
-        for _ in 0..MAX_CATALOG_PAGES_PER_POLL {
-            let catalog = match with_timeout(
-                runtime.settings.provider_timeout,
-                provider.list_catalog(&context, page.as_deref()),
-            )
-            .await
-            {
-                Ok(catalog) => catalog,
-                Err(ProviderError::Unauthorized) => {
-                    credentials_rejected(&state.pool, &connection, state.clock.now()).await?;
-                    break;
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        connection_id = %connection.id,
-                        error = %error,
-                        "stock poll could not read the catalog"
-                    );
-                    break;
-                }
-            };
-            for product in &catalog.products {
-                for variant in &product.variants {
-                    if !variant.made_to_order && variant.stock.is_none() {
-                        continue;
-                    }
-                    let Some(mapping) = store::mapping_for_provider_variant(
-                        &state.pool,
-                        connection.id,
-                        &product.provider_product_id,
-                        &variant.provider_variant_id,
-                    )
-                    .await?
-                    else {
-                        continue;
-                    };
-                    let outcome = match variant.stock {
-                        Some(level) if !variant.made_to_order => {
-                            stock::apply_stock_level(state, &connection, &mapping, level, None)
-                                .await?
-                        }
-                        _ => stock::apply_made_to_order(state, &connection, &mapping).await?,
-                    };
-                    if matches!(
-                        outcome,
-                        StockOutcome::Applied { .. } | StockOutcome::Switched { .. }
-                    ) {
-                        applied += 1;
-                    }
-                }
-            }
-            page = catalog.next_page;
-            if page.is_none() {
+        applied += poll_connection_stock(state, runtime, &connection).await?;
+    }
+    Ok(applied)
+}
+
+/// Reads the catalog of each connection whose mappings were just saved and
+/// applies its stock, so a listing linked a moment ago shows the store's
+/// stock now rather than at the next periodic poll. Returns how many listings
+/// changed.
+pub async fn refresh_requested_stock(state: &AppState) -> Result<u64, sqlx::Error> {
+    let Some(runtime) = runtime_of(state) else {
+        return Ok(0);
+    };
+    let mut applied = 0;
+    for (connection, requested_at) in
+        store::stock_refresh_due(&state.pool, state.clock.now()).await?
+    {
+        applied += poll_connection_stock(state, runtime, &connection).await?;
+        store::clear_stock_refresh(&state.pool, connection.id, requested_at).await?;
+    }
+    Ok(applied)
+}
+
+async fn poll_connection_stock(
+    state: &AppState,
+    runtime: &ConnectorRuntime,
+    connection: &store::ConnectionRow,
+) -> Result<u64, sqlx::Error> {
+    let Some(provider) = connection
+        .provider_kind()
+        .and_then(|kind| runtime.providers.get(kind))
+    else {
+        return Ok(0);
+    };
+    let context = match open_for_call(state, runtime, connection).await? {
+        Ok(context) => context,
+        Err(_) => return Ok(0),
+    };
+    let mut applied = 0;
+    let mut page: Option<String> = None;
+    for _ in 0..MAX_CATALOG_PAGES_PER_POLL {
+        let catalog = match with_timeout(
+            runtime.settings.provider_timeout,
+            provider.list_catalog(&context, page.as_deref()),
+        )
+        .await
+        {
+            Ok(catalog) => catalog,
+            Err(ProviderError::Unauthorized) => {
+                credentials_rejected(&state.pool, connection, state.clock.now()).await?;
                 break;
             }
+            Err(error) => {
+                tracing::warn!(
+                    connection_id = %connection.id,
+                    error = %error,
+                    "stock poll could not read the catalog"
+                );
+                break;
+            }
+        };
+        for product in &catalog.products {
+            for variant in &product.variants {
+                if !variant.made_to_order && variant.stock.is_none() {
+                    continue;
+                }
+                let Some(mapping) = store::mapping_for_provider_variant(
+                    &state.pool,
+                    connection.id,
+                    &product.provider_product_id,
+                    &variant.provider_variant_id,
+                )
+                .await?
+                else {
+                    continue;
+                };
+                let outcome = match variant.stock {
+                    Some(level) if !variant.made_to_order => {
+                        stock::apply_stock_level(state, connection, &mapping, level, None).await?
+                    }
+                    _ => stock::apply_made_to_order(state, connection, &mapping).await?,
+                };
+                if matches!(
+                    outcome,
+                    StockOutcome::Applied { .. } | StockOutcome::Switched { .. }
+                ) {
+                    applied += 1;
+                }
+            }
+        }
+        page = catalog.next_page;
+        if page.is_none() {
+            break;
         }
     }
     Ok(applied)
@@ -825,6 +852,8 @@ pub async fn run_forever(state: AppState) -> anyhow::Result<()> {
                     if let Err(error) = poll_stock(&state).await {
                         tracing::error!(error = %error, "connector stock poll failed");
                     }
+                } else if let Err(error) = refresh_requested_stock(&state).await {
+                    tracing::error!(error = %error, "connector stock refresh failed");
                 }
             }
         }

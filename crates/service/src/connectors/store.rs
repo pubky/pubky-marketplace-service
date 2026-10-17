@@ -747,12 +747,14 @@ pub async fn disconnect(
     // The connection row first: anything that swaps the credential holds this
     // lock while it does, so a swap either completes before the delete below
     // or finds the connection disconnected.
-    let installed: Option<bool> = sqlx::query_scalar(
-        "SELECT connected_at IS NOT NULL FROM connector_connections WHERE id = $1 FOR UPDATE",
+    let found: Option<(bool, String)> = sqlx::query_as(
+        "SELECT connected_at IS NOT NULL, seller_pubky FROM connector_connections \
+         WHERE id = $1 FOR UPDATE",
     )
     .bind(id)
     .fetch_optional(&mut *tx)
     .await?;
+    let installed = found.as_ref().map(|(installed, _)| *installed);
     for table in [
         "connector_credentials",
         "connector_recipient_keys",
@@ -789,6 +791,9 @@ pub async fn disconnect(
     .execute(&mut *tx)
     .await?
     .rows_affected();
+    if let Some((_, seller_pubky)) = &found {
+        crate::variant_stock::end_unlinked_made_to_order(&mut tx, seller_pubky, now).await?;
+    }
     tx.commit().await?;
     Ok(changed > 0)
 }
@@ -889,6 +894,8 @@ pub async fn set_variant_mode(
     .fetch_one(&mut *tx)
     .await?;
     if !unmapped.is_empty() {
+        crate::variant_stock::end_unlinked_made_to_order(&mut tx, &connection.seller_pubky, now)
+            .await?;
         let names = unmapped
             .iter()
             .map(|listing| {
@@ -970,7 +977,9 @@ impl From<sqlx::Error> for MappingError {
 /// Replaces the connection's whole mapping set in one transaction. A product
 /// that has a mapping is always selected, so the selection gains every mapped
 /// product. The caller has already rejected duplicates inside the request;
-/// the unique constraints still stand behind it for a concurrent writer.
+/// the unique constraints still stand behind it for a concurrent writer. The
+/// connection is marked for a stock refresh, so newly linked listings take the
+/// store's stock on the worker's next tick.
 pub async fn replace_mappings(
     pool: &PgPool,
     connection: &ConnectionRow,
@@ -1058,7 +1067,56 @@ pub async fn replace_mappings(
     .bind(now)
     .execute(&mut *tx)
     .await?;
+    sqlx::query("UPDATE connector_connections SET stock_refresh_requested_at = $2 WHERE id = $1")
+        .bind(connection.id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+    crate::variant_stock::end_unlinked_made_to_order(&mut tx, &connection.seller_pubky, now)
+        .await?;
     tx.commit().await?;
+    Ok(())
+}
+
+/// Connections with mappings whose stock refresh was requested at or before
+/// `now`, with the instant each was requested.
+pub async fn stock_refresh_due(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+) -> Result<Vec<(ConnectionRow, DateTime<Utc>)>, sqlx::Error> {
+    let rows: Vec<(Uuid, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT c.id, c.stock_refresh_requested_at FROM connector_connections c \
+         WHERE c.stock_refresh_requested_at <= $1 AND c.status IN ('connected', 'needs_attention') \
+           AND EXISTS (SELECT 1 FROM connector_variant_map m WHERE m.connection_id = c.id) \
+         ORDER BY c.stock_refresh_requested_at, c.id",
+    )
+    .bind(now)
+    .fetch_all(pool)
+    .await?;
+    let mut due = Vec::with_capacity(rows.len());
+    for (id, requested_at) in rows {
+        if let Some(connection) = get(pool, id).await? {
+            due.push((connection, requested_at));
+        }
+    }
+    Ok(due)
+}
+
+/// Clears a connection's stock refresh request, unless a newer one arrived
+/// while the refresh ran.
+pub async fn clear_stock_refresh(
+    pool: &PgPool,
+    connection_id: Uuid,
+    requested_at: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE connector_connections SET stock_refresh_requested_at = NULL \
+         WHERE id = $1 AND stock_refresh_requested_at = $2",
+    )
+    .bind(connection_id)
+    .bind(requested_at)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
