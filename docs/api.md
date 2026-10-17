@@ -1327,13 +1327,16 @@ against Shopify's published schema.
   They are signed with the same app secret and are acknowledged (the service
   keeps no store customer data); `shop/redact` ends the 30-day secret retention.
   The merchant guide must say this, because nothing else configures them. The
-  six operational topics need no merchant step.
+  seven operational topics need no merchant step.
 
 **What the service does.** After a verified launch it redirects to Shopify's
 authorize page; after a verified callback it exchanges the code for an offline
 access token (sealed per connection) and then subscribes `inventory_levels/update`,
-`fulfillments/create`, `fulfillments/update`, `orders/cancelled`, `refunds/create`
-and `app/uninstalled` to the connection's webhooks URL through `webhookSubscriptionCreate`. A repeat
+`inventory_items/update`, `fulfillments/create`, `fulfillments/update`,
+`orders/cancelled`, `refunds/create` and `app/uninstalled` to the connection's
+webhooks URL through `webhookSubscriptionCreate`. A connection installed before
+`inventory_items/update` was added gets it on its next install; until then the
+stock poll catches tracking changes. A repeat
 install reads the subscription list page by page, subscribes nothing twice (a
 create that loses a race to a concurrent install is confirmed by re-reading the
 list, not by interpreting the message) and removes stale subscriptions this
@@ -1343,7 +1346,12 @@ on `X-Shopify-Event-Id`.
 
 - **Catalog.** Active products, a few per page, with every variant (more than 25
   variants are read through the product's variant connection). A variant's stock
-  is its total across locations; an untracked variant has none. A product with
+  is its total across locations; an untracked variant has none. A variant that
+  is untracked or keeps selling at zero (`inventoryPolicy: CONTINUE`) is
+  `made_to_order`, and a mapped one makes its Pubky row
+  [made to order](#made-to-order-stock): `inventory_levels/update` and
+  `inventory_items/update` (tracking switched on or off) are resolved through
+  the inventory item, and the stock poll reads the same fields. A product with
   only Shopify's `Default Title` option has no options.
 - **Orders.** `orderCreate` with the mapped variant ids, financial status `PAID`,
   one manual `SALE` transaction named `Pubky <rail>`, tags `pubky` and

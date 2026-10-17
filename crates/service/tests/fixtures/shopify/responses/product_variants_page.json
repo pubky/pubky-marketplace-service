@@ -12,6 +12,7 @@
             "selectedOptions": [ { "name": "Size", "value": "42" } ],
             "image": null,
             "inventoryQuantity": 3,
+            "inventoryPolicy": "DENY",
             "inventoryItem": { "tracked": true }
           }
         ]

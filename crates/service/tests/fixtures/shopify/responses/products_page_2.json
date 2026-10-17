@@ -45,6 +45,7 @@
                 ],
                 "image": null,
                 "inventoryQuantity": 40,
+                "inventoryPolicy": "DENY",
                 "inventoryItem": {
                   "tracked": false
                 }

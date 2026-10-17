@@ -51,6 +51,7 @@ fn product(id: &str, variant: &str, stock: Option<i64>) -> CatalogProduct {
                 exponent: 2,
             },
             stock,
+            made_to_order: false,
             image_url: None,
         }],
     }

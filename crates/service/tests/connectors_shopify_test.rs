@@ -239,6 +239,7 @@ async fn a_merchant_installs_their_own_custom_app_and_the_store_is_wired_up(pool
             "APP_UNINSTALLED",
             "FULFILLMENTS_CREATE",
             "FULFILLMENTS_UPDATE",
+            "INVENTORY_ITEMS_UPDATE",
             "INVENTORY_LEVELS_UPDATE",
             "ORDERS_CANCELLED",
             "REFUNDS_CREATE"
@@ -658,6 +659,206 @@ async fn an_inventory_webhook_resolves_its_variant_and_sets_the_listings_stock(p
         .await
         .expect("listing");
     assert_eq!(available, 3);
+    r.fake.assert_clean();
+}
+
+async fn listing_stock(r: &Rig, seller: &str) -> (i64, i64, i64, String, bool) {
+    sqlx::query_as(
+        "SELECT available_quantity, sold_quantity, total_quantity, state, made_to_order \
+         FROM listings WHERE seller_pubky = $1 AND listing_id = 'boots_01'",
+    )
+    .bind(seller)
+    .fetch_one(&r.app.pool)
+    .await
+    .expect("listing")
+}
+
+/// A second buyer's paid checkout of `quantity` units of `boots_01`.
+async fn buy(r: &Rig, seller: &TestActor, quantity: i64, n: u64) -> String {
+    let buyer = new_actor(&r.app).await;
+    let revision: i64 = sqlx::query_scalar(
+        "SELECT server_revision FROM listings WHERE seller_pubky = $1 AND listing_id = 'boots_01'",
+    )
+    .bind(&seller.pubky)
+    .fetch_one(&r.app.pool)
+    .await
+    .expect("revision");
+    let mut command =
+        common::checkout_command_with_id(&seller.pubky, &common::indexed_command_id(0x6d70, n));
+    command["payload"]["lines"][0]["expected_revision"] = json!(revision);
+    command["payload"]["lines"][0]["quantity"] = json!(quantity);
+    let (status, body) = execute(&r.app, &buyer.token, &command).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let order_id = body["result"]["orders"][0]["id"]
+        .as_str()
+        .expect("order id")
+        .to_string();
+    let payment_id = body["result"]["payments"][0]["id"]
+        .as_str()
+        .expect("payment id")
+        .to_string();
+    let (status, body) = execute(
+        &r.app,
+        &buyer.token,
+        &common::payment_command(&payment_id, 1, "confirmed", 1, 6_000 + n),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    order_id
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_print_on_demand_variant_stays_orderable_and_flips_back_when_shopify_tracks_it(
+    pool: PgPool,
+) {
+    let r = rig(pool).await;
+    let seller = new_actor(&r.app).await;
+    let connection = r.install(&seller).await;
+    let first_buyer = new_actor(&r.app).await;
+    create_paid_order(&r.app, &seller, &first_buyer).await;
+    map_listing(
+        &r.app,
+        &seller,
+        connection,
+        "boots_01",
+        PRODUCT,
+        "gid://shopify/ProductVariant/50003",
+    )
+    .await;
+    assert_eq!(
+        listing_stock(&r, &seller.pubky).await,
+        (0, 1, 1, "sold".to_string(), false),
+        "the one unit imported is sold"
+    );
+
+    // The merchant's print-on-demand variant: Shopify does not track it.
+    r.fake.lock().inventory_item_tracking = (false, "DENY");
+    let (status, body) = r
+        .webhook(
+            connection,
+            "evt-items-1",
+            "inventory_items/update",
+            &json!({ "id": 4242, "tracked": false,
+                     "admin_graphql_api_id": "gid://shopify/InventoryItem/4242" }),
+            APP_SECRET,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    worker::drive_inbound(&r.app.state, 10)
+        .await
+        .expect("drive");
+    assert_eq!(
+        listing_stock(&r, &seller.pubky).await,
+        (0, 1, 1, "available".to_string(), true),
+        "made to order: orderable again without inventing a count"
+    );
+
+    // Buyers keep ordering it; every sale still reaches Shopify.
+    let second = buy(&r, &seller, 2, 1).await;
+    let third = buy(&r, &seller, 3, 2).await;
+    assert_eq!(
+        listing_stock(&r, &seller.pubky).await,
+        (0, 6, 6, "available".to_string(), true)
+    );
+    r.pass().await;
+    for order in [&second, &third] {
+        assert_eq!(push_state(&r.app.pool, order).await.0, "created", "{order}");
+    }
+    let quantities: Vec<i64> = r
+        .fake
+        .orders()
+        .iter()
+        .map(|order| {
+            order.input["lineItems"][0]["quantity"]
+                .as_i64()
+                .expect("quantity")
+        })
+        .collect();
+    assert_eq!(quantities, [1, 2, 3]);
+
+    // A seller adjustment has no count to move.
+    let revision: i64 = sqlx::query_scalar(
+        "SELECT server_revision FROM listings WHERE seller_pubky = $1 AND listing_id = 'boots_01'",
+    )
+    .bind(&seller.pubky)
+    .fetch_one(&r.app.pool)
+    .await
+    .expect("revision");
+    let adjust = json!({
+        "schema_version": 1,
+        "kind": "inventory.adjust",
+        "aggregate_id": common::listing_aggregate(&seller.pubky),
+        "listing_id": "boots_01",
+        "expected_revision": revision,
+        "delta": 5,
+        "idempotency_key": "00000000-0000-4000-8000-00000000d701",
+    });
+    let (status, body) = common::send(
+        r.app.router.clone(),
+        "POST",
+        "/v1/inventory/adjust",
+        Some(&seller.token),
+        &adjust,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "stock_not_tracked");
+
+    // The merchant turns tracking on with 3 in stock: the next level counts.
+    r.fake.lock().inventory_item_tracking = (true, "DENY");
+    r.webhook(
+        connection,
+        "evt-levels-1",
+        "inventory_levels/update",
+        &json!({ "inventory_item_id": 4242, "location_id": 1001, "available": 3 }),
+        APP_SECRET,
+    )
+    .await;
+    worker::drive_inbound(&r.app.state, 10)
+        .await
+        .expect("drive");
+    assert_eq!(
+        listing_stock(&r, &seller.pubky).await,
+        (3, 6, 9, "available".to_string(), false),
+        "Shopify's count is on sale again; the sold units stay sold"
+    );
+
+    // Selling on at zero (CONTINUE) is made to order too.
+    r.fake.lock().inventory_item_tracking = (true, "CONTINUE");
+    r.webhook(
+        connection,
+        "evt-items-2",
+        "inventory_items/update",
+        &json!({ "id": 4242, "tracked": true }),
+        APP_SECRET,
+    )
+    .await;
+    worker::drive_inbound(&r.app.state, 10)
+        .await
+        .expect("drive");
+    assert_eq!(
+        listing_stock(&r, &seller.pubky).await,
+        (0, 6, 6, "available".to_string(), true)
+    );
+    // A replay of the same state changes nothing.
+    r.webhook(
+        connection,
+        "evt-items-3",
+        "inventory_items/update",
+        &json!({ "id": 4242, "tracked": true }),
+        APP_SECRET,
+    )
+    .await;
+    worker::drive_inbound(&r.app.state, 10)
+        .await
+        .expect("drive");
+    let outcome: Option<String> = sqlx::query_scalar(
+        "SELECT outcome FROM connector_inbound_events WHERE provider_event_id = 'evt-items-3'",
+    )
+    .fetch_one(&r.app.pool)
+    .await
+    .expect("inbound row");
+    assert_eq!(outcome.as_deref(), Some("unchanged"));
     r.fake.assert_clean();
 }
 

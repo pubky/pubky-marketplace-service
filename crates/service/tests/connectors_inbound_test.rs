@@ -791,6 +791,7 @@ async fn the_stock_poll_applies_catalog_stock_to_mapped_variants(pool: PgPool) {
             exponent: 2,
         },
         stock,
+        made_to_order: false,
         image_url: None,
     };
     let product = |id: &str, variants: Vec<CatalogVariant>| CatalogProduct {
@@ -817,6 +818,94 @@ async fn the_stock_poll_applies_catalog_stock_to_mapped_variants(pool: PgPool) {
         .set_catalog(vec![product("prod-1", vec![variant("var-1", None)])]);
     assert_eq!(worker::poll_stock(&s.app.state).await.expect("poll"), 0);
     assert_eq!(listing_available(&s.app, &s.seller.pubky).await.0, 4);
+
+    // The store now sells the variant without a limit: the poll makes the
+    // listing made to order, once.
+    let unlimited = CatalogVariant {
+        made_to_order: true,
+        ..variant("var-1", None)
+    };
+    s.store
+        .set_catalog(vec![product("prod-1", vec![unlimited.clone()])]);
+    assert_eq!(worker::poll_stock(&s.app.state).await.expect("poll"), 1);
+    assert_eq!(worker::poll_stock(&s.app.state).await.expect("poll"), 0);
+    let (available, total, _) = listing_available(&s.app, &s.seller.pubky).await;
+    assert_eq!(
+        (available, total),
+        (0, 1),
+        "only the sold unit is on the books"
+    );
+    let (state, made_to_order): (String, bool) = sqlx::query_as(
+        "SELECT state, made_to_order FROM listings WHERE seller_pubky = $1 AND listing_id = 'boots_01'",
+    )
+    .bind(&s.seller.pubky)
+    .fetch_one(&s.app.pool)
+    .await
+    .expect("listing");
+    assert_eq!((state.as_str(), made_to_order), ("available", true));
+
+    // Tracked again with 2: the poll puts the store's count back on sale.
+    s.store
+        .set_catalog(vec![product("prod-1", vec![variant("var-1", Some(2))])]);
+    assert_eq!(worker::poll_stock(&s.app.state).await.expect("poll"), 1);
+    assert_eq!(listing_available(&s.app, &s.seller.pubky).await.0, 2);
+    assert_eq!(worker::poll_stock(&s.app.state).await.expect("poll"), 0);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_made_to_order_webhook_applies_to_mapped_variants_only(pool: PgPool) {
+    let s = shop(pool).await;
+    webhook(
+        &s.app,
+        SHOP,
+        "evt-mto-unmapped",
+        "inventory_items/update",
+        &json!({ "type": "made_to_order", "product": "prod-9", "variant": "var-9" }),
+    )
+    .await;
+    webhook(
+        &s.app,
+        SHOP,
+        "evt-mto-1",
+        "inventory_items/update",
+        &json!({ "type": "made_to_order", "product": "prod-1", "variant": "var-1" }),
+    )
+    .await;
+    worker::drive_inbound(&s.app.state, 10)
+        .await
+        .expect("drive");
+    assert_eq!(
+        inbound(&s.app, "evt-mto-unmapped").await,
+        ("ignored".to_string(), Some("unmapped_variant".to_string()))
+    );
+    assert_eq!(
+        inbound(&s.app, "evt-mto-1").await,
+        ("applied".to_string(), Some("made to order".to_string()))
+    );
+    let made_to_order: bool = sqlx::query_scalar(
+        "SELECT made_to_order FROM listings WHERE seller_pubky = $1 AND listing_id = 'boots_01'",
+    )
+    .bind(&s.seller.pubky)
+    .fetch_one(&s.app.pool)
+    .await
+    .expect("listing");
+    assert!(made_to_order);
+    webhook(
+        &s.app,
+        SHOP,
+        "evt-stock-after",
+        "inventory_levels/update",
+        &json!({ "type": "stock", "product": "prod-1", "variant": "var-1", "available": 5 }),
+    )
+    .await;
+    worker::drive_inbound(&s.app.state, 10)
+        .await
+        .expect("drive");
+    assert_eq!(
+        inbound(&s.app, "evt-stock-after").await,
+        ("applied".to_string(), Some("counted again".to_string()))
+    );
+    assert_eq!(listing_available(&s.app, &s.seller.pubky).await.0, 5);
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]

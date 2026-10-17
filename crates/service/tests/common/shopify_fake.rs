@@ -150,6 +150,9 @@ pub struct Inner {
     /// A store that forces tax onto every order whatever the order says
     /// (basis points of the order total).
     pub forced_tax_bps: i64,
+    /// How the store keeps inventory item 4242's stock: `(tracked,
+    /// inventoryPolicy)`. Defaults to the fixture's `(true, "DENY")`.
+    pub inventory_item_tracking: (bool, &'static str),
     next_id: u64,
 }
 
@@ -185,6 +188,7 @@ impl FakeShopify {
             token_requests: Vec::new(),
             faults: HashMap::new(),
             shop_currency: "USD".into(),
+            inventory_item_tracking: (true, "DENY"),
             granted_scopes: [
                 "read_products",
                 "read_inventory",
@@ -557,7 +561,11 @@ fn run(inner: &mut Inner, name: &str, document: &str, variables: &Value) -> Resu
         "ProductVariantsPage" => Ok(json!({ "data": fixture("product_variants_page")["data"] })),
         "InventoryItemVariant" => {
             if variables["id"] == "gid://shopify/InventoryItem/4242" {
-                Ok(json!({ "data": fixture("inventory_item")["data"] }))
+                let mut response = fixture("inventory_item");
+                let (tracked, policy) = inner.inventory_item_tracking;
+                response["data"]["inventoryItem"]["tracked"] = json!(tracked);
+                response["data"]["inventoryItem"]["variant"]["inventoryPolicy"] = json!(policy);
+                Ok(json!({ "data": response["data"] }))
             } else {
                 Ok(json!({ "data": { "inventoryItem": null } }))
             }

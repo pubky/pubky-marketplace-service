@@ -1,6 +1,6 @@
 //! Webhook subscriptions and the meaning of Shopify's webhook payloads.
 //!
-//! The service subscribes the store to five topics through the Admin API
+//! The service subscribes the store to seven topics through the Admin API
 //! (`webhookSubscriptionCreate`), all pointing at the connection's own webhooks
 //! URL. Shopify's three mandatory privacy topics (`customers/data_request`,
 //! `customers/redact`, `shop/redact`) are **not** in `WebhookSubscriptionTopic`
@@ -32,8 +32,11 @@ pub const HEADER_WEBHOOK_ID: &str = "x-shopify-webhook-id";
 
 /// The webhook topic as it appears in `X-Shopify-Topic` and the matching
 /// `WebhookSubscriptionTopic` value.
-pub const SUBSCRIBED_TOPICS: [(&str, &str); 6] = [
+pub const SUBSCRIBED_TOPICS: [(&str, &str); 7] = [
     ("inventory_levels/update", "INVENTORY_LEVELS_UPDATE"),
+    // Tracking switched on or off for an item: the variant moves between
+    // counted and made-to-order stock without any level changing.
+    ("inventory_items/update", "INVENTORY_ITEMS_UPDATE"),
     ("fulfillments/create", "FULFILLMENTS_CREATE"),
     ("fulfillments/update", "FULFILLMENTS_UPDATE"),
     ("orders/cancelled", "ORDERS_CANCELLED"),
@@ -284,6 +287,10 @@ pub fn parse(webhook: &VerifiedWebhook, body: &[u8]) -> Result<InboundEvent, Pro
             inventory_item_id: gid("InventoryItem", &payload, "inventory_item_id")
                 .ok_or_else(|| missing("inventory item"))?,
         }),
+        "inventory_items/update" => Ok(InboundEvent::InventoryChanged {
+            inventory_item_id: gid("InventoryItem", &payload, "id")
+                .ok_or_else(|| missing("inventory item"))?,
+        }),
         "fulfillments/create" | "fulfillments/update" => {
             let update = webhook.topic == "fulfillments/update";
             let tracking = payload
@@ -481,6 +488,33 @@ mod tests {
             b"{}"
         )
         .is_err());
+    }
+
+    #[test]
+    fn an_inventory_item_update_names_the_item_to_re_read() {
+        let event = parse(
+            &webhook("inventory_items/update"),
+            br#"{"id":271878346596884015,"sku":"TEE-M","tracked":false,
+                 "admin_graphql_api_id":"gid://shopify/InventoryItem/271878346596884015"}"#,
+        )
+        .expect("event");
+        assert_eq!(
+            event,
+            InboundEvent::InventoryChanged {
+                inventory_item_id: "gid://shopify/InventoryItem/271878346596884015".into()
+            }
+        );
+        let numeric_only = parse(
+            &webhook("inventory_items/update"),
+            br#"{"id":77,"tracked":true}"#,
+        )
+        .expect("event");
+        assert_eq!(
+            numeric_only,
+            InboundEvent::InventoryChanged {
+                inventory_item_id: "gid://shopify/InventoryItem/77".into()
+            }
+        );
     }
 
     #[test]

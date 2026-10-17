@@ -5,6 +5,7 @@ query InventoryItemVariant($id: ID!) {
     variant {
       id
       inventoryQuantity
+      inventoryPolicy
       product {
         id
       }

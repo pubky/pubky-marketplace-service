@@ -597,6 +597,10 @@ impl ConnectorProvider for TestProvider {
                 provider_variant_id: text("variant"),
                 available: value.get("available").and_then(Value::as_i64).unwrap_or(0),
             },
+            "made_to_order" => InboundEvent::MadeToOrder {
+                provider_product_id: text("product"),
+                provider_variant_id: text("variant"),
+            },
             "fulfillment" => InboundEvent::Fulfillment {
                 order: order(),
                 carrier: text("carrier"),

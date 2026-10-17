@@ -53,6 +53,7 @@
                   "url": "https://cdn.shopify.com/s/files/boots-40.jpg"
                 },
                 "inventoryQuantity": 7,
+                "inventoryPolicy": "DENY",
                 "inventoryItem": {
                   "tracked": true
                 }
@@ -70,6 +71,7 @@
                 ],
                 "image": null,
                 "inventoryQuantity": 0,
+                "inventoryPolicy": "CONTINUE",
                 "inventoryItem": {
                   "tracked": true
                 }

@@ -747,9 +747,9 @@ pub async fn poll_stock(state: &AppState) -> Result<u64, sqlx::Error> {
             };
             for product in &catalog.products {
                 for variant in &product.variants {
-                    let Some(level) = variant.stock else {
+                    if !variant.made_to_order && variant.stock.is_none() {
                         continue;
-                    };
+                    }
                     let Some(mapping) = store::mapping_for_provider_variant(
                         &state.pool,
                         connection.id,
@@ -760,9 +760,17 @@ pub async fn poll_stock(state: &AppState) -> Result<u64, sqlx::Error> {
                     else {
                         continue;
                     };
-                    if let StockOutcome::Applied { .. } =
-                        stock::apply_stock_level(state, &connection, &mapping, level, None).await?
-                    {
+                    let outcome = match variant.stock {
+                        Some(level) if !variant.made_to_order => {
+                            stock::apply_stock_level(state, &connection, &mapping, level, None)
+                                .await?
+                        }
+                        _ => stock::apply_made_to_order(state, &connection, &mapping).await?,
+                    };
+                    if matches!(
+                        outcome,
+                        StockOutcome::Applied { .. } | StockOutcome::Switched { .. }
+                    ) {
                         applied += 1;
                     }
                 }

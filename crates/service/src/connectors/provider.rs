@@ -309,6 +309,11 @@ pub struct CatalogVariant {
     /// Units the store can sell; `None` when the store does not track stock
     /// for this variant.
     pub stock: Option<i64>,
+    /// The store sells the variant without a stock limit: it does not track
+    /// its inventory, or keeps selling at zero (print-on-demand, made to
+    /// order). Pubky then sells it as made to order, whatever `stock` says.
+    #[serde(default)]
+    pub made_to_order: bool,
     pub image_url: Option<String>,
 }
 
@@ -497,6 +502,9 @@ pub struct ResolvedStock {
     /// Units the store can sell, summed over its locations; `None` when the
     /// store does not track this variant's stock.
     pub available: Option<i64>,
+    /// The store sells the variant without a stock limit (see
+    /// [`CatalogVariant::made_to_order`]).
+    pub made_to_order: bool,
 }
 
 /// What a live check of a connection found, for the Shop's status page.
@@ -518,6 +526,14 @@ pub enum InboundEvent {
         provider_product_id: String,
         provider_variant_id: String,
         available: i64,
+    },
+    /// The store sells the variant without a stock limit now (see
+    /// [`CatalogVariant::made_to_order`]). Applied only to mapped variants:
+    /// the Pubky variant becomes made to order until a later `StockLevel`
+    /// gives it a count again.
+    MadeToOrder {
+        provider_product_id: String,
+        provider_variant_id: String,
     },
     /// A store inventory item changed. The webhook names the item, not the
     /// variant or the total, so the framework asks the provider
