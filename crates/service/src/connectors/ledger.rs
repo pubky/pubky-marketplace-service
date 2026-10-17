@@ -212,7 +212,8 @@ pub async fn claim_next_push(
 
 /// The attempt succeeded: the store holds the order. The order's connector
 /// address envelope is deleted in the same transaction when the buyer shared
-/// it with this push's store.
+/// it with this push's store, and a `listing_not_linked` alert the order
+/// raised on this connection is resolved: its listing is linked now.
 pub async fn mark_created(
     pool: &PgPool,
     claim: &PushRow,
@@ -234,6 +235,16 @@ pub async fn mark_created(
     .rows_affected();
     if changed == 1 {
         delete_address_envelope(&mut *tx, claim.pubky_order_id, claim.connection_id).await?;
+        sqlx::query(
+            "UPDATE connector_alerts SET resolved_at = $3 \
+             WHERE pubky_order_id = $1 AND connection_id = $2 \
+               AND kind = 'listing_not_linked' AND resolved_at IS NULL",
+        )
+        .bind(claim.pubky_order_id)
+        .bind(claim.connection_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
     }
     tx.commit().await?;
     Ok(changed == 1)
