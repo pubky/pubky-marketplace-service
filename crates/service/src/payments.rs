@@ -1053,6 +1053,7 @@ pub fn upstream_operation_id(reference: &str, attempt: i32) -> String {
     format!("marketplace-payment:{reference}:{attempt}")
 }
 
+/// Mirrors the Shop's `shortOrderReference` (`orderId.slice(0, 8)`): change both together.
 fn upstream_order_description(order_id: uuid::Uuid) -> String {
     let compact = order_id.simple().to_string();
     format!("Pubky Shop order {}", &compact[..8])
