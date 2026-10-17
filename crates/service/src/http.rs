@@ -323,6 +323,13 @@ pub fn build_router(state: AppState) -> Router {
             "/v0/sellers/{pubky}/payment-config",
             get(crate::payment_methods::get_payment_config),
         )
+        // Public: the sellers with a payment method configured and enabled,
+        // for the marketplace filter. Seller keys only; stored config, never
+        // Paykit health.
+        .route(
+            "/v0/payment-methods/{method}/sellers",
+            get(crate::payment_methods::get_payment_method_sellers),
+        )
         // Public: the stores a buyer may share an address with, and each
         // store's recipient public key. Names no credential.
         .route(

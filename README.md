@@ -308,6 +308,26 @@ order they bound to PayPal (`POST /v0/orders/{id}/payment-method`), which only
 that order's buyer and seller can read. The seller reads their own stored
 values from the authenticated `GET /v0/sellers/me/payment-config`.
 
+### Payment-method seller set
+
+`GET /v0/payment-methods/{method}/sellers` is public and feeds the
+marketplace's payment-method filter. It answers with seller keys only:
+`{ "method": "paypal", "sellers": ["<pubky>", …], "next_after": "<pubky>" | null }`.
+
+- **Methods:** `bitcoin` and `paypal` always. `usdt` only while
+  `USDT_PAYMENTS_ENABLED` is on. Anything else answers
+  `invalid_payment_method`.
+- **Source:** the stored configuration only, never Paykit:
+  - Bitcoin is `bitcoin_enabled` on a deployment with a Paykit client.
+  - PayPal is a stored merchant email.
+  - USDT is the seller's opt-in on a deployment whose prepare can offer USDT.
+  - A degraded Paykit therefore drops no seller. Checkout still verifies the
+    rail live.
+- **Scope:** only sellers with a live registered listing (not deleted, not
+  sold) are listed. Drop editions are registered listings too.
+- **Paging:** ordered by key, with `after` (the previous page's last key) and
+  `limit` (1 to 500, default 500).
+
 The seller's own view (`GET` and `PUT /v0/sellers/me/payment-config`) also
 carries `bitcoin_setup`: `ready`, `setup_required` or `unavailable`, asked of
 paykit-server on every call (the same question as `bitcoin_available`, not

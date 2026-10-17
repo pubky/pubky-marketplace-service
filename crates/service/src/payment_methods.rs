@@ -806,6 +806,167 @@ pub async fn get_payment_config(
     )
 }
 
+/// Most sellers one page of [`get_payment_method_sellers`] returns.
+pub const PAYMENT_METHOD_SELLERS_MAX_PAGE: i64 = 500;
+
+#[derive(Debug, Deserialize)]
+pub struct PaymentMethodSellersQuery {
+    after: Option<String>,
+    limit: Option<i64>,
+}
+
+/// A rail a buyer can filter the marketplace by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FilterMethod {
+    Bitcoin,
+    Usdt,
+    Paypal,
+}
+
+impl FilterMethod {
+    fn parse(value: &str, usdt_flag: bool) -> Option<Self> {
+        match value {
+            "bitcoin" => Some(Self::Bitcoin),
+            "usdt" if usdt_flag => Some(Self::Usdt),
+            "paypal" => Some(Self::Paypal),
+            _ => None,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bitcoin => "bitcoin",
+            Self::Usdt => "usdt",
+            Self::Paypal => "paypal",
+        }
+    }
+}
+
+/// `GET /v0/payment-methods/{method}/sellers` (public): the sellers who have
+/// `method` configured and enabled, for the marketplace's payment-method
+/// filter. `method` is `bitcoin`, `paypal` or, only while
+/// `USDT_PAYMENTS_ENABLED` is on, `usdt`; anything else is
+/// `invalid_payment_method`, so with the flag off the surface is identical
+/// to a build without USDT.
+///
+/// The answer is the stored configuration, never Paykit readiness or rail
+/// health: a degraded Paykit must not drop sellers from search, and checkout
+/// still verifies the rail live. Bitcoin is `bitcoin_enabled` on a deployment
+/// with a Paykit client; PayPal is a stored merchant email; USDT is the
+/// seller's opt-in on a deployment whose prepare can offer USDT (the same
+/// deployment gates as `usdt_available`, minus the readiness lookup).
+///
+/// Only sellers with a live registered listing (not deleted, not sold; drop
+/// editions are registered listings too) are listed: the answer names nobody
+/// without a public storefront. The body
+/// is seller keys only, ordered by key and paged with `after` (the last key
+/// of the previous page) and `limit` (1 to 500, default 500); `next_after`
+/// is the cursor for the next page, or null on the last one.
+pub async fn get_payment_method_sellers(
+    State(state): State<AppState>,
+    Path(method): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<PaymentMethodSellersQuery>,
+) -> Response {
+    let Some(method) = FilterMethod::parse(&method, state.config.usdt_payments_enabled) else {
+        return method_error(
+            ErrorCode::InvalidCommand,
+            "invalid_payment_method",
+            "The payment method is not one buyers can filter by.",
+        );
+    };
+    if let Some(after) = &query.after {
+        if !marketplace_domain::pubky::is_valid_pubky(after) {
+            return method_error(
+                ErrorCode::InvalidCommand,
+                "invalid_cursor",
+                "The page cursor is not a seller pubky.",
+            );
+        }
+    }
+    let limit = query.limit.unwrap_or(PAYMENT_METHOD_SELLERS_MAX_PAGE);
+    if !(1..=PAYMENT_METHOD_SELLERS_MAX_PAGE).contains(&limit) {
+        return method_error(
+            ErrorCode::InvalidCommand,
+            "invalid_limit",
+            "The page limit must be between 1 and 500.",
+        );
+    }
+    let paykit = state
+        .payments
+        .as_ref()
+        .and_then(|payments| payments.paykit.as_ref());
+    let deployment_offers = match method {
+        FilterMethod::Bitcoin => paykit.is_some(),
+        FilterMethod::Usdt => {
+            state.config.paykit_marketplace_assets.includes_usdt()
+                && state.config.paykit_marketplace_contract.is_multi_asset()
+                && paykit.is_some_and(|paykit| paykit.api() == PaykitApi::Upstream)
+        }
+        FilterMethod::Paypal => true,
+    };
+    let sellers = if deployment_offers {
+        match load_payment_method_sellers(&state.pool, method, query.after.as_deref(), limit + 1)
+            .await
+        {
+            Ok(sellers) => sellers,
+            Err(error) => return internal("payment method sellers read", &error),
+        }
+    } else {
+        Vec::new()
+    };
+    let has_more = sellers.len() as i64 > limit;
+    let page: Vec<String> = sellers.into_iter().take(limit as usize).collect();
+    let next_after = if has_more { page.last().cloned() } else { None };
+    (
+        StatusCode::OK,
+        Json(json!({
+            "method": method.as_str(),
+            "sellers": page,
+            "next_after": next_after,
+        })),
+    )
+        .into_response()
+}
+
+async fn load_payment_method_sellers(
+    pool: &sqlx::PgPool,
+    method: FilterMethod,
+    after: Option<&str>,
+    fetch: i64,
+) -> Result<Vec<String>, sqlx::Error> {
+    let configured = match method {
+        FilterMethod::Bitcoin => {
+            "SELECT seller_pubky FROM seller_payment_configs WHERE bitcoin_enabled"
+        }
+        FilterMethod::Paypal => {
+            "SELECT seller_pubky FROM seller_payment_configs \
+             WHERE paypal_merchant_email IS NOT NULL"
+        }
+        FilterMethod::Usdt => {
+            "SELECT seller_pubky FROM seller_accepted_payment_options \
+             WHERE option_id = $3 AND enabled"
+        }
+    };
+    let sql = format!(
+        "SELECT configured.seller_pubky FROM ({configured}) AS configured \
+         WHERE ($1::text IS NULL OR configured.seller_pubky > $1) \
+           AND EXISTS (SELECT 1 FROM listings l \
+                       WHERE l.seller_pubky = configured.seller_pubky \
+                         AND l.deleted_at IS NULL AND l.state <> 'sold') \
+         ORDER BY configured.seller_pubky \
+         LIMIT $2"
+    );
+    let query = sqlx::query_scalar::<_, String>(&sql)
+        .bind(after)
+        .bind(fetch);
+    let query = if method == FilterMethod::Usdt {
+        query.bind(PaymentOption::PaykitUsdtArbitrumOne.id())
+    } else {
+        query
+    };
+    query.fetch_all(pool).await
+}
+
 /// Whether a seller is offered USDT right now (see [`get_payment_config`]).
 /// The deployment's asset list is read first, then the seller's consent, so
 /// neither a deployment that cannot prepare USDT nor a seller who never opted

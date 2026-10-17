@@ -100,6 +100,7 @@ and write. "Automation" means the inventory capability plus the
 | POST | `/v1/auth/grant-flows/{flow_id}/result-ticket` | Grant-flow (Shop BFF). |
 | POST | `/v1/auth/grant-flows/{flow_id}/claim` | Grant-flow (Shop BFF). |
 | GET | `/v0/sellers/{pubky}/payment-config` | Public payment configuration of a seller. |
+| GET | `/v0/payment-methods/{method}/sellers` | Seller keys with `bitcoin`, `paypal` or (USDT flag on) `usdt` configured and enabled, for the marketplace filter. Stored config, never Paykit health. Paged by `after`/`limit`. See the README's _Payment-method seller set_. |
 | GET | `/v0/sellers/{pubky}/connector-status` | The stores a buyer may share an address with and each store's recipient public key. Public; answers an empty list while connectors are off. See [Store connectors](#store-connectors). |
 | POST | `/v1/connectors/webhooks/woocommerce/c/{connection_id}` | A WooCommerce connection's own webhooks. Authenticity is the store's signature under that connection's secret. See [Store connectors](#store-connectors). |
 | POST | `/v1/connectors/shopify/c/{connection_id}/webhooks` | Webhook from a merchant's own Shopify app, including the privacy topics; verified with that connection's app secret. |
