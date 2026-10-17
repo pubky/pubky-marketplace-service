@@ -14,6 +14,14 @@
 //! listing row lock before it touches a row ([`lock_rows`] does so), the one
 //! lock order the whole service uses, so row updates and the listing
 //! roll-up cannot deadlock against a path that locks the listing first.
+//!
+//! A MADE-TO-ORDER row (migration 0073) sells without a stock count: its
+//! store does not track the variant's inventory or keeps selling at zero.
+//! Its `available_quantity` is always 0. A claim adds its units to the row's
+//! total as it reserves them and a release takes them out again, so the
+//! balance rule holds and no unit is invented; every other move (reserved to
+//! sold, a hold's expiry, a cancel) is the same as on a tracked row. Only
+//! [`set_made_to_order`] sets or clears the flag.
 
 use std::collections::{HashMap, HashSet};
 
@@ -43,6 +51,7 @@ pub struct VariantRow {
     pub available_quantity: i64,
     pub reserved_quantity: i64,
     pub sold_quantity: i64,
+    pub made_to_order: bool,
 }
 
 impl VariantRow {
@@ -53,10 +62,42 @@ impl VariantRow {
     pub fn committed(&self) -> i64 {
         self.reserved_quantity + self.sold_quantity
     }
+
+    /// A buyer can order this row now: it is made to order, or has units.
+    pub fn orderable(&self) -> bool {
+        self.made_to_order || self.available_quantity > 0
+    }
 }
 
 const ROW_COLUMNS: &str = "variant_id, sku, enabled, total_quantity, available_quantity, \
-     reserved_quantity, sold_quantity";
+     reserved_quantity, sold_quantity, made_to_order";
+
+/// The listing state its quantities imply: `available` while anything can
+/// be ordered (units on sale, or a made-to-order variant), `reserved` while
+/// only held units remain, `sold` otherwise.
+pub fn listing_state(available: i64, reserved: i64, made_to_order: bool) -> &'static str {
+    if available > 0 || made_to_order {
+        "available"
+    } else if reserved > 0 {
+        "reserved"
+    } else {
+        "sold"
+    }
+}
+
+/// The listing state after a new claim of `quantity` units, from the
+/// listing's totals before it: a made-to-order listing stays `available`.
+pub fn state_after_claim(
+    available_before: i64,
+    quantity: i64,
+    made_to_order: bool,
+) -> &'static str {
+    if available_before == quantity && !made_to_order {
+        "reserved"
+    } else {
+        "available"
+    }
+}
 
 /// The listing's rows, locked. The listing row is locked first.
 pub async fn lock_rows(
@@ -203,7 +244,7 @@ pub enum Shortfall {
 }
 
 pub fn shortfall(row: &VariantRow, quantity: i64) -> Option<Shortfall> {
-    if row.available_quantity >= quantity {
+    if row.made_to_order || row.available_quantity >= quantity {
         None
     } else if row.available_quantity > 0 {
         Some(Shortfall::Insufficient)
@@ -232,7 +273,8 @@ impl Held {
 
 /// Available -> reserved on one row, guarded by the available count (the
 /// compare-and-swap; the CHECK constraints keep stock non-negative even
-/// without it). False when the units are not there.
+/// without it). False when the units are not there. A made-to-order row has
+/// no count to take from: the units join its total as they are reserved.
 pub async fn reserve(
     tx: &mut Transaction<'_, Postgres>,
     aggregate_id: &str,
@@ -241,9 +283,11 @@ pub async fn reserve(
 ) -> Result<bool, sqlx::Error> {
     let updated = sqlx::query(
         "UPDATE listing_variant_inventory SET \
-         available_quantity = available_quantity - $3, \
+         available_quantity = available_quantity - CASE WHEN made_to_order THEN 0 ELSE $3 END, \
+         total_quantity = total_quantity + CASE WHEN made_to_order THEN $3 ELSE 0 END, \
          reserved_quantity = reserved_quantity + $3, updated_at = now() \
-         WHERE listing_aggregate_id = $1 AND variant_id = $2 AND available_quantity >= $3",
+         WHERE listing_aggregate_id = $1 AND variant_id = $2 \
+           AND (made_to_order OR available_quantity >= $3)",
     )
     .bind(aggregate_id)
     .bind(variant_id)
@@ -279,7 +323,8 @@ pub async fn confirm_sale(
 /// compare-and-swap against the ledger: nothing else removes a claim's
 /// contribution, so a shortfall is an invariant violation. A variant the
 /// seller has since withdrawn takes the units out of its total instead of
-/// putting them on sale, so a withdrawn size never shows stock.
+/// putting them on sale, so a withdrawn size never shows stock; so does a
+/// made-to-order variant, which has no count to return them to.
 pub async fn release(
     tx: &mut Transaction<'_, Postgres>,
     aggregate_id: &str,
@@ -290,8 +335,10 @@ pub async fn release(
     let column = held.column();
     let updated = sqlx::query(&format!(
         "UPDATE listing_variant_inventory SET \
-         available_quantity = available_quantity + CASE WHEN enabled THEN $3 ELSE 0 END, \
-         total_quantity = total_quantity - CASE WHEN enabled THEN 0 ELSE $3 END, \
+         available_quantity = available_quantity + \
+             CASE WHEN enabled AND NOT made_to_order THEN $3 ELSE 0 END, \
+         total_quantity = total_quantity - \
+             CASE WHEN enabled AND NOT made_to_order THEN 0 ELSE $3 END, \
          {column} = {column} - $3, updated_at = now() \
          WHERE listing_aggregate_id = $1 AND variant_id = $2 AND {column} >= $3",
     ))
@@ -303,8 +350,10 @@ pub async fn release(
     Ok(updated.rows_affected() == 1)
 }
 
-/// The listing state its (already rolled-up) quantities imply.
-pub const STATE_FROM_TOTALS_SQL: &str = "CASE WHEN available_quantity > 0 THEN 'available' \
+/// The listing state its (already rolled-up) quantities imply, as
+/// [`listing_state`] does.
+pub const STATE_FROM_TOTALS_SQL: &str =
+    "CASE WHEN available_quantity > 0 OR made_to_order THEN 'available' \
      WHEN reserved_quantity > 0 THEN 'reserved' ELSE 'sold' END";
 
 /// One variant's stock after a record edit.
@@ -318,6 +367,10 @@ pub struct PlannedRow {
     pub available: i64,
     pub reserved: i64,
     pub sold: i64,
+    /// The row stays (or, converting from a made-to-order implicit row,
+    /// starts) made to order: its record quantity is not a count, so
+    /// `total` is its committed units and `available` 0.
+    pub made_to_order: bool,
 }
 
 /// What a registration or sync does to the listing's stock rows.
@@ -562,10 +615,14 @@ pub async fn plan(
                 return Ok(Ok(StockPlan::Implicit));
             }
         }
-        if unchanged.is_some_and(|record| {
-            implicit.total_quantity != record.enabled_sum
-                && implicit.total_quantity != record.all_variants_sum
-        }) {
+        // A made-to-order total is its committed units, never a count the
+        // seller adjusted, so it does not hold a conversion back.
+        if !implicit.made_to_order
+            && unchanged.is_some_and(|record| {
+                implicit.total_quantity != record.enabled_sum
+                    && implicit.total_quantity != record.all_variants_sum
+            })
+        {
             record_deferral(
                 tx,
                 aggregate_id,
@@ -582,11 +639,34 @@ pub async fn plan(
 
     let mut planned = Vec::with_capacity(variants.len() + rows.len());
     let offered: HashSet<&str> = variants.iter().map(|v| v.id.as_str()).collect();
+    // Converting a made-to-order implicit row keeps every new size made to
+    // order: which sizes the store tracks is the connector's to say, on the
+    // next stock change or poll, and until then none of them is sold out.
+    let inherit_made_to_order = converting_from.is_some_and(|implicit| implicit.made_to_order);
     for (position, variant) in variants.iter().enumerate() {
-        let (reserved, sold) = match rows.iter().find(|row| row.variant_id == variant.id) {
-            Some(row) => (row.reserved_quantity, row.sold_quantity),
-            None => (0, attribution.get(&variant.id).copied().unwrap_or(0)),
-        };
+        let (reserved, sold, made_to_order) =
+            match rows.iter().find(|row| row.variant_id == variant.id) {
+                Some(row) => (row.reserved_quantity, row.sold_quantity, row.made_to_order),
+                None => (
+                    0,
+                    attribution.get(&variant.id).copied().unwrap_or(0),
+                    inherit_made_to_order,
+                ),
+            };
+        if made_to_order {
+            planned.push(PlannedRow {
+                variant_id: variant.id.clone(),
+                sku: variant.sku.clone(),
+                enabled: true,
+                position: i32::try_from(position).unwrap_or(i32::MAX),
+                total: reserved + sold,
+                available: 0,
+                reserved,
+                sold,
+                made_to_order: true,
+            });
+            continue;
+        }
         if variant.quantity < reserved + sold {
             // A conversion that cannot be written stays marked: the marker is
             // never cleared while the listing is unconvertible.
@@ -614,6 +694,7 @@ pub async fn plan(
             available: variant.quantity - reserved - sold,
             reserved,
             sold,
+            made_to_order: false,
         });
     }
     let offered_count = variants.len();
@@ -632,6 +713,7 @@ pub async fn plan(
                 available: 0,
                 reserved: row.reserved_quantity,
                 sold: row.sold_quantity,
+                made_to_order: row.made_to_order,
             });
         }
     }
@@ -657,14 +739,15 @@ pub async fn write_plan(
         sqlx::query(
             "INSERT INTO listing_variant_inventory \
              (listing_aggregate_id, variant_id, position, sku, enabled, total_quantity, \
-              available_quantity, reserved_quantity, sold_quantity, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now()) \
+              available_quantity, reserved_quantity, sold_quantity, made_to_order, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now()) \
              ON CONFLICT (listing_aggregate_id, variant_id) DO UPDATE SET \
                 position = EXCLUDED.position, sku = EXCLUDED.sku, enabled = EXCLUDED.enabled, \
                 total_quantity = EXCLUDED.total_quantity, \
                 available_quantity = EXCLUDED.available_quantity, \
                 reserved_quantity = EXCLUDED.reserved_quantity, \
-                sold_quantity = EXCLUDED.sold_quantity, updated_at = now()",
+                sold_quantity = EXCLUDED.sold_quantity, \
+                made_to_order = EXCLUDED.made_to_order, updated_at = now()",
         )
         .bind(aggregate_id)
         .bind(&row.variant_id)
@@ -675,6 +758,7 @@ pub async fn write_plan(
         .bind(row.available)
         .bind(row.reserved)
         .bind(row.sold)
+        .bind(row.made_to_order)
         .execute(&mut **tx)
         .await?;
     }
@@ -704,6 +788,7 @@ mod tests {
             available_quantity: available,
             reserved_quantity: reserved,
             sold_quantity: sold,
+            made_to_order: false,
         }
     }
 

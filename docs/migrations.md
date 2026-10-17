@@ -242,6 +242,17 @@ claimed by other branches); sqlx applies pending migrations in version order
 and does not need the numbers to be contiguous, which `migration_0033_test`
 already exercises with a missing 0032.
 
+0073 (made-to-order stock) adds `listing_variant_inventory.made_to_order` and
+`listings.made_to_order` (`BOOLEAN NOT NULL DEFAULT false`, a constant default,
+so no rewrite), a `NOT VALID` CHECK that a made-to-order row has
+`available_quantity = 0` (every existing row is `false`), replaces the 0070
+roll-up function so it maintains `listings.made_to_order` and marks
+made-to-order entries of `variant_availability`, and widens
+`connector_alerts_kind` with `listing_not_linked` (small table, one pass). It
+builds no index and sets `lock_timeout` like 0050. A binary from before 0073
+never sets the flag, and on a made-to-order row its writes fail closed: a claim
+would take `available` below 0, which the existing CHECK refuses.
+
 0072 (grant sessions) creates `grant_session_challenges` with its primary key,
 two CHECKs, and plain indexes on `expires_at` and on `pubky` for unused rows
 (a new, empty table), adds the nullable `auth_sessions.source_grant_id` and

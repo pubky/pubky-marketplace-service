@@ -107,6 +107,10 @@ pub struct ListingRow {
     /// per variant; NULL for a listing that sells one variant. Maintained by
     /// the variant-inventory trigger (migration 0070), never written here.
     pub variant_availability: Option<Value>,
+    /// True while an enabled variant row is made to order (migration 0073):
+    /// the listing sells without a stock count there. Maintained by the same
+    /// trigger.
+    pub made_to_order: bool,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -248,6 +252,9 @@ impl ListingRow {
             "updated_at": format_timestamp(self.updated_at),
         });
         let mut projection = projection;
+        if self.made_to_order {
+            projection["made_to_order"] = json!(true);
+        }
         if let Some(variants) = &self.variant_availability {
             projection["variants"] = variants.clone();
         }
