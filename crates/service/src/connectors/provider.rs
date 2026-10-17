@@ -368,6 +368,9 @@ pub struct ShippingAddress {
     pub postal_code: String,
     #[serde(rename = "countryCode", alias = "country_code")]
     pub country_code: String,
+    /// The buyer's phone, when they gave one for the courier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phone: Option<String>,
 }
 
 impl std::fmt::Debug for ShippingAddress {

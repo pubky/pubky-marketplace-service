@@ -116,6 +116,27 @@ pub fn is_region_required(country_code: &str) -> bool {
     postal_country_rule(country_code).region_required
 }
 
+/// The ISO 3166-2 subdivision suffix (`CA`, `ON`, `NSW`) a region names, when
+/// the country's subdivision table resolves it unambiguously: the suffix
+/// itself or the subdivision's full name, case-insensitive. `None` for free
+/// text, an empty region, or a country without a table.
+pub fn subdivision_code(country_code: &str, region: &str) -> Option<String> {
+    let trimmed = region.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let rule = postal_country_rule(country_code);
+    rule.subdivisions
+        .iter()
+        .find(|(code, _)| code.eq_ignore_ascii_case(trimmed))
+        .or_else(|| {
+            rule.subdivisions
+                .iter()
+                .find(|(_, name)| name.eq_ignore_ascii_case(trimmed))
+        })
+        .map(|(code, _)| code.clone())
+}
+
 /// Normalize a region for storage.
 ///
 /// Empty is allowed only when the country does not require a subdivision.
@@ -169,6 +190,28 @@ pub fn canonicalize_region(country_code: &str, region: &str) -> Result<String, &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_subdivision_code_comes_from_the_code_or_the_full_name_only() {
+        assert_eq!(subdivision_code("US", "California").as_deref(), Some("CA"));
+        assert_eq!(subdivision_code("us", " ca ").as_deref(), Some("CA"));
+        assert_eq!(subdivision_code("CA", "ontario").as_deref(), Some("ON"));
+        assert_eq!(
+            subdivision_code("AU", "New South Wales").as_deref(),
+            Some("NSW")
+        );
+        assert_eq!(
+            subdivision_code("US", "Calif."),
+            None,
+            "free text is not guessed"
+        );
+        assert_eq!(subdivision_code("US", ""), None);
+        assert_eq!(
+            subdivision_code("DE", "Bayern"),
+            None,
+            "no table for the country"
+        );
+    }
 
     #[test]
     fn table_parses_and_matches_shop_required_set() {

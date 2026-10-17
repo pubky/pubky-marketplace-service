@@ -1357,7 +1357,12 @@ on `X-Shopify-Event-Id`.
   one manual `SALE` transaction named `Pubky <rail>`, tags `pubky` and
   `pubky-order-{id}`, the `pubky_order_id` attribute, inventory decremented
   ignoring the store's oversell policy, no receipt and no customer. A shipping
-  address is attached only when the buyer opted in. Amounts are formatted with the
+  address is attached only when the buyer opted in. Its region goes as
+  `provinceCode` only when the subdivision table
+  (`contracts/postal-region-rules.json`) resolves it unambiguously, from the
+  code or the full name (`California` -> `CA`); other region text is kept on
+  `address2`, because Shopify takes no free-text province and may refuse an
+  unknown code. The buyer's phone goes with it when they gave one. Amounts are formatted with the
   currency's own exponent, and an order whose exponent differs is refused
   (`exponent_mismatch`). The order currency must be the store's currency (else
   `currency_mismatch`: the push is quarantined and the seller alert says why and

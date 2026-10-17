@@ -219,4 +219,26 @@ mod tests {
         );
         assert!(format!("{key:?}").contains("<redacted>"));
     }
+
+    #[test]
+    fn a_phone_the_buyer_gave_opens_with_the_address_and_none_without_one() {
+        let key = generate();
+        let aad = envelope_aad("cmd-1", "buyer", "seller", &key.key_id);
+        let without = open_address(
+            key.secret(),
+            &aad,
+            &seal_address(&key.public_key, &aad, &address()),
+        )
+        .expect("opens");
+        assert_eq!(without.phone, None);
+        let mut with_phone = address();
+        with_phone["phone"] = serde_json::json!("+351 21 000 0000");
+        let opened = open_address(
+            key.secret(),
+            &aad,
+            &seal_address(&key.public_key, &aad, &with_phone),
+        )
+        .expect("opens");
+        assert_eq!(opened.phone.as_deref(), Some("+351 21 000 0000"));
+    }
 }

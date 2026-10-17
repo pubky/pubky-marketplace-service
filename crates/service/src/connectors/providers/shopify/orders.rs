@@ -110,6 +110,12 @@ pub fn gateway_name(payment_method: &str) -> &'static str {
     }
 }
 
+/// The shipping address as Shopify's `MailingAddressInput`. Shopify takes a
+/// region only as `provinceCode`, and refuses a code it does not know for a
+/// country with provinces, so the code is sent only when the subdivision
+/// table resolves the buyer's region unambiguously (`California` -> `CA`).
+/// Other region text is kept on the second address line, so the label still
+/// carries it and the push is never refused over it.
 fn mailing_address(address: &ShippingAddress) -> Value {
     let (first, last) = match address.name.trim().rsplit_once(' ') {
         Some((first, last)) => (first.trim().to_string(), last.trim().to_string()),
@@ -123,11 +129,27 @@ fn mailing_address(address: &ShippingAddress) -> Value {
         "zip": address.postal_code,
         "countryCode": address.country_code.to_ascii_uppercase(),
     });
-    if !address.line2.is_empty() {
-        value["address2"] = json!(address.line2);
+    let region = address.region.trim();
+    let province_code = marketplace_domain::postal::subdivision_code(&address.country_code, region);
+    let line2 = address.line2.trim();
+    let address2 = match (&province_code, region.is_empty()) {
+        (None, false) if line2.is_empty() => region.to_string(),
+        (None, false) => format!("{line2}, {region}"),
+        _ => line2.to_string(),
+    };
+    if !address2.is_empty() {
+        value["address2"] = json!(address2);
     }
-    if !address.region.is_empty() {
-        value["provinceCode"] = json!(address.region);
+    if let Some(code) = province_code {
+        value["provinceCode"] = json!(code);
+    }
+    if let Some(phone) = address
+        .phone
+        .as_deref()
+        .map(str::trim)
+        .filter(|phone| !phone.is_empty())
+    {
+        value["phone"] = json!(phone);
     }
     value
 }
@@ -737,6 +759,7 @@ mod tests {
             region: String::new(),
             postal_code: "N1".into(),
             country_code: "gb".into(),
+            phone: None,
         });
         let vars = order_create_variables(&shared).expect("variables");
         let address = &vars["order"]["shippingAddress"];
@@ -744,6 +767,35 @@ mod tests {
         assert_eq!(address["lastName"], "Lovelace");
         assert_eq!(address["countryCode"], "GB");
         assert!(address.get("address2").is_none());
+        assert!(address.get("provinceCode").is_none());
+    }
+
+    fn with_region(country: &str, region: &str, line2: &str) -> Value {
+        let mut shared = order();
+        shared.shipping_address = Some(ShippingAddress {
+            name: "Ada Lovelace".into(),
+            line1: "1 Main St".into(),
+            line2: line2.into(),
+            city: "Town".into(),
+            region: region.into(),
+            postal_code: "1".into(),
+            country_code: country.into(),
+            phone: None,
+        });
+        order_create_variables(&shared).expect("variables")["order"]["shippingAddress"].clone()
+    }
+
+    #[test]
+    fn a_region_is_a_province_code_only_when_it_is_unambiguous() {
+        assert_eq!(with_region("US", "California", "")["provinceCode"], "CA");
+        assert_eq!(with_region("US", "ny", "")["provinceCode"], "NY");
+        assert_eq!(with_region("CA", "Quebec", "")["provinceCode"], "QC");
+        let free = with_region("US", "Calif.", "Apt 4");
+        assert!(free.get("provinceCode").is_none());
+        assert_eq!(free["address2"], "Apt 4, Calif.");
+        let elsewhere = with_region("DE", "Bayern", "");
+        assert!(elsewhere.get("provinceCode").is_none());
+        assert_eq!(elsewhere["address2"], "Bayern");
     }
 
     #[test]

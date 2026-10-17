@@ -275,6 +275,7 @@ async fn an_address_the_buyer_shared_reaches_the_store_order() {
         region: "LND".into(),
         postal_code: "N1 1AA".into(),
         country_code: "GB".into(),
+        phone: Some("+44 20 7946 0000".into()),
     });
     provider
         .push_order(&connection, &order)
@@ -282,8 +283,37 @@ async fn an_address_the_buyer_shared_reaches_the_store_order() {
         .expect("pushed");
     let address = &fake.orders()[0].input["shippingAddress"];
     assert_eq!(address["address1"], "1 Main St");
-    assert_eq!(address["address2"], "Flat 2");
+    assert_eq!(
+        address["address2"], "Flat 2, LND",
+        "a region with no known code stays on the label, not as a code Shopify may refuse"
+    );
+    assert!(address.get("provinceCode").is_none());
     assert_eq!(address["countryCode"], "GB");
+    assert_eq!(address["phone"], "+44 20 7946 0000");
+
+    let mut american = push(0);
+    american.pubky_order_id = Uuid::parse_str("11111111-2222-4333-8444-666666666666").unwrap();
+    american.shipping_address = Some(ShippingAddress {
+        name: "Grace Hopper".into(),
+        line1: "1 Infinite Loop".into(),
+        line2: String::new(),
+        city: "Cupertino".into(),
+        region: "California".into(),
+        postal_code: "95014".into(),
+        country_code: "US".into(),
+        phone: None,
+    });
+    provider
+        .push_order(&connection, &american)
+        .await
+        .expect("pushed");
+    let address = &fake.orders()[1].input["shippingAddress"];
+    assert_eq!(
+        address["provinceCode"], "CA",
+        "the state's name becomes its code"
+    );
+    assert!(address.get("address2").is_none());
+    assert!(address.get("phone").is_none());
     fake.assert_clean();
 }
 

@@ -177,6 +177,14 @@ pub fn order_body(push: &OrderPush, shop_origin: Option<&str>) -> Result<Value, 
             "postcode": address.postal_code,
             "country": address.country_code.to_ascii_uppercase(),
         });
+        if let Some(phone) = address
+            .phone
+            .as_deref()
+            .map(str::trim)
+            .filter(|phone| !phone.is_empty())
+        {
+            body["shipping"]["phone"] = json!(phone);
+        }
     }
     Ok(body)
 }
@@ -655,8 +663,13 @@ mod tests {
             region: "ZH".into(),
             postal_code: "8001".into(),
             country_code: "ch".into(),
+            phone: None,
         });
         let body = order_body(&opted_in, None).unwrap();
+        assert!(body["shipping"].get("phone").is_none());
+        opted_in.shipping_address.as_mut().unwrap().phone = Some(" +41 44 000 00 00 ".into());
+        let body = order_body(&opted_in, None).unwrap();
+        assert_eq!(body["shipping"]["phone"], "+41 44 000 00 00");
         assert_eq!(body["shipping"]["first_name"], "Anna");
         assert_eq!(body["shipping"]["last_name"], "Maria Muster");
         assert_eq!(body["shipping"]["country"], "CH");
