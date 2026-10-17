@@ -9,7 +9,10 @@
 //!
 //! Only `status:active` products are listed. A variant's stock is the
 //! variant's total across the store's locations (`inventoryQuantity`); a
-//! variant whose inventory item is not tracked has `stock: None`.
+//! variant whose inventory item is not tracked has `stock: None`. A variant
+//! that is not tracked, or that keeps selling when out of stock
+//! (`inventoryPolicy: CONTINUE`, how print-on-demand apps such as Printful set
+//! their variants up), is `made_to_order`: the store never runs out of it.
 
 use serde_json::{json, Value};
 
@@ -168,6 +171,7 @@ fn product(
         .collect::<Result<Vec<_>, _>>()?;
     Ok(CatalogProduct {
         provider_product_id: text(node, "id").ok_or_else(|| malformed("product id"))?,
+        handle: text(node, "handle"),
         title: text(node, "title").unwrap_or_default(),
         description: text(node, "description"),
         url: text(node, "onlineStoreUrl"),
@@ -234,6 +238,7 @@ fn catalog_variant(
         .pointer("/inventoryItem/tracked")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let made_to_order = sells_without_limit(tracked, variant);
     let stock = tracked.then(|| {
         variant
             .get("inventoryQuantity")
@@ -274,11 +279,18 @@ fn catalog_variant(
             exponent: exponent(currency),
         },
         stock,
+        made_to_order,
         image_url: variant
             .pointer("/image/url")
             .and_then(Value::as_str)
             .map(str::to_string),
     })
+}
+
+/// Whether the store sells the variant without a stock limit: its inventory is
+/// not tracked, or it keeps selling at zero (`inventoryPolicy: CONTINUE`).
+fn sells_without_limit(tracked: bool, variant: &Value) -> bool {
+    !tracked || variant.get("inventoryPolicy").and_then(Value::as_str) == Some("CONTINUE")
 }
 
 /// The variant behind an inventory item and what it can now sell.
@@ -320,6 +332,7 @@ pub async fn resolve(
                 .unwrap_or(0)
                 .max(0)
         }),
+        made_to_order: sells_without_limit(tracked, variant),
     }))
 }
 
@@ -331,7 +344,7 @@ mod tests {
         json!({
             "id": id, "title": "Large", "sku": "BOOT-L", "price": price,
             "selectedOptions": [{"name": "Size", "value": "Large"}],
-            "image": null, "inventoryQuantity": quantity,
+            "image": null, "inventoryQuantity": quantity, "inventoryPolicy": "DENY",
             "inventoryItem": {"tracked": tracked}
         })
     }
@@ -365,6 +378,28 @@ mod tests {
         let oversold =
             catalog_variant(&variant("gid://x/1", "1.00", true, -4), "USD", false).expect("v");
         assert_eq!(oversold.stock, Some(0));
+    }
+
+    #[test]
+    fn untracked_or_continue_selling_variants_are_made_to_order() {
+        let untracked =
+            catalog_variant(&variant("gid://x/1", "1.00", false, 0), "USD", false).expect("v");
+        assert!(untracked.made_to_order);
+        let mut continues = variant("gid://x/2", "1.00", true, 0);
+        continues["inventoryPolicy"] = json!("CONTINUE");
+        let continues = catalog_variant(&continues, "USD", false).expect("v");
+        assert!(continues.made_to_order);
+        assert_eq!(continues.stock, Some(0), "the count is still reported");
+        let counted =
+            catalog_variant(&variant("gid://x/3", "1.00", true, 4), "USD", false).expect("v");
+        assert!(!counted.made_to_order);
+        let mut no_policy = variant("gid://x/4", "1.00", true, 4);
+        no_policy.as_object_mut().unwrap().remove("inventoryPolicy");
+        assert!(
+            !catalog_variant(&no_policy, "USD", false)
+                .expect("v")
+                .made_to_order
+        );
     }
 
     #[test]

@@ -411,6 +411,21 @@ pub(crate) async fn apply_registration(
     // The listing's quantity columns: the payload's quantity for a listing
     // that sells one variant, the sum of its variant rows otherwise.
     let (total, available, reserved, sold, state) = match &plan {
+        StockPlan::Implicit
+            if variant_rows
+                .iter()
+                .any(|row| row.is_implicit() && row.made_to_order) =>
+        {
+            // Made to order: the record's quantity is not a count, so the
+            // listing keeps only its committed units and stays orderable.
+            (
+                reserved_now + sold_now,
+                0,
+                reserved_now,
+                sold_now,
+                variant_stock::listing_state(0, reserved_now, true),
+            )
+        }
         StockPlan::Implicit => {
             let committed = reserved_now + sold_now;
             // Stock is the enabled variants' units: a disabled variant is not
@@ -461,13 +476,8 @@ pub(crate) async fn apply_registration(
                 .as_ref()
                 .map(|listing| (listing.total_quantity, listing.available_quantity))
                 .unwrap_or_default();
-            let state = if available > 0 {
-                "available"
-            } else if reserved_now > 0 {
-                "reserved"
-            } else {
-                "sold"
-            };
+            let made_to_order = current.is_some_and(|listing| listing.made_to_order);
+            let state = variant_stock::listing_state(available, reserved_now, made_to_order);
             (total, available, reserved_now, sold_now, state)
         }
         StockPlan::PerVariant { rows, .. } => {
@@ -475,13 +485,8 @@ pub(crate) async fn apply_registration(
             let available: i64 = rows.iter().map(|row| row.available).sum();
             let reserved: i64 = rows.iter().map(|row| row.reserved).sum();
             let sold: i64 = rows.iter().map(|row| row.sold).sum();
-            let state = if available > 0 {
-                "available"
-            } else if reserved > 0 {
-                "reserved"
-            } else {
-                "sold"
-            };
+            let made_to_order = rows.iter().any(|row| row.enabled && row.made_to_order);
+            let state = variant_stock::listing_state(available, reserved, made_to_order);
             (total, available, reserved, sold, state)
         }
     };

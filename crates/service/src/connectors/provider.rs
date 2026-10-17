@@ -309,12 +309,21 @@ pub struct CatalogVariant {
     /// Units the store can sell; `None` when the store does not track stock
     /// for this variant.
     pub stock: Option<i64>,
+    /// The store sells the variant without a stock limit: it does not track
+    /// its inventory, or keeps selling at zero (print-on-demand, made to
+    /// order). Pubky then sells it as made to order, whatever `stock` says.
+    #[serde(default)]
+    pub made_to_order: bool,
     pub image_url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogProduct {
     pub provider_product_id: String,
+    /// The store's own URL key for the product (Shopify's `handle`, which a
+    /// Shopify product CSV names it by), when the store has one.
+    #[serde(default)]
+    pub handle: Option<String>,
     pub title: String,
     pub description: Option<String>,
     pub url: Option<String>,
@@ -363,6 +372,9 @@ pub struct ShippingAddress {
     pub postal_code: String,
     #[serde(rename = "countryCode", alias = "country_code")]
     pub country_code: String,
+    /// The buyer's phone, when they gave one for the courier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phone: Option<String>,
 }
 
 impl std::fmt::Debug for ShippingAddress {
@@ -497,6 +509,9 @@ pub struct ResolvedStock {
     /// Units the store can sell, summed over its locations; `None` when the
     /// store does not track this variant's stock.
     pub available: Option<i64>,
+    /// The store sells the variant without a stock limit (see
+    /// [`CatalogVariant::made_to_order`]).
+    pub made_to_order: bool,
 }
 
 /// What a live check of a connection found, for the Shop's status page.
@@ -518,6 +533,14 @@ pub enum InboundEvent {
         provider_product_id: String,
         provider_variant_id: String,
         available: i64,
+    },
+    /// The store sells the variant without a stock limit now (see
+    /// [`CatalogVariant::made_to_order`]). Applied only to mapped variants:
+    /// the Pubky variant becomes made to order until a later `StockLevel`
+    /// gives it a count again.
+    MadeToOrder {
+        provider_product_id: String,
+        provider_variant_id: String,
     },
     /// A store inventory item changed. The webhook names the item, not the
     /// variant or the total, so the framework asks the provider

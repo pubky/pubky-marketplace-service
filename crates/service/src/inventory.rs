@@ -217,6 +217,10 @@ struct StockView {
     reserved: i64,
     #[schemars(range(min = 0))]
     sold: i64,
+    /// Present and true when the stock is made to order: it sells without a
+    /// count, `available` is 0 and units join `total` as buyers claim them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    made_to_order: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     listing_total: Option<ListingTotalView>,
 }
@@ -238,6 +242,9 @@ struct VariantStockView {
     #[schemars(range(min = 0))]
     sold: i64,
     sold_out: bool,
+    /// Present and true when the variant is made to order (never sold out).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    made_to_order: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -286,6 +293,7 @@ struct LockedListing {
     available: i64,
     reserved: i64,
     sold: i64,
+    made_to_order: bool,
 }
 
 #[derive(Debug)]
@@ -304,7 +312,7 @@ enum StoredAdjustment {
 }
 
 impl StockView {
-    fn new(total: i64, available: i64, reserved: i64, sold: i64) -> Self {
+    fn new(total: i64, available: i64, reserved: i64, sold: i64, made_to_order: bool) -> Self {
         Self {
             authority: "listing_total",
             variant_id: None,
@@ -313,6 +321,7 @@ impl StockView {
             available,
             reserved,
             sold,
+            made_to_order,
             listing_total: None,
         }
     }
@@ -331,6 +340,7 @@ impl StockView {
             available: variant.1,
             reserved: variant.2,
             sold: variant.3,
+            made_to_order: false,
             listing_total: Some(ListingTotalView {
                 total: listing.0,
                 available: listing.1,
@@ -351,7 +361,8 @@ impl VariantStockView {
             available: row.available_quantity,
             reserved: row.reserved_quantity,
             sold: row.sold_quantity,
-            sold_out: row.available_quantity == 0,
+            sold_out: !row.orderable(),
+            made_to_order: row.made_to_order,
         }
     }
 }
@@ -839,7 +850,7 @@ pub async fn adjust_inventory_for(
     let listing: Option<LockedListing> = match sqlx::query_as(
         "SELECT seller_pubky, listing_id, listing_revision, server_revision, \
                     total_quantity AS total, available_quantity AS available, \
-                    reserved_quantity AS reserved, sold_quantity AS sold \
+                    reserved_quantity AS reserved, sold_quantity AS sold, made_to_order \
              FROM listings WHERE aggregate_id = $1 AND deleted_at IS NULL FOR UPDATE",
     )
     .bind(&request.wire.aggregate_id)
@@ -929,6 +940,24 @@ pub async fn adjust_inventory_for(
                 StatusCode::CONFLICT,
                 "revision_conflict",
                 "The listing server revision is stale.",
+                Some(listing.server_revision),
+            ),
+        )
+        .await;
+    }
+    let addressed_made_to_order = match &target {
+        Some(row) => row.made_to_order,
+        None => rows
+            .iter()
+            .any(|row| row.is_implicit() && row.made_to_order),
+    };
+    if addressed_made_to_order {
+        return finish_without_mutation(
+            tx,
+            inventory_error(
+                StatusCode::CONFLICT,
+                "stock_not_tracked",
+                "The stock is made to order and has no count to adjust.",
                 Some(listing.server_revision),
             ),
         )
@@ -1056,13 +1085,11 @@ pub async fn adjust_inventory_for(
         }
     };
     let listing_new_available = listing.available.saturating_add(request.wire.delta);
-    let state_name = if listing_new_available > 0 {
-        "available"
-    } else if listing.reserved > 0 {
-        "reserved"
-    } else {
-        "sold"
-    };
+    let state_name = variant_stock::listing_state(
+        listing_new_available,
+        listing.reserved,
+        listing.made_to_order,
+    );
     let variant_after: Option<(String, Option<String>, i64, i64, i64, i64)> = match &target {
         Some(row) => {
             match sqlx::query_as(
@@ -1182,7 +1209,7 @@ pub async fn adjust_inventory_for(
                         (total, available, reserved, sold),
                     )
                 }
-                None => StockView::new(total, available, reserved, sold),
+                None => StockView::new(total, available, reserved, sold, false),
             },
         },
     };
@@ -1216,6 +1243,138 @@ pub async fn adjust_inventory_for(
         Ok(()) => (StatusCode::OK, Json(response_value)).into_response(),
         Err(_) => internal_error(),
     }
+}
+
+/// How a store keeps a variant's stock, as the connector worker reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StockTracking {
+    /// The store counts the stock: this many units are for sale.
+    Counted(i64),
+    /// The store sells it without a count (untracked, or it keeps selling at
+    /// zero): made to order.
+    MadeToOrder,
+}
+
+/// What [`set_stock_tracking`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrackingOutcome {
+    /// The row switched; the listing moved to `server_revision` and an
+    /// `inventory.adjusted` event records it.
+    Switched {
+        server_revision: i64,
+    },
+    /// The row already tracks stock that way. A counted row keeps its count:
+    /// a level change is an `inventory.adjust`, not a switch.
+    Unchanged,
+    ListingNotFound,
+    /// The listing tracks stock per variant and no variant was named.
+    VariantRequired,
+    /// The named variant is not a row of the listing.
+    VariantNotFound,
+}
+
+/// Switches one stock row between counted and made to order, for the seller
+/// (`actor`), from what their connected store reports. Made to order: the
+/// row's units on sale are withdrawn (it no longer has a count) and its total
+/// becomes its committed units. Counted: the store's `n` units go on sale,
+/// less the units Pubky buyers hold now (a hold that is paid is pushed to the
+/// store and comes out of those `n`), so Pubky never offers more than the
+/// store counts. Held and sold units never move. `variant_id`
+/// names the row of a listing that tracks stock per variant; a listing that
+/// sells one variant switches its implicit row and ignores it.
+///
+/// Idempotent: a switch to the way the row already tracks stock changes
+/// nothing, so a replayed webhook or a repeated poll is a no-op.
+pub async fn set_stock_tracking(
+    pool: &sqlx::PgPool,
+    actor: &str,
+    listing_id: &str,
+    variant_id: Option<&str>,
+    tracking: StockTracking,
+    now: DateTime<Utc>,
+) -> Result<TrackingOutcome, sqlx::Error> {
+    let aggregate_id = marketplace_domain::ids::listing_aggregate_id(actor, listing_id);
+    let mut tx = pool.begin().await?;
+    let live: Option<i64> = sqlx::query_scalar(
+        "SELECT server_revision FROM listings \
+         WHERE aggregate_id = $1 AND seller_pubky = $2 AND deleted_at IS NULL",
+    )
+    .bind(&aggregate_id)
+    .bind(actor)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if live.is_none() {
+        return Ok(TrackingOutcome::ListingNotFound);
+    }
+    let rows = variant_stock::lock_rows(&mut tx, &aggregate_id).await?;
+    let row = if variant_stock::tracks_variants(&rows) {
+        let Some(id) = variant_id.filter(|id| !id.is_empty()) else {
+            return Ok(TrackingOutcome::VariantRequired);
+        };
+        match rows.iter().find(|row| row.variant_id == id) {
+            Some(row) => row,
+            None => return Ok(TrackingOutcome::VariantNotFound),
+        }
+    } else {
+        match rows.first() {
+            Some(row) => row,
+            None => return Ok(TrackingOutcome::ListingNotFound),
+        }
+    };
+    let (made_to_order, available) = match tracking {
+        StockTracking::MadeToOrder => (true, 0),
+        StockTracking::Counted(units) => (
+            false,
+            (units.clamp(0, MAX_ABSOLUTE_DELTA) - row.reserved_quantity).max(0),
+        ),
+    };
+    if row.made_to_order == made_to_order {
+        return Ok(TrackingOutcome::Unchanged);
+    }
+    sqlx::query(
+        "UPDATE listing_variant_inventory SET made_to_order = $3, \
+             available_quantity = $4, \
+             total_quantity = reserved_quantity + sold_quantity + $4, updated_at = $5 \
+         WHERE listing_aggregate_id = $1 AND variant_id = $2",
+    )
+    .bind(&aggregate_id)
+    .bind(&row.variant_id)
+    .bind(made_to_order)
+    .bind(available)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+    let revision: i64 = sqlx::query_scalar(&format!(
+        "UPDATE listings SET server_revision = server_revision + 1, \
+             state = {}, updated_at = $2 \
+         WHERE aggregate_id = $1 RETURNING server_revision",
+        variant_stock::STATE_FROM_TOTALS_SQL
+    ))
+    .bind(&aggregate_id)
+    .bind(now)
+    .fetch_one(&mut *tx)
+    .await?;
+    let command_id = crate::connectors::deterministic_uuid(&format!(
+        "stock-tracking|{aggregate_id}|{}|{revision}",
+        row.variant_id
+    ));
+    sqlx::query(
+        "INSERT INTO events \
+             (id, command_id, aggregate_id, revision, actor_pubky, kind, occurred_at) \
+         VALUES ($1, $2, $3, $4, $5, 'inventory.adjusted', $6)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(command_id)
+    .bind(&aggregate_id)
+    .bind(revision)
+    .bind(actor)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(TrackingOutcome::Switched {
+        server_revision: revision,
+    })
 }
 
 async fn validate_variant_assertion(
@@ -1329,6 +1488,18 @@ async fn validate_variant_assertion(
     })
 }
 
+#[derive(sqlx::FromRow)]
+struct ProjectedListing {
+    seller_pubky: String,
+    listing_id: String,
+    server_revision: i64,
+    total_quantity: i64,
+    available_quantity: i64,
+    reserved_quantity: i64,
+    sold_quantity: i64,
+    made_to_order: bool,
+}
+
 pub async fn get_inventory_projection(
     State(state): State<AppState>,
     Extension(session): Extension<AuthSession>,
@@ -1354,9 +1525,9 @@ pub async fn get_inventory_projection(
         Ok(false) => return finish_without_mutation(tx, rate_limited("inventory.read")).await,
         Err(_) => return internal_error(),
     }
-    let row: Option<(String, String, i64, i64, i64, i64, i64)> = match sqlx::query_as(
+    let row: Option<ProjectedListing> = match sqlx::query_as(
         "SELECT seller_pubky, listing_id, server_revision, total_quantity, \
-                available_quantity, reserved_quantity, sold_quantity \
+                available_quantity, reserved_quantity, sold_quantity, made_to_order \
          FROM listings WHERE aggregate_id = $1 AND deleted_at IS NULL",
     )
     .bind(&aggregate_id)
@@ -1366,7 +1537,17 @@ pub async fn get_inventory_projection(
         Ok(row) => row,
         Err(_) => return internal_error(),
     };
-    let Some((seller_pubky, listing_id, revision, total, available, reserved, sold)) = row else {
+    let Some(ProjectedListing {
+        seller_pubky,
+        listing_id,
+        server_revision: revision,
+        total_quantity: total,
+        available_quantity: available,
+        reserved_quantity: reserved,
+        sold_quantity: sold,
+        made_to_order,
+    }) = row
+    else {
         return finish_without_mutation(
             tx,
             inventory_error(
@@ -1380,7 +1561,7 @@ pub async fn get_inventory_projection(
     };
     let rows: Vec<VariantRow> = match sqlx::query_as(
         "SELECT variant_id, sku, enabled, total_quantity, available_quantity, \
-                reserved_quantity, sold_quantity \
+                reserved_quantity, sold_quantity, made_to_order \
          FROM listing_variant_inventory WHERE listing_aggregate_id = $1 \
          ORDER BY position, variant_id",
     )
@@ -1400,7 +1581,7 @@ pub async fn get_inventory_projection(
         seller_pubky,
         listing_id,
         server_revision: revision,
-        stock: StockView::new(total, available, reserved, sold),
+        stock: StockView::new(total, available, reserved, sold, made_to_order),
         variants,
     };
     match tx.commit().await {

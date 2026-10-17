@@ -338,6 +338,7 @@ type PageInfo {
 type Product {
   category: TaxonomyCategory
   description(truncateAt: Int): String!
+  handle: String!
   id: ID!
   images(first: Int, after: String, last: Int, before: String, reverse: Boolean, sortKey: ProductImageSortKeys): ImageConnection!
   onlineStoreUrl: URL
@@ -361,6 +362,7 @@ type ProductVariant {
   id: ID!
   image: Image
   inventoryItem: InventoryItem!
+  inventoryPolicy: ProductVariantInventoryPolicy!
   inventoryQuantity: Int
   price: Money!
   product: Product!
@@ -372,6 +374,7 @@ type ProductVariantConnection {
   nodes: [ProductVariant!]!
   pageInfo: PageInfo!
 }
+enum ProductVariantInventoryPolicy { DENY CONTINUE }
 enum ProductVariantSortKeys { FULL_TITLE ID INVENTORY_LEVELS_AVAILABLE INVENTORY_MANAGEMENT INVENTORY_POLICY INVENTORY_QUANTITY NAME POPULAR POSITION RELEVANCE SKU TITLE }
 type QueryRoot {
   currentAppInstallation: AppInstallation!

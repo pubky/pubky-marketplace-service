@@ -274,6 +274,7 @@ pub fn normalize_product(
                     option_values,
                     price,
                     stock: stock_of(variation, Some(product)),
+                    made_to_order: false,
                     image_url: variation
                         .get("image")
                         .and_then(|image| image.get("src")?.as_str())
@@ -291,6 +292,7 @@ pub fn normalize_product(
             option_values: Vec::new(),
             price,
             stock: stock_of(product, None),
+            made_to_order: false,
             image_url: images.first().cloned(),
         }]
     };
@@ -299,6 +301,7 @@ pub fn normalize_product(
     }
     let title = text::title(&string(product, "name"));
     Some(CatalogProduct {
+        handle: None,
         provider_product_id: id.to_string(),
         title: if title.is_empty() {
             format!("Product {id}")

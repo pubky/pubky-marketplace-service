@@ -123,8 +123,15 @@ async fn the_catalog_is_paged_with_whole_products_and_normalised() {
     assert_eq!(boots.attributes[0].name, "Vendor");
     assert_eq!(boots.attributes[0].values, ["Dezentral Goods"]);
     assert_eq!(boots.variants[0].price.amount_minor, 12500);
+    assert_eq!(boots.handle.as_deref(), Some("trail-boots"));
     assert_eq!(boots.variants[0].stock, Some(7));
     assert_eq!(boots.variants[1].stock, Some(0));
+    assert!(!boots.variants[0].made_to_order);
+    assert!(
+        boots.variants[1].made_to_order,
+        "a variant that keeps selling at zero (CONTINUE) is made to order"
+    );
+    assert!(!boots.variants[2].made_to_order);
     assert_eq!(boots.variants[2].price.amount_minor, 12999);
     assert_eq!(boots.variants[2].option_values[0].value, "42");
     assert_eq!(fake.calls("ProductVariantsPage").len(), 1);
@@ -150,6 +157,10 @@ async fn the_catalog_is_paged_with_whole_products_and_normalised() {
     assert_eq!(
         mug.variants[0].stock, None,
         "an untracked variant has no stock"
+    );
+    assert!(
+        mug.variants[0].made_to_order,
+        "an untracked variant is made to order"
     );
     assert_eq!(mug.variants[0].sku, None);
     assert_eq!(
@@ -188,6 +199,7 @@ async fn an_inventory_item_resolves_to_its_variant_and_total_stock() {
         "gid://shopify/ProductVariant/50003"
     );
     assert_eq!(stock.available, Some(3));
+    assert!(!stock.made_to_order, "tracked and DENY: counted stock");
     assert!(provider
         .resolve_inventory(&connection, "gid://shopify/InventoryItem/1")
         .await
@@ -264,6 +276,7 @@ async fn an_address_the_buyer_shared_reaches_the_store_order() {
         region: "LND".into(),
         postal_code: "N1 1AA".into(),
         country_code: "GB".into(),
+        phone: Some("+44 20 7946 0000".into()),
     });
     provider
         .push_order(&connection, &order)
@@ -271,8 +284,37 @@ async fn an_address_the_buyer_shared_reaches_the_store_order() {
         .expect("pushed");
     let address = &fake.orders()[0].input["shippingAddress"];
     assert_eq!(address["address1"], "1 Main St");
-    assert_eq!(address["address2"], "Flat 2");
+    assert_eq!(
+        address["address2"], "Flat 2, LND",
+        "a region with no known code stays on the label, not as a code Shopify may refuse"
+    );
+    assert!(address.get("provinceCode").is_none());
     assert_eq!(address["countryCode"], "GB");
+    assert_eq!(address["phone"], "+44 20 7946 0000");
+
+    let mut american = push(0);
+    american.pubky_order_id = Uuid::parse_str("11111111-2222-4333-8444-666666666666").unwrap();
+    american.shipping_address = Some(ShippingAddress {
+        name: "Grace Hopper".into(),
+        line1: "1 Infinite Loop".into(),
+        line2: String::new(),
+        city: "Cupertino".into(),
+        region: "California".into(),
+        postal_code: "95014".into(),
+        country_code: "US".into(),
+        phone: None,
+    });
+    provider
+        .push_order(&connection, &american)
+        .await
+        .expect("pushed");
+    let address = &fake.orders()[1].input["shippingAddress"];
+    assert_eq!(
+        address["provinceCode"], "CA",
+        "the state's name becomes its code"
+    );
+    assert!(address.get("address2").is_none());
+    assert!(address.get("phone").is_none());
     fake.assert_clean();
 }
 
@@ -662,6 +704,7 @@ async fn webhooks_are_subscribed_once_and_stale_service_subscriptions_are_replac
             "APP_UNINSTALLED",
             "FULFILLMENTS_CREATE",
             "FULFILLMENTS_UPDATE",
+            "INVENTORY_ITEMS_UPDATE",
             "INVENTORY_LEVELS_UPDATE",
             "ORDERS_CANCELLED",
             "REFUNDS_CREATE"
@@ -835,7 +878,7 @@ async fn subscriptions_are_read_page_by_page_and_a_lost_race_is_not_a_failure() 
         .iter()
         .filter(|(_, _, uri)| uri == HOOK)
         .count();
-    assert_eq!(topics, 6, "one subscription per topic, none twice");
+    assert_eq!(topics, 7, "one subscription per topic, none twice");
     fake.assert_clean();
 }
 
@@ -1030,7 +1073,7 @@ fn the_privacy_topics_are_named_for_the_merchant_guide() {
         PRIVACY_TOPICS,
         ["customers/data_request", "customers/redact", "shop/redact"]
     );
-    assert_eq!(SUBSCRIBED_TOPICS.len(), 6);
+    assert_eq!(SUBSCRIBED_TOPICS.len(), 7);
     let _ = Value::Null;
 }
 

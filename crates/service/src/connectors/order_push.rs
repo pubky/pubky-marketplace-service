@@ -204,7 +204,15 @@ pub async fn build_push(
     if resolved.is_empty() {
         return Ok(Err(withheld(
             reason::NO_MAPPED_LINES,
-            "None of the order's lines is mapped to a product in this store.",
+            format!(
+                "Order not sent to the store: {} not linked to a product in the store. \
+                 Link it in Store connections, then send the order again.",
+                if unmapped.len() == 1 {
+                    format!("{} is", unmapped[0])
+                } else {
+                    format!("{} are", unmapped.join("; "))
+                }
+            ),
         )));
     }
     if !unmapped.is_empty() {

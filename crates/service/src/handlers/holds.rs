@@ -230,11 +230,11 @@ pub async fn acquire_payment_hold(
                 refusal
             }));
         }
-        let new_state = if listing.available_quantity == quantity {
-            "reserved"
-        } else {
-            "available"
-        };
+        let new_state = variant_stock::state_after_claim(
+            listing.available_quantity,
+            quantity,
+            listing.made_to_order,
+        );
         debug_assert!(can_transition(
             &listing_machine(),
             &listing.state,

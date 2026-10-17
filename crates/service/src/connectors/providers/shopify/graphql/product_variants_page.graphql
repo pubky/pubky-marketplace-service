@@ -19,6 +19,7 @@ query ProductVariantsPage($id: ID!, $after: String) {
           url
         }
         inventoryQuantity
+        inventoryPolicy
         inventoryItem {
           tracked
         }

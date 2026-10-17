@@ -456,9 +456,23 @@ async fn a_mapping_removed_before_the_push_sets_the_order_aside_until_it_is_rest
     assert_eq!(state, "quarantined");
     assert_eq!(reason.as_deref(), Some("no_mapped_lines"));
     assert_eq!(store.pushes(), 0);
+    // Not sent, and never silently: one `listing_not_linked` alert on the
+    // order names the listing, and no generic quarantine alert.
+    let alerts: Vec<(String, Option<uuid::Uuid>, String)> =
+        sqlx::query_as("SELECT kind, pubky_order_id, detail FROM connector_alerts")
+            .fetch_all(&app.pool)
+            .await
+            .expect("alerts");
+    assert_eq!(alerts.len(), 1, "{alerts:?}");
+    assert_eq!(alerts[0].0, "listing_not_linked");
     assert_eq!(
-        common::count(&app.pool, "SELECT COUNT(*) FROM connector_alerts").await,
-        0
+        alerts[0].1.map(|id| id.to_string()).as_deref(),
+        Some(order.order_id.as_str())
+    );
+    assert!(
+        alerts[0].2.contains("listing boots_01 is not linked"),
+        "{}",
+        alerts[0].2
     );
     let (_, pushes) = api(
         &app,
@@ -485,6 +499,16 @@ async fn a_mapping_removed_before_the_push_sets_the_order_aside_until_it_is_rest
     assert_eq!(status, StatusCode::ACCEPTED);
     settled_pass(&app).await;
     assert_eq!(push_state(&app.pool, &order.order_id).await.0, "created");
+    assert_eq!(
+        common::count(
+            &app.pool,
+            "SELECT COUNT(*) FROM connector_alerts \
+             WHERE kind = 'listing_not_linked' AND resolved_at IS NULL"
+        )
+        .await,
+        0,
+        "the order reached the store, so its not-linked alert is resolved"
+    );
 }
 
 /// A second listing of the same seller, registered next to `boots_01`.

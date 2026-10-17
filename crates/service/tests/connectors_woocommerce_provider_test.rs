@@ -769,6 +769,7 @@ fn order(id: &str, address: bool) -> OrderPush {
             region: "ZH".into(),
             postal_code: "8001".into(),
             country_code: "CH".into(),
+            phone: None,
         }),
     }
 }

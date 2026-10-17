@@ -249,6 +249,36 @@ async fn handle(
                     StockOutcome::MappingError(reason) => {
                         Handled::Ignored(format!("variant_mapping_error: {reason}"))
                     }
+                    StockOutcome::Switched { .. } => Handled::Applied("counted again".to_string()),
+                },
+            )
+        }
+        InboundEvent::MadeToOrder {
+            provider_product_id,
+            provider_variant_id,
+        } => {
+            let Some(mapping) = store::mapping_for_provider_variant(
+                &state.pool,
+                connection.id,
+                &provider_product_id,
+                &provider_variant_id,
+            )
+            .await?
+            else {
+                return Ok(Handled::Ignored("unmapped_variant".to_string()));
+            };
+            Ok(
+                match stock::apply_made_to_order(state, &connection, &mapping).await? {
+                    StockOutcome::Switched { .. } => Handled::Applied("made to order".to_string()),
+                    StockOutcome::Unchanged => Handled::Ignored("unchanged".to_string()),
+                    StockOutcome::Ignored(reason) => Handled::Ignored(reason.to_string()),
+                    StockOutcome::MappingError(reason) => {
+                        Handled::Ignored(format!("variant_mapping_error: {reason}"))
+                    }
+                    StockOutcome::Retry(reason) => Handled::Retry(reason),
+                    StockOutcome::Applied { .. } | StockOutcome::AlreadyApplied => {
+                        Handled::Applied("made to order".to_string())
+                    }
                 },
             )
         }
@@ -655,6 +685,10 @@ async fn resolve_inventory(
     )
     .await;
     Ok(match resolved {
+        Ok(Ok(Some(stock))) if stock.made_to_order => Ok(InboundEvent::MadeToOrder {
+            provider_product_id: stock.provider_product_id,
+            provider_variant_id: stock.provider_variant_id,
+        }),
         Ok(Ok(Some(stock))) => match stock.available {
             Some(available) => Ok(InboundEvent::StockLevel {
                 provider_product_id: stock.provider_product_id,

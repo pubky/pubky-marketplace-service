@@ -191,7 +191,7 @@ pub async fn handle(
                     )));
                 }
             }
-        } else if line.quantity > listing.available_quantity {
+        } else if !row.made_to_order && line.quantity > listing.available_quantity {
             return Ok(Err(CommandFailure::refused_with_revision(
                 crate::refusal_audit::RefusalKind::InsufficientInventory,
                 ErrorCode::InsufficientInventory,
@@ -680,11 +680,11 @@ pub async fn handle(
     // until payment-method bind.
     if drop_aggregate_id.is_some() {
         for (index, (line, listing)) in resolved.iter().enumerate() {
-            let new_state = if listing.available_quantity == line.quantity {
-                "reserved"
-            } else {
-                "available"
-            };
+            let new_state = crate::variant_stock::state_after_claim(
+                listing.available_quantity,
+                line.quantity,
+                listing.made_to_order,
+            );
             if !can_transition(&listing_machine(), &listing.state, new_state) {
                 return Ok(Err(CommandFailure::refused_with_revision(
                     crate::refusal_audit::RefusalKind::InvariantViolation,

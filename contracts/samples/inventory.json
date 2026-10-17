@@ -236,6 +236,10 @@
               }
             ]
           },
+          "made_to_order": {
+            "description": "Present and true when the stock is made to order: it sells without a count, `available` is 0 and units join `total` as buyers claim them.",
+            "type": "boolean"
+          },
           "reserved": {
             "format": "int64",
             "minimum": 0.0,
@@ -285,6 +289,10 @@
             "type": "integer"
           },
           "enabled": {
+            "type": "boolean"
+          },
+          "made_to_order": {
+            "description": "Present and true when the variant is made to order (never sold out).",
             "type": "boolean"
           },
           "reserved": {

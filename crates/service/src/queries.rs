@@ -975,8 +975,9 @@ pub async fn get_public_listing_availability(
         );
         return response;
     }
-    let row: Result<Option<(String, String, Option<Value>)>, sqlx::Error> = sqlx::query_as(
-        "SELECT aggregate_id, state, variant_availability FROM listings \
+    type AvailabilityRow = (String, String, Option<Value>, bool);
+    let row: Result<Option<AvailabilityRow>, sqlx::Error> = sqlx::query_as(
+        "SELECT aggregate_id, state, variant_availability, made_to_order FROM listings \
          WHERE seller_pubky = $1 AND listing_id = $2 AND deleted_at IS NULL",
     )
     .bind(&seller_pubky)
@@ -984,12 +985,17 @@ pub async fn get_public_listing_availability(
     .fetch_optional(&state.pool)
     .await;
     match row {
-        Ok(Some((aggregate_id, listing_state, variant_availability))) => {
+        Ok(Some((aggregate_id, listing_state, variant_availability, made_to_order))) => {
             let mut body = json!({
                 "aggregate_id": aggregate_id,
                 "state": listing_state,
                 "server_time": format_timestamp(now),
             });
+            // Made to order: the listing never sells out, so a reader must
+            // not take a stock count of zero in its record as sold out.
+            if made_to_order {
+                body["made_to_order"] = json!(true);
+            }
             // A listing that tracks stock per variant says which variants
             // are sold out, never how many units are left.
             if let Some(Value::Array(variants)) = variant_availability {
@@ -997,10 +1003,14 @@ pub async fn get_public_listing_availability(
                     variants
                         .iter()
                         .map(|variant| {
-                            json!({
+                            let mut entry = json!({
                                 "variant_id": variant["variant_id"],
                                 "sold_out": variant["sold_out"],
-                            })
+                            });
+                            if variant["made_to_order"] == json!(true) {
+                                entry["made_to_order"] = json!(true);
+                            }
+                            entry
                         })
                         .collect(),
                 );

@@ -12,6 +12,7 @@
       "nodes": [
         {
           "id": "gid://shopify/Product/9001",
+          "handle": "trail-boots",
           "title": "Trail Boots",
           "description": "Waterproof leather boots.",
           "onlineStoreUrl": "https://dezentral.myshopify.com/products/trail-boots",
@@ -53,6 +54,7 @@
                   "url": "https://cdn.shopify.com/s/files/boots-40.jpg"
                 },
                 "inventoryQuantity": 7,
+                "inventoryPolicy": "DENY",
                 "inventoryItem": {
                   "tracked": true
                 }
@@ -70,6 +72,7 @@
                 ],
                 "image": null,
                 "inventoryQuantity": 0,
+                "inventoryPolicy": "CONTINUE",
                 "inventoryItem": {
                   "tracked": true
                 }

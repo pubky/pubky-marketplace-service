@@ -89,7 +89,7 @@ pub async fn create(
             listing.server_revision,
         )));
     }
-    if listing.available_quantity < payload.quantity {
+    if !listing.made_to_order && listing.available_quantity < payload.quantity {
         return Ok(Err(CommandFailure::refused_with_revision(
             crate::refusal_audit::RefusalKind::InsufficientInventory,
             ErrorCode::InsufficientInventory,
@@ -377,7 +377,7 @@ pub async fn counter(
             "The offer listing is unavailable.",
         )));
     };
-    if listing.available_quantity < payload.quantity {
+    if !listing.made_to_order && listing.available_quantity < payload.quantity {
         return Ok(Err(CommandFailure::refused_with_revision(
             crate::refusal_audit::RefusalKind::InsufficientInventory,
             ErrorCode::InsufficientInventory,
@@ -678,11 +678,11 @@ pub async fn accept(
     let held_variant = row.variant_id.clone();
     let reservation_variant = keyed.then(|| held_variant.clone());
 
-    let new_listing_state = if listing.available_quantity == offer.quantity {
-        "reserved"
-    } else {
-        "available"
-    };
+    let new_listing_state = crate::variant_stock::state_after_claim(
+        listing.available_quantity,
+        offer.quantity,
+        listing.made_to_order,
+    );
     if !can_transition(&listing_machine(), &listing.state, new_listing_state) {
         return Ok(Err(CommandFailure::refused_with_revision(
             crate::refusal_audit::RefusalKind::InvariantViolation,

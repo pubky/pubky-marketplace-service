@@ -27,6 +27,14 @@
 //! service answers `variant_required` / `variant_assertion_mismatch`) is a
 //! permanent mapping error, never a retry: the event settles as
 //! `variant_mapping_error` and the seller gets one alert per variant to re-map.
+//!
+//! A store variant sold without a stock limit (untracked, or kept on sale at
+//! zero: print-on-demand) makes the mapped Pubky row made to order
+//! ([`apply_made_to_order`]), so it never sells out on Pubky. A later stock
+//! level for it, once the merchant tracks it again, switches the row back to
+//! the store's count ([`apply_stock_level`]). Both go through
+//! [`crate::inventory::set_stock_tracking`], which is idempotent, so a
+//! replayed webhook or a repeated poll changes nothing.
 
 use axum::body::Bytes;
 use axum::http::StatusCode;
@@ -56,6 +64,8 @@ pub enum StockOutcome {
     /// incomplete mapping). Permanent until the seller re-maps: the framework
     /// raises an alert and never retries.
     MappingError(&'static str),
+    /// The row switched between counted and made-to-order stock.
+    Switched { made_to_order: bool },
 }
 
 /// One store variant's sellable stock, to be applied to the Pubky variant it
@@ -123,6 +133,18 @@ pub async fn apply_stock_level(
     level: i64,
     event_id: Option<&str>,
 ) -> Result<StockOutcome, sqlx::Error> {
+    if let Ok(row) = tracking_row(state, connection, mapping).await? {
+        if row_is_made_to_order(state, connection, mapping, row.as_deref()).await? {
+            return switch_tracking(
+                state,
+                connection,
+                mapping,
+                row.as_deref(),
+                crate::inventory::StockTracking::Counted(level.max(0)),
+            )
+            .await;
+        }
+    }
     // A listing that tracks stock per variant is always addressed by variant,
     // even when the seller mapped only one store variant to it: its listing
     // `available` is the sum across sizes, and the service refuses an
@@ -152,6 +174,103 @@ pub async fn apply_stock_level(
         }
     } else {
         apply_listing_stock(state, connection, mapping, level, event_id).await?
+    };
+    if let StockOutcome::MappingError(reason) = &outcome {
+        raise_mapping_alert(state, connection, mapping, reason).await?;
+    }
+    Ok(outcome)
+}
+
+/// Makes the mapped Pubky row made to order: the store sells the variant
+/// without a stock limit.
+pub async fn apply_made_to_order(
+    state: &AppState,
+    connection: &ConnectionRow,
+    mapping: &MappingRow,
+) -> Result<StockOutcome, sqlx::Error> {
+    let row = match tracking_row(state, connection, mapping).await? {
+        Ok(row) => row,
+        Err(outcome) => return Ok(outcome),
+    };
+    switch_tracking(
+        state,
+        connection,
+        mapping,
+        row.as_deref(),
+        crate::inventory::StockTracking::MadeToOrder,
+    )
+    .await
+}
+
+/// The Pubky row a tracking switch addresses: the mapping's variant on a
+/// listing that tracks stock per variant, the listing's one row otherwise
+/// (`None`). A listing that sells one total but is mapped to several store
+/// variants cannot say which variant is made to order, so it is skipped like
+/// its stock levels are.
+async fn tracking_row(
+    state: &AppState,
+    connection: &ConnectionRow,
+    mapping: &MappingRow,
+) -> Result<Result<Option<String>, StockOutcome>, sqlx::Error> {
+    if listing_tracks_variants(state, &connection.seller_pubky, &mapping.listing_id).await? {
+        if mapping.variant_id.is_empty() {
+            return Ok(Err(StockOutcome::MappingError("variant_required")));
+        }
+        return Ok(Ok(Some(mapping.variant_id.clone())));
+    }
+    if store::mapping_count_for_listing(&state.pool, connection.id, &mapping.listing_id).await? > 1
+    {
+        return Ok(Err(StockOutcome::Ignored("multi_variant_listing")));
+    }
+    Ok(Ok(None))
+}
+
+async fn row_is_made_to_order(
+    state: &AppState,
+    connection: &ConnectionRow,
+    mapping: &MappingRow,
+    variant: Option<&str>,
+) -> Result<bool, sqlx::Error> {
+    let aggregate = marketplace_domain::ids::listing_aggregate_id(
+        &connection.seller_pubky,
+        &mapping.listing_id,
+    );
+    let flag: Option<bool> = sqlx::query_scalar(
+        "SELECT made_to_order FROM listing_variant_inventory \
+         WHERE listing_aggregate_id = $1 AND variant_id = $2",
+    )
+    .bind(&aggregate)
+    .bind(variant.unwrap_or(crate::variant_stock::IMPLICIT_VARIANT_ID))
+    .fetch_optional(&state.pool)
+    .await?;
+    Ok(flag.unwrap_or(false))
+}
+
+async fn switch_tracking(
+    state: &AppState,
+    connection: &ConnectionRow,
+    mapping: &MappingRow,
+    variant: Option<&str>,
+    tracking: crate::inventory::StockTracking,
+) -> Result<StockOutcome, sqlx::Error> {
+    use crate::inventory::TrackingOutcome;
+    let outcome = crate::inventory::set_stock_tracking(
+        &state.pool,
+        &connection.seller_pubky,
+        &mapping.listing_id,
+        variant,
+        tracking,
+        state.clock.now(),
+    )
+    .await?;
+    let outcome = match outcome {
+        TrackingOutcome::Switched { .. } => StockOutcome::Switched {
+            made_to_order: tracking == crate::inventory::StockTracking::MadeToOrder,
+        },
+        TrackingOutcome::Unchanged => StockOutcome::Unchanged,
+        TrackingOutcome::ListingNotFound => StockOutcome::Ignored("listing_not_found"),
+        TrackingOutcome::VariantRequired => StockOutcome::MappingError("variant_required"),
+        TrackingOutcome::VariantNotFound => StockOutcome::MappingError("variant_not_found"),
     };
     if let StockOutcome::MappingError(reason) = &outcome {
         raise_mapping_alert(state, connection, mapping, reason).await?;
@@ -322,7 +441,11 @@ fn classify_adjust(status: StatusCode, code: &str, delta: i64) -> StockOutcome {
         (_, "variant_assertion_mismatch") => {
             StockOutcome::MappingError("variant_assertion_mismatch")
         }
-        (_, "revision_conflict" | "rate_limited") => StockOutcome::Retry(code.to_string()),
+        // The row became made to order after it was read; the retry switches
+        // it back to the store's count.
+        (_, "revision_conflict" | "rate_limited" | "stock_not_tracked") => {
+            StockOutcome::Retry(code.to_string())
+        }
         (StatusCode::TOO_MANY_REQUESTS, _) => StockOutcome::Retry("rate_limited".to_string()),
         (_, "negative_stock" | "stock_overflow" | "inventory_invariant_violation") => {
             StockOutcome::Ignored("stock_refused")

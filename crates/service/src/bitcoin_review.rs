@@ -1445,15 +1445,15 @@ pub(crate) async fn reacquire_hold(
             .as_str()
             .expect("order line carries its listing aggregate id");
         let quantity = line["quantity"].as_i64().expect("line quantity");
-        let live: Option<(i64, Option<chrono::DateTime<Utc>>)> = sqlx::query_as(
-            "SELECT available_quantity, recreated_at FROM listings \
+        let live: Option<(i64, Option<chrono::DateTime<Utc>>, bool)> = sqlx::query_as(
+            "SELECT available_quantity, recreated_at, made_to_order FROM listings \
              WHERE aggregate_id = $1 AND deleted_at IS NULL FOR UPDATE",
         )
         .bind(aggregate_id)
         .fetch_optional(&mut **tx)
         .await
         .map_err(|e| ResolutionFailure::Internal("listing reacquire".into(), e.to_string()))?;
-        let Some((listing_available, recreated_at)) = live else {
+        let Some((listing_available, recreated_at, listing_made_to_order)) = live else {
             return Err(ResolutionFailure::StockUnavailable);
         };
         if recreated_at.is_some_and(|recreated| recreated > order.created_at) {
@@ -1465,7 +1465,7 @@ pub(crate) async fn reacquire_hold(
         let Ok(row) = crate::variant_stock::resolve_held(&rows, line["variant_id"].as_str()) else {
             return Err(ResolutionFailure::StockUnavailable);
         };
-        if row.available_quantity < quantity || !row.enabled {
+        if !row.enabled || (!row.made_to_order && row.available_quantity < quantity) {
             return Err(ResolutionFailure::StockUnavailable);
         }
         let variant_id = row.variant_id.clone();
@@ -1475,11 +1475,11 @@ pub(crate) async fn reacquire_hold(
         if !reacquired {
             return Err(ResolutionFailure::StockUnavailable);
         }
-        let state = if listing_available == quantity {
-            "reserved"
-        } else {
-            "available"
-        };
+        let state = crate::variant_stock::state_after_claim(
+            listing_available,
+            quantity,
+            listing_made_to_order,
+        );
         sqlx::query(
             "UPDATE listings SET server_revision = server_revision + 1, state = $2, \
              updated_at = $3 WHERE aggregate_id = $1",

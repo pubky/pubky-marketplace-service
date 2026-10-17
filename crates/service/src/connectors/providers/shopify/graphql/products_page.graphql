@@ -9,6 +9,7 @@ query ProductsPage($first: Int!, $after: String) {
     }
     nodes {
       id
+      handle
       title
       description
       onlineStoreUrl
@@ -44,6 +45,7 @@ query ProductsPage($first: Int!, $after: String) {
             url
           }
           inventoryQuantity
+          inventoryPolicy
           inventoryItem {
             tracked
           }

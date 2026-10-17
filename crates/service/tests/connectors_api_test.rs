@@ -26,6 +26,7 @@ use uuid::Uuid;
 
 fn product(id: &str, variant: &str, stock: Option<i64>) -> CatalogProduct {
     CatalogProduct {
+        handle: None,
         provider_product_id: id.to_string(),
         title: format!("Product {id}"),
         description: Some("A boot".to_string()),
@@ -51,6 +52,7 @@ fn product(id: &str, variant: &str, stock: Option<i64>) -> CatalogProduct {
                 exponent: 2,
             },
             stock,
+            made_to_order: false,
             image_url: None,
         }],
     }

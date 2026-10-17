@@ -375,13 +375,11 @@ pub(crate) async fn confirm_order(
                 "The reserved inventory for this order is no longer held.",
             )));
         };
-        let new_state = if listing.available_quantity > 0 {
-            "available"
-        } else if listing.reserved_quantity > quantity {
-            "reserved"
-        } else {
-            "sold"
-        };
+        let new_state = crate::variant_stock::listing_state(
+            listing.available_quantity,
+            listing.reserved_quantity - quantity,
+            listing.made_to_order,
+        );
         debug_assert!(can_transition(
             &listing_machine(),
             &listing.state,

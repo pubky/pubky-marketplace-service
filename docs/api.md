@@ -470,6 +470,10 @@ another buyer holding this item. It exists because the full listing projection
   offered variant: `{ "variant_id": "size_m", "sold_out": true }`. See
   [per-variant stock](#per-variant-stock). A listing that sells one variant has
   no `variants` key.
+- A listing with [made-to-order stock](#made-to-order-stock) adds
+  `"made_to_order": true`, and so does each made-to-order entry of `variants`
+  (never `sold_out`). A client must not read a zero quantity in the seller's
+  record as sold out for it.
 - `state` is the listing's stock state, `available`, `reserved` or `sold`. It
   is the same `state` the projection carries. `reserved` means a buyer's
   in-flight payment holds the last units; it returns to `available` when the
@@ -915,6 +919,7 @@ Errors (inventory envelope):
 | 409 | `inventory_invariant_violation` | The adjustment would break a stock invariant. |
 | 409 | `stock_overflow` | Total would exceed the maximum. |
 | 409 | `negative_stock` | Available stock (of the addressed variant, on a variant-tracked listing) would go below zero. |
+| 409 | `stock_not_tracked` | The addressed stock is [made to order](#made-to-order-stock): it has no count to adjust. `current_revision` is returned. |
 | 429 | `rate_limited` | Inventory limiter; `Retry-After: 1`. |
 | 500 | `internal` | Unexpected failure. |
 
@@ -1042,6 +1047,48 @@ for the offered variants in record order; the public availability read carries
 `[{ "variant_id", "sold_out" }]` and no quantity. The inventory projection
 (`GET /v1/inventory/listings/{aggregate_id}`) lists every row. A listing that
 sells one variant has no `variants` key anywhere.
+
+### Made-to-order stock
+
+A stock row (a listing's one row, or one variant's) is **made to order** when
+the seller's connected store sells it without a stock count: Shopify does not
+track the variant's inventory, or keeps selling it at zero
+(`inventoryPolicy: CONTINUE`), which is how print-on-demand apps such as
+Printful set their variants up. Only the connector worker sets or clears it,
+from what the store reports (webhooks and the stock poll); the seller's record
+quantity is not a count for it.
+
+- **Orderable.** A made-to-order row is never sold out. Its `available` is 0,
+  and a claim (checkout hold, payment-method bind, reserve, accepted offer)
+  adds its units to the row's `total` as it reserves them, so
+  `available + reserved + sold = total` holds and nothing is invented. Payment
+  moves the units to `sold` as usual; a lapsed hold, cancel or refund takes
+  them out of `total` (there is no count to put them back on). A listing is
+  `available` while any enabled row is made to order, whatever its counted
+  rows hold.
+- **Projections.** The listing projection carries `"made_to_order": true`, and
+  each made-to-order entry of `variants` carries it with `sold_out: false`; the
+  public availability read the same. The inventory projection's `stock` and
+  rows carry `made_to_order: true` when set. Counted listings are unchanged.
+- **Adjustments.** `inventory.adjust` of made-to-order stock answers
+  `409 stock_not_tracked`. A counted variant of the same listing adjusts as
+  before.
+- **Record edits.** A sync or edit of the seller's record keeps a made-to-order
+  row made to order (its record quantity is ignored, never refused). A listing
+  converting to per-variant rows from a made-to-order total starts every size
+  made to order until the store says otherwise.
+- **Back to counted.** When the store counts the variant again (tracking on,
+  `DENY`), its next stock level switches the row back: the store's count goes on
+  sale less the units Pubky buyers hold now (a paid hold is pushed and comes out
+  of that count), so Pubky never offers more than the store has.
+- **Unlinked.** A made-to-order row is orderable only while a live store
+  connection maps it. When its mapping goes (the seller unlinks it, switches to
+  `split`, disconnects, or the store uninstalls the app) it goes back to
+  counted stock with nothing on sale, so Pubky never sells an item no store
+  makes; the seller sets its stock again.
+- Each switch bumps the listing's `server_revision` and appends an
+  `inventory.adjusted` event; a switch to the mode the row already has changes
+  nothing.
 
 ## Webhooks
 
@@ -1285,13 +1332,16 @@ against Shopify's published schema.
   They are signed with the same app secret and are acknowledged (the service
   keeps no store customer data); `shop/redact` ends the 30-day secret retention.
   The merchant guide must say this, because nothing else configures them. The
-  six operational topics need no merchant step.
+  seven operational topics need no merchant step.
 
 **What the service does.** After a verified launch it redirects to Shopify's
 authorize page; after a verified callback it exchanges the code for an offline
 access token (sealed per connection) and then subscribes `inventory_levels/update`,
-`fulfillments/create`, `fulfillments/update`, `orders/cancelled`, `refunds/create`
-and `app/uninstalled` to the connection's webhooks URL through `webhookSubscriptionCreate`. A repeat
+`inventory_items/update`, `fulfillments/create`, `fulfillments/update`,
+`orders/cancelled`, `refunds/create` and `app/uninstalled` to the connection's
+webhooks URL through `webhookSubscriptionCreate`. A connection installed before
+`inventory_items/update` was added gets it on its next install; until then the
+stock poll catches tracking changes. A repeat
 install reads the subscription list page by page, subscribes nothing twice (a
 create that loses a race to a concurrent install is confirmed by re-reading the
 list, not by interpreting the message) and removes stale subscriptions this
@@ -1301,13 +1351,25 @@ on `X-Shopify-Event-Id`.
 
 - **Catalog.** Active products, a few per page, with every variant (more than 25
   variants are read through the product's variant connection). A variant's stock
-  is its total across locations; an untracked variant has none. A product with
+  is its total across locations; an untracked variant has none. A variant that
+  is untracked or keeps selling at zero (`inventoryPolicy: CONTINUE`) is
+  `made_to_order`, and a mapped one makes its Pubky row
+  [made to order](#made-to-order-stock): `inventory_levels/update` and
+  `inventory_items/update` (tracking switched on or off) are resolved through
+  the inventory item, and the stock poll reads the same fields. Each product
+  carries its `handle`, the key a Shopify product CSV names it by, so the Shop
+  can link a CSV-imported listing to it. A product with
   only Shopify's `Default Title` option has no options.
 - **Orders.** `orderCreate` with the mapped variant ids, financial status `PAID`,
   one manual `SALE` transaction named `Pubky <rail>`, tags `pubky` and
   `pubky-order-{id}`, the `pubky_order_id` attribute, inventory decremented
   ignoring the store's oversell policy, no receipt and no customer. A shipping
-  address is attached only when the buyer opted in. Amounts are formatted with the
+  address is attached only when the buyer opted in. Its region goes as
+  `provinceCode` only when the subdivision table
+  (`contracts/postal-region-rules.json`) resolves it unambiguously, from the
+  code or the full name (`California` -> `CA`); other region text is kept on
+  `address2`, because Shopify takes no free-text province and may refuse an
+  unknown code. The buyer's phone goes with it when they gave one. Amounts are formatted with the
   currency's own exponent, and an order whose exponent differs is refused
   (`exponent_mismatch`). The order currency must be the store's currency (else
   `currency_mismatch`: the push is quarantined and the seller alert says why and
@@ -1378,6 +1440,18 @@ on `X-Shopify-Event-Id`.
   (`unmapped_listings: [{listing_id, mappings_removed}]`) and a
   `listings_unmapped` alert says to re-import each variant as its own listing or
   end the combined one. Nothing is refused, so there is no unmap-first loop.
+- **Unlinked listings.** A paid order none of whose lines is mapped to a
+  product of the connected store is not pushed (`quarantine_reason:
+  no_mapped_lines`, severity `info`, since it may be a Pubky-only sale), and it
+  is never silent: a `listing_not_linked` alert on the order names the
+  listings ("Order not sent to the store: listing … is not linked"). The seller
+  links them (`PUT /v1/connectors/{id}/mappings`; saving mappings also reads
+  the store's stock for the connection on the worker's next tick, so a listing
+  linked a moment ago shows the store's stock and made-to-order state within
+  seconds) and retries the push
+  (`POST /v1/connectors/{id}/pushes/{order}/retry`), or resolves the alert for a
+  Pubky-only sale. An order with only some lines mapped stays
+  `unmapped_variant` with a `push_quarantined` alert, as before.
 - **Tax.** No tax is added: the pushed order carries `taxesIncluded: false`, no
   tax lines, lines marked not taxable, so the store total is what the buyer paid.
   The created order is read back; a total or tax that differs raises a

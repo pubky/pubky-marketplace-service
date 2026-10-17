@@ -41,7 +41,9 @@ pub async fn handle(
             listing.server_revision,
         )));
     }
-    if listing.available_quantity < payload.quantity {
+    // A made-to-order listing has no listing-wide count; the variant row
+    // below answers for the units.
+    if !listing.made_to_order && listing.available_quantity < payload.quantity {
         return Ok(Err(CommandFailure::refused_with_revision(
             crate::refusal_audit::RefusalKind::InsufficientInventory,
             ErrorCode::InsufficientInventory,
@@ -101,11 +103,11 @@ pub async fn handle(
     let variant_id = row.variant_id.clone();
     let reservation_variant = keyed.then(|| variant_id.clone());
 
-    let new_state = if listing.available_quantity == payload.quantity {
-        "reserved"
-    } else {
-        "available"
-    };
+    let new_state = crate::variant_stock::state_after_claim(
+        listing.available_quantity,
+        payload.quantity,
+        listing.made_to_order,
+    );
     if !can_transition(&listing_machine(), &listing.state, new_state) {
         return Ok(Err(CommandFailure::refused_with_revision(
             crate::refusal_audit::RefusalKind::InvariantViolation,
