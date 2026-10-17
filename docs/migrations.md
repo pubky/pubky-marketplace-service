@@ -247,17 +247,18 @@ already exercises with a missing 0032.
 so no rewrite), a `NOT VALID` CHECK that a made-to-order row has
 `available_quantity = 0` (every existing row is `false`), replaces the 0070
 roll-up function so it maintains `listings.made_to_order` and marks
-made-to-order entries of `variant_availability`, and widens
-`connector_alerts_kind` with `listing_not_linked` (small table, one pass). It
-builds no index and sets `lock_timeout` like 0050. A binary from before 0073
+made-to-order entries of `variant_availability`. It touches no connector
+table, builds no index and sets `lock_timeout` like 0050. A binary from before 0073
 never sets the flag, and on a made-to-order row its writes fail closed: a claim
 would take `available` below 0, which the existing CHECK refuses.
 
-0074 (connector stock refresh) adds the nullable
+0074 (connector link alerts and stock refresh) adds the nullable
 `connector_connections.stock_refresh_requested_at`: saving a connection's
 mappings sets it and the connector worker reads that connection's stock on its
-next tick, then clears it. No default, no index; `lock_timeout` like 0050. A
-binary from before 0074 never sets or reads it.
+next tick, then clears it. It also widens `connector_alerts_kind` with
+`listing_not_linked` (small table, one pass, like 0067). No default, no index;
+`lock_timeout` like 0050. A binary from before 0074 never sets or reads the
+column and never writes the new kind.
 
 0072 (grant sessions) creates `grant_session_challenges` with its primary key,
 two CHECKs, and plain indexes on `expires_at` and on `pubky` for unused rows

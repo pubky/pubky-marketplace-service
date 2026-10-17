@@ -1,5 +1,5 @@
--- Made-to-order stock and the `listing_not_linked` connector alert. Additive
--- and directly rerunnable. There is NO DOWN migration.
+-- Made-to-order stock. Additive and directly rerunnable. There is NO DOWN
+-- migration.
 --
 -- A made-to-order variant row (`listing_variant_inventory.made_to_order`)
 -- sells without a stock count: a store that does not track the variant's
@@ -18,10 +18,6 @@
 -- so it also maintains the flag and adds `"made_to_order": true` to the
 -- `variant_availability` entry of a made-to-order variant, which is never
 -- `sold_out` (entries of counted variants are unchanged).
---
--- `connector_alerts_kind` gains `listing_not_linked`: a paid order whose
--- listings are not linked to any product of the seller's connected store was
--- not sent to the store, and the seller is told so on the order.
 --
 -- The two columns are `NOT NULL DEFAULT false`, a constant default, so adding
 -- them rewrites no table. The CHECK is `NOT VALID` (every existing row is
@@ -91,22 +87,3 @@ BEGIN
     RETURN NULL;
 END;
 $$;
-
-ALTER TABLE connector_alerts DROP CONSTRAINT IF EXISTS connector_alerts_kind;
-ALTER TABLE connector_alerts
-    ADD CONSTRAINT connector_alerts_kind CHECK (
-        kind IN (
-            'push_quarantined',
-            'action_quarantined',
-            'merchant_cancelled',
-            'merchant_refunded',
-            'store_uninstalled',
-            'credentials_rejected',
-            'inbound_failed',
-            'refund_reversed_after_mirror',
-            'listings_unmapped',
-            'variant_mapping_error',
-            'push_total_mismatch',
-            'listing_not_linked'
-        )
-    );
