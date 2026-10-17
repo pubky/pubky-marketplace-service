@@ -1055,7 +1055,7 @@ pub fn upstream_operation_id(reference: &str, attempt: i32) -> String {
 
 fn upstream_order_description(order_id: uuid::Uuid) -> String {
     let compact = order_id.simple().to_string();
-    format!("Pubky Shop order {}", compact[..6].to_ascii_uppercase())
+    format!("Pubky Shop order {}", &compact[..8])
 }
 
 /// The single per-order reference every bind used before per-attempt
