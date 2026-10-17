@@ -764,7 +764,7 @@ async fn a_print_on_demand_variant_stays_orderable_and_flips_back_when_shopify_t
     for order in [&second, &third] {
         assert_eq!(push_state(&r.app.pool, order).await.0, "created", "{order}");
     }
-    let quantities: Vec<i64> = r
+    let mut quantities: Vec<i64> = r
         .fake
         .orders()
         .iter()
@@ -774,7 +774,12 @@ async fn a_print_on_demand_variant_stays_orderable_and_flips_back_when_shopify_t
                 .expect("quantity")
         })
         .collect();
-    assert_eq!(quantities, [1, 2, 3]);
+    quantities.sort_unstable();
+    assert_eq!(
+        quantities,
+        [1, 2, 3],
+        "one store order per Pubky order, in any order"
+    );
 
     // A seller adjustment has no count to move.
     let revision: i64 = sqlx::query_scalar(
