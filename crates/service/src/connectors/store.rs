@@ -1215,6 +1215,10 @@ pub enum AlertKind {
     VariantMappingError,
     /// The store order's total is not what the buyer paid.
     PushTotalMismatch,
+    /// A paid order's listings are not linked to any product of the store,
+    /// so it was not sent there. The seller links them (or confirms the sale
+    /// is Pubky-only) and sends the order again.
+    ListingNotLinked,
 }
 
 impl AlertKind {
@@ -1231,6 +1235,7 @@ impl AlertKind {
             AlertKind::ListingsUnmapped => "listings_unmapped",
             AlertKind::VariantMappingError => "variant_mapping_error",
             AlertKind::PushTotalMismatch => "push_total_mismatch",
+            AlertKind::ListingNotLinked => "listing_not_linked",
         }
     }
 }

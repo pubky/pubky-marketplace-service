@@ -1428,6 +1428,15 @@ on `X-Shopify-Event-Id`.
   (`unmapped_listings: [{listing_id, mappings_removed}]`) and a
   `listings_unmapped` alert says to re-import each variant as its own listing or
   end the combined one. Nothing is refused, so there is no unmap-first loop.
+- **Unlinked listings.** A paid order none of whose lines is mapped to a
+  product of the connected store is not pushed (`quarantine_reason:
+  no_mapped_lines`, severity `info`, since it may be a Pubky-only sale), and it
+  is never silent: a `listing_not_linked` alert on the order names the
+  listings ("Order not sent to the store: listing … is not linked"). The seller
+  links them (`PUT /v1/connectors/{id}/mappings`) and retries the push
+  (`POST /v1/connectors/{id}/pushes/{order}/retry`), or resolves the alert for a
+  Pubky-only sale. An order with only some lines mapped stays
+  `unmapped_variant` with a `push_quarantined` alert, as before.
 - **Tax.** No tax is added: the pushed order carries `taxesIncluded: false`, no
   tax lines, lines marked not taxable, so the store total is what the buyer paid.
   The created order is read back; a total or tax that differs raises a

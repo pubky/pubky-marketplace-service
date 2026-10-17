@@ -103,8 +103,10 @@ pub mod reason {
     pub const ORDER_NOT_PAID: &str = "order_not_paid";
     pub const ORDER_NOT_FOUND: &str = "order_not_found";
     pub const UNMAPPED_VARIANT: &str = "unmapped_variant";
-    /// No line of the order is mapped to this store: a Pubky-only sale. Not
-    /// pushed, no alert.
+    /// No line of the order is mapped to this store: a Pubky-only sale, or a
+    /// listing the seller has not linked to its store product yet. Not
+    /// pushed; the seller gets a `listing_not_linked` alert naming the
+    /// listings, so an unlinked store product is never missed silently.
     pub const NO_MAPPED_LINES: &str = "no_mapped_lines";
     pub const CONNECTION_UNAVAILABLE: &str = "connection_unavailable";
     pub const CREDENTIALS_REJECTED: &str = "credentials_rejected";
@@ -302,6 +304,18 @@ pub async fn quarantine_push(
             Some(claim.pubky_order_id),
             &format!("{reason}: {detail}"),
             &format!("push|{}|{reason}|{}", claim.id, claim.attempts),
+        )
+        .await?;
+    }
+    if changed == 1 && reason == self::reason::NO_MAPPED_LINES {
+        raise_alert(
+            &mut *tx,
+            now,
+            connection,
+            AlertKind::ListingNotLinked,
+            Some(claim.pubky_order_id),
+            detail,
+            &format!("listing-not-linked|{}", claim.id),
         )
         .await?;
     }
