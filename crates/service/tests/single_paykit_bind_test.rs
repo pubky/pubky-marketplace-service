@@ -411,10 +411,7 @@ async fn the_paykit_bind_sends_the_denomination_and_records_every_offered_asset(
     let compact = uuid(&order.order_id).simple().to_string();
     assert_eq!(
         prepare["description"],
-        json!(format!(
-            "Pubky Shop order {}",
-            compact[..6].to_ascii_uppercase()
-        )),
+        json!(format!("Pubky Shop order {}", &compact[..8])),
         "the multi-asset request is labelled like the legacy one"
     );
     assert!(
