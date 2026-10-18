@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// Publishes the standing shipping and pickup fixtures hold-smoke.py picks from.
+// Publishes, sweeps and guards the shipping and pickup fixtures hold-smoke.py picks from. hold-smoke.py runs
+// these modes itself; the fixtures live only for one run (see Fixture lifecycle in its header).
 //
 // hold-smoke.py takes every listing from one dedicated staging seller
 // (HOLD_SMOKE_FIXTURE_SELLER). That seller needs a qty-1, fixed-price,
@@ -12,6 +13,11 @@
 //   publish   publish whichever of the two fixtures is missing, register it
 //             with the service, and wait for the index to show it
 //   status    print each fixture's homeserver, index and service state
+//   sweep     delete every listing record, media file and delivery ciphertext the seat holds, then wait for 404
+//             on the homeserver, every guarded Nexus and the service (needs HOLD_SMOKE_FIXTURE_SELLER: the seat
+//             must be the dedicated fixture seller)
+//   guard     fail unless no guarded Nexus lists an active listing owned by HOLD_SMOKE_FIXTURE_SELLER or titled
+//             "SMOKE FIXTURE, do not buy"; an unreadable stream fails too. Needs no seat.
 //   check     offline: build both records and check their shape; no network
 //
 // Records follow pubky-app-specs: a shipped listing is
@@ -30,7 +36,10 @@
 //   MARKETPLACE_URL         default https://staging-api.pubky.app
 //   NEXUS_URL               default https://nexusd-staging-production.up.railway.app
 //   HTTP_RELAY              default https://httprelay.pubky.app/inbox
-//   HOLD_SMOKE_FIXTURE_SELLER  optional; when set, the seat must match it
+//   HOLD_SMOKE_FIXTURE_SELLER  optional for publish and status (the seat must match it when set); required
+//                           for sweep and guard
+//   HOLD_SMOKE_GUARD_NEXUS  comma list of Nexus hosts that must not list a fixture; default the production and
+//                           staging Nexus (change it when the production Nexus moves)
 // Staging only: it refuses a production service host.
 
 import { chmodSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
