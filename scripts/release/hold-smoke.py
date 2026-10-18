@@ -42,6 +42,24 @@ HOLD_SMOKE_FIXTURE_SELLER); no other seller's listing is picked or modified.
       `digital_manual_test`), not here. Select kinds with `--digital-kinds`
       (default all five; an empty value runs none).
 
+Fixture lifecycle: the fixtures are never left standing. The staging homeserver
+this seller writes to is also indexed by the production Nexus, so a fixture
+that outlives a run is a test listing live on the production index. Each run
+sweeps the fixture seller's homeserver (deleting every listing, media file
+and delivery ciphertext it holds), publishes the fixtures, runs the cases, and
+in a `finally` sweeps again, waits until each deleted listing answers 404 on
+the staging and production Nexus and the service, and then runs the guard:
+no Nexus may list an active fixture. A run that cannot prove that is STOP,
+whatever its cases did, and a run killed past `finally` (SIGKILL, power loss)
+is cleaned by the next run's opening sweep or by
+`node hold-smoke-fixtures.mjs sweep` and checked by `... guard`.
+Environment: HOLD_SMOKE_SEAT_FILE, HOLD_SMOKE_FIXTURE_STATE, PUBKY_SDK_DIR (see
+hold-smoke-fixtures.mjs) and, when digital kinds are smoked,
+HOLD_SMOKE_DIGITAL_FIXTURE_CMD: a command that takes `publish` or `teardown`,
+reads the kinds from HOLD_SMOKE_DIGITAL_FIXTURE_KINDS, and publishes (or tears
+down) one digital listing per kind on the fixture seller with its delivery
+set (the Shop's scripts/release/production-digital-fixture.mjs, wrapped).
+
 Any HTTP 4xx other than the expected bind 409 is STOP. Never production.
 Every created order is cancelled and verified cancelled at the end.
 
@@ -74,6 +92,8 @@ import hashlib
 import json
 import os
 import re
+import shlex
+import signal
 import subprocess
 import sys
 import uuid
@@ -106,9 +126,15 @@ FIXTURE_SELLER = os.environ.get(
     "HOLD_SMOKE_FIXTURE_SELLER", "ka7q4cmabp6amo13bye9q6iwhb4pxuwr9fo37h5ygx4uk9e63tjy"
 )
 FIXTURE_HINT = (
-    "publish the hold-smoke fixtures on the fixture seller "
-    "(scripts/release/hold-smoke-fixtures.mjs publish for shipping and pickup)"
+    "the smoke publishes its own fixtures on the fixture seller at the start of a run "
+    "(see Fixture lifecycle in the header); check the publish output above"
 )
+FIXTURES_SCRIPT = Path(__file__).with_name("hold-smoke-fixtures.mjs")
+FIXTURE_ENV = ("HOLD_SMOKE_SEAT_FILE", "HOLD_SMOKE_FIXTURE_STATE", "PUBKY_SDK_DIR")
+DIGITAL_FIXTURE_ENV = "HOLD_SMOKE_DIGITAL_FIXTURE_CMD"
+PUBLISH_TIMEOUT_SECONDS = 1800
+SWEEP_TIMEOUT_SECONDS = 900
+GUARD_TIMEOUT_SECONDS = 180
 PRODUCTION_HOST_MARKERS = (
     "marketplace-service-production-ce23",
     "shop.pubky.app",
@@ -659,6 +685,32 @@ def self_check() -> None:
         raise RuntimeError("digital kinds parse")
     if parse_digital_kinds("all") != DIGITAL_KINDS:
         raise RuntimeError("digital kinds default")
+    complete = {name: "x" for name in (*FIXTURE_ENV, DIGITAL_FIXTURE_ENV)}
+    if fixture_missing_environment(DIGITAL_KINDS, complete) or fixture_missing_environment((), complete):
+        raise RuntimeError("a complete fixture environment was refused")
+    if fixture_missing_environment(DIGITAL_KINDS, {name: "x" for name in FIXTURE_ENV}) != [DIGITAL_FIXTURE_ENV]:
+        raise RuntimeError("digital kinds without a digital fixture command were accepted")
+    if fixture_missing_environment((), {name: "x" for name in FIXTURE_ENV}):
+        raise RuntimeError("a run with no digital kinds must not need the digital fixture command")
+    if sorted(fixture_missing_environment((), {})) != sorted(FIXTURE_ENV):
+        raise RuntimeError("an empty fixture environment was accepted")
+    if fixtures_argv("sweep")[2] != "sweep" or digital_fixture_argv("teardown", "zsh -c run.sh") != ["zsh", "-c", "run.sh", "teardown"]:
+        raise RuntimeError("fixture command line")
+    for bad in (lambda: fixtures_argv("status"), lambda: digital_fixture_argv("buy", "x"), lambda: digital_fixture_argv("publish", " ")):
+        try:
+            bad()
+        except RuntimeError:
+            continue
+        raise RuntimeError("an unknown fixture mode or empty command was accepted")
+    if fixture_environment()["HOLD_SMOKE_FIXTURE_SELLER"] != FIXTURE_SELLER:
+        raise RuntimeError("the fixture steps must act on the smoke's fixture seller")
+    failing = FixtureLifecycle(())
+    failing.digital = lambda action: (_ for _ in ()).throw(RuntimeError("digital down"))  # type: ignore[method-assign]
+    ran: list[str] = []
+    failing.step = lambda label, argv, timeout: ran.append(label)  # type: ignore[method-assign]
+    problems = failing.retire()
+    if ran != ["sweep", "guard"] or len(problems) != 1 or not problems[0].startswith("digital teardown"):
+        raise RuntimeError(f"retire must run sweep and guard after a failed digital teardown: {ran!r} {problems!r}")
     fixture_path = Path(__file__).with_name(FIXTURE_NAME)
     fixture = json.loads(fixture_path.read_text())
     if fixture["captured_from"]["shop_tag"] != SHOP_TAG:
@@ -1163,6 +1215,87 @@ def pick_digital_listing(kind: str, exclude: set[str]) -> dict[str, Any]:
     return listing
 
 
+def fixture_environment() -> dict[str, str]:
+    env = dict(os.environ)
+    env["HOLD_SMOKE_FIXTURE_SELLER"] = FIXTURE_SELLER
+    return env
+
+
+def fixture_missing_environment(digital_kinds: tuple[str, ...], environ: dict[str, str] | None = None) -> list[str]:
+    environ = os.environ if environ is None else environ
+    missing = [name for name in FIXTURE_ENV if not environ.get(name)]
+    if digital_kinds and not environ.get(DIGITAL_FIXTURE_ENV):
+        missing.append(DIGITAL_FIXTURE_ENV)
+    return missing
+
+
+def fixtures_argv(mode: str) -> list[str]:
+    if mode not in {"publish", "sweep", "guard"}:
+        raise RuntimeError(f"unknown fixtures mode {mode!r}")
+    return [NODE, str(FIXTURES_SCRIPT), mode]
+
+
+def digital_fixture_argv(action: str, command: str) -> list[str]:
+    if action not in {"publish", "teardown"}:
+        raise RuntimeError(f"unknown digital fixture action {action!r}")
+    argv = shlex.split(command)
+    if not argv:
+        raise RuntimeError(f"{DIGITAL_FIXTURE_ENV} is empty")
+    return [*argv, action]
+
+
+def run_step(label: str, argv: list[str], *, env: dict[str, str], timeout: int) -> None:
+    print(f"fixture_step={label}", file=sys.stderr, flush=True)
+    result = subprocess.run(argv, env=env, timeout=timeout, check=False, stdout=subprocess.PIPE, text=True)
+    sys.stderr.write(result.stdout)
+    if result.returncode != 0:
+        raise RuntimeError(f"fixture step {label} failed rc={result.returncode}")
+
+
+class FixtureLifecycle:
+    """The fixtures exist only for the length of one run (see Fixture lifecycle in the header)."""
+
+    def __init__(self, digital_kinds: tuple[str, ...]) -> None:
+        self.digital_kinds = digital_kinds
+        self.env = fixture_environment()
+        self.env["HOLD_SMOKE_DIGITAL_FIXTURE_KINDS"] = ",".join(digital_kinds)
+
+    def check_environment(self) -> None:
+        missing = fixture_missing_environment(self.digital_kinds, self.env)
+        if missing:
+            raise SystemExit(f"HOLD_SMOKE=STOP the fixture lifecycle needs {', '.join(missing)} (see the header)")
+
+    def step(self, label: str, argv: list[str], timeout: int) -> None:
+        run_step(label, argv, env=self.env, timeout=timeout)
+
+    def digital(self, action: str) -> None:
+        if self.digital_kinds:
+            self.step(f"digital {action}", digital_fixture_argv(action, self.env[DIGITAL_FIXTURE_ENV]), PUBLISH_TIMEOUT_SECONDS)
+
+    def publish(self) -> None:
+        self.step("sweep before publish", fixtures_argv("sweep"), SWEEP_TIMEOUT_SECONDS)
+        self.step("publish shipping and pickup", fixtures_argv("publish"), PUBLISH_TIMEOUT_SECONDS)
+        self.digital("publish")
+
+    def retire(self) -> list[str]:
+        """Remove every fixture and prove it. Every step runs even when an earlier one failed."""
+        problems: list[str] = []
+        for label, action in (
+            ("digital teardown", lambda: self.digital("teardown")),
+            ("sweep", lambda: self.step("sweep", fixtures_argv("sweep"), SWEEP_TIMEOUT_SECONDS)),
+            ("guard", lambda: self.step("guard", fixtures_argv("guard"), GUARD_TIMEOUT_SECONDS)),
+        ):
+            try:
+                action()
+            except (RuntimeError, subprocess.SubprocessError, OSError) as error:
+                problems.append(f"{label}: {error}")
+        return problems
+
+
+def terminate_as_exit(signum: int, _frame: Any) -> None:
+    raise SystemExit(128 + signum)
+
+
 class Smoke:
     def __init__(self, digital_kinds: tuple[str, ...] = DIGITAL_KINDS) -> None:
         self.base = os.environ["MARKETPLACE_URL"].rstrip("/")
@@ -1596,6 +1729,34 @@ class Smoke:
                 print(f"session_cleanup_error={error}", file=sys.stderr)
 
     def run(self) -> dict[str, Any]:
+        lifecycle = FixtureLifecycle(self.digital_kinds)
+        lifecycle.check_environment()
+        for signum in (signal.SIGTERM, signal.SIGHUP):
+            signal.signal(signum, terminate_as_exit)
+        try:
+            try:
+                lifecycle.publish()
+            except BaseException:
+                print("HOLD_SMOKE=STOP the fixtures could not be published", file=sys.stderr)
+                raise
+            summary = self.run_cases()
+        except BaseException:
+            problems = lifecycle.retire()
+            if problems:
+                print(json.dumps({"fixtures_not_retired": problems}, indent=2), file=sys.stderr)
+                print("HOLD_SMOKE_FIXTURES=NOT_RETIRED", file=sys.stderr)
+            raise
+        problems = lifecycle.retire()
+        if problems:
+            print(json.dumps({"fixtures_not_retired": problems}, indent=2))
+            print("HOLD_SMOKE=STOP")
+            raise RuntimeError("hold-smoke fixtures were not retired: " + "; ".join(problems))
+        summary["fixtures"] = "ephemeral: swept, 404 on every Nexus and the service, guard PASS"
+        print(json.dumps(summary, indent=2, sort_keys=True, default=str))
+        print("HOLD_SMOKE=PASS")
+        return summary
+
+    def run_cases(self) -> dict[str, Any]:
         try:
             shipping = pick_listing(shipping=True, require_bind=True)
             pickup = pick_listing(shipping=False, exclude={shipping["aggregate_id"]}, require_bind=True)
@@ -1654,8 +1815,6 @@ class Smoke:
                 "cases": self.cases,
                 "orders_verified_cancelled": verified,
             }
-            print(json.dumps(summary, indent=2, sort_keys=True, default=str))
-            print("HOLD_SMOKE=PASS")
             return summary
         except Exception:
             for row in list(self.created_orders):

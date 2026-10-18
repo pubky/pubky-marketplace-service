@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// Publishes the standing shipping and pickup fixtures hold-smoke.py picks from.
+// Publishes, sweeps and guards the shipping and pickup fixtures hold-smoke.py picks from. hold-smoke.py runs
+// these modes itself; the fixtures live only for one run (see Fixture lifecycle in its header).
 //
 // hold-smoke.py takes every listing from one dedicated staging seller
 // (HOLD_SMOKE_FIXTURE_SELLER). That seller needs a qty-1, fixed-price,
@@ -12,6 +13,11 @@
 //   publish   publish whichever of the two fixtures is missing, register it
 //             with the service, and wait for the index to show it
 //   status    print each fixture's homeserver, index and service state
+//   sweep     delete every listing record, media file and delivery ciphertext the seat holds, then wait for 404
+//             on the homeserver, every guarded Nexus and the service (needs HOLD_SMOKE_FIXTURE_SELLER: the seat
+//             must be the dedicated fixture seller)
+//   guard     fail unless no guarded Nexus lists an active listing owned by HOLD_SMOKE_FIXTURE_SELLER or titled
+//             "SMOKE FIXTURE, do not buy"; an unreadable stream fails too. Needs no seat.
 //   check     offline: build both records and check their shape; no network
 //
 // Records follow pubky-app-specs: a shipped listing is
@@ -30,7 +36,10 @@
 //   MARKETPLACE_URL         default https://staging-api.pubky.app
 //   NEXUS_URL               default https://nexusd-staging-production.up.railway.app
 //   HTTP_RELAY              default https://httprelay.pubky.app/inbox
-//   HOLD_SMOKE_FIXTURE_SELLER  optional; when set, the seat must match it
+//   HOLD_SMOKE_FIXTURE_SELLER  optional for publish and status (the seat must match it when set); required
+//                           for sweep and guard
+//   HOLD_SMOKE_GUARD_NEXUS  comma list of Nexus hosts that must not list a fixture; default the production and
+//                           staging Nexus (change it when the production Nexus moves)
 // Staging only: it refuses a production service host.
 
 import { chmodSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
@@ -49,7 +58,14 @@ const KINDS = {
   shipping: { methods: ['physical', 'shipping'], service: ['shipping'] },
   pickup: { methods: ['pickup'], service: ['pickup'] },
 };
-const TITLE = (kind) => `SMOKE FIXTURE, do not buy hold-smoke ${kind}`;
+const FIXTURE_TITLE_PREFIX = 'SMOKE FIXTURE, do not buy';
+const TITLE = (kind) => `${FIXTURE_TITLE_PREFIX} hold-smoke ${kind}`;
+const DELIVERABLES = '/pub/pubky.app/marketplace/v1/deliverables';
+// Every Nexus a fixture must be absent from. The staging homeserver is indexed by the production Nexus as well,
+// so a fixture published here is visible to real buyers until it is deleted.
+const GUARD_NEXUS = (process.env.HOLD_SMOKE_GUARD_NEXUS ?? 'https://nexusd-production-7108.up.railway.app,https://nexusd-staging-production.up.railway.app')
+  .split(',').map((url) => url.trim().replace(/\/$/, '')).filter(Boolean);
+const STREAM_PAGE = 100;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const log = (text) => process.stderr.write(`${new Date().toISOString()} ${text}\n`);
 
@@ -110,6 +126,40 @@ export function registerCommand(kind, record) {
   };
 }
 
+export function fixtureLeaks(listings, sellers) {
+  return listings
+    .filter((l) => sellers.includes(l.owner_id) || String(l.title ?? '').startsWith(FIXTURE_TITLE_PREFIX))
+    .map((l) => ({ owner: String(l.owner_id).slice(0, 8), id: l.id, title: l.title }));
+}
+
+async function activeStream(nexus) {
+  const all = [];
+  for (let skip = 0; ; skip += STREAM_PAGE) {
+    const response = await fetch(`${nexus}/v0/stream/listings?state=active&limit=${STREAM_PAGE}&skip=${skip}`);
+    if (response.status !== 200) throw new Error(`${nexus} listing stream answered ${response.status}`);
+    const page = await response.json();
+    if (!Array.isArray(page)) throw new Error(`${nexus} listing stream is not a list`);
+    all.push(...page);
+    if (page.length < STREAM_PAGE) return all;
+  }
+}
+
+// Fails (exit 1) when any Nexus lists an active fixture. An unreadable stream also fails: the guard never assumes clean.
+async function guard() {
+  const sellers = [requireEnv('HOLD_SMOKE_FIXTURE_SELLER')];
+  const leaks = [];
+  const unreadable = [];
+  for (const nexus of GUARD_NEXUS) {
+    try {
+      for (const leak of fixtureLeaks(await activeStream(nexus), sellers)) leaks.push({ nexus: new URL(nexus).host, ...leak });
+    } catch (error) {
+      unreadable.push(`${nexus}: ${error.message}`);
+    }
+  }
+  console.log(JSON.stringify({ guard: leaks.length || unreadable.length ? 'FAIL' : 'PASS', nexus: GUARD_NEXUS.length, leaks, unreadable }));
+  process.exitCode = leaks.length || unreadable.length || GUARD_NEXUS.length === 0 ? 1 : 0;
+}
+
 function check() {
   const pubky = 'y'.repeat(52);
   const media = { id: '0'.repeat(32), type: 'image', url: `pubky://${pubky}${MEDIA}/${'0'.repeat(32)}`, contentHash: 'a'.repeat(64), mimeType: 'image/png', byteSize: 1, width: 64, height: 64, altText: 'x' };
@@ -124,6 +174,13 @@ function check() {
   const png = fixturePng();
   if (png.bytes.readUInt32BE(16) !== 64 || png.bytes.toString('ascii', 12, 16) !== 'IHDR') failures.push('fixture png');
   if (!PRODUCTION_HOST_MARKERS.some((m) => 'https://marketplace-service-production-ce23.up.railway.app'.includes(m))) failures.push('production guard');
+  const stream = [
+    { owner_id: pubky, id: 'a', title: 'anything' },
+    { owner_id: 'z'.repeat(52), id: 'b', title: TITLE('pickup') },
+    { owner_id: 'z'.repeat(52), id: 'c', title: 'Pav test: active, buy me' },
+  ];
+  if (fixtureLeaks(stream, [pubky]).map((l) => l.id).join() !== 'a,b') failures.push('leak detection');
+  if (fixtureLeaks(stream, []).length !== 1) failures.push('leak detection by title only');
   console.log(failures.length ? `HOLD_SMOKE_FIXTURES=CHECK_FAIL ${failures.join(', ')}` : 'HOLD_SMOKE_FIXTURES=CHECK_PASS');
   process.exitCode = failures.length ? 1 : 0;
 }
@@ -155,16 +212,62 @@ async function main(mode) {
   const publicStorage = new Pubky().publicStorage;
   const onHomeserver = async (id) => await publicStorage.exists(`pubky://${pk}${LISTINGS}/${id}`).catch(() => null);
   const indexStatus = async (path) => (await fetch(`${NEXUS}${path}`)).status;
-  const waitFor = async (path, want, timeoutMs = 180_000) => {
+  const waitForUrl = async (url, want, timeoutMs = 180_000) => {
     const start = Date.now();
     let status = null;
     while (Date.now() - start < timeoutMs) {
-      status = await indexStatus(path).catch(() => null);
+      status = (await fetch(url).catch(() => null))?.status ?? null;
       if (status === want) return { status, ms: Date.now() - start };
       await sleep(5_000);
     }
     return { status, ms: Date.now() - start, timedOut: true };
   };
+  const waitFor = (path, want, timeoutMs) => waitForUrl(`${NEXUS}${path}`, want, timeoutMs);
+
+  const names = async (path) => {
+    const out = [];
+    let cursor = null;
+    for (;;) {
+      const page = await publicStorage.list(`pubky://${pk}${path}/`, cursor, false, STREAM_PAGE).catch((error) => {
+        if (/404|not found/i.test(String(error?.message ?? error))) return [];
+        throw error;
+      });
+      out.push(...page.map((url) => url.split('/').pop()));
+      if (page.length < STREAM_PAGE) return out;
+      cursor = page[page.length - 1];
+    }
+  };
+
+  // Deletes every listing record, media file and delivery ciphertext the fixture seller holds, then waits until
+  // each deleted listing is gone from the homeserver, every guarded Nexus and the service. The seat is dedicated
+  // to fixtures (sweep requires HOLD_SMOKE_FIXTURE_SELLER), so nothing under these paths is anyone else's.
+  async function sweep() {
+    const session = await new Pubky().signer(seat).signinCookie();
+    const ids = await names(LISTINGS);
+    try {
+      for (const id of ids) await session.storage.delete(`${LISTINGS}/${id}`);
+      for (const path of [MEDIA, DELIVERABLES]) {
+        for (const name of await names(path)) await session.storage.delete(`${path}/${name}`);
+      }
+    } finally {
+      session.free?.();
+    }
+    writeState({});
+    const failures = [];
+    for (const id of ids) {
+      if ((await onHomeserver(id)) !== false) failures.push(`${id}: still on the homeserver`);
+      for (const nexus of GUARD_NEXUS) {
+        const gone = await waitForUrl(`${nexus}/v0/listing/${pk}/${id}`, 404);
+        if (gone.timedOut) failures.push(`${id}: ${new URL(nexus).host} answers ${gone.status}`);
+      }
+      const gone = await waitForUrl(`${SERVICE}/v0/listings/${pk}/${id}/availability`, 404);
+      if (gone.timedOut) failures.push(`${id}: the service answers ${gone.status}`);
+    }
+    const leftover = [...(await names(LISTINGS)), ...(await names(MEDIA)), ...(await names(DELIVERABLES))];
+    if (leftover.length) failures.push(`the homeserver still holds ${leftover.length} fixture file(s)`);
+    console.log(JSON.stringify({ sweep: failures.length ? 'FAIL' : 'PASS', seller: pk.slice(0, 8), listingsRemoved: ids.length, failures }));
+    process.exitCode = failures.length ? 1 : 0;
+  }
 
   const sessions = [];
   async function bearer() {
@@ -180,6 +283,11 @@ async function main(mode) {
   }
 
   try {
+    if (mode === 'sweep') {
+      if (!process.env.HOLD_SMOKE_FIXTURE_SELLER) throw new Error('sweep deletes everything the seat owns under the marketplace paths: set HOLD_SMOKE_FIXTURE_SELLER to the dedicated fixture seller');
+      await sweep();
+      return;
+    }
     if (mode === 'publish') {
       const user = await waitFor(`/v0/user/${pk}`, 200);
       if (user.timedOut) throw new Error(`the index has no user for the seat (status ${user.status}); publish its profile first`);
@@ -241,8 +349,9 @@ async function main(mode) {
 
 const mode = process.argv[2];
 if (mode === 'check') check();
-else if (mode === 'publish' || mode === 'status') await main(mode);
+else if (mode === 'guard') await guard();
+else if (mode === 'publish' || mode === 'status' || mode === 'sweep') await main(mode);
 else {
-  console.error('usage: hold-smoke-fixtures.mjs publish | status | check');
+  console.error('usage: hold-smoke-fixtures.mjs publish | status | sweep | guard | check');
   process.exitCode = 2;
 }
