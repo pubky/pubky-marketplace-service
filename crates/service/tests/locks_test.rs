@@ -3851,3 +3851,32 @@ async fn a_failed_claimed_digital_locks_item_does_not_stall_the_rest_of_the_batc
         "the verification lease is free right after the pass"
     );
 }
+
+// A Locks order is paid when the Lock Server reports the lifecycle completed:
+// the Lock Server issues the unlock itself, so by the time the service sees the
+// completion the buyer already has the content. The service cannot hold what it
+// does not release, so the seller's Bitcoin confirmation option (legal plan B4)
+// does not apply to a Locks order, and the documentation says so.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_sellers_bitcoin_confirmation_option_does_not_hold_a_locks_order(pool: PgPool) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
+    register_locks(&app, &buyer.token, &order, &seller.pubky).await;
+    sqlx::query("UPDATE orders SET seller_confirms_bitcoin = TRUE WHERE id = $1::uuid")
+        .bind(&order.order_id)
+        .execute(&app.pool)
+        .await
+        .expect("opt the seller in");
+    fake.set_outcome(
+        TEST_BUNDLE_ID,
+        LocksLookupOutcome::Status(LocksTaskStatus::Completed),
+    );
+
+    let summary = run_once(&app.state, Uuid::new_v4(), app.clock.now())
+        .await
+        .expect("worker pass runs");
+    assert_eq!(summary.locks_completions_applied, 1);
+    assert_eq!(order_state(&app.pool, &order.order_id).await, "paid");
+}
