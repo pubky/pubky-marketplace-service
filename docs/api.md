@@ -337,7 +337,7 @@ request failed, so clients should branch on HTTP status first, and parse
    | `REVISION_CONFLICT`, `IDEMPOTENCY_CONFLICT`, `INSUFFICIENT_INVENTORY`, `INVARIANT_VIOLATION`, `OFFER_EXPIRED`, `INVALID_STATE`, `AUCTION_CLOSED`, `BID_TOO_LOW`, `SELLER_REGISTRATION_REQUIRED` | 409 |
    | `AWARD_EXPIRED`, `AWARD_ALREADY_CONVERTED`, `AWARD_QUANTITY_MISMATCH`, `AWARD_VARIANT_MISMATCH`, `AWARD_LISTING_CHANGED`, `AWARD_HOLD_MISSING` | 409 |
    | `LISTING_MODERATED`, `LISTING_NOT_ACTIVE` | 409 |
-   | `SELLER_UNAVAILABLE_IN_REGION`, `SELLER_ANNUAL_LIMIT_REACHED` | 409 |
+   | `SELLER_UNAVAILABLE_IN_REGION`, `SELLER_ANNUAL_LIMIT_REACHED`, `DIGITAL_UNAVAILABLE_IN_REGION` | 409 |
    | `UPSTREAM_UNAVAILABLE` | 503 (retriable) |
 
    A command error may also carry `issues` and `reason` fields.
@@ -385,6 +385,14 @@ request failed, so clients should branch on HTTP status first, and parse
    `annual_amount_limit` (a seller whose shop country is in the EU-27 reached
    29 paid or open orders, or EUR 2,000, this calendar year, UTC). A shop
    record the service cannot read is refused with `UPSTREAM_UNAVAILABLE`.
+
+   `DIGITAL_UNAVAILABLE_IN_REGION` exists only while
+   `DIGITAL_REGION_BLOCK_ENABLED` is on (see
+   [Digital sales to EU and UK buyers](../README.md#digital-sales-to-eu-and-uk-buyers)):
+   `checkout.create` and `offer.checkout` with a digital line, from a buyer whose
+   `payload.buyer_country` is in the EU-27 (`reason: "eu_buyer"`) or is `GB`
+   (`reason: "gb_buyer"`). Such a command must carry `buyer_country` (422
+   `INVALID_COMMAND` without it).
 
    `GET /v1/sellers/{seller_pubky}/annual-limit` answers `{"enabled": false}`
    with the fence off. On, it answers `enabled`, `year` and `limit_reached` to

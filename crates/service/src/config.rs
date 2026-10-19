@@ -179,6 +179,13 @@ pub struct Config {
     /// and `auction.place_bid`. Off, the service accepts and records
     /// `buyer_country` but refuses nothing on these grounds.
     pub eu_fence_enabled: bool,
+    /// Refuse digital lines to buyers in the EU-27 or GB
+    /// (`DIGITAL_REGION_BLOCK_ENABLED`, default false; legal launch plan
+    /// C3b). Independent of `EU_FENCE_ENABLED`. On, `checkout.create` and
+    /// `offer.checkout` with a digital line (any digital
+    /// delivery kind, or a Locks listing) need `buyer_country` and are
+    /// refused with `DIGITAL_UNAVAILABLE_IN_REGION` for those buyers.
+    pub digital_region_block_enabled: bool,
     /// Days a cancelled-after-payment order's pinned pickup snapshot is
     /// retained as the dispute exhibit when no refund evidence ever lands,
     /// before the ordinary terminal-order purge takes it
@@ -370,6 +377,7 @@ impl Config {
         let require_encrypted_delivery_address =
             env_bool("REQUIRE_ENCRYPTED_DELIVERY_ADDRESS", false)?;
         let eu_fence_enabled = env_bool("EU_FENCE_ENABLED", false)?;
+        let digital_region_block_enabled = env_bool("DIGITAL_REGION_BLOCK_ENABLED", false)?;
         let pickup_dispute_retention_days = env_days("PICKUP_DISPUTE_RETENTION_DAYS", 30)?;
         let buyer_email_retention_days = env_days("BUYER_EMAIL_RETENTION_DAYS", 30)?;
         let buyer_email_unpaid_retention_days = env_days("BUYER_EMAIL_UNPAID_RETENTION_DAYS", 7)?;
@@ -447,6 +455,7 @@ impl Config {
             sandbox_payments_enabled,
             require_encrypted_delivery_address,
             eu_fence_enabled,
+            digital_region_block_enabled,
             pickup_dispute_retention_days,
             digital_delivery_max_bytes,
             buyer_email_retention_days,
@@ -514,6 +523,7 @@ impl Config {
             sandbox_payments_enabled: true,
             require_encrypted_delivery_address: false,
             eu_fence_enabled: false,
+            digital_region_block_enabled: false,
             pickup_dispute_retention_days: 30,
             digital_delivery_max_bytes: DEFAULT_DIGITAL_DELIVERY_MAX_BYTES,
             buyer_email_retention_days: 30,

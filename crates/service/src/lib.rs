@@ -21,6 +21,7 @@ pub mod connectors;
 pub mod content_lock;
 pub mod contracts;
 pub mod digital;
+pub mod digital_region;
 pub mod executor;
 pub mod expiry;
 pub mod fx;

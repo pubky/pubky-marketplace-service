@@ -183,6 +183,7 @@ Railway IaC `preserve()`):
 | `PAYPAL_CHECKOUT_URL` | `https://www.paypal.com/cgi-bin/webscr` | PayPal `_xclick` checkout base. HTTPS only; host must be `www.paypal.com` (live) or `www.sandbox.paypal.com`. Default stays live. |
 | `REQUIRE_ENCRYPTED_DELIVERY_ADDRESS` | `false` | `true`/`1` refuses a checkout or award checkout that carries a plaintext `delivery_address` (422 `INVALID_COMMAND`, reason `encrypted_delivery_required`); only sealed envelopes are accepted. Leave unset until the Shop version that seals is the deployed one (see [Sealed delivery address](#sealed-delivery-address)) |
 | `EU_FENCE_ENABLED` | `false` | `true`/`1` turns on the EU scope fence (legal launch plan C2-C4): `buyer_country` becomes required on the selling commands, a buyer in the EU-27 buys only from sellers whose shop record says `sellerStatus: "private"`, and sellers whose shop country is in the EU-27 stop at 29 sales or EUR 2,000 a calendar year. Off, `buyer_country` is accepted and stored and nothing is refused on these grounds. See [EU scope fence](#eu-scope-fence) |
+| `DIGITAL_REGION_BLOCK_ENABLED` | `false` | `true`/`1` refuses `checkout.create` (which carries drop claims) and `offer.checkout` that contain a digital line (any digital delivery kind, or a Locks listing) when `payload.buyer_country` is in the EU-27 or is `GB`: `DIGITAL_UNAVAILABLE_IN_REGION` (409), reason `eu_buyer` or `gb_buyer`; such a command must carry `buyer_country`. Independent of `EU_FENCE_ENABLED`. Off, nothing is refused. See [Digital sales to EU and UK buyers](#digital-sales-to-eu-and-uk-buyers) |
 | `ADDRESS_SEARCH_UPSTREAM_URL` | `https://photon.komoot.io` | Photon geocoder behind `POST /v0/address/suggest`. HTTPS only (http for loopback in tests). Point it at a self-hosted Photon to stop using the public instance |
 | `ADDRESS_SEARCH_DISABLED` | unset | `1`/`true` turns the address proxy off; the route answers `address_search_unavailable` |
 | `ADDRESS_SEARCH_CLIENT_IP_HEADER` | unset | name of a header set by a trusted edge that carries the client address (last value is used); unset keys the per-client limit on the socket peer |
@@ -288,6 +289,30 @@ With the flag on:
 
 The Shop reads `GET /v1/sellers/{seller_pubky}/annual-limit` (see
 `docs/api.md`) for the seller's counters.
+
+### Digital sales to EU and UK buyers
+
+Legal launch plan C3b, behind `DIGITAL_REGION_BLOCK_ENABLED` (default off,
+independent of `EU_FENCE_ENABLED`). EU VAT presumes a platform that authorises
+the charge or the delivery of an electronic service to be its supplier
+(IR 282/2011 Art. 9a), and the UK has the same platform rule. The service
+releases file, link and text items and Locks items itself, so with the flag on
+a `checkout.create` (a drop claim is one) or an `offer.checkout` that contains a
+digital line is refused with `DIGITAL_UNAVAILABLE_IN_REGION` (409, audited as
+`invalid_state`) when `payload.buyer_country` is in the EU-27 or is `GB`.
+`reason` is `eu_buyer` or `gb_buyer`.
+
+- A line is digital when its listing is a Locks listing, when the buyer chose
+  the `digital` fulfillment for it, or when `digital` is the only method the
+  listing publishes. A listing that publishes digital next to shipping or
+  pickup is physical when the buyer chose one of those. Email and message
+  items count: Synonym's automatic payment confirmation may authorise the
+  charge even when the seller delivers by hand.
+- A command with a digital line must carry `buyer_country`; one without does
+  not need it on this flag's account.
+- Offers on digital items are already refused
+  (`offers_unavailable_for_digital`), and auctions ship only.
+- Buyers from every other country, and physical lines, are unaffected.
 
 ### Listing lifecycle
 

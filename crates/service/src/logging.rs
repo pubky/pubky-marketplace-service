@@ -94,6 +94,7 @@ pub(crate) fn error_code_name(code: Option<ErrorCode>) -> &'static str {
         Some(ErrorCode::ListingNotActive) => "LISTING_NOT_ACTIVE",
         Some(ErrorCode::SellerUnavailableInRegion) => "SELLER_UNAVAILABLE_IN_REGION",
         Some(ErrorCode::SellerAnnualLimitReached) => "SELLER_ANNUAL_LIMIT_REACHED",
+        Some(ErrorCode::DigitalUnavailableInRegion) => "DIGITAL_UNAVAILABLE_IN_REGION",
         None => "",
     }
 }

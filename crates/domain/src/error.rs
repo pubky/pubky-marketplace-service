@@ -43,6 +43,9 @@ pub enum ErrorCode {
     /// EU (29 paid sales or EUR 2,000 of paid orders per calendar year). Only
     /// returned while `EU_FENCE_ENABLED` is on.
     SellerAnnualLimitReached,
+    /// The cart has a digital line and the buyer's country is in the EU-27
+    /// or is GB. Only returned while `DIGITAL_REGION_BLOCK_ENABLED` is on.
+    DigitalUnavailableInRegion,
 }
 
 impl ErrorCode {
@@ -71,7 +74,8 @@ impl ErrorCode {
             | ErrorCode::ListingModerated
             | ErrorCode::ListingNotActive
             | ErrorCode::SellerUnavailableInRegion
-            | ErrorCode::SellerAnnualLimitReached => 409,
+            | ErrorCode::SellerAnnualLimitReached
+            | ErrorCode::DigitalUnavailableInRegion => 409,
             ErrorCode::UpstreamUnavailable => 503,
         }
     }
