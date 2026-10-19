@@ -276,9 +276,8 @@ columns NULL.
 with a CHECK that treats NULL as valid (no default, no rewrite; `lock_timeout`
 like 0050). 0077 builds `orders_seller_created_idx` on `orders (seller_pubky,
 created_at)` as one `CREATE INDEX CONCURRENTLY` in a `-- no-transaction` file,
-for the per-seller annual counters. 0075 is claimed by service #159, so
-0076 and 0077 land with a gap that sqlx applies in version order. A binary
-from before 0076 never reads or writes the columns.
+for the per-seller annual counters. They follow 0075 (per-variant prices,
+#159). A binary from before 0076 never reads or writes the columns.
 
 ### Backing out 0076 and 0077
 
