@@ -657,3 +657,72 @@ async fn checkout_accepts_but_neither_stores_nor_projects_a_guarantee_policy_ver
     assert_ne!(status, StatusCode::OK, "{body}");
     assert_eq!(body["error"]["code"], json!("INVALID_COMMAND"));
 }
+
+async fn declaration_row(pool: &PgPool, order_id: &str) -> (Option<String>, Option<String>) {
+    sqlx::query_as("SELECT seller_status, seller_country FROM orders WHERE id = $1::uuid")
+        .bind(order_id)
+        .fetch_one(pool)
+        .await
+        .expect("order row")
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn the_sellers_declaration_freezes_on_the_order_with_the_periods(pool: PgPool) {
+    let (app, homeserver) = test_app_with_shop_homeserver(pool).await;
+    let private = new_actor(&app).await;
+    homeserver.put_shop_record(
+        &private.pubky,
+        shop_record(
+            &private,
+            json!({ "sellerStatus": "private", "location": { "countryCode": "CH" } }),
+        ),
+    );
+    let buyer = new_actor(&app).await;
+    let order_id = paid_order(&app, &private, &buyer).await;
+    assert_eq!(
+        declaration_row(&app.pool, &order_id).await,
+        (Some("private".to_string()), Some("CH".to_string()))
+    );
+
+    let trader = new_actor(&app).await;
+    homeserver.put_shop_record(
+        &trader.pubky,
+        shop_record(
+            &trader,
+            json!({ "sellerStatus": "trader", "location": { "countryCode": "US" } }),
+        ),
+    );
+    let buyer = new_actor(&app).await;
+    let order_id = paid_order(&app, &trader, &buyer).await;
+    assert_eq!(
+        declaration_row(&app.pool, &order_id).await,
+        (Some("trader".to_string()), Some("US".to_string()))
+    );
+
+    let undeclared = new_actor(&app).await;
+    homeserver.put_shop_record(&undeclared.pubky, shop_record(&undeclared, json!({})));
+    let buyer = new_actor(&app).await;
+    let order_id = paid_order(&app, &undeclared, &buyer).await;
+    assert_eq!(
+        declaration_row(&app.pool, &order_id).await,
+        (Some("undeclared".to_string()), None)
+    );
+
+    let no_shop = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order_id = paid_order(&app, &no_shop, &buyer).await;
+    assert_eq!(
+        declaration_row(&app.pool, &order_id).await,
+        (Some("undeclared".to_string()), None)
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_unreadable_shop_record_freezes_no_declaration(pool: PgPool) {
+    let (app, homeserver) = test_app_with_shop_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    homeserver.fail_shop_record(&seller.pubky);
+    let order_id = paid_order(&app, &seller, &buyer).await;
+    assert_eq!(declaration_row(&app.pool, &order_id).await, (None, None));
+}

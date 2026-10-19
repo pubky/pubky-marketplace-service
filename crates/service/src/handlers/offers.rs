@@ -183,9 +183,9 @@ pub async fn create(
         "INSERT INTO offers (id, aggregate_id, listing_aggregate_id, buyer_pubky, seller_pubky, \
          revision, state, offered_by, amount_minor, currency, exponent, quantity, message, \
          history, expires_at, created_at, updated_at, variant_id, terms_listing_revision, \
-         terms_listing_record_sha256, terms_snapshot) \
+         terms_listing_record_sha256, terms_snapshot, buyer_country) \
          VALUES ($1, $2, $3, $4, $5, 1, 'pending', $4, $6, $7, $8, $9, $10, $11, $12, $13, $13, \
-                 $14, $15, $16, $17) \
+                 $14, $15, $16, $17, $18) \
          RETURNING {OFFER_COLUMNS}"
     ))
     .bind(command.command_id)
@@ -205,6 +205,7 @@ pub async fn create(
     .bind(terms.as_ref().map(|snapshot| snapshot.revision))
     .bind(terms.as_ref().map(|snapshot| snapshot.raw_sha256.clone()))
     .bind(&terms_snapshot)
+    .bind(&payload.buyer_country)
     .fetch_one(&mut **tx)
     .await?;
 

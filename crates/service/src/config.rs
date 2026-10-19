@@ -23,6 +23,9 @@ pub const AUTOMATION_RATE_LIMIT_MAX_TOKENS: i64 = 20_000;
 /// Hard deployment-policy ceiling for accepted upstream preparation TTLs.
 pub const MAX_PAYKIT_PREPARE_TTL_SECONDS: i64 = 86_400;
 
+/// The default edge header carrying the client's country.
+pub const DEFAULT_CLIENT_COUNTRY_HEADER: &str = "x-client-region";
+
 #[derive(Clone)]
 pub struct Config {
     pub bind_addr: SocketAddr,
@@ -170,6 +173,28 @@ pub struct Config {
     /// false). Off until the Shop release that seals addresses is deployed;
     /// then on, so no client can send the service a readable address.
     pub require_encrypted_delivery_address: bool,
+    /// Enforce the EU scope fence (`EU_FENCE_ENABLED`, default false; legal
+    /// launch plan C2-C4). On, the service refuses a business or undeclared
+    /// seller's sale to a buyer in the EU-27 (`SELLER_UNAVAILABLE_IN_REGION`),
+    /// refuses a sale by an EU-resident seller past 29 paid sales or EUR 2,000
+    /// in a calendar year (`SELLER_ANNUAL_LIMIT_REACHED`), and requires
+    /// `buyer_country` on `checkout.create`, `offer.create`, `offer.checkout`
+    /// and `auction.place_bid`. Off, the service accepts and records
+    /// `buyer_country` but refuses nothing on these grounds.
+    pub eu_fence_enabled: bool,
+    /// Refuse digital lines to buyers in the EU-27 or GB
+    /// (`DIGITAL_REGION_BLOCK_ENABLED`, default false; legal launch plan
+    /// C3b). Independent of `EU_FENCE_ENABLED`. On, `checkout.create` and
+    /// `offer.checkout` with a digital line (any digital
+    /// delivery kind, or a Locks listing) need `buyer_country` and are
+    /// refused with `DIGITAL_UNAVAILABLE_IN_REGION` for those buyers.
+    pub digital_region_block_enabled: bool,
+    /// The request header the trusted edge sets to the client's country from
+    /// its IP (`CLIENT_COUNTRY_HEADER`, default `x-client-region`), read for the
+    /// digital hold. On GCP the load balancer's custom request header
+    /// `X-Client-Region:{client_region}`; on Vercel `x-vercel-ip-country`. Stored
+    /// lowercase.
+    pub client_country_header: String,
     /// Days a cancelled-after-payment order's pinned pickup snapshot is
     /// retained as the dispute exhibit when no refund evidence ever lands,
     /// before the ordinary terminal-order purge takes it
@@ -360,6 +385,16 @@ impl Config {
         let sandbox_payments_enabled = env_bool("SANDBOX_PAYMENTS_ENABLED", false)?;
         let require_encrypted_delivery_address =
             env_bool("REQUIRE_ENCRYPTED_DELIVERY_ADDRESS", false)?;
+        let eu_fence_enabled = env_bool("EU_FENCE_ENABLED", false)?;
+        let digital_region_block_enabled = env_bool("DIGITAL_REGION_BLOCK_ENABLED", false)?;
+        let client_country_header = std::env::var("CLIENT_COUNTRY_HEADER")
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| DEFAULT_CLIENT_COUNTRY_HEADER.to_string());
+        if axum::http::HeaderName::from_bytes(client_country_header.as_bytes()).is_err() {
+            anyhow::bail!("CLIENT_COUNTRY_HEADER must be a valid HTTP header name");
+        }
         let pickup_dispute_retention_days = env_days("PICKUP_DISPUTE_RETENTION_DAYS", 30)?;
         let buyer_email_retention_days = env_days("BUYER_EMAIL_RETENTION_DAYS", 30)?;
         let buyer_email_unpaid_retention_days = env_days("BUYER_EMAIL_UNPAID_RETENTION_DAYS", 7)?;
@@ -436,6 +471,9 @@ impl Config {
             public_service_origin,
             sandbox_payments_enabled,
             require_encrypted_delivery_address,
+            eu_fence_enabled,
+            digital_region_block_enabled,
+            client_country_header,
             pickup_dispute_retention_days,
             digital_delivery_max_bytes,
             buyer_email_retention_days,
@@ -502,6 +540,9 @@ impl Config {
             public_service_origin: Some("https://svc.test".to_string()),
             sandbox_payments_enabled: true,
             require_encrypted_delivery_address: false,
+            eu_fence_enabled: false,
+            digital_region_block_enabled: false,
+            client_country_header: DEFAULT_CLIENT_COUNTRY_HEADER.to_string(),
             pickup_dispute_retention_days: 30,
             digital_delivery_max_bytes: DEFAULT_DIGITAL_DELIVERY_MAX_BYTES,
             buyer_email_retention_days: 30,

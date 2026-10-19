@@ -186,6 +186,10 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/listings/{aggregate_id}/bids",
             get(queries::list_listing_bids),
         )
+        .route(
+            "/v1/sellers/{seller_pubky}/annual-limit",
+            get(crate::region_fence::get_annual_limit),
+        )
         .route("/v1/drops/{aggregate_id}", get(queries::get_drop))
         .route(
             "/v1/drops/{aggregate_id}/me",
@@ -494,9 +498,14 @@ async fn ready(State(state): State<AppState>) -> Response {
 async fn execute_command(
     State(state): State<AppState>,
     Extension(actor): Extension<Actor>,
+    headers: axum::http::HeaderMap,
     Json(raw): Json<Value>,
 ) -> Response {
-    match executor::execute(&state, &actor.0, &raw).await {
+    let edge = crate::digital_region::EdgeContext::from_headers(
+        &headers,
+        &state.config.client_country_header,
+    );
+    match executor::execute_with_edge(&state, &actor.0, &raw, &edge).await {
         Ok((status, body)) => match crate::reserve_secrecy::guard_command_result(&actor.0, body) {
             Ok(body) => (status, Json(body)).into_response(),
             Err(body) => (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response(),

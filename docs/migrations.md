@@ -269,6 +269,32 @@ index on an existing table and sets `lock_timeout` like 0050. A binary from
 before 0072 never reads the new table and its session inserts leave the new
 columns NULL.
 
+## EU fence columns and index (0076, 0077)
+
+0076 adds the nullable `orders.buyer_country`, `orders.seller_status`,
+`orders.seller_country`, `offers.buyer_country` and `bids.buyer_country`, each
+with a CHECK that treats NULL as valid (no default, no rewrite; `lock_timeout`
+like 0050). 0077 builds `orders_seller_created_idx` on `orders (seller_pubky,
+created_at)` as one `CREATE INDEX CONCURRENTLY` in a `-- no-transaction` file,
+for the per-seller annual counters. They follow 0075 (per-variant prices,
+#159). A binary from before 0076 never reads or writes the columns.
+
+### Backing out 0076 and 0077
+
+Both are additive, so an image from before them runs on the migrated database
+(see "A ledger ahead of the build"); nothing needs to be undone to roll back.
+To remove the objects by hand, after the old image is serving:
+
+```sql
+DROP INDEX CONCURRENTLY IF EXISTS orders_seller_created_idx;
+ALTER TABLE orders DROP COLUMN IF EXISTS buyer_country,
+                   DROP COLUMN IF EXISTS seller_status,
+                   DROP COLUMN IF EXISTS seller_country;
+ALTER TABLE offers DROP COLUMN IF EXISTS buyer_country;
+ALTER TABLE bids DROP COLUMN IF EXISTS buyer_country;
+DELETE FROM _sqlx_migrations WHERE version IN (76, 77);
+```
+
 ## Numbers claimed by open pull requests
 
 `main` has 0001 to 0054 and 0056 to 0059; 0055 is #92, so the catalog is

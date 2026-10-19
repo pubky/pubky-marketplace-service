@@ -4,6 +4,17 @@ Two transactions that lock the same rows in opposite orders can deadlock.
 Postgres detects the cycle after `deadlock_timeout` and aborts one of them
 with `40P01`; that transaction rolls back completely.
 
+## Seller counters before everything
+
+With `EU_FENCE_ENABLED` on, `checkout.create` and `offer.checkout` take one
+transaction-scoped advisory lock per seller, `pg_advisory_xact_lock(
+hashtextextended(seller_pubky, 6381))`, in ascending seller order, as the first
+locks of the transaction: before the drop row, the listing rows and the
+variant rows. The annual-limit count (`region_fence::usage`) then runs under
+that lock, so two checkouts of one seller serialize at the lock and never hold a
+listing the other needs. `eu_fence_test` runs concurrent checkouts at the last
+slot and checkouts over the same two sellers in opposite order.
+
 ## Drops before listings
 
 A transaction that touches a drop and its listings locks the drop row, then

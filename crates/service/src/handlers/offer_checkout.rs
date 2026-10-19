@@ -23,6 +23,7 @@ struct AwardReservation {
     variant_id: Option<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn handle(
     tx: &mut Transaction<'_, Postgres>,
     actor: &str,
@@ -31,7 +32,11 @@ pub async fn handle(
     clock: &dyn Clock,
     hold_window_seconds: i64,
     require_encrypted_delivery: bool,
+    fence: &crate::region_fence::FencePlan,
 ) -> Result<HandlerResult, sqlx::Error> {
+    // The EU fence's per-seller counter lock comes before every other lock
+    // of this transaction (`docs/lock-order.md`).
+    crate::region_fence::lock_sellers(tx, fence).await?;
     let offer: Option<OfferRow> = sqlx::query_as(&format!(
         "SELECT {OFFER_COLUMNS} FROM offers WHERE id = $1 FOR UPDATE"
     ))
@@ -271,6 +276,21 @@ pub async fn handle(
         "fulfillment": fulfillment.as_str()
     }]);
     let hold_expires_at = lock_now + chrono::Duration::seconds(hold_window_seconds);
+    if let Err(failure) = crate::region_fence::check_new_order(
+        tx,
+        fence,
+        &offer.seller_pubky,
+        crate::region_fence::NewOrder {
+            total_minor: total,
+            currency,
+            exponent,
+        },
+        lock_now,
+    )
+    .await
+    {
+        return Ok(Err(failure));
+    }
     let converted_reservation: Option<Uuid> = sqlx::query_scalar(
         "UPDATE reservations SET status = 'converted', updated_at = $2 \
          WHERE id = $1 AND status = 'active' RETURNING id",
@@ -291,9 +311,9 @@ pub async fn handle(
          buyer_pubky, seller_pubky, revision, state, lines, delivery_address, subtotal_minor, \
          shipping_minor, total_minor, currency, exponent, payment_id, \
          stock_held, hold_expires_at, fulfillment, created_at, updated_at, \
-         delivery_address_envelope, delivery_key_id) \
+         delivery_address_envelope, delivery_key_id, buyer_country) \
          VALUES ($1, $2, $3, 'offer', $4, $5, 1, 'pending_payment', $6, $7, $8, $9, $10, \
-         $11, $12, $13, TRUE, $14, $16, $15, $15, $17, $18)",
+         $11, $12, $13, TRUE, $14, $16, $15, $15, $17, $18, $19)",
     )
     .bind(order_id)
     .bind(command.command_id)
@@ -313,6 +333,7 @@ pub async fn handle(
     .bind(fulfillment.as_str())
     .bind(sealed.as_ref().map(|stored| stored.bytes.as_slice()))
     .bind(sealed.as_ref().map(|stored| stored.key_id.as_str()))
+    .bind(&payload.buyer_country)
     .execute(&mut **tx)
     .await?;
     sqlx::query(
