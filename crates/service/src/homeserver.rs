@@ -1082,11 +1082,25 @@ struct RecordVariant {
     enabled: Option<Value>,
     #[serde(default)]
     sku: Option<Value>,
+    #[serde(default, rename = "priceOverride")]
+    price_override: Option<Value>,
 }
 
 impl RecordVariant {
     fn is_enabled(&self) -> bool {
         self.enabled.as_ref().and_then(Value::as_bool) == Some(true)
+    }
+
+    /// The variant's own price. `Err` when a `priceOverride` is present but
+    /// is not money: charging the listing price instead would sell the
+    /// variant at a price the seller did not sign.
+    fn price(&self) -> Result<Option<Money>, ()> {
+        match &self.price_override {
+            None | Some(Value::Null) => Ok(None),
+            Some(value) => serde_json::from_value::<RecordMoney>(value.clone())
+                .map(|money| Some(money.into_money()))
+                .map_err(|_| ()),
+        }
     }
 
     fn usable_id(&self) -> Option<&str> {
@@ -1101,7 +1115,9 @@ impl RecordVariant {
 /// `None` when two or more variants are enabled but their ids cannot key
 /// separate stock (a missing, malformed or repeated id): such a record
 /// cannot back per-variant inventory and must not silently fall back to one
-/// shared total.
+/// shared total. Also `None` when an enabled variant carries a
+/// `priceOverride` that is not money, or one that has no usable id to key it
+/// by: the price would be dropped and the variant sold at the listing price.
 fn enabled_variant_stock(
     variants: &[RecordVariant],
 ) -> Option<Vec<marketplace_domain::commands::VariantStock>> {
@@ -1109,6 +1125,9 @@ fn enabled_variant_stock(
     let mut seen = std::collections::HashSet::new();
     let mut stock = Vec::with_capacity(enabled.len());
     for variant in &enabled {
+        let Ok(unit_price) = variant.price() else {
+            return None;
+        };
         let usable = variant
             .usable_id()
             .filter(|id| seen.insert((*id).to_string()));
@@ -1122,8 +1141,9 @@ fn enabled_variant_stock(
                     .filter(|sku| !sku.is_empty())
                     .map(str::to_string),
                 quantity: variant.quantity,
+                unit_price,
             }),
-            None if enabled.len() >= 2 => return None,
+            None if enabled.len() >= 2 || unit_price.is_some() => return None,
             None => {}
         }
     }
@@ -1591,12 +1611,14 @@ mod tests {
                 marketplace_domain::commands::VariantStock {
                     id: "size_s".to_string(),
                     sku: Some("SKU-S".to_string()),
-                    quantity: 2
+                    quantity: 2,
+                    unit_price: None,
                 },
                 marketplace_domain::commands::VariantStock {
                     id: "size_m".to_string(),
                     sku: None,
-                    quantity: 0
+                    quantity: 0,
+                    unit_price: None,
                 },
             ]
         );
@@ -1604,6 +1626,103 @@ mod tests {
             payload.quantity, 11,
             "the registration quantity is still the sum of ALL variants"
         );
+    }
+
+    #[test]
+    fn derives_each_enabled_variants_price_override() {
+        let seller = "y".repeat(52);
+        let mut record = record_json();
+        record["variants"] = json!([
+            { "id": "size_s", "enabled": true, "quantity": 3 },
+            {
+                "id": "size_l",
+                "enabled": true,
+                "quantity": 2,
+                "priceOverride": { "amountMinor": 150, "currency": "USD", "exponent": 2 }
+            },
+            {
+                "id": "size_xl",
+                "enabled": false,
+                "quantity": 2,
+                "priceOverride": { "amountMinor": 999, "currency": "USD", "exponent": 2 }
+            },
+            { "id": "size_m", "enabled": true, "quantity": 1, "priceOverride": null },
+        ]);
+        let payload = registration_payload_from_record(&seller, "l", &record)
+            .expect("record parses")
+            .expect("listing record");
+        let prices: Vec<(&str, Option<i64>)> = payload
+            .variants
+            .iter()
+            .map(|variant| {
+                (
+                    variant.id.as_str(),
+                    variant.unit_price.as_ref().map(|price| price.amount_minor),
+                )
+            })
+            .collect();
+        assert_eq!(
+            prices,
+            vec![("size_s", None), ("size_l", Some(150)), ("size_m", None)],
+            "a disabled variant's price is not carried and a null override is no override"
+        );
+        assert_eq!(
+            payload.unit_price.amount_minor, 6_900,
+            "the listing price stays the record's sale price"
+        );
+    }
+
+    #[test]
+    fn a_sole_enabled_variant_keeps_its_price_override() {
+        let seller = "y".repeat(52);
+        let mut record = record_json();
+        record["variants"] = json!([{
+            "id": "only",
+            "enabled": true,
+            "quantity": 4,
+            "priceOverride": { "amountMinor": 4_500, "currency": "USD", "exponent": 2 }
+        }]);
+        let payload = registration_payload_from_record(&seller, "l", &record)
+            .expect("record parses")
+            .expect("listing record");
+        assert_eq!(payload.variants.len(), 1);
+        assert_eq!(
+            payload.variants[0]
+                .unit_price
+                .as_ref()
+                .map(|p| p.amount_minor),
+            Some(4_500)
+        );
+    }
+
+    #[test]
+    fn a_price_override_that_cannot_be_carried_makes_the_record_not_interpretable() {
+        let seller = "y".repeat(52);
+        for variants in [
+            json!([
+                { "id": "a", "enabled": true, "quantity": 1, "priceOverride": "1.50" },
+                { "id": "b", "enabled": true, "quantity": 1 },
+            ]),
+            json!([
+                { "id": "a", "enabled": true, "quantity": 1, "priceOverride": { "amountMinor": "150", "currency": "USD", "exponent": 2 } },
+                { "id": "b", "enabled": true, "quantity": 1 },
+            ]),
+            json!([{
+                "enabled": true,
+                "quantity": 1,
+                "priceOverride": { "amountMinor": 150, "currency": "USD", "exponent": 2 }
+            }]),
+        ] {
+            let mut record = record_json();
+            record["variants"] = variants.clone();
+            assert!(
+                matches!(
+                    registration_payload_from_record(&seller, "l", &record),
+                    Ok(None)
+                ),
+                "{variants}"
+            );
+        }
     }
 
     #[test]

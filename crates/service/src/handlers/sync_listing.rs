@@ -299,13 +299,17 @@ async fn sync(
                 .iter()
                 .map(|method| method.as_str().to_string())
                 .collect();
-            // The healing exception covers both derived fields the service
+            // The healing exception covers the derived fields the service
             // reads out of the record after listings were first registered:
-            // shipping (added earlier) and fulfillment_methods (added with
-            // local pickup). Both are inventory-neutral, so nothing else
-            // (quantity, price, state) is touched.
+            // shipping (added earlier), fulfillment_methods (added with local
+            // pickup) and the variants' own prices (migration 0075). All are
+            // inventory-neutral, so nothing else (quantity, listing price,
+            // state) is touched.
+            let registration_variant_prices =
+                crate::handlers::register_listing::variant_prices_json(&registration.variants);
             if registration.listing_revision == current.listing_revision
                 && (registration.shipping_minor != current.shipping_minor
+                    || registration_variant_prices != current.variant_prices
                     || registration_methods != current.fulfillment_methods
                     || registration
                         .digital_lock
@@ -321,7 +325,7 @@ async fn sync(
                 let healed: crate::model::ListingRow = sqlx::query_as(&format!(
                     "UPDATE listings SET server_revision = server_revision + 1, \
                      shipping_minor = $2, fulfillment_methods = $3, digital_lock_policy_uri = $4, \
-                     digital_lock_criterion_id = $5, updated_at = $6 \
+                     digital_lock_criterion_id = $5, updated_at = $6, variant_prices = $7 \
                      WHERE aggregate_id = $1 \
                      RETURNING {}",
                     crate::handlers::LISTING_COLUMNS
@@ -342,6 +346,7 @@ async fn sync(
                         .map(|lock| &lock.criterion_id),
                 )
                 .bind(now)
+                .bind(&registration_variant_prices)
                 .fetch_one(&mut **tx)
                 .await?;
                 let event_id = crate::executor::insert_event(

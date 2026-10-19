@@ -344,8 +344,10 @@ pub struct RegisterListingPayload {
     pub variants: Vec<VariantStock>,
 }
 
-/// One enabled variant of a listing record and the units the seller holds of
-/// it (`variants[].id`, `.sku`, `.quantity` in the owner-signed record).
+/// One enabled variant of a listing record: the units the seller holds of it
+/// and the price it sells at when that differs from the listing's
+/// (`variants[].id`, `.sku`, `.quantity`, `.priceOverride` in the owner-signed
+/// record).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VariantStock {
@@ -353,6 +355,12 @@ pub struct VariantStock {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sku: Option<String>,
     pub quantity: i64,
+    /// The variant's own unit price (`priceOverride`), in the listing's asset.
+    /// Absent when the variant sells at the listing's `unit_price`. Serialized
+    /// only when present so older clients keep byte-identical canonical JSON
+    /// (the idempotency hash input).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit_price: Option<Money>,
 }
 
 /// Most variants one listing may carry (the reference client's limit).
@@ -1610,7 +1618,11 @@ pub fn validate_public_listing_payload(
     validate_listing_payload(payload, false)
 }
 
-fn validate_variant_stock(variants: &[VariantStock], issues: &mut Vec<ValidationIssue>) {
+fn validate_variant_stock(
+    variants: &[VariantStock],
+    listing_price: &Money,
+    issues: &mut Vec<ValidationIssue>,
+) {
     if variants.len() > MAX_LISTING_VARIANTS {
         issues.push(issue("payload.variants", "Expected at most 100 variants"));
         return;
@@ -1641,6 +1653,13 @@ fn validate_variant_stock(variants: &[VariantStock], issues: &mut Vec<Validation
                 &format!("payload.variants.{index}.sku"),
                 "Expected a sku of 1 to 128 printable characters",
             ));
+        }
+        if let Some(price) = &variant.unit_price {
+            let path = format!("payload.variants.{index}.unit_price");
+            validate_positive_money(&path, price, issues);
+            if !price.same_asset(listing_price) {
+                issues.push(issue(&path, "Expected the listing's currency and exponent"));
+            }
         }
     }
 }
@@ -1681,7 +1700,7 @@ fn validate_listing_payload(
             "Expected a quantity between 1 and 1000000",
         ));
     }
-    validate_variant_stock(&payload.variants, &mut issues);
+    validate_variant_stock(&payload.variants, &payload.unit_price, &mut issues);
     validate_positive_money("payload.unit_price", &payload.unit_price, &mut issues);
     if !(0..=MAX_SAFE_INTEGER).contains(&payload.shipping_minor) {
         issues.push(issue(
@@ -3005,12 +3024,14 @@ mod tests {
                 VariantStock {
                     id: "size_s".to_string(),
                     sku: Some("SKU-S".to_string()),
-                    quantity: 0
+                    quantity: 0,
+                    unit_price: None,
                 },
                 VariantStock {
                     id: "size_m".to_string(),
                     sku: None,
-                    quantity: 3
+                    quantity: 3,
+                    unit_price: None,
                 },
             ]
         );
@@ -3057,6 +3078,68 @@ mod tests {
             parse_command(&unknown).is_err(),
             "unknown variant fields are refused"
         );
+    }
+
+    #[test]
+    fn a_variant_price_is_carried_and_serialized_only_when_present() {
+        let command = register_with_variants(json!([
+            { "id": "size_s", "quantity": 1 },
+            {
+                "id": "size_l",
+                "quantity": 2,
+                "unit_price": { "amount_minor": 150, "currency": "USD", "exponent": 2 }
+            },
+        ]))
+        .expect("a variant price in the listing's asset is valid");
+        let CommandPayload::RegisterListing(payload) = &command.payload else {
+            panic!("expected register payload");
+        };
+        assert_eq!(payload.variants[0].unit_price, None);
+        assert_eq!(
+            payload.variants[1].unit_price,
+            Some(Money {
+                amount_minor: 150,
+                currency: "USD".to_string(),
+                exponent: 2,
+            })
+        );
+        let serialized = serde_json::to_value(payload).expect("payload serializes");
+        assert!(serialized["variants"][0].get("unit_price").is_none());
+        assert_eq!(
+            serialized["variants"][1]["unit_price"]["amount_minor"],
+            json!(150)
+        );
+    }
+
+    #[test]
+    fn a_malformed_variant_price_is_refused_by_path() {
+        for (price, path) in [
+            (
+                json!({ "amount_minor": 0, "currency": "USD", "exponent": 2 }),
+                "payload.variants.0.unit_price.amount_minor",
+            ),
+            (
+                json!({ "amount_minor": -5, "currency": "USD", "exponent": 2 }),
+                "payload.variants.0.unit_price.amount_minor",
+            ),
+            (
+                json!({ "amount_minor": 150, "currency": "EUR", "exponent": 2 }),
+                "payload.variants.0.unit_price",
+            ),
+            (
+                json!({ "amount_minor": 150, "currency": "USD", "exponent": 3 }),
+                "payload.variants.0.unit_price",
+            ),
+        ] {
+            let issues = register_with_variants(json!([
+                { "id": "a", "quantity": 1, "unit_price": price }
+            ]))
+            .expect_err(path);
+            assert!(
+                issues.iter().any(|issue| issue.path == path),
+                "{path}: {issues:?}"
+            );
+        }
     }
 
     #[test]
