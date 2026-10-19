@@ -2944,7 +2944,9 @@ async fn apply_report_inside_seller_window(
             facts,
         } => ("confirmed", *amount_matched, facts),
         PaykitStatusOutcome::AcceptancePending { facts } => ("confirmed", true, facts),
-        PaykitStatusOutcome::Detected { facts } => ("detected", true, facts),
+        PaykitStatusOutcome::Detected { facts } => {
+            ("detected", facts.amount_matched.unwrap_or(true), facts)
+        }
         PaykitStatusOutcome::ManualReview { .. } | PaykitStatusOutcome::UsdtObserved { .. } => {
             return Ok(false)
         }
@@ -3115,6 +3117,13 @@ async fn apply_upstream_manual_review(
 /// order, and Paykit's report only informs the seller. A late settlement still
 /// takes the late path whatever the mode. USDT is not affected, and an order
 /// that did not opt in (or whose option was never read) is untouched.
+///
+/// Only money that matches the order's amount waits for the seller. A
+/// `confirmed` report whose amount does not match keeps the `exclusive` mode, so
+/// it takes the same route as for any other seller (durable manual review with
+/// the amount-mismatch reason), and an unmatched `detected` sighting stays a
+/// display-only detection. The seller is never shown a short payment as
+/// "waiting for your confirmation".
 fn with_seller_confirmation(
     outcome: PaykitStatusOutcome,
     row: &ClaimedPaykitOrder,
@@ -3134,7 +3143,7 @@ fn with_seller_confirmation(
             facts,
         } => PaykitStatusOutcome::Confirmed {
             amount_matched,
-            facts: shared(facts),
+            facts: if amount_matched { shared(facts) } else { facts },
         },
         PaykitStatusOutcome::AcceptancePending { facts } => {
             PaykitStatusOutcome::AcceptancePending {
@@ -3142,7 +3151,11 @@ fn with_seller_confirmation(
             }
         }
         PaykitStatusOutcome::Detected { facts } => PaykitStatusOutcome::Detected {
-            facts: shared(facts),
+            facts: if facts.amount_matched == Some(false) {
+                facts
+            } else {
+                shared(facts)
+            },
         },
         PaykitStatusOutcome::UsdtObserved {
             usdt,
@@ -3345,7 +3358,7 @@ async fn apply_status_outcome(
                         &state.pool,
                         row,
                         "detected",
-                        true,
+                        facts.amount_matched.unwrap_or(true),
                         &facts.observation,
                         state.confirm_keys(),
                         now,

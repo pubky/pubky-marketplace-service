@@ -4205,6 +4205,7 @@ pub fn exclusive_facts() -> marketplace_service::payments::PaykitStatusFacts {
         late_settlement: false,
         payment_deadline: None,
         observation: Default::default(),
+        amount_matched: None,
     }
 }
 

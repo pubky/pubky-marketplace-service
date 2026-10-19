@@ -379,6 +379,21 @@ pub async fn confirm_bitcoin_payment(
         }
     }
 
+    // An observation that says the amount did not match is not a payment the
+    // seller can attest as received: it stays with review, where the amount
+    // mismatch is resolved.
+    if observation["amount_matched"] == json!(false) {
+        tracing::info!(
+            order_id = %order_id,
+            "rejected a confirmation of an observation whose amount did not match the order"
+        );
+        return review_error(
+            ErrorCode::InvalidState,
+            review_reason(ReviewReason::ConfirmationObservationMismatch),
+            "The observed amount does not match this order, so it cannot be confirmed as paid. It goes to review.",
+        );
+    }
+
     let now = state.clock.now();
     let pool = state.pool.clone();
     let mut tx = match pool.begin().await {

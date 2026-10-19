@@ -283,6 +283,11 @@ pub struct PaykitStatusFacts {
     /// later status.
     pub payment_deadline: Option<chrono::DateTime<chrono::Utc>>,
     pub observation: PaykitObservation,
+    /// Whether the observed amount matched the request, when the source says
+    /// so for this report. A `confirmed` outcome carries it on its own; a
+    /// `detected` one has nowhere else to put it. `None` reads as matched, as
+    /// every report did before this field existed.
+    pub amount_matched: Option<bool>,
 }
 
 /// Whether the payment request reached the buyer's wallet, normalized from
@@ -2167,6 +2172,7 @@ impl PaykitClient {
                         confirmations: Some(bitcoin.confirmations),
                         ..PaykitObservation::default()
                     },
+                    amount_matched: Some(bitcoin.amount_matched),
                 };
                 if bitcoin.amount_matched
                     && matches!(body.request_state.as_deref(), None | Some("proposed"))
@@ -2402,6 +2408,7 @@ impl PaykitClient {
                 confirmations: body.confirmations,
                 ..PaykitObservation::default()
             },
+            amount_matched: Some(body.amount_matched),
         };
         let outcome = match body.status.as_deref() {
             Some("undetected") => PaykitStatusOutcome::Undetected,

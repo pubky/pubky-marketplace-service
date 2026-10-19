@@ -48,7 +48,9 @@ const BITCOIN_CONFIRMATION_SELLER: &str = "seller";
 /// Whether a shop record opts the seller in to confirming their own Bitcoin
 /// payments.
 pub fn confirms_bitcoin_payments(record: &Value) -> bool {
-    record.get(BITCOIN_CONFIRMATION_FIELD).and_then(Value::as_str)
+    record
+        .get(BITCOIN_CONFIRMATION_FIELD)
+        .and_then(Value::as_str)
         == Some(BITCOIN_CONFIRMATION_SELLER)
 }
 

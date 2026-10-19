@@ -40,6 +40,33 @@ fn confirmed(late: bool) -> PaykitStatusOutcome {
     }
 }
 
+/// Money that does not match the order's amount, as a confirmed report.
+fn confirmed_short() -> PaykitStatusOutcome {
+    let PaykitStatusOutcome::Confirmed { facts, .. } = confirmed(false) else {
+        unreachable!("confirmed() builds a confirmed outcome");
+    };
+    PaykitStatusOutcome::Confirmed {
+        amount_matched: false,
+        facts: PaykitStatusFacts {
+            amount_matched: Some(false),
+            ..facts
+        },
+    }
+}
+
+/// An underpaid sighting: upstream reports it as `detected`.
+fn detected_short() -> PaykitStatusOutcome {
+    let PaykitStatusOutcome::Detected { facts } = detected() else {
+        unreachable!("detected() builds a detected outcome");
+    };
+    PaykitStatusOutcome::Detected {
+        facts: PaykitStatusFacts {
+            amount_matched: Some(false),
+            ..facts
+        },
+    }
+}
+
 fn detected() -> PaykitStatusOutcome {
     PaykitStatusOutcome::Detected {
         facts: PaykitStatusFacts {
@@ -337,4 +364,122 @@ async fn concurrent_seller_confirmations_and_polls_pay_the_order_exactly_once(po
         "{code}"
     );
     assert_eq!(confirmed_events(&fx.app.pool, &payment_id).await, 1);
+}
+
+// --- underpaid money (Ovi, 19 Oct) ---------------------------------------------
+
+async fn payment_review_reason(pool: &PgPool, payment_id: &str) -> Option<String> {
+    sqlx::query_scalar("SELECT review_reason FROM payments WHERE id = $1")
+        .bind(Uuid::parse_str(payment_id).expect("payment uuid"))
+        .fetch_one(pool)
+        .await
+        .expect("payment row")
+}
+
+async fn observed_amount_matched(pool: &PgPool, order_id: &str) -> Option<bool> {
+    sqlx::query_scalar(
+        "SELECT (paykit_observation->>'amount_matched')::boolean FROM orders WHERE id = $1",
+    )
+    .bind(Uuid::parse_str(order_id).expect("order uuid"))
+    .fetch_one(pool)
+    .await
+    .expect("order row")
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_underpaid_confirmed_payment_goes_to_manual_review_not_to_the_seller(pool: PgPool) {
+    let fx = fixture(pool).await;
+    fx.homeserver.put_shop_record(
+        &fx.seller.pubky,
+        shop_record(&fx.seller, json!({ "bitcoinConfirmation": "seller" })),
+    );
+    let (order_id, payment_id, reference) = upstream_bound(&fx).await;
+    fx.status.set_outcome(&reference, confirmed_short());
+    assert!(poll_now(&fx.app, &fx.status, fx.app.clock.now()).await >= 1);
+
+    let (order_state, request_state, payment_state) = states(&fx.app.pool, &order_id).await;
+    assert_eq!(payment_state, "manual_review");
+    assert_ne!(request_state, "awaiting_seller_confirmation");
+    assert_eq!(order_state, "pending_payment");
+    assert_eq!(
+        payment_review_reason(&fx.app.pool, &payment_id)
+            .await
+            .as_deref(),
+        Some("amount_mismatch")
+    );
+    assert_eq!(confirmed_events(&fx.app.pool, &payment_id).await, 0);
+    // The seller has nothing to confirm.
+    let (code, _) = confirm_call(&fx.app, &fx.seller.token, &order_id, &json!({})).await;
+    assert_ne!(code, StatusCode::OK);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_underpaid_sighting_never_enters_the_window(pool: PgPool) {
+    let fx = fixture(pool).await;
+    fx.homeserver.put_shop_record(
+        &fx.seller.pubky,
+        shop_record(&fx.seller, json!({ "bitcoinConfirmation": "seller" })),
+    );
+    let (order_id, payment_id, reference) = upstream_bound(&fx).await;
+    fx.status.set_outcome(&reference, detected_short());
+    poll_now(&fx.app, &fx.status, fx.app.clock.now()).await;
+    let (_, request_state, payment_state) = states(&fx.app.pool, &order_id).await;
+    assert_ne!(request_state, "awaiting_seller_confirmation");
+    assert_eq!(payment_state, "awaiting_entitlement");
+    assert_eq!(confirmed_events(&fx.app.pool, &payment_id).await, 0);
+
+    // The same payment topped up to the full amount then waits for the seller.
+    fx.app.clock.advance_seconds(60);
+    fx.status.set_outcome(&reference, confirmed(false));
+    poll_now(&fx.app, &fx.status, fx.app.clock.now()).await;
+    assert_eq!(
+        states(&fx.app.pool, &order_id).await.1,
+        "awaiting_seller_confirmation"
+    );
+    assert_eq!(
+        observed_amount_matched(&fx.app.pool, &order_id).await,
+        Some(true)
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_matched_sighting_is_stored_as_matched_and_a_later_short_report_cannot_be_confirmed(
+    pool: PgPool,
+) {
+    let fx = fixture(pool).await;
+    fx.homeserver.put_shop_record(
+        &fx.seller.pubky,
+        shop_record(&fx.seller, json!({ "bitcoinConfirmation": "seller" })),
+    );
+    let (order_id, payment_id, reference) = upstream_bound(&fx).await;
+    fx.status.set_outcome(&reference, detected());
+    poll_now(&fx.app, &fx.status, fx.app.clock.now()).await;
+    assert_eq!(
+        states(&fx.app.pool, &order_id).await.1,
+        "awaiting_seller_confirmation"
+    );
+    assert_eq!(
+        observed_amount_matched(&fx.app.pool, &order_id).await,
+        Some(true)
+    );
+
+    // Inside the window a later report only refreshes the facts, so the
+    // stored observation now says the amount does not match ...
+    fx.app.clock.advance_seconds(60);
+    fx.status.set_outcome(&reference, confirmed_short());
+    poll_now(&fx.app, &fx.status, fx.app.clock.now()).await;
+    assert_eq!(
+        observed_amount_matched(&fx.app.pool, &order_id).await,
+        Some(false)
+    );
+
+    // ... and the seller cannot attest it as paid.
+    let (code, body) = confirm_call(&fx.app, &fx.seller.token, &order_id, &json!({})).await;
+    assert_eq!(code, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        body["error"]["reason"],
+        json!("confirmation_observation_mismatch")
+    );
+    assert_eq!(states(&fx.app.pool, &order_id).await.0, "pending_payment");
+    assert_eq!(confirmed_events(&fx.app.pool, &payment_id).await, 0);
 }

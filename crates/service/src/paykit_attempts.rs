@@ -299,7 +299,13 @@ async fn apply_attempt_status(
                 .await
         }
         PaykitStatusOutcome::Detected { facts } => {
-            let observation = observation_json("detected", true, &facts.observation, now, false);
+            let observation = observation_json(
+                "detected",
+                facts.amount_matched.unwrap_or(true),
+                &facts.observation,
+                now,
+                false,
+            );
             let first = sqlx::query(
                 "UPDATE paykit_superseded_attempts SET detected_at = $3, observation = $4 \
                  WHERE order_id = $1 AND invoice_id = $2 AND state = 'watching' \
