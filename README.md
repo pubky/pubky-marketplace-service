@@ -330,6 +330,24 @@ and overwrite any client-sent value.
   (`offers_unavailable_for_digital`), and auctions ship only.
 - Buyers from every other country, and physical lines, are unaffected.
 
+### Seller confirmation of Bitcoin payments
+
+Legal launch plan B4, a seller option that is off unless the seller turns it
+on. A seller whose shop record says `bitcoinConfirmation: "seller"` confirms
+their own Bitcoin payments. Upstream Paykit reports every order as
+`exclusive`, so Bitcoin money seen on time would pay the order by itself.
+For an opted-in seller the service reads that report as `shared_manual`
+instead (`orders.seller_confirms_bitcoin`, frozen with the delivery periods
+when the order's payment starts): an on-time matching payment enters the
+existing `awaiting_seller_confirmation` window, Paykit's report only informs the
+seller (`bitcoin_payment_seen`), and the seller's confirmation
+(`POST /v0/orders/{id}/confirm-bitcoin-payment`) is the only way the order is
+paid. Digital and Locks items therefore wait for the seller. A late settlement
+still takes the late path, USDT is not affected, an order on the fork API keeps
+the creator's own mode, and an order whose shop record was unreadable at the
+payment start is not held (an `ALERT seller_terms_fallback_unreadable_shop_record`
+is logged).
+
 ### Listing lifecycle
 
 A seller pauses, ends or removes a listing by rewriting `state` in its record
