@@ -14,9 +14,9 @@ const PRODUCTION_ENVIRONMENT_ID = "404919ad-fb95-4621-9f45-b7f993dfa8ae";
 // of git, not of the operator's shell. The release train MUST bump each
 // constant in the same PR as the IMAGE connect for that seat.
 const STAGING_IMAGE =
-  "ghcr.io/pubky/pubky-marketplace-service@sha256:995733787becf0c792b39cc92fab5ea4cbf8aef061c51b62a6c8072700533413";
+  "ghcr.io/pubky/pubky-marketplace-service@sha256:e2e58215e3d118cbbc5dc972ff5a35c46fc1663959482588a9aa5c345f4b2e96";
 const PRODUCTION_IMAGE =
-  "ghcr.io/pubky/pubky-marketplace-service@sha256:995733787becf0c792b39cc92fab5ea4cbf8aef061c51b62a6c8072700533413";
+  "ghcr.io/pubky/pubky-marketplace-service@sha256:e2e58215e3d118cbbc5dc972ff5a35c46fc1663959482588a9aa5c345f4b2e96";
 
 const sharedDeploy = {
   healthcheckPath: "/ready",
