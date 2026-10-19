@@ -33,16 +33,23 @@ const AUCTION_HOLD_SECONDS: i64 = 30 * 60;
 
 /// Returns the lowest proxy maximum accepted for the next bid by a bidder.
 ///
-/// The visible price advances by the auction increment, while a bidder
-/// raising their own proxy ceiling only needs to exceed their previous
-/// maximum by one minor unit. This is shared with the authenticated listing
-/// projection so the UI cannot show a stale threshold.
+/// Before the first bid the visible price is the seller's starting bid, not a
+/// bid to beat, so the opening bid may equal it. Once a bid stands the visible
+/// price advances by the auction increment, while a bidder raising their own
+/// proxy ceiling only needs to exceed their previous maximum by one minor
+/// unit. This is shared with the authenticated listing projection so the UI
+/// cannot show a stale threshold.
 pub fn personal_minimum_next_bid(
     current_price_minor: i64,
     minimum_increment_minor: i64,
     bidder_previous_maximum: i64,
+    bid_count: i64,
 ) -> i64 {
-    let visible_price_minimum = current_price_minor.saturating_add(minimum_increment_minor);
+    let visible_price_minimum = if bid_count == 0 {
+        current_price_minor
+    } else {
+        current_price_minor.saturating_add(minimum_increment_minor)
+    };
     if bidder_previous_maximum == 0 {
         visible_price_minimum
     } else {
@@ -130,12 +137,13 @@ pub async fn place_bid(
         auction.current_price.amount_minor,
         auction.minimum_increment.amount_minor,
         bidder_previous_maximum,
+        auction.bid_count,
     );
     if payload.maximum_amount.amount_minor < minimum_next_bid {
         return Ok(Err(CommandFailure::refused_with_revision(
             crate::refusal_audit::RefusalKind::BidTooLow,
             ErrorCode::BidTooLow,
-            "Bid maximum must meet the current visible price increment and exceed the prior maximum.",
+            "Bid maximum must meet the minimum next bid and exceed the prior maximum.",
             listing.server_revision,
         )));
     }
@@ -697,6 +705,7 @@ fn viewer_bid_json(
         auction.current_price.amount_minor,
         auction.minimum_increment.amount_minor,
         maximum_minor,
+        auction.bid_count,
     );
     json!({
         "maximum_amount": money_json(maximum_minor, currency, exponent),

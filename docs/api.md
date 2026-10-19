@@ -360,6 +360,15 @@ request failed, so clients should branch on HTTP status first, and parse
    refused with `UPSTREAM_UNAVAILABLE` instead (see
    [Listing lifecycle](../README.md#listing-lifecycle)).
 
+   `BID_TOO_LOW` refuses an `auction.place_bid` whose maximum is under the
+   bidder's minimum next bid. While no bid stands the minimum is the starting
+   bid, so an opening bid may equal it (the visible price stays at the
+   starting bid whatever the opener's maximum). Once a bid stands it is the
+   visible price plus the minimum increment, and a bidder raising their own
+   maximum must also exceed their previous maximum by one minor unit. The
+   authenticated listing projection carries the bidder's figure as
+   `viewer_bid.minimum_next_bid`.
+
 ### Automation error codes
 
 | HTTP | `error.code` | Where |
@@ -1048,6 +1057,40 @@ for the offered variants in record order; the public availability read carries
 `[{ "variant_id", "sold_out" }]` and no quantity. The inventory projection
 (`GET /v1/inventory/listings/{aggregate_id}`) lists every row. A listing that
 sells one variant has no `variants` key anywhere.
+
+### Per-variant prices
+
+A record's enabled variant may carry its own `priceOverride`; a variant without
+one sells at the listing's `unit_price`. Migration 0075 holds the prices on the
+listing row (`listings.variant_prices`).
+
+- `listing.sync` reads each enabled variant's `priceOverride` with its `id`;
+  `listing.register` takes the same price as `payload.variants[].unit_price`
+  (money, omitted from the canonical JSON when the variant has none). The
+  price must be positive and in the listing's currency and exponent, else the
+  registration is `INVALID_STATE` (sync) or `INVALID_COMMAND` (register) with
+  `issues` naming `payload.variants.{n}.unit_price`. A record whose enabled
+  variant carries a `priceOverride` that is not money, or one with no usable id
+  to key it by, cannot be interpreted and does not register: the variant would
+  otherwise sell at a price the seller did not sign. A disabled variant's price
+  is not carried.
+- A registration carries the full set: a later registration (a new revision,
+  or an equal-revision `listing.sync` for a row that predates the column) that
+  carries none clears them.
+- `checkout.create` charges the unit price of the variant a line takes its
+  units from (`variant_id`, or the sole offered variant), read under the
+  listing row lock; the order line's `unit_price` and `subtotal` are that
+  price. A line that names no priced variant is charged the listing price.
+  Shipping is unchanged (once per line). A buyer who read the listing before a
+  reprice is refused `REVISION_CONFLICT` as for any registration, so nobody is
+  charged a price they did not see.
+- The listing projection carries `variant_prices`,
+  `[{ "variant_id", "unit_price" }]` for the variants that sell at their own
+  price, and no key when every variant sells at the listing price. A client
+  compares it with the record to tell a row that predates the column. The
+  public availability read carries no price.
+- Offers and accepted-offer checkout are unchanged: an offer prices its own
+  award.
 
 ### Made-to-order stock
 

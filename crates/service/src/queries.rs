@@ -274,6 +274,7 @@ pub async fn get_listing(
                                 auction.current_price.amount_minor,
                                 auction.minimum_increment.amount_minor,
                                 maximum_minor,
+                                auction.bid_count,
                             );
                             Some(json!({
                                 "maximum_amount": crate::model::money_json(

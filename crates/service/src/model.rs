@@ -111,6 +111,12 @@ pub struct ListingRow {
     /// the listing sells without a stock count there. Maintained by the same
     /// trigger.
     pub made_to_order: bool,
+    /// The enabled variants that sell at their own price
+    /// (`[{variant_id, unit_price}]`, migration 0075), or NULL when every
+    /// variant sells at `unit_price`. Written with the registration that
+    /// carries the record's `priceOverride`s and read, under the listing row
+    /// lock, by the checkout that charges them.
+    pub variant_prices: Option<Value>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -170,6 +176,22 @@ impl std::error::Error for ListingProjectionError {}
 impl ListingRow {
     pub fn is_deleted(&self) -> bool {
         self.deleted_at.is_some()
+    }
+
+    /// The price of one unit of `variant_id`: the variant's own price when the
+    /// registration carried one, the listing's `unit_price` otherwise (no
+    /// variant named, an unpriced one, or a listing with no variant prices).
+    pub fn unit_price_amount_minor_for(&self, variant_id: Option<&str>) -> i64 {
+        variant_id
+            .and_then(|variant_id| {
+                self.variant_prices
+                    .as_ref()?
+                    .as_array()?
+                    .iter()
+                    .find(|entry| entry["variant_id"].as_str() == Some(variant_id))
+                    .and_then(|entry| entry["unit_price"]["amount_minor"].as_i64())
+            })
+            .unwrap_or(self.unit_price_amount_minor)
     }
 
     /// Whether an offer, award, or order created at `created_at` may still
@@ -257,6 +279,9 @@ impl ListingRow {
         }
         if let Some(variants) = &self.variant_availability {
             projection["variants"] = variants.clone();
+        }
+        if let Some(prices) = &self.variant_prices {
+            projection["variant_prices"] = prices.clone();
         }
         crate::reserve_secrecy::ensure_reserve_free(&projection)
             .map_err(|_| ListingProjectionError)?;

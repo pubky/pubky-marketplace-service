@@ -216,6 +216,21 @@ pub async fn handle(
     }
     let currency = first.unit_price_currency.clone();
     let exponent = first.unit_price_exponent;
+    // What one unit of each line costs. The variant the line takes its units
+    // from sells at its own price when the registration carried one; the
+    // listing row is locked above, so the price read here is the one the
+    // `expected_revision` check just confirmed.
+    let line_unit_prices: Vec<i64> = resolved
+        .iter()
+        .enumerate()
+        .map(|(index, (line, listing))| {
+            listing.unit_price_amount_minor_for(
+                stock_variants[index]
+                    .as_deref()
+                    .or(line.variant_id.as_deref()),
+            )
+        })
+        .collect();
 
     // Group checkout lines by (seller, fulfillment), preserving line order
     // (§A2: one order per seller group per fulfillment choice; several
@@ -375,9 +390,13 @@ pub async fn handle(
                     "content_hash": listing.content_hash,
                     "title": listing.title,
                     "quantity": line.quantity,
-                    "unit_price": listing.unit_price_json(),
+                    "unit_price": money_json(
+                        line_unit_prices[index],
+                        &listing.unit_price_currency,
+                        listing.unit_price_exponent,
+                    ),
                     "subtotal": money_json(
-                        listing.unit_price_amount_minor * line.quantity,
+                        line_unit_prices[index] * line.quantity,
                         &listing.unit_price_currency,
                         listing.unit_price_exponent,
                     ),
@@ -420,8 +439,8 @@ pub async fn handle(
         let subtotal_minor: i64 = indices
             .iter()
             .map(|&index| {
-                let (line, listing) = &resolved[index];
-                listing.unit_price_amount_minor * line.quantity
+                let (line, _) = &resolved[index];
+                line_unit_prices[index] * line.quantity
             })
             .sum();
         // Shipping is the seller-signed flat rate, charged once per order

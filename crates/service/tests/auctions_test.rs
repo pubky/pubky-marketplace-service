@@ -218,14 +218,14 @@ async fn rejects_seller_low_stale_and_post_close_bids(pool: PgPool) {
     let (status, body) = execute(
         &app,
         &buyer.token,
-        &place_bid_command(&seller.pubky, 2, 4_500, 1),
+        &place_bid_command(&seller.pubky, 2, 4_499, 1),
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["error"]["code"], json!("BID_TOO_LOW"));
     assert_eq!(
         body["error"]["message"],
-        json!("Bid maximum must meet the current visible price increment and exceed the prior maximum.")
+        json!("Bid maximum must meet the minimum next bid and exceed the prior maximum.")
     );
 
     let (status, _) = execute(
@@ -262,7 +262,7 @@ async fn rejects_seller_low_stale_and_post_close_bids(pool: PgPool) {
     assert_eq!(body["error"]["code"], json!("BID_TOO_LOW"));
     assert_eq!(
         body["error"]["message"],
-        json!("Bid maximum must meet the current visible price increment and exceed the prior maximum.")
+        json!("Bid maximum must meet the minimum next bid and exceed the prior maximum.")
     );
 
     app.clock.advance_seconds(11 * 60);
@@ -289,22 +289,48 @@ async fn personal_minimum_is_the_exact_bid_acceptance_boundary(pool: PgPool) {
     )
     .await;
 
-    // First-time bidders must meet visible price plus the increment.
+    // The opening bid may equal the starting bid ($45.00) but not undercut it.
     let (status, body) = execute(
         &app,
         &buyer.token,
-        &place_bid_command(&seller.pubky, 10, 4_999, 1),
+        &place_bid_command(&seller.pubky, 10, 4_499, 1),
     )
     .await;
-    assert_eq!(status, StatusCode::CONFLICT, "below first minimum: {body}");
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "below the starting bid: {body}"
+    );
     assert_eq!(body["error"]["code"], json!("BID_TOO_LOW"));
     let (status, body) = execute(
         &app,
         &buyer.token,
-        &place_bid_command(&seller.pubky, 11, 5_000, 1),
+        &place_bid_command(&seller.pubky, 11, 4_500, 1),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "at first minimum: {body}");
+    assert_eq!(status, StatusCode::OK, "at the starting bid: {body}");
+
+    // Once a bid stands, the next bidder must clear the visible price plus the
+    // increment ($50.00).
+    let (status, body) = execute(
+        &app,
+        &other_buyer.token,
+        &place_bid_command(&seller.pubky, 12, 4_999, 2),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "below visible plus increment: {body}"
+    );
+    assert_eq!(body["error"]["code"], json!("BID_TOO_LOW"));
+    let (status, body) = execute(
+        &app,
+        &other_buyer.token,
+        &place_bid_command(&seller.pubky, 13, 7_000, 2),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "second bidder minimum: {body}");
 
     // A leader raising a private maximum only needs to exceed their old
     // maximum by one minor unit when that is higher than the visible
@@ -312,15 +338,7 @@ async fn personal_minimum_is_the_exact_bid_acceptance_boundary(pool: PgPool) {
     let (status, body) = execute(
         &app,
         &other_buyer.token,
-        &place_bid_command(&seller.pubky, 12, 7_000, 2),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "second bidder minimum: {body}");
-
-    let (status, body) = execute(
-        &app,
-        &other_buyer.token,
-        &place_bid_command(&seller.pubky, 13, 7_000, 3),
+        &place_bid_command(&seller.pubky, 14, 7_000, 3),
     )
     .await;
     assert_eq!(
@@ -332,7 +350,7 @@ async fn personal_minimum_is_the_exact_bid_acceptance_boundary(pool: PgPool) {
     let (status, body) = execute(
         &app,
         &other_buyer.token,
-        &place_bid_command(&seller.pubky, 14, 7_001, 3),
+        &place_bid_command(&seller.pubky, 15, 7_001, 3),
     )
     .await;
     assert_eq!(
@@ -341,11 +359,12 @@ async fn personal_minimum_is_the_exact_bid_acceptance_boundary(pool: PgPool) {
         "leader's previous maximum plus one is accepted: {body}"
     );
 
-    // A returning non-leader must still clear the visible price increment.
+    // A returning non-leader must still clear the visible price increment:
+    // the visible price is $50.00 (the $45.00 runner-up plus $5.00), so $55.00.
     let (status, body) = execute(
         &app,
         &buyer.token,
-        &place_bid_command(&seller.pubky, 15, 5_499, 4),
+        &place_bid_command(&seller.pubky, 16, 5_499, 4),
     )
     .await;
     assert_eq!(
@@ -357,19 +376,7 @@ async fn personal_minimum_is_the_exact_bid_acceptance_boundary(pool: PgPool) {
     let (status, body) = execute(
         &app,
         &buyer.token,
-        &place_bid_command(&seller.pubky, 16, 5_999, 4),
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::CONFLICT,
-        "non-leader below visible minimum: {body}"
-    );
-    assert_eq!(body["error"]["code"], json!("BID_TOO_LOW"));
-    let (status, body) = execute(
-        &app,
-        &buyer.token,
-        &place_bid_command(&seller.pubky, 17, 6_000, 4),
+        &place_bid_command(&seller.pubky, 17, 5_500, 4),
     )
     .await;
     assert_eq!(
@@ -377,6 +384,100 @@ async fn personal_minimum_is_the_exact_bid_acceptance_boundary(pool: PgPool) {
         StatusCode::OK,
         "non-leader at visible minimum: {body}"
     );
+}
+
+// A lone opening bid never raises the visible price: it stays at the starting
+// bid whatever the bidder's private maximum, so a bidder who opens at exactly
+// the starting bid and one who opens far above it see the same price.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_opening_bid_at_the_starting_bid_keeps_the_visible_price_at_the_start(pool: PgPool) {
+    let app = test_app(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let rival = new_actor(&app).await;
+    execute(
+        &app,
+        &seller.token,
+        &register_auction_command(&seller.pubky),
+    )
+    .await;
+
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &place_bid_command(&seller.pubky, 1, 4_500, 1),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let auction = &body["result"]["listing"]["auction"];
+    assert_eq!(auction["current_price"]["amount_minor"], json!(4_500));
+    assert_eq!(auction["leader_pubky"], json!(buyer.pubky));
+    assert_eq!(auction["bid_count"], json!(1));
+    // The opener's own projection: their next raise only has to beat the
+    // visible price plus the increment, and their own maximum by one unit.
+    assert_eq!(
+        body["result"]["listing"]["viewer_bid"]["minimum_next_bid"]["amount_minor"],
+        json!(5_000)
+    );
+
+    // A rival who matches the opening bid is outbid by it, not tied: the
+    // opener's maximum equals the starting bid, so the rival needs $50.00.
+    let (status, body) = execute(
+        &app,
+        &rival.token,
+        &place_bid_command(&seller.pubky, 2, 4_500, 2),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], json!("BID_TOO_LOW"));
+    let (status, body) = execute(
+        &app,
+        &rival.token,
+        &place_bid_command(&seller.pubky, 3, 5_000, 2),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let auction = &body["result"]["listing"]["auction"];
+    assert_eq!(auction["leader_pubky"], json!(rival.pubky));
+    assert_eq!(
+        auction["current_price"]["amount_minor"],
+        json!(5_000),
+        "the winner pays the runner-up's maximum plus one increment, capped at their own"
+    );
+}
+
+// The pure rule: no standing bid means the starting bid is the floor; with a
+// bid standing the floor is the visible price plus the increment; and a
+// bidder's own earlier maximum only ever raises the floor.
+#[test]
+fn personal_minimum_next_bid_is_the_starting_bid_until_a_bid_stands() {
+    use marketplace_service::handlers::auction::personal_minimum_next_bid as minimum;
+    for current in [1i64, 100, 4_500, i64::MAX - 1] {
+        for increment in [1i64, 5, 500] {
+            assert_eq!(minimum(current, increment, 0, 0), current, "no bids");
+            assert_eq!(
+                minimum(current, increment, 0, 1),
+                current.saturating_add(increment),
+                "one bid stands"
+            );
+            assert_eq!(
+                minimum(current, increment, 0, 7),
+                current.saturating_add(increment),
+                "several bids stand"
+            );
+            let own = current.saturating_add(increment).saturating_add(40);
+            assert_eq!(
+                minimum(current, increment, own, 3),
+                own.saturating_add(1),
+                "a raise must exceed the bidder's own maximum"
+            );
+            assert_eq!(
+                minimum(current, increment, 1, 3),
+                current.saturating_add(increment),
+                "a small own maximum leaves the visible floor in charge"
+            );
+        }
+    }
 }
 
 // The prototype rejects bids on non-auction listings as INVALID_STATE.

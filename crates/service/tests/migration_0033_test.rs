@@ -89,7 +89,7 @@ async fn migration_0032_applies_after_already_applied_0033(pool: PgPool) {
     assert_eq!(
         finally_applied,
         (1..=61)
-            .chain([62, 63, 64, 65, 66, 67, 70, 71, 72, 73, 74])
+            .chain([62, 63, 64, 65, 66, 67, 70, 71, 72, 73, 74, 75])
             .collect::<Vec<_>>()
     );
 }
