@@ -186,6 +186,10 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/listings/{aggregate_id}/bids",
             get(queries::list_listing_bids),
         )
+        .route(
+            "/v1/sellers/{seller_pubky}/annual-limit",
+            get(crate::region_fence::get_annual_limit),
+        )
         .route("/v1/drops/{aggregate_id}", get(queries::get_drop))
         .route(
             "/v1/drops/{aggregate_id}/me",

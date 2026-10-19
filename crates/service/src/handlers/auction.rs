@@ -160,7 +160,8 @@ pub async fn place_bid(
     };
     sqlx::query(
         "INSERT INTO bids (id, listing_aggregate_id, bidder_pubky, maximum_amount_minor, \
-         currency, exponent, sequence, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+         currency, exponent, sequence, created_at, buyer_country) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
     )
     .bind(bid.id)
     .bind(&bid.listing_aggregate_id)
@@ -170,6 +171,7 @@ pub async fn place_bid(
     .bind(bid.exponent)
     .bind(bid.sequence)
     .bind(bid.created_at)
+    .bind(&payload.buyer_country)
     .execute(&mut **tx)
     .await?;
 
@@ -521,9 +523,12 @@ pub async fn close_locked_auction(
             "INSERT INTO orders (id, auction_aggregate_id, buyer_pubky, seller_pubky, revision, \
              state, lines, delivery_address, subtotal_minor, shipping_minor, \
              total_minor, currency, exponent, payment_id, \
-             fulfillment, hold_expires_at, created_at, updated_at) \
+             fulfillment, hold_expires_at, created_at, updated_at, buyer_country) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, $8, $9, $10, $11, $12, $13, 'shipping', \
-             $15, $14, $14)",
+             $15, $14, $14, \
+             (SELECT buyer_country FROM bids WHERE listing_aggregate_id = $2 \
+              AND bidder_pubky = $3 AND buyer_country IS NOT NULL \
+              ORDER BY sequence DESC LIMIT 1))",
         )
         .bind(order.id)
         .bind(&listing.aggregate_id)

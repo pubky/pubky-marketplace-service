@@ -182,6 +182,7 @@ Railway IaC `preserve()`):
 | `PAYPAL_IPN_VERIFY_URL` | `https://ipnpb.paypal.com/cgi-bin/webscr` | PayPal's IPN validation endpoint; tests point it at a local double |
 | `PAYPAL_CHECKOUT_URL` | `https://www.paypal.com/cgi-bin/webscr` | PayPal `_xclick` checkout base. HTTPS only; host must be `www.paypal.com` (live) or `www.sandbox.paypal.com`. Default stays live. |
 | `REQUIRE_ENCRYPTED_DELIVERY_ADDRESS` | `false` | `true`/`1` refuses a checkout or award checkout that carries a plaintext `delivery_address` (422 `INVALID_COMMAND`, reason `encrypted_delivery_required`); only sealed envelopes are accepted. Leave unset until the Shop version that seals is the deployed one (see [Sealed delivery address](#sealed-delivery-address)) |
+| `EU_FENCE_ENABLED` | `false` | `true`/`1` turns on the EU scope fence (legal launch plan C2-C4): `buyer_country` becomes required on the selling commands, a buyer in the EU-27 buys only from sellers whose shop record says `sellerStatus: "private"`, and sellers whose shop country is in the EU-27 stop at 29 sales or EUR 2,000 a calendar year. Off, `buyer_country` is accepted and stored and nothing is refused on these grounds. See [EU scope fence](#eu-scope-fence) |
 | `ADDRESS_SEARCH_UPSTREAM_URL` | `https://photon.komoot.io` | Photon geocoder behind `POST /v0/address/suggest`. HTTPS only (http for loopback in tests). Point it at a self-hosted Photon to stop using the public instance |
 | `ADDRESS_SEARCH_DISABLED` | unset | `1`/`true` turns the address proxy off; the route answers `address_search_unavailable` |
 | `ADDRESS_SEARCH_CLIENT_IP_HEADER` | unset | name of a header set by a trusted edge that carries the client address (last value is used); unset keys the per-client limit on the socket peer |
@@ -242,6 +243,51 @@ answers are cached (5 minutes, per listing); a "clear" answer is never cached,
 so a moderation placed meanwhile is seen on the next command and lifting one
 takes effect once the cached answer expires. Orders created before a listing
 was moderated are not cancelled by this check.
+
+### EU scope fence
+
+Legal launch plan C1-C4, behind `EU_FENCE_ENABLED` (default off). The seller
+declares who they are in their own shop record (`sellerStatus`: `private` or
+`trader`; absent or anything else is undeclared and counts as a business) and
+their shop country (`location.countryCode`); the buyer's client sends the
+buyer's country in clear text as `payload.buyer_country` on `checkout.create`,
+`offer.create`, `offer.checkout` and `auction.place_bid`. The service stores it
+(`orders`, `offers` and `bids` have `buyer_country`; an auction's order takes
+the winning bidder's latest country) and freezes the seller's declared status
+and country on the order with the delivery periods (`orders.seller_status`,
+`orders.seller_country`). Those two things happen with the flag off too.
+
+With the flag on:
+
+- **Regional gate.** A buyer in the EU-27 buys only from a seller who declared
+  `private`: `SELLER_UNAVAILABLE_IN_REGION` (409) with `reason`
+  `business_seller` or `undeclared_seller`. Every other buyer country is
+  unaffected.
+- **Annual limit.** A seller whose shop country is in the EU-27 can have at
+  most 29 sales and EUR 2,000 of orders per calendar year (UTC), counting paid
+  orders (a confirmed payment, even if the order was later cancelled or
+  refunded) and open orders (`pending_payment`) together: past it,
+  `SELLER_ANNUAL_LIMIT_REACHED` (409). Order totals convert to euro with the
+  persisted reference rates (`fx_rate_samples` medians), per currency,
+  rounding up; with no reference the order is refused as `UPSTREAM_UNAVAILABLE`
+  rather than waved through. Counting happens in the order's own transaction
+  under a per-seller advisory lock taken before any listing lock
+  ([lock order](docs/lock-order.md)), so concurrent checkouts cannot both take
+  the last slot. An offer or a bid on a seller already at the limit is refused
+  up front; an auction's winning order is counted but never refused, since
+  the bidder already won.
+- **Re-confirmation.** A private seller of any country who reaches the same
+  numbers in sales to EU buyers is refused further EU sales
+  (`SELLER_UNAVAILABLE_IN_REGION`, `reason`
+  `private_seller_reconfirmation_required`) until their shop record carries a
+  `sellerStatusConfirmedAt` (RFC 3339, not in the future) later than those
+  sales; the count restarts at the confirmation.
+- A seller's shop record is read before the command's transaction, like the
+  lifecycle gate, and fails closed: an unreadable record is
+  `UPSTREAM_UNAVAILABLE` (`HOMESERVER_URL` is already required to boot).
+
+The Shop reads `GET /v1/sellers/{seller_pubky}/annual-limit` (see
+`docs/api.md`) for the seller's counters.
 
 ### Listing lifecycle
 

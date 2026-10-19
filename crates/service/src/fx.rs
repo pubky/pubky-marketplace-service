@@ -425,6 +425,42 @@ pub fn usd_cents_for(
     u64::try_from(cents).map_err(|_| FxError::Overflow)
 }
 
+/// Euro cents of an order total, from the persisted reference medians alone
+/// (no feed fetch), rounding up: `ceil(total_minor * 100 * BTCEUR /
+/// (10^exponent * BTC<CCY>))`, the arithmetic of [`usd_cents_for`] with the
+/// euro ticker on top. A euro total is already in euro cents; a Bitcoin
+/// total is converted with the euro ticker alone, one bitcoin being 1 and one
+/// satoshi 10^-8 of it. Used by the EU annual-limit guard, which compares
+/// an amount against a threshold and has no payment to quote.
+pub async fn eur_cents_reference(
+    conn: &mut sqlx::PgConnection,
+    currency: Currency,
+    exponent: i32,
+    total_minor: i64,
+    now: DateTime<Utc>,
+) -> Result<u64, FxError> {
+    let total = u64::try_from(total_minor).map_err(|_| FxError::Overflow)?;
+    if total == 0 {
+        return Ok(0);
+    }
+    if currency == Currency::Eur {
+        return Ok(total);
+    }
+    let eur_rate = reference_median(&mut *conn, Currency::Eur, now).await?;
+    let currency_rate = match currency {
+        Currency::Btc => Decimal {
+            mantissa: 1,
+            scale: 0,
+        },
+        Currency::Sat => Decimal {
+            mantissa: 100_000_000,
+            scale: 0,
+        },
+        fiat => reference_median(&mut *conn, fiat, now).await?,
+    };
+    usd_cents_for(total_minor, exponent, &eur_rate, &currency_rate)
+}
+
 /// The persisted reference of one currency: the median of the samples the
 /// sampler accepted inside [`REFERENCE_WINDOW_SECS`], or `MissingReference`
 /// below [`REFERENCE_MIN_SAMPLES`].

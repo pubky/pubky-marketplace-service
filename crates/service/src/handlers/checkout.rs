@@ -25,6 +25,9 @@ pub struct CheckoutContext<'a> {
     /// Refuse a checkout that carries a plaintext delivery address
     /// (`REQUIRE_ENCRYPTED_DELIVERY_ADDRESS`).
     pub require_encrypted_delivery: bool,
+    /// What the EU scope fence read for this command (legal launch plan
+    /// C3, C4); off unless `EU_FENCE_ENABLED`.
+    pub fence: &'a crate::region_fence::FencePlan,
 }
 
 pub async fn handle(
@@ -46,6 +49,10 @@ pub async fn handle(
             "Checkout aggregate identity or revision is invalid.",
         )));
     }
+
+    // The EU fence's per-seller counter locks come before every other lock
+    // of this transaction (`docs/lock-order.md`).
+    crate::region_fence::lock_sellers(tx, context.fence).await?;
 
     // Peek listings without FOR UPDATE so a bound drop can lock first
     // (drop-then-listing, the order every gating and release path shares).
@@ -460,6 +467,21 @@ pub async fn handle(
         let order_id = Uuid::new_v4();
         let payment_id = Uuid::new_v4();
         let seller_has_rail = crate::queries::seller_has_rail(tx, seller_pubky).await?;
+        if let Err(failure) = crate::region_fence::check_new_order(
+            tx,
+            context.fence,
+            seller_pubky,
+            crate::region_fence::NewOrder {
+                total_minor,
+                currency: &currency,
+                exponent,
+            },
+            now,
+        )
+        .await
+        {
+            return Ok(Err(failure));
+        }
 
         // Drop-bound checkout keeps lock-at-claim. Ordinary checkout does
         // not hold: bind is the first acquire.
@@ -506,9 +528,10 @@ pub async fn handle(
              seller_pubky, revision, state, lines, delivery_address, subtotal_minor, \
              shipping_minor, total_minor, currency, exponent, \
              payment_id, stock_held, hold_expires_at, hold_source, \
-             fulfillment, created_at, updated_at, delivery_address_envelope, delivery_key_id) \
+             fulfillment, created_at, updated_at, delivery_address_envelope, delivery_key_id, \
+             buyer_country) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, \
-             $18, $19, $20, $20, $21, $22)",
+             $18, $19, $20, $20, $21, $22, $23)",
         )
         .bind(order.id)
         .bind(command.command_id)
@@ -536,6 +559,7 @@ pub async fn handle(
         .bind(now)
         .bind(sealed.map(|stored| stored.bytes.as_slice()))
         .bind(sealed.map(|stored| stored.key_id.as_str()))
+        .bind(&payload.buyer_country)
         .execute(&mut **tx)
         .await?;
         if let Some(share) = connector_shares.get(seller_pubky).filter(|_| !unshipped) {

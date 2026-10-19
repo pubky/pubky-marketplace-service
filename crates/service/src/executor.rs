@@ -130,6 +130,49 @@ pub async fn execute(
         }
     }
 
+    // The EU scope fence (legal launch plan C2-C4), when `EU_FENCE_ENABLED`
+    // is on: a command that sells needs the buyer's country, and a buyer in
+    // the EU-27 buys only from a declared private seller. The sellers' shop
+    // records are read here for the same reason as above. A replay is
+    // answered from its stored result.
+    let mut fence = crate::region_fence::FencePlan::off();
+    if state.config.eu_fence_enabled
+        && crate::region_fence::buyer_country_of(&command.payload).is_some()
+        && stored_command_result(&state.pool, actor, command.command_id)
+            .await?
+            .is_none()
+    {
+        let listings =
+            crate::listing_moderation::listings_a_command_sells(&state.pool, actor, &command)
+                .await?;
+        match crate::region_fence::gate(state, &command, &listings).await {
+            Ok(plan) => fence = plan,
+            Err(failure) => {
+                log_command(
+                    actor,
+                    command.kind(),
+                    &command.command_id.to_string(),
+                    &command.aggregate_id,
+                    "refused",
+                    Some(failure.code()),
+                    Some(failure.message()),
+                    command.expected_revision,
+                    started.elapsed().as_millis() as u64,
+                );
+                enqueue_refusal(
+                    state,
+                    actor,
+                    state.clock.now(),
+                    SurfaceKind::V1Command,
+                    command_kind(&command.payload),
+                    failure.refusal_kind(),
+                    Some(command.command_id),
+                );
+                return Ok(failure_response(&failure));
+            }
+        }
+    }
+
     // A `listing.register` that needs the seller's public record reads it
     // here, before the transaction and the command's advisory lock, so a slow
     // homeserver never holds a domain connection or blocks a duplicate. It
@@ -198,7 +241,7 @@ pub async fn execute(
     }
 
     let now = state.clock.now();
-    let outcome = dispatch(state, &mut tx, actor, &command, &prefetched, now).await;
+    let outcome = dispatch(state, &mut tx, actor, &command, &prefetched, &fence, now).await;
     match outcome {
         Ok(Ok(success)) => {
             let body = success_body(&command, &success);
@@ -539,6 +582,7 @@ async fn dispatch(
     actor: &str,
     command: &Command,
     prefetched: &crate::handlers::register_listing::RegisterRecordPrefetch,
+    fence: &crate::region_fence::FencePlan,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     match &command.payload {
@@ -588,6 +632,7 @@ async fn dispatch(
                     drop_claim_seconds: state.config.drop_claim_window_seconds,
                     digital: state.digital.as_deref(),
                     require_encrypted_delivery: state.config.require_encrypted_delivery_address,
+                    fence,
                 },
                 now,
             )
@@ -640,6 +685,7 @@ async fn dispatch(
                 state.clock.as_ref(),
                 hold_window_seconds,
                 state.config.require_encrypted_delivery_address,
+                fence,
             )
             .await
         }

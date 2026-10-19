@@ -688,6 +688,13 @@ pub struct CreateCheckoutPayload {
     /// email-kind; the handler refuses it otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery_email: Option<DeliveryEmail>,
+    /// The buyer's country (ISO 3166-1 alpha-2, uppercase), sent in clear
+    /// text beside the sealed address so the service can enforce the EU
+    /// scope fence without opening it. Optional on the wire: clients that
+    /// predate the field omit it, and the service requires it only while
+    /// `EU_FENCE_ENABLED` is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buyer_country: Option<String>,
     /// Retired field. A client that still sends it must send `1`; it is
     /// accepted for compatibility and otherwise ignored: the service neither
     /// stores nor projects it. Do not read it.
@@ -770,6 +777,13 @@ pub struct OfferTermsPayload {
     pub quantity: i64,
     pub expires_in_seconds: i64,
     pub message: String,
+    /// The buyer's country (ISO 3166-1 alpha-2, uppercase), sent in clear
+    /// text beside the sealed address so the service can enforce the EU
+    /// scope fence without opening it. Optional on the wire: clients that
+    /// predate the field omit it, and the service requires it only while
+    /// `EU_FENCE_ENABLED` is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buyer_country: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -812,6 +826,13 @@ pub struct OfferCheckoutPayload {
     /// listing publishes and never silently rewrites it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fulfillment: Option<FulfillmentMethod>,
+    /// The buyer's country (ISO 3166-1 alpha-2, uppercase), sent in clear
+    /// text beside the sealed address so the service can enforce the EU
+    /// scope fence without opening it. Optional on the wire: clients that
+    /// predate the field omit it, and the service requires it only while
+    /// `EU_FENCE_ENABLED` is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buyer_country: Option<String>,
     /// Legacy field; see [`CreateCheckoutPayload::guarantee_policy_version`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guarantee_policy_version: Option<u32>,
@@ -821,6 +842,13 @@ pub struct OfferCheckoutPayload {
 #[serde(deny_unknown_fields)]
 pub struct PlaceBidPayload {
     pub maximum_amount: Money,
+    /// The buyer's country (ISO 3166-1 alpha-2, uppercase), sent in clear
+    /// text beside the sealed address so the service can enforce the EU
+    /// scope fence without opening it. Optional on the wire: clients that
+    /// predate the field omit it, and the service requires it only while
+    /// `EU_FENCE_ENABLED` is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub buyer_country: Option<String>,
 }
 
 /// `auction.close` carries an empty payload; unknown fields are rejected.
@@ -1931,6 +1959,18 @@ fn validate_offer_terms(
     validate_trimmed("payload.message", message, 0, 500, issues);
 }
 
+/// Shape check for the optional `payload.buyer_country`.
+fn validate_buyer_country(country: &Option<String>, issues: &mut Vec<ValidationIssue>) {
+    if let Some(country) = country {
+        if !country_code_regex().is_match(country) {
+            issues.push(issue(
+                "payload.buyer_country",
+                "Expected an ISO 3166-1 alpha-2 country code",
+            ));
+        }
+    }
+}
+
 fn validate_create_offer(
     mut payload: OfferTermsPayload,
 ) -> Result<CommandPayload, Vec<ValidationIssue>> {
@@ -1942,6 +1982,7 @@ fn validate_create_offer(
         &mut payload.message,
         &mut issues,
     );
+    validate_buyer_country(&payload.buyer_country, &mut issues);
     if issues.is_empty() {
         Ok(CommandPayload::CreateOffer(payload))
     } else {
@@ -2049,6 +2090,7 @@ fn validate_offer_checkout(
             "Expected guarantee policy version 1 when present",
         ));
     }
+    validate_buyer_country(&payload.buyer_country, &mut issues);
     if issues.is_empty() {
         Ok(CommandPayload::OfferCheckout(payload))
     } else {
@@ -2063,6 +2105,7 @@ fn validate_place_bid(payload: PlaceBidPayload) -> Result<CommandPayload, Vec<Va
         &payload.maximum_amount,
         &mut issues,
     );
+    validate_buyer_country(&payload.buyer_country, &mut issues);
     if issues.is_empty() {
         Ok(CommandPayload::PlaceBid(payload))
     } else {
@@ -2839,6 +2882,7 @@ fn validate_create_checkout(
             "Expected guarantee policy version 1 when present",
         ));
     }
+    validate_buyer_country(&payload.buyer_country, &mut issues);
 
     if issues.is_empty() {
         Ok(CommandPayload::CreateCheckout(payload))
@@ -4877,5 +4921,43 @@ mod tests {
             decode_delivery_envelope(&format!("{}x", &ones[..2794])),
             None
         );
+    }
+
+    #[test]
+    fn buyer_country_is_optional_and_must_be_an_uppercase_alpha2_code() {
+        let mut bid = offer_command_json();
+        bid["kind"] = json!("auction.place_bid");
+        bid["payload"] = json!({
+            "maximum_amount": { "amount_minor": 10_000, "currency": "USD", "exponent": 2 },
+        });
+        let mut commands = vec![
+            checkout_command_json(),
+            offer_command_json(),
+            sealed_offer_checkout_json(),
+            bid,
+        ];
+        for raw in &mut commands {
+            parse_command(raw).expect("parses without a buyer country");
+            raw["payload"]["buyer_country"] = json!("DE");
+            let command = parse_command(raw).expect("parses with a buyer country");
+            let payload = command.canonical_json();
+            assert_eq!(payload["payload"]["buyer_country"], json!("DE"));
+            for bad in ["de", "DEU", "D", "1A", ""] {
+                raw["payload"]["buyer_country"] = json!(bad);
+                let issues = parse_command(raw).expect_err("malformed country");
+                assert!(
+                    issues.iter().any(|i| i.path == "payload.buyer_country"),
+                    "{bad}: {issues:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_command_without_a_buyer_country_hashes_as_before() {
+        let command = parse_command(&checkout_command_json()).expect("checkout");
+        assert!(command.canonical_json()["payload"]
+            .get("buyer_country")
+            .is_none());
     }
 }

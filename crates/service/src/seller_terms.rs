@@ -9,11 +9,18 @@
 //! later change to the record never moves an open order's clock. A period
 //! the seller left unset stays NULL on the order and the sweeps apply the
 //! configured `DELIVERY_ASSUME_DAYS` / `AUTO_COMPLETE_DAYS` default.
+//!
+//! The same read freezes the seller's own declaration on the order (legal
+//! launch plan C1): `sellerStatus` ("private" or "trader"; "undeclared" for a
+//! record without a usable declaration) and `location.countryCode`. They are
+//! stored for the audit trail and read by nothing that sells.
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
+
+use marketplace_domain::region::{shop_country_from_record, SellerStatus};
 
 use crate::homeserver::{HomeserverFetchOutcome, HomeserverListingClient};
 
@@ -44,6 +51,33 @@ impl SellerDeliveryTerms {
         Self {
             delivery_assume_days: bounded_days(record, DELIVERY_ASSUME_FIELD),
             auto_complete_days: bounded_days(record, AUTO_COMPLETE_FIELD),
+        }
+    }
+}
+
+/// What the seller's shop record declared about who they are, frozen on the
+/// order with the periods. `None` fields mean the record could not be read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SellerDeclaration {
+    pub status: Option<SellerStatus>,
+    pub country: Option<String>,
+}
+
+impl SellerDeclaration {
+    /// A shop record read: the status the seller declared (undeclared when
+    /// absent) and their shop country when it is a valid code.
+    pub fn from_shop_record(record: &Value) -> Self {
+        Self {
+            status: Some(SellerStatus::from_shop_record(record)),
+            country: shop_country_from_record(record),
+        }
+    }
+
+    /// A seller with no shop record at all declared nothing.
+    pub fn undeclared() -> Self {
+        Self {
+            status: Some(SellerStatus::Undeclared),
+            country: None,
         }
     }
 }
@@ -84,11 +118,17 @@ pub async fn capture_for_order(
     if already_captured {
         return Ok(());
     }
-    let terms = match homeserver {
-        None => SellerDeliveryTerms::default(),
+    let (terms, declaration) = match homeserver {
+        None => (SellerDeliveryTerms::default(), SellerDeclaration::default()),
         Some(homeserver) => match homeserver.fetch_shop(seller_pubky).await {
-            HomeserverFetchOutcome::Found(record) => SellerDeliveryTerms::from_shop_record(&record),
-            HomeserverFetchOutcome::NotFound => SellerDeliveryTerms::default(),
+            HomeserverFetchOutcome::Found(record) => (
+                SellerDeliveryTerms::from_shop_record(&record),
+                SellerDeclaration::from_shop_record(&record),
+            ),
+            HomeserverFetchOutcome::NotFound => (
+                SellerDeliveryTerms::default(),
+                SellerDeclaration::undeclared(),
+            ),
             HomeserverFetchOutcome::Unavailable => {
                 tracing::error!(
                     seller_pubky = %seller_pubky,
@@ -97,19 +137,21 @@ pub async fn capture_for_order(
                      unreadable at payment start; order frozen with the configured default \
                      delivery periods (seller_pubky={seller_pubky} order_id={order_id})"
                 );
-                SellerDeliveryTerms::default()
+                (SellerDeliveryTerms::default(), SellerDeclaration::default())
             }
         },
     };
     sqlx::query(
         "UPDATE orders SET delivery_assume_days = $2, auto_complete_days = $3, \
-         delivery_terms_captured_at = $4 \
+         delivery_terms_captured_at = $4, seller_status = $5, seller_country = $6 \
          WHERE id = $1 AND delivery_terms_captured_at IS NULL",
     )
     .bind(order_id)
     .bind(terms.delivery_assume_days)
     .bind(terms.auto_complete_days)
     .bind(now)
+    .bind(declaration.status.map(SellerStatus::as_str))
+    .bind(declaration.country)
     .execute(&mut **tx)
     .await?;
     Ok(())

@@ -121,6 +121,7 @@ and write. "Automation" means the inventory capability plus the
 | GET | `/v1/listings/{aggregate_id}/bids` |
 | GET | `/v1/listings/{aggregate_id}/pickup-details` |
 | GET | `/v1/listings/{aggregate_id}/digital-delivery` |
+| GET | `/v1/sellers/{seller_pubky}/annual-limit` |
 | GET | `/v1/drops/{aggregate_id}` |
 | GET | `/v1/drops/{aggregate_id}/me` |
 | GET | `/v1/offers` |
@@ -336,6 +337,7 @@ request failed, so clients should branch on HTTP status first, and parse
    | `REVISION_CONFLICT`, `IDEMPOTENCY_CONFLICT`, `INSUFFICIENT_INVENTORY`, `INVARIANT_VIOLATION`, `OFFER_EXPIRED`, `INVALID_STATE`, `AUCTION_CLOSED`, `BID_TOO_LOW`, `SELLER_REGISTRATION_REQUIRED` | 409 |
    | `AWARD_EXPIRED`, `AWARD_ALREADY_CONVERTED`, `AWARD_QUANTITY_MISMATCH`, `AWARD_VARIANT_MISMATCH`, `AWARD_LISTING_CHANGED`, `AWARD_HOLD_MISSING` | 409 |
    | `LISTING_MODERATED`, `LISTING_NOT_ACTIVE` | 409 |
+   | `SELLER_UNAVAILABLE_IN_REGION`, `SELLER_ANNUAL_LIMIT_REACHED` | 409 |
    | `UPSTREAM_UNAVAILABLE` | 503 (retriable) |
 
    A command error may also carry `issues` and `reason` fields.
@@ -368,6 +370,28 @@ request failed, so clients should branch on HTTP status first, and parse
    maximum must also exceed their previous maximum by one minor unit. The
    authenticated listing projection carries the bidder's figure as
    `viewer_bid.minimum_next_bid`.
+
+   `SELLER_UNAVAILABLE_IN_REGION` and `SELLER_ANNUAL_LIMIT_REACHED` exist only
+   while `EU_FENCE_ENABLED` is on (see [EU scope fence](../README.md#eu-scope-fence)).
+   With it on, `checkout.create`, `offer.create`, `offer.checkout` and
+   `auction.place_bid` must carry `payload.buyer_country` (ISO 3166-1 alpha-2,
+   uppercase; 422 `INVALID_COMMAND` with an issue at `payload.buyer_country`
+   without it). `SELLER_UNAVAILABLE_IN_REGION` has `reason` `business_seller`
+   or `undeclared_seller` (the buyer is in the EU-27 and the seller's shop
+   record does not declare `sellerStatus: "private"`), or
+   `private_seller_reconfirmation_required` (a private seller reached 29 sales
+   or EUR 2,000 to EU buyers since their `sellerStatusConfirmedAt`).
+   `SELLER_ANNUAL_LIMIT_REACHED` has `reason` `annual_sales_limit` or
+   `annual_amount_limit` (a seller whose shop country is in the EU-27 reached
+   29 paid or open orders, or EUR 2,000, this calendar year, UTC). A shop
+   record the service cannot read is refused with `UPSTREAM_UNAVAILABLE`.
+
+   `GET /v1/sellers/{seller_pubky}/annual-limit` answers `{"enabled": false}`
+   with the fence off. On, it answers `enabled`, `year` and `limit_reached` to
+   any signed-in actor, and to the seller themself also `resident_in_eu`,
+   `sales_limit`, `eur_limit_cents`, `sales`, `eur_cents` (EU-resident sellers),
+   and `eu_buyer_sales`, `eu_buyer_eur_cents` and `reconfirmation_required`
+   (private sellers).
 
 ### Automation error codes
 

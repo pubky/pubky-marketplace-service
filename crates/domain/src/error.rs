@@ -34,6 +34,15 @@ pub enum ErrorCode {
     /// removed): it cannot be bought, bid on or offered on. `error.reason`
     /// names the state.
     ListingNotActive,
+    /// The seller does not sell to the buyer's region: a business or
+    /// undeclared seller with a buyer in the EU-27, or a private seller who
+    /// must re-confirm their status first. `error.reason` names which.
+    /// Only returned while `EU_FENCE_ENABLED` is on.
+    SellerUnavailableInRegion,
+    /// The seller reached the annual sales limit for sellers resident in the
+    /// EU (29 paid sales or EUR 2,000 of paid orders per calendar year). Only
+    /// returned while `EU_FENCE_ENABLED` is on.
+    SellerAnnualLimitReached,
 }
 
 impl ErrorCode {
@@ -60,7 +69,9 @@ impl ErrorCode {
             | ErrorCode::AwardListingChanged
             | ErrorCode::AwardHoldMissing
             | ErrorCode::ListingModerated
-            | ErrorCode::ListingNotActive => 409,
+            | ErrorCode::ListingNotActive
+            | ErrorCode::SellerUnavailableInRegion
+            | ErrorCode::SellerAnnualLimitReached => 409,
             ErrorCode::UpstreamUnavailable => 503,
         }
     }

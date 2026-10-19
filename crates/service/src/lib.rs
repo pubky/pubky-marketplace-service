@@ -49,6 +49,7 @@ pub mod queries;
 pub mod refund_destination;
 pub mod refusal_audit;
 pub mod refusal_audit_admin;
+pub mod region_fence;
 pub mod reserve_secrecy;
 pub mod resolve_delivery;
 pub mod result;

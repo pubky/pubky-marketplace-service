@@ -14,6 +14,7 @@ pub mod ids;
 pub mod money;
 pub mod postal;
 pub mod pubky;
+pub mod region;
 pub mod state_machines;
 
 pub use commands::{Command, CommandPayload, ValidationIssue, COMMERCE_CONTRACT_VERSION};

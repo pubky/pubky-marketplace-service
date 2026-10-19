@@ -170,6 +170,15 @@ pub struct Config {
     /// false). Off until the Shop release that seals addresses is deployed;
     /// then on, so no client can send the service a readable address.
     pub require_encrypted_delivery_address: bool,
+    /// Enforce the EU scope fence (`EU_FENCE_ENABLED`, default false; legal
+    /// launch plan C2-C4). On, the service refuses a business or undeclared
+    /// seller's sale to a buyer in the EU-27 (`SELLER_UNAVAILABLE_IN_REGION`),
+    /// refuses a sale by an EU-resident seller past 29 paid sales or EUR 2,000
+    /// in a calendar year (`SELLER_ANNUAL_LIMIT_REACHED`), and requires
+    /// `buyer_country` on `checkout.create`, `offer.create`, `offer.checkout`
+    /// and `auction.place_bid`. Off, the service accepts and records
+    /// `buyer_country` but refuses nothing on these grounds.
+    pub eu_fence_enabled: bool,
     /// Days a cancelled-after-payment order's pinned pickup snapshot is
     /// retained as the dispute exhibit when no refund evidence ever lands,
     /// before the ordinary terminal-order purge takes it
@@ -360,6 +369,7 @@ impl Config {
         let sandbox_payments_enabled = env_bool("SANDBOX_PAYMENTS_ENABLED", false)?;
         let require_encrypted_delivery_address =
             env_bool("REQUIRE_ENCRYPTED_DELIVERY_ADDRESS", false)?;
+        let eu_fence_enabled = env_bool("EU_FENCE_ENABLED", false)?;
         let pickup_dispute_retention_days = env_days("PICKUP_DISPUTE_RETENTION_DAYS", 30)?;
         let buyer_email_retention_days = env_days("BUYER_EMAIL_RETENTION_DAYS", 30)?;
         let buyer_email_unpaid_retention_days = env_days("BUYER_EMAIL_UNPAID_RETENTION_DAYS", 7)?;
@@ -436,6 +446,7 @@ impl Config {
             public_service_origin,
             sandbox_payments_enabled,
             require_encrypted_delivery_address,
+            eu_fence_enabled,
             pickup_dispute_retention_days,
             digital_delivery_max_bytes,
             buyer_email_retention_days,
@@ -502,6 +513,7 @@ impl Config {
             public_service_origin: Some("https://svc.test".to_string()),
             sandbox_payments_enabled: true,
             require_encrypted_delivery_address: false,
+            eu_fence_enabled: false,
             pickup_dispute_retention_days: 30,
             digital_delivery_max_bytes: DEFAULT_DIGITAL_DELIVERY_MAX_BYTES,
             buyer_email_retention_days: 30,
