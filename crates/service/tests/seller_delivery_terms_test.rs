@@ -669,8 +669,6 @@ async fn declaration_row(pool: &PgPool, order_id: &str) -> (Option<String>, Opti
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn the_sellers_declaration_freezes_on_the_order_with_the_periods(pool: PgPool) {
     let (app, homeserver) = test_app_with_shop_homeserver(pool).await;
-    let buyer = new_actor(&app).await;
-
     let private = new_actor(&app).await;
     homeserver.put_shop_record(
         &private.pubky,
@@ -679,6 +677,7 @@ async fn the_sellers_declaration_freezes_on_the_order_with_the_periods(pool: PgP
             json!({ "sellerStatus": "private", "location": { "countryCode": "CH" } }),
         ),
     );
+    let buyer = new_actor(&app).await;
     let order_id = paid_order(&app, &private, &buyer).await;
     assert_eq!(
         declaration_row(&app.pool, &order_id).await,
@@ -693,6 +692,7 @@ async fn the_sellers_declaration_freezes_on_the_order_with_the_periods(pool: PgP
             json!({ "sellerStatus": "trader", "location": { "countryCode": "US" } }),
         ),
     );
+    let buyer = new_actor(&app).await;
     let order_id = paid_order(&app, &trader, &buyer).await;
     assert_eq!(
         declaration_row(&app.pool, &order_id).await,
@@ -701,6 +701,7 @@ async fn the_sellers_declaration_freezes_on_the_order_with_the_periods(pool: PgP
 
     let undeclared = new_actor(&app).await;
     homeserver.put_shop_record(&undeclared.pubky, shop_record(&undeclared, json!({})));
+    let buyer = new_actor(&app).await;
     let order_id = paid_order(&app, &undeclared, &buyer).await;
     assert_eq!(
         declaration_row(&app.pool, &order_id).await,
@@ -708,6 +709,7 @@ async fn the_sellers_declaration_freezes_on_the_order_with_the_periods(pool: PgP
     );
 
     let no_shop = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
     let order_id = paid_order(&app, &no_shop, &buyer).await;
     assert_eq!(
         declaration_row(&app.pool, &order_id).await,
