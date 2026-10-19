@@ -183,7 +183,8 @@ Railway IaC `preserve()`):
 | `PAYPAL_CHECKOUT_URL` | `https://www.paypal.com/cgi-bin/webscr` | PayPal `_xclick` checkout base. HTTPS only; host must be `www.paypal.com` (live) or `www.sandbox.paypal.com`. Default stays live. |
 | `REQUIRE_ENCRYPTED_DELIVERY_ADDRESS` | `false` | `true`/`1` refuses a checkout or award checkout that carries a plaintext `delivery_address` (422 `INVALID_COMMAND`, reason `encrypted_delivery_required`); only sealed envelopes are accepted. Leave unset until the Shop version that seals is the deployed one (see [Sealed delivery address](#sealed-delivery-address)) |
 | `EU_FENCE_ENABLED` | `false` | `true`/`1` turns on the EU scope fence (legal launch plan C2-C4): `buyer_country` becomes required on the selling commands, a buyer in the EU-27 buys only from sellers whose shop record says `sellerStatus: "private"`, and sellers whose shop country is in the EU-27 stop at 29 sales or EUR 2,000 a calendar year. Off, `buyer_country` is accepted and stored and nothing is refused on these grounds. See [EU scope fence](#eu-scope-fence) |
-| `DIGITAL_REGION_BLOCK_ENABLED` | `false` | `true`/`1` refuses `checkout.create` (which carries drop claims) and `offer.checkout` that contain a digital line (any digital delivery kind, or a Locks listing) when `payload.buyer_country` is in the EU-27 or is `GB`: `DIGITAL_UNAVAILABLE_IN_REGION` (409), reason `eu_buyer` or `gb_buyer`; such a command must carry `buyer_country`. Independent of `EU_FENCE_ENABLED`. Off, nothing is refused. See [Digital sales to EU and UK buyers](#digital-sales-to-eu-and-uk-buyers) |
+| `DIGITAL_REGION_BLOCK_ENABLED` | `false` | `true`/`1` refuses `checkout.create` (which carries drop claims) and `offer.checkout` that contain a digital line (any digital delivery kind, or a Locks listing) when `payload.buyer_country` is in the EU-27 or is `GB`: `DIGITAL_UNAVAILABLE_IN_REGION` (409), reason `eu_buyer` or `gb_buyer` for the declared country, `eu_ip` or `gb_ip` for the request's own country (read from `CLIENT_COUNTRY_HEADER`), `buyer_region_unknown` when the edge sent none; such a command must carry `buyer_country`. Independent of `EU_FENCE_ENABLED`. Off, nothing is refused. See [Digital sales to EU and UK buyers](#digital-sales-to-eu-and-uk-buyers) |
+| `CLIENT_COUNTRY_HEADER` | `x-client-region` | Name of the request header the trusted edge sets to the client's country (ISO alpha-2) from its IP. Read only by the digital hold (`DIGITAL_REGION_BLOCK_ENABLED`). GCP: a load-balancer custom request header `X-Client-Region:{client_region}`; Vercel: `x-vercel-ip-country`. The edge must set it itself and overwrite any value the client sent. Missing or unusable with the digital hold on: digital lines are refused (`buyer_region_unknown`) and an `ALERT digital_region_client_country_missing` is logged |
 | `ADDRESS_SEARCH_UPSTREAM_URL` | `https://photon.komoot.io` | Photon geocoder behind `POST /v0/address/suggest`. HTTPS only (http for loopback in tests). Point it at a self-hosted Photon to stop using the public instance |
 | `ADDRESS_SEARCH_DISABLED` | unset | `1`/`true` turns the address proxy off; the route answers `address_search_unavailable` |
 | `ADDRESS_SEARCH_CLIENT_IP_HEADER` | unset | name of a header set by a trusted edge that carries the client address (last value is used); unset keys the per-client limit on the socket peer |
@@ -264,8 +265,9 @@ With the flag on:
   `private`: `SELLER_UNAVAILABLE_IN_REGION` (409) with `reason`
   `business_seller` or `undeclared_seller`. Every other buyer country is
   unaffected.
-- **Annual limit.** A seller whose shop country is in the EU-27 can have at
-  most 29 sales and EUR 2,000 of orders per calendar year (UTC), counting paid
+- **Annual limit.** A seller whose shop country is in the EU-27 stops at 29
+  sales or EUR 2,000 in total per calendar year (UTC), whichever comes first
+  (29 sales of any size, or the euro total, whichever is reached first), counting paid
   orders (a confirmed payment, even if the order was later cancelled or
   refunded) and open orders (`pending_payment`) together: past it,
   `SELLER_ANNUAL_LIMIT_REACHED` (409). Order totals convert to euro with the
@@ -301,6 +303,20 @@ a `checkout.create` (a drop claim is one) or an `offer.checkout` that contains a
 digital line is refused with `DIGITAL_UNAVAILABLE_IN_REGION` (409, audited as
 `invalid_state`) when `payload.buyer_country` is in the EU-27 or is `GB`.
 `reason` is `eu_buyer` or `gb_buyer`.
+
+The declared country is not trusted on its own, since a buyer in the EU can
+declare Switzerland. The request's own country is read too, from the header named
+by `CLIENT_COUNTRY_HEADER` (default `x-client-region`) that the trusted edge sets
+from the client's IP, and a digital line is refused when EITHER country is in the
+EU-27 or is GB: `reason` is `eu_buyer`/`gb_buyer` for the declared country (checked
+first) and `eu_ip`/`gb_ip` for the IP country. With the flag on and no usable IP
+country (header absent, malformed, or the unknown markers `XX` and `T1`), digital
+lines fail closed with `reason: buyer_region_unknown` and an
+`ALERT digital_region_client_country_missing` is logged; physical lines never
+need the header. Commands that do not arrive over HTTP from a buyer (automation,
+connectors) carry no edge country and are refused for digital lines the same way.
+Deploy note: the load balancer (or Vercel) must set the header on every request
+and overwrite any client-sent value.
 
 - A line is digital when its listing is a Locks listing, when the buyer chose
   the `digital` fulfillment for it, or when `digital` is the only method the

@@ -382,8 +382,9 @@ request failed, so clients should branch on HTTP status first, and parse
    `private_seller_reconfirmation_required` (a private seller reached 29 sales
    or EUR 2,000 to EU buyers since their `sellerStatusConfirmedAt`).
    `SELLER_ANNUAL_LIMIT_REACHED` has `reason` `annual_sales_limit` or
-   `annual_amount_limit` (a seller whose shop country is in the EU-27 reached
-   29 paid or open orders, or EUR 2,000, this calendar year, UTC). A shop
+   `annual_amount_limit`: a seller whose shop country is in the EU-27 stops at 29
+   paid or open orders or EUR 2,000 in total this calendar year (UTC), whichever
+   comes first. A shop
    record the service cannot read is refused with `UPSTREAM_UNAVAILABLE`.
 
    `DIGITAL_UNAVAILABLE_IN_REGION` exists only while
@@ -391,7 +392,11 @@ request failed, so clients should branch on HTTP status first, and parse
    [Digital sales to EU and UK buyers](../README.md#digital-sales-to-eu-and-uk-buyers)):
    `checkout.create` and `offer.checkout` with a digital line, from a buyer whose
    `payload.buyer_country` is in the EU-27 (`reason: "eu_buyer"`) or is `GB`
-   (`reason: "gb_buyer"`). Such a command must carry `buyer_country` (422
+   (`reason: "gb_buyer"`), or whose request country (the header named by
+   `CLIENT_COUNTRY_HEADER`, set by the trusted edge from the client's IP) is in
+   the EU-27 (`reason: "eu_ip"`) or is `GB` (`reason: "gb_ip"`); with no usable
+   request country the digital line is refused with `reason:
+   "buyer_region_unknown"`. Such a command must carry `buyer_country` (422
    `INVALID_COMMAND` without it).
 
    `GET /v1/sellers/{seller_pubky}/annual-limit` answers `{"enabled": false}`

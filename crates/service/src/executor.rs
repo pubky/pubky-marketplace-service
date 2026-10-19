@@ -26,6 +26,23 @@ pub async fn execute(
     actor: &str,
     raw: &Value,
 ) -> Result<(StatusCode, Value), sqlx::Error> {
+    execute_with_edge(
+        state,
+        actor,
+        raw,
+        &crate::digital_region::EdgeContext::default(),
+    )
+    .await
+}
+
+/// [`execute`] for a command that arrived over HTTP, with what the trusted
+/// edge said about the request (the client's country).
+pub async fn execute_with_edge(
+    state: &AppState,
+    actor: &str,
+    raw: &Value,
+    edge: &crate::digital_region::EdgeContext,
+) -> Result<(StatusCode, Value), sqlx::Error> {
     let started = Instant::now();
     if let Err(issues) = validate_actor(actor) {
         log_invalid_command(None, started.elapsed().as_millis() as u64);
@@ -181,7 +198,7 @@ pub async fn execute(
             .await?
             .is_none()
     {
-        if let Err(failure) = crate::digital_region::gate(state, &command).await {
+        if let Err(failure) = crate::digital_region::gate(state, &command, edge).await {
             log_command(
                 actor,
                 command.kind(),

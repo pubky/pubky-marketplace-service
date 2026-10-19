@@ -61,6 +61,61 @@ async fn locks_seller(app: &TestApp) -> TestActor {
     seller
 }
 
+/// `execute` with the country the trusted edge puts on the request, under
+/// the default header name; `None` sends no header.
+async fn execute_from(
+    app: &TestApp,
+    token: &str,
+    command: &Value,
+    ip_country: Option<&str>,
+) -> (StatusCode, Value) {
+    execute_with_header(
+        app,
+        token,
+        command,
+        ip_country.map(|ip| ("x-client-region", ip)),
+    )
+    .await
+}
+
+async fn execute_with_header(
+    app: &TestApp,
+    token: &str,
+    command: &Value,
+    header: Option<(&str, &str)>,
+) -> (StatusCode, Value) {
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt;
+    use tower::util::ServiceExt;
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/v1/commands")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"));
+    if let Some((name, value)) = header {
+        request = request.header(name, value);
+    }
+    let response = app
+        .router
+        .clone()
+        .oneshot(
+            request
+                .body(Body::from(command.to_string()))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    (status, serde_json::from_slice(&bytes).expect("json body"))
+}
+
 fn digital_checkout(seller: &TestActor, number: u64, country: Option<&str>) -> Value {
     let mut command = as_digital_checkout(checkout_command_with_id(
         &seller.pubky,
@@ -156,10 +211,11 @@ async fn a_locks_listing_is_refused_for_eu_and_gb_buyers_and_open_elsewhere(pool
     assert_eq!(orders(&app).await, 0);
 
     for (number, country) in [(10, "US"), (11, "CH"), (12, "NO"), (13, "BR")] {
-        let result = execute(
+        let result = execute_from(
             &app,
             &buyer.token,
             &digital_checkout(&seller, number, Some(country)),
+            Some(country),
         )
         .await;
         assert_eq!(result.0, StatusCode::OK, "{country}: {}", result.1);
@@ -360,4 +416,145 @@ async fn the_two_flags_are_independent_and_compose(pool: PgPool) {
         .await,
         "eu_buyer",
     );
+}
+
+// --- the request's own country (Jean-Christophe, 19 Oct) ---------------------
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_digital_line_is_refused_when_either_the_declared_or_the_ip_country_is_held(
+    pool: PgPool,
+) {
+    let app = app(pool, true, false).await;
+    let seller = locks_seller(&app).await;
+    let buyer = new_actor(&app).await;
+    let mut number = 0;
+    let mut buy = |declared: &'static str, ip: Option<&'static str>| {
+        number += 1;
+        (digital_checkout(&seller, number, Some(declared)), ip)
+    };
+
+    // Declared Switzerland from a German IP: the buyer cannot talk their way out.
+    let (command, ip) = buy("CH", Some("DE"));
+    assert_blocked(
+        &execute_from(&app, &buyer.token, &command, ip).await,
+        "eu_ip",
+    );
+    let (command, ip) = buy("CH", Some("GB"));
+    assert_blocked(
+        &execute_from(&app, &buyer.token, &command, ip).await,
+        "gb_ip",
+    );
+    // Declared Germany from a Swiss IP (a traveller or a VPN): still refused.
+    let (command, ip) = buy("DE", Some("CH"));
+    assert_blocked(
+        &execute_from(&app, &buyer.token, &command, ip).await,
+        "eu_buyer",
+    );
+    let (command, ip) = buy("GB", Some("CH"));
+    assert_blocked(
+        &execute_from(&app, &buyer.token, &command, ip).await,
+        "gb_buyer",
+    );
+    // Both held: the declared country is reported.
+    let (command, ip) = buy("FR", Some("DE"));
+    assert_blocked(
+        &execute_from(&app, &buyer.token, &command, ip).await,
+        "eu_buyer",
+    );
+    assert_eq!(orders(&app).await, 0);
+
+    // Switzerland and Switzerland is allowed, as is the US from the US; the
+    // header's case and spacing do not matter.
+    for (declared, ip) in [("CH", "CH"), ("US", "US"), ("CH", " ch "), ("NO", "no")] {
+        let (command, _) = buy(declared, None);
+        let result = execute_from(&app, &buyer.token, &command, Some(ip)).await;
+        assert_eq!(result.0, StatusCode::OK, "{declared}/{ip}: {}", result.1);
+    }
+    assert_eq!(orders(&app).await, 4);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn with_the_flag_on_a_missing_or_unusable_ip_country_fails_closed_for_digital_only(
+    pool: PgPool,
+) {
+    common::install_log_capture();
+    let app = app(pool, true, false).await;
+    let seller = locks_seller(&app).await;
+    let physical = physical_seller(&app).await;
+    let buyer = new_actor(&app).await;
+    let mut number = 0;
+    for ip in [None, Some(""), Some("XX"), Some("T1"), Some("DEU")] {
+        number += 1;
+        let result = execute_from(
+            &app,
+            &buyer.token,
+            &digital_checkout(&seller, number, Some("CH")),
+            ip,
+        )
+        .await;
+        assert_blocked(&result, "buyer_region_unknown");
+    }
+    assert_eq!(orders(&app).await, 0);
+    assert!(common::captured_logs().contains("ALERT digital_region_client_country_missing"));
+
+    // A physical order never needs the header.
+    let result = execute_from(
+        &app,
+        &buyer.token,
+        &physical_checkout(&physical, 1, Some("CH")),
+        None,
+    )
+    .await;
+    assert_eq!(result.0, StatusCode::OK, "{}", result.1);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn the_edge_header_name_is_configurable_and_other_headers_are_ignored(pool: PgPool) {
+    let mut config = Config::for_tests();
+    config.digital_region_block_enabled = true;
+    config.client_country_header = "x-vercel-ip-country".to_string();
+    let app = test_app_with_config(pool, config).await;
+    let seller = locks_seller(&app).await;
+    let buyer = new_actor(&app).await;
+
+    let held = execute_with_header(
+        &app,
+        &buyer.token,
+        &digital_checkout(&seller, 1, Some("CH")),
+        Some(("x-vercel-ip-country", "DE")),
+    )
+    .await;
+    assert_blocked(&held, "eu_ip");
+    let open = execute_with_header(
+        &app,
+        &buyer.token,
+        &digital_checkout(&seller, 2, Some("CH")),
+        Some(("x-vercel-ip-country", "CH")),
+    )
+    .await;
+    assert_eq!(open.0, StatusCode::OK, "{}", open.1);
+    // The default header name means nothing once another is configured.
+    let other = execute_with_header(
+        &app,
+        &buyer.token,
+        &digital_checkout(&seller, 3, Some("CH")),
+        Some(("x-client-region", "CH")),
+    )
+    .await;
+    assert_blocked(&other, "buyer_region_unknown");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn with_the_flag_off_the_ip_country_is_not_read(pool: PgPool) {
+    let app = app(pool, false, false).await;
+    let seller = locks_seller(&app).await;
+    let buyer = new_actor(&app).await;
+    let result = execute_from(
+        &app,
+        &buyer.token,
+        &digital_checkout(&seller, 1, Some("CH")),
+        Some("DE"),
+    )
+    .await;
+    assert_eq!(result.0, StatusCode::OK, "{}", result.1);
 }

@@ -20,6 +20,17 @@
 //! digital delivery kind (file, link, text, email, message) publishes the
 //! `digital` method. Auctions ship only, so a bid is never digital.
 //!
+//! The buyer's declared country is not trusted on its own: a buyer in the EU
+//! can declare Switzerland. So the request's own country, read from a header
+//! the trusted edge sets from the client's IP (`CLIENT_COUNTRY_HEADER`: the GCP
+//! load balancer's `{client_region}`, Vercel's `x-vercel-ip-country`), is
+//! checked too. A digital line is refused when EITHER the declared country OR
+//! the IP country is in the EU-27 or is GB. With the flag on and no usable IP
+//! country (header absent, malformed, or the unknown markers `XX` and `T1`),
+//! digital lines fail closed with `reason: buyer_region_unknown` and an ALERT is
+//! logged; physical lines never need it. The edge must set the header itself
+//! and overwrite any value the client sent.
+//!
 //! The flag is independent of `EU_FENCE_ENABLED`. With it on, a command that
 //! contains a digital line must carry `buyer_country` (the Shop asks for it
 //! on digital listings); a command with no digital line does not need one on
@@ -38,6 +49,37 @@ pub const DIGITAL_UNAVAILABLE_MESSAGE: &str =
     "Digital items aren't available to buyers in the EU or UK yet.";
 pub const REASON_EU_BUYER: &str = "eu_buyer";
 pub const REASON_GB_BUYER: &str = "gb_buyer";
+/// The IP country is in the EU-27.
+pub const REASON_EU_IP: &str = "eu_ip";
+/// The IP country is GB.
+pub const REASON_GB_IP: &str = "gb_ip";
+/// No usable IP country: digital lines fail closed.
+pub const REASON_REGION_UNKNOWN: &str = "buyer_region_unknown";
+
+/// What the trusted edge told the service about the request.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EdgeContext {
+    /// The client's country from the edge header, uppercase ISO alpha-2.
+    /// `None` when the header is absent or holds no usable country.
+    pub client_country: Option<String>,
+}
+
+impl EdgeContext {
+    /// Reads the configured header. `XX` and `T1` are the unknown and Tor
+    /// markers CDNs send; they are not countries.
+    pub fn from_headers(headers: &axum::http::HeaderMap, header: &str) -> Self {
+        let client_country = headers
+            .get(header)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.trim().to_ascii_uppercase())
+            .filter(|value| {
+                value.len() == 2
+                    && value.bytes().all(|byte| byte.is_ascii_uppercase())
+                    && value != "XX"
+            });
+        Self { client_country }
+    }
+}
 
 /// Whether digital sales are held back for a buyer in `country_code`.
 pub fn blocked_country(country_code: &str) -> Option<&'static str> {
@@ -135,7 +177,11 @@ async fn flavors(
 /// Runs before the command's transaction. `Ok` when the flag is off, the
 /// command is not gated, no line is digital or the buyer is outside the
 /// EU-27 and GB.
-pub async fn gate(state: &AppState, command: &Command) -> Result<(), CommandFailure> {
+pub async fn gate(
+    state: &AppState,
+    command: &Command,
+    edge: &EdgeContext,
+) -> Result<(), CommandFailure> {
     if !state.config.digital_region_block_enabled {
         return Ok(());
     }
@@ -160,9 +206,23 @@ pub async fn gate(state: &AppState, command: &Command) -> Result<(), CommandFail
     let Some(country) = crate::region_fence::buyer_country_of(&command.payload).flatten() else {
         return Err(missing_country());
     };
-    match blocked_country(country) {
-        Some(reason) => Err(blocked(reason)),
-        None => Ok(()),
+    if let Some(reason) = blocked_country(country) {
+        return Err(blocked(reason));
+    }
+    match edge.client_country.as_deref() {
+        Some(ip_country) => match blocked_country(ip_country) {
+            Some(REASON_GB_BUYER) => Err(blocked(REASON_GB_IP)),
+            Some(_) => Err(blocked(REASON_EU_IP)),
+            None => Ok(()),
+        },
+        None => {
+            tracing::error!(
+                header = %state.config.client_country_header,
+                "ALERT digital_region_client_country_missing: no usable client country from the \
+                 edge header; refusing a digital line (fail closed)"
+            );
+            Err(blocked(REASON_REGION_UNKNOWN))
+        }
     }
 }
 
@@ -185,6 +245,31 @@ mod tests {
         assert_eq!(blocked_country("GB"), Some(REASON_GB_BUYER));
         for code in ["US", "CH", "NO", "IS", "LI", "BR", "JP", "UK", "gb", ""] {
             assert_eq!(blocked_country(code), None, "{code}");
+        }
+    }
+
+    #[test]
+    fn the_edge_header_yields_only_a_real_uppercase_country() {
+        use axum::http::{HeaderMap, HeaderValue};
+        let read = |value: Option<&str>| {
+            let mut headers = HeaderMap::new();
+            if let Some(value) = value {
+                headers.insert("x-client-region", HeaderValue::from_str(value).unwrap());
+            }
+            EdgeContext::from_headers(&headers, "x-client-region").client_country
+        };
+        assert_eq!(read(Some("DE")).as_deref(), Some("DE"));
+        assert_eq!(read(Some(" ch ")).as_deref(), Some("CH"));
+        for bad in [
+            None,
+            Some(""),
+            Some("XX"),
+            Some("T1"),
+            Some("DEU"),
+            Some("D"),
+            Some("1A"),
+        ] {
+            assert_eq!(read(bad), None, "{bad:?}");
         }
     }
 

@@ -498,9 +498,14 @@ async fn ready(State(state): State<AppState>) -> Response {
 async fn execute_command(
     State(state): State<AppState>,
     Extension(actor): Extension<Actor>,
+    headers: axum::http::HeaderMap,
     Json(raw): Json<Value>,
 ) -> Response {
-    match executor::execute(&state, &actor.0, &raw).await {
+    let edge = crate::digital_region::EdgeContext::from_headers(
+        &headers,
+        &state.config.client_country_header,
+    );
+    match executor::execute_with_edge(&state, &actor.0, &raw, &edge).await {
         Ok((status, body)) => match crate::reserve_secrecy::guard_command_result(&actor.0, body) {
             Ok(body) => (status, Json(body)).into_response(),
             Err(body) => (StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response(),
