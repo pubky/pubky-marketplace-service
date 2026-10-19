@@ -335,6 +335,95 @@ async fn concurrent_duplicate_checkouts_converge_on_one_stored_result(pool: PgPo
     assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM orders").await, 1);
 }
 
+/// Opening-bid race: bidders who all open at exactly the starting bid
+/// ($45.00). The opening bid needs no increment, so one of them is accepted;
+/// every other sees the standing bid and, retrying at the same amount, is
+/// refused because a bid now stands and the floor is the visible price plus
+/// the increment. The auction ends with one bid, one leader, and the visible
+/// price at the start.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn concurrent_opening_bids_at_the_starting_bid_accept_exactly_one(pool: PgPool) {
+    let app = test_app(pool).await;
+    let seller = new_actor(&app).await;
+    let (status, _) = execute(
+        &app,
+        &seller.token,
+        &register_auction_command(&seller.pubky),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let mut bidders = Vec::with_capacity(20);
+    for _ in 0..20 {
+        bidders.push(new_actor(&app).await);
+    }
+    let mut handles = Vec::with_capacity(bidders.len());
+    for (index, bidder) in bidders.into_iter().enumerate() {
+        let router = app.router.clone();
+        let seller_pubky = seller.pubky.clone();
+        handles.push(tokio::spawn(async move {
+            let mut expected_revision = 1i64;
+            for attempt in 0..50u64 {
+                let command = json!({
+                    "version": 1,
+                    "command_id": indexed_command_id(0x8005, (index as u64 + 1) * 1_000 + attempt),
+                    "aggregate_id": listing_aggregate(&seller_pubky),
+                    "expected_revision": expected_revision,
+                    "issued_at": "2026-08-19T22:00:00.000Z",
+                    "kind": "auction.place_bid",
+                    "payload": {
+                        "maximum_amount": {
+                            "amount_minor": 4_500,
+                            "currency": "USD",
+                            "exponent": 2,
+                        },
+                    },
+                });
+                let (_, body) = common::send(
+                    router.clone(),
+                    "POST",
+                    "/v1/commands",
+                    Some(&bidder.token),
+                    &command,
+                )
+                .await;
+                if body["ok"] == json!(true) {
+                    return ("accepted", bidder.pubky.clone());
+                }
+                match body["error"]["code"].as_str() {
+                    Some("REVISION_CONFLICT") => {
+                        expected_revision = body["error"]["current_revision"]
+                            .as_i64()
+                            .expect("revision conflicts carry current_revision");
+                    }
+                    Some("BID_TOO_LOW") => return ("outbid", bidder.pubky.clone()),
+                    other => panic!("unexpected bid rejection {other:?}: {body}"),
+                }
+            }
+            panic!("bidder did not reach a terminal outcome in 50 attempts");
+        }));
+    }
+    let mut accepted = Vec::new();
+    for handle in handles {
+        let (outcome, pubky) = handle.await.expect("bid task completes");
+        if outcome == "accepted" {
+            accepted.push(pubky);
+        }
+    }
+    assert_eq!(accepted.len(), 1, "exactly one opening bid is accepted");
+
+    let (auction,): (Value,) =
+        sqlx::query_as("SELECT auction FROM listings WHERE aggregate_id = $1")
+            .bind(listing_aggregate(&seller.pubky))
+            .fetch_one(&app.pool)
+            .await
+            .expect("listing row exists");
+    assert_eq!(auction["leader_pubky"], json!(accepted[0]));
+    assert_eq!(auction["bid_count"], json!(1));
+    assert_eq!(auction["current_price"]["amount_minor"], json!(4_500));
+    assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM bids").await, 1);
+}
+
 /// Auction concurrency proof: 100 concurrent proxy bidders (retrying on
 /// revision conflicts, stopping on BID_TOO_LOW) converge on one
 /// deterministic leader — the highest maximum — and the close produces

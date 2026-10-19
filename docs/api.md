@@ -360,6 +360,15 @@ request failed, so clients should branch on HTTP status first, and parse
    refused with `UPSTREAM_UNAVAILABLE` instead (see
    [Listing lifecycle](../README.md#listing-lifecycle)).
 
+   `BID_TOO_LOW` refuses an `auction.place_bid` whose maximum is under the
+   bidder's minimum next bid. While no bid stands the minimum is the starting
+   bid, so an opening bid may equal it (the visible price stays at the
+   starting bid whatever the opener's maximum). Once a bid stands it is the
+   visible price plus the minimum increment, and a bidder raising their own
+   maximum must also exceed their previous maximum by one minor unit. The
+   authenticated listing projection carries the bidder's figure as
+   `viewer_bid.minimum_next_bid`.
+
 ### Automation error codes
 
 | HTTP | `error.code` | Where |
