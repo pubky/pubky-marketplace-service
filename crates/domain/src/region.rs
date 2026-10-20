@@ -68,11 +68,17 @@ impl SellerStatus {
 }
 
 /// The seller's shop country: `location.countryCode` of the shop record,
-/// when it is an uppercase ISO 3166-1 alpha-2 code.
+/// trimmed and uppercased, when it is then an ISO 3166-1 alpha-2 code. A
+/// seller who typed `de` or ` DE ` is resident in Germany all the same, so the
+/// annual cap must not skip them.
 pub fn shop_country_from_record(record: &Value) -> Option<String> {
-    let code = record.get("location")?.get("countryCode")?.as_str()?;
-    (code.len() == 2 && code.bytes().all(|byte| byte.is_ascii_uppercase()))
-        .then(|| code.to_string())
+    let code = record
+        .get("location")?
+        .get("countryCode")?
+        .as_str()?
+        .trim()
+        .to_ascii_uppercase();
+    (code.len() == 2 && code.bytes().all(|byte| byte.is_ascii_uppercase())).then_some(code)
 }
 
 #[cfg(test)]
@@ -128,7 +134,18 @@ mod tests {
     }
 
     #[test]
-    fn the_shop_country_must_be_an_uppercase_code() {
+    fn the_shop_country_is_trimmed_and_uppercased() {
+        for (written, expected) in [("DE", "DE"), ("de", "DE"), (" DE ", "DE"), ("\tch\n", "CH")] {
+            assert_eq!(
+                shop_country_from_record(&json!({ "location": { "countryCode": written } })),
+                Some(expected.to_string()),
+                "{written:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_shop_country_must_be_a_two_letter_code() {
         assert_eq!(
             shop_country_from_record(&json!({ "location": { "countryCode": "DE" } })),
             Some("DE".to_string())
@@ -136,8 +153,9 @@ mod tests {
         for record in [
             json!({}),
             json!({ "location": {} }),
-            json!({ "location": { "countryCode": "de" } }),
             json!({ "location": { "countryCode": "DEU" } }),
+            json!({ "location": { "countryCode": "" } }),
+            json!({ "location": { "countryCode": "D E" } }),
             json!({ "location": { "countryCode": 5 } }),
         ] {
             assert_eq!(shop_country_from_record(&record), None, "{record}");

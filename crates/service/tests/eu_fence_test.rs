@@ -511,10 +511,28 @@ async fn an_eu_resident_seller_stops_at_29_sales_and_the_30th_is_refused(pool: P
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn a_lowercase_or_missing_shop_country_is_not_an_eu_residence(pool: PgPool) {
+async fn a_lowercase_or_padded_shop_country_is_still_an_eu_residence(pool: PgPool) {
     let (app, homeserver) = app_with_fence(pool, true).await;
     seed_usd_and_eur(&app).await;
-    let seller = Seller::new(&app, &homeserver, Some("private"), "de", 100).await;
+    let buyer = new_actor(&app).await;
+    for (country, base) in [("de", 0), (" FR ", 1_000)] {
+        let seller = Seller::new(&app, &homeserver, Some("private"), country, 100).await;
+        fill(&app, &seller.actor, base + 1, 29, "US").await;
+        assert_refused(
+            &buy(&app, &buyer, &seller.actor, base + 500, Some("US")).await,
+            StatusCode::CONFLICT,
+            "SELLER_ANNUAL_LIMIT_REACHED",
+            Some("annual_sales_limit"),
+        );
+        assert_eq!(orders_of(&app, &seller.actor).await, 29, "{country:?}");
+    }
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_shop_country_that_is_not_a_code_is_not_an_eu_residence(pool: PgPool) {
+    let (app, homeserver) = app_with_fence(pool, true).await;
+    seed_usd_and_eur(&app).await;
+    let seller = Seller::new(&app, &homeserver, Some("private"), "GERMANY", 100).await;
     fill(&app, &seller.actor, 1, 31, "US").await;
     assert_eq!(orders_of(&app, &seller.actor).await, 31);
 }

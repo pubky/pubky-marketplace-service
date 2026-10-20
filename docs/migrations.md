@@ -297,20 +297,19 @@ DELETE FROM _sqlx_migrations WHERE version IN (76, 77);
 
 ## Numbers claimed by open pull requests
 
-`main` has 0001 to 0054 and 0056 to 0059; 0055 is #92, so the catalog is
-gapless 0001 to 0059 once it lands; 0060 is the single Paykit bind. Pull requests that are open when this was
-written claim numbers, so a new migration must check the open list
-(`gh pr list`) and take the next free number (0060 or later) rather than
+`main` has 0001 to 0077 (0068 and 0069 were never used). A new migration must
+check the open list (`gh pr list`) and take the next free number rather than
 assume it is free:
 
 | Number | File | Pull request |
 | --- | --- | --- |
-| 0055 | `0055_user_priv_key_custody_releases.sql` | #92 (`/priv` Phase 4) |
-| 0071 | `0071_update_tracking_command_kind.sql` | optional tracking (`cursor/optional-tracking-85f6`) |
-| 0072 | `0072_grant_sessions.sql` | #137 (grant sessions) |
+| 0078 | `0078_paykit_known_sellers.sql` | #161 (renumbered from 0076, which the EU fence took) |
+| 0079 | `0079_seller_confirms_bitcoin.sql` | #162 (seller Bitcoin confirmation) |
 
 This table describes unmerged work and goes stale as pull requests land; trust
-`crates/service/migrations/` on `main` over it.
+`crates/service/migrations/` on `main` over it. sqlx does not reject two files
+with the same version, so a clash shows up only as a failed start, never in
+review.
 
 ## Sealed delivery addresses (0057)
 
