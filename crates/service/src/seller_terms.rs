@@ -195,6 +195,9 @@ pub async fn capture_for_order(
     .bind(declaration.status_confirmed_at)
     .execute(&mut **tx)
     .await?;
+    if let Some(homeserver) = homeserver {
+        crate::return_policy::capture_for_order(tx, homeserver, order_id, seller_pubky).await?;
+    }
     Ok(())
 }
 
