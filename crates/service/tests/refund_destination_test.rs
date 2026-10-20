@@ -1013,3 +1013,120 @@ async fn the_bitcoin_reference_cap_is_unchanged(pool: PgPool) {
     assert_eq!(external_refund["transaction_id"], json!(at_the_cap));
     assert!(external_refund.get("destination_address").is_none());
 }
+
+/// An Arbitrum RPC double answering every refund check with one outcome.
+struct FixedChain(marketplace_service::refund_chain::RefundChainOutcome);
+
+impl marketplace_service::refund_chain::RefundChain for FixedChain {
+    fn check<'a>(
+        &'a self,
+        _transaction_hash: &'a str,
+        _recipient: &'a str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = marketplace_service::refund_chain::RefundChainOutcome>
+                + Send
+                + 'a,
+        >,
+    > {
+        let outcome = self.0;
+        Box::pin(async move { outcome })
+    }
+}
+
+fn with_chain(
+    app: TestApp,
+    outcome: marketplace_service::refund_chain::RefundChainOutcome,
+) -> TestApp {
+    let state = app
+        .state
+        .clone()
+        .with_refund_chain(Some(std::sync::Arc::new(FixedChain(outcome))));
+    TestApp {
+        router: marketplace_service::http::build_router(state.clone()),
+        pool: app.pool,
+        clock: app.clock,
+        state,
+    }
+}
+
+async fn cancelled_usdt_order_with_destination(app: &TestApp) -> (TestActor, String) {
+    let seller = new_actor(app).await;
+    let buyer = new_actor(app).await;
+    let order = paid_usdt_order(app, &seller, &buyer).await;
+    cancel(&app.pool, &order.order_id).await;
+    let (status, body) = confirm(app, &buyer.token, &order.order_id, CHECKSUMMED).await;
+    assert_eq!(status, StatusCode::OK, "confirm failed: {body}");
+    (seller, order.order_id)
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_checked_refund_keeps_what_the_buyer_received(pool: PgPool) {
+    use marketplace_service::refund_chain::RefundChainOutcome;
+    let app = with_chain(
+        test_app(pool).await,
+        RefundChainOutcome::Transferred { units: 970_435 },
+    );
+    let (seller, order_id) = cancelled_usdt_order_with_destination(&app).await;
+
+    let (status, body) = record(
+        &app,
+        &seller.token,
+        &order_id,
+        ORDER_TOTAL_CENTS,
+        &tx_hash(7),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "record failed: {body}");
+    let refund = &body["result"]["order"]["external_refund"];
+    assert_eq!(refund["amount_minor"], json!(ORDER_TOTAL_CENTS));
+    assert_eq!(refund["received_units"], json!(970_435));
+    assert!(refund["checked_at"].is_string(), "{refund}");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_refund_arbitrum_does_not_back_is_refused(pool: PgPool) {
+    use marketplace_service::refund_chain::RefundChainOutcome;
+    for (outcome, reason) in [
+        (RefundChainOutcome::NotFound, "refund_transaction_not_found"),
+        (RefundChainOutcome::Reverted, "refund_transaction_reverted"),
+        (
+            RefundChainOutcome::Transferred { units: 0 },
+            "refund_transaction_wrong_recipient",
+        ),
+    ] {
+        let app = with_chain(test_app(pool.clone()).await, outcome);
+        let (seller, order_id) = cancelled_usdt_order_with_destination(&app).await;
+        let (status, body) = record(
+            &app,
+            &seller.token,
+            &order_id,
+            ORDER_TOTAL_CENTS,
+            &tx_hash(8),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{reason}: {body}");
+        assert_eq!(body["error"]["reason"], json!(reason), "{body}");
+    }
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_unreachable_rpc_records_the_refund_unchecked(pool: PgPool) {
+    use marketplace_service::refund_chain::RefundChainOutcome;
+    let app = with_chain(test_app(pool).await, RefundChainOutcome::Unavailable);
+    let (seller, order_id) = cancelled_usdt_order_with_destination(&app).await;
+
+    let (status, body) = record(
+        &app,
+        &seller.token,
+        &order_id,
+        ORDER_TOTAL_CENTS,
+        &tx_hash(9),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "record failed: {body}");
+    assert_eq!(
+        body["result"]["order"]["external_refund"]["received_units"],
+        Value::Null
+    );
+}

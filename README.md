@@ -164,6 +164,7 @@ Railway IaC `preserve()`):
 | `ATTESTOR_SECRET_KEY` | unset | 32-byte hex Ed25519 secret of the attestor identity (ADR 0024); its z-base-32 public key is the attestor pubky |
 | `ATTESTOR_ORDER_SALT` | unset | 32-byte hex salt for `order_ref` hashing; must stay stable for the attestor identity's lifetime |
 | `STRIPE_KEY_ENCRYPTION_KEY` | unset | 32-byte hex key sealing seller secrets (Shippo API tokens) at rest; setting it enables the `/v0` payment-methods surface. The name is a legacy of the removed Stripe rail and is kept so deployments need no change |
+| `ARBITRUM_RPC_URL` | unset | Arbitrum One JSON-RPC endpoint (http(s)); setting it checks a recorded USDT refund's transaction on Arbitrum. See [USDT refund destination](#usdt-refund-destination) |
 | `PAYKIT_SERVER_URL` | unset | paykit-server base URL; setting it enables the bitcoin method |
 | `PAYKIT_REQUEST_SIGNING_KEY` | unset | 32-byte hex ed25519 seed signing paykit-server requests. Its pubky-formatted public key goes into paykit-server's `[signed_services] trusted_public_keys`, beside the Locks key, when `PAYKIT_SERVER_API=upstream`; on the fork (`fork`, the default) it is `marketplace.trusted_public_key`. See [Paykit server API](#paykit-server-api) |
 | `PAYKIT_SERVER_API` | `fork` | which paykit-server the service speaks to: `fork` (today's production server) or `upstream` (`pubky/paykit-server` with the signed-services allowlist, first shipped in v0.1.0-rc9, #55; the latest tagged release is v0.1.0-rc11). Set only together with `PAYKIT_SERVER_URL`. See [Paykit server API](#paykit-server-api) |
@@ -884,9 +885,18 @@ USDT rail); every other order is unchanged. It is not gated by
   manual-review USDT refund records the quoted USDT amount in order units
   (cents) for a USD order, and in the paid asset's own units (USDT0
   millionths) for an order priced in anything else.
-- **What it does not do.** It never verifies the refund on Arbitrum, so the
-  record is what the seller said they did. A `refunded` resolution toward Paykit
-  is an annotation only (it does not verify or execute a refund).
+- **Checking it on Arbitrum.** With `ARBITRUM_RPC_URL` set,
+  `refund.record_external` on a USDT order reads the transaction's receipt and
+  sums the USDT0 it sent to the confirmed address. A hash Arbitrum doesn't show
+  (`refund_transaction_not_found`), a reverted transaction
+  (`refund_transaction_reverted`) or one that sent the address no USDT0
+  (`refund_transaction_wrong_recipient`) is refused with 422. Otherwise the
+  record keeps `received_units` (USDT0 millionths) and `checked_at`, so a short
+  refund reads as short. An unreachable RPC records the refund unchecked.
+- **What it does not do.** Without `ARBITRUM_RPC_URL`, and on the manual-review
+  `refunded` resolution, the record is what the seller said they did. A
+  `refunded` resolution toward Paykit is an annotation only (it does not verify
+  or execute a refund).
 - **Refusals** (closed `error.reason` tokens): `invalid_refund_destination`
   (422), `refund_destination_required` (409) and `invalid_refund_reference`
   (422). A wrong sender, order method or payment state is a plain
