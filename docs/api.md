@@ -380,7 +380,11 @@ request failed, so clients should branch on HTTP status first, and parse
    or `undeclared_seller` (the buyer is in the EU-27 and the seller's shop
    record does not declare `sellerStatus: "private"`), or
    `private_seller_reconfirmation_required` (a private seller reached 29 sales
-   or EUR 2,000 to EU buyers since their `sellerStatusConfirmedAt`).
+   or EUR 2,000 to EU buyers since their `sellerStatusConfirmedAt`); it is also
+   the answer from payment start, and the payment-time counterpart of the
+   `SELLER_ANNUAL_LIMIT_REACHED` behaviour below: money already on chain when
+   the point is crossed goes to `manual_review` and can only be resolved as
+   `refunded`.
    `SELLER_ANNUAL_LIMIT_REACHED` has `reason` `annual_sales_limit` or
    `annual_amount_limit`: a seller whose shop country is in the EU-27 stops at 29
    paid orders or EUR 2,000 of paid orders this calendar year (UTC), whichever

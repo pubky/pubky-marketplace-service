@@ -12,8 +12,10 @@
 //!
 //! The same read freezes the seller's own declaration on the order (legal
 //! launch plan C1): `sellerStatus` ("private" or "trader"; "undeclared" for a
-//! record without a usable declaration) and `location.countryCode`. They are
-//! stored for the audit trail and read by nothing that sells.
+//! record without a usable declaration), `location.countryCode` and
+//! `sellerStatusConfirmedAt`. They are stored for the audit trail, and the EU
+//! seller limits re-checked where money is taken read them from the order
+//! (`region_fence::recheck_at_payment`).
 //!
 //! It also freezes the seller's Bitcoin confirmation option (legal launch plan
 //! B4): `bitcoinConfirmation: "seller"` in the shop record means the seller
@@ -81,15 +83,19 @@ impl SellerDeliveryTerms {
 pub struct SellerDeclaration {
     pub status: Option<SellerStatus>,
     pub country: Option<String>,
+    /// `sellerStatusConfirmedAt` (legal launch plan C4, LG18): when the seller
+    /// last re-confirmed that they sell as a private individual.
+    pub status_confirmed_at: Option<DateTime<Utc>>,
 }
 
 impl SellerDeclaration {
     /// A shop record read: the status the seller declared (undeclared when
     /// absent) and their shop country when it is a valid code.
-    pub fn from_shop_record(record: &Value) -> Self {
+    pub fn from_shop_record(record: &Value, now: DateTime<Utc>) -> Self {
         Self {
             status: Some(SellerStatus::from_shop_record(record)),
             country: shop_country_from_record(record),
+            status_confirmed_at: crate::region_fence::status_confirmed_at_from_record(record, now),
         }
     }
 
@@ -98,6 +104,7 @@ impl SellerDeclaration {
         Self {
             status: Some(SellerStatus::Undeclared),
             country: None,
+            status_confirmed_at: None,
         }
     }
 }
@@ -147,7 +154,7 @@ pub async fn capture_for_order(
         Some(homeserver) => match homeserver.fetch_shop(seller_pubky).await {
             HomeserverFetchOutcome::Found(record) => (
                 SellerDeliveryTerms::from_shop_record(&record),
-                SellerDeclaration::from_shop_record(&record),
+                SellerDeclaration::from_shop_record(&record, now),
                 Some(confirms_bitcoin_payments(&record)),
             ),
             HomeserverFetchOutcome::NotFound => (
@@ -175,7 +182,7 @@ pub async fn capture_for_order(
     sqlx::query(
         "UPDATE orders SET delivery_assume_days = $2, auto_complete_days = $3, \
          delivery_terms_captured_at = $4, seller_status = $5, seller_country = $6, \
-         seller_confirms_bitcoin = $7 \
+         seller_confirms_bitcoin = $7, seller_status_confirmed_at = $8 \
          WHERE id = $1 AND delivery_terms_captured_at IS NULL",
     )
     .bind(order_id)
@@ -185,6 +192,7 @@ pub async fn capture_for_order(
     .bind(declaration.status.map(SellerStatus::as_str))
     .bind(declaration.country)
     .bind(confirms_bitcoin)
+    .bind(declaration.status_confirmed_at)
     .execute(&mut **tx)
     .await?;
     Ok(())

@@ -96,18 +96,27 @@ pub struct SellerFacts {
     pub status_confirmed_at: Option<DateTime<Utc>>,
 }
 
+/// The shop record's `sellerStatusConfirmedAt`: a valid RFC 3339 timestamp
+/// that is not in the future, else `None` (a future or malformed value counts
+/// as no confirmation).
+pub fn status_confirmed_at_from_record(
+    record: &Value,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    record
+        .get("sellerStatusConfirmedAt")
+        .and_then(Value::as_str)
+        .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
+        .map(|moment| moment.with_timezone(&Utc))
+        .filter(|moment| *moment <= now)
+}
+
 impl SellerFacts {
     pub fn from_shop_record(record: &Value, now: DateTime<Utc>) -> Self {
-        let status_confirmed_at = record
-            .get("sellerStatusConfirmedAt")
-            .and_then(Value::as_str)
-            .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
-            .map(|moment| moment.with_timezone(&Utc))
-            .filter(|moment| *moment <= now);
         Self {
             status: SellerStatus::from_shop_record(record),
             country: shop_country_from_record(record),
-            status_confirmed_at,
+            status_confirmed_at: status_confirmed_at_from_record(record, now),
         }
     }
 
@@ -534,10 +543,17 @@ pub async fn check_limits(
     Ok(())
 }
 
-/// The annual limit check where money is taken (legal launch plan C4, LG15):
-/// at payment start, so a buyer is not asked to pay a seller already at the
-/// limit, and at payment confirmation, so a payment that would cross 29
-/// sales or EUR 2,000 is never marked paid.
+/// The seller limits where money is taken (legal launch plan C4, LG15 and
+/// LG18): at payment start, so a buyer is not asked to pay a seller who cannot
+/// take the sale, and at payment confirmation, so a payment that would cross
+/// a limit is never marked paid. Two rules are checked:
+///
+/// - **The annual limit** of an EU-resident seller (29 sales or EUR 2,000):
+///   `SELLER_ANNUAL_LIMIT_REACHED`.
+/// - **The re-confirmation point** of a private seller selling to a buyer in
+///   the EU-27 (29 sales or EUR 2,000 to EU buyers since their last
+///   re-confirmation): `SELLER_UNAVAILABLE_IN_REGION` with reason
+///   `private_seller_reconfirmation_required`.
 ///
 /// Nothing reserves a slot before payment, so several unpaid orders and
 /// several payments in flight can each pass the order-time check; this is the
@@ -545,25 +561,31 @@ pub async fn check_limits(
 /// `order_id`, under the same per-seller advisory lock the order-time check
 /// takes, so two payments confirming at once cannot both take the last slot.
 ///
-/// The seller's residence is the country frozen on the order at its payment
-/// start (`orders.seller_country`), not a fresh shop read: a payment is
-/// never coupled to the homeserver being reachable. No frozen country means
-/// no residence and no cap, as at order time. The seller's other-country
-/// re-confirmation point is not re-checked here.
+/// Every fact comes from the order, frozen at its payment start with the
+/// seller's declaration, not from a fresh shop read: a payment is never
+/// coupled to the homeserver being reachable. `orders.seller_country` is the
+/// residence (none means no residence and no cap, as at order time);
+/// `orders.seller_status` and `orders.buyer_country` decide whether the
+/// re-confirmation point applies; `orders.seller_status_confirmed_at` is where
+/// its count starts (the start of the year when none). A seller who
+/// re-confirms after an order's payment started therefore does not release
+/// that payment, but the next order's payment starts from the new date.
 ///
-/// `Err` is the refusal `SELLER_ANNUAL_LIMIT_REACHED`. At payment start the
-/// caller returns it and the buyer never pays. At confirmation the money is
-/// already on its way (the marketplace never holds funds), so every
-/// confirming path treats it like any other order that can no longer be
-/// confirmed: the payment goes to `manual_review`, nothing is marked paid,
-/// no receipt is issued and the seller and ops decide the refund.
+/// `Err` is the refusal for the rule that failed. At payment start the caller
+/// returns it and the buyer never pays. At confirmation the money is already
+/// on its way (the marketplace never holds funds), so every confirming path
+/// treats it like any other order that can no longer be confirmed: the payment
+/// goes to `manual_review`, nothing is marked paid, no receipt is issued and
+/// the seller and ops decide the refund. [`is_limit_at_payment`] names these
+/// refusals for those paths.
 pub async fn recheck_at_payment(
     tx: &mut Transaction<'_, Postgres>,
     order_id: Uuid,
     now: DateTime<Utc>,
 ) -> Result<(), CommandFailure> {
-    let row: Option<(String, Option<String>, i64, String, i32)> = sqlx::query_as(
-        "SELECT seller_pubky, seller_country, total_minor, currency, exponent \
+    let row: Option<OrderToPay> = sqlx::query_as(
+        "SELECT seller_pubky, seller_country, seller_status, buyer_country, \
+                seller_status_confirmed_at, total_minor, currency, exponent \
          FROM orders WHERE id = $1",
     )
     .bind(order_id)
@@ -573,14 +595,17 @@ pub async fn recheck_at_payment(
         tracing::error!(%error, "eu fence could not read the order to pay");
         unavailable()
     })?;
-    let Some((seller_pubky, seller_country, total_minor, currency, exponent)) = row else {
+    let Some(order) = row else {
         return Err(unavailable());
     };
-    if !seller_country.as_deref().is_some_and(is_eu_country) {
+    let annual_limit = order.seller_country.as_deref().is_some_and(is_eu_country);
+    let reconfirmation = order.seller_status.as_deref() == Some(SellerStatus::Private.as_str())
+        && order.buyer_country.as_deref().is_some_and(is_eu_country);
+    if !annual_limit && !reconfirmation {
         return Ok(());
     }
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, $2))")
-        .bind(&seller_pubky)
+        .bind(&order.seller_pubky)
         .bind(SELLER_LOCK_SEED)
         .execute(&mut **tx)
         .await
@@ -588,32 +613,87 @@ pub async fn recheck_at_payment(
             tracing::error!(%error, "eu fence could not lock the seller's counters");
             unavailable()
         })?;
-    let new_cents = eur_cents(tx, &currency, exponent, total_minor, now).await?;
-    let annual = usage(
-        tx,
-        &seller_pubky,
-        year_start(now),
-        Scope::AllBuyers,
-        Some(order_id),
-        now,
-    )
-    .await?;
-    match exceeded_by(&annual, new_cents) {
+    let new_cents = eur_cents(tx, &order.currency, order.exponent, order.total_minor, now).await?;
+    let refusal = if annual_limit {
+        let annual = usage(
+            tx,
+            &order.seller_pubky,
+            year_start(now),
+            Scope::AllBuyers,
+            Some(order_id),
+            now,
+        )
+        .await?;
+        exceeded_by(&annual, new_cents).map(|reason| (limit_refusal(reason), reason, annual))
+    } else {
+        None
+    };
+    let refusal = match refusal {
+        Some(refusal) => Some(refusal),
+        None if reconfirmation => {
+            let from = order
+                .seller_status_confirmed_at
+                .map_or(year_start(now), |confirmed| confirmed.max(year_start(now)));
+            let eu_sales = usage(
+                tx,
+                &order.seller_pubky,
+                from,
+                Scope::EuBuyers,
+                Some(order_id),
+                now,
+            )
+            .await?;
+            exceeded_by(&eu_sales, new_cents).map(|_| {
+                (
+                    region_refusal(REASON_RECONFIRM, RECONFIRM_MESSAGE),
+                    REASON_RECONFIRM,
+                    eu_sales,
+                )
+            })
+        }
+        None => None,
+    };
+    match refusal {
         None => Ok(()),
-        Some(reason) => {
+        Some((failure, reason, counted)) => {
             tracing::error!(
                 order_id = %order_id,
-                seller_pubky = %seller_pubky,
+                seller_pubky = %order.seller_pubky,
                 reason,
-                paid_sales = annual.sales,
-                paid_eur_cents = annual.eur_cents,
-                "ALERT eu_annual_limit_at_payment: a payment would cross the EU seller's annual \
-                 limit; it is refused at payment start or sent to manual review at confirmation \
-                 (order_id={order_id} seller_pubky={seller_pubky})"
+                paid_sales = counted.sales,
+                paid_eur_cents = counted.eur_cents,
+                "ALERT eu_seller_limit_at_payment: a payment would cross an EU seller limit; it \
+                 is refused at payment start or sent to manual review at confirmation \
+                 (order_id={order_id} seller_pubky={})",
+                order.seller_pubky
             );
-            Err(limit_refusal(reason))
+            Err(failure)
         }
     }
+}
+
+/// The facts of an order about to be paid that the seller limits turn on.
+#[derive(sqlx::FromRow)]
+struct OrderToPay {
+    seller_pubky: String,
+    seller_country: Option<String>,
+    seller_status: Option<String>,
+    buyer_country: Option<String>,
+    seller_status_confirmed_at: Option<DateTime<Utc>>,
+    total_minor: i64,
+    currency: String,
+    exponent: i32,
+}
+
+/// Whether `failure` is a refusal [`recheck_at_payment`] gives: the annual
+/// limit or the private seller's re-confirmation point. The paths that
+/// confirm a payment route such a refusal to manual review (or refund
+/// required) instead of failing the money they already hold.
+pub fn is_limit_at_payment(failure: &CommandFailure) -> bool {
+    matches!(
+        failure.code(),
+        ErrorCode::SellerAnnualLimitReached | ErrorCode::SellerUnavailableInRegion
+    )
 }
 
 /// Which limit one more sale of `new_cents` would cross, if either.
