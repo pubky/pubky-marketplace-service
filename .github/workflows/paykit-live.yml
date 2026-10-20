@@ -41,7 +41,7 @@ jobs:
   live:
     name: live paykit-server
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 15
     services:
       postgres:
         image: postgres:16
