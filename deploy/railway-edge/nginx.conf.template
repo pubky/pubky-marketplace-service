@@ -1,0 +1,24 @@
+load_module modules/ngx_http_geoip2_module.so;
+
+worker_processes auto;
+pid /tmp/nginx.pid;
+error_log /dev/stderr warn;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    client_body_temp_path /tmp/nginx-body;
+    proxy_temp_path /tmp/nginx-proxy;
+    fastcgi_temp_path /tmp/nginx-fastcgi;
+    uwsgi_temp_path /tmp/nginx-uwsgi;
+    scgi_temp_path /tmp/nginx-scgi;
+
+    geoip2 /usr/share/GeoIP/country.mmdb {
+        auto_reload 60m;
+        $geoip2_country_code country iso_code;
+    }
+
+    include /etc/nginx/edge/proxy.conf;
+}
