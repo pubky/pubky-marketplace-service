@@ -12,8 +12,19 @@ hashtextextended(seller_pubky, 6381))`, in ascending seller order, as the first
 locks of the transaction: before the drop row, the listing rows and the
 variant rows. The annual-limit count (`region_fence::usage`) then runs under
 that lock, so two checkouts of one seller serialize at the lock and never hold a
-listing the other needs. `eu_fence_test` runs concurrent checkouts at the last
-slot and checkouts over the same two sellers in opposite order.
+listing the other needs. `eu_fence_test` runs checkouts over the same two
+sellers in opposite order.
+
+The annual limit counts paid orders only, so it is decided where payments are
+taken. `region_fence::recheck_at_payment` takes the same lock, again before any
+drop or listing row: at payment start (the bind, Locks preparation and the
+sandbox payment call it before `acquire_payment_hold`) and as the first step of
+`handlers::payment::confirm_order`. The late-money fork and the seller's
+"resolve as paid" call it before they reacquire a hold, so they never wait for
+the seller lock while holding a listing. Two payments confirming at once for
+one seller therefore serialize at the lock: `eu_fence_test` pays eight open
+orders at the last slot concurrently, and `annual_cap_at_payment_test` polls two
+settled Bitcoin payments at once.
 
 ## Drops before listings
 

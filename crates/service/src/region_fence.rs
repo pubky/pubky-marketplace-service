@@ -11,13 +11,19 @@
 //!   or `undeclared_seller`.
 //! - **C4, annual limit.** A seller whose shop country is in the EU-27 stops
 //!   at 29 paid sales and EUR 2,000 of paid orders per calendar year (UTC),
-//!   counting open orders too so a burst cannot overshoot:
-//!   `SELLER_ANNUAL_LIMIT_REACHED`. A private seller of any country who
-//!   reaches the same numbers in sales to EU buyers must re-confirm their
-//!   status (`sellerStatusConfirmedAt` in the shop record) before the next
-//!   such sale: `SELLER_UNAVAILABLE_IN_REGION` with reason
-//!   `private_seller_reconfirmation_required`. The count restarts at the
-//!   confirmation.
+//!   whichever comes first: `SELLER_ANNUAL_LIMIT_REACHED`. Only paid orders
+//!   count (a confirmed payment, whatever became of the order afterwards, so
+//!   a refunded sale still counts); an unpaid checkout never uses a slot.
+//!   Because nothing reserves a slot before payment, the limit is checked
+//!   again where money is taken: see [`recheck_at_payment`]. A seller whose
+//!   shop record carries no usable country has no residence, so no cap
+//!   applies to them (LG16: the fence never reads a missing country as EU).
+//!   A private seller of any country who reaches the same numbers in sales to
+//!   EU buyers must re-confirm their status (`sellerStatusConfirmedAt` in the
+//!   shop record) before the next such sale: `SELLER_UNAVAILABLE_IN_REGION`
+//!   with reason `private_seller_reconfirmation_required`. The count restarts
+//!   at the confirmation. The re-confirmation point is checked when the order
+//!   is created, on paid sales only.
 //!
 //! The buyer's country is the one the buyer's client sends in clear text
 //! (`buyer_country`); the sealed address is never opened. It is a
@@ -30,10 +36,9 @@
 //! the lifecycle gate), applies C3, and refuses an offer or bid on a seller
 //! already at a limit. The orders themselves are counted inside the order's
 //! transaction by [`lock_sellers`] and [`check_new_order`], under a
-//! per-seller advisory lock taken before any listing lock, so two concurrent
-//! checkouts cannot both take the last slot. An auction's winning order is
-//! created by the close and is counted but never refused, since the bidder
-//! already won; the limit is enforced at the bid.
+//! per-seller advisory lock taken before any listing lock. An auction's
+//! winning order is created by the close and is not refused there, since the
+//! bidder already won; the limit is enforced at the bid and again at payment.
 //!
 //! With the flag off nothing here refuses and no shop record is read.
 
@@ -48,6 +53,7 @@ use marketplace_domain::{Currency, ErrorCode, ValidationIssue};
 use serde_json::Value;
 use sqlx::{PgConnection, Postgres, Transaction};
 use tokio::task::JoinSet;
+use uuid::Uuid;
 
 use crate::homeserver::{HomeserverFetchOutcome, HomeserverListingClient};
 use crate::listing_moderation::SoldListing;
@@ -349,9 +355,10 @@ pub struct NewOrder<'a> {
 }
 
 /// Inside the order transaction, after [`lock_sellers`], before the order
-/// row is inserted: refuses the order when C4 would be exceeded by it.
-/// Orders inserted earlier in the same transaction are counted. The refusal
-/// is returned for the handler to answer; the transaction rolls back.
+/// row is inserted: refuses the order when C4 would be exceeded by it,
+/// counting paid orders only. The refusal is returned for the handler to
+/// answer; the transaction rolls back. Payment is checked again by
+/// [`recheck_at_payment`].
 pub async fn check_new_order(
     tx: &mut Transaction<'_, Postgres>,
     plan: &FencePlan,
@@ -392,15 +399,18 @@ pub fn year_start(now: DateTime<Utc>) -> DateTime<Utc> {
         .expect("January 1st exists")
 }
 
-/// The seller's counted orders since `from`: paid orders (a confirmed
-/// payment since `from`, whatever became of the order afterwards) and open
-/// orders (`pending_payment`, created since `from`). Totals are converted to
-/// euro cents with the persisted reference rates, per currency, rounding up.
+/// The seller's counted orders since `from`: paid orders only, meaning a
+/// confirmed payment since `from`, whatever became of the order afterwards
+/// (a refunded or cancelled sale still counts). Open orders do not count.
+/// `exclude_order` leaves one order out, so an order being paid is not
+/// counted against itself. Totals are converted to euro cents with the
+/// persisted reference rates, per currency, rounding up.
 pub async fn usage(
     conn: &mut PgConnection,
     seller_pubky: &str,
     from: DateTime<Utc>,
     scope: Scope,
+    exclude_order: Option<Uuid>,
     now: DateTime<Utc>,
 ) -> Result<Usage, CommandFailure> {
     let rows: Vec<(String, i32, i64, i64)> = sqlx::query_as(
@@ -408,12 +418,12 @@ pub async fn usage(
          FROM orders o \
          WHERE o.seller_pubky = $1 \
            AND ($3 = false OR o.buyer_country = ANY($4)) \
-           AND ((o.state = 'pending_payment' AND o.created_at >= $2) \
-                OR EXISTS ( \
-                  SELECT 1 FROM payments p \
-                  JOIN events e ON e.aggregate_id = 'payment:' || p.id::text \
-                   AND e.kind = 'payment.confirmed' \
-                  WHERE p.order_id = o.id AND e.occurred_at >= $2)) \
+           AND ($5::uuid IS NULL OR o.id <> $5) \
+           AND EXISTS ( \
+                SELECT 1 FROM payments p \
+                JOIN events e ON e.aggregate_id = 'payment:' || p.id::text \
+                 AND e.kind = 'payment.confirmed' \
+                WHERE p.order_id = o.id AND e.occurred_at >= $2) \
          GROUP BY o.currency, o.exponent",
     )
     .bind(seller_pubky)
@@ -425,6 +435,7 @@ pub async fn usage(
             .map(|code| code.to_string())
             .collect::<Vec<_>>(),
     )
+    .bind(exclude_order)
     .fetch_all(&mut *conn)
     .await
     .map_err(|error| {
@@ -497,33 +508,123 @@ pub async fn check_limits(
         }
         None => 1,
     };
-    let exceeds = |usage: &Usage| {
-        usage.sales + 1 > ANNUAL_SALES_LIMIT
-            || usage.eur_cents.saturating_add(new_cents) > ANNUAL_EUR_LIMIT_CENTS
-    };
-    let reason = |usage: &Usage| {
-        if usage.sales + 1 > ANNUAL_SALES_LIMIT {
-            REASON_SALES_LIMIT
-        } else {
-            REASON_AMOUNT_LIMIT
-        }
-    };
     if annual_limit {
-        let annual = usage(conn, seller_pubky, year_start(now), Scope::AllBuyers, now).await?;
-        if exceeds(&annual) {
-            return Err(limit_refusal(reason(&annual)));
+        let annual = usage(
+            conn,
+            seller_pubky,
+            year_start(now),
+            Scope::AllBuyers,
+            None,
+            now,
+        )
+        .await?;
+        if let Some(reason) = exceeded_by(&annual, new_cents) {
+            return Err(limit_refusal(reason));
         }
     }
     if reconfirmation {
         let from = facts
             .status_confirmed_at
             .map_or(year_start(now), |confirmed| confirmed.max(year_start(now)));
-        let eu_sales = usage(conn, seller_pubky, from, Scope::EuBuyers, now).await?;
-        if exceeds(&eu_sales) {
+        let eu_sales = usage(conn, seller_pubky, from, Scope::EuBuyers, None, now).await?;
+        if exceeded_by(&eu_sales, new_cents).is_some() {
             return Err(region_refusal(REASON_RECONFIRM, RECONFIRM_MESSAGE));
         }
     }
     Ok(())
+}
+
+/// The annual limit check where money is taken (legal launch plan C4, LG15):
+/// at payment start, so a buyer is not asked to pay a seller already at the
+/// limit, and at payment confirmation, so a payment that would cross 29
+/// sales or EUR 2,000 is never marked paid.
+///
+/// Nothing reserves a slot before payment, so several unpaid orders and
+/// several payments in flight can each pass the order-time check; this is the
+/// check that decides. It counts the seller's paid orders other than
+/// `order_id`, under the same per-seller advisory lock the order-time check
+/// takes, so two payments confirming at once cannot both take the last slot.
+///
+/// The seller's residence is the country frozen on the order at its payment
+/// start (`orders.seller_country`), not a fresh shop read: a payment is
+/// never coupled to the homeserver being reachable. No frozen country means
+/// no residence and no cap, as at order time. The seller's other-country
+/// re-confirmation point is not re-checked here.
+///
+/// `Err` is the refusal `SELLER_ANNUAL_LIMIT_REACHED`. At payment start the
+/// caller returns it and the buyer never pays. At confirmation the money is
+/// already on its way (the marketplace never holds funds), so every
+/// confirming path treats it like any other order that can no longer be
+/// confirmed: the payment goes to `manual_review`, nothing is marked paid,
+/// no receipt is issued and the seller and ops decide the refund.
+pub async fn recheck_at_payment(
+    tx: &mut Transaction<'_, Postgres>,
+    order_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<(), CommandFailure> {
+    let row: Option<(String, Option<String>, i64, String, i32)> = sqlx::query_as(
+        "SELECT seller_pubky, seller_country, total_minor, currency, exponent \
+         FROM orders WHERE id = $1",
+    )
+    .bind(order_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, "eu fence could not read the order to pay");
+        unavailable()
+    })?;
+    let Some((seller_pubky, seller_country, total_minor, currency, exponent)) = row else {
+        return Err(unavailable());
+    };
+    if !seller_country.as_deref().is_some_and(is_eu_country) {
+        return Ok(());
+    }
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, $2))")
+        .bind(&seller_pubky)
+        .bind(SELLER_LOCK_SEED)
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "eu fence could not lock the seller's counters");
+            unavailable()
+        })?;
+    let new_cents = eur_cents(tx, &currency, exponent, total_minor, now).await?;
+    let annual = usage(
+        tx,
+        &seller_pubky,
+        year_start(now),
+        Scope::AllBuyers,
+        Some(order_id),
+        now,
+    )
+    .await?;
+    match exceeded_by(&annual, new_cents) {
+        None => Ok(()),
+        Some(reason) => {
+            tracing::error!(
+                order_id = %order_id,
+                seller_pubky = %seller_pubky,
+                reason,
+                paid_sales = annual.sales,
+                paid_eur_cents = annual.eur_cents,
+                "ALERT eu_annual_limit_at_payment: a payment would cross the EU seller's annual \
+                 limit; it is refused at payment start or sent to manual review at confirmation \
+                 (order_id={order_id} seller_pubky={seller_pubky})"
+            );
+            Err(limit_refusal(reason))
+        }
+    }
+}
+
+/// Which limit one more sale of `new_cents` would cross, if either.
+fn exceeded_by(usage: &Usage, new_cents: u64) -> Option<&'static str> {
+    if usage.sales + 1 > ANNUAL_SALES_LIMIT {
+        Some(REASON_SALES_LIMIT)
+    } else if usage.eur_cents.saturating_add(new_cents) > ANNUAL_EUR_LIMIT_CENTS {
+        Some(REASON_AMOUNT_LIMIT)
+    } else {
+        None
+    }
 }
 
 /// `GET /v1/sellers/{seller_pubky}/annual-limit`: what the annual limit
@@ -579,7 +680,7 @@ pub async fn get_annual_limit(
     };
     let year = year_start(now);
     let annual = if facts.resident_in_eu() {
-        match usage(&mut conn, &seller_pubky, year, Scope::AllBuyers, now).await {
+        match usage(&mut conn, &seller_pubky, year, Scope::AllBuyers, None, now).await {
             Ok(annual) => Some(annual),
             Err(refusal) => return failure(refusal),
         }
@@ -606,7 +707,7 @@ pub async fn get_annual_limit(
             let from = facts
                 .status_confirmed_at
                 .map_or(year, |confirmed| confirmed.max(year));
-            match usage(&mut conn, &seller_pubky, from, Scope::EuBuyers, now).await {
+            match usage(&mut conn, &seller_pubky, from, Scope::EuBuyers, None, now).await {
                 Ok(eu) => {
                     body["eu_buyer_sales"] = json!(eu.sales);
                     body["eu_buyer_eur_cents"] = json!(eu.eur_cents);

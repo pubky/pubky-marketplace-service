@@ -121,6 +121,13 @@ pub async fn advance(
     let order = if payment.state == "awaiting_entitlement" {
         crate::seller_terms::capture_for_order(tx, homeserver, order.id, &order.seller_pubky, now)
             .await?;
+        // The annual limit at payment start, before any listing lock so the
+        // per-seller counter lock stays first (`docs/lock-order.md`).
+        if keys.eu_fence_enabled && payload.target == SandboxPaymentTarget::Confirmed {
+            if let Err(failure) = crate::region_fence::recheck_at_payment(tx, order.id, now).await {
+                return Ok(Err(failure));
+            }
+        }
         match crate::handlers::holds::acquire_payment_hold(
             tx,
             order,
@@ -270,6 +277,17 @@ pub(crate) async fn confirm_order(
             ErrorCode::InvalidState,
             "The order can no longer be paid.",
         )));
+    }
+    // The EU seller's annual limit (legal launch plan C4): a payment that
+    // would cross 29 sales or EUR 2,000 is not marked paid. Every caller
+    // already treats a refusal here as "money seen, order cannot confirm",
+    // which is the manual-review route. First among the confirmation locks:
+    // the per-seller counter lock comes before the drop and listing rows
+    // (`docs/lock-order.md`).
+    if keys.eu_fence_enabled {
+        if let Err(failure) = crate::region_fence::recheck_at_payment(tx, order.id, now).await {
+            return Ok(Err(failure));
+        }
     }
     // The money rails route an undeliverable digital order to the refund
     // path before calling this (§6 D3); every other caller is refused

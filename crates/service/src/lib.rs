@@ -83,6 +83,9 @@ use crate::refusal_audit::RefusalAuditRuntime;
 pub struct ConfirmKeys<'a> {
     pub pickup: Option<&'a PickupKeys>,
     pub digital: Option<&'a DigitalKeys>,
+    /// `EU_FENCE_ENABLED`: confirmation re-checks the seller's annual limit
+    /// ([`region_fence::recheck_at_payment`]).
+    pub eu_fence_enabled: bool,
 }
 
 #[derive(Clone)]
@@ -187,6 +190,7 @@ impl AppState {
         ConfirmKeys {
             pickup: self.pickup.as_deref(),
             digital: self.digital.as_deref(),
+            eu_fence_enabled: self.config.eu_fence_enabled,
         }
     }
 }

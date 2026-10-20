@@ -1277,7 +1277,27 @@ async fn apply_outcome_effects(
     now: DateTime<Utc>,
 ) -> Result<OrderRow, ResolutionFailure> {
     match input.outcome {
-        "paid" => apply_paid_effects(tx, state, order, payment, input, now).await,
+        "paid" => {
+            // The EU seller's annual limit (legal launch plan C4): a seller
+            // cannot resolve into `paid` a payment that would cross it; the
+            // funds go back. Checked first so the per-seller counter lock
+            // stays ahead of the listing locks the paid effects take.
+            if state.config.eu_fence_enabled {
+                match crate::region_fence::recheck_at_payment(tx, order.id, now).await {
+                    Ok(()) => {}
+                    Err(failure) if failure.code() == ErrorCode::SellerAnnualLimitReached => {
+                        return Err(ResolutionFailure::RefundRequired);
+                    }
+                    Err(failure) => {
+                        return Err(ResolutionFailure::Internal(
+                            "annual limit check".into(),
+                            failure.message().to_string(),
+                        ));
+                    }
+                }
+            }
+            apply_paid_effects(tx, state, order, payment, input, now).await
+        }
         "refunded" => apply_refunded_effects(tx, order, payment, input, now).await,
         _ => apply_abandoned_effects(tx, order, input, now).await,
     }
@@ -1332,7 +1352,9 @@ async fn apply_paid_effects(
     {
         Ok((order, _receipt, _event)) => Ok(order),
         Err(failure) => {
-            if failure.code() == ErrorCode::InsufficientInventory
+            if failure.code() == ErrorCode::SellerAnnualLimitReached {
+                Err(ResolutionFailure::RefundRequired)
+            } else if failure.code() == ErrorCode::InsufficientInventory
                 || failure.code() == ErrorCode::InvalidState
             {
                 Err(ResolutionFailure::StockUnavailable)
@@ -1627,6 +1649,34 @@ pub(crate) async fn apply_late_money(
         return Ok(LateMoneyOutcome::HeldLateSettlement);
     }
 
+    // The EU seller's annual limit (legal launch plan C4): late money that
+    // would cross it is never marked paid. It takes the refund-required
+    // shape, like money whose unit is gone. Checked before the reacquire so
+    // the per-seller counter lock stays ahead of the listing locks.
+    if keys.eu_fence_enabled {
+        match crate::region_fence::recheck_at_payment(tx, order.id, now).await {
+            Ok(()) => {}
+            Err(failure) if failure.code() == ErrorCode::SellerAnnualLimitReached => {
+                refund_required(
+                    tx,
+                    payment,
+                    order,
+                    "seller annual limit reached",
+                    command_id,
+                    event_actor,
+                    now,
+                )
+                .await?;
+                return Ok(LateMoneyOutcome::RefundRequired);
+            }
+            Err(failure) => {
+                return Err(ResolutionFailure::Internal(
+                    "annual limit check".into(),
+                    failure.message().to_string(),
+                ));
+            }
+        }
+    }
     // A failed reacquire must leave nothing behind: the reservation flip or
     // drop debit it already made would otherwise outlive the refund path.
     let mut reacquire = sqlx::Acquire::begin(&mut **tx)

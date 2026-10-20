@@ -383,8 +383,15 @@ request failed, so clients should branch on HTTP status first, and parse
    or EUR 2,000 to EU buyers since their `sellerStatusConfirmedAt`).
    `SELLER_ANNUAL_LIMIT_REACHED` has `reason` `annual_sales_limit` or
    `annual_amount_limit`: a seller whose shop country is in the EU-27 stops at 29
-   paid or open orders or EUR 2,000 in total this calendar year (UTC), whichever
-   comes first. A shop
+   paid orders or EUR 2,000 of paid orders this calendar year (UTC), whichever
+   comes first; open orders do not count. It is also the answer when a payment
+   would cross the limit, from `POST /v0/orders/{id}/payment-method`, from
+   `payment.prepare_locks` and from the sandbox payment, and to
+   `POST /v0/orders/{id}/confirm-bitcoin-payment` for a seller whose own
+   confirmation would cross it. A payment that settles after the last slot is
+   gone is not refused (the funds are already on their way): it goes to
+   `manual_review` and can only be resolved as `refunded`. A seller with no
+   usable shop country has no limit. A shop
    record the service cannot read is refused with `UPSTREAM_UNAVAILABLE`.
 
    `DIGITAL_UNAVAILABLE_IN_REGION` exists only while
