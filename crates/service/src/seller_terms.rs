@@ -14,6 +14,13 @@
 //! launch plan C1): `sellerStatus` ("private" or "trader"; "undeclared" for a
 //! record without a usable declaration) and `location.countryCode`. They are
 //! stored for the audit trail and read by nothing that sells.
+//!
+//! It also freezes the seller's Bitcoin confirmation option (legal launch plan
+//! B4): `bitcoinConfirmation: "seller"` in the shop record means the seller
+//! confirms their own Bitcoin payments (`orders.seller_confirms_bitcoin`
+//! true); any other value, or no record, means they do not (false). An
+//! unreadable record leaves it NULL, which the Paykit poll reads as "not opted
+//! in" after an ALERT, so an outage can never hold a payment.
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -33,6 +40,19 @@ pub const MAX_TERM_DAYS: i64 = 60;
 const DELIVERY_ASSUME_FIELD: &str = "deliveryAssumeDays";
 /// Shop-record field naming the days after delivery when the order completes.
 const AUTO_COMPLETE_FIELD: &str = "autoCompleteDays";
+/// Shop-record field naming who confirms the seller's Bitcoin payments.
+const BITCOIN_CONFIRMATION_FIELD: &str = "bitcoinConfirmation";
+/// The value that makes the seller confirm their own Bitcoin payments.
+const BITCOIN_CONFIRMATION_SELLER: &str = "seller";
+
+/// Whether a shop record opts the seller in to confirming their own Bitcoin
+/// payments.
+pub fn confirms_bitcoin_payments(record: &Value) -> bool {
+    record
+        .get(BITCOIN_CONFIRMATION_FIELD)
+        .and_then(Value::as_str)
+        == Some(BITCOIN_CONFIRMATION_SELLER)
+}
 
 /// The periods a seller set. `None` means unset: the configured default
 /// applies when the sweeps run.
@@ -118,16 +138,22 @@ pub async fn capture_for_order(
     if already_captured {
         return Ok(());
     }
-    let (terms, declaration) = match homeserver {
-        None => (SellerDeliveryTerms::default(), SellerDeclaration::default()),
+    let (terms, declaration, confirms_bitcoin) = match homeserver {
+        None => (
+            SellerDeliveryTerms::default(),
+            SellerDeclaration::default(),
+            Some(false),
+        ),
         Some(homeserver) => match homeserver.fetch_shop(seller_pubky).await {
             HomeserverFetchOutcome::Found(record) => (
                 SellerDeliveryTerms::from_shop_record(&record),
                 SellerDeclaration::from_shop_record(&record),
+                Some(confirms_bitcoin_payments(&record)),
             ),
             HomeserverFetchOutcome::NotFound => (
                 SellerDeliveryTerms::default(),
                 SellerDeclaration::undeclared(),
+                Some(false),
             ),
             HomeserverFetchOutcome::Unavailable => {
                 tracing::error!(
@@ -135,15 +161,21 @@ pub async fn capture_for_order(
                     order_id = %order_id,
                     "ALERT seller_terms_fallback_unreadable_shop_record: seller shop record \
                      unreadable at payment start; order frozen with the configured default \
-                     delivery periods (seller_pubky={seller_pubky} order_id={order_id})"
+                     delivery periods and no seller confirmation \
+                 (seller_pubky={seller_pubky} order_id={order_id})"
                 );
-                (SellerDeliveryTerms::default(), SellerDeclaration::default())
+                (
+                    SellerDeliveryTerms::default(),
+                    SellerDeclaration::default(),
+                    None,
+                )
             }
         },
     };
     sqlx::query(
         "UPDATE orders SET delivery_assume_days = $2, auto_complete_days = $3, \
-         delivery_terms_captured_at = $4, seller_status = $5, seller_country = $6 \
+         delivery_terms_captured_at = $4, seller_status = $5, seller_country = $6, \
+         seller_confirms_bitcoin = $7 \
          WHERE id = $1 AND delivery_terms_captured_at IS NULL",
     )
     .bind(order_id)
@@ -152,6 +184,7 @@ pub async fn capture_for_order(
     .bind(now)
     .bind(declaration.status.map(SellerStatus::as_str))
     .bind(declaration.country)
+    .bind(confirms_bitcoin)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -176,6 +209,23 @@ mod tests {
                 auto_complete_days: Some(30),
             }
         );
+    }
+
+    #[test]
+    fn only_the_seller_value_opts_in_to_confirming_bitcoin_payments() {
+        assert!(confirms_bitcoin_payments(
+            &json!({ "bitcoinConfirmation": "seller" })
+        ));
+        for record in [
+            json!({}),
+            json!({ "bitcoinConfirmation": "paykit" }),
+            json!({ "bitcoinConfirmation": "Seller" }),
+            json!({ "bitcoinConfirmation": true }),
+            json!({ "bitcoinConfirmation": null }),
+            json!([]),
+        ] {
+            assert!(!confirms_bitcoin_payments(&record), "{record}");
+        }
     }
 
     #[test]

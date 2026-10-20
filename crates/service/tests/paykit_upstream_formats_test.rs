@@ -168,6 +168,7 @@ async fn fork_status_v2_bodies_parse_unchanged() {
                         confirmations: Some(2),
                         ..PaykitObservation::default()
                     },
+                    amount_matched: Some(true),
                 },
             },
             Some(PaykitDeliveryState::Delivered),
@@ -191,6 +192,7 @@ async fn fork_status_v2_bodies_parse_unchanged() {
                     confirmations: Some(0),
                     ..PaykitObservation::default()
                 },
+                amount_matched: Some(true),
             },
         }
     );

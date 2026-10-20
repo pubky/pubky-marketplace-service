@@ -330,6 +330,38 @@ and overwrite any client-sent value.
   (`offers_unavailable_for_digital`), and auctions ship only.
 - Buyers from every other country, and physical lines, are unaffected.
 
+### Seller confirmation of Bitcoin payments
+
+Legal launch plan B4, a seller option that is off unless the seller turns it
+on. A seller whose shop record says `bitcoinConfirmation: "seller"` confirms
+their own Bitcoin payments made through Paykit. Upstream Paykit reports every
+order as `exclusive`, so Bitcoin money seen on time would pay the order by
+itself. For an opted-in seller the service reads that report as
+`shared_manual` instead (`orders.seller_confirms_bitcoin`, frozen when the
+order's payment starts, so the option applies to new orders only): money that
+matches the order's amount enters the existing `awaiting_seller_confirmation`
+window, Paykit's report only informs the seller (`bitcoin_payment_seen`), and
+the seller's confirmation (`POST /v0/orders/{id}/confirm-bitcoin-payment`) is
+the only way the order is paid. The seller has 24 hours; after that the payment
+goes to manual review.
+
+- **Underpaid money is not shown to the seller as matching.** A `confirmed`
+  report whose amount does not match goes to manual review with the
+  amount-mismatch reason, exactly as for any other seller, and an unmatched
+  `detected` sighting stays a display-only detection. The amount flag a report
+  carries is stored with the observation, and a confirmation of an observation
+  that says the amount did not match is refused
+  (`confirmation_observation_mismatch`).
+- **Locks orders are not held.** A Locks order is paid when the Lock Server
+  reports the lifecycle completed; the Lock Server issues the unlock itself, so
+  the service cannot hold something it does not release. The option covers
+  Paykit Bitcoin payments only, and the Shop copy says so
+  (`a_sellers_bitcoin_confirmation_option_does_not_hold_a_locks_order`).
+- A late settlement still takes the late path, USDT is not affected, an order
+  on the fork API keeps the creator's own mode, and an order whose shop record
+  was unreadable at the payment start is not held (an
+  `ALERT seller_terms_fallback_unreadable_shop_record` is logged).
+
 ### Listing lifecycle
 
 A seller pauses, ends or removes a listing by rewriting `state` in its record

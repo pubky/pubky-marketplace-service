@@ -1996,6 +1996,9 @@ struct ClaimedPaykitOrder {
     paykit_allocation_mode: Option<String>,
     paykit_stack_id: Option<String>,
     paykit_stack_endpoint: Option<String>,
+    /// The seller's Bitcoin confirmation option frozen at the payment start
+    /// (`orders.seller_confirms_bitcoin`); NULL reads as not opted in.
+    seller_confirms_bitcoin: Option<bool>,
 }
 
 /// Claims a batch of bitcoin orders due for a paykit status poll by stamping
@@ -2041,7 +2044,7 @@ async fn claim_due_paykit_orders(
              FOR UPDATE OF o SKIP LOCKED\
          ) RETURNING id, payment_id, buyer_pubky, seller_pubky, paykit_invoice_id, paykit_api, \
          paykit_request_reference, paykit_request_state, paykit_expires_at, paykit_allocation_mode, \
-         paykit_stack_id, paykit_stack_endpoint",
+         paykit_stack_id, paykit_stack_endpoint, seller_confirms_bitcoin",
     )
     .bind(now)
     .bind(now - chrono::Duration::seconds(poll_seconds))
@@ -2745,7 +2748,14 @@ async fn apply_shared_manual_observation(
     keys: crate::ConfirmKeys<'_>,
     now: DateTime<Utc>,
 ) -> anyhow::Result<bool> {
-    if row.paykit_stack_id.is_none() || row.paykit_stack_endpoint.is_none() {
+    // A fork order resolves through the pinned stack; an upstream order has
+    // no stack and carries neither pin.
+    let resolution_pins_present = match row.paykit_api.as_str() {
+        "fork" => row.paykit_stack_id.is_some() && row.paykit_stack_endpoint.is_some(),
+        "upstream" => row.paykit_stack_id.is_none() && row.paykit_stack_endpoint.is_none(),
+        _ => false,
+    };
+    if !resolution_pins_present {
         tracing::error!(
             order_id = %row.id,
             code = "paykit_resolution_pins_missing",
@@ -2934,7 +2944,9 @@ async fn apply_report_inside_seller_window(
             facts,
         } => ("confirmed", *amount_matched, facts),
         PaykitStatusOutcome::AcceptancePending { facts } => ("confirmed", true, facts),
-        PaykitStatusOutcome::Detected { facts } => ("detected", true, facts),
+        PaykitStatusOutcome::Detected { facts } => {
+            ("detected", facts.amount_matched.unwrap_or(true), facts)
+        }
         PaykitStatusOutcome::ManualReview { .. } | PaykitStatusOutcome::UsdtObserved { .. } => {
             return Ok(false)
         }
@@ -3096,6 +3108,78 @@ async fn apply_upstream_manual_review(
     Ok(true)
 }
 
+/// The seller's Bitcoin confirmation option (legal launch plan B4). Upstream
+/// Paykit reports every order as `exclusive`, so a Bitcoin payment on time
+/// would pay the order by itself. For an order whose seller opted in at the
+/// payment start (`orders.seller_confirms_bitcoin`) the report is read as
+/// `shared_manual` instead: on-time matching money enters the existing
+/// seller-confirmation window and only the seller's attestation pays the
+/// order, and Paykit's report only informs the seller. A late settlement still
+/// takes the late path whatever the mode. USDT is not affected, and an order
+/// that did not opt in (or whose option was never read) is untouched.
+///
+/// Only money that matches the order's amount waits for the seller. A
+/// `confirmed` report whose amount does not match keeps the `exclusive` mode, so
+/// it takes the same route as for any other seller (durable manual review with
+/// the amount-mismatch reason), and an unmatched `detected` sighting stays a
+/// display-only detection. The seller is never shown a short payment as
+/// "waiting for your confirmation".
+fn with_seller_confirmation(
+    outcome: PaykitStatusOutcome,
+    row: &ClaimedPaykitOrder,
+) -> PaykitStatusOutcome {
+    if row.paykit_api != "upstream" || row.seller_confirms_bitcoin != Some(true) {
+        return outcome;
+    }
+    fn shared(mut facts: crate::payments::PaykitStatusFacts) -> crate::payments::PaykitStatusFacts {
+        if facts.allocation_mode == "exclusive" {
+            facts.allocation_mode = "shared_manual".to_string();
+        }
+        facts
+    }
+    match outcome {
+        PaykitStatusOutcome::Confirmed {
+            amount_matched,
+            facts,
+        } => PaykitStatusOutcome::Confirmed {
+            amount_matched,
+            facts: if amount_matched { shared(facts) } else { facts },
+        },
+        PaykitStatusOutcome::AcceptancePending { facts } => {
+            PaykitStatusOutcome::AcceptancePending {
+                facts: shared(facts),
+            }
+        }
+        PaykitStatusOutcome::Detected { facts } => PaykitStatusOutcome::Detected {
+            facts: if facts.amount_matched == Some(false) {
+                facts
+            } else {
+                shared(facts)
+            },
+        },
+        PaykitStatusOutcome::UsdtObserved {
+            usdt,
+            bitcoin,
+            payment_deadline,
+            paid_asset,
+        } => PaykitStatusOutcome::UsdtObserved {
+            usdt,
+            bitcoin: Box::new(with_seller_confirmation(*bitcoin, row)),
+            payment_deadline,
+            paid_asset,
+        },
+        other => other,
+    }
+}
+
+/// Whether the order's Bitcoin payments wait for the seller: a fork order the
+/// creator's mode pinned to `shared_manual`, or an upstream order whose seller
+/// opted in.
+fn waits_for_seller(row: &ClaimedPaykitOrder) -> bool {
+    row.paykit_allocation_mode.as_deref() == Some("shared_manual")
+        || (row.paykit_api == "upstream" && row.seller_confirms_bitcoin == Some(true))
+}
+
 /// Applies the polled paykit status for ONE claimed order. Errors
 /// propagate to the caller's per-item handler — one bad row must never
 /// stall the rest of the claimed batch.
@@ -3119,6 +3203,7 @@ async fn apply_paykit_status_outcome(
             row.paykit_expires_at,
         )
         .await;
+    let outcome = with_seller_confirmation(outcome, row);
     let recovered_deadline = match &outcome {
         PaykitStatusOutcome::Confirmed { facts, .. }
         | PaykitStatusOutcome::AcceptancePending { facts }
@@ -3273,7 +3358,7 @@ async fn apply_status_outcome(
                         &state.pool,
                         row,
                         "detected",
-                        true,
+                        facts.amount_matched.unwrap_or(true),
                         &facts.observation,
                         state.confirm_keys(),
                         now,
@@ -3292,7 +3377,7 @@ async fn apply_status_outcome(
             }
         }
         PaykitStatusOutcome::Undetected | PaykitStatusOutcome::ActiveUndetected { .. } => {
-            if row.paykit_allocation_mode.as_deref() == Some("shared_manual") {
+            if waits_for_seller(row) {
                 mark_shared_manual_disappeared(&state.pool, row, now).await
             } else {
                 Ok(false)
