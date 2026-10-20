@@ -1,0 +1,58 @@
+# http context. Shared by the image (nginx.conf.template) and tests/test.sh, which stubs
+# $geoip2_country_code. Expects $geoip2_country_code to be defined before this file is included.
+
+# Railway's edge overwrites X-Real-IP with the connecting client's address and reaches this
+# container from the shared address space 100.64.0.0/10; no other source is trusted for it.
+real_ip_header X-Real-IP;
+set_real_ip_from ${TRUSTED_EDGE_CIDR};
+
+# Sanctioned jurisdictions, the same rule as the GCP edge (shop-migration docs/geo-block).
+map $geoip2_country_code $g1_blocked {
+    default 0;
+    CU 1;
+    IR 1;
+    KP 1;
+    SY 1;
+    RU 1;
+    BY 1;
+}
+
+log_format edge '$time_iso8601 $request_method $uri $status country=$geoip2_country_code '
+                'g1=$g1_blocked upstream=$upstream_status rt=$request_time';
+access_log /dev/stdout edge;
+
+resolver ${RESOLVER} valid=5s ipv6=off;
+server_tokens off;
+
+server {
+    listen ${PORT};
+    client_max_body_size 0;
+
+    include /etc/nginx/edge/g1-block.conf;
+
+    location = /_edge/health {
+        access_log off;
+        default_type text/plain;
+        return 200 "ok\n";
+    }
+
+    location / {
+        set $upstream_origin ${UPSTREAM_ORIGIN};
+        proxy_pass $upstream_origin;
+        proxy_http_version 1.1;
+        proxy_request_buffering off;
+        proxy_read_timeout 120s;
+        proxy_send_timeout 120s;
+
+        # proxy_set_header replaces every client copy of a header, whatever its casing or how
+        # many times it was sent. An empty value is not sent at all, so a client can never
+        # supply X-Client-Region; with no country the service refuses digital lines.
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Client-Region $geoip2_country_code;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
+        proxy_set_header X-Forwarded-Host $http_host;
+        proxy_set_header Connection "";
+    }
+}

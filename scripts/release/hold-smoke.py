@@ -137,6 +137,7 @@ SWEEP_TIMEOUT_SECONDS = 900
 GUARD_TIMEOUT_SECONDS = 180
 PRODUCTION_HOST_MARKERS = (
     "marketplace-service-production-ce23",
+    "marketplace-edge-production",
     "shop.pubky.app",
     "-ce23.up.railway.app",
 )

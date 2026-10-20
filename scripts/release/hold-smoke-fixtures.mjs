@@ -51,7 +51,7 @@ import { crc32, deflateSync } from 'node:zlib';
 const SERVICE = process.env.MARKETPLACE_URL ?? 'https://staging-api.pubky.app';
 const NEXUS = process.env.NEXUS_URL ?? 'https://nexusd-staging-production.up.railway.app';
 const RELAY = process.env.HTTP_RELAY ?? 'https://httprelay.pubky.app/inbox';
-const PRODUCTION_HOST_MARKERS = ['marketplace-service-production-ce23', '-ce23.up.railway.app', 'shop.pubky.app'];
+const PRODUCTION_HOST_MARKERS = ['marketplace-service-production-ce23', '-ce23.up.railway.app', 'marketplace-edge-production', 'shop.pubky.app'];
 const LISTINGS = '/pub/pubky.app/marketplace/v1/listings';
 const MEDIA = '/pub/pubky.app/marketplace/v1/media';
 const KINDS = {
@@ -173,7 +173,7 @@ function check() {
   if (![shipping, pickup].every((r) => r.title.startsWith('SMOKE FIXTURE, do not buy') && r.variants[0].quantity === 1)) failures.push('title or quantity');
   const png = fixturePng();
   if (png.bytes.readUInt32BE(16) !== 64 || png.bytes.toString('ascii', 12, 16) !== 'IHDR') failures.push('fixture png');
-  if (!PRODUCTION_HOST_MARKERS.some((m) => 'https://marketplace-service-production-ce23.up.railway.app'.includes(m))) failures.push('production guard');
+  if (!['https://marketplace-service-production-ce23.up.railway.app', 'https://marketplace-edge-production.up.railway.app'].every((u) => PRODUCTION_HOST_MARKERS.some((m) => u.includes(m)))) failures.push('production guard');
   const stream = [
     { owner_id: pubky, id: 'a', title: 'anything' },
     { owner_id: 'z'.repeat(52), id: 'b', title: TITLE('pickup') },
