@@ -310,8 +310,8 @@ DELETE FROM _sqlx_migrations WHERE version IN (76, 77);
 `lock_timeout` like 0050). The seller's shop record option
 `bitcoinConfirmation: "seller"` is frozen on the order at its payment start with
 the delivery periods: true opted in, false not, NULL unreadable (the Paykit poll
-reads NULL as not opted in). It follows the EU fence's 0076 and 0077; 0078 is
-claimed by #161, so this lands with a gap. A binary from before 0079 never
+reads NULL as not opted in). It follows the EU fence's 0076 and 0077 and the Paykit-held
+sellers' 0078. A binary from before 0079 never
 sets or reads the column.
 
 ### Backing out 0079
@@ -326,13 +326,12 @@ DELETE FROM _sqlx_migrations WHERE version = 79;
 
 ## Numbers claimed by open pull requests
 
-`main` has 0001 to 0077 (0068 and 0069 were never used). A new migration must
+`main` has 0001 to 0078 (0068 and 0069 were never used). A new migration must
 check the open list (`gh pr list`) and take the next free number rather than
 assume it is free:
 
 | Number | File | Pull request |
 | --- | --- | --- |
-| 0078 | `0078_paykit_known_sellers.sql` | #161 (renumbered from 0076, which the EU fence took) |
 | 0079 | `0079_seller_confirms_bitcoin.sql` | #162 (seller Bitcoin confirmation) |
 
 This table describes unmerged work and goes stale as pull requests land; trust

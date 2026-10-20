@@ -574,7 +574,9 @@ fn migration_catalog_is_gapless_through_0061_then_0070_to_0079() {
     // per-variant prices 0075, the EU fence columns and index 0076 and 0077,
     // the Paykit-held sellers 0078 and the seller Bitcoin confirmation option 0079.
     let expected = (1..=61)
-        .chain([62, 63, 64, 65, 66, 67, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79])
+        .chain([
+            62, 63, 64, 65, 66, 67, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79,
+        ])
         .collect::<Vec<_>>();
     assert_eq!(
         sorted_migration_catalog(numbers),
