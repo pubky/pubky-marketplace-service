@@ -47,11 +47,13 @@ server {
         # proxy_set_header replaces every client copy of a header, whatever its casing or how
         # many times it was sent. An empty value is not sent at all, so a client can never
         # supply X-Client-Region; with no country the service refuses digital lines.
+        # Host and X-Forwarded-Host are whatever the client sent; nothing at the service may build
+        # an absolute URL from them (it uses PUBLIC_SERVICE_ORIGIN).
         proxy_set_header Host $http_host;
         proxy_set_header X-Client-Region $geoip2_country_code;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $remote_addr;
-        proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
+        proxy_set_header X-Forwarded-Proto https;
         proxy_set_header X-Forwarded-Host $http_host;
         proxy_set_header Connection "";
     }

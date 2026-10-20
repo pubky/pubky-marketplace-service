@@ -6,7 +6,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # DB-IP Lite country database (CC BY 4.0, https://db-ip.com), current month with the previous month
-# as fallback. The build stops unless the file answers a known address.
+# as fallback. The build stops unless the file maps the probe addresses in geoip-selftest.sh to the
+# expected countries. The file's sha256 is printed so the exact database behind an image can be audited.
+COPY geoip-selftest.sh /usr/local/bin/geoip-selftest.sh
 RUN set -eu; \
     mkdir -p /usr/share/GeoIP; \
     for month in "$(date -u +%Y-%m)" "$(date -u -d '-1 month' +%Y-%m)"; do \
@@ -18,8 +20,8 @@ RUN set -eu; \
     done; \
     rm -f /tmp/country.mmdb.gz; \
     test -s /usr/share/GeoIP/country.mmdb; \
-    mmdblookup --file /usr/share/GeoIP/country.mmdb --ip 8.8.8.8 country iso_code | grep -q '"US"'; \
-    mmdblookup --file /usr/share/GeoIP/country.mmdb --ip 5.9.0.1 country iso_code | grep -q '"DE"'
+    sha256sum /usr/share/GeoIP/country.mmdb; \
+    sh /usr/local/bin/geoip-selftest.sh /usr/share/GeoIP/country.mmdb
 
 COPY nginx.conf.template /etc/nginx/edge/nginx.conf.template
 COPY proxy.conf.template /etc/nginx/edge/proxy.conf.template

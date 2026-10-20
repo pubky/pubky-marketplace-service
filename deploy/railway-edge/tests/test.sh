@@ -83,6 +83,8 @@ check "lower-case client header replaced" "$(seen -H 'X-Test-Country: FR' -H 'x-
 check "unknown country sends no header" "$(seen)" "-"
 check "client header dropped when the country is unknown" "$(seen -H 'X-Client-Region: CH')" "-"
 
+HDR=x-forwarded-proto
+check "client X-Forwarded-Proto replaced" "$(seen -H 'X-Forwarded-Proto: http')" "https"
 HDR=x-real-ip
 check "untrusted peer: X-Real-IP is the socket address" "$(seen -H 'X-Real-IP: 1.2.3.4')" "127.0.0.1"
 HDR=x-forwarded-for
@@ -97,14 +99,29 @@ done
 code="$(curl -s -o /dev/null -w '%{http_code}' -H 'X-Test-Country: DE' "http://127.0.0.1:$EDGE_PORT/v0/ping")"
 check "EU country is not blocked by G1" "$code" "200"
 code="$(curl -s -o /dev/null -w '%{http_code}' -H 'X-Test-Country: IR' "http://127.0.0.1:$EDGE_PORT/_edge/health")"
+check "G1 applies to the health path too" "$code" "403"
 code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$EDGE_PORT/_edge/health")"
 check "health answers 200" "$code" "200"
 
 start_edge 127.0.0.0/8
 HDR=x-real-ip
 check "trusted edge: X-Real-IP is the client address the edge reported" "$(seen -H 'X-Real-IP: 1.2.3.4')" "1.2.3.4"
+check "trusted edge: duplicate X-Real-IP, nginx takes the first (Railway overwrites it; checked live)" "$(seen -H 'X-Real-IP: 1.2.3.4' -H 'X-Real-IP: 9.9.9.9')" "1.2.3.4"
 HDR=x-forwarded-for
 check "trusted edge: forwarded single client address" "$(seen -H 'X-Forwarded-For: 5.6.7.8' -H 'X-Real-IP: 1.2.3.4')" "1.2.3.4"
+
+mkdir -p "$work/bin"
+cat > "$work/bin/mmdblookup" <<'FAKE'
+#!/bin/sh
+while [ $# -gt 0 ]; do [ "$1" = "--ip" ] && ip="$2"; shift; done
+cc="$(sed -n "s/^$ip \([A-Z][A-Z]\)$/\1/p" "$FAKE_DB")"
+printf '\n  "%s" <utf8_string>\n\n' "$cc"
+FAKE
+chmod +x "$work/bin/mmdblookup"
+awk '/^PROBES$/{p=0} p&&/^[0-9]/{print} /<<PROBES/{p=1}' "$edge/geoip-selftest.sh" > "$work/good.db"
+sed 's/^77.88.55.60 RU$/77.88.55.60 US/' "$work/good.db" > "$work/bad.db"
+check "self-test accepts a database that maps every probe correctly" "$(PATH="$work/bin:$PATH" FAKE_DB="$work/good.db" sh "$edge/geoip-selftest.sh" /dev/null >/dev/null 2>&1 && echo 0 || echo 1)" "0"
+check "self-test rejects a database that maps a G1 address elsewhere" "$(PATH="$work/bin:$PATH" FAKE_DB="$work/bad.db" sh "$edge/geoip-selftest.sh" /dev/null >/dev/null 2>&1 && echo 0 || echo 1)" "1"
 
 printf '\n%s checks, %s failed\n' "$total" "$fail"
 [ "$fail" -eq 0 ]

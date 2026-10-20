@@ -23,6 +23,16 @@ browser ──> marketplace-edge (public Railway domain, nginx + GeoIP) ──pr
 - The same rule as the GCP edge blocks CU, IR, KP, SY, RU and BY with `403` (`g1-block.conf`, copied from shop-migration
   `docs/geo-block`).
 - The service must have no public domain. With one, a client can reach the service directly and send the header itself.
+  Two standing invariants hold the trust model, because the service checks no secret (as on GCP): the service never regains a
+  public domain or TCP proxy, and no other service in the project forwards user requests to its private address.
+- `X-Real-IP` was measured on the live Railway edge with a spoofed single header, two headers in either order, a
+  comma-separated list, and a spoofed `X-Forwarded-For`: in every case the edge logged the connecting address's country
+  (here PT), never the spoofed one, so the Railway edge overwrites `X-Real-IP`. `X-Forwarded-For` is not usable as the source
+  instead: Railway sends `client, <edge hop>` where the hop is a public address, so walking it recursively from a trusted range
+  would stop at the hop. If Railway ever stopped overwriting `X-Real-IP`, a client could choose its own country, so repeat the
+  check after any Railway networking change.
+- `Host` and `X-Forwarded-Host` are the client's values; the service builds URLs from `PUBLIC_SERVICE_ORIGIN`, not from them.
+  `X-Forwarded-Proto` is always `https` (the public domain is HTTPS only).
 
 ## Variables (marketplace-edge)
 
@@ -47,16 +57,19 @@ cd /tmp/edge-deploy && railway up -s <marketplace-edge service id> -e <environme
 ```
 
 The image downloads the DB-IP Lite country database when it is built (current month, previous month as fallback) and the
-build fails unless the file answers 8.8.8.8 with `US` and 5.9.0.1 with `DE`. Redeploy about monthly to refresh it.
+build prints the file's sha256 and fails unless `geoip-selftest.sh` finds twelve probe addresses in their expected countries:
+the six G1 countries, DE, FR, NL, PL, GB and US. DB-IP publishes no checksum, so integrity rests on TLS to db-ip.com plus those
+probes (a database altered only elsewhere would pass). Redeploy about monthly to refresh it.
 The database is by [DB-IP](https://db-ip.com), licensed CC BY 4.0. It is not MaxMind's, so borderline addresses can resolve
 differently from the GCP edge.
 
 ## Tests
 
 `sh deploy/railway-edge/tests/test.sh` runs the same `proxy.conf.template` on a local nginx (realip module required) with the
-country read from an `X-Test-Country` header, in front of a stand-in service that reports the headers it receives: 19 checks
+country read from an `X-Test-Country` header, in front of a stand-in service that reports the headers it receives: 24 checks
 (country passed through, client-sent `X-Client-Region` single, duplicate and lower-case replaced, nothing sent for an unknown
-country, `X-Real-IP` honoured only from the trusted range, G1 `403`s). Removing the `X-Client-Region` line fails 6 of them.
+country, `X-Real-IP` honoured only from the trusted range, a client `X-Forwarded-Proto` replaced, G1 `403`s including on the
+health path, and the GeoIP self-test accepting a good database and rejecting one that maps a G1 address elsewhere). Removing the `X-Client-Region` line fails 6 of them.
 The GeoIP lookup itself is covered by the image build check and the live checks below.
 
 Live checks (no payment): from a US source and an EU source, request through the edge to an echo upstream and read the
