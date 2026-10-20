@@ -182,7 +182,7 @@ Railway IaC `preserve()`):
 | `PAYPAL_IPN_VERIFY_URL` | `https://ipnpb.paypal.com/cgi-bin/webscr` | PayPal's IPN validation endpoint; tests point it at a local double |
 | `PAYPAL_CHECKOUT_URL` | `https://www.paypal.com/cgi-bin/webscr` | PayPal `_xclick` checkout base. HTTPS only; host must be `www.paypal.com` (live) or `www.sandbox.paypal.com`. Default stays live. |
 | `REQUIRE_ENCRYPTED_DELIVERY_ADDRESS` | `false` | `true`/`1` refuses a checkout or award checkout that carries a plaintext `delivery_address` (422 `INVALID_COMMAND`, reason `encrypted_delivery_required`); only sealed envelopes are accepted. Leave unset until the Shop version that seals is the deployed one (see [Sealed delivery address](#sealed-delivery-address)) |
-| `EU_FENCE_ENABLED` | `false` | `true`/`1` turns on the EU scope fence (legal launch plan C2-C4): `buyer_country` becomes required on the selling commands, a buyer in the EU-27 buys only from sellers whose shop record says `sellerStatus: "private"`, and sellers whose shop country is in the EU-27 stop at 29 sales or EUR 2,000 a calendar year. Off, `buyer_country` is accepted and stored and nothing is refused on these grounds. See [EU scope fence](#eu-scope-fence) |
+| `EU_FENCE_ENABLED` | `false` | `true`/`1` turns on the EU scope fence (legal launch plan C2-C4): `buyer_country` becomes required on the selling commands, a buyer in the EU-27 buys only from sellers whose shop record says `sellerStatus: "private"`, and sellers whose shop country is in the EU-27 stop at 29 paid sales or EUR 2,000 of paid orders a calendar year (checked at checkout and again at payment). Off, `buyer_country` is accepted and stored and nothing is refused on these grounds. See [EU scope fence](#eu-scope-fence) |
 | `DIGITAL_REGION_BLOCK_ENABLED` | `false` | `true`/`1` refuses `checkout.create` (which carries drop claims) and `offer.checkout` that contain a digital line (any digital delivery kind, or a Locks listing) when `payload.buyer_country` is in the EU-27 or is `GB`: `DIGITAL_UNAVAILABLE_IN_REGION` (409), reason `eu_buyer` or `gb_buyer` for the declared country, `eu_ip` or `gb_ip` for the request's own country (read from `CLIENT_COUNTRY_HEADER`), `buyer_region_unknown` when the edge sent none; such a command must carry `buyer_country`. Independent of `EU_FENCE_ENABLED`. Off, nothing is refused. See [Digital sales to EU and UK buyers](#digital-sales-to-eu-and-uk-buyers) |
 | `CLIENT_COUNTRY_HEADER` | `x-client-region` | Name of the request header the trusted edge sets to the client's country (ISO alpha-2) from its IP. Read only by the digital hold (`DIGITAL_REGION_BLOCK_ENABLED`). GCP: a load-balancer custom request header `X-Client-Region:{client_region}`; Vercel: `x-vercel-ip-country`. The edge must set it itself and overwrite any value the client sent. Missing or unusable with the digital hold on: digital lines are refused (`buyer_region_unknown`) and an `ALERT digital_region_client_country_missing` is logged |
 | `ADDRESS_SEARCH_UPSTREAM_URL` | `https://photon.komoot.io` | Photon geocoder behind `POST /v0/address/suggest`. HTTPS only (http for loopback in tests). Point it at a self-hosted Photon to stop using the public instance |
@@ -267,24 +267,43 @@ With the flag on:
   unaffected.
 - **Annual limit.** A seller whose shop country is in the EU-27 stops at 29
   sales or EUR 2,000 in total per calendar year (UTC), whichever comes first
-  (29 sales of any size, or the euro total, whichever is reached first), counting paid
-  orders (a confirmed payment, even if the order was later cancelled or
-  refunded) and open orders (`pending_payment`) together: past it,
-  `SELLER_ANNUAL_LIMIT_REACHED` (409). Order totals convert to euro with the
-  persisted reference rates (`fx_rate_samples` medians), per currency,
-  rounding up; with no reference the order is refused as `UPSTREAM_UNAVAILABLE`
-  rather than waved through. Counting happens in the order's own transaction
-  under a per-seller advisory lock taken before any listing lock
-  ([lock order](docs/lock-order.md)), so concurrent checkouts cannot both take
-  the last slot. An offer or a bid on a seller already at the limit is refused
-  up front; an auction's winning order is counted but never refused, since
-  the bidder already won.
+  (29 sales of any size, or the euro total, whichever is reached first).
+  **Only paid orders count**: a confirmed payment, even if the order was later
+  cancelled or refunded. An open order (`pending_payment`) never uses a slot,
+  so unpaid checkouts cannot block a seller. Past the limit, a new order is
+  refused with `SELLER_ANNUAL_LIMIT_REACHED` (409). Order totals convert to
+  euro with the persisted reference rates (`fx_rate_samples` medians), per
+  currency, rounding up; with no reference the order is refused as
+  `UPSTREAM_UNAVAILABLE` rather than waved through. Counting happens under a
+  per-seller advisory lock taken before any listing lock
+  ([lock order](docs/lock-order.md)). An offer or a bid on a seller already at
+  the limit is refused up front; an auction's winning order is not refused when
+  it is created, since the bidder already won.
+- **The limit is checked again where money is taken.** Because open orders
+  reserve nothing, many can be open when the last slot goes. Payment start
+  (the Bitcoin or fiat bind, Locks preparation, the sandbox) refuses with
+  `SELLER_ANNUAL_LIMIT_REACHED` when the seller is at the limit or the payment
+  would cross it, so the buyer is not asked to pay. A payment already in flight
+  when the last slot goes cannot be refused, because the marketplace never
+  holds funds: at confirmation the payment goes to `manual_review`, the order
+  is not marked paid and no receipt is issued, and the seller can only record
+  it as `refunded` (resolving it as `paid` answers `refund_required`). The check counts the seller's other paid orders
+  under the same per-seller lock, so two payments confirming at once cannot
+  both take the last slot, and uses the seller's country frozen on the order at
+  payment start, so a payment never waits on the homeserver. An `ALERT
+  eu_annual_limit_at_payment` is logged each time. The same check covers a
+  late settlement (refund required) and the seller's own Bitcoin confirmation.
+- **No country, no cap.** A seller whose shop record has no usable
+  `location.countryCode` (missing, empty, or not two letters) has no residence
+  and no annual limit: the fence never reads a missing or unknown country as
+  EU. The regional gate and the re-confirmation point still apply to them.
 - **Re-confirmation.** A private seller of any country who reaches the same
   numbers in sales to EU buyers is refused further EU sales
   (`SELLER_UNAVAILABLE_IN_REGION`, `reason`
   `private_seller_reconfirmation_required`) until their shop record carries a
   `sellerStatusConfirmedAt` (RFC 3339, not in the future) later than those
-  sales; the count restarts at the confirmation.
+  sales; the count restarts at the confirmation. Paid sales count here too,
+  and the point is checked when an order is created, not again at payment.
 - A seller's shop record is read before the command's transaction, like the
   lifecycle gate, and fails closed: an unreadable record is
   `UPSTREAM_UNAVAILABLE` (`HOMESERVER_URL` is already required to boot).

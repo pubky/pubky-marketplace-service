@@ -1985,6 +1985,19 @@ pub async fn bind_payment_method(
     {
         return internal("seller delivery terms capture", &error);
     }
+    // The EU seller's annual limit (legal launch plan C4) at payment start:
+    // the buyer is not asked to pay a seller who has reached it. Before any
+    // listing lock, so the per-seller counter lock stays first.
+    if state.config.eu_fence_enabled {
+        if let Err(failure) = crate::region_fence::recheck_at_payment(&mut tx, order.id, now).await
+        {
+            return method_error(
+                failure.code(),
+                failure.reason().unwrap_or("annual_limit"),
+                failure.message(),
+            );
+        }
+    }
     let order = match crate::handlers::holds::acquire_payment_hold(
         &mut tx,
         order,

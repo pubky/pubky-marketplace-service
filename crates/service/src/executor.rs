@@ -794,6 +794,7 @@ async fn dispatch(
                 state.locks.as_deref(),
                 state.homeserver.as_deref(),
                 state.config.locks_payment_window_seconds,
+                state.config.eu_fence_enabled,
                 now,
             )
             .await

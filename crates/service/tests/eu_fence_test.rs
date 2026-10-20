@@ -2,9 +2,10 @@
 //!
 //! Off, the service accepts and stores the buyer's country and refuses
 //! nothing on these grounds. On, a buyer in the EU-27 buys only from a
-//! declared private seller, a seller resident in the EU stops at 29 sales or
-//! EUR 2,000 a calendar year, and a private seller selling to EU buyers must
-//! re-confirm after the same numbers.
+//! declared private seller, a seller resident in the EU stops at 29 paid sales
+//! or EUR 2,000 of paid orders a calendar year (unpaid orders never count, and
+//! the limit is checked again where the payment is taken), and a private
+//! seller selling to EU buyers must re-confirm after the same numbers.
 
 mod common;
 
@@ -180,13 +181,60 @@ async fn buyer_country_of_orders(app: &TestApp, seller: &TestActor) -> Vec<Optio
     .expect("order countries")
 }
 
-/// Fills a seller with `n` open (pending) orders from other buyers.
-async fn fill(app: &TestApp, seller: &TestActor, from: u64, n: u64, country: &str) {
+/// Gives a seller `n` open (pending) orders from one buyer. Open orders never
+/// count toward the annual limit.
+async fn open_orders(app: &TestApp, seller: &TestActor, from: u64, n: u64, country: &str) {
     let buyer = new_actor(app).await;
     for number in from..from + n {
         let result = buy(app, &buyer, seller, number, Some(country)).await;
         assert_accepted(&result);
     }
+}
+
+fn payment_id_of(result: &(StatusCode, Value)) -> String {
+    result.1["result"]["payments"][0]["id"]
+        .as_str()
+        .expect("payment id")
+        .to_string()
+}
+
+/// Confirms one order's payment on the sandbox, as its buyer.
+async fn pay(
+    app: &TestApp,
+    buyer: &TestActor,
+    payment_id: &str,
+    number: u64,
+) -> (StatusCode, Value) {
+    execute(
+        app,
+        &buyer.token,
+        &payment_command(payment_id, 1, "confirmed", 1, 10_000 + number),
+    )
+    .await
+}
+
+/// Gives a seller `n` paid orders from one buyer: the only orders that count.
+async fn fill(app: &TestApp, seller: &TestActor, from: u64, n: u64, country: &str) {
+    let buyer = new_actor(app).await;
+    for number in from..from + n {
+        let result = buy(app, &buyer, seller, number, Some(country)).await;
+        assert_accepted(&result);
+        let paid = pay(app, &buyer, &payment_id_of(&result), number).await;
+        assert_eq!(paid.0, StatusCode::OK, "paying order {number}: {}", paid.1);
+    }
+}
+
+async fn paid_events(app: &TestApp, seller: &TestActor) -> i64 {
+    let (total,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM events e JOIN payments p ON e.aggregate_id = 'payment:' || p.id::text \
+         JOIN orders o ON o.id = p.order_id \
+         WHERE e.kind = 'payment.confirmed' AND o.seller_pubky = $1",
+    )
+    .bind(&seller.pubky)
+    .fetch_one(&app.pool)
+    .await
+    .expect("paid events");
+    total
 }
 
 // --- flag off ---------------------------------------------------------------
@@ -209,9 +257,11 @@ async fn with_the_fence_off_nothing_is_refused_and_the_country_is_stored(pool: P
     let bad = buy(&app, &buyer, &trader.actor, 3, Some("fr")).await;
     assert_eq!(bad.0, StatusCode::UNPROCESSABLE_ENTITY, "{}", bad.1);
 
-    // Past 29 sales for an EU-resident seller: still nothing is refused.
+    // Past 29 paid sales for an EU-resident seller: still nothing is refused,
+    // and no payment is stopped at confirmation.
     fill(&app, &trader.actor, 100, 30, "DE").await;
     assert_eq!(orders_of(&app, &trader.actor).await, 32);
+    assert_eq!(paid_events(&app, &trader.actor).await, 30);
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
@@ -538,7 +588,7 @@ async fn a_shop_country_that_is_not_a_code_is_not_an_eu_residence(pool: PgPool) 
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn paid_orders_count_after_they_leave_pending_and_cancelled_ones_do_not(pool: PgPool) {
+async fn only_paid_orders_count_and_a_paid_order_that_is_later_cancelled_still_does(pool: PgPool) {
     let (app, homeserver) = app_with_fence(pool, true).await;
     seed_usd_and_eur(&app).await;
     let seller = Seller::new(&app, &homeserver, Some("private"), "FR", 100).await;
@@ -547,40 +597,45 @@ async fn paid_orders_count_after_they_leave_pending_and_cancelled_ones_do_not(po
     for number in 1..=29 {
         let result = buy(&app, &buyer, &seller.actor, number, Some("FR")).await;
         assert_accepted(&result);
-        payments.push(
-            result.1["result"]["payments"][0]["id"]
-                .as_str()
-                .expect("payment id")
-                .to_string(),
-        );
+        payments.push(payment_id_of(&result));
     }
+    // 29 open orders use no slot: a 30th and a 31st checkout are accepted.
+    assert_accepted(&buy(&app, &buyer, &seller.actor, 100, Some("FR")).await);
+    assert_accepted(&buy(&app, &buyer, &seller.actor, 101, Some("US")).await);
+
+    // Ten are paid: nine slots left, so checkouts still go through.
     for (index, payment_id) in payments.iter().take(10).enumerate() {
-        let (code, body) = execute(
-            &app,
-            &buyer.token,
-            &payment_command(payment_id, 1, "confirmed", 1, 2_000 + index as u64),
-        )
-        .await;
-        assert_eq!(code, StatusCode::OK, "payment failed: {body}");
+        let paid = pay(&app, &buyer, payment_id, index as u64 + 1).await;
+        assert_eq!(paid.0, StatusCode::OK, "payment failed: {}", paid.1);
     }
+    assert_accepted(&buy(&app, &buyer, &seller.actor, 102, Some("FR")).await);
+
+    // The 29th payment takes the last slot, and then no new order is taken.
+    for (index, payment_id) in payments.iter().enumerate().skip(10) {
+        let paid = pay(&app, &buyer, payment_id, index as u64 + 1).await;
+        assert_eq!(paid.0, StatusCode::OK, "payment failed: {}", paid.1);
+    }
+    assert_eq!(paid_events(&app, &seller.actor).await, 29);
     assert_refused(
-        &buy(&app, &buyer, &seller.actor, 100, Some("FR")).await,
+        &buy(&app, &buyer, &seller.actor, 200, Some("FR")).await,
         StatusCode::CONFLICT,
         "SELLER_ANNUAL_LIMIT_REACHED",
         Some("annual_sales_limit"),
     );
 
-    // The 19 unpaid orders lapse: only the 10 paid ones count.
-    sqlx::query("UPDATE orders SET state = 'cancelled' WHERE seller_pubky = $1 AND state = 'pending_payment'")
-        .bind(&seller.actor.pubky)
-        .execute(&app.pool)
-        .await
-        .expect("cancel the unpaid orders");
-    for number in 101..=119 {
-        assert_accepted(&buy(&app, &buyer, &seller.actor, number, Some("FR")).await);
-    }
+    // A sale that is cancelled or refunded afterwards keeps its slot: the
+    // payment was taken.
+    sqlx::query(
+        "UPDATE orders SET state = 'cancelled' WHERE seller_pubky = $1 AND id IN \
+         (SELECT o.id FROM orders o JOIN payments p ON p.order_id = o.id \
+          WHERE o.seller_pubky = $1 AND p.state = 'confirmed' LIMIT 5)",
+    )
+    .bind(&seller.actor.pubky)
+    .execute(&app.pool)
+    .await
+    .expect("cancel some paid orders");
     assert_refused(
-        &buy(&app, &buyer, &seller.actor, 120, Some("FR")).await,
+        &buy(&app, &buyer, &seller.actor, 201, Some("FR")).await,
         StatusCode::CONFLICT,
         "SELLER_ANNUAL_LIMIT_REACHED",
         Some("annual_sales_limit"),
@@ -595,6 +650,7 @@ async fn paid_orders_count_after_they_leave_pending_and_cancelled_ones_do_not(po
         &seller.actor.pubky,
         region_fence::year_start(now),
         Scope::AllBuyers,
+        None,
         now,
     )
     .await
@@ -606,11 +662,34 @@ async fn paid_orders_count_after_they_leave_pending_and_cancelled_ones_do_not(po
         &seller.actor.pubky,
         region_fence::year_start(next_year),
         Scope::AllBuyers,
+        None,
         now,
     )
     .await
     .expect("usage next year");
     assert_eq!(next, Usage::default());
+
+    // An order can be left out of the count, so a payment is not counted
+    // against itself.
+    let first: uuid::Uuid = sqlx::query_scalar(
+        "SELECT o.id FROM orders o JOIN payments p ON p.order_id = o.id \
+         WHERE o.seller_pubky = $1 AND p.state = 'confirmed' LIMIT 1",
+    )
+    .bind(&seller.actor.pubky)
+    .fetch_one(&app.pool)
+    .await
+    .expect("a paid order");
+    let without = region_fence::usage(
+        &mut conn,
+        &seller.actor.pubky,
+        region_fence::year_start(now),
+        Scope::AllBuyers,
+        Some(first),
+        now,
+    )
+    .await
+    .expect("usage without one order");
+    assert_eq!(without.sales, 28);
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
@@ -621,16 +700,36 @@ async fn an_eu_resident_seller_stops_at_2000_euro_converted_with_the_reference_r
     // 1,000.00 USD plus the 12.00 shipping is 910.80 EUR per order.
     let seller = Seller::priced(&app, &homeserver, Some("private"), "IE", 100_000).await;
     let buyer = new_actor(&app).await;
-    assert_accepted(&buy(&app, &buyer, &seller.actor, 1, Some("IE")).await);
-    assert_accepted(&buy(&app, &buyer, &seller.actor, 2, Some("US")).await);
-    // 3 x 910.80 = 2,732.40 EUR: the third order would pass 2,000.
+    let first = buy(&app, &buyer, &seller.actor, 1, Some("IE")).await;
+    assert_accepted(&first);
+    let second = buy(&app, &buyer, &seller.actor, 2, Some("US")).await;
+    assert_accepted(&second);
+    // Open orders carry no amount: both are accepted and neither is counted.
+    let third = buy(&app, &buyer, &seller.actor, 3, Some("US")).await;
+    assert_accepted(&third);
+    assert_eq!(
+        pay(&app, &buyer, &payment_id_of(&first), 1).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        pay(&app, &buyer, &payment_id_of(&second), 2).await.0,
+        StatusCode::OK
+    );
+    // The third payment would take the paid total past 2,000 EUR: refused.
     assert_refused(
-        &buy(&app, &buyer, &seller.actor, 3, Some("US")).await,
+        &pay(&app, &buyer, &payment_id_of(&third), 3).await,
         StatusCode::CONFLICT,
         "SELLER_ANNUAL_LIMIT_REACHED",
         Some("annual_amount_limit"),
     );
-    assert_eq!(orders_of(&app, &seller.actor).await, 2);
+    // 3 x 910.80 = 2,732.40 EUR: a new order past two paid ones would pass 2,000.
+    assert_refused(
+        &buy(&app, &buyer, &seller.actor, 4, Some("US")).await,
+        StatusCode::CONFLICT,
+        "SELLER_ANNUAL_LIMIT_REACHED",
+        Some("annual_amount_limit"),
+    );
+    assert_eq!(orders_of(&app, &seller.actor).await, 3);
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
@@ -720,6 +819,29 @@ async fn an_offer_checkout_past_the_limit_is_refused_and_keeps_its_hold(pool: Pg
     .fetch_one(&app.pool)
     .await
     .expect("accepted offer row");
+    // 29 other paid orders already count. They are on a second listing, so
+    // the offered listing stays on the revision the offer was accepted on.
+    let history_aggregate = format!("listing:{}_history_01", seller.actor.pubky);
+    let mut history = common::register_listing_command(&seller.actor.pubky, "history_01", 100, 1);
+    history["payload"]["unit_price"]["amount_minor"] = json!(1_000);
+    assert_accepted(&execute(&app, &seller.actor.token, &history).await);
+    let other = new_actor(&app).await;
+    for number in 1..=29u64 {
+        let mut order = checkout(&seller.actor, number, Some("DE"));
+        order["payload"]["lines"][0]["listing_aggregate_id"] = json!(history_aggregate);
+        let revision: i64 =
+            sqlx::query_scalar("SELECT server_revision FROM listings WHERE aggregate_id = $1")
+                .bind(&history_aggregate)
+                .fetch_one(&app.pool)
+                .await
+                .expect("history listing revision");
+        order["payload"]["lines"][0]["expected_revision"] = json!(revision);
+        let placed = execute(&app, &other.token, &order).await;
+        assert_accepted(&placed);
+        let paid = pay(&app, &other, &payment_id_of(&placed), number).await;
+        assert_eq!(paid.0, StatusCode::OK, "paying order {number}: {}", paid.1);
+    }
+    assert_eq!(paid_events(&app, &seller.actor).await, 29);
     let command = |country: Option<&str>, id: &str| {
         let mut command = json!({
             "version": 1,
@@ -752,21 +874,6 @@ async fn an_offer_checkout_past_the_limit_is_refused_and_keeps_its_hold(pool: Pg
         }
         command
     };
-    // 29 other open orders already count. The accepted offer holds a unit,
-    // so the listing is on a later revision than registration.
-    let revision: i64 =
-        sqlx::query_scalar("SELECT server_revision FROM listings WHERE seller_pubky = $1")
-            .bind(&seller.actor.pubky)
-            .fetch_one(&app.pool)
-            .await
-            .expect("listing revision");
-    let other = new_actor(&app).await;
-    for number in 1..=29 {
-        let mut order = checkout(&seller.actor, number, Some("DE"));
-        order["payload"]["lines"][0]["expected_revision"] = json!(revision);
-        assert_accepted(&execute(&app, &other.token, &order).await);
-    }
-
     let missing = execute(
         &app,
         &buyer.token,
@@ -801,15 +908,13 @@ async fn an_offer_checkout_past_the_limit_is_refused_and_keeps_its_hold(pool: Pg
             .expect("reservation");
     assert_eq!(reservation, "active");
 
-    // One open order lapses and the same buyer checks the offer out.
-    sqlx::query(
-        "UPDATE orders SET state = 'cancelled' WHERE seller_pubky = $1 AND state = 'pending_payment' \
-         AND id = (SELECT id FROM orders WHERE seller_pubky = $1 LIMIT 1)",
-    )
-    .bind(&seller.actor.pubky)
-    .execute(&app.pool)
-    .await
-    .expect("cancel one order");
+    // The seller moves out of the EU and re-confirms their status: no
+    // residence, no limit, and the same buyer checks the offer out.
+    app.clock.advance_seconds(5);
+    let mut record = shop_record(&seller.actor, Some("private"), "CH");
+    record["sellerStatusConfirmedAt"] = json!(app.clock.now().to_rfc3339());
+    homeserver.put_shop_record(&seller.actor.pubky, record);
+    app.clock.advance_seconds(5);
     let accepted = execute(
         &app,
         &buyer.token,
@@ -835,11 +940,13 @@ async fn concurrent_buys(
     first_number: u64,
     country: &str,
 ) -> Vec<(StatusCode, Value)> {
+    let revision = listing_revision(app, seller).await;
     let mut tasks = tokio::task::JoinSet::new();
     for (index, buyer) in buyers.iter().enumerate() {
         let router = app.router.clone();
         let token = buyer.token.clone();
-        let command = checkout(seller, first_number + index as u64, Some(country));
+        let mut command = checkout(seller, first_number + index as u64, Some(country));
+        command["payload"]["lines"][0]["expected_revision"] = json!(revision);
         tasks.spawn(
             async move { send(router, "POST", "/v1/commands", Some(&token), &command).await },
         );
@@ -851,50 +958,224 @@ async fn concurrent_buys(
     results
 }
 
+async fn buyers(app: &TestApp, n: usize) -> Vec<TestActor> {
+    // Sessions are issued before anything runs: `authenticate` moves the
+    // shared test clock while it works.
+    let mut buyers = Vec::new();
+    for _ in 0..n {
+        buyers.push(new_actor(app).await);
+    }
+    buyers
+}
+
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn concurrent_checkouts_cannot_both_take_the_last_slot(pool: PgPool) {
+async fn concurrent_checkouts_all_succeed_because_open_orders_use_no_slot(pool: PgPool) {
     let (app, homeserver) = app_with_fence(pool, true).await;
     seed_usd_and_eur(&app).await;
     let seller = Seller::new(&app, &homeserver, Some("private"), "DE", 100).await;
     fill(&app, &seller.actor, 1, 28, "DE").await;
-    let mut buyers = Vec::new();
-    for _ in 0..8 {
-        buyers.push(new_actor(&app).await);
-    }
+    let buyers = buyers(&app, 8).await;
 
     let results = concurrent_buys(&app, &seller.actor, &buyers, 1_000, "DE").await;
+    for result in &results {
+        assert_accepted(result);
+    }
+    assert_eq!(orders_of(&app, &seller.actor).await, 36);
+    assert_eq!(paid_events(&app, &seller.actor).await, 28);
+}
+
+/// Several unpaid orders, each from its own buyer, then all paid at once.
+async fn open_orders_from_distinct_buyers(
+    app: &TestApp,
+    seller: &TestActor,
+    first_number: u64,
+    n: usize,
+    country: &str,
+) -> Vec<(TestActor, String)> {
+    let mut orders = Vec::new();
+    for (index, buyer) in buyers(app, n).await.into_iter().enumerate() {
+        let result = buy(
+            app,
+            &buyer,
+            seller,
+            first_number + index as u64,
+            Some(country),
+        )
+        .await;
+        assert_accepted(&result);
+        let payment_id = payment_id_of(&result);
+        orders.push((buyer, payment_id));
+    }
+    orders
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn concurrent_payments_cannot_both_take_the_last_slot(pool: PgPool) {
+    let (app, homeserver) = app_with_fence(pool, true).await;
+    seed_usd_and_eur(&app).await;
+    let seller = Seller::new(&app, &homeserver, Some("private"), "DE", 100).await;
+    fill(&app, &seller.actor, 1, 28, "DE").await;
+    let orders = open_orders_from_distinct_buyers(&app, &seller.actor, 1_000, 8, "DE").await;
+
+    let mut tasks = tokio::task::JoinSet::new();
+    for (index, (buyer, payment_id)) in orders.into_iter().enumerate() {
+        let router = app.router.clone();
+        let command = payment_command(&payment_id, 1, "confirmed", 1, 50_000 + index as u64);
+        tasks.spawn(async move {
+            send(router, "POST", "/v1/commands", Some(&buyer.token), &command).await
+        });
+    }
+    let mut results = Vec::new();
+    while let Some(joined) = tasks.join_next().await {
+        results.push(joined.expect("payment task"));
+    }
     let accepted = results
         .iter()
         .filter(|(code, _)| *code == StatusCode::OK)
         .count();
     assert_eq!(
         accepted, 1,
-        "exactly one buyer takes the 29th slot: {results:?}"
+        "exactly one payment takes the 29th slot: {results:?}"
     );
     for (code, body) in results.iter().filter(|(code, _)| *code != StatusCode::OK) {
         assert_eq!(*code, StatusCode::CONFLICT, "{body}");
         assert_eq!(body["error"]["code"], json!("SELLER_ANNUAL_LIMIT_REACHED"));
     }
-    assert_eq!(orders_of(&app, &seller.actor).await, 29);
+    assert_eq!(paid_events(&app, &seller.actor).await, 29);
+    // The seven refused payments took nothing: no receipt, order still open.
+    assert_eq!(
+        count(
+            &app.pool,
+            "SELECT COUNT(*) FROM orders WHERE state = 'pending_payment'"
+        )
+        .await,
+        7
+    );
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn concurrent_checkouts_cannot_overshoot_the_private_sellers_reconfirmation(pool: PgPool) {
+async fn a_payment_after_the_last_slot_is_refused_and_takes_nothing(pool: PgPool) {
+    let (app, homeserver) = app_with_fence(pool, true).await;
+    seed_usd_and_eur(&app).await;
+    let seller = Seller::new(&app, &homeserver, Some("private"), "DE", 100).await;
+    fill(&app, &seller.actor, 1, 28, "DE").await;
+    let orders = open_orders_from_distinct_buyers(&app, &seller.actor, 1_000, 2, "DE").await;
+    let (first_buyer, first) = &orders[0];
+    let (second_buyer, second) = &orders[1];
+
+    assert_eq!(
+        pay(&app, first_buyer, first, 90_001).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(paid_events(&app, &seller.actor).await, 29);
+
+    let refused = pay(&app, second_buyer, second, 90_002).await;
+    assert_refused(
+        &refused,
+        StatusCode::CONFLICT,
+        "SELLER_ANNUAL_LIMIT_REACHED",
+        Some("annual_sales_limit"),
+    );
+    assert_eq!(paid_events(&app, &seller.actor).await, 29);
+    let (payment_state, order_state): (String, String) = sqlx::query_as(
+        "SELECT p.state, o.state FROM payments p JOIN orders o ON o.id = p.order_id WHERE p.id = $1",
+    )
+    .bind(uuid::Uuid::parse_str(second).expect("payment uuid"))
+    .fetch_one(&app.pool)
+    .await
+    .expect("second payment");
+    assert_eq!(
+        (payment_state.as_str(), order_state.as_str()),
+        ("awaiting_entitlement", "pending_payment")
+    );
+    assert_eq!(
+        count(&app.pool, "SELECT COUNT(*) FROM receipts").await,
+        29,
+        "no receipt for the refused payment"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn with_the_fence_off_the_30th_payment_is_taken(pool: PgPool) {
+    let (app, homeserver) = app_with_fence(pool, false).await;
+    seed_usd_and_eur(&app).await;
+    let seller = Seller::new(&app, &homeserver, Some("private"), "DE", 100).await;
+    fill(&app, &seller.actor, 1, 29, "DE").await;
+    let orders = open_orders_from_distinct_buyers(&app, &seller.actor, 1_000, 1, "DE").await;
+    let (buyer, payment_id) = &orders[0];
+    assert_eq!(pay(&app, buyer, payment_id, 90_001).await.0, StatusCode::OK);
+    assert_eq!(paid_events(&app, &seller.actor).await, 30);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_seller_with_no_usable_country_has_no_cap_at_checkout_or_payment(pool: PgPool) {
+    let (app, homeserver) = app_with_fence(pool, true).await;
+    seed_usd_and_eur(&app).await;
+    // An empty country, a country that is not a code, and no location at all.
+    let empty = Seller::new(&app, &homeserver, Some("private"), "", 100).await;
+    let unknown = Seller::new(&app, &homeserver, Some("private"), "XX1", 100).await;
+    let actor = new_actor(&app).await;
+    let mut record = shop_record(&actor, Some("private"), "DE");
+    record.as_object_mut().expect("record").remove("location");
+    homeserver.put_shop_record(&actor.pubky, record);
+    let listing = register_command(&actor.pubky, 100);
+    let (code, body) = execute(&app, &actor.token, &listing).await;
+    assert_eq!(code, StatusCode::OK, "register failed: {body}");
+
+    for (index, seller) in [&empty.actor, &unknown.actor, &actor]
+        .into_iter()
+        .enumerate()
+    {
+        let base = 1 + index as u64 * 1_000;
+        fill(&app, seller, base, 31, "US").await;
+        let again = buy(&app, &new_actor(&app).await, seller, base + 500, Some("US")).await;
+        assert_accepted(&again);
+        assert_eq!(paid_events(&app, seller).await, 31, "seller {index}");
+    }
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn unpaid_orders_do_not_move_a_private_seller_toward_reconfirmation(pool: PgPool) {
     let (app, homeserver) = app_with_fence(pool, true).await;
     seed_usd_and_eur(&app).await;
     let seller = Seller::new(&app, &homeserver, Some("private"), "CH", 100).await;
     fill(&app, &seller.actor, 1, 25, "DE").await;
-    let mut buyers = Vec::new();
-    for _ in 0..8 {
-        buyers.push(new_actor(&app).await);
-    }
+    let buyers = buyers(&app, 8).await;
     let results = concurrent_buys(&app, &seller.actor, &buyers, 1_000, "DE").await;
-    let accepted = results
-        .iter()
-        .filter(|(code, _)| *code == StatusCode::OK)
-        .count();
-    assert_eq!(accepted, 4, "25 + 4 reaches 29 and no more: {results:?}");
-    assert_eq!(orders_of(&app, &seller.actor).await, 29);
+    for result in &results {
+        assert_accepted(result);
+    }
+    assert_eq!(orders_of(&app, &seller.actor).await, 33);
+    // The re-confirmation point counts paid sales to EU buyers: four more
+    // payments reach 29, and the next order waits for the seller to
+    // re-confirm.
+    fill(&app, &seller.actor, 2_000, 4, "DE").await;
+    assert_refused(
+        &buy(
+            &app,
+            &new_actor(&app).await,
+            &seller.actor,
+            3_000,
+            Some("DE"),
+        )
+        .await,
+        StatusCode::CONFLICT,
+        "SELLER_UNAVAILABLE_IN_REGION",
+        Some("private_seller_reconfirmation_required"),
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn thirty_open_orders_leave_the_limit_untouched_and_the_counters_at_zero(pool: PgPool) {
+    let (app, homeserver) = app_with_fence(pool, true).await;
+    seed_usd_and_eur(&app).await;
+    let seller = Seller::new(&app, &homeserver, Some("private"), "DE", 100).await;
+    open_orders(&app, &seller.actor, 1, 30, "DE").await;
+    let (code, own) = annual_limit(&app, &seller.actor.token, &seller.actor).await;
+    assert_eq!(code, StatusCode::OK, "{own}");
+    assert_eq!(own["sales"], json!(0));
+    assert_eq!(own["eur_cents"], json!(0));
+    assert_eq!(own["limit_reached"], json!(false));
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]

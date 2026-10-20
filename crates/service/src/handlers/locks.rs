@@ -299,6 +299,7 @@ pub async fn prepare(
     locks: Option<&LocksRuntime>,
     homeserver: Option<&dyn HomeserverListingClient>,
     payment_window_seconds: i64,
+    eu_fence_enabled: bool,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     let (Some(locks), Some(homeserver)) = (locks, homeserver) else {
@@ -581,6 +582,13 @@ pub async fn prepare(
         now,
     )
     .await?;
+    // The EU seller's annual limit (legal launch plan C4) at payment start,
+    // before any listing lock.
+    if eu_fence_enabled {
+        if let Err(failure) = crate::region_fence::recheck_at_payment(tx, order.id, now).await {
+            return Ok(Err(failure));
+        }
+    }
     if let Err(failure) = holds::acquire_payment_hold(
         tx,
         order,
