@@ -1836,6 +1836,16 @@ Configuration (defaults in parentheses): `MARKETPLACE_GRANT_CLIENT_ID` and
 `MARKETPLACE_GRANT_RESULT_PER_PRINCIPAL_PER_MINUTE` (30) and
 `SHOP_GRANT_ASSERTION_ISSUER` (`https://shop.pubky.app`).
 
+The per-address limits (`MARKETPLACE_GRANT_CREATE_PER_IP_PER_MINUTE` and the
+address half of the status limit) key on the socket peer by default. Behind a
+reverse proxy every request has the proxy's address, so one client can use up
+the shared budget. Set `MARKETPLACE_GRANT_CLIENT_IP_HEADER` to the name of a
+header the trusted edge sets to the client address (the last comma-separated
+value is used); a missing or invalid value falls back to the socket peer. Set
+it only when the edge overwrites that header: a header the client can choose
+lets it pick its own bucket. It is read by no other limit, and the
+per-public-key create limit is unaffected.
+
 Key material (all required when enabled; the previous-key pairs are optional
 and only used during rotation): `GRANT_FLOW_ENCRYPTION_KEY_B64` with
 `GRANT_FLOW_KEY_EPOCH`, `GRANT_FLOW_PREVIOUS_ENCRYPTION_KEY_B64` with
