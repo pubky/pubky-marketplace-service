@@ -1278,14 +1278,14 @@ async fn apply_outcome_effects(
 ) -> Result<OrderRow, ResolutionFailure> {
     match input.outcome {
         "paid" => {
-            // The EU seller's annual limit (legal launch plan C4): a seller
+            // The EU seller limits (legal launch plan C4, annual limit and re-confirmation): a seller
             // cannot resolve into `paid` a payment that would cross it; the
             // funds go back. Checked first so the per-seller counter lock
             // stays ahead of the listing locks the paid effects take.
             if state.config.eu_fence_enabled {
                 match crate::region_fence::recheck_at_payment(tx, order.id, now).await {
                     Ok(()) => {}
-                    Err(failure) if failure.code() == ErrorCode::SellerAnnualLimitReached => {
+                    Err(failure) if crate::region_fence::is_limit_at_payment(&failure) => {
                         return Err(ResolutionFailure::RefundRequired);
                     }
                     Err(failure) => {
@@ -1352,7 +1352,7 @@ async fn apply_paid_effects(
     {
         Ok((order, _receipt, _event)) => Ok(order),
         Err(failure) => {
-            if failure.code() == ErrorCode::SellerAnnualLimitReached {
+            if crate::region_fence::is_limit_at_payment(&failure) {
                 Err(ResolutionFailure::RefundRequired)
             } else if failure.code() == ErrorCode::InsufficientInventory
                 || failure.code() == ErrorCode::InvalidState
@@ -1649,14 +1649,14 @@ pub(crate) async fn apply_late_money(
         return Ok(LateMoneyOutcome::HeldLateSettlement);
     }
 
-    // The EU seller's annual limit (legal launch plan C4): late money that
+    // The EU seller limits (legal launch plan C4, annual limit and re-confirmation): late money that
     // would cross it is never marked paid. It takes the refund-required
     // shape, like money whose unit is gone. Checked before the reacquire so
     // the per-seller counter lock stays ahead of the listing locks.
     if keys.eu_fence_enabled {
         match crate::region_fence::recheck_at_payment(tx, order.id, now).await {
             Ok(()) => {}
-            Err(failure) if failure.code() == ErrorCode::SellerAnnualLimitReached => {
+            Err(failure) if crate::region_fence::is_limit_at_payment(&failure) => {
                 refund_required(
                     tx,
                     payment,

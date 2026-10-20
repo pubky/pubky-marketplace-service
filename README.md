@@ -291,7 +291,7 @@ With the flag on:
   under the same per-seller lock, so two payments confirming at once cannot
   both take the last slot, and uses the seller's country frozen on the order at
   payment start, so a payment never waits on the homeserver. An `ALERT
-  eu_annual_limit_at_payment` is logged each time. The same check covers a
+  eu_seller_limit_at_payment` is logged each time. The same check covers a
   late settlement (refund required) and the seller's own Bitcoin confirmation.
 - **No country, no cap.** A seller whose shop record has no usable
   `location.countryCode` (missing, empty, or not two letters) has no residence
@@ -302,8 +302,19 @@ With the flag on:
   (`SELLER_UNAVAILABLE_IN_REGION`, `reason`
   `private_seller_reconfirmation_required`) until their shop record carries a
   `sellerStatusConfirmedAt` (RFC 3339, not in the future) later than those
-  sales; the count restarts at the confirmation. Paid sales count here too,
-  and the point is checked when an order is created, not again at payment.
+  sales; the count restarts at the confirmation. Paid sales count here too.
+  The point is checked when an order is created and again where money is
+  taken, like the annual limit: the order freezes the seller's
+  `sellerStatusConfirmedAt` at its payment start
+  (`orders.seller_status_confirmed_at`, migration 0080), and
+  `region_fence::recheck_at_payment` counts the private seller's paid sales to
+  EU buyers from that date under the same per-seller lock. Past the point,
+  payment start answers `SELLER_UNAVAILABLE_IN_REGION` with `reason`
+  `private_seller_reconfirmation_required` and the buyer never pays; money
+  already on chain goes to `manual_review` exactly as for the annual limit
+  (not marked paid, no receipt, refund only). A seller who re-confirms after
+  an order's payment started does not release that payment; the next order's
+  payment starts from the new date.
 - A seller's shop record is read before the command's transaction, like the
   lifecycle gate, and fails closed: an unreadable record is
   `UPSTREAM_UNAVAILABLE` (`HOMESERVER_URL` is already required to boot).

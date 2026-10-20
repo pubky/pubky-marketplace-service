@@ -1054,6 +1054,85 @@ async fn concurrent_payments_cannot_both_take_the_last_slot(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn concurrent_payments_cannot_overshoot_the_private_sellers_reconfirmation(pool: PgPool) {
+    let (app, homeserver) = app_with_fence(pool, true).await;
+    seed_usd_and_eur(&app).await;
+    let seller = Seller::new(&app, &homeserver, Some("private"), "CH", 100).await;
+    fill(&app, &seller.actor, 1, 25, "DE").await;
+    let orders = open_orders_from_distinct_buyers(&app, &seller.actor, 1_000, 8, "DE").await;
+
+    let mut tasks = tokio::task::JoinSet::new();
+    for (index, (buyer, payment_id)) in orders.into_iter().enumerate() {
+        let router = app.router.clone();
+        let command = payment_command(&payment_id, 1, "confirmed", 1, 60_000 + index as u64);
+        tasks.spawn(async move {
+            send(router, "POST", "/v1/commands", Some(&buyer.token), &command).await
+        });
+    }
+    let mut results = Vec::new();
+    while let Some(joined) = tasks.join_next().await {
+        results.push(joined.expect("payment task"));
+    }
+    let accepted = results
+        .iter()
+        .filter(|(code, _)| *code == StatusCode::OK)
+        .count();
+    assert_eq!(accepted, 4, "25 + 4 reaches 29 and no more: {results:?}");
+    for (code, body) in results.iter().filter(|(code, _)| *code != StatusCode::OK) {
+        assert_eq!(*code, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"]["code"], json!("SELLER_UNAVAILABLE_IN_REGION"));
+        assert_eq!(
+            body["error"]["reason"],
+            json!("private_seller_reconfirmation_required")
+        );
+    }
+    assert_eq!(paid_events(&app, &seller.actor).await, 29);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_payment_after_the_reconfirmation_point_is_refused_until_the_seller_reconfirms(
+    pool: PgPool,
+) {
+    let (app, homeserver) = app_with_fence(pool, true).await;
+    seed_usd_and_eur(&app).await;
+    let seller = Seller::new(&app, &homeserver, Some("private"), "CH", 100).await;
+    fill(&app, &seller.actor, 1, 28, "DE").await;
+    let orders = open_orders_from_distinct_buyers(&app, &seller.actor, 1_000, 3, "DE").await;
+    let (first_buyer, first) = &orders[0];
+    let (second_buyer, second) = &orders[1];
+    let (third_buyer, third) = &orders[2];
+
+    assert_eq!(
+        pay(&app, first_buyer, first, 91_001).await.0,
+        StatusCode::OK
+    );
+    assert_refused(
+        &pay(&app, second_buyer, second, 91_002).await,
+        StatusCode::CONFLICT,
+        "SELLER_UNAVAILABLE_IN_REGION",
+        Some("private_seller_reconfirmation_required"),
+    );
+    assert_eq!(paid_events(&app, &seller.actor).await, 29);
+
+    // The seller re-confirms; a payment that starts afterwards counts from
+    // the new date and is taken.
+    app.clock.advance_seconds(60);
+    let mut record = shop_record(&seller.actor, Some("private"), "CH");
+    record["sellerStatusConfirmedAt"] = json!(app.clock.now().to_rfc3339());
+    homeserver.put_shop_record(&seller.actor.pubky, record);
+    app.clock.advance_seconds(60);
+    assert_eq!(
+        pay(&app, third_buyer, third, 91_003).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        pay(&app, second_buyer, second, 91_004).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(paid_events(&app, &seller.actor).await, 31);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_payment_after_the_last_slot_is_refused_and_takes_nothing(pool: PgPool) {
     let (app, homeserver) = app_with_fence(pool, true).await;
     seed_usd_and_eur(&app).await;

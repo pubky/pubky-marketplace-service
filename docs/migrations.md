@@ -324,15 +324,39 @@ ALTER TABLE orders DROP COLUMN IF EXISTS seller_confirms_bitcoin;
 DELETE FROM _sqlx_migrations WHERE version = 79;
 ```
 
+## Frozen re-confirmation date (0080)
+
+0080 adds the nullable `orders.seller_status_confirmed_at` (no default, no
+index, `lock_timeout` like 0050). The shop record's `sellerStatusConfirmedAt` is
+frozen on the order at its payment start with the seller's declaration: the
+timestamp when it was valid and not in the future, NULL otherwise (no
+confirmation, an unreadable record, or an order whose terms were frozen before
+0080). The payment-time re-check of the private seller's re-confirmation rule
+(`region_fence::recheck_at_payment`, behind `EU_FENCE_ENABLED`) counts EU-buyer
+sales from this date, or from the start of the year when NULL, so a payment
+never reads the homeserver. An order whose payment started before 0080 has no
+date, so that rule counts it from the start of the year; with the fence off
+nothing reads the column. A binary from before 0080 never sets or reads it.
+
+### Backing out 0080
+
+Additive: an image from before it runs on the migrated database. By hand, after
+the old image is serving:
+
+```sql
+ALTER TABLE orders DROP COLUMN IF EXISTS seller_status_confirmed_at;
+DELETE FROM _sqlx_migrations WHERE version = 80;
+```
+
 ## Numbers claimed by open pull requests
 
-`main` has 0001 to 0078 (0068 and 0069 were never used). A new migration must
+`main` has 0001 to 0079 (0068 and 0069 were never used). A new migration must
 check the open list (`gh pr list`) and take the next free number rather than
 assume it is free:
 
 | Number | File | Pull request |
 | --- | --- | --- |
-| 0079 | `0079_seller_confirms_bitcoin.sql` | #162 (seller Bitcoin confirmation) |
+| 0080 | `0080_seller_status_confirmed_at.sql` | seller re-confirmation date at payment (LG18) |
 
 This table describes unmerged work and goes stale as pull requests land; trust
 `crates/service/migrations/` on `main` over it. sqlx does not reject two files

@@ -12,7 +12,7 @@ use common::paykit_review::{enable_bitcoin, poll_now, resolve_call, status_confi
 use common::{
     checkout_command_with_id, execute, indexed_command_id, new_actor, payment_command,
     register_sat_command, send, spawn_fake_homeserver, test_app_with_payments_config,
-    with_shop_homeserver, FakePaykit, TestActor, TestApp,
+    with_shop_homeserver, FakeHomeserver, FakePaykit, TestActor, TestApp,
 };
 use marketplace_service::clock::Clock;
 use marketplace_service::config::Config;
@@ -33,6 +33,8 @@ struct Fixture {
     paykit: FakePaykit,
     seller: TestActor,
     buyer_country: &'static str,
+    homeserver: FakeHomeserver,
+    shop_country: &'static str,
 }
 
 async fn seed_eur(pool: &PgPool, now: DateTime<Utc>) {
@@ -57,7 +59,7 @@ async fn seed_eur(pool: &PgPool, now: DateTime<Utc>) {
     }
 }
 
-async fn fixture(pool: PgPool, country: &str, buyer_country: &'static str) -> Fixture {
+async fn fixture(pool: PgPool, country: &'static str, buyer_country: &'static str) -> Fixture {
     let mut config = Config::for_tests();
     config.eu_fence_enabled = true;
     let (app, paykit, _ipn) = test_app_with_payments_config(pool, config).await;
@@ -65,17 +67,7 @@ async fn fixture(pool: PgPool, country: &str, buyer_country: &'static str) -> Fi
     let app = with_shop_homeserver(app, &homeserver);
     seed_eur(&app.pool, app.clock.now()).await;
     let seller = new_actor(&app).await;
-    homeserver.put_shop_record(
-        &seller.pubky,
-        json!({
-            "schemaVersion": 1,
-            "recordType": "shop",
-            "ownerPubky": seller.pubky,
-            "name": "Cap Shop",
-            "sellerStatus": "private",
-            "location": { "countryCode": country },
-        }),
-    );
+    homeserver.put_shop_record(&seller.pubky, shop_record(&seller, country, None));
     let (status, body) = execute(
         &app,
         &seller.token,
@@ -90,6 +82,40 @@ async fn fixture(pool: PgPool, country: &str, buyer_country: &'static str) -> Fi
         paykit,
         seller,
         buyer_country,
+        homeserver,
+        shop_country: country,
+    }
+}
+
+fn shop_record(seller: &TestActor, country: &str, confirmed_at: Option<String>) -> Value {
+    let mut record = json!({
+        "schemaVersion": 1,
+        "recordType": "shop",
+        "ownerPubky": seller.pubky,
+        "name": "Cap Shop",
+        "sellerStatus": "private",
+        "location": { "countryCode": country },
+    });
+    if let Some(confirmed_at) = confirmed_at {
+        record["sellerStatusConfirmedAt"] = json!(confirmed_at);
+    }
+    record
+}
+
+impl Fixture {
+    /// The seller's shop record, with `sellerStatusConfirmedAt` when given.
+    fn put_record(&self, confirmed_at: Option<String>) {
+        self.homeserver.put_shop_record(
+            &self.seller.pubky,
+            shop_record(&self.seller, self.shop_country, confirmed_at),
+        );
+    }
+
+    /// The seller re-confirms now: later than every sale so far, and not in the future.
+    fn reconfirm(&self) {
+        self.app.clock.advance_seconds(60);
+        self.put_record(Some(self.app.clock.now().to_rfc3339()));
+        self.app.clock.advance_seconds(60);
     }
 }
 
@@ -163,7 +189,14 @@ async fn bind_ok(fx: &Fixture, order: &Placed) -> String {
     drain_outbox(&fx.app.pool, client, fx.app.clock.now(), 30)
         .await
         .expect("activation delivers");
-    attempt_reference(Uuid::parse_str(&order.order_id).expect("order uuid"), 1)
+    // A refused bind spends its attempt number, so the reference is the latest.
+    let order_uuid = Uuid::parse_str(&order.order_id).expect("order uuid");
+    let attempt: i32 = sqlx::query_scalar("SELECT paykit_bind_attempt FROM orders WHERE id = $1")
+        .bind(order_uuid)
+        .fetch_one(&fx.app.pool)
+        .await
+        .expect("bind attempt");
+    attempt_reference(order_uuid, attempt)
 }
 
 async fn paid_events(fx: &Fixture) -> i64 {
@@ -329,6 +362,226 @@ async fn concurrent_polls_of_two_settled_payments_take_one_last_slot(pool: PgPoo
         paid_events(&fx).await,
         29,
         "exactly one takes the 29th slot"
+    );
+    let mut outcomes = vec![states(&fx, &first).await, states(&fx, &second).await];
+    outcomes.sort();
+    assert_eq!(
+        outcomes,
+        vec![
+            ("paid".to_string(), "confirmed".to_string()),
+            ("pending_payment".to_string(), "manual_review".to_string()),
+        ]
+    );
+}
+
+// --- LG18: the private seller's re-confirmation point at payment ------------
+
+async fn confirmed_at_of(fx: &Fixture, order: &Placed) -> Option<DateTime<Utc>> {
+    sqlx::query_scalar("SELECT seller_status_confirmed_at FROM orders WHERE id = $1")
+        .bind(Uuid::parse_str(&order.order_id).expect("order uuid"))
+        .fetch_one(&fx.app.pool)
+        .await
+        .expect("order row")
+}
+
+fn is_reconfirmation_refusal(body: &Value) -> bool {
+    body["error"]["code"] == json!("SELLER_UNAVAILABLE_IN_REGION")
+        && body["error"]["reason"] == json!("private_seller_reconfirmation_required")
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn the_confirmation_date_freezes_on_the_order_at_its_payment_start(pool: PgPool) {
+    let fx = fixture(pool, "CH", "DE").await;
+    let confirmed = fx.app.clock.now() - Duration::days(3);
+    fx.put_record(Some(confirmed.to_rfc3339()));
+    let first = placed(&fx, 1).await;
+    // Not frozen before the payment starts.
+    assert_eq!(confirmed_at_of(&fx, &first).await, None);
+    bind_ok(&fx, &first).await;
+    assert_eq!(confirmed_at_of(&fx, &first).await, Some(confirmed));
+
+    // A later change to the record never moves an order whose payment started.
+    fx.put_record(Some((fx.app.clock.now() - Duration::days(1)).to_rfc3339()));
+    assert_eq!(confirmed_at_of(&fx, &first).await, Some(confirmed));
+
+    // A date in the future, or none, freezes as none.
+    fx.put_record(Some((fx.app.clock.now() + Duration::days(1)).to_rfc3339()));
+    let future = placed(&fx, 2).await;
+    bind_ok(&fx, &future).await;
+    assert_eq!(confirmed_at_of(&fx, &future).await, None);
+    fx.put_record(None);
+    let none = placed(&fx, 3).await;
+    bind_ok(&fx, &none).await;
+    assert_eq!(confirmed_at_of(&fx, &none).await, None);
+
+    // An unreadable record freezes none, and the payment still starts.
+    let unreadable = placed(&fx, 4).await;
+    fx.homeserver.fail_shop_record(&fx.seller.pubky);
+    let (status, body) = bind(&fx, &unreadable).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(confirmed_at_of(&fx, &unreadable).await, None);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_buyer_is_not_asked_to_pay_a_private_seller_past_the_reconfirmation_point(pool: PgPool) {
+    let fx = fixture(pool, "CH", "DE").await;
+    paid_sales(&fx, 28).await;
+    let early = placed(&fx, 101).await;
+    let late = placed(&fx, 102).await;
+
+    // One more EU sale reaches the point; the order placed earlier cannot
+    // start a Bitcoin payment any more.
+    let reference = bind_ok(&fx, &early).await;
+    fx.paykit
+        .set_status(&reference, status_confirmed("exclusive", true, 2));
+    assert!(poll_now(&fx.app, fx.app.clock.now()).await >= 1);
+    assert_eq!(paid_events(&fx).await, 29);
+
+    let (status, body) = bind(&fx, &late).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(is_reconfirmation_refusal(&body), "{body}");
+    let (order_state, payment_state) = states(&fx, &late).await;
+    assert_eq!(
+        (order_state.as_str(), payment_state.as_str()),
+        ("pending_payment", "awaiting_entitlement")
+    );
+
+    // The seller re-confirms: the same order can now start paying, from the
+    // new date.
+    fx.reconfirm();
+    let reference = bind_ok(&fx, &late).await;
+    assert!(confirmed_at_of(&fx, &late).await.is_some());
+    fx.paykit
+        .set_status(&reference, status_confirmed("exclusive", true, 2));
+    assert!(poll_now(&fx.app, fx.app.clock.now()).await >= 1);
+    assert_eq!(states(&fx, &late).await.0, "paid");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn money_already_on_chain_past_the_reconfirmation_point_goes_to_manual_review(pool: PgPool) {
+    let fx = fixture(pool, "CH", "DE").await;
+    paid_sales(&fx, 27).await;
+    let orders = [
+        placed(&fx, 101).await,
+        placed(&fx, 102).await,
+        placed(&fx, 103).await,
+    ];
+    let mut references = Vec::new();
+    for order in &orders {
+        references.push(bind_ok(&fx, order).await);
+    }
+    for reference in &references[..2] {
+        fx.paykit
+            .set_status(reference, status_confirmed("exclusive", true, 2));
+    }
+    assert!(poll_now(&fx.app, fx.app.clock.now()).await >= 2);
+    assert_eq!(paid_events(&fx).await, 29);
+
+    // The third settles after the point: real money, so review, not paid.
+    fx.app.clock.advance_seconds(60);
+    fx.paykit
+        .set_status(&references[2], status_confirmed("exclusive", true, 2));
+    assert!(poll_now(&fx.app, fx.app.clock.now()).await >= 1);
+    assert_eq!(
+        states(&fx, &orders[2]).await,
+        ("pending_payment".to_string(), "manual_review".to_string())
+    );
+    assert_eq!(paid_events(&fx).await, 29);
+    assert_eq!(
+        common::count(&fx.app.pool, "SELECT COUNT(*) FROM receipts").await,
+        29
+    );
+
+    // The seller cannot resolve it into a sale, even after re-confirming:
+    // the date frozen on the order is the one the payment started with.
+    fx.reconfirm();
+    let (code, body) = resolve_call(
+        &fx.app,
+        &fx.seller.token,
+        &orders[2].order_id,
+        Some(Uuid::new_v4()),
+        &json!({ "outcome": "paid" }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["reason"], json!("refund_required"), "{body}");
+    assert_eq!(paid_events(&fx).await, 29);
+    let (code, body) = resolve_call(
+        &fx.app,
+        &fx.seller.token,
+        &orders[2].order_id,
+        Some(Uuid::new_v4()),
+        &json!({ "outcome": "refunded", "external_refund_reference": "refund-0002" }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_reconfirmation_after_the_payment_started_does_not_release_it(pool: PgPool) {
+    let fx = fixture(pool, "CH", "DE").await;
+    paid_sales(&fx, 28).await;
+    let first = placed(&fx, 101).await;
+    let second = placed(&fx, 102).await;
+    let first_reference = bind_ok(&fx, &first).await;
+    let second_reference = bind_ok(&fx, &second).await;
+    fx.paykit
+        .set_status(&first_reference, status_confirmed("exclusive", true, 2));
+    assert!(poll_now(&fx.app, fx.app.clock.now()).await >= 1);
+    assert_eq!(paid_events(&fx).await, 29);
+
+    // The seller re-confirms while the second payment is in flight.
+    fx.reconfirm();
+    fx.paykit
+        .set_status(&second_reference, status_confirmed("exclusive", true, 2));
+    assert!(poll_now(&fx.app, fx.app.clock.now()).await >= 1);
+    assert_eq!(
+        states(&fx, &second).await,
+        ("pending_payment".to_string(), "manual_review".to_string())
+    );
+
+    // A new order's payment starts from the new date and is taken.
+    let fresh = placed(&fx, 103).await;
+    let reference = bind_ok(&fx, &fresh).await;
+    fx.paykit
+        .set_status(&reference, status_confirmed("exclusive", true, 2));
+    assert!(poll_now(&fx.app, fx.app.clock.now()).await >= 1);
+    assert_eq!(states(&fx, &fresh).await.0, "paid");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn the_reconfirmation_point_only_applies_to_sales_to_eu_buyers(pool: PgPool) {
+    let fx = fixture(pool, "CH", "US").await;
+    paid_sales(&fx, 29).await;
+    let thirtieth = placed(&fx, 101).await;
+    let reference = bind_ok(&fx, &thirtieth).await;
+    fx.paykit
+        .set_status(&reference, status_confirmed("exclusive", true, 2));
+    assert!(poll_now(&fx.app, fx.app.clock.now()).await >= 1);
+    assert_eq!(states(&fx, &thirtieth).await.0, "paid");
+    assert_eq!(paid_events(&fx).await, 30);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn concurrent_polls_of_two_settled_payments_take_one_reconfirmation_slot(pool: PgPool) {
+    let fx = fixture(pool, "CH", "DE").await;
+    paid_sales(&fx, 28).await;
+    let first = placed(&fx, 101).await;
+    let second = placed(&fx, 102).await;
+    let first_reference = bind_ok(&fx, &first).await;
+    let second_reference = bind_ok(&fx, &second).await;
+    for reference in [&first_reference, &second_reference] {
+        fx.paykit
+            .set_status(reference, status_confirmed("exclusive", true, 2));
+    }
+    let now = fx.app.clock.now();
+    let (a, b) = tokio::join!(poll_now(&fx.app, now), poll_now(&fx.app, now));
+    assert!(a + b >= 2, "both payments were looked at ({a}, {b})");
+
+    assert_eq!(
+        paid_events(&fx).await,
+        29,
+        "exactly one takes the last slot"
     );
     let mut outcomes = vec![states(&fx, &first).await, states(&fx, &second).await];
     outcomes.sort();

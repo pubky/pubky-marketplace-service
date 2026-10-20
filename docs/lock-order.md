@@ -15,8 +15,8 @@ that lock, so two checkouts of one seller serialize at the lock and never hold a
 listing the other needs. `eu_fence_test` runs checkouts over the same two
 sellers in opposite order.
 
-The annual limit counts paid orders only, so it is decided where payments are
-taken. `region_fence::recheck_at_payment` takes the same lock, again before any
+The annual limit and the private seller's re-confirmation point count paid
+orders only, so they are decided where payments are taken. `region_fence::recheck_at_payment` takes the same lock, again before any
 drop or listing row: at payment start (the bind, Locks preparation and the
 sandbox payment call it before `acquire_payment_hold`) and as the first step of
 `handlers::payment::confirm_order`. The late-money fork and the seller's
