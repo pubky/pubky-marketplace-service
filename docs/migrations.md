@@ -260,6 +260,15 @@ next tick, then clears it. It also widens `connector_alerts_kind` with
 `lock_timeout` like 0050. A binary from before 0074 never sets or reads the
 column and never writes the new kind.
 
+0078 (Paykit-held sellers) creates `paykit_known_sellers`
+(`seller_pubky TEXT PRIMARY KEY`, `first_ready_at TIMESTAMPTZ NOT NULL`), a new,
+empty table: the first time the service read a seller as `ready` from
+paykit-server, so a later `setup_required` for that seller is told to
+reconnect, the only flow paykit-server accepts for a Creator it holds. It
+builds no index on an existing table and sets `lock_timeout` like 0050. A
+binary from before 0078 never reads or writes it. Additive, so an image from
+before it runs on the migrated database.
+
 0072 (grant sessions) creates `grant_session_challenges` with its primary key,
 two CHECKs, and plain indexes on `expires_at` and on `pubky` for unused rows
 (a new, empty table), adds the nullable `auth_sessions.source_grant_id` and

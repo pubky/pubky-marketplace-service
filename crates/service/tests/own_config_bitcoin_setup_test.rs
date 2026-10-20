@@ -58,6 +58,7 @@ async fn a_seller_who_never_saved_reads_the_empty_config_with_bitcoin_setup(pool
             "payment_config": {
                 "bitcoin_enabled": false,
                 "bitcoin_setup": "setup_required",
+                "bitcoin_setup_action": "setup",
                 "paypal_merchant_email": null,
                 "updated_at": EPOCH,
             }

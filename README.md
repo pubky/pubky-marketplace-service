@@ -434,6 +434,18 @@ warn as `paykit setup status unavailable` (upstream) or
 and the elapsed time. A seller who never saved anything reads the empty
 configuration (epoch `updated_at`) instead of `null`.
 
+On the upstream Paykit API (`PAYKIT_SERVER_API=upstream`) the same view also
+carries `bitcoin_setup_action`: `setup`, `reconnect` or `null`, the Bitkit flow
+for a seller whose `bitcoin_setup` is `setup_required` (`null` otherwise). The
+key is absent on the fork, which has no reconnect flow. paykit-server's
+`setup_required` means the authority is absent or invalid, so it cannot tell a
+seller it has never seen from one it holds whose reconnect stopped after the
+credentials were stored, and its initial `/setup` refuses a held seller (it
+never deletes a Creator). The service therefore records the first time it read
+a seller as `ready` (`paykit_known_sellers`, migration 0078): a recorded seller
+is told `reconnect`, any other `setup`. `usdt_setup_action` follows the same
+rule when both USDT answers are `setup_required`.
+
 Stripe is not a payment method: the service has no Stripe client, binding
 `stripe` answers `invalid_method`, and `PUT /v0/sellers/me/payment-config`
 answers `stripe_removed` to a non-empty `stripe_payment_link` or
@@ -615,9 +627,12 @@ stays refused.
   paykit-server is only ever asked about Bitcoin (`bitcoin_setup`).
   - Readiness comes only from paykit-server's signed `POST /setup/status`
     (`PAYKIT_SERVER_API=upstream`): `{accepted_asset: "USDT"}` for the seller, and the
-    authority-only `{}` body to tell a seller with no Paykit account
-    (`setup`) from one that only lacks USDT (`reconnect`). The authority is
-    looked up only when USDT is not ready. `unavailable`, a non-2xx answer
+    authority-only `{}` body to tell a seller that only lacks USDT
+    (`reconnect`) from one whose authority is missing or invalid. That one is
+    `setup` unless the service has read the seller as `ready` before, which
+    means paykit-server holds them, so `reconnect`
+    (`paykit_known_sellers`). The authority is looked up only when USDT is not
+    ready. `unavailable`, a non-2xx answer
     or an answer outside the closed `{"status": ...}` contract is
     `usdt_setup: "unavailable"` with no action: the service never turns it
     into an authorization flow. On the fork, or without Paykit, `usdt_setup`

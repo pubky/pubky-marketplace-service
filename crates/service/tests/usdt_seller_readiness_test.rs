@@ -398,6 +398,7 @@ async fn a_seller_who_never_saved_gets_the_usdt_fields_without_a_stored_row(pool
         json!({
             "bitcoin_enabled": false,
             "bitcoin_setup": "setup_required",
+            "bitcoin_setup_action": "setup",
             "paypal_merchant_email": null,
             "updated_at": EPOCH,
             "usdt_enabled": false,
@@ -1004,9 +1005,12 @@ async fn readiness_is_cached_per_seller_and_asset(pool: PgPool) {
 // Flag off and the fork
 // ---------------------------------------------------------------------------
 
-const RAIL_KEYS: [&str; 4] = [
+/// The own view with the flag off on the upstream API: no `usdt_*` key, but
+/// the Bitcoin step's own `bitcoin_setup_action`.
+const RAIL_KEYS: [&str; 5] = [
     "bitcoin_enabled",
     "bitcoin_setup",
+    "bitcoin_setup_action",
     "paypal_merchant_email",
     "updated_at",
 ];
@@ -1034,6 +1038,7 @@ async fn with_the_flag_off_nothing_usdt_exists_and_paykit_is_asked_only_about_bi
             "payment_config": {
                 "bitcoin_enabled": false,
                 "bitcoin_setup": "ready",
+                "bitcoin_setup_action": null,
                 "paypal_merchant_email": null,
                 "updated_at": EPOCH,
             }
@@ -1162,4 +1167,200 @@ fn the_fixture_list_matches_the_directory() {
         .collect();
     listed.sort_unstable();
     assert_eq!(on_disk, listed);
+}
+
+// ---------------------------------------------------------------------------
+// A seller paykit-server holds is only ever sent to reconnect
+// ---------------------------------------------------------------------------
+//
+// paykit-server answers `setup_required` for a Creator it has never seen and
+// for one it holds whose reconnect stopped after the credentials were stored
+// (setup incomplete on every rail), and its initial `/setup` refuses the
+// second (`422 setup_failed` after the Bitkit approval). Run against
+// paykit-server v0.1.0 on a real testnet and Postgres, the second answers
+// `{"status":"setup_required"}` to the Bitcoin, USDT and authority questions,
+// byte for byte what the captured `never_set_up` seller gets, which is why
+// the exchanges below stand in for it.
+
+fn bitcoin_fields(body: &Value) -> (Value, Value) {
+    let config = &body["payment_config"];
+    (
+        config["bitcoin_setup"].clone(),
+        config["bitcoin_setup_action"].clone(),
+    )
+}
+
+/// What the service has recorded about the seller.
+async fn known_rows(pool: &PgPool, seller: &str) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM paykit_known_sellers WHERE seller_pubky = $1")
+        .bind(seller)
+        .fetch_one(pool)
+        .await
+        .expect("count")
+}
+
+/// Bitkit's reconnect stopped after paykit-server stored the credentials: it
+/// answers `setup_required` to every question, exactly as for a Creator it
+/// has never seen.
+fn strand(paykit: &FakePaykit, seller: &str) {
+    replay(
+        paykit,
+        seller,
+        "setup_status_usdt_never_set_up",
+        "setup_status_authority_never_set_up",
+    );
+    paykit.set_setup_status(seller, "setup_required");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_existing_seller_who_adds_usdt_is_never_sent_to_the_initial_setup(pool: PgPool) {
+    let (app, paykit) = upstream_app(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    paykit.set_setup_status(&seller.pubky, "ready");
+
+    // Set up for Bitcoin, no USDT address yet: the Add USDT step is reconnect.
+    replay(
+        &paykit,
+        &seller.pubky,
+        "setup_status_usdt_before_reconnect",
+        "setup_status_authority_ready_bitcoin_only",
+    );
+    let (_, body) = get_own(&app, &seller.token).await;
+    assert_eq!(bitcoin_fields(&body), (json!("ready"), Value::Null));
+    assert_eq!(
+        usdt_fields(&body),
+        (json!(false), json!("setup_required"), json!("reconnect"))
+    );
+    assert_eq!(known_rows(&pool, &seller.pubky).await, 1);
+
+    // The approved reconnect stops after paykit-server stored the credentials:
+    // every rail reads as for a seller it has never seen. Both cards offer
+    // the reconnect, the only flow paykit-server accepts for this seller.
+    strand(&paykit, &seller.pubky);
+    let (_, body) = get_own(&app, &seller.token).await;
+    assert_eq!(
+        bitcoin_fields(&body),
+        (json!("setup_required"), json!("reconnect"))
+    );
+    assert_eq!(
+        usdt_fields(&body),
+        (json!(false), json!("setup_required"), json!("reconnect"))
+    );
+
+    // The save path answers the same.
+    let (status, saved) = put(&app, &seller.token, &rails(false)).await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    assert_eq!(
+        bitcoin_fields(&saved),
+        (json!("setup_required"), json!("reconnect"))
+    );
+    assert_eq!(usdt_fields(&saved).2, json!("reconnect"));
+
+    // The retried reconnect completes: both rails are ready again.
+    paykit.set_setup_status(&seller.pubky, "ready");
+    replay(
+        &paykit,
+        &seller.pubky,
+        "setup_status_usdt_after_reconnect",
+        "setup_status_authority_ready",
+    );
+    let (_, body) = get_own(&app, &seller.token).await;
+    assert_eq!(bitcoin_fields(&body), (json!("ready"), Value::Null));
+    assert_eq!(
+        usdt_fields(&body),
+        (json!(false), json!("ready"), Value::Null)
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_seller_paykit_server_has_never_read_ready_is_told_to_set_up(pool: PgPool) {
+    let (app, paykit) = upstream_app(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let other = new_actor(&app).await;
+    paykit.set_setup_status(&other.pubky, "ready");
+    strand(&paykit, &seller.pubky);
+
+    // Another seller being ready says nothing about this one.
+    let (_, other_body) = get_own(&app, &other.token).await;
+    assert_eq!(bitcoin_fields(&other_body), (json!("ready"), Value::Null));
+    let (_, body) = get_own(&app, &seller.token).await;
+    assert_eq!(
+        bitcoin_fields(&body),
+        (json!("setup_required"), json!("setup"))
+    );
+    assert_eq!(
+        usdt_fields(&body),
+        (json!(false), json!("setup_required"), json!("setup"))
+    );
+    assert_eq!(known_rows(&pool, &seller.pubky).await, 0);
+    assert_eq!(known_rows(&pool, &other.pubky).await, 1);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_seller_ready_only_for_bitcoin_is_remembered_and_reconnects_after_a_stop(pool: PgPool) {
+    // Reads before USDT is ever asked: the Bitcoin answer alone records the
+    // seller, and the first-seen time never moves.
+    let (app, paykit) = upstream_app(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    paykit.set_setup_status(&seller.pubky, "ready");
+    let (_, body) = get_own(&app, &seller.token).await;
+    assert_eq!(bitcoin_fields(&body), (json!("ready"), Value::Null));
+    let first: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+        "SELECT first_ready_at FROM paykit_known_sellers WHERE seller_pubky = $1",
+    )
+    .bind(&seller.pubky)
+    .fetch_one(&pool)
+    .await
+    .expect("first_ready_at");
+
+    app.clock.advance_seconds(3_600);
+    let (_, _) = get_own(&app, &seller.token).await;
+    let again: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+        "SELECT first_ready_at FROM paykit_known_sellers WHERE seller_pubky = $1",
+    )
+    .bind(&seller.pubky)
+    .fetch_one(&pool)
+    .await
+    .expect("first_ready_at");
+    assert_eq!(first, again);
+
+    strand(&paykit, &seller.pubky);
+    let (_, body) = get_own(&app, &seller.token).await;
+    assert_eq!(
+        bitcoin_fields(&body),
+        (json!("setup_required"), json!("reconnect"))
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_unavailable_answer_records_nothing_and_offers_no_flow(pool: PgPool) {
+    let (app, paykit) = upstream_app(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    paykit.fail_setup_status_with(503);
+    let (_, body) = get_own(&app, &seller.token).await;
+    assert_eq!(bitcoin_fields(&body), (json!("unavailable"), Value::Null));
+    assert_eq!(
+        usdt_fields(&body),
+        (json!(false), json!("unavailable"), Value::Null)
+    );
+    assert_eq!(known_rows(&pool, &seller.pubky).await, 0);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn on_the_fork_there_is_no_reconnect_flow_and_nothing_is_recorded(pool: PgPool) {
+    let (app, paykit) =
+        test_app_with_paykit_api_config(pool.clone(), usdt_config(), PaykitApi::Fork).await;
+    let seller = new_actor(&app).await;
+    paykit.set_claimed(&seller.pubky);
+    let (_, body) = get_own(&app, &seller.token).await;
+    assert_eq!(body["payment_config"]["bitcoin_setup"], json!("ready"));
+    assert!(
+        body["payment_config"]
+            .as_object()
+            .expect("object")
+            .get("bitcoin_setup_action")
+            .is_none(),
+        "{body}"
+    );
+    assert_eq!(known_rows(&pool, &seller.pubky).await, 0);
 }

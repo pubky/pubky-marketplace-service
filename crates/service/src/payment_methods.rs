@@ -239,21 +239,26 @@ fn config_view(
     bitcoin_enabled: bool,
     paypal_merchant_email: &Option<String>,
     updated_at: DateTime<Utc>,
-    bitcoin_setup: BitcoinSetup,
-    usdt: Option<&UsdtOwnView>,
+    paykit: &OwnPaykitView,
 ) -> Value {
     let mut view = json!({
         "bitcoin_enabled": bitcoin_enabled,
-        "bitcoin_setup": bitcoin_setup.as_str(),
+        "bitcoin_setup": paykit.bitcoin_setup.as_str(),
         "paypal_merchant_email": paypal_merchant_email,
         "updated_at": format_timestamp(updated_at),
     });
+    // Only on the upstream API, the one with a reconnect flow: the fork's
+    // body is unchanged.
+    if let Some(action) = paykit.bitcoin_action {
+        view["bitcoin_setup_action"] = json!(action.map(SetupAction::as_str));
+    }
+    let usdt = paykit.usdt.as_ref();
     // Only while the USDT flag is on, so every other body is byte-identical
     // to a build without USDT.
     if let Some(usdt) = usdt {
         view["usdt_enabled"] = json!(usdt.enabled);
         view["usdt_setup"] = json!(usdt.setup.as_str());
-        view["usdt_setup_action"] = json!(usdt.action.map(UsdtSetupAction::as_str));
+        view["usdt_setup_action"] = json!(usdt.action.map(SetupAction::as_str));
     }
     view
 }
@@ -342,7 +347,7 @@ struct UsdtOwnView {
     /// The seller's Shop-level consent, as stored.
     enabled: bool,
     setup: UsdtSetup,
-    action: Option<UsdtSetupAction>,
+    action: Option<SetupAction>,
 }
 
 /// `usdt_setup`: whether the seller's Paykit setup can receive USDT.
@@ -365,18 +370,20 @@ impl UsdtSetup {
     }
 }
 
-/// `usdt_setup_action`: which Paykit flow gets the seller to USDT.
+/// `bitcoin_setup_action` and `usdt_setup_action`: which Paykit flow gets the
+/// seller set up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UsdtSetupAction {
-    /// No Paykit account yet: `/setup` asks for the Bitcoin account and the
-    /// optional USDT address together.
+enum SetupAction {
+    /// paykit-server does not hold the seller: `/setup` asks for the Bitcoin
+    /// account and the optional USDT address together.
     Setup,
-    /// An account exists: `/setup/reconnect` can add the USDT address
-    /// without touching the Bitcoin account.
+    /// paykit-server holds the seller: `/setup/reconnect` re-approves them,
+    /// adds a USDT address, or finishes a reconnect that stopped after the
+    /// credentials were stored. `/setup` refuses a held seller.
     Reconnect,
 }
 
-impl UsdtSetupAction {
+impl SetupAction {
     fn as_str(self) -> &'static str {
         match self {
             Self::Setup => "setup",
@@ -385,43 +392,63 @@ impl UsdtSetupAction {
     }
 }
 
+/// What paykit-server answered for the seller's USDT readiness: `usdt` is the
+/// status for `accepted_asset: "USDT"`; `authority` is the status without an
+/// asset, asked only when USDT is not ready.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UsdtStatuses {
+    usdt: Option<SetupStatus>,
+    authority: Option<SetupStatus>,
+}
+
 /// Maps the two signed `/setup/status` answers to what the seller must do.
-/// `usdt` is the status for `asset: "USDT"`; `authority` is looked up only
-/// when USDT is not ready, and is the status without an asset.
+/// `holds` is whether paykit-server holds the seller (see
+/// [`paykit_holds_seller`]).
 ///
 /// - USDT `ready`: ready, no action.
-/// - USDT `setup_required` and authority `setup_required`: the seller has no
-///   Paykit account, so `setup`.
 /// - USDT `setup_required` and authority `ready`: the account exists and
 ///   only lacks the USDT address, so `reconnect`.
+/// - USDT `setup_required` and authority `setup_required`: paykit-server
+///   holds no usable authority. `setup_required` is also what it says for a
+///   held seller whose reconnect stopped after the credentials were stored,
+///   and `/setup` refuses that seller, so `reconnect` when it holds the
+///   seller and `setup` when it does not.
 /// - Anything `unavailable` (or unanswered): `unavailable` with no action.
 ///   rc10 says callers "must not convert `unavailable` into a new
 ///   authorization flow".
 fn usdt_setup_from_statuses(
-    usdt: Option<SetupStatus>,
-    authority: Option<SetupStatus>,
-) -> (UsdtSetup, Option<UsdtSetupAction>) {
-    match (usdt, authority) {
+    statuses: UsdtStatuses,
+    holds: bool,
+) -> (UsdtSetup, Option<SetupAction>) {
+    match (statuses.usdt, statuses.authority) {
         (Some(SetupStatus::Ready), _) => (UsdtSetup::Ready, None),
         (Some(SetupStatus::SetupRequired), Some(SetupStatus::SetupRequired)) => {
-            (UsdtSetup::SetupRequired, Some(UsdtSetupAction::Setup))
+            (UsdtSetup::SetupRequired, Some(setup_action_for(holds)))
         }
         (Some(SetupStatus::SetupRequired), Some(SetupStatus::Ready)) => {
-            (UsdtSetup::SetupRequired, Some(UsdtSetupAction::Reconnect))
+            (UsdtSetup::SetupRequired, Some(SetupAction::Reconnect))
         }
         _ => (UsdtSetup::Unavailable, None),
     }
 }
 
+fn setup_action_for(holds: bool) -> SetupAction {
+    if holds {
+        SetupAction::Reconnect
+    } else {
+        SetupAction::Setup
+    }
+}
+
 /// Asks paykit-server, uncached, what USDT setup the seller needs. Only the
 /// upstream API answers per asset; the fork, or no Paykit at all, is
-/// `unavailable`. The authority lookup runs only when USDT is not ready.
-async fn lookup_usdt_setup(
-    paykit: Option<&PaykitClient>,
-    seller_pubky: &str,
-) -> (UsdtSetup, Option<UsdtSetupAction>) {
+/// unanswered. The authority lookup runs only when USDT is not ready.
+async fn lookup_usdt_statuses(paykit: Option<&PaykitClient>, seller_pubky: &str) -> UsdtStatuses {
     let Some(paykit) = paykit.filter(|paykit| paykit.api() == PaykitApi::Upstream) else {
-        return usdt_setup_from_statuses(None, None);
+        return UsdtStatuses {
+            usdt: None,
+            authority: None,
+        };
     };
     let usdt = paykit
         .upstream_setup_status(seller_pubky, Some(SetupAsset::Usdt))
@@ -432,7 +459,7 @@ async fn lookup_usdt_setup(
     } else {
         None
     };
-    usdt_setup_from_statuses(usdt, authority)
+    UsdtStatuses { usdt, authority }
 }
 
 async fn usdt_option_enabled<'e, E>(executor: E, seller_pubky: &str) -> Result<bool, sqlx::Error>
@@ -450,14 +477,100 @@ where
     Ok(enabled.unwrap_or(false))
 }
 
-async fn own_usdt_view(state: &AppState, seller_pubky: &str) -> Result<UsdtOwnView, sqlx::Error> {
-    let enabled = usdt_option_enabled(&state.pool, seller_pubky).await?;
-    let (setup, action) = lookup_usdt_setup(own_paykit(state), seller_pubky).await;
-    Ok(UsdtOwnView {
-        enabled,
-        setup,
-        action,
+/// The seller's Paykit-derived own view: what both setup cards render.
+struct OwnPaykitView {
+    bitcoin_setup: BitcoinSetup,
+    /// `bitcoin_setup_action`: `None` leaves the key out (no upstream
+    /// Paykit, so no reconnect flow), `Some(None)` is a `null` (nothing to
+    /// do), `Some(Some(_))` names the flow for a `setup_required` seller.
+    bitcoin_action: Option<Option<SetupAction>>,
+    usdt: Option<UsdtOwnView>,
+}
+
+/// Reads both Paykit questions for the seller's own config and resolves the
+/// flow each card offers. `holds` is read only when a card needs it.
+async fn own_paykit_view(
+    state: &AppState,
+    seller_pubky: &str,
+) -> Result<OwnPaykitView, sqlx::Error> {
+    let usdt_flag = state.config.usdt_payments_enabled;
+    let (bitcoin_setup, usdt) = tokio::join!(lookup_bitcoin_setup(state, seller_pubky), async {
+        if usdt_flag {
+            let enabled = usdt_option_enabled(&state.pool, seller_pubky).await?;
+            let statuses = lookup_usdt_statuses(own_paykit(state), seller_pubky).await;
+            Ok::<_, sqlx::Error>(Some((enabled, statuses)))
+        } else {
+            Ok(None)
+        }
+    });
+    let usdt = usdt?;
+    let upstream = own_paykit(state).is_some_and(|paykit| paykit.api() == PaykitApi::Upstream);
+    let ready_seen = upstream
+        && (bitcoin_setup == BitcoinSetup::Ready
+            || usdt.is_some_and(|(_, statuses)| {
+                statuses.usdt == Some(SetupStatus::Ready)
+                    || statuses.authority == Some(SetupStatus::Ready)
+            }));
+    let needs_flow = upstream
+        && (bitcoin_setup == BitcoinSetup::SetupRequired
+            || usdt.is_some_and(|(_, statuses)| {
+                statuses.usdt == Some(SetupStatus::SetupRequired)
+                    && statuses.authority == Some(SetupStatus::SetupRequired)
+            }));
+    let holds = if ready_seen {
+        record_paykit_known_seller(&state.pool, seller_pubky, state.clock.now()).await?;
+        true
+    } else if needs_flow {
+        paykit_holds_seller(&state.pool, seller_pubky).await?
+    } else {
+        false
+    };
+    let bitcoin_action = upstream
+        .then(|| (bitcoin_setup == BitcoinSetup::SetupRequired).then(|| setup_action_for(holds)));
+    let usdt = usdt.map(|(enabled, statuses)| {
+        let (setup, action) = usdt_setup_from_statuses(statuses, holds);
+        UsdtOwnView {
+            enabled,
+            setup,
+            action,
+        }
+    });
+    Ok(OwnPaykitView {
+        bitcoin_setup,
+        bitcoin_action,
+        usdt,
     })
+}
+
+/// Remembers that paykit-server answered `ready` for the seller. Only the
+/// first answer is stored: the table says "paykit-server holds this seller",
+/// which stays true because paykit-server never deletes a Creator.
+async fn record_paykit_known_seller(
+    pool: &sqlx::PgPool,
+    seller_pubky: &str,
+    now: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO paykit_known_sellers (seller_pubky, first_ready_at) VALUES ($1, $2) \
+         ON CONFLICT (seller_pubky) DO NOTHING",
+    )
+    .bind(seller_pubky)
+    .bind(now)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Whether the service has ever read the seller as `ready`, so paykit-server
+/// holds them. A held seller can only be reconnected: paykit-server refuses
+/// its initial `/setup` for a Creator it holds, including one whose reconnect
+/// stopped after the credentials were stored, and `setup_required` does not
+/// tell that Creator from one it has never seen.
+async fn paykit_holds_seller(pool: &sqlx::PgPool, seller_pubky: &str) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM paykit_known_sellers WHERE seller_pubky = $1)")
+        .bind(seller_pubky)
+        .fetch_one(pool)
+        .await
 }
 
 async fn upsert_config<'e, E>(
@@ -578,14 +691,7 @@ pub async fn put_payment_config(
         Ok(row) => row,
         Err(error) => return internal("payment config upsert", &error),
     };
-    let (bitcoin_setup, usdt) = tokio::join!(lookup_bitcoin_setup(&state, &actor.0), async {
-        if usdt_flag {
-            own_usdt_view(&state, &actor.0).await.map(Some)
-        } else {
-            Ok(None)
-        }
-    },);
-    let usdt = match usdt {
+    let paykit = match own_paykit_view(&state, &actor.0).await {
         Ok(view) => view,
         Err(error) => return internal("payment config upsert", &error),
     };
@@ -597,8 +703,7 @@ pub async fn put_payment_config(
                 row.bitcoin_enabled,
                 &row.paypal_merchant_email,
                 row.updated_at,
-                bitcoin_setup,
-                usdt.as_ref(),
+                &paykit,
             ),
         })),
     )
@@ -625,8 +730,9 @@ async fn store_config_with_usdt(
 /// availability.
 ///
 /// The body also carries `bitcoin_setup` (see [`lookup_bitcoin_setup`]) and,
-/// while `USDT_PAYMENTS_ENABLED` is on, `usdt_enabled`, `usdt_setup` and
-/// `usdt_setup_action` (see [`lookup_usdt_setup`]). Both are read from
+/// on the upstream Paykit API, `bitcoin_setup_action`; while
+/// `USDT_PAYMENTS_ENABLED` is on it carries `usdt_enabled`, `usdt_setup` and
+/// `usdt_setup_action` (see [`own_paykit_view`]). Both are read from
 /// paykit-server on every call, never from the availability cache, so the
 /// Shop sees a Bitkit setup or reconnect the moment it completes; only a
 /// failed Bitcoin ask falls back to the seller's last `ready` within a
@@ -642,14 +748,7 @@ pub async fn get_own_payment_config(
         Ok(row) => row,
         Err(error) => return internal("payment config read", &error),
     };
-    let (bitcoin_setup, usdt) = tokio::join!(lookup_bitcoin_setup(&state, &actor.0), async {
-        if state.config.usdt_payments_enabled {
-            own_usdt_view(&state, &actor.0).await.map(Some)
-        } else {
-            Ok(None)
-        }
-    },);
-    let usdt = match usdt {
+    let paykit = match own_paykit_view(&state, &actor.0).await {
         Ok(view) => view,
         Err(error) => return internal("payment config read", &error),
     };
@@ -658,16 +757,9 @@ pub async fn get_own_payment_config(
             row.bitcoin_enabled,
             &row.paypal_merchant_email,
             row.updated_at,
-            bitcoin_setup,
-            usdt.as_ref(),
+            &paykit,
         ),
-        None => config_view(
-            false,
-            &None,
-            DateTime::<Utc>::UNIX_EPOCH,
-            bitcoin_setup,
-            usdt.as_ref(),
-        ),
+        None => config_view(false, &None, DateTime::<Utc>::UNIX_EPOCH, &paykit),
     };
     (StatusCode::OK, Json(json!({ "payment_config": view }))).into_response()
 }
