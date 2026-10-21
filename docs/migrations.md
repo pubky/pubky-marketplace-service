@@ -376,6 +376,43 @@ DELETE FROM _sqlx_migrations WHERE version = 81;
 kind catalog, like 0071, and fails loudly if id 41 holds anything else. An
 image from before it never writes id 41; the row is harmless to it.
 
+## Per-item reviews (0083 to 0086)
+
+A buyer reviews each listing of an order, with one purchase attestation per
+listing ([Reviews](api.md#reviews)). The four files apply in one start.
+
+- 0083 adds `reviews.listing_aggregate_id` (backfilled from the order's first
+  line, then `NOT NULL`), the nullable `reviews.shipping` and
+  `reviews.communication` (buyer only, set together, 1 to 5 each), and
+  `review_attestations.listing_uri` (backfilled from `claims ->> 'listing'`,
+  then `NOT NULL`, with a CHECK that it equals that claim). The append-only
+  trigger on `review_attestations` is dropped for the backfill and re-created
+  right after, as 0018 does for `attestation_annotations`. Two `BEFORE INSERT`
+  triggers fill the new key columns when an insert leaves them out. Directly
+  rerunnable; `lock_timeout` like 0050.
+- 0084 builds `reviews_one_per_order_role_listing` on `(order_id,
+  reviewer_role, listing_aggregate_id)` and 0085 builds
+  `review_attestations_item_key` on `(order_id, reviewer_pubky, listing_uri)`,
+  each as one `CREATE UNIQUE INDEX CONCURRENTLY` in a `-- no-transaction` file.
+- 0086 swaps the keys onto those indexes: `reviews_one_per_order_role` gives
+  way to the `reviews_one_per_order_role_listing` unique constraint, and the
+  `(order_id, reviewer_pubky)` primary key of `review_attestations` to
+  `review_attestations_item_key`. Attaching an index builds nothing.
+  Rerunnable; `lock_timeout` like 0050.
+
+**Deploy mode: rolling.** Every existing review and attestation is the order's
+first line, which is what the backfill writes. A binary from before 0083 writes
+neither new column; the insert triggers key its reviews to the first line and
+its attestations to the listing their claims bind, which is what that binary
+reviews, so its duplicate reviews are still refused. During the overlap it
+reads a reviewer's first row where a buyer has reviewed several items.
+
+### Backing out 0083 to 0086
+
+An image from before them runs on the migrated database while no buyer has
+reviewed a second item of an order. Once one has, restoring the per-order keys
+means deleting those rows first; roll forward instead.
+
 ## Numbers claimed by open pull requests
 
 `main` has 0001 to 0079 (0068 and 0069 were never used). A new migration must
@@ -387,6 +424,7 @@ assume it is free:
 | 0080 | `0080_seller_status_confirmed_at.sql` | seller re-confirmation date at payment (LG18) |
 | 0081 | `0081_order_return_policy.sql` | listing return policy frozen at payment |
 | 0082 | `0082_cancel_return_command_kind.sql` | `return.cancel` refusal-audit command kind |
+| 0083 to 0086 | `0083_review_items.sql` to `0086_review_item_keys.sql` | per-item reviews and seller ratings |
 
 This table describes unmerged work and goes stale as pull requests land; trust
 `crates/service/migrations/` on `main` over it. sqlx does not reject two files

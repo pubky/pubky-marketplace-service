@@ -171,34 +171,94 @@ fn internal_error(context: &str, error: &sqlx::Error) -> Response {
 }
 
 /// `GET /v1/orders/{id}/review-attestation`: the actor's own stored purchase
-/// attestation for the order (ADR 0024 §4). Issuance is deterministic per
-/// (order, reviewer), so this re-fetch is idempotent — no consumption
-/// semantics. 404 covers absent orders, foreign orders, and orders the
-/// actor has not reviewed, indistinguishably.
+/// attestation for the order's first line (ADR 0024 §4), the one a
+/// single-listing review publishes. Issuance is deterministic per (order,
+/// reviewer, listing), so this re-fetch is idempotent — no consumption
+/// semantics. 404 covers absent orders, foreign orders, and orders whose
+/// first line the actor has not reviewed, indistinguishably.
 pub async fn get_review_attestation(
     State(state): State<AppState>,
     Extension(actor): Extension<Actor>,
     Path(id): Path<Uuid>,
 ) -> Response {
-    let row: Result<Option<(String, Value)>, sqlx::Error> = sqlx::query_as(
-        "SELECT a.jws, a.claims FROM review_attestations a \
-         JOIN orders o ON o.id = a.order_id \
-         WHERE a.order_id = $1 AND a.reviewer_pubky = $2 \
-           AND (o.buyer_pubky = $2 OR o.seller_pubky = $2)",
-    )
-    .bind(id)
-    .bind(&actor.0)
-    .fetch_optional(&state.pool)
-    .await;
-    match row {
-        Ok(Some((jws, claims))) => (
+    let (order, attestations) = match participant_review_attestations(&state, &actor, id).await {
+        Ok(Some(found)) => found,
+        Ok(None) => {
+            return query_error(ErrorCode::NotFound, "The review attestation was not found.")
+        }
+        Err(error) => return internal_error("review attestation", &error),
+    };
+    let first_line = crate::handlers::reviews::order_listings(&order)
+        .into_iter()
+        .next();
+    match attestations
+        .into_iter()
+        .find(|(listing, _)| Some(listing) == first_line.as_ref())
+    {
+        Some((_, attestation)) => (
             StatusCode::OK,
-            Json(json!({ "attestation": { "jws": jws, "claims": claims } })),
+            Json(json!({
+                "attestation": { "jws": attestation["jws"], "claims": attestation["claims"] }
+            })),
         )
             .into_response(),
-        Ok(None) => query_error(ErrorCode::NotFound, "The review attestation was not found."),
-        Err(error) => internal_error("review attestation", &error),
+        None => query_error(ErrorCode::NotFound, "The review attestation was not found."),
     }
+}
+
+/// `GET /v1/orders/{id}/review-attestations`: every purchase attestation
+/// issued to the caller for the order, one per reviewed listing in line
+/// order, each `{ listing_id, jws, claims }`. Participants only; absent and
+/// foreign orders are both 404, and a participant with no attestation gets
+/// an empty list.
+pub async fn get_review_attestations(
+    State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<Uuid>,
+) -> Response {
+    match participant_review_attestations(&state, &actor, id).await {
+        Ok(Some((_, attestations))) => (
+            StatusCode::OK,
+            Json(json!({
+                "attestations": attestations
+                    .into_iter()
+                    .map(|(_, attestation)| attestation)
+                    .collect::<Vec<_>>(),
+            })),
+        )
+            .into_response(),
+        Ok(None) => query_error(ErrorCode::NotFound, "The order was not found."),
+        Err(error) => internal_error("review attestations", &error),
+    }
+}
+
+/// The order and the caller's review attestations for it in line order, or
+/// `None` when the caller is not a participant of an existing order.
+async fn participant_review_attestations(
+    state: &AppState,
+    actor: &Actor,
+    order_id: Uuid,
+) -> Result<
+    Option<(
+        OrderRow,
+        Vec<(crate::handlers::reviews::OrderListing, Value)>,
+    )>,
+    sqlx::Error,
+> {
+    let order: Option<OrderRow> = sqlx::query_as(&format!(
+        "SELECT {ORDER_COLUMNS} FROM orders \
+         WHERE id = $1 AND (buyer_pubky = $2 OR seller_pubky = $2)"
+    ))
+    .bind(order_id)
+    .bind(&actor.0)
+    .fetch_optional(&state.pool)
+    .await?;
+    let Some(order) = order else {
+        return Ok(None);
+    };
+    let attestations =
+        crate::handlers::reviews::fetch_attestations(&state.pool, &order, &actor.0).await?;
+    Ok(Some((order, attestations)))
 }
 
 /// `GET /v1/sellers/{pubky}/band-consent`: the seller's standing amount-band

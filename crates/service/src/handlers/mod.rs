@@ -230,7 +230,7 @@ pub fn guard_order_action(
 }
 
 pub const REVIEW_COLUMNS: &str = "id, order_id, reviewer_pubky, reviewer_role, subject_pubky, \
-     rating, text, created_at, updated_at";
+     listing_aggregate_id, rating, text, shipping, communication, created_at, updated_at";
 
 pub async fn fetch_order_reviews(
     tx: &mut Transaction<'_, Postgres>,

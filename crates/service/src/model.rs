@@ -1946,8 +1946,15 @@ pub struct ReviewRow {
     pub reviewer_pubky: String,
     pub reviewer_role: String,
     pub subject_pubky: String,
+    /// The order line's listing this review rates (a seller's review of the
+    /// buyer is keyed to the first line).
+    pub listing_aggregate_id: String,
     pub rating: i32,
     pub text: String,
+    /// The buyer's per-order seller ratings, identical on every item review
+    /// of the order; NULL on seller reviews and on reviews without them.
+    pub shipping: Option<i32>,
+    pub communication: Option<i32>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -1959,8 +1966,11 @@ impl ReviewRow {
             "reviewer_pubky": self.reviewer_pubky,
             "reviewer_role": self.reviewer_role,
             "subject_pubky": self.subject_pubky,
+            "listing_aggregate_id": self.listing_aggregate_id,
             "rating": self.rating,
             "text": self.text,
+            "shipping": self.shipping,
+            "communication": self.communication,
             "created_at": format_timestamp(self.created_at),
             "updated_at": format_timestamp(self.updated_at),
         })

@@ -1149,7 +1149,9 @@ purchase attestations are issued (`review.create` results carry no
 `attestation`), no attestor annotations are recorded, and the weekly seller
 stat-attestation job does not run.
 With both set, `review.create` issues a durable compact-JWS purchase
-attestation inside the review transaction (re-fetchable via
+attestation per reviewed listing inside the review transaction, all sharing
+the order's `order_ref` (re-fetchable via
+`GET /v1/orders/{id}/review-attestations`, and the first line's via
 `GET /v1/orders/{id}/review-attestation`, participant-scoped, idempotent),
 the D2 amount-band consent gate applies (`attestation.set_band_consent`
 command + `GET /v1/sellers/{pubky}/band-consent` read), external refunds
@@ -1325,8 +1327,8 @@ compare it.
 | `return.receive` | CAS 409 vs order `revision` | `returns.rs:171` |
 | `refund.record_external` | CAS 409 vs order `revision` | `returns.rs:251` |
 | `refund.confirm_destination` | CAS 409 vs order `revision` | `refund_destination.rs:27` |
-| `review.create` | CAS 409 vs order `revision` | `reviews.rs:54` |
-| `review.update` | CAS 409 vs order `revision` | `reviews.rs:304` |
+| `review.create` | CAS 409 vs order `revision` | `reviews.rs:214` |
+| `review.update` | CAS 409 vs order `revision` | `reviews.rs:571` |
 | `attestation.set_band_consent` | CAS 409 vs stored consent revision (`0` on first write) | `attestation.rs:47` |
 
 Handler paths are under `crates/service/src/handlers/`.
@@ -1564,12 +1566,18 @@ and refund branches):
   A refund never restocks. Contract table:
   [`docs/paypal-refund-ipn.md`](docs/paypal-refund-ipn.md).
 - **Reviews.** `review.create` (participants, from
-  `delivered`/`completed`/`closed`): one review per participant per order
-  per role, enforced by the `reviews_one_per_order_role` database
-  constraint rather than application logic — the insert happens before the
-  order's revision compare-and-swap, so a same-role race is decided by the
-  constraint. `review.update` (this service only) lets the reviewer revise
-  rating and text within 24 hours of creation.
+  `delivered`/`completed`/`closed`): a buyer reviews each listing of the
+  order (v2 `items`, with optional per-order `seller` ratings written on
+  every item review; v1 `rating`/`text` rates the first line), a seller
+  reviews the buyer once per order, keyed to the first line. One review per
+  order, role and listing is enforced by the
+  `reviews_one_per_order_role_listing` database constraint rather than
+  application logic — the inserts happen before the order's revision
+  compare-and-swap, so a same-item race is decided by the constraint and a
+  race on different items by the compare-and-swap. Within 24 hours of their
+  first review of the order a buyer may add items, and `review.update` (this
+  service only) lets either reviewer revise ratings and text. See
+  [Reviews](docs/api.md#reviews).
 
 Every post-purchase command is participant-scoped, enforces
 `expected_revision` compare-and-swap, replays
@@ -2278,8 +2286,8 @@ This service is canonical and resolves them as follows:
 | Confirming a lapsed auction hold | impossible in the prototype (no reservation expiry) | refused with `INVALID_STATE` once the winner's 30-minute hold has expired on server time | This service sweeps expired holds back to `available`; confirming afterwards would sell inventory the order no longer holds. |
 | Inventory release on cancelling a paid order | the prototype's `releaseOrderInventory` moved the quantity reserved → available (it never moved paid quantities out of `reservedQuantity`) | `order.cancel_approve` returns the cancelled order's sold quantities to available; the listing machine declares `sold → available` via `order.cancel_approve` | Payment confirmation here moves quantities reserved → sold (see above), so reversing a cancelled paid sale on the durable ledger necessarily reverses the sold quantities — otherwise every cancelled paid order would understock the listing forever. Same prototype semantics (held stock returns to available), expressed against the durable columns. |
 | Cancelling a lapsed auction hold | impossible in the prototype (no reservation expiry) | the cancel succeeds; the reservation compare-and-swap (`active → released`) finds the hold already `expired`, so no quantities move | The sweep already returned the unit; releasing again would double-count it, and refusing would strand an order that can be neither paid (confirmation is refused, see above) nor cancelled. |
-| Review uniqueness | application check on the in-memory order's `reviews` array | `reviews_one_per_order_role` UNIQUE constraint; the review insert precedes the order revision CAS so a same-role race is decided by the constraint (`INVARIANT_VIOLATION`), sequential duplicates by the ported check (`INVALID_STATE`) | ADR-0019 §4: one participant review per order/role is a database invariant, not code. |
-| Review editing | none (reviews were immutable) | `review.update` (this service only): the reviewer may revise rating/text within 24 hours of creation, under the order's revision CAS with a `review.updated` event | The task's bounded edit window; the window is a documented policy constant (`REVIEW_EDIT_WINDOW_SECONDS`). No notification is emitted — the prototype had none to copy. |
+| Review uniqueness | application check on the in-memory order's `reviews` array | `reviews_one_per_order_role_listing` UNIQUE constraint on (order, role, listing); the review inserts precede the order revision CAS so a same-item race is decided by the constraint (`INVARIANT_VIOLATION`), a race on different items by the CAS (`REVISION_CONFLICT`), sequential duplicates by the ported check (`INVALID_STATE`) | ADR-0019 §4: one participant review per order/role/listing is a database invariant, not code. |
+| Review editing | none (reviews were immutable) | `review.update` (this service only): the reviewer may revise ratings/text within 24 hours of their first review of the order, under the order's revision CAS with a `review.updated` event | The task's bounded edit window; the window is a documented policy constant (`REVIEW_EDIT_WINDOW_SECONDS`). No notification is emitted — the prototype had none to copy. |
 | Conversations | client `conversationSchema` + sandbox `GET /v1/conversations` | no endpoint | No durable conversation/message tables exist; `message.*` commands are not ported. |
 | Notification projection | client `notificationSchema` requires a positive `revision` | no `revision` field | Delivered notifications are immutable outbox-consumer rows, not revisioned aggregates; no `notification.*` command exists that would need an `expected_revision`. |
 

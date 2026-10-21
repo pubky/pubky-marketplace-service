@@ -132,6 +132,7 @@ and write. "Automation" means the inventory capability plus the
 | GET | `/v1/orders/{id}/digital-evidence` |
 | GET | `/v1/orders/{id}/digital-delivery/{line_index}` |
 | GET | `/v1/orders/{id}/review-attestation` |
+| GET | `/v1/orders/{id}/review-attestations` |
 | GET | `/v1/sellers/{pubky}/band-consent` |
 | GET | `/v1/payments/{id}` |
 | GET | `/v1/receipts/{id}` |
@@ -799,6 +800,115 @@ update is refused with `order_not_shipped`.
 
 The event carries the new order `revision` and, like every event, `data: {}`:
 fetch the order for the new carrier, number and history.
+
+## Reviews
+
+`review.create` and `review.update` go through `POST /v1/commands` against the
+order aggregate, from `delivered`, `completed` or `closed`. The payload takes
+one of two shapes.
+
+**v1** (either participant): one rating and text for the order.
+
+```json
+{ "order_id": "<order_id>", "rating": 5, "text": "Accurate and fast.", "allow_amount_band": false }
+```
+
+A buyer's v1 review rates the order's first line; a seller's rates the buyer
+and is keyed and attested to the first line. `text` is 1 to 5,000 characters.
+
+**v2** (buyer only): one entry per reviewed listing, plus optional seller
+ratings for the order.
+
+```json
+{
+  "order_id": "<order_id>",
+  "items": [
+    { "listing_id": "boots_01", "rating": 5, "text": "Warm." },
+    { "listing_id": "laces_02", "rating": 4 }
+  ],
+  "seller": { "shipping": 4, "communication": 5 },
+  "allow_amount_band": false
+}
+```
+
+- `listing_id` is the seller's record id (the part after `listing:{seller}_` in
+  the line's `listing_aggregate_id`), at most once per command and 1 to 50
+  items. `rating` is 1 to 5; `text` is optional, 0 to 5,000 characters.
+- `seller` is written on every item review of the order, so the ratings are
+  identical on all of them; sending it again replaces them on every item.
+- A payload with both shapes, or `seller` without `items`, is refused with
+  `INVALID_COMMAND` and `issues`. A seller sending `items`, or an item naming a
+  listing that is not in the order, is refused with `INVALID_COMMAND`.
+
+`review.create` writes one review per listing and issues one purchase
+attestation per listing; the attestations share the order's `order_ref` and
+each binds its listing. Within 24 hours of their first review of the order, a
+buyer may create again to add listings not yet reviewed, and either reviewer
+may `review.update` the listings they reviewed (v1 terms edit the first line).
+Reviewing a listing twice is refused with `INVALID_STATE`; past the window,
+adding and editing are refused with `INVALID_STATE`. A buyer's first review
+moves `delivered` to `completed`. Each `review.create` emits one
+`review.created` event and one `review_received` notification to the
+counterparty, however many items it rates; `review.update` emits
+`review.updated` and no notification.
+
+Two submissions racing on the same listing are decided by the unique key: the
+loser is refused with `INVARIANT_VIOLATION`. Two racing on different listings,
+or a buyer and a seller reviewing at once, resolve on the order revision: the
+loser is refused with `REVISION_CONFLICT` and `error.current_revision`, and
+nothing it wrote remains.
+
+The result is:
+
+```json
+{
+  "kind": "review",
+  "order": { "...": "...", "reviews": [ "... every review of the order ..." ] },
+  "review": { "...": "the first review this command wrote, in line order" },
+  "reviews": [
+    {
+      "id": "<uuid>",
+      "reviewer_pubky": "<pubky>",
+      "reviewer_role": "buyer",
+      "subject_pubky": "<pubky>",
+      "listing_aggregate_id": "listing:<seller>_boots_01",
+      "rating": 5,
+      "text": "Warm.",
+      "shipping": 4,
+      "communication": 5,
+      "created_at": "2026-10-21T10:00:00.000Z",
+      "updated_at": "2026-10-21T10:00:00.000Z"
+    }
+  ],
+  "attestations": [ { "listing_id": "boots_01", "jws": "<compact JWS>", "claims": { "...": "..." } } ],
+  "attestation": { "jws": "<compact JWS>", "claims": { "...": "..." } }
+}
+```
+
+- `reviews` are the rows the command wrote, in line order, including earlier
+  item reviews whose seller ratings it changed. `shipping` and `communication`
+  are `null` on seller reviews and on reviews without them.
+- `attestations` are those rows' attestations, in the same order.
+- `attestation` is the caller's first-line attestation in the closed
+  `{ jws, claims }` shape, whichever command issued it.
+- Without a configured attestor, both attestation fields are absent.
+
+### `GET /v1/orders/{id}/review-attestations`
+
+Every purchase attestation issued to the caller for the order, in line order:
+
+```json
+{ "attestations": [ { "listing_id": "boots_01", "jws": "<compact JWS>", "claims": { "...": "..." } } ] }
+```
+
+Participants only: an unknown or foreign order is `404 NOT_FOUND`, and a
+participant without an attestation gets `{"attestations": []}`.
+
+### `GET /v1/orders/{id}/review-attestation`
+
+The caller's first-line attestation, `{"attestation": {"jws", "claims"}}`, the
+route single-listing clients read. `404 NOT_FOUND` when the order is unknown or
+foreign, or the caller has not reviewed its first line.
 
 ## Batch sync (`sync-many`)
 
