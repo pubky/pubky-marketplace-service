@@ -36,16 +36,33 @@ fn listing_uri(seller: &TestActor, listing_id: &str) -> String {
     )
 }
 
-/// Registers one unit of each listing, checks all of them out in one order,
-/// pays, ships and confirms delivery. Returns the order id; the order is
-/// `delivered` at revision 4.
+/// Registers one unit of each listing at 125.00 USD, checks all of them out
+/// in one order, pays, ships and confirms delivery. Returns the order id;
+/// the order is `delivered` at revision 4.
 async fn delivered_order(
     app: &TestApp,
     seller: &TestActor,
     buyer: &TestActor,
     listing_ids: &[&str],
 ) -> String {
-    for (index, listing_id) in listing_ids.iter().enumerate() {
+    let priced: Vec<(&str, i64)> = listing_ids
+        .iter()
+        .map(|listing_id| (*listing_id, 12_500))
+        .collect();
+    delivered_priced_order(app, seller, buyer, &priced, "USD", 2).await
+}
+
+/// [`delivered_order`] with each listing's unit price, in `currency` at
+/// `exponent`.
+async fn delivered_priced_order(
+    app: &TestApp,
+    seller: &TestActor,
+    buyer: &TestActor,
+    listings: &[(&str, i64)],
+    currency: &str,
+    exponent: i64,
+) -> String {
+    for (index, (listing_id, amount_minor)) in listings.iter().enumerate() {
         let (status, body) = execute(
             app,
             &seller.token,
@@ -62,7 +79,11 @@ async fn delivered_order(
                     "listing_revision": 1,
                     "content_hash": "a".repeat(64),
                     "quantity": 1,
-                    "unit_price": { "amount_minor": 12_500, "currency": "USD", "exponent": 2 },
+                    "unit_price": {
+                        "amount_minor": amount_minor,
+                        "currency": currency,
+                        "exponent": exponent,
+                    },
                     "shipping_minor": 1_200,
                 },
             }),
@@ -71,9 +92,9 @@ async fn delivered_order(
         assert_eq!(status, StatusCode::OK, "register {listing_id}: {body}");
     }
     let checkout_id = indexed_command_id(0x7200, 1);
-    let lines: Vec<Value> = listing_ids
+    let lines: Vec<Value> = listings
         .iter()
-        .map(|listing_id| {
+        .map(|(listing_id, _)| {
             json!({
                 "listing_aggregate_id": format!("listing:{}_{listing_id}", seller.pubky),
                 "expected_revision": 1,
@@ -827,4 +848,221 @@ async fn concurrent_buyer_and_seller_reviews_both_land_after_one_retry(pool: PgP
     assert_eq!(order_refs.len(), 1);
     assert_eq!(order_revision(&app, &order_id).await, 6);
     assert_eq!(review_notifications(&app).await, 2);
+}
+
+fn band_consent_command(seller: &TestActor, allows: bool) -> Value {
+    json!({
+        "version": 1,
+        "command_id": indexed_command_id(0x9000, 1),
+        "aggregate_id": format!("seller_settings:{}", seller.pubky),
+        "expected_revision": 0,
+        "issued_at": "2026-08-19T22:00:00.000Z",
+        "kind": "attestation.set_band_consent",
+        "payload": { "allows_amount_band": allows },
+    })
+}
+
+/// Reviews all three listings of an order priced `listings` (listing id,
+/// unit price, expected claim), then the seller reviews the buyer. Every
+/// attestation signs the decade of its own listing's unit price, in the
+/// result, the JWS and the stored row; the seller's binds the first line.
+/// Nobody consented to the order-total band, so none carries one.
+async fn assert_each_item_signs_its_price_decade(
+    pool: PgPool,
+    currency: &str,
+    exponent: i64,
+    listings: [(&str, i64, &str); 3],
+) {
+    let app = test_app_with_attestor(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let priced: Vec<(&str, i64)> = listings
+        .iter()
+        .map(|(listing_id, price, _)| (*listing_id, *price))
+        .collect();
+    let order_id = delivered_priced_order(&app, &seller, &buyer, &priced, currency, exponent).await;
+    let items: Vec<(&str, i64)> = listings
+        .iter()
+        .map(|(listing_id, _, _)| (*listing_id, 5))
+        .collect();
+    let (status, reviewed) = execute(
+        &app,
+        &buyer.token,
+        &items_review(&order_id, 4, &items, 7_501),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "review failed: {reviewed}");
+    let attestations = reviewed["result"]["attestations"]
+        .as_array()
+        .expect("attestations");
+    assert_eq!(attestations.len(), 3);
+    for (attestation, (listing_id, _, decade)) in attestations.iter().zip(listings) {
+        assert_eq!(attestation["listing_id"], json!(listing_id));
+        let claims = claims_of(attestation);
+        assert_eq!(attestation["claims"], claims);
+        assert_eq!(claims["price_decade"], json!(decade), "{listing_id}");
+        assert!(claims.get("amount_band").is_none(), "{claims}");
+    }
+
+    let (status, seller_reviewed) = execute(
+        &app,
+        &seller.token,
+        &order_command(
+            "review.create",
+            &order_id,
+            5,
+            json!({ "rating": 5, "text": "Great buyer." }),
+            7_502,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "seller review: {seller_reviewed}");
+    assert_eq!(
+        claims_of(&seller_reviewed["result"]["attestation"])["price_decade"],
+        json!(listings[0].2)
+    );
+
+    let stored: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT reviewer_pubky, listing_uri, claims ->> 'price_decade' FROM review_attestations \
+         WHERE order_id = $1::uuid ORDER BY reviewer_pubky = $2, listing_uri",
+    )
+    .bind(&order_id)
+    .bind(&seller.pubky)
+    .fetch_all(&app.pool)
+    .await
+    .expect("stored attestations");
+    let expected: Vec<(String, String, Option<String>)> = listings
+        .iter()
+        .map(|(listing_id, _, decade)| {
+            (
+                buyer.pubky.clone(),
+                listing_uri(&seller, listing_id),
+                Some(decade.to_string()),
+            )
+        })
+        .chain([(
+            seller.pubky.clone(),
+            listing_uri(&seller, listings[0].0),
+            Some(listings[0].2.to_string()),
+        )])
+        .collect();
+    assert_eq!(stored, expected);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn items_of_a_bitcoin_order_sign_their_sat_decades_under_btc(pool: PgPool) {
+    assert_each_item_signs_its_price_decade(
+        pool,
+        "BTC",
+        8,
+        [
+            ("boots_01", 25_000, "BTC:4"),
+            ("laces_02", 1_000, "BTC:3"),
+            ("socks_03", 150_000_000, "BTC:8"),
+        ],
+    )
+    .await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn items_of_a_sat_order_sign_their_own_price_decades(pool: PgPool) {
+    assert_each_item_signs_its_price_decade(
+        pool,
+        "SAT",
+        0,
+        [
+            ("boots_01", 999, "SAT:2"),
+            ("laces_02", 25_000, "SAT:4"),
+            ("socks_03", 2_100_000, "SAT:6"),
+        ],
+    )
+    .await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn items_of_a_fiat_order_sign_their_own_price_decades(pool: PgPool) {
+    assert_each_item_signs_its_price_decade(
+        pool,
+        "USD",
+        2,
+        [
+            ("boots_01", 999, "USD:2"),
+            ("laces_02", 12_500, "USD:4"),
+            ("socks_03", 1_000_000, "USD:6"),
+        ],
+    )
+    .await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn items_of_a_yen_order_sign_their_own_price_decades(pool: PgPool) {
+    assert_each_item_signs_its_price_decade(
+        pool,
+        "JPY",
+        0,
+        [
+            ("boots_01", 450, "JPY:2"),
+            ("laces_02", 4_500, "JPY:3"),
+            ("socks_03", 1_000_000, "JPY:6"),
+        ],
+    )
+    .await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn the_order_total_band_stays_consent_only_beside_the_price_decades(pool: PgPool) {
+    let app = test_app_with_attestor(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (status, body) = execute(&app, &seller.token, &band_consent_command(&seller, true)).await;
+    assert_eq!(status, StatusCode::OK, "consent: {body}");
+    let order_id = delivered_priced_order(
+        &app,
+        &seller,
+        &buyer,
+        &[
+            ("boots_01", 999),
+            ("laces_02", 12_500),
+            ("socks_03", 1_000_000),
+        ],
+        "USD",
+        2,
+    )
+    .await;
+
+    let mut command = items_review(
+        &order_id,
+        4,
+        &[("boots_01", 5), ("laces_02", 4), ("socks_03", 3)],
+        7_511,
+    );
+    command["payload"]["allow_amount_band"] = json!(true);
+    let (status, reviewed) = execute(&app, &buyer.token, &command).await;
+    assert_eq!(status, StatusCode::OK, "review failed: {reviewed}");
+    // The band is the order total's decade, the same on every item: the
+    // total is 1,013,499 cents of items plus shipping, under 10^7.
+    let total = reviewed["result"]["order"]["total"]["amount_minor"]
+        .as_i64()
+        .expect("order total");
+    assert!((1_000_000..10_000_000).contains(&total), "{total}");
+    let decades: Vec<(Value, Value)> = reviewed["result"]["attestations"]
+        .as_array()
+        .expect("attestations")
+        .iter()
+        .map(|attestation| {
+            let claims = claims_of(attestation);
+            (
+                claims["amount_band"].clone(),
+                claims["price_decade"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        decades,
+        vec![
+            (json!("USD:6"), json!("USD:2")),
+            (json!("USD:6"), json!("USD:4")),
+            (json!("USD:6"), json!("USD:6")),
+        ]
+    );
 }

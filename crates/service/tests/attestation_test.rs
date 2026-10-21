@@ -211,7 +211,7 @@ async fn review_create_issues_a_verifiable_attestation_with_the_designed_claims(
     assert_eq!(claims["iss"], json!(test_attestor().pubky()));
 
     // Exact claim shape (closed world, design §5.3). No amount band: the D2
-    // default is not-included.
+    // default is not-included. The price decade is always signed (RV1).
     let keys: Vec<&str> = claims
         .as_object()
         .expect("claims are an object")
@@ -229,10 +229,13 @@ async fn review_create_issues_a_verifiable_attestation_with_the_designed_claims(
             "listing",
             "order_ref",
             "completed_on",
+            "price_decade",
             "iat"
         ]
     );
     assert_eq!(claims["v"], json!(1));
+    // 12,500 cents is 10^4 cents.
+    assert_eq!(claims["price_decade"], json!("USD:4"));
     assert_eq!(claims["sub"], json!(buyer.pubky));
     assert_eq!(claims["cpk"], json!(seller.pubky));
     assert_eq!(claims["role"], json!("buyer_reviewing_seller"));
