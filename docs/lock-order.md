@@ -26,6 +26,16 @@ one seller therefore serialize at the lock: `eu_fence_test` pays eight open
 orders at the last slot concurrently, and `annual_cap_at_payment_test` polls two
 settled Bitcoin payments at once.
 
+## A refund hash after its order
+
+`refund.record_external` on a USDT order locks the order row, then takes
+`pg_advisory_xact_lock(hashtextextended('refund-tx|' || lower(hash), 0))`
+before it checks that no other order recorded the same Arbitrum transaction
+hash. Two records of one hash on two orders hold different order rows and
+serialize at the hash lock; the second sees the first's record and is refused
+with `refund_transaction_already_recorded`. Nothing waits for an order row
+while holding the hash lock.
+
 ## Drops before listings
 
 A transaction that touches a drop and its listings locks the drop row, then

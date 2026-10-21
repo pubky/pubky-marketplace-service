@@ -389,6 +389,12 @@ pub async fn record_external_refund(
     // One Arbitrum transaction is evidence for one order's refund: a hash
     // already recorded on another order would read as checked there too.
     if usdt_destination.is_some() {
+        // Two records of one hash on two orders lock different order rows, so
+        // they serialize here, or both would pass the check below.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('refund-tx|' || lower($1), 0))")
+            .bind(&payload.transaction_id)
+            .execute(&mut **tx)
+            .await?;
         let recorded_elsewhere: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM orders WHERE id <> $1 \
              AND lower(external_refund->>'transaction_id') = lower($2))",

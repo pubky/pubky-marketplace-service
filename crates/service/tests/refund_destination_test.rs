@@ -1163,3 +1163,31 @@ async fn one_transaction_is_the_refund_of_one_order_only(pool: PgPool) {
         "{body}"
     );
 }
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn two_records_of_one_hash_at_once_record_it_once(pool: PgPool) {
+    use marketplace_service::refund_chain::RefundChainOutcome;
+    let app = with_chain(
+        test_app(pool).await,
+        RefundChainOutcome::Transferred { units: 137_000_000 },
+    );
+    let (first_seller, first) = cancelled_usdt_order_with_destination(&app).await;
+    let (second_seller, second) = cancelled_usdt_order_with_destination(&app).await;
+
+    let hash = tx_hash(11);
+    let ((first_status, _), (second_status, _)) = tokio::join!(
+        record(&app, &first_seller.token, &first, ORDER_TOTAL_CENTS, &hash),
+        record(
+            &app,
+            &second_seller.token,
+            &second,
+            ORDER_TOTAL_CENTS,
+            &hash
+        ),
+    );
+    let recorded = [first_status, second_status]
+        .iter()
+        .filter(|status| **status == StatusCode::OK)
+        .count();
+    assert_eq!(recorded, 1, "{first_status} {second_status}");
+}
