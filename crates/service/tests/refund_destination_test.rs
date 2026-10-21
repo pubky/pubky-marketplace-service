@@ -1015,8 +1015,12 @@ async fn the_bitcoin_reference_cap_is_unchanged(pool: PgPool) {
     assert!(external_refund.get("destination_address").is_none());
 }
 
-/// An Arbitrum RPC double answering every refund check with one outcome.
-struct FixedChain(marketplace_service::refund_chain::RefundChainOutcome);
+/// An Arbitrum RPC double answering every refund check with one outcome,
+/// after an optional delay.
+struct FixedChain(
+    marketplace_service::refund_chain::RefundChainOutcome,
+    std::time::Duration,
+);
 
 impl marketplace_service::refund_chain::RefundChain for FixedChain {
     fn check<'a>(
@@ -1030,8 +1034,11 @@ impl marketplace_service::refund_chain::RefundChain for FixedChain {
                 + 'a,
         >,
     > {
-        let outcome = self.0;
-        Box::pin(async move { outcome })
+        let (outcome, delay) = (self.0, self.1);
+        Box::pin(async move {
+            tokio::time::sleep(delay).await;
+            outcome
+        })
     }
 }
 
@@ -1039,10 +1046,18 @@ fn with_chain(
     app: TestApp,
     outcome: marketplace_service::refund_chain::RefundChainOutcome,
 ) -> TestApp {
+    with_slow_chain(app, outcome, std::time::Duration::ZERO)
+}
+
+fn with_slow_chain(
+    app: TestApp,
+    outcome: marketplace_service::refund_chain::RefundChainOutcome,
+    delay: std::time::Duration,
+) -> TestApp {
     let state = app
         .state
         .clone()
-        .with_refund_chain(Some(std::sync::Arc::new(FixedChain(outcome))));
+        .with_refund_chain(Some(std::sync::Arc::new(FixedChain(outcome, delay))));
     TestApp {
         router: marketplace_service::http::build_router(state.clone()),
         pool: app.pool,
@@ -1167,9 +1182,12 @@ async fn one_transaction_is_the_refund_of_one_order_only(pool: PgPool) {
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn two_records_of_one_hash_at_once_record_it_once(pool: PgPool) {
     use marketplace_service::refund_chain::RefundChainOutcome;
-    let app = with_chain(
+    // The check sleeps, so without the hash lock both records pass the
+    // duplicate check before either is written, every time.
+    let app = with_slow_chain(
         test_app(pool).await,
         RefundChainOutcome::Transferred { units: 137_000_000 },
+        std::time::Duration::from_millis(200),
     );
     let (first_seller, first) = cancelled_usdt_order_with_destination(&app).await;
     let (second_seller, second) = cancelled_usdt_order_with_destination(&app).await;
