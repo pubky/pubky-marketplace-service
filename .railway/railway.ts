@@ -28,6 +28,7 @@ const sharedDeploy = {
 const sharedEnv = {
   ADDRESS_SEARCH_CLIENT_IP_HEADER: preserve(),
   ALLOWED_ORIGINS: preserve(),
+  ARBITRUM_RPC_URL: preserve(),
   BITCOIN_PAYMENT_WINDOW_SECONDS: preserve(),
   CHECKOUT_HOLD_WINDOW_SECONDS: preserve(),
   CONNECTOR_CREDENTIAL_ENCRYPTION_KEY: preserve(),

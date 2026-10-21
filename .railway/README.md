@@ -96,7 +96,7 @@ event and webhook variables (`AUTOMATION_*`, `EVENT_RETENTION_DAYS`,
 set on a live service, add it as a `preserve()` entry (or a literal) before
 applying, otherwise the plan will show it as a delete. Variables the code
 defaults when unset are unaffected. `PAYKIT_SERVER_URL`,
-`PAYKIT_REQUEST_SIGNING_KEY`, `HOMESERVER_URL`, `NEXUS_URL` and the grant-flow
+`PAYKIT_REQUEST_SIGNING_KEY`, `HOMESERVER_URL`, `NEXUS_URL`, `ARBITRUM_RPC_URL` and the grant-flow
 variables are already preserved. The key-material rule is enforced by
 `crates/service/tests/railway_iac_test.rs`.
 
