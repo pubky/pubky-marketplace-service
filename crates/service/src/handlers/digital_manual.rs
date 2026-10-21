@@ -165,7 +165,7 @@ async fn order_action_success(
     Ok(Ok(HandlerSuccess {
         revision: order.revision,
         event_ids: vec![event_id],
-        result: json!({ "kind": "order", "order": order_json_with_reviews(order, &reviews) }),
+        result: json!({ "kind": "order", "order": order_json_with_reviews(order, &reviews, actor) }),
     }))
 }
 

@@ -17,6 +17,10 @@ pub const DEFAULT_AUTO_COMPLETE_DAYS: i64 = 14;
 /// Default `DELIVERY_SWEEP_BATCH_SIZE`: rows claimed per inner pass
 /// (same shape as the paykit/outbox worker batches).
 pub const DEFAULT_DELIVERY_SWEEP_BATCH_SIZE: i64 = 100;
+/// Default `REVIEW_BLIND_WINDOW_DAYS`: 0 leaves double-blind reviews off.
+pub const DEFAULT_REVIEW_BLIND_WINDOW_DAYS: i64 = 0;
+/// Largest `REVIEW_BLIND_WINDOW_DAYS` a deployment may set.
+pub const MAX_REVIEW_BLIND_WINDOW_DAYS: i64 = 90;
 /// Upper bound of `automation_rate_limits.tokens`. Env `rate × burst`
 /// capacity must fit this CHECK or process start fails closed.
 pub const AUTOMATION_RATE_LIMIT_MAX_TOKENS: i64 = 20_000;
@@ -140,6 +144,13 @@ pub struct Config {
     /// cancel request is open (those are their own order states, so an open
     /// request takes the order out of the sweep by construction).
     pub auto_complete_days: i64,
+    /// Days after an order becomes reviewable during which seller-to-buyer
+    /// reviews are double-blind (`REVIEW_BLIND_WINDOW_DAYS`, default 0 = off,
+    /// at most 90). Inside the window each side's review stays withheld from
+    /// the other and the reviewer's attestations are not served until both
+    /// have reviewed or the window ends; past it a seller's review is refused.
+    /// 0 leaves reviews exactly as they were.
+    pub review_blind_window_days: i64,
     /// Rows claimed per inner delivery/auto-complete sweep pass
     /// (`DELIVERY_SWEEP_BATCH_SIZE`, default 100, minimum 1). The worker
     /// iterates until a pass claims fewer than this many rows or the
@@ -378,6 +389,9 @@ impl Config {
         }
         let delivery_assume_days = env_days("DELIVERY_ASSUME_DAYS", DEFAULT_DELIVERY_ASSUME_DAYS)?;
         let auto_complete_days = env_days("AUTO_COMPLETE_DAYS", DEFAULT_AUTO_COMPLETE_DAYS)?;
+        let review_blind_window_days = parse_review_blind_window_days(
+            std::env::var("REVIEW_BLIND_WINDOW_DAYS").ok().as_deref(),
+        )?;
         let delivery_sweep_batch_size = env_days(
             "DELIVERY_SWEEP_BATCH_SIZE",
             DEFAULT_DELIVERY_SWEEP_BATCH_SIZE,
@@ -466,6 +480,7 @@ impl Config {
             paykit_rail_stale_seconds,
             delivery_assume_days,
             auto_complete_days,
+            review_blind_window_days,
             delivery_sweep_batch_size,
             public_app_origin,
             public_service_origin,
@@ -535,6 +550,7 @@ impl Config {
             paykit_rail_stale_seconds: 60,
             delivery_assume_days: DEFAULT_DELIVERY_ASSUME_DAYS,
             auto_complete_days: DEFAULT_AUTO_COMPLETE_DAYS,
+            review_blind_window_days: DEFAULT_REVIEW_BLIND_WINDOW_DAYS,
             delivery_sweep_batch_size: DEFAULT_DELIVERY_SWEEP_BATCH_SIZE,
             public_app_origin: Some("https://app.test".to_string()),
             public_service_origin: Some("https://svc.test".to_string()),
@@ -710,6 +726,23 @@ fn parse_days(name: &str, raw: Option<&str>, default: i64) -> anyhow::Result<i64
     }
 }
 
+/// `REVIEW_BLIND_WINDOW_DAYS`: 0 (the default) turns double-blind reviews
+/// off; 1 to 90 is the window in days.
+fn parse_review_blind_window_days(raw: Option<&str>) -> anyhow::Result<i64> {
+    let Some(value) = raw else {
+        return Ok(DEFAULT_REVIEW_BLIND_WINDOW_DAYS);
+    };
+    let days: i64 = value
+        .parse()
+        .map_err(|_| anyhow::anyhow!("REVIEW_BLIND_WINDOW_DAYS must be an integer"))?;
+    if !(0..=MAX_REVIEW_BLIND_WINDOW_DAYS).contains(&days) {
+        anyhow::bail!(
+            "REVIEW_BLIND_WINDOW_DAYS must be between 0 and {MAX_REVIEW_BLIND_WINDOW_DAYS}"
+        );
+    }
+    Ok(days)
+}
+
 /// An optional http(s) origin from the environment, normalized without a
 /// trailing slash.
 fn env_origin(name: &str) -> anyhow::Result<Option<String>> {
@@ -804,8 +837,8 @@ fn parse_paypal_checkout_url(raw: Option<&str>) -> anyhow::Result<String> {
 mod tests {
     use super::{
         automation_rate_capacity, parse_app_base, parse_days, parse_paypal_checkout_url,
-        refusal_audit_keys_from_env, reject_audit_url_reuse, required_postgres_url,
-        validate_postgres_url, Config, AUTOMATION_RATE_LIMIT_MAX_TOKENS,
+        parse_review_blind_window_days, refusal_audit_keys_from_env, reject_audit_url_reuse,
+        required_postgres_url, validate_postgres_url, Config, AUTOMATION_RATE_LIMIT_MAX_TOKENS,
         DEFAULT_AUTO_COMPLETE_DAYS, DEFAULT_DELIVERY_ASSUME_DAYS, DEFAULT_PAYPAL_CHECKOUT_URL,
     };
     use crate::payment_attempt::{MarketplaceAssets, MarketplaceContract};
@@ -1076,6 +1109,20 @@ mod tests {
             assert!(
                 error.to_string().contains("must be at least 1"),
                 "unexpected: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn review_blind_window_days_defaults_off_and_is_bounded() {
+        assert_eq!(parse_review_blind_window_days(None).unwrap(), 0);
+        assert_eq!(parse_review_blind_window_days(Some("0")).unwrap(), 0);
+        assert_eq!(parse_review_blind_window_days(Some("14")).unwrap(), 14);
+        assert_eq!(parse_review_blind_window_days(Some("90")).unwrap(), 90);
+        for value in ["-1", "91", "two", ""] {
+            assert!(
+                parse_review_blind_window_days(Some(value)).is_err(),
+                "{value:?} must be refused"
             );
         }
     }

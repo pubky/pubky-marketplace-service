@@ -181,13 +181,17 @@ pub async fn get_review_attestation(
     Extension(actor): Extension<Actor>,
     Path(id): Path<Uuid>,
 ) -> Response {
-    let (order, attestations) = match participant_review_attestations(&state, &actor, id).await {
-        Ok(Some(found)) => found,
-        Ok(None) => {
-            return query_error(ErrorCode::NotFound, "The review attestation was not found.")
-        }
-        Err(error) => return internal_error("review attestation", &error),
-    };
+    let (order, attestations, window) =
+        match participant_review_attestations(&state, &actor, id).await {
+            Ok(Some(found)) => found,
+            Ok(None) => {
+                return query_error(ErrorCode::NotFound, "The review attestation was not found.")
+            }
+            Err(error) => return internal_error("review attestation", &error),
+        };
+    if let Some(pending) = pending_attestations(&attestations, &window) {
+        return pending;
+    }
     let first_line = crate::handlers::reviews::order_listings(&order)
         .into_iter()
         .next();
@@ -217,19 +221,48 @@ pub async fn get_review_attestations(
     Path(id): Path<Uuid>,
 ) -> Response {
     match participant_review_attestations(&state, &actor, id).await {
-        Ok(Some((_, attestations))) => (
-            StatusCode::OK,
-            Json(json!({
-                "attestations": attestations
-                    .into_iter()
-                    .map(|(_, attestation)| attestation)
-                    .collect::<Vec<_>>(),
-            })),
-        )
-            .into_response(),
+        Ok(Some((_, attestations, window))) => {
+            if let Some(pending) = pending_attestations(&attestations, &window) {
+                return pending;
+            }
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "attestations": attestations
+                        .into_iter()
+                        .map(|(_, attestation)| attestation)
+                        .collect::<Vec<_>>(),
+                })),
+            )
+                .into_response()
+        }
         Ok(None) => query_error(ErrorCode::NotFound, "The order was not found."),
         Err(error) => internal_error("review attestations", &error),
     }
+}
+
+/// The answer of both attestation routes while the caller's attestations are
+/// withheld by the order's double-blind window: `{ status: "pending",
+/// releaseAt }`. `None` when nothing is withheld, or when the caller has no
+/// attestation to withhold, so the route answers as it always did.
+fn pending_attestations(
+    attestations: &[(crate::handlers::reviews::OrderListing, Value)],
+    window: &crate::review_release::ReviewWindow,
+) -> Option<Response> {
+    let release_at = window.pending_until()?;
+    if attestations.is_empty() {
+        return None;
+    }
+    Some(
+        (
+            StatusCode::OK,
+            Json(json!({
+                "status": "pending",
+                "releaseAt": crate::clock::format_timestamp(release_at),
+            })),
+        )
+            .into_response(),
+    )
 }
 
 /// The order and the caller's review attestations for it in line order, or
@@ -242,6 +275,7 @@ async fn participant_review_attestations(
     Option<(
         OrderRow,
         Vec<(crate::handlers::reviews::OrderListing, Value)>,
+        crate::review_release::ReviewWindow,
     )>,
     sqlx::Error,
 > {
@@ -258,7 +292,8 @@ async fn participant_review_attestations(
     };
     let attestations =
         crate::handlers::reviews::fetch_attestations(&state.pool, &order, &actor.0).await?;
-    Ok(Some((order, attestations)))
+    let window = crate::review_release::read_window(&state.pool, order.id).await?;
+    Ok(Some((order, attestations, window)))
 }
 
 /// `GET /v1/sellers/{pubky}/band-consent`: the seller's standing amount-band
@@ -527,7 +562,7 @@ fn order_with_payment(
         view["payment"] =
             payment.projection_for_actor_with_legacy_merchandise(actor, synthesize_legacy);
     }
-    view["reviews"] = Value::Array(reviews.iter().map(|review| review.view()).collect());
+    view["reviews"] = ReviewRow::views_for(reviews.iter().copied(), actor);
     view
 }
 

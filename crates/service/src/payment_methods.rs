@@ -1112,10 +1112,11 @@ async fn fetch_payment_for_order_update(
 async fn order_response(
     tx: &mut Transaction<'_, Postgres>,
     order: &OrderRow,
+    viewer: &str,
     extra: Value,
 ) -> Result<Response, sqlx::Error> {
     let reviews = fetch_order_reviews(tx, order.id).await?;
-    let mut body = json!({ "ok": true, "order": order_json_with_reviews(order, &reviews) });
+    let mut body = json!({ "ok": true, "order": order_json_with_reviews(order, &reviews, viewer) });
     if let Value::Object(extra) = extra {
         for (key, value) in extra {
             body[key] = value;
@@ -1621,7 +1622,7 @@ pub async fn bind_payment_method(
     if let Some(bound) = &order.payment_method {
         if bound == method {
             // Idempotent re-bind of the same method.
-            return match order_response(&mut tx, &order, json!({})).await {
+            return match order_response(&mut tx, &order, &actor.0, json!({})).await {
                 Ok(response) => response,
                 Err(error) => internal("order projection", &error),
             };
@@ -2733,7 +2734,7 @@ pub async fn bind_payment_method(
     } else {
         updated_order
     };
-    let response = match order_response(&mut tx, &updated_order, json!({})).await {
+    let response = match order_response(&mut tx, &updated_order, &actor.0, json!({})).await {
         Ok(response) => response,
         Err(error) => {
             let _ = tx.rollback().await;
@@ -2986,7 +2987,7 @@ async fn apply_fiat_paid(
                     ));
                 };
                 settle_gateway(&mut tx, state, order_id, gateway, now).await?;
-                let response = order_response(&mut tx, &order, json!({ "verified": true }))
+                let response = order_response(&mut tx, &order, "", json!({ "verified": true }))
                     .await
                     .map_err(|error| internal("order projection", &error))?;
                 tx.commit()
@@ -3015,7 +3016,7 @@ async fn apply_fiat_paid(
         // Already confirmed (or under review): a duplicate verification has
         // no further effect beyond settling the gateway payment id.
         settle_gateway(&mut tx, state, order_id, gateway, now).await?;
-        let response = order_response(&mut tx, &order, json!({ "verified": true }))
+        let response = order_response(&mut tx, &order, "", json!({ "verified": true }))
             .await
             .map_err(|error| internal("order projection", &error))?;
         tx.commit()
@@ -3072,7 +3073,7 @@ async fn apply_fiat_paid(
                 "The order was not found.",
             ));
         };
-        let response = order_response(&mut tx, &order, json!({ "verified": true }))
+        let response = order_response(&mut tx, &order, "", json!({ "verified": true }))
             .await
             .map_err(|error| internal("order projection", &error))?;
         tx.commit()
@@ -3142,9 +3143,10 @@ async fn apply_fiat_paid(
                 .map_err(|error| internal("payment confirmation notification", &error))?;
             }
             settle_gateway(&mut tx, state, order_id, gateway, now).await?;
-            let response = order_response(&mut tx, &confirmed_order, json!({ "verified": true }))
-                .await
-                .map_err(|error| internal("order projection", &error))?;
+            let response =
+                order_response(&mut tx, &confirmed_order, "", json!({ "verified": true }))
+                    .await
+                    .map_err(|error| internal("order projection", &error))?;
             tx.commit()
                 .await
                 .map_err(|error| internal("fiat confirmation commit", &error))?;
@@ -3210,7 +3212,7 @@ async fn apply_fiat_paid(
                     )
                 })?;
             settle_gateway(&mut tx, state, order_id, gateway, now).await?;
-            let response = order_response(&mut tx, &order, json!({ "verified": true }))
+            let response = order_response(&mut tx, &order, "", json!({ "verified": true }))
                 .await
                 .map_err(|error| internal("order projection", &error))?;
             tx.commit()
@@ -3328,7 +3330,7 @@ pub async fn mark_fiat_paid(
     }
     if order.payment_reported_at.is_some() {
         // Idempotent duplicate report: the original timestamp is kept.
-        return match order_response(&mut tx, &order, json!({})).await {
+        return match order_response(&mut tx, &order, &actor.0, json!({})).await {
             Ok(response) => response,
             Err(error) => internal("order projection", &error),
         };
@@ -3376,7 +3378,7 @@ pub async fn mark_fiat_paid(
     {
         return internal("mark-paid notification", &error);
     }
-    let response = match order_response(&mut tx, &updated_order, json!({})).await {
+    let response = match order_response(&mut tx, &updated_order, &actor.0, json!({})).await {
         Ok(response) => response,
         Err(error) => return internal("order projection", &error),
     };

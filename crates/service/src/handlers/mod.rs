@@ -229,8 +229,15 @@ pub fn guard_order_action(
     None
 }
 
+/// The review columns plus `withheld`: whether the order's double-blind
+/// window is open and its reviews unreleased. Every read of reviews that
+/// reaches a participant goes through [`ReviewRow::view_for`], so the flag
+/// travels with each row instead of being looked up per projection.
 pub const REVIEW_COLUMNS: &str = "id, order_id, reviewer_pubky, reviewer_role, subject_pubky, \
-     listing_aggregate_id, rating, text, shipping, communication, created_at, updated_at";
+     listing_aggregate_id, rating, text, shipping, communication, created_at, updated_at, \
+     EXISTS (SELECT 1 FROM orders blind WHERE blind.id = reviews.order_id \
+             AND blind.review_window_ends_at IS NOT NULL \
+             AND blind.reviews_released_at IS NULL) AS withheld";
 
 pub async fn fetch_order_reviews(
     tx: &mut Transaction<'_, Postgres>,
@@ -244,13 +251,14 @@ pub async fn fetch_order_reviews(
     .await
 }
 
-/// The redacted order projection with its reviews attached, the shape every
-/// order-action command result returns (never the delivery address).
-pub fn order_json_with_reviews(order: &OrderRow, reviews: &[ReviewRow]) -> Value {
+/// The redacted order projection with its reviews attached as `viewer` may
+/// read them, the shape every order-action command result returns (never
+/// the delivery address).
+pub fn order_json_with_reviews(order: &OrderRow, reviews: &[ReviewRow], viewer: &str) -> Value {
     let mut view = order.project(ProjectionContext::CommandResult {
         authenticated_actor: "",
     });
-    view["reviews"] = Value::Array(reviews.iter().map(ReviewRow::view).collect());
+    view["reviews"] = ReviewRow::views_for(reviews, viewer);
     view
 }
 
@@ -263,7 +271,7 @@ pub fn seller_order_json_with_reviews(
     authenticated_actor: &str,
 ) -> Value {
     let mut view = order.projection_for_actor_with_payment(authenticated_actor, None);
-    view["reviews"] = Value::Array(reviews.iter().map(ReviewRow::view).collect());
+    view["reviews"] = ReviewRow::views_for(reviews, authenticated_actor);
     view
 }
 
@@ -309,7 +317,7 @@ pub async fn finish_order_action(
         event_ids: vec![event_id],
         result: json!({
             "kind": "order",
-            "order": order_json_with_reviews(order, &reviews),
+            "order": order_json_with_reviews(order, &reviews, actor),
         }),
     }))
 }

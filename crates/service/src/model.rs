@@ -1957,9 +1957,14 @@ pub struct ReviewRow {
     pub communication: Option<i32>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Whether the order's reviews are still double-blind: a review window
+    /// is open on the order and its reviews are not yet released. Computed
+    /// by the query that read the row, never stored.
+    pub withheld: bool,
 }
 
 impl ReviewRow {
+    /// The review as its reviewer sees it, and as it reads once released.
     pub fn view(&self) -> Value {
         json!({
             "id": self.id,
@@ -1974,6 +1979,34 @@ impl ReviewRow {
             "created_at": format_timestamp(self.created_at),
             "updated_at": format_timestamp(self.updated_at),
         })
+    }
+
+    /// The review as `viewer` may read it. Until the order's reviews are
+    /// released, a review by anyone else shows only that its role has
+    /// submitted.
+    pub fn view_for(&self, viewer: &str) -> Value {
+        if self.withheld && self.reviewer_pubky != viewer {
+            return json!({ "role": self.reviewer_role, "submitted": true });
+        }
+        self.view()
+    }
+
+    /// An order's reviews as `viewer` may read them: every readable review
+    /// in order, and one `{role, submitted: true}` entry per withheld role,
+    /// so the number of items a counterparty reviewed is not disclosed.
+    pub fn views_for<'a>(reviews: impl IntoIterator<Item = &'a ReviewRow>, viewer: &str) -> Value {
+        let mut withheld_roles: Vec<&str> = Vec::new();
+        let mut views = Vec::new();
+        for review in reviews {
+            if review.withheld && review.reviewer_pubky != viewer {
+                if withheld_roles.contains(&review.reviewer_role.as_str()) {
+                    continue;
+                }
+                withheld_roles.push(&review.reviewer_role);
+            }
+            views.push(review.view_for(viewer));
+        }
+        Value::Array(views)
     }
 }
 

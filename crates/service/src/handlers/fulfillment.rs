@@ -197,7 +197,7 @@ pub async fn update_tracking(
             event_ids: vec![],
             result: json!({
                 "kind": "order",
-                "order": crate::handlers::order_json_with_reviews(&order, &reviews),
+                "order": crate::handlers::order_json_with_reviews(&order, &reviews, actor),
                 "changed": false,
             }),
         }));

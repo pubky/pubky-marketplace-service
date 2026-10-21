@@ -25,7 +25,7 @@ crates/service     axum HTTP service: Postgres schema (sqlx migrations),
                    idempotency, command handlers, Locks lifecycle
                    verification (encrypted correlations, HMAC lookup
                    tokens, Lock Server client), background worker runtime
-                   (see "Background workers": 23 lease-guarded tasks plus
+                   (see "Background workers": 24 lease-guarded tasks plus
                    the webhook delivery worker). Besides the server binary
                    (`marketplace-service`) it builds the operator binaries
                    `refusal-audit-admin` and `paykit-attempts-admin`.
@@ -189,6 +189,7 @@ Configuration is environment-based. Window keys and their defaults also live in
 | `PAYKIT_RAIL_STALE_SECONDS` | `60` | stale-out window for cached Paykit rail and seller claim availability; must be at least `PAYKIT_POLL_SECONDS` |
 | `DELIVERY_ASSUME_DAYS` | `14` | default for the days after shipment when the worker marks a `shipped` order `delivered` on server time (no carrier tracking feed), flagging the projection `delivery_assumed` (≥ 1). The same period counts from payment for a paid manual digital order the seller never marks delivered. Applies only to an order whose seller left `deliveryAssumeDays` unset on their shop record; see [Seller-set periods](#seller-set-periods) |
 | `AUTO_COMPLETE_DAYS` | `14` | default for the days after delivery when the worker completes a `delivered` order on server time, unless a return/cancel request is open (≥ 1). Applies only to an order whose seller left `autoCompleteDays` unset on their shop record; see [Seller-set periods](#seller-set-periods) |
+| `REVIEW_BLIND_WINDOW_DAYS` | `0` | days after an order becomes reviewable during which its reviews are double-blind (0 to 90; `0` is off and changes nothing). Inside the window each side's review and the reviewer's attestations are withheld from the other until both have reviewed or the window ends, and a seller's review after it is refused. Keep it at `0` until the Shop handles pending reviews; see [Reviews](docs/api.md#double-blind-reviews) |
 | `DELIVERY_SWEEP_BATCH_SIZE` | `100` | rows claimed per inner delivery/auto-complete sweep pass (≥ 1); the worker loops until a short batch or the per-lease cap |
 | `PUBLIC_APP_ORIGIN` | unset | the web app's public URL: an origin, plus the mount path when the Shop is served under one (e.g. `https://shop.pubky.app`, or `https://pubky.app/shop`); no query, fragment, credentials or `.`/`..` path segments. When set, hosted checkouts that support a return destination (PayPal `_xclick`) send the buyer back to `{value}/marketplace/orders` after commit/cancel |
 | `PUBLIC_SERVICE_ORIGIN` | unset | this service's own public origin; when set, PayPal checkout links carry `notify_url={origin}/v0/paypal/ipn` so PayPal's IPN pays the order automatically (postback-verified, matched against seller email + exact order total) and records the seller's PayPal refunds and the buyer's reversals on it. Unset, PayPal stays participant-attested |
@@ -1328,8 +1329,8 @@ compare it.
 | `return.receive` | CAS 409 vs order `revision` | `returns.rs:171` |
 | `refund.record_external` | CAS 409 vs order `revision` | `returns.rs:251` |
 | `refund.confirm_destination` | CAS 409 vs order `revision` | `refund_destination.rs:27` |
-| `review.create` | CAS 409 vs order `revision` | `reviews.rs:229` |
-| `review.update` | CAS 409 vs order `revision` | `reviews.rs:587` |
+| `review.create` | CAS 409 vs order `revision` | `reviews.rs:239` |
+| `review.update` | CAS 409 vs order `revision` | `reviews.rs:792` |
 | `attestation.set_band_consent` | CAS 409 vs stored consent revision (`0` on first write) | `attestation.rs:47` |
 
 Handler paths are under `crates/service/src/handlers/`.
@@ -1590,7 +1591,9 @@ request, to the buyer on approval — `order_shipped`, `tracking_updated`,
 `return_updated`,
 `refund_recorded`,
 `review_received`). `review.update` emits none — the
-prototype had no counterpart to copy.
+prototype had no counterpart to copy. With `REVIEW_BLIND_WINDOW_DAYS` above
+0 the review notifications are `review_waiting`, `review_released` and
+`review_received` at release; see [Reviews](docs/api.md#double-blind-reviews).
 
 ## Local pickup (Wave 7 safe subset)
 
@@ -2135,14 +2138,14 @@ Not served, deliberately (no fabricated or empty-by-default reads):
 
 ## Background workers (tasks 3.4, 4.5)
 
-One worker runtime (`crates/service/src/workers.rs`) drains 23 lease-guarded
+One worker runtime (`crates/service/src/workers.rs`) drains 24 lease-guarded
 server-time tasks: `reservation_expiry`, `drop_transitions`, `offer_expiry`,
 `auction_close`, `outbox`, `locks_verification`, `paykit_verification`,
 `payment_window`, `stat_attestations`, `delivery_autocomplete`,
 `pickup_reseal`, `digital_reseal`, `priv_key_reseal`, `delivery_email_purge`,
 `delivery_address_purge`, `read_rate_purge`, `pickup_retention`, `seller_confirmation_window`,
 `manual_review_watch`, `paykit_resolve_delivery`, `fx_sampler`,
-`refusal_audit_retention` and `listing_deletions`. Webhook delivery runs in a
+`refusal_audit_retention`, `listing_deletions` and `review_release`. Webhook delivery runs in a
 separate worker (`spawn_webhook_worker` in `crates/service/src/automation.rs`;
 see [`docs/api.md`](docs/api.md#webhooks)).
 
@@ -2160,6 +2163,12 @@ see [`docs/api.md`](docs/api.md#webhooks)).
   undelivered; it is redelivered after the lease lapses. The consumer side
   (the `notifications` table) dedups by `(event_id, recipient_pubky)`, so
   redelivery never duplicates the effect.
+- **Review release.** The `review_release` task releases the double-blind
+  reviews of every order whose window has ended (see
+  [Reviews](docs/api.md#double-blind-reviews)): one conditional update per
+  order, `WHERE reviews_released_at IS NULL`, so a replayed tick, a second
+  instance or a late `review.create` racing it releases an order at most
+  once. It runs whether or not `REVIEW_BLIND_WINDOW_DAYS` is still set.
 - **Auction close on server time.** The worker closes active auctions whose
   `ends_at` has passed through the same code path as the seller's
   `auction.close` command; the `active` status guard plus the partial unique
