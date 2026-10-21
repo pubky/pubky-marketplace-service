@@ -8,7 +8,7 @@ use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
 use common::paykit_review::{
     create_sat_order, delivered_notifications, enable_bitcoin, poll_now, status_confirmed,
-    status_detected,
+    status_detected, OBSERVED_TXID,
 };
 use common::*;
 use marketplace_service::clock::Clock;
@@ -224,6 +224,90 @@ async fn money_on_a_released_attempt_after_a_rebind_reaches_late_money(pool: PgP
     .await
     .expect("attempt 2 row");
     assert_eq!(second_state, "needs_review");
+}
+
+/// A released attempt that carried an FX quote and settles for `delta` sats
+/// away from its total while paykit-server calls the amount matched.
+async fn quoted_released_settlement(
+    pool: PgPool,
+    delta: i64,
+) -> (PgPool, TestApp, Uuid, Vec<Value>, TestActor, TestActor) {
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (order_id, _first) = released_first_attempt(&app, &paykit, &seller, &buyer).await;
+    bind_bitcoin(&app, &buyer.token, &order_id.to_string()).await;
+    drain(&app).await;
+    let total: i64 = sqlx::query_scalar(
+        "UPDATE paykit_superseded_attempts SET bitcoin_quoted_sats = total_sats - 12, \
+         bitcoin_quote_rate = 77197, bitcoin_quote_source = 'blocktank', \
+         bitcoin_quote_fetched_at = released_at, bitcoin_quote_expires_at = expires_at, \
+         bitcoin_quote_currency = (SELECT currency FROM orders WHERE id = $1), \
+         bitcoin_quote_exponent = (SELECT exponent FROM orders WHERE id = $1), \
+         bitcoin_quote_spread_bps = 0 \
+         WHERE order_id = $1 RETURNING total_sats",
+    )
+    .bind(order_id)
+    .fetch_one(&pool)
+    .await
+    .expect("quote the released attempt");
+    let observed = u64::try_from(total + delta).expect("observed sats");
+    paykit.set_status(
+        &attempt_reference(order_id, 1),
+        late(bitcoin_status_v2(
+            "confirmed",
+            true,
+            "exclusive",
+            Some(OBSERVED_TXID),
+            Some(observed),
+            Some(2),
+        )),
+    );
+    assert!(poll_now(&app, app.clock.now()).await >= 1);
+    let notices = review_notices(&app, &seller, &buyer, order_id).await;
+    (pool, app, order_id, notices, seller, buyer)
+}
+
+async fn assert_quoted_release_waits_as_amount_mismatch(pool: PgPool, delta: i64) {
+    let (pool, _app, order_id, notices, ..) = quoted_released_settlement(pool, delta).await;
+    assert_eq!(
+        payment_facts(&pool, order_id).await,
+        (
+            "manual_review".to_string(),
+            Some("amount_mismatch".to_string())
+        )
+    );
+    assert_eq!(notices, vec![json!("amount_mismatch")]);
+    let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM receipts WHERE order_id = $1")
+        .bind(order_id)
+        .fetch_one(&pool)
+        .await
+        .expect("receipt count");
+    assert_eq!(receipts, 0);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_quoted_released_attempt_overpaid_waits_as_an_amount_mismatch(pool: PgPool) {
+    assert_quoted_release_waits_as_amount_mismatch(pool, 1_000).await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_quoted_released_attempt_underpaid_waits_as_an_amount_mismatch(pool: PgPool) {
+    assert_quoted_release_waits_as_amount_mismatch(pool, -1_000).await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_quoted_released_attempt_settled_exactly_is_not_an_amount_mismatch(pool: PgPool) {
+    let (pool, _app, order_id, notices, ..) = quoted_released_settlement(pool, 0).await;
+    assert_eq!(
+        payment_facts(&pool, order_id).await,
+        (
+            "manual_review".to_string(),
+            Some("late_settlement".to_string())
+        ),
+        "the exact amount takes the ordinary late-money path"
+    );
+    assert_eq!(notices, vec![json!("late_settlement")]);
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]

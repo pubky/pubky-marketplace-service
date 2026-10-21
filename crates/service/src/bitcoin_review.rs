@@ -1548,6 +1548,7 @@ pub(crate) enum LateMoneyOutcome {
     Completed,
     RefundRequired,
     HeldLateSettlement,
+    AmountMismatch,
 }
 
 /// Whether a still-payable auction order lost its winning reservation to the
@@ -1579,15 +1580,22 @@ pub(crate) async fn auction_hold_lapsed(
 }
 
 /// Late money observed after the hold window: one transaction, listing
-/// `FOR UPDATE` via [`reacquire_hold`]. Stock free completes the order
-/// (`late_completion`). Stock gone stamps `refund_required` and never
-/// pays. A still-held pending order keeps the existing `manual_review`
-/// path with `review_reason=late_settlement` and does not reacquire.
+/// `FOR UPDATE` via [`reacquire_hold`]. Money whose amount does not match
+/// what the order asked for (`amount_mismatch`) waits in `manual_review`
+/// with `review_reason=amount_mismatch`, exactly as on-time money does, and
+/// is decided before any stock, limit or delivery check: it never completes
+/// the order and never re-takes the unit. Of the rest, stock free completes
+/// the order (`late_completion`). Stock gone stamps `refund_required` and
+/// never pays. A still-held pending order keeps the existing
+/// `manual_review` path with `review_reason=late_settlement` and does not
+/// reacquire.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn apply_late_money(
     tx: &mut Transaction<'_, Postgres>,
     keys: crate::ConfirmKeys<'_>,
     payment: &PaymentRow,
     order: &OrderRow,
+    amount_mismatch: bool,
     command_id: Uuid,
     event_actor: &str,
     now: DateTime<Utc>,
@@ -1599,6 +1607,33 @@ pub(crate) async fn apply_late_money(
             "late money".into(),
             "the order is awaiting seller confirmation".into(),
         ));
+    }
+    if amount_mismatch {
+        let event_id = stamp_review_reason(
+            tx,
+            payment,
+            "amount_mismatch",
+            "manual_review",
+            command_id,
+            event_actor,
+            now,
+        )
+        .await?;
+        if payment.adapter == "paykit" {
+            insert_bitcoin_manual_review_intent(
+                tx,
+                event_id,
+                &order.seller_pubky,
+                order.id,
+                BitcoinReviewNotice::AmountMismatch,
+                now,
+            )
+            .await
+            .map_err(|e| {
+                ResolutionFailure::Internal("review notification".into(), e.to_string())
+            })?;
+        }
+        return Ok(LateMoneyOutcome::AmountMismatch);
     }
     // A digital order the seller can no longer deliver takes the stock-gone
     // shape (digital delivery design §6 D3) before any other late-money

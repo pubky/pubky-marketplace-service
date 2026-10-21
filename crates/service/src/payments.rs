@@ -268,9 +268,11 @@ pub struct PaykitObservation {
 /// — the producer's mandatory late-settlement flag, plus the reported
 /// observation. `late_settlement` is the producer's authoritative
 /// statement that the settlement landed outside the invoice's settlement
-/// window: a late observation NEVER auto-pays and NEVER enters
-/// `awaiting_seller_confirmation`; a confirmed one routes to durable
-/// `manual_review`. None of this applies to an order already inside
+/// window: a late observation NEVER enters `awaiting_seller_confirmation`;
+/// a confirmed one takes the late-money fork. A late amount mismatch, a
+/// unit that is gone, or a still-held order routes to durable
+/// `manual_review`; only an exact late payment completes an order whose
+/// unit is still free. None of this applies to an order already inside
 /// `awaiting_seller_confirmation`: whatever mode, lateness, or amount a
 /// later report carries, it only refreshes the facts, and the seller or
 /// the seller-window reaper decides.
