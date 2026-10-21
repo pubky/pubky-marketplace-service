@@ -377,7 +377,7 @@ request failed, so clients should branch on HTTP status first, and parse
    `auction.place_bid` must carry `payload.buyer_country` (ISO 3166-1 alpha-2,
    uppercase; 422 `INVALID_COMMAND` with an issue at `payload.buyer_country`
    without it). `SELLER_UNAVAILABLE_IN_REGION` has `reason` `business_seller`
-   or `undeclared_seller` (the buyer is in the EU-27 and the seller's shop
+   or `undeclared_seller` (the buyer is in the EU-27 or GB and the seller's shop
    record does not declare `sellerStatus: "private"`), or
    `private_seller_reconfirmation_required` (a private seller reached 29 sales
    or EUR 2,000 to EU buyers since their `sellerStatusConfirmedAt`); it is also

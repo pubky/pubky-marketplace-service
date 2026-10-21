@@ -37,7 +37,7 @@
 //! this account. With it off nothing here reads the database or refuses.
 
 use marketplace_domain::commands::{Command, CommandPayload, FulfillmentMethod};
-use marketplace_domain::region::is_eu_country;
+use marketplace_domain::region::{is_eu_country, GB};
 use marketplace_domain::{ErrorCode, ValidationIssue};
 use sqlx::PgPool;
 
@@ -85,7 +85,7 @@ impl EdgeContext {
 pub fn blocked_country(country_code: &str) -> Option<&'static str> {
     if is_eu_country(country_code) {
         Some(REASON_EU_BUYER)
-    } else if country_code == "GB" {
+    } else if country_code == GB {
         Some(REASON_GB_BUYER)
     } else {
         None

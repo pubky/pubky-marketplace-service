@@ -183,7 +183,7 @@ Railway IaC `preserve()`):
 | `PAYPAL_IPN_VERIFY_URL` | `https://ipnpb.paypal.com/cgi-bin/webscr` | PayPal's IPN validation endpoint; tests point it at a local double |
 | `PAYPAL_CHECKOUT_URL` | `https://www.paypal.com/cgi-bin/webscr` | PayPal `_xclick` checkout base. HTTPS only; host must be `www.paypal.com` (live) or `www.sandbox.paypal.com`. Default stays live. |
 | `REQUIRE_ENCRYPTED_DELIVERY_ADDRESS` | `false` | `true`/`1` refuses a checkout or award checkout that carries a plaintext `delivery_address` (422 `INVALID_COMMAND`, reason `encrypted_delivery_required`); only sealed envelopes are accepted. Leave unset until the Shop version that seals is the deployed one (see [Sealed delivery address](#sealed-delivery-address)) |
-| `EU_FENCE_ENABLED` | `false` | `true`/`1` turns on the EU scope fence (legal launch plan C2-C4): `buyer_country` becomes required on the selling commands, a buyer in the EU-27 buys only from sellers whose shop record says `sellerStatus: "private"`, and sellers whose shop country is in the EU-27 stop at 29 paid sales or EUR 2,000 of paid orders a calendar year (checked at checkout and again at payment). Off, `buyer_country` is accepted and stored and nothing is refused on these grounds. See [EU scope fence](#eu-scope-fence) |
+| `EU_FENCE_ENABLED` | `false` | `true`/`1` turns on the EU scope fence (legal launch plan C2-C4): `buyer_country` becomes required on the selling commands, a buyer in the EU-27 or GB buys only from sellers whose shop record says `sellerStatus: "private"`, and sellers whose shop country is in the EU-27 stop at 29 paid sales or EUR 2,000 of paid orders a calendar year (checked at checkout and again at payment). Off, `buyer_country` is accepted and stored and nothing is refused on these grounds. See [EU scope fence](#eu-scope-fence) |
 | `DIGITAL_REGION_BLOCK_ENABLED` | `false` | `true`/`1` refuses `checkout.create` (which carries drop claims) and `offer.checkout` that contain a digital line (any digital delivery kind, or a Locks listing) when `payload.buyer_country` is in the EU-27 or is `GB`: `DIGITAL_UNAVAILABLE_IN_REGION` (409), reason `eu_buyer` or `gb_buyer` for the declared country, `eu_ip` or `gb_ip` for the request's own country (read from `CLIENT_COUNTRY_HEADER`), `buyer_region_unknown` when the edge sent none; such a command must carry `buyer_country`. Independent of `EU_FENCE_ENABLED`. Off, nothing is refused. See [Digital sales to EU and UK buyers](#digital-sales-to-eu-and-uk-buyers) |
 | `CLIENT_COUNTRY_HEADER` | `x-client-region` | Name of the request header the trusted edge sets to the client's country (ISO alpha-2) from its IP. Read only by the digital hold (`DIGITAL_REGION_BLOCK_ENABLED`). GCP: a load-balancer custom request header `X-Client-Region:{client_region}`; Vercel: `x-vercel-ip-country`. The edge must set it itself and overwrite any value the client sent. Missing or unusable with the digital hold on: digital lines are refused (`buyer_region_unknown`) and an `ALERT digital_region_client_country_missing` is logged |
 | `ADDRESS_SEARCH_UPSTREAM_URL` | `https://photon.komoot.io` | Photon geocoder behind `POST /v0/address/suggest`. HTTPS only (http for loopback in tests). Point it at a self-hosted Photon to stop using the public instance |
@@ -262,10 +262,13 @@ and country on the order with the delivery periods (`orders.seller_status`,
 
 With the flag on:
 
-- **Regional gate.** A buyer in the EU-27 buys only from a seller who declared
-  `private`: `SELLER_UNAVAILABLE_IN_REGION` (409) with `reason`
+- **Regional gate.** A buyer in the EU-27 or GB buys only from a seller who
+  declared `private`: `SELLER_UNAVAILABLE_IN_REGION` (409) with `reason`
   `business_seller` or `undeclared_seller`. Every other buyer country is
-  unaffected.
+  unaffected. GB is in the gate because UK consumers buying from a business
+  have a 14-day withdrawal right under the Consumer Contracts Regulations
+  2013. The annual limit and the re-confirmation point below stay EU-only
+  (DAC7), so a GB buyer never counts toward them.
 - **Annual limit.** A seller whose shop country is in the EU-27 stops at 29
   sales or EUR 2,000 in total per calendar year (UTC), whichever comes first
   (29 sales of any size, or the euro total, whichever is reached first).

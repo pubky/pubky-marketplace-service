@@ -1,8 +1,8 @@
 //! The EU scope fence (legal launch plan C2-C4) behind `EU_FENCE_ENABLED`.
 //!
 //! Off, the service accepts and stores the buyer's country and refuses
-//! nothing on these grounds. On, a buyer in the EU-27 buys only from a
-//! declared private seller, a seller resident in the EU stops at 29 paid sales
+//! nothing on these grounds. On, a buyer in the EU-27 or GB buys only from a
+//! declared private seller (C3), a seller resident in the EU stops at 29 paid sales
 //! or EUR 2,000 of paid orders a calendar year (unpaid orders never count, and
 //! the limit is checked again where the payment is taken), and a private
 //! seller selling to EU buyers must re-confirm after the same numbers.
@@ -385,12 +385,12 @@ async fn an_eu_buyer_is_refused_by_business_and_undeclared_sellers(pool: PgPool)
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn buyers_outside_the_eu_buy_from_any_seller(pool: PgPool) {
+async fn buyers_outside_the_eu_and_uk_buy_from_any_seller(pool: PgPool) {
     let (app, homeserver) = app_with_fence(pool, true).await;
     let trader = Seller::new(&app, &homeserver, Some("trader"), "US", 10).await;
     let undeclared = Seller::new(&app, &homeserver, None, "US", 10).await;
     let buyer = new_actor(&app).await;
-    for (number, country) in ["US", "GB", "CH", "NO", "BR", "JP"].into_iter().enumerate() {
+    for (number, country) in ["US", "CH", "NO", "BR", "JP", "AU"].into_iter().enumerate() {
         let number = number as u64 + 1;
         assert_accepted(&buy(&app, &buyer, &trader.actor, number, Some(country)).await);
         assert_accepted(&buy(&app, &buyer, &undeclared.actor, number + 100, Some(country)).await);
@@ -418,7 +418,7 @@ async fn an_unreadable_shop_record_fails_closed_for_every_buyer(pool: PgPool) {
     let seller = Seller::new(&app, &homeserver, Some("private"), "CH", 5).await;
     let buyer = new_actor(&app).await;
     homeserver.fail_shop_record(&seller.actor.pubky);
-    for (number, country) in [(1, "DE"), (2, "US")] {
+    for (number, country) in [(1, "DE"), (2, "GB"), (4, "US")] {
         assert_refused(
             &buy(&app, &buyer, &seller.actor, number, Some(country)).await,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -747,6 +747,198 @@ async fn an_order_that_cannot_be_priced_in_euro_is_refused_not_waved_through(poo
     assert_eq!(orders_of(&app, &seller.actor).await, 0);
 }
 
+// --- C3 for GB buyers (Consumer Contracts Regulations 2013) -----------------
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_gb_buyer_is_refused_by_business_and_undeclared_sellers_like_an_eu_buyer(pool: PgPool) {
+    let (app, homeserver) = app_with_fence(pool, true).await;
+    let trader = Seller::new(&app, &homeserver, Some("trader"), "US", 5).await;
+    let undeclared = Seller::new(&app, &homeserver, None, "US", 5).await;
+    let nonsense = Seller::new(&app, &homeserver, Some("Private"), "US", 5).await;
+    let no_shop = new_actor(&app).await;
+    let (code, body) = execute(&app, &no_shop.token, &register_command(&no_shop.pubky, 5)).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let buyer = new_actor(&app).await;
+
+    let refused = buy(&app, &buyer, &trader.actor, 1, Some("GB")).await;
+    assert_refused(
+        &refused,
+        StatusCode::CONFLICT,
+        "SELLER_UNAVAILABLE_IN_REGION",
+        Some("business_seller"),
+    );
+    assert_eq!(
+        refused.1["error"]["message"],
+        json!("This seller doesn't sell to buyers in the EU or UK.")
+    );
+    for seller in [&undeclared.actor, &nonsense.actor, &no_shop] {
+        assert_refused(
+            &buy(&app, &buyer, seller, 2, Some("GB")).await,
+            StatusCode::CONFLICT,
+            "SELLER_UNAVAILABLE_IN_REGION",
+            Some("undeclared_seller"),
+        );
+    }
+    for seller in [&trader.actor, &undeclared.actor, &nonsense.actor, &no_shop] {
+        assert_eq!(orders_of(&app, seller).await, 0);
+    }
+    assert_eq!(
+        count(
+            &app.pool,
+            "SELECT COUNT(*) FROM events WHERE kind = 'order.created'"
+        )
+        .await,
+        0
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_gb_buyer_buys_from_a_private_seller_and_the_country_is_stored(pool: PgPool) {
+    let (app, homeserver) = app_with_fence(pool, true).await;
+    seed_usd_and_eur(&app).await;
+    let private_ch = Seller::new(&app, &homeserver, Some("private"), "CH", 5).await;
+    let private_gb = Seller::new(&app, &homeserver, Some("private"), "GB", 5).await;
+    let buyer = new_actor(&app).await;
+    assert_accepted(&buy(&app, &buyer, &private_ch.actor, 1, Some("GB")).await);
+    assert_accepted(&buy(&app, &buyer, &private_gb.actor, 2, Some("GB")).await);
+    assert_eq!(
+        buyer_country_of_orders(&app, &private_ch.actor).await,
+        vec![Some("GB".to_string())]
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_gb_buyer_is_open_to_everyone_with_the_fence_off(pool: PgPool) {
+    let (app, homeserver) = app_with_fence(pool, false).await;
+    let trader = Seller::new(&app, &homeserver, Some("trader"), "US", 5).await;
+    let buyer = new_actor(&app).await;
+    assert_accepted(&buy(&app, &buyer, &trader.actor, 1, Some("GB")).await);
+    assert_eq!(
+        buyer_country_of_orders(&app, &trader.actor).await,
+        vec![Some("GB".to_string())]
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn offers_and_bids_from_gb_follow_the_same_gate(pool: PgPool) {
+    let (app, homeserver) = app_with_fence(pool, true).await;
+    let trader = Seller::new(&app, &homeserver, Some("trader"), "US", 5).await;
+    let buyer = new_actor(&app).await;
+
+    let mut offer = create_offer_command(&trader.actor.pubky, 1);
+    offer["payload"]["buyer_country"] = json!("GB");
+    assert_refused(
+        &execute(&app, &buyer.token, &offer).await,
+        StatusCode::CONFLICT,
+        "SELLER_UNAVAILABLE_IN_REGION",
+        Some("business_seller"),
+    );
+    assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM offers").await, 0);
+
+    let auction_seller = new_actor(&app).await;
+    homeserver.put_shop_record(
+        &auction_seller.pubky,
+        shop_record(&auction_seller, Some("trader"), "US"),
+    );
+    let (code, body) = execute(
+        &app,
+        &auction_seller.token,
+        &register_auction_command(&auction_seller.pubky),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let mut bid = place_bid_command(&auction_seller.pubky, 1, 7_000, 1);
+    bid["payload"]["buyer_country"] = json!("GB");
+    assert_refused(
+        &execute(&app, &buyer.token, &bid).await,
+        StatusCode::CONFLICT,
+        "SELLER_UNAVAILABLE_IN_REGION",
+        Some("business_seller"),
+    );
+    assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM bids").await, 0);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_offer_checkout_by_a_gb_buyer_is_refused_for_a_business_seller(pool: PgPool) {
+    let (app, homeserver) = app_with_fence(pool, true).await;
+    seed_usd_and_eur(&app).await;
+    let seller = Seller::new(&app, &homeserver, Some("trader"), "US", 100).await;
+    let buyer = new_actor(&app).await;
+    // The offer was made from a country the fence leaves open.
+    let mut offer = create_offer_command(&seller.actor.pubky, 1);
+    offer["payload"]["buyer_country"] = json!("US");
+    assert_accepted(&execute(&app, &buyer.token, &offer).await);
+    assert_accepted(
+        &execute(
+            &app,
+            &seller.actor.token,
+            &offer_action("offer.accept", 1, "00000000-0000-4000-8000-000000001201"),
+        )
+        .await,
+    );
+    let row: (uuid::Uuid, String, i64, String, String) = sqlx::query_as(
+        "SELECT award_id, listing_aggregate_id, accepted_listing_revision, \
+         accepted_listing_record_sha256, accepted_variant_id FROM offers WHERE id = $1",
+    )
+    .bind(uuid::Uuid::parse_str(OFFER_COMMAND_ID).expect("offer id"))
+    .fetch_one(&app.pool)
+    .await
+    .expect("accepted offer row");
+    let command = |country: &str, id: &str| {
+        json!({
+            "version": 1,
+            "command_id": id,
+            "aggregate_id": format!("offer:{OFFER_COMMAND_ID}"),
+            "expected_revision": 2,
+            "issued_at": "2026-08-19T22:00:00.000Z",
+            "kind": "offer.checkout",
+            "payload": {
+                "offer_id": OFFER_COMMAND_ID,
+                "award_id": row.0.to_string(),
+                "listing_aggregate_id": row.1,
+                "listing_revision": row.2,
+                "listing_record_sha256": row.3,
+                "variant_id": row.4,
+                "quantity": 1,
+                "buyer_country": country,
+                "delivery_address": {
+                    "name": "Alice Buyer",
+                    "line1": "1 Market Street",
+                    "line2": "",
+                    "city": "London",
+                    "region": "",
+                    "postal_code": "N1 9GU",
+                    "country_code": "GB"
+                },
+            }
+        })
+    };
+    assert_refused(
+        &execute(
+            &app,
+            &buyer.token,
+            &command("GB", "00000000-0000-4000-8000-000000001202"),
+        )
+        .await,
+        StatusCode::CONFLICT,
+        "SELLER_UNAVAILABLE_IN_REGION",
+        Some("business_seller"),
+    );
+    assert_eq!(orders_of(&app, &seller.actor).await, 0);
+    assert_accepted(
+        &execute(
+            &app,
+            &buyer.token,
+            &command("US", "00000000-0000-4000-8000-000000001203"),
+        )
+        .await,
+    );
+    assert_eq!(
+        buyer_country_of_orders(&app, &seller.actor).await,
+        vec![Some("US".to_string())]
+    );
+}
+
 // --- C4: the private seller's re-confirmation -------------------------------
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
@@ -786,6 +978,56 @@ async fn a_private_seller_must_reconfirm_after_29_sales_to_eu_buyers(pool: PgPoo
         "SELLER_UNAVAILABLE_IN_REGION",
         Some("private_seller_reconfirmation_required"),
     );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn sales_to_gb_buyers_never_count_toward_the_reconfirmation_point(pool: PgPool) {
+    let (app, homeserver) = app_with_fence(pool, true).await;
+    seed_usd_and_eur(&app).await;
+    let seller = Seller::new(&app, &homeserver, Some("private"), "CH", 200).await;
+    // DAC7 is an EU directive: 40 paid sales to GB buyers are not EU sales.
+    fill(&app, &seller.actor, 1, 40, "GB").await;
+    let buyer = new_actor(&app).await;
+    assert_accepted(&buy(&app, &buyer, &seller.actor, 500, Some("DE")).await);
+    assert_accepted(&buy(&app, &buyer, &seller.actor, 501, Some("GB")).await);
+
+    let (code, read) = annual_limit(&app, &seller.actor.token, &seller.actor).await;
+    assert_eq!(code, StatusCode::OK, "{read}");
+    assert_eq!(read["eu_buyer_sales"], json!(0));
+    assert_eq!(read["reconfirmation_required"], json!(false));
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_gb_buyer_is_not_stopped_by_a_private_sellers_reconfirmation_point(pool: PgPool) {
+    let (app, homeserver) = app_with_fence(pool, true).await;
+    seed_usd_and_eur(&app).await;
+    let seller = Seller::new(&app, &homeserver, Some("private"), "CH", 100).await;
+    fill(&app, &seller.actor, 100, 29, "DE").await;
+    let buyer = new_actor(&app).await;
+    assert_refused(
+        &buy(&app, &buyer, &seller.actor, 500, Some("DE")).await,
+        StatusCode::CONFLICT,
+        "SELLER_UNAVAILABLE_IN_REGION",
+        Some("private_seller_reconfirmation_required"),
+    );
+    assert_accepted(&buy(&app, &buyer, &seller.actor, 501, Some("GB")).await);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_eu_resident_sellers_annual_limit_still_counts_sales_to_gb_buyers(pool: PgPool) {
+    let (app, homeserver) = app_with_fence(pool, true).await;
+    seed_usd_and_eur(&app).await;
+    let seller = Seller::new(&app, &homeserver, Some("private"), "DE", 100).await;
+    fill(&app, &seller.actor, 1, 29, "GB").await;
+    let buyer = new_actor(&app).await;
+    for country in ["GB", "US"] {
+        assert_refused(
+            &buy(&app, &buyer, &seller.actor, 500, Some(country)).await,
+            StatusCode::CONFLICT,
+            "SELLER_ANNUAL_LIMIT_REACHED",
+            Some("annual_sales_limit"),
+        );
+    }
 }
 
 // --- offer.checkout is counted in its own transaction -----------------------
