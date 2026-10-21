@@ -672,6 +672,101 @@ async fn closes_auction_without_reserve_met_leader_as_unsold(pool: PgPool) {
     );
 }
 
+/// An auction the Shop starts "now" by a seller clock running a minute ahead
+/// of the service: it registers while its start is still in the future.
+fn auction_starting_ahead_of_the_service_clock(seller_pubky: &str) -> serde_json::Value {
+    let mut command = register_auction_command(seller_pubky);
+    command["payload"]["auction_terms"]["starts_at"] = json!("2026-08-19T22:01:00.000Z");
+    command
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_auction_registered_before_its_start_takes_bids_once_it_starts(pool: PgPool) {
+    let app = test_app(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (status, body) = execute(
+        &app,
+        &seller.token,
+        &auction_starting_ahead_of_the_service_clock(&seller.pubky),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["result"]["listing"]["auction"]["status"],
+        json!("scheduled")
+    );
+
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &place_bid_command(&seller.pubky, 1, 4_500, 1),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], json!("AUCTION_CLOSED"));
+
+    // Past the start, a bid at the revision the buyer read is accepted.
+    app.clock.advance_seconds(61);
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &place_bid_command(&seller.pubky, 2, 4_500, 1),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "bid after the start failed: {body}");
+    let auction = &body["result"]["listing"]["auction"];
+    assert_eq!(auction["status"], json!("active"));
+    assert_eq!(auction["bid_count"], json!(1));
+    assert_eq!(auction["leader_pubky"], json!(buyer.pubky));
+    assert_eq!(body["revision"], json!(3));
+    assert_eq!(
+        count(
+            &app.pool,
+            "SELECT COUNT(*) FROM events WHERE kind = 'auction.started'"
+        )
+        .await,
+        1
+    );
+
+    // A stale revision is still refused after the start.
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &place_bid_command(&seller.pubky, 3, 6_000, 1),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], json!("REVISION_CONFLICT"));
+    assert_eq!(body["error"]["current_revision"], json!(3));
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn the_seller_closes_an_auction_registered_before_its_start(pool: PgPool) {
+    let app = test_app(pool).await;
+    let seller = new_actor(&app).await;
+    execute(
+        &app,
+        &seller.token,
+        &auction_starting_ahead_of_the_service_clock(&seller.pubky),
+    )
+    .await;
+    app.clock.advance_seconds(11 * 60);
+
+    let (status, body) = execute(
+        &app,
+        &seller.token,
+        &close_auction_command(&seller.pubky, 1, 954),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "close failed: {body}");
+    assert_eq!(body["result"]["outcome"], json!("unsold"));
+    assert_eq!(
+        body["result"]["listing"]["auction"]["status"],
+        json!("unsold")
+    );
+}
+
 // Prototype closeAuction: "The auction has not ended yet."
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn rejects_closing_an_auction_before_its_end_time(pool: PgPool) {

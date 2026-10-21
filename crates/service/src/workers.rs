@@ -444,6 +444,48 @@ pub struct AuctionCloseBatchSummary {
 /// cast; the locked Rust path remains authoritative for validity and due-ness.
 const AUCTION_INSTANT: &str = r"^[0-9]{4}-(0[1-9]|1[0-2])-([012][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]\.[0-9]{3}Z$";
 
+/// Starts a bounded batch of scheduled auctions whose start time has passed
+/// on server time, so their projection reads `active` (and the close sweep
+/// below picks them up) without waiting for a bid. Bidding and the seller's
+/// close apply the same transition themselves. A malformed start time is
+/// never cast: the CASE keeps the cast off such rows.
+pub async fn start_due_auctions(pool: &PgPool, now: DateTime<Utc>) -> anyhow::Result<u64> {
+    let mut tx = pool.begin().await?;
+    let due: Vec<ListingRow> = sqlx::query_as(&format!(
+        "SELECT {LISTING_COLUMNS} FROM listings \
+         WHERE sale_format = 'auction' AND auction->>'status' = 'scheduled' \
+         AND CASE \
+             WHEN auction->>'starts_at' ~ $2 \
+                 AND pg_input_is_valid(auction->>'starts_at', 'timestamp with time zone') \
+             THEN (auction->>'starts_at')::timestamptz <= $1 \
+             ELSE FALSE \
+         END \
+         ORDER BY aggregate_id LIMIT $3 FOR UPDATE SKIP LOCKED"
+    ))
+    .bind(now)
+    .bind(AUCTION_INSTANT)
+    .bind(AUCTION_CLOSE_BATCH_SIZE)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    let mut started = 0u64;
+    for listing in due {
+        let before = listing.server_revision;
+        let after =
+            crate::handlers::auction::apply_start_transition(&mut tx, listing, Uuid::new_v4(), now)
+                .await?;
+        if after.server_revision != before {
+            tracing::info!(
+                aggregate_id = %after.aggregate_id,
+                "started auction on server time"
+            );
+            started += 1;
+        }
+    }
+    tx.commit().await?;
+    Ok(started)
+}
+
 /// Authoritatively closes a bounded batch of active auctions whose end time
 /// has passed on server time, using the same close path as the seller command.
 /// Canonical due rows and malformed timestamp rows have independent limits:
@@ -5048,6 +5090,7 @@ pub struct WorkerSummary {
     pub reservations_expired: u64,
     pub drops_transitioned: u64,
     pub offers_expired: u64,
+    pub auctions_started: u64,
     pub auctions_closed: u64,
     pub auction_close_failures: u64,
     pub outbox_delivered: u64,
@@ -5226,9 +5269,15 @@ pub async fn run_once(
         summary.offers_expired = result?;
     }
     if try_acquire_lease(&state.pool, TASK_AUCTION_CLOSE, holder, now, lease_seconds).await? {
-        let result = close_due_auctions(&state.pool, state.homeserver.as_deref(), now).await;
+        let result = async {
+            let started = start_due_auctions(&state.pool, now).await?;
+            let closed = close_due_auctions(&state.pool, state.homeserver.as_deref(), now).await?;
+            anyhow::Ok((started, closed))
+        }
+        .await;
         release_lease(&state.pool, TASK_AUCTION_CLOSE, holder, now).await?;
-        let result = result?;
+        let (started, result) = result?;
+        summary.auctions_started = started;
         summary.auctions_closed = result.closed;
         summary.auction_close_failures = result.failed;
     }
@@ -5879,6 +5928,7 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
                             reservations_expired = summary.reservations_expired,
                             drops_transitioned = summary.drops_transitioned,
                             offers_expired = summary.offers_expired,
+                            auctions_started = summary.auctions_started,
                             auctions_closed = summary.auctions_closed,
                             auction_close_failures = summary.auction_close_failures,
                             outbox_delivered = summary.outbox_delivered,
