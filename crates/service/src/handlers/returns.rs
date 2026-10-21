@@ -1,6 +1,7 @@
 //! Return commands (`return.request`, `return.approve`, `return.receive`)
 //! and the return resolution (`refund.record_external`), ported from the
-//! TypeScript prototype engine.
+//! TypeScript prototype engine. `return.request` follows the listing's return
+//! policy frozen on the order ([`crate::return_policy`]).
 //!
 //! `refund.record_external` records independently supplied seller evidence
 //! of a refund executed outside this service (an external transaction id).
@@ -23,9 +24,32 @@ use crate::model::OrderRow;
 use crate::queries::ORDER_COLUMNS;
 use crate::refund_destination::{self, is_transaction_hash, is_usdt_order};
 use crate::result::{CommandFailure, HandlerResult};
+use crate::return_policy::{self, ReturnPolicy, ReturnRefusal};
 
 pub const REASON_REFUND_DESTINATION_REQUIRED: &str = "refund_destination_required";
 pub const REASON_INVALID_REFUND_REFERENCE: &str = "invalid_refund_reference";
+pub const REASON_RETURNS_NOT_ACCEPTED: &str = "returns_not_accepted";
+pub const REASON_RETURN_WINDOW_CLOSED: &str = "return_window_closed";
+
+/// When the order reached the buyer: the pickup handover's server instant,
+/// or the shipment's `delivered_at`. `None` when neither is recorded.
+async fn delivered_at(
+    tx: &mut Transaction<'_, Postgres>,
+    order: &OrderRow,
+) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+    if order.fulfillment == "pickup" {
+        return sqlx::query_scalar("SELECT confirmed_at FROM pickup_handovers WHERE order_id = $1")
+            .bind(order.id)
+            .fetch_optional(&mut **tx)
+            .await;
+    }
+    Ok(order
+        .shipment
+        .as_ref()
+        .and_then(|shipment| shipment["delivered_at"].as_str())
+        .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
+        .map(|instant| instant.with_timezone(&Utc)))
+}
 
 pub async fn request(
     tx: &mut Transaction<'_, Postgres>,
@@ -67,6 +91,32 @@ pub async fn request(
             ErrorCode::InvalidState,
             "The order is not eligible for this return amount.",
         )));
+    }
+    // The listing's return policy, frozen on the order at its payment start:
+    // a final-sale order takes no return, and none after the return window.
+    let policy = order
+        .return_policy
+        .as_ref()
+        .and_then(ReturnPolicy::from_json);
+    let delivered_at = delivered_at(tx, &order).await?;
+    match return_policy::check_request(policy, delivered_at, now) {
+        Ok(()) => {}
+        Err(ReturnRefusal::FinalSale) => {
+            return Ok(Err(CommandFailure::refused_with_reason(
+                crate::refusal_audit::RefusalKind::InvalidState,
+                ErrorCode::InvalidState,
+                "This item was sold as final sale: the seller doesn't accept returns.",
+                REASON_RETURNS_NOT_ACCEPTED,
+            )));
+        }
+        Err(ReturnRefusal::WindowClosed) => {
+            return Ok(Err(CommandFailure::refused_with_reason(
+                crate::refusal_audit::RefusalKind::InvalidState,
+                ErrorCode::InvalidState,
+                "The return window for this order has closed.",
+                REASON_RETURN_WINDOW_CLOSED,
+            )));
+        }
     }
     debug_assert!(can_transition(
         &order_machine(),
