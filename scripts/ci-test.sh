@@ -31,6 +31,7 @@ SERIAL=(
   migration_0035_test
   migration_0037_test
   migration_0070_test
+  migration_0083_test
   rolling_overlap_test
   manual_review_resolve_test
   migrator_tolerance_test
