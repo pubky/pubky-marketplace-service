@@ -563,6 +563,73 @@ async fn the_reconfirmation_point_only_applies_to_sales_to_eu_buyers(pool: PgPoo
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn the_reconfirmation_point_leaves_a_gb_buyers_payment_alone(pool: PgPool) {
+    // C3 now covers GB, but the re-confirmation point is part of the DAC7
+    // guard (EU-only): the seller's 29 paid sales to EU buyers do not stop a
+    // GB buyer from starting or completing a payment.
+    let mut fx = fixture(pool, "CH", "DE").await;
+    paid_sales(&fx, 28).await;
+    let early = placed(&fx, 100).await;
+    let late = placed(&fx, 101).await;
+    fx.buyer_country = "GB";
+    let gb_buyer = placed(&fx, 102).await;
+
+    // One more EU sale reaches the point.
+    let reference = bind_ok(&fx, &early).await;
+    fx.paykit
+        .set_status(&reference, status_confirmed("exclusive", true, 2));
+    assert!(poll_now(&fx.app, fx.app.clock.now()).await >= 1);
+    assert_eq!(paid_events(&fx).await, 29);
+
+    let (status, body) = bind(&fx, &late).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(is_reconfirmation_refusal(&body), "{body}");
+
+    let reference = bind_ok(&fx, &gb_buyer).await;
+    fx.paykit
+        .set_status(&reference, status_confirmed("exclusive", true, 2));
+    assert!(poll_now(&fx.app, fx.app.clock.now()).await >= 1);
+    assert_eq!(states(&fx, &gb_buyer).await.0, "paid");
+    assert_eq!(paid_events(&fx).await, 30);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn sales_to_gb_buyers_do_not_bring_a_private_seller_to_the_reconfirmation_point(
+    pool: PgPool,
+) {
+    let fx = fixture(pool, "CH", "GB").await;
+    paid_sales(&fx, 29).await;
+    let thirtieth = placed(&fx, 101).await;
+    let reference = bind_ok(&fx, &thirtieth).await;
+    fx.paykit
+        .set_status(&reference, status_confirmed("exclusive", true, 2));
+    assert!(poll_now(&fx.app, fx.app.clock.now()).await >= 1);
+    assert_eq!(states(&fx, &thirtieth).await.0, "paid");
+    assert_eq!(paid_events(&fx).await, 30);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_eu_resident_sellers_annual_limit_at_payment_still_covers_a_gb_buyer(pool: PgPool) {
+    let fx = fixture(pool, "DE", "GB").await;
+    paid_sales(&fx, 28).await;
+    let early = placed(&fx, 101).await;
+    let late = placed(&fx, 102).await;
+    let reference = bind_ok(&fx, &early).await;
+    fx.paykit
+        .set_status(&reference, status_confirmed("exclusive", true, 2));
+    assert!(poll_now(&fx.app, fx.app.clock.now()).await >= 1);
+    assert_eq!(paid_events(&fx).await, 29);
+
+    let (status, body) = bind(&fx, &late).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        body["error"]["code"],
+        json!("SELLER_ANNUAL_LIMIT_REACHED"),
+        "{body}"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn concurrent_polls_of_two_settled_payments_take_one_reconfirmation_slot(pool: PgPool) {
     let fx = fixture(pool, "CH", "DE").await;
     paid_sales(&fx, 28).await;

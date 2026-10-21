@@ -1,10 +1,21 @@
-//! Countries the legal launch plan fences on (EU-27) and the seller
-//! declaration vocabulary.
+//! Countries the legal launch plan fences on and the seller declaration
+//! vocabulary.
 //!
-//! The list is the member states of the European Union as ISO 3166-1
+//! [`EU_27`] is the member states of the European Union as ISO 3166-1
 //! alpha-2 codes (Greece is `GR`, not the VAT prefix `EL`). The United
 //! Kingdom, Switzerland, Norway and the other EEA or neighbouring states are
 //! not in it.
+//!
+//! Two rules use different sets:
+//!
+//! - **C3, the private-seller rule** ([`is_private_seller_only_country`]):
+//!   the EU-27 plus [`GB`]. A buyer in one of these countries buys only from
+//!   a seller who declared they are private (UK consumers buying from a
+//!   business have a 14-day withdrawal right under the Consumer Contracts
+//!   Regulations 2013 that a "final sale" label cannot remove).
+//! - **C4, the DAC7 guard** ([`is_eu_country`]): the EU-27 only, because
+//!   DAC7 is an EU directive. The annual limit, the re-confirmation point and
+//!   the count behind it never include GB.
 
 use serde_json::Value;
 
@@ -14,9 +25,20 @@ pub const EU_27: [&str; 27] = [
     "LT", "LU", "LV", "MT", "NL", "PL", "PT", "RO", "SE", "SI", "SK",
 ];
 
+/// The United Kingdom, ISO 3166-1 alpha-2.
+pub const GB: &str = "GB";
+
 /// Whether `country_code` (uppercase ISO 3166-1 alpha-2) is an EU member.
 pub fn is_eu_country(country_code: &str) -> bool {
     EU_27.binary_search(&country_code).is_ok()
+}
+
+/// Whether a buyer in `country_code` (uppercase ISO 3166-1 alpha-2) can buy
+/// only from a seller who declared they are private (C3): the EU-27 and GB.
+/// This is the one definition of that set; C4 and DAC7 use
+/// [`is_eu_country`].
+pub fn is_private_seller_only_country(country_code: &str) -> bool {
+    is_eu_country(country_code) || country_code == GB
 }
 
 /// What a seller declared about themselves in their own shop record
@@ -101,6 +123,16 @@ mod tests {
         }
         for code in ["GB", "CH", "NO", "IS", "LI", "US", "EL", "UK", "de", ""] {
             assert!(!is_eu_country(code), "{code}");
+        }
+    }
+
+    #[test]
+    fn the_private_seller_rule_covers_the_eu_27_and_gb_only() {
+        for code in EU_27.iter().copied().chain([GB]) {
+            assert!(is_private_seller_only_country(code), "{code}");
+        }
+        for code in ["CH", "NO", "IS", "LI", "US", "EL", "UK", "gb", "de", ""] {
+            assert!(!is_private_seller_only_country(code), "{code}");
         }
     }
 

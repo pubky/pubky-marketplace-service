@@ -4,11 +4,13 @@
 //! limiting what the service accepts, from facts the sellers and buyers
 //! publish themselves:
 //!
-//! - **C3, regional gate.** A buyer in the EU-27 can buy only from a seller
-//!   who declared `sellerStatus: "private"` in their own shop record. A
-//!   seller who declared `"trader"`, or declared nothing, is unavailable to
-//!   EU buyers: `SELLER_UNAVAILABLE_IN_REGION` with reason `business_seller`
-//!   or `undeclared_seller`.
+//! - **C3, regional gate.** A buyer in the EU-27 or GB can buy only from a
+//!   seller who declared `sellerStatus: "private"` in their own shop record.
+//!   A seller who declared `"trader"`, or declared nothing, is unavailable to
+//!   these buyers: `SELLER_UNAVAILABLE_IN_REGION` with reason
+//!   `business_seller` or `undeclared_seller`. GB is in C3 because UK
+//!   consumers buying from a business have a 14-day withdrawal right under
+//!   the Consumer Contracts Regulations 2013; C4 below stays EU-only (DAC7).
 //! - **C4, annual limit.** A seller whose shop country is in the EU-27 stops
 //!   at 29 paid sales and EUR 2,000 of paid orders per calendar year (UTC),
 //!   whichever comes first: `SELLER_ANNUAL_LIMIT_REACHED`. Only paid orders
@@ -48,7 +50,9 @@ use std::time::Duration;
 
 use chrono::{DateTime, Datelike, TimeZone, Utc};
 use marketplace_domain::commands::{Command, CommandPayload};
-use marketplace_domain::region::{is_eu_country, shop_country_from_record, SellerStatus, EU_27};
+use marketplace_domain::region::{
+    is_eu_country, is_private_seller_only_country, shop_country_from_record, SellerStatus, EU_27,
+};
 use marketplace_domain::{Currency, ErrorCode, ValidationIssue};
 use serde_json::Value;
 use sqlx::{PgConnection, Postgres, Transaction};
@@ -67,7 +71,7 @@ pub const ANNUAL_SALES_LIMIT: i64 = 29;
 /// euro cents.
 pub const ANNUAL_EUR_LIMIT_CENTS: u64 = 200_000;
 
-pub const REGION_MESSAGE: &str = "This seller doesn't sell to buyers in the EU.";
+pub const REGION_MESSAGE: &str = "This seller doesn't sell to buyers in the EU or UK.";
 pub const RECONFIRM_MESSAGE: &str =
     "This seller must confirm they still sell as a private individual before selling again.";
 pub const LIMIT_MESSAGE: &str = "This seller isn't taking new orders right now.";
@@ -215,10 +219,10 @@ fn missing_country() -> CommandFailure {
     )
 }
 
-/// The refusal C3 gives a buyer in the EU-27 for a seller who is not a
+/// The refusal C3 gives a buyer in the EU-27 or GB for a seller who is not a
 /// declared private seller; `None` when the sale is open.
 pub fn region_verdict(facts: &SellerFacts, buyer_country: &str) -> Option<CommandFailure> {
-    if !is_eu_country(buyer_country) {
+    if !is_private_seller_only_country(buyer_country) {
         return None;
     }
     match facts.status {
@@ -866,7 +870,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_private_seller_is_open_to_the_eu() {
+    fn only_a_private_seller_is_open_to_the_eu_and_gb() {
         let private = SellerFacts {
             status: SellerStatus::Private,
             ..SellerFacts::undeclared()
@@ -885,7 +889,20 @@ mod tests {
             region_verdict(&undeclared, "FR").and_then(|failure| failure.reason()),
             Some(REASON_UNDECLARED)
         );
-        for outside in ["GB", "CH", "US", "NO", "BR"] {
+        for country in ["GB", "IE"] {
+            assert!(region_verdict(&private, country).is_none(), "{country}");
+            assert_eq!(
+                region_verdict(&trader, country).and_then(|failure| failure.reason()),
+                Some(REASON_BUSINESS),
+                "{country}"
+            );
+            assert_eq!(
+                region_verdict(&undeclared, country).and_then(|failure| failure.reason()),
+                Some(REASON_UNDECLARED),
+                "{country}"
+            );
+        }
+        for outside in ["CH", "US", "NO", "BR", "UK"] {
             assert!(region_verdict(&trader, outside).is_none(), "{outside}");
             assert!(region_verdict(&undeclared, outside).is_none(), "{outside}");
         }

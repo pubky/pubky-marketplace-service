@@ -149,8 +149,8 @@ pub async fn execute_with_edge(
 
     // The EU scope fence (legal launch plan C2-C4), when `EU_FENCE_ENABLED`
     // is on: a command that sells needs the buyer's country, and a buyer in
-    // the EU-27 buys only from a declared private seller. The sellers' shop
-    // records are read here for the same reason as above. A replay is
+    // the EU-27 or GB buys only from a declared private seller. The sellers'
+    // shop records are read here for the same reason as above. A replay is
     // answered from its stored result.
     let mut fence = crate::region_fence::FencePlan::off();
     if state.config.eu_fence_enabled

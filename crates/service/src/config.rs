@@ -175,7 +175,8 @@ pub struct Config {
     pub require_encrypted_delivery_address: bool,
     /// Enforce the EU scope fence (`EU_FENCE_ENABLED`, default false; legal
     /// launch plan C2-C4). On, the service refuses a business or undeclared
-    /// seller's sale to a buyer in the EU-27 (`SELLER_UNAVAILABLE_IN_REGION`),
+    /// seller's sale to a buyer in the EU-27 or GB
+    /// (`SELLER_UNAVAILABLE_IN_REGION`),
     /// refuses a sale by an EU-resident seller past 29 paid sales or EUR 2,000
     /// in a calendar year (`SELLER_ANNUAL_LIMIT_REACHED`), and requires
     /// `buyer_country` on `checkout.create`, `offer.create`, `offer.checkout`
