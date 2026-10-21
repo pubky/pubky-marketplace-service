@@ -60,7 +60,7 @@ pub const ORDER_COLUMNS: &str =
      delivery_key_id, subtotal_minor, shipping_minor, total_minor, \
      currency, exponent, payment_id, receipt_id, edition, \
      cancellation_reason, stock_held, hold_expires_at, hold_source, \
-     shipment, delivery_assumed, delivery_assume_days, auto_complete_days, return_request, external_refund, payment_method, fiat_checkout_url, \
+     shipment, delivery_assumed, delivery_assume_days, auto_complete_days, return_policy, return_request, external_refund, payment_method, fiat_checkout_url, \
      payment_reported_at, fiat_transaction_ref, fiat_verified_by, payment_reversed_at, payment_reversal_cancelled_at, gateway_refund_review_at, \
      EXISTS (SELECT 1 FROM gateway_refund_inbox AS refund_inbox \
        WHERE refund_inbox.order_id = orders.id AND refund_inbox.resolved_at IS NULL) \

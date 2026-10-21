@@ -269,6 +269,7 @@
           "payment_reversed_at": null,
           "priced_from": "listing",
           "receipt_id": "<uuid:5>",
+          "return_policy": null,
           "return_request": null,
           "reviews": [],
           "revision": 4,

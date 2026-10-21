@@ -17,7 +17,10 @@ use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 use uuid::Uuid;
 
-use common::{execute, listing_aggregate, register_command, send, test_app_with_grant, NOW};
+use common::{
+    execute, listing_aggregate, register_command, send, test_app_with_grant,
+    test_app_with_grant_authority, NOW,
+};
 
 const RC55_CAPTURE_ATTESTATION_KEY: &str = "RJWeSyXMVeBbAFV_Q-FKGqipnh-JC65BII65MV-a894";
 
@@ -372,6 +375,129 @@ async fn status_rate_limit_is_shared_in_postgres(pool: sqlx::PgPool) {
     unhashed.update([0]);
     unhashed.update(format!("127.0.0.1:{flow_id}").as_bytes());
     assert_ne!(bucket_hash, unhashed.finalize().as_slice());
+}
+
+async fn post_create_from(router: axum::Router, client: Option<&str>) -> StatusCode {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri("/v1/auth/grant-flows")
+        .header("content-type", "application/json");
+    if let Some(client) = client {
+        request = request.header("x-real-ip", client);
+    }
+    router
+        .oneshot(request.body(Body::from("{}")).expect("request"))
+        .await
+        .expect("response")
+        .status()
+}
+
+async fn grant_bucket_rows(pool: &sqlx::PgPool, class: &str) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM grant_rate_limits WHERE endpoint_class = $1")
+        .bind(class)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn create_limit_keys_on_the_configured_client_header(pool: sqlx::PgPool) {
+    let authority = grant::test_support::GrantTestAuthority::generate(
+        marketplace_service::config::Config::for_tests().session_ttl_seconds,
+    )
+    .with_client_ip_header("x-real-ip");
+    let (app, _authority) = test_app_with_grant_authority(pool, authority).await;
+    for _ in 0..10 {
+        assert_ne!(
+            post_create_from(app.router.clone(), Some("203.0.113.7")).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+    assert_eq!(
+        post_create_from(app.router.clone(), Some("203.0.113.7")).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_ne!(
+        post_create_from(app.router.clone(), Some("203.0.113.8")).await,
+        StatusCode::TOO_MANY_REQUESTS,
+        "another client behind the same peer keeps its own bucket"
+    );
+    assert_ne!(
+        post_create_from(app.router.clone(), Some("not an address")).await,
+        StatusCode::TOO_MANY_REQUESTS,
+        "an unusable header falls back to the socket peer"
+    );
+    assert_ne!(
+        post_create_from(app.router.clone(), None).await,
+        StatusCode::TOO_MANY_REQUESTS,
+        "a request without the header falls back to the socket peer"
+    );
+    assert_eq!(grant_bucket_rows(&app.pool, "create_ip").await, 3);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn create_limit_ignores_client_headers_unless_configured(pool: sqlx::PgPool) {
+    let (app, _authority) = test_app_with_grant(pool).await;
+    for index in 0..10 {
+        let client = format!("203.0.113.{index}");
+        assert_ne!(
+            post_create_from(app.router.clone(), Some(&client)).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+    assert_eq!(
+        post_create_from(app.router.clone(), Some("198.51.100.1")).await,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the peer bucket is shared and a forged header cannot escape it"
+    );
+    assert_eq!(grant_bucket_rows(&app.pool, "create_ip").await, 1);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn status_limit_keys_on_the_configured_client_header(pool: sqlx::PgPool) {
+    let authority = grant::test_support::GrantTestAuthority::generate(
+        marketplace_service::config::Config::for_tests().session_ttl_seconds,
+    )
+    .with_client_ip_header("x-real-ip");
+    let (app, authority) = test_app_with_grant_authority(pool, authority).await;
+    let result_key = SigningKey::from_bytes(&[30u8; 32]);
+    let flow_id = authority
+        .seed_completed_flow(
+            &app.pool,
+            SeedCompletedFlow {
+                expected_pubky: &"y".repeat(52),
+                result_cpk: &encode_pubky(&result_key.verifying_key().to_bytes()),
+                delivery_id: [31u8; 32],
+                bearer: [32u8; 32],
+                result_token: [33u8; 32],
+                now: app.clock.now(),
+            },
+        )
+        .await;
+    let get_from = |client: &'static str| {
+        let router = app.router.clone();
+        let uri = format!("/v1/auth/grant-flows/{flow_id}");
+        async move {
+            router
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(uri)
+                        .header("x-real-ip", client)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response")
+                .status()
+        }
+    };
+    for _ in 0..60 {
+        assert_eq!(get_from("203.0.113.7").await, StatusCode::OK);
+    }
+    assert_eq!(get_from("203.0.113.7").await, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(get_from("203.0.113.8").await, StatusCode::OK);
+    assert_eq!(grant_bucket_rows(&app.pool, "status_flow").await, 2);
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]

@@ -661,6 +661,10 @@ pub struct OrderRow {
     /// Days after delivery this order completes unless a return is opened,
     /// frozen like [`Self::delivery_assume_days`].
     pub auto_complete_days: Option<i32>,
+    /// The listings' return policy frozen at the payment start
+    /// (`{accepts_returns, return_window_days}`, see
+    /// [`crate::return_policy`]); NULL when none was captured.
+    pub return_policy: Option<Value>,
     pub return_request: Option<Value>,
     pub external_refund: Option<Value>,
     /// The buyer-bound payment method (`bitcoin` | `paypal`; historical rows may
@@ -839,6 +843,7 @@ impl std::fmt::Debug for OrderRow {
             .field("delivery_assumed", &self.delivery_assumed)
             .field("delivery_assume_days", &self.delivery_assume_days)
             .field("auto_complete_days", &self.auto_complete_days)
+            .field("return_policy", &self.return_policy)
             .field("return_request", &self.return_request)
             .field("external_refund", &self.external_refund)
             .field("payment_method", &self.payment_method)
@@ -964,6 +969,7 @@ impl OrderRow {
             delivery_assumed: false,
             delivery_assume_days: None,
             auto_complete_days: None,
+            return_policy: None,
             return_request: None,
             external_refund: None,
             payment_method: None,
@@ -1287,6 +1293,7 @@ impl OrderRow {
         view["shipping_address_required"] = json!(self.needs_delivery_address());
         view["delivery_assume_days"] = json!(self.delivery_assume_days);
         view["auto_complete_days"] = json!(self.auto_complete_days);
+        view["return_policy"] = json!(self.return_policy);
         view["paykit_delivery_state"] = json!(self.paykit_delivery_state);
         view["payment_reversed_at"] = self.payment_reversed_at.map(format_timestamp).into();
         view["payment_reversal_cancelled_at"] = self

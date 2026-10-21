@@ -348,6 +348,28 @@ ALTER TABLE orders DROP COLUMN IF EXISTS seller_status_confirmed_at;
 DELETE FROM _sqlx_migrations WHERE version = 80;
 ```
 
+## Frozen return policy (0081)
+
+0081 adds the nullable `orders.return_policy` JSONB (no default, no index,
+`lock_timeout` like 0050). When an order's payment starts, the service reads
+each line's listing record from the homeserver with the seller's shop record
+and freezes `{accepts_returns, return_window_days}` (the most generous of the
+lines). `return.request` refuses a return on a final-sale order
+(`returns_not_accepted`) and after the window counted from delivery
+(`return_window_closed`). NULL, for an unreadable record, a record without a
+usable `returnPolicy` or an order paid before 0081, takes a return as before.
+A binary from before 0081 never sets or reads it.
+
+### Backing out 0081
+
+Additive: an image from before it runs on the migrated database. By hand, after
+the old image is serving:
+
+```sql
+ALTER TABLE orders DROP COLUMN IF EXISTS return_policy;
+DELETE FROM _sqlx_migrations WHERE version = 81;
+```
+
 ## Numbers claimed by open pull requests
 
 `main` has 0001 to 0079 (0068 and 0069 were never used). A new migration must
@@ -357,6 +379,7 @@ assume it is free:
 | Number | File | Pull request |
 | --- | --- | --- |
 | 0080 | `0080_seller_status_confirmed_at.sql` | seller re-confirmation date at payment (LG18) |
+| 0081 | `0081_order_return_policy.sql` | listing return policy frozen at payment |
 
 This table describes unmerged work and goes stale as pull requests land; trust
 `crates/service/migrations/` on `main` over it. sqlx does not reject two files
