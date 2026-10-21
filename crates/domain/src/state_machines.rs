@@ -341,6 +341,18 @@ pub fn order_machine() -> AggregateMachine {
                 "return_approved",
                 vec![Command("return.approve")],
             ),
+            // The buyer withdraws a return the seller has not acted on yet:
+            // the order goes back to where the request came from.
+            t(
+                "return_requested",
+                "delivered",
+                vec![Command("return.cancel")],
+            ),
+            t(
+                "return_requested",
+                "completed",
+                vec![Command("return.cancel")],
+            ),
             t(
                 "return_approved",
                 "return_received",
@@ -478,6 +490,7 @@ pub fn order_machine() -> AggregateMachine {
             "order.set_delivery_email",
             "return.request",
             "return.approve",
+            "return.cancel",
             "return.receive",
             "refund.record_external",
             "refund.confirm_destination",

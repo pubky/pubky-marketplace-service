@@ -572,6 +572,26 @@
           ]
         },
         {
+          "from": "return_requested",
+          "to": "delivered",
+          "via": [
+            {
+              "trigger": "command",
+              "name": "return.cancel"
+            }
+          ]
+        },
+        {
+          "from": "return_requested",
+          "to": "completed",
+          "via": [
+            {
+              "trigger": "command",
+              "name": "return.cancel"
+            }
+          ]
+        },
+        {
           "from": "return_approved",
           "to": "return_received",
           "via": [
@@ -826,6 +846,7 @@
         "order.set_delivery_email",
         "return.request",
         "return.approve",
+        "return.cancel",
         "return.receive",
         "refund.record_external",
         "refund.confirm_destination",

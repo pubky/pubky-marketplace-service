@@ -100,6 +100,7 @@ pub enum CommandPayload {
     ConfirmPickup(OrderActionPayload),
     RequestReturn(RequestReturnPayload),
     ApproveReturn(OrderActionPayload),
+    CancelReturn(OrderActionPayload),
     ReceiveReturn(OrderActionPayload),
     RecordExternalRefund(RecordExternalRefundPayload),
     ConfirmRefundDestination(ConfirmRefundDestinationPayload),
@@ -144,6 +145,7 @@ impl Command {
             CommandPayload::ConfirmPickup(_) => "fulfillment.confirm_pickup",
             CommandPayload::RequestReturn(_) => "return.request",
             CommandPayload::ApproveReturn(_) => "return.approve",
+            CommandPayload::CancelReturn(_) => "return.cancel",
             CommandPayload::ReceiveReturn(_) => "return.receive",
             CommandPayload::RecordExternalRefund(_) => "refund.record_external",
             CommandPayload::ConfirmRefundDestination(_) => "refund.confirm_destination",
@@ -188,6 +190,7 @@ impl Command {
             CommandPayload::ConfirmDelivery(p)
             | CommandPayload::ApproveCancellation(p)
             | CommandPayload::ApproveReturn(p)
+            | CommandPayload::CancelReturn(p)
             | CommandPayload::ReceiveReturn(p)
             | CommandPayload::MarkReadyForPickup(p)
             | CommandPayload::ConfirmPickup(p) => serde_json::to_value(p),
@@ -1488,6 +1491,7 @@ pub fn parse_command(raw: &Value) -> Result<Command, Vec<ValidationIssue>> {
         }
         "return.request" => parse_payload(&envelope.payload).and_then(validate_request_return)?,
         "return.approve" => parse_payload(&envelope.payload).map(CommandPayload::ApproveReturn)?,
+        "return.cancel" => parse_payload(&envelope.payload).map(CommandPayload::CancelReturn)?,
         "return.receive" => parse_payload(&envelope.payload).map(CommandPayload::ReceiveReturn)?,
         "refund.record_external" => {
             parse_payload(&envelope.payload).and_then(validate_record_external_refund)?
@@ -3515,6 +3519,7 @@ mod tests {
                 json!({ "order_id": order_id, "reason": "Differs", "requested_amount_minor": 14_796 }),
             ),
             ("return.approve", json!({ "order_id": order_id })),
+            ("return.cancel", json!({ "order_id": order_id })),
             ("return.receive", json!({ "order_id": order_id })),
             (
                 "refund.record_external",

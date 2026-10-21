@@ -370,6 +370,12 @@ ALTER TABLE orders DROP COLUMN IF EXISTS return_policy;
 DELETE FROM _sqlx_migrations WHERE version = 81;
 ```
 
+## The return.cancel command kind (0082)
+
+0082 appends `cancel_return` (id 41) to the append-only refusal-audit command
+kind catalog, like 0071, and fails loudly if id 41 holds anything else. An
+image from before it never writes id 41; the row is harmless to it.
+
 ## Numbers claimed by open pull requests
 
 `main` has 0001 to 0079 (0068 and 0069 were never used). A new migration must
@@ -380,6 +386,7 @@ assume it is free:
 | --- | --- | --- |
 | 0080 | `0080_seller_status_confirmed_at.sql` | seller re-confirmation date at payment (LG18) |
 | 0081 | `0081_order_return_policy.sql` | listing return policy frozen at payment |
+| 0082 | `0082_cancel_return_command_kind.sql` | `return.cancel` refusal-audit command kind |
 
 This table describes unmerged work and goes stale as pull requests land; trust
 `crates/service/migrations/` on `main` over it. sqlx does not reject two files

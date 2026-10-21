@@ -617,6 +617,7 @@ fn command_kind(payload: &CommandPayload) -> CommandKind {
         CommandPayload::ConfirmPickup(_) => CommandKind::ConfirmPickup,
         CommandPayload::RequestReturn(_) => CommandKind::RequestReturn,
         CommandPayload::ApproveReturn(_) => CommandKind::ApproveReturn,
+        CommandPayload::CancelReturn(_) => CommandKind::CancelReturn,
         CommandPayload::ReceiveReturn(_) => CommandKind::ReceiveReturn,
         CommandPayload::RecordExternalRefund(_) => CommandKind::RecordExternalRefund,
         CommandPayload::ConfirmRefundDestination(_) => CommandKind::ConfirmRefundDestination,
@@ -890,6 +891,9 @@ async fn dispatch(
         }
         CommandPayload::ReceiveReturn(payload) => {
             crate::handlers::returns::receive(tx, actor, command, payload, now).await
+        }
+        CommandPayload::CancelReturn(payload) => {
+            crate::handlers::returns::cancel(tx, actor, command, payload, now).await
         }
         CommandPayload::RecordExternalRefund(payload) => {
             crate::handlers::returns::record_external_refund(
