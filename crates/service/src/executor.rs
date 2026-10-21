@@ -898,6 +898,7 @@ async fn dispatch(
                 command,
                 payload,
                 state.attestor.as_deref(),
+                state.refund_chain.as_deref(),
                 now,
             )
             .await

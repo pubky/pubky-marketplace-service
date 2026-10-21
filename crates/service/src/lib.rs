@@ -47,6 +47,7 @@ pub mod payments;
 pub mod pickup;
 pub mod priv_keys;
 pub mod queries;
+pub mod refund_chain;
 pub mod refund_destination;
 pub mod refusal_audit;
 pub mod refusal_audit_admin;
@@ -104,6 +105,9 @@ pub struct AppState {
     /// stat job does not run (fail closed;
     /// see [`attestor::Attestor::from_env`]).
     pub attestor: Option<Arc<Attestor>>,
+    /// Reads a recorded USDT refund's transaction on Arbitrum One
+    /// (`ARBITRUM_RPC_URL`); `None` records it unchecked.
+    pub refund_chain: Option<Arc<dyn refund_chain::RefundChain>>,
     /// The homeserver listing-record fetch backing `listing.sync`. Required
     /// in production (`HOMESERVER_URL`); `None` only in tests that do not
     /// exercise sync, where the command is refused (fail closed).
@@ -204,6 +208,7 @@ impl AppState {
             config: Arc::new(config),
             locks: None,
             attestor: None,
+            refund_chain: None,
             homeserver: None,
             command_flights: command_flight::CommandFlights::default(),
             payments: None,
@@ -231,6 +236,14 @@ impl AppState {
 
     pub fn with_attestor(mut self, attestor: Option<Arc<Attestor>>) -> Self {
         self.attestor = attestor;
+        self
+    }
+
+    pub fn with_refund_chain(
+        mut self,
+        refund_chain: Option<Arc<dyn refund_chain::RefundChain>>,
+    ) -> Self {
+        self.refund_chain = refund_chain;
         self
     }
 

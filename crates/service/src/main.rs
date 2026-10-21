@@ -214,11 +214,23 @@ async fn main() -> anyhow::Result<()> {
     let listing_availability =
         Arc::new(marketplace_service::listing_availability::AvailabilityLimiter::from_env()?);
 
+    let refund_chain = marketplace_service::refund_chain::client_from_env()?
+        .map(|client| Arc::new(client) as Arc<dyn marketplace_service::refund_chain::RefundChain>);
+    tracing::info!(
+        refund_chain = if refund_chain.is_some() {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        "usdt refund check on arbitrum resolved"
+    );
+
     let bind_addr = config.bind_addr;
     let state = AppState::new(pool, Arc::new(SystemClock), config)
         .with_locks(locks)
         .with_attestor(attestor)
         .with_homeserver(Some(homeserver))
+        .with_refund_chain(refund_chain)
         .with_listing_moderation(Some(listing_moderation))
         .with_payments(payments)
         .with_pickup(pickup)

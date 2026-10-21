@@ -11,6 +11,7 @@ const STAGING_IMAGE =
 const stagingEnv = {
   ADDRESS_SEARCH_CLIENT_IP_HEADER: preserve(),
   ALLOWED_ORIGINS: preserve(),
+  ARBITRUM_RPC_URL: preserve(),
   ATTESTOR_ORDER_SALT: preserve(),
   ATTESTOR_SECRET_KEY: preserve(),
   AUTH_SESSION_TTL_SECONDS: preserve(),
