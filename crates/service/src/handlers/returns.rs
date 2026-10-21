@@ -184,9 +184,24 @@ pub async fn approve(
     .await
 }
 
+/// Whether the order reached `completed` before its return was requested.
+async fn completed_before(
+    tx: &mut Transaction<'_, Postgres>,
+    order: &OrderRow,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM events WHERE aggregate_id = $1 \
+         AND kind IN ('order.completed', 'review.created'))",
+    )
+    .bind(marketplace_domain::ids::order_aggregate_id(order.id))
+    .fetch_one(&mut **tx)
+    .await
+}
+
 /// `return.cancel`: the buyer withdraws a return the seller has not acted on
 /// yet. The order goes back to the state the request came from (`delivered`
-/// or `completed`; `delivered` for a request made before that was recorded)
+/// or `completed`; for a request made before that was recorded, `completed`
+/// when the order had completed, else `delivered`)
 /// and the return is cleared, so the buyer may request one again while the
 /// policy allows. The seller is notified.
 pub async fn cancel(
@@ -227,7 +242,13 @@ pub async fn cancel(
     };
     let back_to = match return_request["requested_from"].as_str() {
         Some("completed") => "completed",
-        _ => "delivered",
+        Some(_) => "delivered",
+        // A request made before `requested_from` was recorded: the order had
+        // completed if the sweep (`order.completed`) or a review
+        // (`review.created`) completed it, so it goes back there instead of
+        // being completed, and notified, a second time.
+        None if completed_before(tx, &order).await? => "completed",
+        None => "delivered",
     };
     debug_assert!(can_transition(&order_machine(), &order.state, back_to));
 

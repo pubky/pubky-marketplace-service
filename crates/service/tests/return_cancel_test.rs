@@ -147,3 +147,43 @@ async fn an_approved_return_cannot_be_cancelled(pool: PgPool) {
     );
     assert_eq!(body["error"]["reason"], json!("return_not_cancellable"));
 }
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_older_return_on_a_reviewed_order_goes_back_to_completed(pool: PgPool) {
+    let app = test_app(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (order_id, total_minor) = delivered(&app, &seller, &buyer).await;
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &order_command(
+            "review.create",
+            &order_id,
+            4,
+            json!({ "rating": 5, "text": "Arrived fine." }),
+            1_350,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "review failed: {body}");
+    assert_eq!(body["result"]["order"]["state"], json!("completed"));
+    request_return(&app, &buyer, &order_id, 5, total_minor).await;
+    // A return requested before `requested_from` was recorded.
+    sqlx::query(
+        "UPDATE orders SET return_request = return_request - 'requested_from' WHERE id = $1::uuid",
+    )
+    .bind(&order_id)
+    .execute(&app.pool)
+    .await
+    .expect("strip requested_from");
+
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &order_command("return.cancel", &order_id, 6, json!({}), 1_351),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "cancel failed: {body}");
+    assert_eq!(body["result"]["order"]["state"], json!("completed"));
+}
