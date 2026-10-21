@@ -3253,7 +3253,7 @@ async fn refused_locks_commands_need_no_second_pool_connection(pool: PgPool) {
 }
 
 // ---------------------------------------------------------------------------
-// Lock asset = price denomination (Ben, B8). The seller's lock names the
+// Lock asset = price denomination (ben-kaufman, B8). The seller's lock names the
 // unit the listing is PRICED in, mapped through an explicit table (USD/2 ->
 // USD cents, BTC/8 and SAT/0 -> BTC sats), never the rail the buyer pays on.
 // ---------------------------------------------------------------------------

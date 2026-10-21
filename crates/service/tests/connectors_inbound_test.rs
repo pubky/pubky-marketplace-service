@@ -157,10 +157,10 @@ async fn without_the_right_secret_every_failure_looks_the_same(pool: PgPool) {
     );
     // The old registry-style paths are gone.
     for path in [
-        "/v1/connectors/webhooks/shopify/john",
+        "/v1/connectors/webhooks/shopify/legacy",
         "/v1/connectors/webhooks/shopify",
         "/v1/connectors/webhooks/etsy",
-        "/v1/connectors/shopify/apps/john/launch",
+        "/v1/connectors/shopify/apps/legacy/launch",
     ] {
         let (status, _, _) = raw(s.app.router.clone(), "POST", path, &[], b"{}".to_vec()).await;
         assert!(

@@ -366,7 +366,7 @@ async fn concurrent_seller_confirmations_and_polls_pay_the_order_exactly_once(po
     assert_eq!(confirmed_events(&fx.app.pool, &payment_id).await, 1);
 }
 
-// --- underpaid money (Ovi, 19 Oct) ---------------------------------------------
+// --- underpaid money (ovitrif, 19 Oct) ---------------------------------------------
 
 async fn payment_review_reason(pool: &PgPool, payment_id: &str) -> Option<String> {
     sqlx::query_scalar("SELECT review_reason FROM payments WHERE id = $1")
