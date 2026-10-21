@@ -2155,7 +2155,11 @@ see [`docs/api.md`](docs/api.md#webhooks)).
   `ends_at` has passed through the same code path as the seller's
   `auction.close` command; the `active` status guard plus the partial unique
   index `orders_one_winner_per_auction` make the close exactly-once even
-  when the command and the worker race.
+  when the command and the worker race. Before closing, the same task starts
+  `scheduled` auctions whose `starts_at` has passed (`auction.started`).
+  Registration stores `scheduled` when the seller's start time is still
+  ahead of the service clock; `auction.place_bid` and `auction.close` apply
+  the same start first, keeping the revision the caller read.
 - **Locks verification and the payment window.** The verification task
   (see "Locks verification" above) runs only when the deployment has Locks
   configured. The `payment_window` sweep always runs and covers EVERY armed

@@ -78,6 +78,10 @@ pub async fn place_bid(
             "A seller cannot bid on their own auction.",
         )));
     }
+    // The bidder read the listing before this command started it, so the
+    // revision they hold is the one before the start.
+    let revision_before_start = listing.server_revision;
+    let listing = apply_start_transition(tx, listing, command.command_id, now).await?;
     let auction = match parse_auction(&listing) {
         Some(auction) => auction,
         None => {
@@ -102,7 +106,7 @@ pub async fn place_bid(
             "The auction is not open for bidding.",
         )));
     }
-    if command.expected_revision != listing.server_revision {
+    if command.expected_revision != revision_before_start {
         return Ok(Err(CommandFailure::refused_with_revision(
             crate::refusal_audit::RefusalKind::RevisionConflict,
             ErrorCode::RevisionConflict,
@@ -291,6 +295,8 @@ pub async fn close(
             "Only the seller may close this sandbox auction.",
         )));
     }
+    let revision_before_start = listing.server_revision;
+    let listing = apply_start_transition(tx, listing, command.command_id, now).await?;
     let auction = parse_auction(&listing);
     let Some(auction) = auction.filter(|auction| auction.status == "active") else {
         return Ok(Err(CommandFailure::refused(
@@ -299,7 +305,7 @@ pub async fn close(
             "The auction is not active.",
         )));
     };
-    if command.expected_revision != listing.server_revision {
+    if command.expected_revision != revision_before_start {
         return Ok(Err(CommandFailure::refused_with_revision(
             crate::refusal_audit::RefusalKind::RevisionConflict,
             ErrorCode::RevisionConflict,
@@ -743,6 +749,49 @@ pub async fn viewer_bid_projection(
         &currency,
         exponent,
     )))
+}
+
+/// Starts a `scheduled` auction on a row-locked listing once its start time
+/// has passed on server time (the auction machine's `auction_start`): the
+/// status becomes `active`, the revision advances, and `auction.started` is
+/// appended. Registration stores `scheduled` whenever the seller's start time
+/// is still ahead of the service clock, which a seller clock running a little
+/// fast is enough for, so bidding, closing and the worker all apply this
+/// first. Any other listing is returned unchanged.
+pub async fn apply_start_transition(
+    tx: &mut Transaction<'_, Postgres>,
+    listing: ListingRow,
+    command_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<ListingRow, sqlx::Error> {
+    let Some(mut auction) = parse_auction(&listing) else {
+        return Ok(listing);
+    };
+    if auction.status != "scheduled" || now < auction.starts_at {
+        return Ok(listing);
+    }
+    debug_assert!(can_transition(&auction_machine(), "scheduled", "active"));
+    auction.status = "active".to_string();
+    let started: ListingRow = sqlx::query_as(&format!(
+        "UPDATE listings SET server_revision = server_revision + 1, auction = $2, \
+         updated_at = $3 WHERE aggregate_id = $1 RETURNING {LISTING_COLUMNS}"
+    ))
+    .bind(&listing.aggregate_id)
+    .bind(auction.to_value())
+    .bind(now)
+    .fetch_one(&mut **tx)
+    .await?;
+    insert_event(
+        tx,
+        command_id,
+        &started.aggregate_id,
+        started.server_revision,
+        &started.seller_pubky,
+        "auction.started",
+        now,
+    )
+    .await?;
+    Ok(started)
 }
 
 pub fn parse_auction(listing: &ListingRow) -> Option<AuctionState> {

@@ -669,7 +669,8 @@ participant-scoped application routes, not through this export.
   `order.completed`, `payment.confirmed`, `payment.expired`,
   `fulfillment.shipped`, `fulfillment.tracking_updated`,
   `fulfillment.delivered`, `offer.created`,
-  `offer.accepted`, `auction.bid_placed`, `drop.started`, `return.requested`,
+  `offer.accepted`, `auction.started`, `auction.bid_placed`, `drop.started`,
+  `return.requested`,
   `refund.recorded_external` and `review.created`. The list is not exhaustive
   and not guaranteed to be closed; ignore unknown types.
 - `data` is always `{}` today. Treat the event as a change notification: fetch
