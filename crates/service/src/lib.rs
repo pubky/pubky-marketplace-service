@@ -56,6 +56,7 @@ pub mod reserve_secrecy;
 pub mod resolve_delivery;
 pub mod result;
 pub mod return_policy;
+pub mod review_release;
 pub mod rotating_keys;
 pub mod seal;
 pub mod seller_terms;

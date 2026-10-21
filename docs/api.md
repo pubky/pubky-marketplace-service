@@ -850,7 +850,8 @@ adding and editing are refused with `INVALID_STATE`. A buyer's first review
 moves `delivered` to `completed`. Each `review.create` emits one
 `review.created` event and one `review_received` notification to the
 counterparty, however many items it rates; `review.update` emits
-`review.updated` and no notification.
+`review.updated` and no notification. With the double-blind window on, the
+notifications differ: see [Double-blind reviews](#double-blind-reviews).
 
 Two submissions racing on the same listing are decided by the unique key: the
 loser is refused with `INVARIANT_VIOLATION`. Two racing on different listings,
@@ -893,6 +894,55 @@ The result is:
   `{ jws, claims }` shape, whichever command issued it.
 - Without a configured attestor, both attestation fields are absent.
 
+### Double-blind reviews
+
+`REVIEW_BLIND_WINDOW_DAYS` (default `0`, at most 90) turns on double-blind
+seller-to-buyer reviews. At `0` everything above is exactly as written and
+nothing in this section applies. With a window of N days:
+
+- **The window.** It runs N days from when the order became reviewable: the
+  delivery confirmation (`fulfillment.delivered`; `fulfillment.digital_delivered`
+  or `orders.digital_delivered_at` for digital orders), else the first move to
+  `completed` (`order.completed`), else the first review. It is stamped on the
+  order at its first `review.create` and never moves.
+- **Withheld.** Inside the window `review.create` stores its rows and issues
+  its attestations as ever, but the result carries no `attestation` or
+  `attestations`; it carries `attestation_status: "pending"` and `release_at`
+  (the window end) instead. The reviewer still reads their own review. Until
+  release, every order projection (`GET /v1/orders`, `GET /v1/orders/{id}`
+  and the `order` of every command result) shows the counterparty's review
+  only as `{ "role": "buyer", "submitted": true }`, once per role however many
+  items were reviewed.
+- **Released** in the transaction of the `review.create` that makes both roles
+  reviewed, or of a buyer's `review.create` after the window, or by the
+  `review_release` worker when the window ends. That is one `review.released`
+  event at the next order revision (a conditional update, so however the
+  three interleave the order is released once). A result that releases
+  carries `attestation_status: "released"` and the attestations as usual. A
+  `review.create` that loses a race to a release is refused with
+  `REVISION_CONFLICT` and succeeds on retry.
+- **After the window** a seller's `review.create` is refused with
+  `INVALID_STATE` ("The review window has closed."). A buyer's still
+  succeeds and publishes at once. `review.update` and the 24-hour edit window
+  are unchanged.
+- **Notifications**, once per order, kind and recipient: `review_waiting` to
+  the counterparty at a reviewer's first review while it is withheld;
+  `review_released` to each reviewer when the order is released, so their
+  client can publish; `review_received` to each reviewed participant at
+  release (in place of at the review itself) and to the reviewed participant
+  of any review written after release.
+- **Orders without a window** are never withheld: those reviewed while the
+  window was off, and (by migration 0087) every order that had reviews when it
+  was applied. Their results carry no `attestation_status`; read a missing
+  status as released. An order that carries a window stays double-blind if
+  the setting is later cleared.
+
+`attestation_status` and `release_at` appear on `review.create` and
+`review.update` results only for an order that carries a window. A replayed
+command returns its stored result, which may still say `pending`; after a
+`review_released` notification, or at `release_at`, fetch the attestations
+from the routes below.
+
 ### `GET /v1/orders/{id}/review-attestations`
 
 Every purchase attestation issued to the caller for the order, in line order:
@@ -902,13 +952,18 @@ Every purchase attestation issued to the caller for the order, in line order:
 ```
 
 Participants only: an unknown or foreign order is `404 NOT_FOUND`, and a
-participant without an attestation gets `{"attestations": []}`.
+participant without an attestation gets `{"attestations": []}`. While the
+caller's attestations are withheld by a double-blind window the answer is
+`200 { "status": "pending", "releaseAt": "<window end>" }` and no attestation
+is served.
 
 ### `GET /v1/orders/{id}/review-attestation`
 
 The caller's first-line attestation, `{"attestation": {"jws", "claims"}}`, the
 route single-listing clients read. `404 NOT_FOUND` when the order is unknown or
-foreign, or the caller has not reviewed its first line.
+foreign, or the caller has not reviewed its first line. While withheld it
+answers `200 { "status": "pending", "releaseAt": "<window end>" }`, as the
+route above does.
 
 ## Batch sync (`sync-many`)
 

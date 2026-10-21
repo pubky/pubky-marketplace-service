@@ -182,7 +182,7 @@ pub async fn advance(
             result: json!({
                 "kind": "payment",
                 "payment": payment.projection(),
-                "order": order_json_with_reviews(&order, &reviews),
+                "order": order_json_with_reviews(&order, &reviews, actor),
                 "receipt": Value::Null,
             }),
         }));
@@ -241,7 +241,7 @@ pub async fn advance(
         result: json!({
             "kind": "payment",
             "payment": updated_payment.projection(),
-            "order": order_json_with_reviews(&updated_order, &reviews),
+            "order": order_json_with_reviews(&updated_order, &reviews, actor),
             "receipt": receipt.as_ref().map(ReceiptRow::view).unwrap_or(Value::Null),
         }),
     }))
