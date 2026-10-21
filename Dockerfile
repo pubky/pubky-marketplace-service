@@ -16,6 +16,6 @@ COPY --from=builder /build/target/release/connector-worker /usr/local/bin/connec
 # not invalidate the cargo build cache. `/health` reports it as `commit`.
 ARG GIT_COMMIT=unknown
 ENV GIT_COMMIT=${GIT_COMMIT}
-# Railway injects PORT; the service reads BIND_ADDR. Bridge them at startup.
+# A platform that injects PORT is bridged to BIND_ADDR, which the service reads, at startup.
 ENV RUST_LOG=info
 CMD ["sh", "-c", "BIND_ADDR=0.0.0.0:${PORT:-8080} exec marketplace-service"]

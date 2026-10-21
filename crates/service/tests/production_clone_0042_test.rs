@@ -1,6 +1,7 @@
-//! Migration 0042 against a production-schema clone
-//! (`scripts/release/rehearse-0042-production-clone.sh`): the clone holds
-//! production's roles, schema, and migration ledger (0001..=0039) and no
+//! Migration 0042 against a production-schema clone (restored by a rehearsal
+//! script outside this repository, which sets `MARKETPLACE_CLONE_DATABASE_URL`):
+//! the clone holds production's
+//! roles, schema, and migration ledger (0001..=0039) and no
 //! production rows. The test seeds synthetic orders in the released shape
 //! production holds (buyer-cancelled while preparing: order cancelled,
 //! payment expired, activation voided, request state cleared, method still

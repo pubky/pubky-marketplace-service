@@ -104,7 +104,7 @@ pub struct Config {
     /// (`BITCOIN_PAYMENT_WINDOW_SECONDS`, default 1800, minimum 60). The
     /// same instant is Paykit `expires_at` — never longer than the invoice
     /// the buyer is shown. Honor a deployment value ≥ 60; do not cap below
-    /// a live Railway override.
+    /// a live deployment override.
     pub bitcoin_payment_window_seconds: i64,
     /// Largest remaining upstream Paykit preparation TTL Marketplace accepts
     /// (`PAYKIT_MAX_PREPARE_TTL_SECONDS`, default 900, range 60..=86400).
@@ -152,7 +152,7 @@ pub struct Config {
     /// `cancel_return`). Optional: unset omits the return parameters.
     pub public_app_origin: Option<String>,
     /// This service's own public origin (`PUBLIC_SERVICE_ORIGIN`, e.g.
-    /// `https://marketplace-service-production.up.railway.app`), used to
+    /// `https://api.example.com`), used to
     /// build gateway callback URLs (PayPal `notify_url` → `/v0/paypal/ipn`).
     /// Optional: unset omits the callback and PayPal payments stay
     /// participant-attested.
@@ -193,8 +193,7 @@ pub struct Config {
     /// The request header the trusted edge sets to the client's country from
     /// its IP (`CLIENT_COUNTRY_HEADER`, default `x-client-region`), read for the
     /// digital hold. On GCP the load balancer's custom request header
-    /// `X-Client-Region:{client_region}`; on Vercel `x-vercel-ip-country`. Stored
-    /// lowercase.
+    /// `X-Client-Region:{client_region}`. Stored lowercase.
     pub client_country_header: String,
     /// Days a cancelled-after-payment order's pinned pickup snapshot is
     /// retained as the dispute exhibit when no refund evidence ever lands,

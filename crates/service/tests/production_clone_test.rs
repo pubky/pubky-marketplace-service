@@ -1,11 +1,13 @@
-//! Driven by `scripts/rehearse-production-schema-clone.sh` against a local
+//! Driven by a production-schema clone rehearsal (a script outside this
+//! repository that restores the schema and migration ledger into a disposable
+//! local database and sets `MARKETPLACE_CLONE_DATABASE_URL`) against a local
 //! clone of the production schema and migration ledger (no domain rows):
 //! the startup migrator from `main.rs` must apply every pending migration.
 
 use sqlx::postgres::PgPoolOptions;
 
 #[tokio::test]
-#[ignore = "run by scripts/rehearse-production-schema-clone.sh against a production-schema clone"]
+#[ignore = "run by a production-schema clone rehearsal that sets MARKETPLACE_CLONE_DATABASE_URL"]
 async fn production_schema_clone_applies_pending_migrations() {
     let url = std::env::var("MARKETPLACE_CLONE_DATABASE_URL")
         .expect("MARKETPLACE_CLONE_DATABASE_URL names the clone");

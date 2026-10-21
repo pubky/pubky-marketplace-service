@@ -1806,9 +1806,8 @@ delivery emails are held beyond their retention window (in that case the body
 also carries `"reason":"delivery_email_purge_overdue"`).
 
 The service publishes no version endpoint. `GET /health` reports `commit`; for
-the authoritative record use the digest of the image that is deployed (Railway,
-or GCP once the service runs there) and its `org.opencontainers.image.revision`
-label.
+the authoritative record use the digest of the image that is deployed and its
+`org.opencontainers.image.revision` label.
 
 ## Grant-flow routes (Shop BFF)
 

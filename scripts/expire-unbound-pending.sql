@@ -1,7 +1,7 @@
 -- Operator step for leftover unbound pending_payment carts (Pav 10 Sep class).
 -- NOT a sqlx migration. Do not run at migrate-at-boot. Do not run in this
 -- implementation wave. Dry-run the SELECTs first (read-only, exact-ID
--- `railway connect --ssh`, counts/ids only, no PII). Apply the UPDATE only
+-- counts/ids only, no PII). Apply the UPDATE only
 -- after stop-start cutover, and only when bound_unheld is 0 or escalated.
 
 -- Dry-run: ordinary unbound pending (intended blast + in-flight method-screen carts)
