@@ -23,7 +23,7 @@
 //! The buyer's declared country is not trusted on its own: a buyer in the EU
 //! can declare Switzerland. So the request's own country, read from a header
 //! the trusted edge sets from the client's IP (`CLIENT_COUNTRY_HEADER`: the GCP
-//! load balancer's `{client_region}`, Vercel's `x-vercel-ip-country`), is
+//! load balancer's `{client_region}`), is
 //! checked too. A digital line is refused when EITHER the declared country OR
 //! the IP country is in the EU-27 or is GB. With the flag on and no usable IP
 //! country (header absent, malformed, or the unknown markers `XX` and `T1`),

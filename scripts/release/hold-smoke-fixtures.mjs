@@ -33,14 +33,17 @@
 //   PUBKY_SDK_DIR           directory whose node_modules holds
 //                           @synonymdev/pubky (0.11 API: startCookieAuthFlow,
 //                           signinCookie) and @noble/hashes
-//   MARKETPLACE_URL         default https://staging-api.pubky.app
-//   NEXUS_URL               default https://nexusd-staging-production.up.railway.app
+//   MARKETPLACE_URL         the staging service under test (required; no default)
+//   HOLD_SMOKE_ALLOWED_URL  the one service URL this run may touch; MARKETPLACE_URL must equal it (required)
+//   HOLD_SMOKE_PRODUCTION_HOSTS  comma list of host substrings that mark production; a MARKETPLACE_URL containing
+//                           any of them is refused (required, non-empty)
+//   NEXUS_URL               the staging Nexus the fixtures are indexed by (required; no default)
 //   HTTP_RELAY              default https://httprelay.pubky.app/inbox
 //   HOLD_SMOKE_FIXTURE_SELLER  optional for publish and status (the seat must match it when set); required
 //                           for sweep and guard
-//   HOLD_SMOKE_GUARD_NEXUS  comma list of Nexus hosts that must not list a fixture; default the production and
-//                           staging Nexus (change it when the production Nexus moves)
-// Staging only: it refuses a production service host.
+//   HOLD_SMOKE_GUARD_NEXUS  comma list of every Nexus that must not list a fixture, production and staging alike
+//                           (required; the guard fails on an empty list)
+// Staging only: it refuses a production service host. `check` is offline and needs none of the target variables.
 
 import { chmodSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -48,10 +51,8 @@ import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { crc32, deflateSync } from 'node:zlib';
 
-const SERVICE = process.env.MARKETPLACE_URL ?? 'https://staging-api.pubky.app';
-const NEXUS = process.env.NEXUS_URL ?? 'https://nexusd-staging-production.up.railway.app';
 const RELAY = process.env.HTTP_RELAY ?? 'https://httprelay.pubky.app/inbox';
-const PRODUCTION_HOST_MARKERS = ['marketplace-service-production-ce23', '-ce23.up.railway.app', 'marketplace-edge-production', 'shop.pubky.app'];
+const csv = (value) => (value ?? '').split(',').map((item) => item.trim()).filter(Boolean);
 const LISTINGS = '/pub/pubky.app/marketplace/v1/listings';
 const MEDIA = '/pub/pubky.app/marketplace/v1/media';
 const KINDS = {
@@ -63,8 +64,7 @@ const TITLE = (kind) => `${FIXTURE_TITLE_PREFIX} hold-smoke ${kind}`;
 const DELIVERABLES = '/pub/pubky.app/marketplace/v1/deliverables';
 // Every Nexus a fixture must be absent from. The staging homeserver is indexed by the production Nexus as well,
 // so a fixture published here is visible to real buyers until it is deleted.
-const GUARD_NEXUS = (process.env.HOLD_SMOKE_GUARD_NEXUS ?? 'https://nexusd-production-7108.up.railway.app,https://nexusd-staging-production.up.railway.app')
-  .split(',').map((url) => url.trim().replace(/\/$/, '')).filter(Boolean);
+const GUARD_NEXUS = csv(process.env.HOLD_SMOKE_GUARD_NEXUS).map((url) => url.replace(/\/$/, ''));
 const STREAM_PAGE = 100;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const log = (text) => process.stderr.write(`${new Date().toISOString()} ${text}\n`);
@@ -173,7 +173,13 @@ function check() {
   if (![shipping, pickup].every((r) => r.title.startsWith('SMOKE FIXTURE, do not buy') && r.variants[0].quantity === 1)) failures.push('title or quantity');
   const png = fixturePng();
   if (png.bytes.readUInt32BE(16) !== 64 || png.bytes.toString('ascii', 12, 16) !== 'IHDR') failures.push('fixture png');
-  if (!['https://marketplace-service-production-ce23.up.railway.app', 'https://marketplace-edge-production.up.railway.app'].every((u) => PRODUCTION_HOST_MARKERS.some((m) => u.includes(m)))) failures.push('production guard');
+  const guarded = (url, env) => { try { return serviceTarget(env, url).service; } catch { return null; } };
+  const guardEnv = { HOLD_SMOKE_ALLOWED_URL: 'https://staging.example.test', HOLD_SMOKE_PRODUCTION_HOSTS: 'api.example.test,shop.example.test', MARKETPLACE_URL: 'https://staging.example.test/' };
+  if (guarded(guardEnv.MARKETPLACE_URL, guardEnv) !== 'https://staging.example.test') failures.push('production guard refuses the configured staging URL');
+  if (guarded('https://api.example.test', { ...guardEnv, HOLD_SMOKE_ALLOWED_URL: 'https://api.example.test' }) !== null) failures.push('production guard accepts a production host');
+  if (guarded('https://other.example.test', guardEnv) !== null) failures.push('production guard accepts a URL other than the allowed one');
+  if (guarded(guardEnv.MARKETPLACE_URL, { ...guardEnv, HOLD_SMOKE_PRODUCTION_HOSTS: ' , ' }) !== null) failures.push('production guard accepts an empty production list');
+  if (guarded(guardEnv.MARKETPLACE_URL, { ...guardEnv, HOLD_SMOKE_ALLOWED_URL: '' }) !== null) failures.push('production guard accepts no allowed URL');
   const stream = [
     { owner_id: pubky, id: 'a', title: 'anything' },
     { owner_id: 'z'.repeat(52), id: 'b', title: TITLE('pickup') },
@@ -185,14 +191,25 @@ function check() {
   process.exitCode = failures.length ? 1 : 0;
 }
 
-function requireEnv(name) {
-  const value = process.env[name];
+function requireEnv(name, env = process.env) {
+  const value = env[name];
   if (!value) throw new Error(`set ${name} (see the header of this script)`);
   return value;
 }
 
+// The production guard is explicit configuration: an unset allowed URL or an empty production list refuses the run.
+function serviceTarget(env = process.env, url = requireEnv('MARKETPLACE_URL', env)) {
+  const markers = csv(env.HOLD_SMOKE_PRODUCTION_HOSTS).map((marker) => marker.toLowerCase());
+  if (markers.length === 0) throw new Error('set HOLD_SMOKE_PRODUCTION_HOSTS (comma list of production host substrings)');
+  const allowed = requireEnv('HOLD_SMOKE_ALLOWED_URL', env).replace(/\/$/, '');
+  if (markers.some((marker) => url.toLowerCase().includes(marker))) throw new Error('staging only: refusing a production service host');
+  if (url.replace(/\/$/, '') !== allowed) throw new Error('MARKETPLACE_URL is not HOLD_SMOKE_ALLOWED_URL');
+  return { service: allowed };
+}
+
 async function main(mode) {
-  if (PRODUCTION_HOST_MARKERS.some((marker) => SERVICE.includes(marker))) throw new Error('staging only: refusing a production service host');
+  const SERVICE = serviceTarget().service;
+  const NEXUS = requireEnv('NEXUS_URL');
   const require = createRequire(join(requireEnv('PUBKY_SDK_DIR'), 'package.json'));
   const { AuthFlowKind, Keypair, Pubky } = require('@synonymdev/pubky');
   const { blake3 } = require('@noble/hashes/blake3.js');

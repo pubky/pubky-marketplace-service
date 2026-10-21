@@ -63,18 +63,51 @@ set (the Shop's scripts/release/production-digital-fixture.mjs, wrapped).
 Any HTTP 4xx other than the expected bind 409 is STOP. Never production.
 Every created order is cancelled and verified cancelled at the end.
 
-    MARKETPLACE_URL=https://staging-api.pubky.app
-    RAILWAY_PROJECT_ID=c991d768-4a3c-42ea-b5ed-eaa22d4916ed
-    RAILWAY_ENVIRONMENT=c67a6435-bb23-453b-9169-764bfa0312e1
-    RAILWAY_DATABASE_SERVICE=Postgres
+    MARKETPLACE_URL=https://staging.example.com \\
+    HOLD_SMOKE_ALLOWED_URL=https://staging.example.com \\
+    HOLD_SMOKE_PRODUCTION_HOSTS=api.example.com,shop.example.com \\
+    HOLD_SMOKE_PSQL_CMD='psql postgres://...' \\
+    HOLD_SMOKE_SERVICE_ENV_CMD='/path/to/print-service-env' \\
+    HOLD_SMOKE_FIXTURE_SELLER=<fixture seller pubky> \\
+    NEXUS_URL=https://nexus-staging.example.com \\
+    HOLD_SMOKE_GUARD_NEXUS=https://nexus.example.com,https://nexus-staging.example.com \\
+    HOLD_SMOKE_PUBKY_CWD=/path/to/pubky-sdk \\
     python3 scripts/release/hold-smoke.py
+
+The target is entirely configuration; the script has no default host:
+
+  MARKETPLACE_URL              the service under test.
+  HOLD_SMOKE_ALLOWED_URL       the one URL this run may touch; MARKETPLACE_URL
+                               must equal it (trailing slash ignored).
+  HOLD_SMOKE_PRODUCTION_HOSTS  comma list of host substrings that mark
+                               production (public hostnames, edges, the shop
+                               domain); a MARKETPLACE_URL containing any of
+                               them is refused. Required and non-empty.
+  HOLD_SMOKE_PSQL_CMD          the command (split with shell quoting rules, no
+                               shell) that reads one psql script on stdin and
+                               prints its output: the staging database, however
+                               the operator reaches it.
+  HOLD_SMOKE_SERVICE_ENV_CMD   the command that takes one variable name as its
+                               last argument and prints that variable's value
+                               from the running staging service (empty output
+                               and exit 0 when it is unset). Only
+                               FIAT_PAYMENT_WINDOW_SECONDS is requested.
+  HOLD_SMOKE_FIXTURE_SELLER    the dedicated fixture seller's pubky.
+  NEXUS_URL                    the staging Nexus the fixtures are indexed by.
+  HOLD_SMOKE_GUARD_NEXUS       comma list of every Nexus, production and
+                               staging, that must not list a fixture.
+  NODE_BIN                     node executable, default `node`.
+  HOLD_SMOKE_PUBKY_CWD         a directory whose node_modules has
+                               @synonymdev/pubky.
+  HPKE_CWD                     see below.
 
     python3 scripts/release/hold-smoke.py --self-check
 
 Sealing runs `hold-smoke-seal.mjs` under node with the same `hpke-js`
-packages and pins the Shop uses. Install them once (the default HPKE_CWD):
+packages and pins the Shop uses. Install them once into HPKE_CWD (default
+`~/.cache/hold-smoke-hpke`; `--self-check` needs them and HOLD_SMOKE_PUBKY_CWD):
 
-    mkdir -p /Volumes/t7/vibes-dev/.deps/hold-smoke-hpke && cd "$_" && npm init -y \\
+    mkdir -p "$HPKE_CWD" && cd "$HPKE_CWD" && npm init -y \\
       && npm install --save-exact @hpke/core@1.9.0 @hpke/chacha20poly1305@1.8.0 \\
          @hpke/dhkem-x25519@1.8.0
 
@@ -114,17 +147,10 @@ SHOP_TAG = "shop-v0.6.25"
 SHOP_SHA = "5e7fc0e6433e8535ca0444607e7864d79ff4f73c"
 FIXTURE_NAME = "shop-v0.6.25-checkout.create.json"
 
-STAGING_URL = "https://staging-api.pubky.app"
-STAGING_PROJECT = "c991d768-4a3c-42ea-b5ed-eaa22d4916ed"
-STAGING_ENVIRONMENT = "c67a6435-bb23-453b-9169-764bfa0312e1"
-STAGING_SERVICE = "3e98e363-f9a7-4711-b668-d714acee6e32"
-PRODUCTION_PROJECT = "75faa4fe-466c-4277-977f-1d8e4e31df8c"
-# Every listing the smoke holds, buys or cancels belongs to this dedicated staging seller
-# ("Hold-smoke fixtures (staging)"): a shipping, a pickup-only and one digital "SMOKE FIXTURE, do not buy"
+# Every listing the smoke holds, buys or cancels belongs to one dedicated staging seller
+# (HOLD_SMOKE_FIXTURE_SELLER): a shipping, a pickup-only and one digital "SMOKE FIXTURE, do not buy"
 # listing per kind. Other sellers' listings are never picked or modified.
-FIXTURE_SELLER = os.environ.get(
-    "HOLD_SMOKE_FIXTURE_SELLER", "ka7q4cmabp6amo13bye9q6iwhb4pxuwr9fo37h5ygx4uk9e63tjy"
-)
+FIXTURE_SELLER = os.environ.get("HOLD_SMOKE_FIXTURE_SELLER", "")
 FIXTURE_HINT = (
     "the smoke publishes its own fixtures on the fixture seller at the start of a run "
     "(see Fixture lifecycle in the header); check the publish output above"
@@ -135,16 +161,10 @@ DIGITAL_FIXTURE_ENV = "HOLD_SMOKE_DIGITAL_FIXTURE_CMD"
 PUBLISH_TIMEOUT_SECONDS = 1800
 SWEEP_TIMEOUT_SECONDS = 900
 GUARD_TIMEOUT_SECONDS = 180
-PRODUCTION_HOST_MARKERS = (
-    "marketplace-service-production-ce23",
-    "marketplace-edge-production",
-    "shop.pubky.app",
-    "-ce23.up.railway.app",
-)
 
-NODE = "/Users/johncarvalho/.nvm/versions/node/v22.14.0/bin/node"
-PUBKY_CWD = "/Users/johncarvalho/work/.deps/pubky-app-ci-green"
-HPKE_CWD = os.environ.get("HPKE_CWD", "/Volumes/t7/vibes-dev/.deps/hold-smoke-hpke")
+NODE = os.environ.get("NODE_BIN", "node")
+PUBKY_CWD = os.environ.get("HOLD_SMOKE_PUBKY_CWD", "")
+HPKE_CWD = os.environ.get("HPKE_CWD", str(Path.home() / ".cache" / "hold-smoke-hpke"))
 SEAL_HELPER = Path(__file__).with_name("hold-smoke-seal.mjs")
 ENVELOPE_FIXTURE_NAME = "shop-delivery-envelope.json"
 ENVELOPE_FIXTURE_SHOP_SHA = "deb3c7f71b8b915bc960b3a799bf2af286062ff0"
@@ -213,16 +233,32 @@ DIGITAL_SMOKE_EMAIL = "hold-smoke.digital@example.com"
 DIGITAL_PAYLOAD_KEYS = {"lines"}
 
 
-def refuse_production(url: str, project: str) -> None:
+def production_host_markers() -> tuple[str, ...]:
+    raw = os.environ.get("HOLD_SMOKE_PRODUCTION_HOSTS", "")
+    return tuple(item.strip().lower() for item in raw.split(",") if item.strip())
+
+
+def refuse_production(url: str) -> None:
+    """The production guard is explicit configuration: no allowed URL or no
+    production markers configured is a refusal, never a pass."""
+    markers = production_host_markers()
+    if not markers:
+        raise SystemExit("HOLD_SMOKE=STOP set HOLD_SMOKE_PRODUCTION_HOSTS (comma list of production host substrings)")
+    allowed = os.environ.get("HOLD_SMOKE_ALLOWED_URL", "").strip()
+    if not allowed:
+        raise SystemExit("HOLD_SMOKE=STOP set HOLD_SMOKE_ALLOWED_URL (the one URL this run may touch)")
     lowered = url.lower()
-    if project == PRODUCTION_PROJECT:
-        raise SystemExit("HOLD_SMOKE=STOP production project id is forbidden")
-    if "ce23" in lowered or any(marker in lowered for marker in PRODUCTION_HOST_MARKERS):
+    if any(marker in lowered for marker in markers):
         raise SystemExit(f"HOLD_SMOKE=STOP production host is forbidden: {url}")
-    if project != STAGING_PROJECT:
-        raise SystemExit(f"HOLD_SMOKE=STOP expected staging project {STAGING_PROJECT}, got {project}")
-    if url.rstrip("/") != STAGING_URL:
-        raise SystemExit(f"HOLD_SMOKE=STOP expected {STAGING_URL}, got {url}")
+    if url.rstrip("/") != allowed.rstrip("/"):
+        raise SystemExit(f"HOLD_SMOKE=STOP expected {allowed}, got {url}")
+
+
+def required_env(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise SystemExit(f"HOLD_SMOKE=STOP missing {name}")
+    return value
 
 
 def issued_at() -> str:
@@ -479,7 +515,45 @@ def refusal_reason(body: dict | str) -> str | None:
     return error.get("reason") if isinstance(error, dict) else None
 
 
+SELF_CHECK_SELLER = "y" * 52
+
+
+def self_check_production_guard() -> None:
+    saved = {name: os.environ.get(name) for name in ("HOLD_SMOKE_ALLOWED_URL", "HOLD_SMOKE_PRODUCTION_HOSTS")}
+    try:
+        def refused(url: str, allowed: str | None, hosts: str | None) -> bool:
+            for name, value in (("HOLD_SMOKE_ALLOWED_URL", allowed), ("HOLD_SMOKE_PRODUCTION_HOSTS", hosts)):
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+            try:
+                refuse_production(url)
+            except SystemExit:
+                return True
+            return False
+
+        staging, production = "https://staging.example.test", "api.example.test,shop.example.test"
+        if refused(staging, staging + "/", production):
+            raise RuntimeError("the configured staging URL was refused")
+        if not refused("https://api.example.test", "https://api.example.test", production):
+            raise RuntimeError("a configured production host was accepted")
+        if not refused("https://other.example.test", staging, production):
+            raise RuntimeError("a URL other than the allowed one was accepted")
+        if not refused(staging, None, production) or not refused(staging, staging, None) or not refused(staging, staging, " , "):
+            raise RuntimeError("an unconfigured production guard was accepted")
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
 def self_check() -> None:
+    global FIXTURE_SELLER
+    FIXTURE_SELLER = SELF_CHECK_SELLER
+    self_check_production_guard()
     listing = {
         "aggregate_id": "listing:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "seller_pubky": z32_pubky(),
@@ -738,16 +812,28 @@ def self_check() -> None:
     print("HOLD_SMOKE=SELF_CHECK_PASS")
 
 
+def operator_command(name: str) -> list[str]:
+    """Split an operator-supplied command variable; it runs without a shell."""
+    argv = shlex.split(required_env(name))
+    if not argv:
+        raise SystemExit(f"HOLD_SMOKE=STOP {name} is empty")
+    return argv
+
+
+def drop_connection_noise(text: str | None) -> list[str]:
+    """Never echo a connection string or a password an operator command printed."""
+    return [
+        line
+        for line in (text or "").splitlines()
+        if "postgres://" not in line.lower() and "postgresql://" not in line.lower() and "password" not in line.lower()
+    ]
+
+
 def sql(statement: str) -> str:
-    project = os.environ["RAILWAY_PROJECT_ID"]
-    environment = os.environ["RAILWAY_ENVIRONMENT"]
-    db_service = os.environ.get("RAILWAY_DATABASE_SERVICE", "Postgres")
-    refuse_production(os.environ["MARKETPLACE_URL"], project)
+    refuse_production(os.environ["MARKETPLACE_URL"])
+    argv = operator_command("HOLD_SMOKE_PSQL_CMD")
     env = os.environ.copy()
-    env["PATH"] = "/opt/homebrew/opt/postgresql@17/bin:" + env.get("PATH", "")
     env["PGCONNECT_TIMEOUT"] = "15"
-    for key in ("RAILWAY_PROJECT_ID", "RAILWAY_ENVIRONMENT_ID", "RAILWAY_SERVICE_ID"):
-        env.pop(key, None)
     payload = (
         "\\set ON_ERROR_STOP on\n"
         "\\pset tuples_only on\n"
@@ -757,90 +843,39 @@ def sql(statement: str) -> str:
         + "\n\\q\n"
     )
     result = subprocess.run(
-        ["railway", "connect", db_service, "--ssh", "-p", project, "-e", environment],
+        argv,
         input=payload,
         text=True,
         capture_output=True,
         env=env,
         check=False,
     )
-    filtered = []
-    for line in (result.stdout or "").splitlines():
-        lower = line.lower()
-        if "postgres://" in lower or "password" in lower:
-            continue
-        if "config as code" in lower or "migrate:" in lower or "existing files" in lower:
-            continue
-        if "ssh tunnel" in lower:
-            continue
-        filtered.append(line)
+    filtered = drop_connection_noise(result.stdout)
     if result.returncode != 0:
-        err = "\n".join(
-            ln
-            for ln in (result.stderr or "").splitlines()
-            if "postgres://" not in ln.lower() and "password" not in ln.lower()
-        )
+        err = "\n".join(drop_connection_noise(result.stderr))
         raise RuntimeError(f"sql failed rc={result.returncode} err={err[:400]!r} out={filtered!r}")
     return "\n".join(filtered)
 
 
-def railway_ssh(argv: list[str]) -> str:
-    """Run one command on the staging marketplace-service instance.
+def service_env(name: str) -> str:
+    """Exact-key read of one variable from the running staging service.
 
-    Used only for an exact-key `printenv FIAT_PAYMENT_WINDOW_SECONDS`. Never
+    The operator's HOLD_SMOKE_SERVICE_ENV_CMD gets the variable name as its last
+    argument and prints the value (nothing, exit 0, when it is unset). Never
     list or dump the rest of the environment.
     """
-    project = os.environ["RAILWAY_PROJECT_ID"]
-    environment = os.environ["RAILWAY_ENVIRONMENT"]
-    refuse_production(os.environ["MARKETPLACE_URL"], project)
-    env = os.environ.copy()
-    env["PATH"] = "/opt/homebrew/bin:" + env.get("PATH", "")
-    for key in ("RAILWAY_PROJECT_ID", "RAILWAY_ENVIRONMENT_ID", "RAILWAY_SERVICE_ID"):
-        env.pop(key, None)
+    refuse_production(os.environ["MARKETPLACE_URL"])
     result = subprocess.run(
-        [
-            "railway",
-            "ssh",
-            "-p",
-            project,
-            "-e",
-            environment,
-            "-s",
-            STAGING_SERVICE,
-            "--",
-            *argv,
-        ],
+        [*operator_command("HOLD_SMOKE_SERVICE_ENV_CMD"), name],
         text=True,
         capture_output=True,
-        env=env,
+        env=os.environ.copy(),
         check=False,
     )
-    filtered = []
-    for line in (result.stdout or "").splitlines():
-        lower = line.lower()
-        if "postgres://" in lower or "password" in lower:
-            continue
-        if "config as code" in lower or "migrate:" in lower:
-            continue
-        if "ssh tunnel" in lower or "connected to" in lower:
-            continue
-        filtered.append(line)
+    filtered = drop_connection_noise(result.stdout)
     if result.returncode != 0:
-        # GNU printenv exits 1 when the named key is unset; that is the
-        # empty-window case (code default 600), not an SSH failure.
-        if (
-            result.returncode == 1
-            and len(argv) == 2
-            and argv[0] == "printenv"
-            and not filtered
-        ):
-            return ""
-        err = "\n".join(
-            ln
-            for ln in (result.stderr or "").splitlines()
-            if "postgres://" not in ln.lower() and "password" not in ln.lower()
-        )
-        raise RuntimeError(f"ssh failed rc={result.returncode} err={err[:400]!r} out={filtered!r}")
+        err = "\n".join(drop_connection_noise(result.stderr))
+        raise RuntimeError(f"service env read failed rc={result.returncode} err={err[:400]!r} out={filtered!r}")
     return "\n".join(filtered)
 
 
@@ -856,10 +891,9 @@ def parse_digital_kinds(raw: str) -> tuple[str, ...]:
 
 
 def parse_fiat_window(raw: str) -> int:
-    """Parse an exact-key `printenv FIAT_PAYMENT_WINDOW_SECONDS` payload.
+    """Parse an exact-key read of FIAT_PAYMENT_WINDOW_SECONDS.
 
-    Empty output means the process is on the service default (600). Staging
-    IaC `preserve()`s the key and does not inject it when unset.
+    Empty output means the process is on the service default (600).
     """
     token = sql_scalar(raw) if "\n" in raw else raw.strip()
     if not token:
@@ -877,7 +911,7 @@ def parse_fiat_window(raw: str) -> int:
 
 def fiat_window_seconds() -> int:
     """Exact-key read of FIAT_PAYMENT_WINDOW_SECONDS from the running service."""
-    return parse_fiat_window(railway_ssh(["printenv", "FIAT_PAYMENT_WINDOW_SECONDS"]))
+    return parse_fiat_window(service_env("FIAT_PAYMENT_WINDOW_SECONDS"))
 
 
 def api(base: str, method: str, path: str, bearer: str | None, body: Any = None) -> tuple[int, dict | str]:
@@ -919,7 +953,7 @@ def z32_pubky() -> str:
     )
     result = subprocess.run(
         [NODE, "-e", script],
-        cwd=PUBKY_CWD,
+        cwd=required_env("HOLD_SMOKE_PUBKY_CWD"),
         capture_output=True,
         text=True,
         check=True,
@@ -1300,12 +1334,7 @@ def terminate_as_exit(signum: int, _frame: Any) -> None:
 class Smoke:
     def __init__(self, digital_kinds: tuple[str, ...] = DIGITAL_KINDS) -> None:
         self.base = os.environ["MARKETPLACE_URL"].rstrip("/")
-        self.project = os.environ["RAILWAY_PROJECT_ID"]
-        refuse_production(self.base, self.project)
-        environment = os.environ.get("RAILWAY_ENVIRONMENT", STAGING_ENVIRONMENT)
-        os.environ["RAILWAY_ENVIRONMENT"] = environment
-        if environment not in {STAGING_ENVIRONMENT, "production"}:
-            raise SystemExit(f"HOLD_SMOKE=STOP unexpected RAILWAY_ENVIRONMENT {environment}")
+        refuse_production(self.base)
         self.sessions: list[str] = []
         self.created_orders: list[dict[str, Any]] = []
         self.cases: list[dict[str, Any]] = []
@@ -1809,7 +1838,6 @@ class Smoke:
                 "shop_tag": SHOP_TAG,
                 "shop_sha": SHOP_SHA,
                 "marketplace_url": self.base,
-                "railway_project": self.project,
                 "fiat_window_seconds": self.fiat_window,
                 "fixture_seller": FIXTURE_SELLER[:8],
                 "digital_kinds": list(self.digital_kinds),
@@ -1858,11 +1886,18 @@ def main() -> None:
     if args.self_check:
         self_check()
         return
-    for required in ("MARKETPLACE_URL", "RAILWAY_PROJECT_ID"):
-        if required not in os.environ:
-            raise SystemExit(f"HOLD_SMOKE=STOP missing {required}")
-    os.environ.setdefault("RAILWAY_ENVIRONMENT", STAGING_ENVIRONMENT)
-    os.environ.setdefault("RAILWAY_DATABASE_SERVICE", "Postgres")
+    for required in (
+        "MARKETPLACE_URL",
+        "HOLD_SMOKE_ALLOWED_URL",
+        "HOLD_SMOKE_PRODUCTION_HOSTS",
+        "HOLD_SMOKE_PSQL_CMD",
+        "HOLD_SMOKE_SERVICE_ENV_CMD",
+        "HOLD_SMOKE_FIXTURE_SELLER",
+        "HOLD_SMOKE_PUBKY_CWD",
+        "NEXUS_URL",
+        "HOLD_SMOKE_GUARD_NEXUS",
+    ):
+        required_env(required)
     Smoke(digital_kinds).run()
 
 

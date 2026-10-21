@@ -45,9 +45,7 @@ docs/              api.md (seller automation API), migrations.md and the
                    PayPal refund IPN, released Paykit attempts, refusal-audit
                    operations).
 scripts/           ci-test.sh (the CI test split), the pre-push gate
-                   (prepush*.sh), and schema-rehearsal helpers.
-.railway/          Railway infrastructure as code (see .railway/README.md);
-                   railway.toml is the git-deploy build/healthcheck config.
+                   (prepush*.sh), and release-proof helpers (`scripts/release/`).
 docker-compose.yml Dev/test PostgreSQL 17 on port 55432.
 ```
 
@@ -121,11 +119,25 @@ before applying (it was empty as of 2026-09-05). The migration is applied
 everywhere this service runs; this paragraph is history, not a pending
 step.
 
+## Deployment
+
+The service ships as the container image built from the [`Dockerfile`](Dockerfile)
+(published by `.github/workflows/production-image.yml` as
+`ghcr.io/pubky/pubky-marketplace-service`). Team deployments (staging, then
+production) run on Synonym's GCP and are deployed through
+[pubky/shop-migration](https://github.com/pubky/shop-migration); infrastructure,
+pins and environment values live there. This repository carries no
+host-specific infrastructure configuration, and personal development hosting is
+out of scope for it.
+
+The release-proof helpers in [`scripts/release/`](scripts/release/) take every
+target from environment variables and carry no default host; see the header of
+each script.
+
 ## Configuration
 
 Configuration is environment-based. Window keys and their defaults also live in
-[`.env.example`](.env.example) (config-parity with `Config::from_env` and
-Railway IaC `preserve()`):
+[`.env.example`](.env.example) (config-parity with `Config::from_env`):
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
@@ -156,8 +168,8 @@ Railway IaC `preserve()`):
 | `LOCKS_LOOKUP_HMAC_KEY` | unset | 32-byte hex key for the HMAC-SHA256 correlation lookup token; must differ from the encryption key |
 | `LOCKS_PAYMENT_WINDOW_SECONDS` | `3600` | hold window armed by the `payment.register_locks` lock point (≥ 60); the correlation window IS the hold window |
 | `CHECKOUT_HOLD_WINDOW_SECONDS` | `900` | unbound leftover cancel for ordinary `pending_payment` rows with `stock_held=false` and no payment method (≥ 60). Ordinary `checkout.create` does not hold stock |
-| `FIAT_PAYMENT_WINDOW_SECONDS` | `600` | hold window armed by a PayPal payment-method bind (`POST /v0/orders/{id}/payment-method`) (≥ 60). Default 10 minutes; live Railway may still preserve a longer override |
-| `BITCOIN_PAYMENT_WINDOW_SECONDS` | `1800` | hold window armed by a bitcoin payment-method bind; the same instant is Paykit `expires_at` (fork), or Paykit's activation-time deadline plus 60 s once an upstream request is active — never longer than the invoice the buyer is shown (≥ 60). Honor a deployment value ≥ 60; do not cap below a live Railway override |
+| `FIAT_PAYMENT_WINDOW_SECONDS` | `600` | hold window armed by a PayPal payment-method bind (`POST /v0/orders/{id}/payment-method`) (≥ 60). Default 10 minutes; a deployment may set a longer override |
+| `BITCOIN_PAYMENT_WINDOW_SECONDS` | `1800` | hold window armed by a bitcoin payment-method bind; the same instant is Paykit `expires_at` (fork), or Paykit's activation-time deadline plus 60 s once an upstream request is active — never longer than the invoice the buyer is shown (≥ 60). Honor a deployment value ≥ 60; do not cap below a deployment override |
 | `SANDBOX_PAYMENT_WINDOW_SECONDS` | `900` | hold window armed by the sandbox lock point (`payment.sandbox_advance`'s first transition out of `awaiting_entitlement`) (≥ 60) |
 | `DROP_CLAIM_WINDOW_SECONDS` | `600` | hold window armed at checkout for drop-bound orders (lock-at-claim) (≥ 60) |
 | `LOCKS_POLL_SECONDS` | `30` | minimum interval between lifecycle lookups per pending correlation |
@@ -185,7 +197,7 @@ Railway IaC `preserve()`):
 | `REQUIRE_ENCRYPTED_DELIVERY_ADDRESS` | `false` | `true`/`1` refuses a checkout or award checkout that carries a plaintext `delivery_address` (422 `INVALID_COMMAND`, reason `encrypted_delivery_required`); only sealed envelopes are accepted. Leave unset until the Shop version that seals is the deployed one (see [Sealed delivery address](#sealed-delivery-address)) |
 | `EU_FENCE_ENABLED` | `false` | `true`/`1` turns on the EU scope fence (legal launch plan C2-C4): `buyer_country` becomes required on the selling commands, a buyer in the EU-27 or GB buys only from sellers whose shop record says `sellerStatus: "private"`, and sellers whose shop country is in the EU-27 stop at 29 paid sales or EUR 2,000 of paid orders a calendar year (checked at checkout and again at payment). Off, `buyer_country` is accepted and stored and nothing is refused on these grounds. See [EU scope fence](#eu-scope-fence) |
 | `DIGITAL_REGION_BLOCK_ENABLED` | `false` | `true`/`1` refuses `checkout.create` (which carries drop claims) and `offer.checkout` that contain a digital line (any digital delivery kind, or a Locks listing) when `payload.buyer_country` is in the EU-27 or is `GB`: `DIGITAL_UNAVAILABLE_IN_REGION` (409), reason `eu_buyer` or `gb_buyer` for the declared country, `eu_ip` or `gb_ip` for the request's own country (read from `CLIENT_COUNTRY_HEADER`), `buyer_region_unknown` when the edge sent none; such a command must carry `buyer_country`. Independent of `EU_FENCE_ENABLED`. Off, nothing is refused. See [Digital sales to EU and UK buyers](#digital-sales-to-eu-and-uk-buyers) |
-| `CLIENT_COUNTRY_HEADER` | `x-client-region` | Name of the request header the trusted edge sets to the client's country (ISO alpha-2) from its IP. Read only by the digital hold (`DIGITAL_REGION_BLOCK_ENABLED`). GCP: a load-balancer custom request header `X-Client-Region:{client_region}`; Vercel: `x-vercel-ip-country`. The edge must set it itself and overwrite any value the client sent. Missing or unusable with the digital hold on: digital lines are refused (`buyer_region_unknown`) and an `ALERT digital_region_client_country_missing` is logged |
+| `CLIENT_COUNTRY_HEADER` | `x-client-region` | Name of the request header the trusted edge sets to the client's country (ISO alpha-2) from its IP. Read only by the digital hold (`DIGITAL_REGION_BLOCK_ENABLED`). GCP: a load-balancer custom request header `X-Client-Region:{client_region}`. The edge must set it itself and overwrite any value the client sent. Missing or unusable with the digital hold on: digital lines are refused (`buyer_region_unknown`) and an `ALERT digital_region_client_country_missing` is logged |
 | `ADDRESS_SEARCH_UPSTREAM_URL` | `https://photon.komoot.io` | Photon geocoder behind `POST /v0/address/suggest`. HTTPS only (http for loopback in tests). Point it at a self-hosted Photon to stop using the public instance |
 | `ADDRESS_SEARCH_DISABLED` | unset | `1`/`true` turns the address proxy off; the route answers `address_search_unavailable` |
 | `ADDRESS_SEARCH_CLIENT_IP_HEADER` | unset | name of a header set by a trusted edge that carries the client address (last value is used); unset keys the per-client limit on the socket peer |
@@ -349,7 +361,7 @@ lines fail closed with `reason: buyer_region_unknown` and an
 `ALERT digital_region_client_country_missing` is logged; physical lines never
 need the header. Commands that do not arrive over HTTP from a buyer (automation,
 connectors) carry no edge country and are refused for digital lines the same way.
-Deploy note: the load balancer (or Vercel) must set the header on every request
+Deploy note: the load balancer must set the header on every request
 and overwrite any client-sent value.
 
 - A line is digital when its listing is a Locks listing, when the buyer chose
