@@ -34,6 +34,7 @@ pub const REASON_INVALID_REFUND_REFERENCE: &str = "invalid_refund_reference";
 pub const REASON_REFUND_TRANSACTION_NOT_FOUND: &str = "refund_transaction_not_found";
 pub const REASON_REFUND_TRANSACTION_REVERTED: &str = "refund_transaction_reverted";
 pub const REASON_REFUND_TRANSACTION_WRONG_RECIPIENT: &str = "refund_transaction_wrong_recipient";
+pub const REASON_REFUND_TRANSACTION_ALREADY_RECORDED: &str = "refund_transaction_already_recorded";
 pub const REASON_RETURNS_NOT_ACCEPTED: &str = "returns_not_accepted";
 pub const REASON_RETURN_WINDOW_CLOSED: &str = "return_window_closed";
 
@@ -385,6 +386,26 @@ pub async fn record_external_refund(
     } else {
         None
     };
+    // One Arbitrum transaction is evidence for one order's refund: a hash
+    // already recorded on another order would read as checked there too.
+    if usdt_destination.is_some() {
+        let recorded_elsewhere: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM orders WHERE id <> $1 \
+             AND lower(external_refund->>'transaction_id') = lower($2))",
+        )
+        .bind(order.id)
+        .bind(&payload.transaction_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        if recorded_elsewhere {
+            return Ok(Err(CommandFailure::refused_with_reason(
+                crate::refusal_audit::RefusalKind::InvalidCommand,
+                ErrorCode::InvalidCommand,
+                "This transaction is already recorded as the refund of another order.",
+                REASON_REFUND_TRANSACTION_ALREADY_RECORDED,
+            )));
+        }
+    }
     // With an Arbitrum RPC configured, the transaction must have sent USDT to
     // that address; the record keeps what the buyer actually received.
     let received_units = match (refund_chain, &usdt_destination) {

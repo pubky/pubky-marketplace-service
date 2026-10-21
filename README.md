@@ -890,7 +890,9 @@ USDT rail); every other order is unchanged. It is not gated by
   sums the USDT0 it sent to the confirmed address. A hash Arbitrum doesn't show
   (`refund_transaction_not_found`), a reverted transaction
   (`refund_transaction_reverted`) or one that sent the address no USDT0
-  (`refund_transaction_wrong_recipient`) is refused with 422. Otherwise the
+  (`refund_transaction_wrong_recipient`) is refused with 422, and so, with or
+  without the RPC, is a hash already recorded on another order
+  (`refund_transaction_already_recorded`). Otherwise the
   record keeps `received_units` (USDT0 millionths) and `checked_at`, so a short
   refund reads as short. An unreachable RPC records the refund unchecked.
 - **What it does not do.** Without `ARBITRUM_RPC_URL`, and on the manual-review

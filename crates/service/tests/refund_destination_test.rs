@@ -728,7 +728,8 @@ async fn the_flag_never_strands_an_existing_usdt_refund(pool: PgPool) {
             &seller.token,
             &order.order_id,
             order.total_minor,
-            &tx_hash(0x22),
+            // One transaction is the refund of one order only.
+            &tx_hash(if flag { 0x23 } else { 0x22 }),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "flag {flag}: {body}");
@@ -1128,5 +1129,37 @@ async fn an_unreachable_rpc_records_the_refund_unchecked(pool: PgPool) {
     assert_eq!(
         body["result"]["order"]["external_refund"]["received_units"],
         Value::Null
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn one_transaction_is_the_refund_of_one_order_only(pool: PgPool) {
+    use marketplace_service::refund_chain::RefundChainOutcome;
+    let app = with_chain(
+        test_app(pool).await,
+        RefundChainOutcome::Transferred { units: 137_000_000 },
+    );
+    let (seller, first) = cancelled_usdt_order_with_destination(&app).await;
+    let (status, body) = record(&app, &seller.token, &first, ORDER_TOTAL_CENTS, &tx_hash(10)).await;
+    assert_eq!(status, StatusCode::OK, "first record failed: {body}");
+
+    let (other_seller, second) = cancelled_usdt_order_with_destination(&app).await;
+    let (status, body) = record(
+        &app,
+        &other_seller.token,
+        &second,
+        ORDER_TOTAL_CENTS,
+        &tx_hash(10),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "second record accepted: {body}"
+    );
+    assert_eq!(
+        body["error"]["reason"],
+        json!("refund_transaction_already_recorded"),
+        "{body}"
     );
 }
