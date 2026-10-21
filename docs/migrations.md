@@ -413,6 +413,32 @@ An image from before them runs on the migrated database while no buyer has
 reviewed a second item of an order. Once one has, restoring the per-order keys
 means deleting those rows first; roll forward instead.
 
+## Review withdrawal (0089)
+
+0089 adds the nullable `reviews.public_removed_at` (no default, no index,
+`lock_timeout` like 0050), set by `review.withdraw` and cleared by
+`review.update`; NULL means published, which is every review that exists when
+it applies. It also appends `withdraw_review` (id 42) to the append-only
+refusal-audit command kind catalog, like 0082, and fails loudly if id 42 holds
+anything else. Directly rerunnable: a recorded withdrawal survives a rerun.
+
+**Deploy mode: rolling.** A binary from before 0089 neither reads nor writes
+the column, so it treats a withdrawn review as published and its own edit does
+not clear the flag; it never writes id 42. Nothing an old binary does breaks.
+
+### Backing out 0089
+
+Additive: an image from before it runs on the migrated database. By hand,
+after the old image is serving:
+
+```sql
+ALTER TABLE reviews DROP COLUMN IF EXISTS public_removed_at;
+DELETE FROM _sqlx_migrations WHERE version = 89;
+```
+
+The catalog row stays; the table is append-only and the row is harmless to an
+older image.
+
 ## Numbers claimed by open pull requests
 
 `main` has 0001 to 0079 (0068 and 0069 were never used). A new migration must
@@ -425,6 +451,7 @@ assume it is free:
 | 0081 | `0081_order_return_policy.sql` | listing return policy frozen at payment |
 | 0082 | `0082_cancel_return_command_kind.sql` | `return.cancel` refusal-audit command kind |
 | 0083 to 0086 | `0083_review_items.sql` to `0086_review_item_keys.sql` | per-item reviews and seller ratings |
+| 0089 | `0089_review_withdrawal.sql` | `reviews.public_removed_at` and the `review.withdraw` refusal-audit command kind (0087 and 0088 are the double-blind review window) |
 
 This table describes unmerged work and goes stale as pull requests land; trust
 `crates/service/migrations/` on `main` over it. sqlx does not reject two files

@@ -496,6 +496,7 @@ pub fn order_machine() -> AggregateMachine {
             "refund.confirm_destination",
             "review.create",
             "review.update",
+            "review.withdraw",
         ],
         unreachable_states: vec!["processing", "closed"],
     }

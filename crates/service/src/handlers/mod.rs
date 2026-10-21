@@ -235,6 +235,7 @@ pub fn guard_order_action(
 /// travels with each row instead of being looked up per projection.
 pub const REVIEW_COLUMNS: &str = "id, order_id, reviewer_pubky, reviewer_role, subject_pubky, \
      listing_aggregate_id, rating, text, shipping, communication, created_at, updated_at, \
+     public_removed_at, \
      EXISTS (SELECT 1 FROM orders blind WHERE blind.id = reviews.order_id \
              AND blind.review_window_ends_at IS NOT NULL \
              AND blind.reviews_released_at IS NULL) AS withheld";

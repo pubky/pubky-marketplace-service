@@ -9,7 +9,9 @@
 //! on the same item are decided by the constraint, and two racing on
 //! different items by the compare-and-swap. `review.update` is this service
 //! only. A buyer may add items, and either participant may revise, within a
-//! bounded window of their first review of the order.
+//! bounded window of their first review of the order. `review.withdraw` is
+//! this service only too: it records that the author removed their public
+//! review (`reviews.public_removed_at`) and an edit clears it again.
 //!
 //! With `REVIEW_BLIND_WINDOW_DAYS` above 0 the order's reviews are
 //! double-blind (see [`crate::review_release`]): a create inside the window
@@ -18,7 +20,9 @@
 //! reviewed or the window ends. At 0 none of that code runs.
 
 use chrono::{DateTime, Utc};
-use marketplace_domain::commands::{ReviewTerms, ReviewTermsPayload, SellerRatingTerms};
+use marketplace_domain::commands::{
+    ReviewTerms, ReviewTermsPayload, SellerRatingTerms, WithdrawReviewPayload,
+};
 use marketplace_domain::state_machines::{can_transition, order_machine};
 use marketplace_domain::{ids, Command, ErrorCode};
 use serde_json::{json, Value};
@@ -612,8 +616,8 @@ async fn review_result(
     let mut result = json!({
         "kind": "review",
         "order": order_json_with_reviews(order, &reviews, actor),
-        "review": own.first().map(|row| row.view()),
-        "reviews": own.iter().map(|row| row.view()).collect::<Vec<_>>(),
+        "review": own.first().map(|row| row.own_view()),
+        "reviews": own.iter().map(|row| row.own_view()).collect::<Vec<_>>(),
     });
     // A double-blind order's attestations are issued and stored but not
     // served until release; an order with no window answers as it always did.
@@ -827,18 +831,27 @@ pub async fn update(
 
     let mut written: Vec<Uuid> = Vec::with_capacity(targets.len());
     for (row, item) in &targets {
-        sqlx::query("UPDATE reviews SET rating = $2, text = $3, updated_at = $4 WHERE id = $1")
-            .bind(row.id)
-            .bind(item.rating)
-            .bind(item.text)
-            .bind(now)
-            .execute(&mut **tx)
-            .await?;
+        // An edit republishes a withdrawn review, so it clears the withdrawal
+        // in the same statement.
+        sqlx::query(
+            "UPDATE reviews SET rating = $2, text = $3, updated_at = $4, \
+             public_removed_at = NULL WHERE id = $1",
+        )
+        .bind(row.id)
+        .bind(item.rating)
+        .bind(item.text)
+        .bind(now)
+        .execute(&mut **tx)
+        .await?;
         written.push(row.id);
     }
     if let Some(ratings) = seller.map(seller_ratings) {
         written.extend(write_seller_ratings(tx, order.id, actor, ratings, now).await?);
     }
+
+    #[cfg(feature = "test-faults")]
+    test_faults::after_review_edit(order.id).await;
+
     let updated: OrderRow = sqlx::query_as(&format!(
         "UPDATE orders SET revision = revision + 1, updated_at = $3 \
          WHERE id = $1 AND revision = $2 RETURNING {ORDER_COLUMNS}"
@@ -871,7 +884,113 @@ pub async fn update(
     }))
 }
 
-/// Test-only fault hooks for `review.create`. Compiled out in release
+/// `review.withdraw`: the reviewer's own reviews of the order (or the one
+/// `listing_id` names) are marked removed from public view, so another
+/// device reads the removal from the service rather than republishing.
+/// Ratings, text, attestations and the counterparty's rows are untouched, and
+/// it is allowed in any order state and at any time (it is not bound by the
+/// edit window), also while the order's reviews are still withheld. Rows
+/// that are already withdrawn keep their first timestamp: a call that finds
+/// nothing left to withdraw changes nothing, writes no event and returns the
+/// same result.
+pub async fn withdraw(
+    tx: &mut Transaction<'_, Postgres>,
+    actor: &str,
+    command: &Command,
+    payload: &WithdrawReviewPayload,
+    now: DateTime<Utc>,
+) -> Result<HandlerResult, sqlx::Error> {
+    let Some(order) = fetch_order_for_update(tx, payload.order_id).await? else {
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::NotFound,
+            ErrorCode::NotFound,
+            "The order was not found.",
+        )));
+    };
+    if let Some(failure) = guard_order_action(actor, command, &order) {
+        return Ok(Err(failure));
+    }
+    let listings = order_listings(&order);
+    let scope = match &payload.listing_id {
+        None => None,
+        Some(listing_id) => {
+            let Some(listing) = listings
+                .iter()
+                .find(|listing| &listing.listing_id == listing_id)
+            else {
+                return Ok(Err(CommandFailure::refused(
+                    crate::refusal_audit::RefusalKind::InvalidCommand,
+                    ErrorCode::InvalidCommand,
+                    &format!("Listing {listing_id} is not part of this order."),
+                )));
+            };
+            Some(listing)
+        }
+    };
+    let existing = reviewer_reviews(tx, order.id, actor, &listings, true).await?;
+    let targets: Vec<&ReviewRow> = existing
+        .iter()
+        .filter(|row| scope.is_none_or(|listing| row.listing_aggregate_id == listing.aggregate_id))
+        .collect();
+    if targets.is_empty() {
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
+            ErrorCode::InvalidState,
+            "This participant has no review to withdraw.",
+        )));
+    }
+    let target_ids: Vec<Uuid> = targets.iter().map(|row| row.id).collect();
+
+    let withdrawn: Vec<Uuid> = sqlx::query_scalar(
+        "UPDATE reviews SET public_removed_at = $2 \
+         WHERE id = ANY($1) AND public_removed_at IS NULL RETURNING id",
+    )
+    .bind(&target_ids)
+    .bind(now)
+    .fetch_all(&mut **tx)
+    .await?;
+    if withdrawn.is_empty() {
+        let result = review_result(tx, &order, actor, &listings, &target_ids).await?;
+        return Ok(Ok(HandlerSuccess {
+            revision: order.revision,
+            event_ids: vec![],
+            result,
+        }));
+    }
+
+    #[cfg(feature = "test-faults")]
+    test_faults::after_review_edit(order.id).await;
+
+    let updated: OrderRow = sqlx::query_as(&format!(
+        "UPDATE orders SET revision = revision + 1, updated_at = $3 \
+         WHERE id = $1 AND revision = $2 RETURNING {ORDER_COLUMNS}"
+    ))
+    .bind(order.id)
+    .bind(order.revision)
+    .bind(now)
+    .fetch_one(&mut **tx)
+    .await?;
+    let event_id = insert_event(
+        tx,
+        command.command_id,
+        &ids::order_aggregate_id(updated.id),
+        updated.revision,
+        actor,
+        "review.withdrawn",
+        now,
+    )
+    .await?;
+    let result = review_result(tx, &updated, actor, &listings, &target_ids).await?;
+    // No notification: the withdrawal is the author's own record.
+    Ok(Ok(HandlerSuccess {
+        revision: updated.revision,
+        event_ids: vec![event_id],
+        result,
+    }))
+}
+
+/// Test-only fault hooks for `review.create`, `review.update` and
+/// `review.withdraw`. Compiled out in release
 /// builds: the module exists only under the `test-faults` cargo feature,
 /// which is enabled solely for integration tests (the crate's
 /// dev-dependency on itself).
@@ -923,6 +1042,22 @@ pub mod test_faults {
             gate.arrived.wait().await;
             gate.release.wait().await;
         }
+    }
+
+    static EDIT_GATES: Mutex<Vec<(uuid::Uuid, InsertGate)>> = Mutex::new(Vec::new());
+
+    /// Arms one pause for the next `review.update` or `review.withdraw` on
+    /// `order_id` that has written its review rows: it waits, still holding
+    /// the order's row lock, before the revision compare-and-swap.
+    pub fn arm_after_edit(order_id: uuid::Uuid, gate: InsertGate) {
+        EDIT_GATES
+            .lock()
+            .expect("fault hook mutex")
+            .push((order_id, gate));
+    }
+
+    pub(super) async fn after_review_edit(order_id: uuid::Uuid) {
+        pause(&EDIT_GATES, order_id).await;
     }
 
     pub(super) async fn after_review_insert(order_id: uuid::Uuid) {

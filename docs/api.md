@@ -672,7 +672,8 @@ participant-scoped application routes, not through this export.
   `fulfillment.delivered`, `offer.created`,
   `offer.accepted`, `auction.started`, `auction.bid_placed`, `drop.started`,
   `return.requested`,
-  `refund.recorded_external` and `review.created`. The list is not exhaustive
+  `refund.recorded_external`, `review.created`, `review.updated` and
+  `review.withdrawn`. The list is not exhaustive
   and not guaranteed to be closed; ignore unknown types.
 - `data` is always `{}` today. Treat the event as a change notification: fetch
   the aggregate (listing export, order export) for the new state, using
@@ -805,7 +806,7 @@ fetch the order for the new carrier, number and history.
 
 `review.create` and `review.update` go through `POST /v1/commands` against the
 order aggregate, from `delivered`, `completed` or `closed`. The payload takes
-one of two shapes.
+one of two shapes. `review.withdraw` is described [below](#withdrawing-a-review).
 
 **v1** (either participant): one rating and text for the order.
 
@@ -893,6 +894,60 @@ The result is:
 - `attestation` is the caller's first-line attestation in the closed
   `{ jws, claims }` shape, whichever command issued it.
 - Without a configured attestor, both attestation fields are absent.
+- A review the author withdrew carries `"public_removed": true`, in the
+  author's own `review`, `reviews` and `order.reviews` only; it is omitted
+  otherwise. See [Withdrawing a review](#withdrawing-a-review).
+
+### Withdrawing a review
+
+`review.withdraw` records that the reviewer removed their public review, so
+that every device they sign in on, and a fresh sign-in, reads the removal from
+the service instead of republishing the review from its own state. It is this
+service only and changes nothing on the homeserver: the client deletes its
+record itself, after the withdrawal is recorded.
+
+```json
+{ "order_id": "<order_id>", "listing_id": "boots_01" }
+```
+
+- `listing_id` is optional and takes the same seller record id review items
+  use. Without it, every review of the order by the caller is withdrawn; with
+  it, only that item's. A listing the order does not carry is refused with
+  `INVALID_COMMAND`.
+- Only the author withdraws, and only their own reviews: the command touches
+  the caller's rows and never the counterparty's. A participant with no review
+  of the order (or of that listing) to withdraw is refused with
+  `409 INVALID_STATE` ("This participant has no review to withdraw."); a
+  non-participant gets `UNAUTHORIZED`.
+- It works in any order state and at any time (it is not bound by the 24-hour
+  edit window), also inside a double-blind window, where it is invisible to the
+  counterparty. Ratings, text and attestations are untouched, and the
+  attestation stays valid and fetchable.
+- Same conventions as `review.update`: `expected_revision` compare-and-swap
+  (`REVISION_CONFLICT` when stale, and a retry with the current revision
+  succeeds), idempotent by `command_id`. A withdrawal that changes something
+  bumps the order revision once and emits `review.withdrawn`, with no
+  notification. Rows already withdrawn keep their first timestamp: a call that
+  finds nothing left to withdraw changes nothing, emits no event, leaves the
+  revision as it is and returns the same result.
+- The result has the shape of a `review.update` result: `order`, and `review`
+  and `reviews` for the rows the command covers, each with
+  `"public_removed": true`.
+- **`public_removed`** is `true` on a withdrawn review in the author's own
+  views (`GET /v1/orders`, `GET /v1/orders/{id}`, and the `order` and
+  `review`/`reviews` of the author's command results) and absent otherwise.
+  The counterparty never reads it, whatever the window state: a withheld
+  review is still only `{ "role", "submitted": true }`, and a released one is
+  shown as published. An old reader ignores the field; a missing field means
+  published.
+- **`review.update` clears it.** An edit sets the reviews it edits back to
+  published in the same statement as the edit, so the result and every view
+  then omit the flag (a client republishes the record, as it does for any
+  edit). A later withdrawal sets it again.
+- A client that removes a review should call `review.withdraw` before it
+  deletes its homeserver record, and a client that republishes a review it
+  finds missing should read `public_removed` first and not republish when it
+  is `true`.
 
 ### Double-blind reviews
 

@@ -851,7 +851,8 @@
         "refund.record_external",
         "refund.confirm_destination",
         "review.create",
-        "review.update"
+        "review.update",
+        "review.withdraw"
       ],
       "unreachable_states": [
         "processing",

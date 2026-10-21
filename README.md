@@ -1329,7 +1329,8 @@ compare it.
 | `refund.record_external` | CAS 409 vs order `revision` | `returns.rs:251` |
 | `refund.confirm_destination` | CAS 409 vs order `revision` | `refund_destination.rs:27` |
 | `review.create` | CAS 409 vs order `revision` | `reviews.rs:223` |
-| `review.update` | CAS 409 vs order `revision` | `reviews.rs:775` |
+| `review.update` | CAS 409 vs order `revision` | `reviews.rs:778` |
+| `review.withdraw` | CAS 409 vs order `revision` | `reviews.rs:896` |
 | `attestation.set_band_consent` | CAS 409 vs stored consent revision (`0` on first write) | `attestation.rs:47` |
 
 Handler paths are under `crates/service/src/handlers/`.
@@ -1350,8 +1351,8 @@ actor may sync), `drop.sync` (convergent; any actor may sync),
 `fulfillment.confirm_pickup` (see Local pickup), `return.request`,
 `return.approve`, `return.cancel`, `return.receive`, `refund.record_external`,
 `refund.confirm_destination` (see USDT refund destination),
-`review.create`, `review.update` (this service only), and
-`attestation.set_band_consent`.
+`review.create`, `review.update` and `review.withdraw` (these two this
+service only), and `attestation.set_band_consent`.
 Server-driven transitions (reservation expiry, offer expiry, auction close
 on server time, outbox delivery) run in the background worker runtime, not
 as client commands. All other command kinds are rejected by the envelope
@@ -1577,7 +1578,10 @@ and refund branches):
   compare-and-swap, so a same-item race is decided by the constraint and a
   race on different items by the compare-and-swap. Within 24 hours of their
   first review of the order a buyer may add items, and `review.update` (this
-  service only) lets either reviewer revise ratings and text. See
+  service only) lets either reviewer revise ratings and text, and
+  `review.withdraw` (this service only) records that the author removed their
+  public review, so another device does not republish it
+  (`reviews.public_removed_at`, shown to the author only). See
   [Reviews](docs/api.md#reviews).
 
 Every post-purchase command is participant-scoped, enforces
@@ -1589,7 +1593,7 @@ request, to the buyer on approval — `order_shipped`, `tracking_updated`,
 `order_delivered`,
 `return_updated`,
 `refund_recorded`,
-`review_received`). `review.update` emits none — the
+`review_received`). `review.update` and `review.withdraw` emit none — the
 prototype had no counterpart to copy. With `REVIEW_BLIND_WINDOW_DAYS` above
 0 the review notifications are `review_waiting`, `review_released` and
 `review_received` at release; see [Reviews](docs/api.md#double-blind-reviews).
@@ -2297,6 +2301,7 @@ This service is canonical and resolves them as follows:
 | Cancelling a lapsed auction hold | impossible in the prototype (no reservation expiry) | the cancel succeeds; the reservation compare-and-swap (`active → released`) finds the hold already `expired`, so no quantities move | The sweep already returned the unit; releasing again would double-count it, and refusing would strand an order that can be neither paid (confirmation is refused, see above) nor cancelled. |
 | Review uniqueness | application check on the in-memory order's `reviews` array | `reviews_one_per_order_role_listing` UNIQUE constraint on (order, role, listing); the review inserts precede the order revision CAS so a same-item race is decided by the constraint (`INVARIANT_VIOLATION`), a race on different items by the CAS (`REVISION_CONFLICT`), sequential duplicates by the ported check (`INVALID_STATE`) | ADR-0019 §4: one participant review per order/role/listing is a database invariant, not code. |
 | Review editing | none (reviews were immutable) | `review.update` (this service only): the reviewer may revise ratings/text within 24 hours of their first review of the order, under the order's revision CAS with a `review.updated` event | The task's bounded edit window; the window is a documented policy constant (`REVIEW_EDIT_WINDOW_SECONDS`). No notification is emitted — the prototype had none to copy. |
+| Review withdrawal | none (reviews were immutable) | `review.withdraw` (this service only): the author's own reviews of an order are marked `public_removed_at`, shown as `public_removed: true` to the author only and cleared by `review.update`, under the order's revision CAS with a `review.withdrawn` event | A removal must outlive the device that made it: the homeserver cannot tell a removed review from one overwritten by a later order, and the service already holds every review. No notification is emitted. |
 | Conversations | client `conversationSchema` + sandbox `GET /v1/conversations` | no endpoint | No durable conversation/message tables exist; `message.*` commands are not ported. |
 | Notification projection | client `notificationSchema` requires a positive `revision` | no `revision` field | Delivered notifications are immutable outbox-consumer rows, not revisioned aggregates; no `notification.*` command exists that would need an `expected_revision`. |
 

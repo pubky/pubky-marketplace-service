@@ -106,6 +106,7 @@ pub enum CommandPayload {
     ConfirmRefundDestination(ConfirmRefundDestinationPayload),
     CreateReview(ReviewTermsPayload),
     UpdateReview(ReviewTermsPayload),
+    WithdrawReview(WithdrawReviewPayload),
     SetBandConsent(SetBandConsentPayload),
 }
 
@@ -151,6 +152,7 @@ impl Command {
             CommandPayload::ConfirmRefundDestination(_) => "refund.confirm_destination",
             CommandPayload::CreateReview(_) => "review.create",
             CommandPayload::UpdateReview(_) => "review.update",
+            CommandPayload::WithdrawReview(_) => "review.withdraw",
             CommandPayload::SetBandConsent(_) => "attestation.set_band_consent",
         }
     }
@@ -200,6 +202,7 @@ impl Command {
             CommandPayload::CreateReview(p) | CommandPayload::UpdateReview(p) => {
                 serde_json::to_value(p)
             }
+            CommandPayload::WithdrawReview(p) => serde_json::to_value(p),
             CommandPayload::SetBandConsent(p) => serde_json::to_value(p),
         }
         .expect("command payloads serialize infallibly");
@@ -1395,6 +1398,19 @@ impl ReviewTermsPayload {
     }
 }
 
+/// `review.withdraw` (the review's author only; this service only): marks the
+/// caller's own reviews of the order as removed from public view, so every
+/// device the author signs in on reads the removal from the service. With
+/// `listing_id` (the seller's record id, as review items name it) only that
+/// item's review; without it every one of the caller's reviews of the order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WithdrawReviewPayload {
+    pub order_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listing_id: Option<String>,
+}
+
 /// Seller's standing amount-band consent (ratified D2): whether purchase
 /// attestations for this seller's orders may carry a log-decade amount band.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1568,6 +1584,7 @@ pub fn parse_command(raw: &Value) -> Result<Command, Vec<ValidationIssue>> {
             .and_then(|payload| validate_review_terms(payload, CommandPayload::CreateReview))?,
         "review.update" => parse_payload(&envelope.payload)
             .and_then(|payload| validate_review_terms(payload, CommandPayload::UpdateReview))?,
+        "review.withdraw" => parse_payload(&envelope.payload).and_then(validate_withdraw_review)?,
         "attestation.set_band_consent" => {
             parse_payload(&envelope.payload).map(CommandPayload::SetBandConsent)?
         }
@@ -2771,6 +2788,22 @@ fn validate_clear_digital_delivery(
     }
 }
 
+fn validate_withdraw_review(
+    payload: WithdrawReviewPayload,
+) -> Result<CommandPayload, Vec<ValidationIssue>> {
+    if payload
+        .listing_id
+        .as_deref()
+        .is_some_and(|listing_id| !entity_id_regex().is_match(listing_id))
+    {
+        return Err(vec![issue(
+            "payload.listing_id",
+            "Expected a path-safe commerce identifier",
+        )]);
+    }
+    Ok(CommandPayload::WithdrawReview(payload))
+}
+
 fn validate_clear_pickup_details(
     payload: ClearPickupDetailsPayload,
 ) -> Result<CommandPayload, Vec<ValidationIssue>> {
@@ -3673,6 +3706,11 @@ mod tests {
                 "review.update",
                 json!({ "order_id": order_id, "rating": 4, "text": "Revised after wear." }),
             ),
+            ("review.withdraw", json!({ "order_id": order_id })),
+            (
+                "review.withdraw",
+                json!({ "order_id": order_id, "listing_id": "boots-1" }),
+            ),
         ] {
             let command = order_command_json(kind, payload);
             assert_eq!(parse_command(&command).expect("valid command").kind(), kind);
@@ -3846,6 +3884,53 @@ mod tests {
             json!({ "order_id": order_id, "items": [item], "seller": { "shipping": 5 } }),
         ))
         .is_err());
+    }
+
+    #[test]
+    fn review_withdraw_payload_is_closed_and_listing_ids_are_path_safe() {
+        let order_id = "00000000-0000-4000-8000-00000000aaaa";
+        let whole = parse_command(&order_command_json(
+            "review.withdraw",
+            json!({ "order_id": order_id }),
+        ))
+        .expect("an order-wide withdraw parses");
+        let CommandPayload::WithdrawReview(payload) = &whole.payload else {
+            panic!("wrong payload");
+        };
+        assert_eq!(payload.listing_id, None);
+        assert!(
+            whole.canonical_json()["payload"]
+                .get("listing_id")
+                .is_none(),
+            "an absent listing is not serialized, so the request hash stays stable"
+        );
+
+        let one = parse_command(&order_command_json(
+            "review.withdraw",
+            json!({ "order_id": order_id, "listing_id": "boots_01" }),
+        ))
+        .expect("an item withdraw parses");
+        assert_ne!(whole.request_hash(), one.request_hash());
+
+        for (payload, path) in [
+            (
+                json!({ "order_id": order_id, "listing_id": "../boots" }),
+                "payload.listing_id",
+            ),
+            (
+                json!({ "order_id": order_id, "listing_id": "" }),
+                "payload.listing_id",
+            ),
+            (json!({ "order_id": order_id, "rating": 5 }), "payload"),
+            (json!({}), "payload"),
+        ] {
+            let issues = parse_command(&order_command_json("review.withdraw", payload.clone()))
+                .expect_err(&format!("{payload} must be refused"));
+            assert!(
+                issues.iter().any(|i| i.path == path),
+                "{payload}: expected an issue at {path}, got {issues:?}"
+            );
+        }
     }
 
     #[test]
