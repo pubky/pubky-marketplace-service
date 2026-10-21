@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, Path, State};
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -36,6 +36,7 @@ use tokio::sync::Notify;
 use url::Url;
 use uuid::Uuid;
 
+use crate::address_search::resolve_client_address;
 use crate::auth;
 use crate::clock::format_timestamp;
 use crate::priv_keys;
@@ -158,6 +159,7 @@ pub struct GrantConfig {
     pub worker_batch_size: i64,
     pub reaper_batch_size: i64,
     pub terminal_retention_seconds: i64,
+    pub client_ip_header: Option<HeaderName>,
     pub create_per_ip_per_minute: i64,
     pub create_per_pubky_per_minute: i64,
     pub status_per_flow_per_minute: i64,
@@ -290,6 +292,22 @@ fn env_bool(name: &str, default: bool) -> anyhow::Result<bool> {
             _ => anyhow::bail!("{name} must be true, false, 1, or 0"),
         },
         Err(_) => Ok(default),
+    }
+}
+
+const ENV_CLIENT_IP_HEADER: &str = "MARKETPLACE_GRANT_CLIENT_IP_HEADER";
+
+/// The header a trusted edge sets to the client address. Unset (the default)
+/// keys the per-address limits on the socket peer.
+fn client_ip_header_from_env() -> anyhow::Result<Option<HeaderName>> {
+    match std::env::var(ENV_CLIENT_IP_HEADER)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        Some(name) => HeaderName::from_bytes(name.trim().as_bytes())
+            .map(Some)
+            .map_err(|_| anyhow::anyhow!("{ENV_CLIENT_IP_HEADER} is not a header name")),
+        None => Ok(None),
     }
 }
 
@@ -471,6 +489,7 @@ impl GrantRuntime {
                 600,
                 i64::MAX,
             )?,
+            client_ip_header: client_ip_header_from_env()?,
             create_per_ip_per_minute: env_bounded_i64(
                 "MARKETPLACE_GRANT_CREATE_PER_IP_PER_MINUTE",
                 10,
@@ -651,6 +670,7 @@ pub mod test_support {
                     worker_batch_size: 25,
                     reaper_batch_size: 100,
                     terminal_retention_seconds: 86_400,
+                    client_ip_header: None,
                     create_per_ip_per_minute: 10,
                     create_per_pubky_per_minute: 5,
                     status_per_flow_per_minute: 60,
@@ -697,6 +717,14 @@ pub mod test_support {
                 assertion_key,
                 request_key,
             }
+        }
+
+        pub fn with_client_ip_header(mut self, name: &str) -> Self {
+            let runtime = Arc::get_mut(&mut self.runtime)
+                .expect("the authority is the sole owner of the runtime");
+            runtime.config.client_ip_header =
+                Some(HeaderName::from_bytes(name.as_bytes()).expect("test header name"));
+            self
         }
 
         pub fn sign_bootstrap_assertion(
@@ -1246,8 +1274,16 @@ async fn admit_rate(
     Ok(i64::from(count) <= limit)
 }
 
-fn request_ip(ConnectInfo(address): ConnectInfo<SocketAddr>) -> String {
-    address.ip().to_string()
+fn request_ip(
+    config: &GrantConfig,
+    headers: &HeaderMap,
+    ConnectInfo(address): ConnectInfo<SocketAddr>,
+) -> String {
+    resolve_client_address(
+        config.client_ip_header.as_ref(),
+        headers,
+        Some(address.ip()),
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -1298,7 +1334,7 @@ pub async fn create_flow(
         &state,
         runtime,
         "create_ip",
-        &request_ip(connect),
+        &request_ip(&runtime.config, &headers, connect),
         runtime.config.create_per_ip_per_minute,
     )
     .await
@@ -1493,12 +1529,16 @@ struct StatusRow {
 pub async fn get_status(
     State(state): State<AppState>,
     connect: ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Path(flow_id): Path<Uuid>,
 ) -> Response {
     let Some(runtime) = grant_runtime(&state) else {
         return error_response(StatusCode::SERVICE_UNAVAILABLE, "grant_unavailable");
     };
-    let bucket = format!("{}:{flow_id}", request_ip(connect));
+    let bucket = format!(
+        "{}:{flow_id}",
+        request_ip(&runtime.config, &headers, connect)
+    );
     match admit_rate(
         &state,
         runtime,
