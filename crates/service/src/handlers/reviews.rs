@@ -10,6 +10,12 @@
 //! different items by the compare-and-swap. `review.update` is this service
 //! only. A buyer may add items, and either participant may revise, within a
 //! bounded window of their first review of the order.
+//!
+//! With `REVIEW_BLIND_WINDOW_DAYS` above 0 the order's reviews are
+//! double-blind (see [`crate::review_release`]): a create inside the window
+//! stores its rows and issues its attestations as ever, but the result
+//! withholds them (`attestation_status: "pending"`) until both roles have
+//! reviewed or the window ends. At 0 none of that code runs.
 
 use chrono::{DateTime, Utc};
 use marketplace_domain::commands::{ReviewTerms, ReviewTermsPayload, SellerRatingTerms};
@@ -20,6 +26,7 @@ use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::attestor::{amount_band, claim_role, Attestor};
+use crate::clock::format_timestamp;
 use crate::executor::insert_event;
 use crate::handlers::{
     fetch_order, fetch_order_for_update, fetch_order_reviews, guard_order_action,
@@ -28,6 +35,7 @@ use crate::handlers::{
 use crate::model::{OrderRow, ReviewRow};
 use crate::queries::ORDER_COLUMNS;
 use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
+use crate::review_release::{self, ReleasedBy};
 
 /// How long a reviewer may add items to and edit their review of an order,
 /// counted from their first review of it. This service only — the
@@ -210,12 +218,14 @@ async fn write_seller_ratings(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn create(
     tx: &mut Transaction<'_, Postgres>,
     actor: &str,
     command: &Command,
     payload: &ReviewTermsPayload,
     attestor: Option<&Attestor>,
+    blind_window_days: i64,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     // Deliberately no FOR UPDATE: the review inserts happen before the
@@ -273,6 +283,13 @@ pub async fn create(
         return Ok(Err(failure));
     }
 
+    // The double-blind window: the one the order already carries, else the
+    // one this first review opens. A seller's review after it is refused.
+    let blind_window_end = blind_window_end(tx, &order, blind_window_days, now).await?;
+    if let Some(failure) = seller_review_too_late(role, blind_window_end, now) {
+        return Ok(Err(failure));
+    }
+
     // Every item review of the order carries the same seller ratings: new
     // ones from this command, otherwise the ones already on the order.
     let ratings = seller.map(seller_ratings).or_else(|| {
@@ -307,6 +324,7 @@ pub async fn create(
         .await?;
         written.push(id);
     }
+    let inserted = written.clone();
     if let Some(ratings) = seller.map(seller_ratings) {
         written.extend(write_seller_ratings(tx, order.id, actor, ratings, now).await?);
     }
@@ -366,6 +384,9 @@ pub async fn create(
         )));
     };
 
+    #[cfg(feature = "test-faults")]
+    test_faults::after_review_swap(order.id).await;
+
     let order_aggregate_id = ids::order_aggregate_id(updated.id);
     let event_id = insert_event(
         tx,
@@ -377,24 +398,196 @@ pub async fn create(
         now,
     )
     .await?;
-    // One notification per review action, however many items it rates.
-    insert_notification_intent(
+    let mut revision = updated.revision;
+    let mut event_ids = vec![event_id];
+    let mut current = updated;
+    match blind_window_end {
+        None => {
+            // One notification per review action, however many items it rates.
+            insert_notification_intent(
+                tx,
+                event_id,
+                "review_received",
+                &subject,
+                actor,
+                &order_aggregate_id,
+                None,
+                now,
+            )
+            .await?;
+        }
+        Some(planned_end) => {
+            let blind = BlindReview {
+                order_id: current.id,
+                role,
+                actor,
+                subject: &subject,
+                command_id: command.command_id,
+                created_event: event_id,
+                first_review_of_reviewer: existing.is_empty(),
+                inserted: &inserted,
+                planned_end,
+            };
+            match settle_blind_window(tx, &blind, now).await? {
+                Ok(Some(released)) => {
+                    revision = released.revision;
+                    event_ids.push(released.event_id);
+                    current = fetch_order(tx, current.id)
+                        .await?
+                        .expect("a reviewed order exists");
+                }
+                Ok(None) => {}
+                Err(failure) => return Ok(Err(failure)),
+            }
+        }
+    }
+    let result = review_result(tx, &current, actor, &listings, &written).await?;
+    Ok(Ok(HandlerSuccess {
+        revision,
+        event_ids,
+        result,
+    }))
+}
+
+/// The end of the order's double-blind window, or `None` when reviews are
+/// not double-blind: the stamped end when the order has one, else (with the
+/// window on) the order's eligibility plus the window.
+async fn blind_window_end(
+    tx: &mut Transaction<'_, Postgres>,
+    order: &OrderRow,
+    window_days: i64,
+    now: DateTime<Utc>,
+) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+    let window = review_release::read_window(&mut **tx, order.id).await?;
+    if let Some(ends_at) = window.ends_at {
+        return Ok(Some(ends_at));
+    }
+    if window_days == 0 {
+        return Ok(None);
+    }
+    let since = review_release::eligible_since(tx, order, now).await?;
+    Ok(Some(since + chrono::Duration::days(window_days)))
+}
+
+/// A seller's review of the buyer is refused once the window has ended: it
+/// could answer a buyer review that is already public.
+fn seller_review_too_late(
+    role: &str,
+    window_end: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Option<CommandFailure> {
+    (role == "seller" && window_end.is_some_and(|end| end <= now)).then(|| {
+        CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
+            ErrorCode::InvalidState,
+            "The review window has closed.",
+        )
+    })
+}
+
+/// What `settle_blind_window` needs of the create that just won the order's
+/// revision compare-and-swap.
+struct BlindReview<'a> {
+    order_id: Uuid,
+    role: &'a str,
+    actor: &'a str,
+    subject: &'a str,
+    command_id: Uuid,
+    created_event: Uuid,
+    first_review_of_reviewer: bool,
+    inserted: &'a [Uuid],
+    planned_end: DateTime<Utc>,
+}
+
+/// Decides, under the order's row lock, whether the create's reviews are
+/// withheld or released, and sends the notifications that follow.
+///
+/// Released: both roles have reviewed, or the window has ended and this is
+/// the buyer's review. Otherwise the reviews wait, and the counterparty is
+/// told once that a review is waiting. Reviews written while the window was
+/// off are already public, so the order is marked released without an event.
+async fn settle_blind_window(
+    tx: &mut Transaction<'_, Postgres>,
+    blind: &BlindReview<'_>,
+    now: DateTime<Utc>,
+) -> Result<Result<Option<review_release::Released>, CommandFailure>, sqlx::Error> {
+    let window = review_release::read_window(&mut **tx, blind.order_id).await?;
+    let end = window.ends_at.unwrap_or(blind.planned_end);
+    // Re-checked under the lock: a create that committed since the first
+    // read may have stamped a different end.
+    if let Some(failure) = seller_review_too_late(blind.role, Some(end), now) {
+        return Ok(Err(failure));
+    }
+    let reviews: Vec<(Uuid, String)> =
+        sqlx::query_as("SELECT id, reviewer_role FROM reviews WHERE order_id = $1")
+            .bind(blind.order_id)
+            .fetch_all(&mut **tx)
+            .await?;
+    let reviewed_by = |role: &str| reviews.iter().any(|(_, reviewer)| reviewer == role);
+    let both_reviewed = reviewed_by("buyer") && reviewed_by("seller");
+    let earlier_reviews = reviews.iter().any(|(id, _)| !blind.inserted.contains(id));
+
+    if window.released_at.is_none() && window.ends_at.is_none() && earlier_reviews {
+        review_release::mark_public(tx, blind.order_id, now).await?;
+        notify_received(tx, blind, now).await?;
+        return Ok(Ok(None));
+    }
+    if window.released_at.is_some() {
+        notify_received(tx, blind, now).await?;
+        return Ok(Ok(None));
+    }
+
+    if window.ends_at.is_none() {
+        review_release::stamp_window(tx, blind.order_id, end).await?;
+    }
+    let releasing = both_reviewed || (blind.role == "buyer" && end <= now);
+    if releasing {
+        let released = review_release::release_reviews(
+            tx,
+            blind.order_id,
+            ReleasedBy::Create {
+                actor: blind.actor,
+                command_id: blind.command_id,
+                created_event: blind.created_event,
+            },
+            now,
+        )
+        .await?;
+        return Ok(Ok(released));
+    }
+    if blind.first_review_of_reviewer {
+        review_release::notify_once(
+            tx,
+            blind.created_event,
+            "review_waiting",
+            blind.order_id,
+            blind.subject,
+            blind.actor,
+            now,
+        )
+        .await?;
+    }
+    Ok(Ok(None))
+}
+
+/// Tells the reviewed participant, once per order, that a review of them
+/// was published at the moment it was written.
+async fn notify_received(
+    tx: &mut Transaction<'_, Postgres>,
+    blind: &BlindReview<'_>,
+    now: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    review_release::notify_once(
         tx,
-        event_id,
+        blind.created_event,
         "review_received",
-        &subject,
-        actor,
-        &order_aggregate_id,
-        None,
+        blind.order_id,
+        blind.subject,
+        blind.actor,
         now,
     )
     .await?;
-    let result = review_result(tx, &updated, actor, &listings, &written).await?;
-    Ok(Ok(HandlerSuccess {
-        revision: updated.revision,
-        event_ids: vec![event_id],
-        result,
-    }))
+    Ok(())
 }
 
 /// The command result of a review action: the order with every review, the
@@ -410,6 +603,7 @@ async fn review_result(
     written: &[Uuid],
 ) -> Result<Value, sqlx::Error> {
     let reviews = fetch_order_reviews(tx, order.id).await?;
+    let window = review_release::read_window(&mut **tx, order.id).await?;
     let mut own: Vec<&ReviewRow> = reviews
         .iter()
         .filter(|row| row.reviewer_pubky == actor && written.contains(&row.id))
@@ -417,10 +611,20 @@ async fn review_result(
     own.sort_by_key(|row| line_position(listings, &row.listing_aggregate_id));
     let mut result = json!({
         "kind": "review",
-        "order": order_json_with_reviews(order, &reviews),
+        "order": order_json_with_reviews(order, &reviews, actor),
         "review": own.first().map(|row| row.view()),
         "reviews": own.iter().map(|row| row.view()).collect::<Vec<_>>(),
     });
+    // A double-blind order's attestations are issued and stored but not
+    // served until release; an order with no window answers as it always did.
+    if let Some(release_at) = window.pending_until() {
+        result["attestation_status"] = json!("pending");
+        result["release_at"] = json!(format_timestamp(release_at));
+        return Ok(result);
+    }
+    if window.ends_at.is_some() {
+        result["attestation_status"] = json!("released");
+    }
     let stored = fetch_attestations(&mut **tx, order, actor).await?;
     let attestations: Vec<Value> = own
         .iter()
@@ -695,9 +899,21 @@ pub mod test_faults {
             .push((order_id, gate));
     }
 
-    pub(super) async fn after_review_insert(order_id: uuid::Uuid) {
+    static SWAP_GATES: Mutex<Vec<(uuid::Uuid, InsertGate)>> = Mutex::new(Vec::new());
+
+    /// Arms one pause for the next `review.create` on `order_id` that wins
+    /// the revision compare-and-swap: it waits, still holding the order's row
+    /// lock, between the swap and everything that follows it.
+    pub fn arm_after_swap(order_id: uuid::Uuid, gate: InsertGate) {
+        SWAP_GATES
+            .lock()
+            .expect("fault hook mutex")
+            .push((order_id, gate));
+    }
+
+    async fn pause(gates: &Mutex<Vec<(uuid::Uuid, InsertGate)>>, order_id: uuid::Uuid) {
         let gate = {
-            let mut gates = GATES.lock().expect("fault hook mutex");
+            let mut gates = gates.lock().expect("fault hook mutex");
             gates
                 .iter()
                 .position(|(armed, _)| *armed == order_id)
@@ -707,5 +923,13 @@ pub mod test_faults {
             gate.arrived.wait().await;
             gate.release.wait().await;
         }
+    }
+
+    pub(super) async fn after_review_insert(order_id: uuid::Uuid) {
+        pause(&GATES, order_id).await;
+    }
+
+    pub(super) async fn after_review_swap(order_id: uuid::Uuid) {
+        pause(&SWAP_GATES, order_id).await;
     }
 }

@@ -90,6 +90,7 @@ pub const TASK_PAYKIT_RESOLVE_DELIVERY: &str = "paykit_resolve_delivery";
 pub const TASK_FX_SAMPLER: &str = "fx_sampler";
 pub const TASK_REFUSAL_AUDIT_RETENTION: &str = "refusal_audit_retention";
 pub const TASK_LISTING_DELETIONS: &str = "listing_deletions";
+pub const TASK_REVIEW_RELEASE: &str = "review_release";
 
 static AWARD_EXPIRY_RETRY_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -5116,6 +5117,7 @@ pub struct WorkerSummary {
     pub fx_samples_accepted: u64,
     pub refusal_audit_rows_purged: u64,
     pub listings_tombstoned: u64,
+    pub reviews_released: u64,
 }
 
 /// Samples the bounded sole source once per server-time bucket, one sample
@@ -5473,6 +5475,20 @@ pub async fn run_once(
         .await;
         release_lease(&state.pool, TASK_DELIVERY_AUTOCOMPLETE, holder, now).await?;
         result?;
+    }
+    // Double-blind reviews whose window has ended publish on server time. The
+    // pass runs whether or not REVIEW_BLIND_WINDOW_DAYS is still set: an order
+    // that already carries a window is released when it ends.
+    if try_acquire_lease(&state.pool, TASK_REVIEW_RELEASE, holder, now, lease_seconds).await? {
+        let result = crate::review_release::release_due_orders(
+            &state.pool,
+            now,
+            state.config.delivery_sweep_batch_size,
+            DELIVERY_SWEEP_MAX_BATCHES,
+        )
+        .await;
+        release_lease(&state.pool, TASK_REVIEW_RELEASE, holder, now).await?;
+        summary.reviews_released = result?;
     }
     // Pickup maintenance runs only when the sealing keys are configured:
     // the retention purge of pinned versions/snapshots whose referencing
@@ -5951,6 +5967,7 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
                             read_rate_buckets_purged = summary.read_rate_buckets_purged,
                             delivery_addresses_purged = summary.delivery_addresses_purged,
                             listings_tombstoned = summary.listings_tombstoned,
+                            reviews_released = summary.reviews_released,
                             "worker pass completed"
                         );
                     }

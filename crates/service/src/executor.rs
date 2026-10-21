@@ -917,6 +917,7 @@ async fn dispatch(
                 command,
                 payload,
                 state.attestor.as_deref(),
+                state.config.review_blind_window_days,
                 now,
             )
             .await
