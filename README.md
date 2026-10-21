@@ -1293,6 +1293,7 @@ compare it.
 | `fulfillment.mark_ready` | CAS 409 vs order `revision` | `fulfillment.rs:193` |
 | `fulfillment.confirm_pickup` | CAS 409 vs order `revision` | `fulfillment.rs:272` |
 | `return.request` | CAS 409 vs order `revision` | `returns.rs:40` |
+| `return.cancel` | CAS 409 vs order `revision` | `returns.rs` |
 | `return.approve` | CAS 409 vs order `revision` | `returns.rs:171` |
 | `return.receive` | CAS 409 vs order `revision` | `returns.rs:171` |
 | `refund.record_external` | CAS 409 vs order `revision` | `returns.rs:251` |
@@ -1317,7 +1318,7 @@ actor may sync), `drop.sync` (convergent; any actor may sync),
 `fulfillment.confirm_delivery`, `pickup_details.set`,
 `pickup_details.clear`, `fulfillment.mark_ready`,
 `fulfillment.confirm_pickup` (see Local pickup), `return.request`,
-`return.approve`, `return.receive`, `refund.record_external`,
+`return.approve`, `return.cancel`, `return.receive`, `refund.record_external`,
 `refund.confirm_destination` (see USDT refund destination),
 `review.create`, `review.update` (this service only), and
 `attestation.set_band_consent`.
@@ -1509,7 +1510,10 @@ and refund branches):
   additive-only). A command that still carries it (an older Shop) is
   accepted when it is `1`, ignored, and any other value is `INVALID_COMMAND`.
 - **Returns.** `return.request` (buyer, from `delivered`/`completed`, capped
-  at the order total), `return.approve` and `return.receive` (seller). The
+  at the order total), `return.cancel` (buyer, while `return_requested`: the
+  order goes back to `delivered` or `completed`, the return is cleared and the
+  seller is notified; once the seller acted it is `return_not_cancellable`),
+  `return.approve` and `return.receive` (seller). The
   return sub-state (`requested → approved → received → refunded`) is a
   canonical machine in the contract artifact.
 - **External refunds.** `refund.record_external` (seller, from

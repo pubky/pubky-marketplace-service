@@ -1,4 +1,5 @@
-//! Return commands (`return.request`, `return.approve`, `return.receive`)
+//! Return commands (`return.request`, `return.approve`, `return.cancel`,
+//! `return.receive`)
 //! and the return resolution (`refund.record_external`), ported from the
 //! TypeScript prototype engine. `return.request` follows the listing's return
 //! policy frozen on the order ([`crate::return_policy`]).
@@ -28,6 +29,7 @@ use crate::return_policy::{self, ReturnPolicy, ReturnRefusal};
 
 pub const REASON_REFUND_DESTINATION_REQUIRED: &str = "refund_destination_required";
 pub const REASON_INVALID_REFUND_REFERENCE: &str = "invalid_refund_reference";
+pub const REASON_RETURN_NOT_CANCELLABLE: &str = "return_not_cancellable";
 pub const REASON_RETURNS_NOT_ACCEPTED: &str = "returns_not_accepted";
 pub const REASON_RETURN_WINDOW_CLOSED: &str = "return_window_closed";
 
@@ -128,6 +130,8 @@ pub async fn request(
         "state": "requested",
         "reason": payload.reason,
         "requested_amount_minor": payload.requested_amount_minor,
+        // Where `return.cancel` sends the order back to.
+        "requested_from": order.state,
         "requested_at": format_timestamp(now),
         "updated_at": format_timestamp(now),
     });
@@ -175,6 +179,77 @@ pub async fn approve(
             invalid_message: "No return is pending approval.",
             event_kind: "return.approved",
         },
+        now,
+    )
+    .await
+}
+
+/// `return.cancel`: the buyer withdraws a return the seller has not acted on
+/// yet. The order goes back to the state the request came from (`delivered`
+/// or `completed`; `delivered` for a request made before that was recorded)
+/// and the return is cleared, so the buyer may request one again while the
+/// policy allows. The seller is notified.
+pub async fn cancel(
+    tx: &mut Transaction<'_, Postgres>,
+    actor: &str,
+    command: &Command,
+    payload: &OrderActionPayload,
+    now: DateTime<Utc>,
+) -> Result<HandlerResult, sqlx::Error> {
+    let Some(order) = fetch_order_for_update(tx, payload.order_id).await? else {
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::NotFound,
+            ErrorCode::NotFound,
+            "The order was not found.",
+        )));
+    };
+    if let Some(failure) = guard_order_action(actor, command, &order) {
+        return Ok(Err(failure));
+    }
+    if order.buyer_pubky != actor {
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::Unauthorized,
+            ErrorCode::Unauthorized,
+            "Only the buyer may cancel this return.",
+        )));
+    }
+    let Some(return_request) = order
+        .return_request
+        .as_ref()
+        .filter(|_| order.state == "return_requested")
+    else {
+        return Ok(Err(CommandFailure::refused_with_reason(
+            crate::refusal_audit::RefusalKind::InvalidState,
+            ErrorCode::InvalidState,
+            "The seller has already acted on this return.",
+            REASON_RETURN_NOT_CANCELLABLE,
+        )));
+    };
+    let back_to = match return_request["requested_from"].as_str() {
+        Some("completed") => "completed",
+        _ => "delivered",
+    };
+    debug_assert!(can_transition(&order_machine(), &order.state, back_to));
+
+    let updated: OrderRow = sqlx::query_as(&format!(
+        "UPDATE orders SET revision = revision + 1, state = $3, return_request = NULL, \
+         updated_at = $4 WHERE id = $1 AND revision = $2 RETURNING {ORDER_COLUMNS}"
+    ))
+    .bind(order.id)
+    .bind(order.revision)
+    .bind(back_to)
+    .bind(now)
+    .fetch_one(&mut **tx)
+    .await?;
+
+    let recipient = updated.seller_pubky.clone();
+    finish_order_action(
+        tx,
+        actor,
+        command,
+        &updated,
+        "return.cancelled",
+        ("return_updated", &recipient),
         now,
     )
     .await
