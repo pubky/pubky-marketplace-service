@@ -6,6 +6,8 @@
 //!
 //! `refund.record_external` records independently supplied seller evidence
 //! of a refund executed outside this service (an external transaction id).
+//! A USDT refund's transaction is read on Arbitrum when an RPC is configured
+//! ([`crate::refund_chain`]): what the buyer received is stored with it.
 //! The service never claims to spend, custody, escrow, release, or refund
 //! funds (ADR-0019 §7); it records the evidence and advances the order to
 //! `refunded_external`.
@@ -23,6 +25,7 @@ use crate::clock::format_timestamp;
 use crate::handlers::{fetch_order_for_update, finish_order_action, guard_order_action};
 use crate::model::OrderRow;
 use crate::queries::ORDER_COLUMNS;
+use crate::refund_chain::{RefundChain, RefundChainOutcome};
 use crate::refund_destination::{self, is_transaction_hash, is_usdt_order};
 use crate::result::{CommandFailure, HandlerResult};
 use crate::return_policy::{self, ReturnPolicy, ReturnRefusal};
@@ -30,6 +33,10 @@ use crate::return_policy::{self, ReturnPolicy, ReturnRefusal};
 pub const REASON_REFUND_DESTINATION_REQUIRED: &str = "refund_destination_required";
 pub const REASON_INVALID_REFUND_REFERENCE: &str = "invalid_refund_reference";
 pub const REASON_RETURN_NOT_CANCELLABLE: &str = "return_not_cancellable";
+pub const REASON_REFUND_TRANSACTION_NOT_FOUND: &str = "refund_transaction_not_found";
+pub const REASON_REFUND_TRANSACTION_REVERTED: &str = "refund_transaction_reverted";
+pub const REASON_REFUND_TRANSACTION_WRONG_RECIPIENT: &str = "refund_transaction_wrong_recipient";
+pub const REASON_REFUND_TRANSACTION_ALREADY_RECORDED: &str = "refund_transaction_already_recorded";
 pub const REASON_RETURNS_NOT_ACCEPTED: &str = "returns_not_accepted";
 pub const REASON_RETURN_WINDOW_CLOSED: &str = "return_window_closed";
 
@@ -397,6 +404,7 @@ pub async fn record_external_refund(
     command: &Command,
     payload: &RecordExternalRefundPayload,
     attestor: Option<&crate::attestor::Attestor>,
+    refund_chain: Option<&dyn RefundChain>,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     let Some(order) = fetch_order_for_update(tx, payload.order_id).await? else {
@@ -474,6 +482,66 @@ pub async fn record_external_refund(
     } else {
         None
     };
+    // One Arbitrum transaction is evidence for one order's refund: a hash
+    // already recorded on another order would read as checked there too.
+    if usdt_destination.is_some() {
+        let recorded_elsewhere: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM orders WHERE id <> $1 \
+             AND lower(external_refund->>'transaction_id') = lower($2))",
+        )
+        .bind(order.id)
+        .bind(&payload.transaction_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        if recorded_elsewhere {
+            return Ok(Err(CommandFailure::refused_with_reason(
+                crate::refusal_audit::RefusalKind::InvalidCommand,
+                ErrorCode::InvalidCommand,
+                "This transaction is already recorded as the refund of another order.",
+                REASON_REFUND_TRANSACTION_ALREADY_RECORDED,
+            )));
+        }
+    }
+    // With an Arbitrum RPC configured, the transaction must have sent USDT to
+    // that address; the record keeps what the buyer actually received.
+    let received_units = match (refund_chain, &usdt_destination) {
+        (Some(chain), Some(destination)) => {
+            let refusal = |message: &'static str, reason: &'static str| {
+                Ok(Err(CommandFailure::refused_with_reason(
+                    crate::refusal_audit::RefusalKind::InvalidCommand,
+                    ErrorCode::InvalidCommand,
+                    message,
+                    reason,
+                )))
+            };
+            match chain
+                .check(&payload.transaction_id, &destination.address)
+                .await
+            {
+                RefundChainOutcome::Transferred { units } if units > 0 => Some(units),
+                RefundChainOutcome::Transferred { .. } => {
+                    return refusal(
+                        "This transaction sent no USDT to the buyer's refund address.",
+                        REASON_REFUND_TRANSACTION_WRONG_RECIPIENT,
+                    );
+                }
+                RefundChainOutcome::NotFound => {
+                    return refusal(
+                        "Arbitrum doesn't show this transaction yet.",
+                        REASON_REFUND_TRANSACTION_NOT_FOUND,
+                    );
+                }
+                RefundChainOutcome::Reverted => {
+                    return refusal(
+                        "This transaction failed on Arbitrum.",
+                        REASON_REFUND_TRANSACTION_REVERTED,
+                    );
+                }
+                RefundChainOutcome::Unavailable => None,
+            }
+        }
+        _ => None,
+    };
     debug_assert!(can_transition(
         &order_machine(),
         &order.state,
@@ -487,6 +555,10 @@ pub async fn record_external_refund(
     });
     if let Some(destination) = &usdt_destination {
         external_refund["destination_address"] = json!(destination.address);
+    }
+    if let Some(units) = received_units {
+        external_refund["received_units"] = json!(units);
+        external_refund["checked_at"] = json!(format_timestamp(now));
     }
     let return_request = order.return_request.clone().map(|mut request| {
         request["state"] = json!("refunded");
