@@ -1,0 +1,390 @@
+{
+  "description": "Shared price weight vectors (Pubky Market counting rules v2). For each line item the issuer signs priceDecade = price_decade(currency, exponent, unitPriceMinor) from the listing's own unit price as the purchase attestation's price_decade claim (null: claim omitted), and every verifier derives weight = price_weight(priceDecade). Table currencies are decaded in the table's minor unit (cents; yen for JPY; satoshis for BTC and SAT), so a price at another exponent shifts the decade. An attestation without the claim weighs 1.",
+  "vectors": [
+    {
+      "currency": "USD",
+      "exponent": 2,
+      "unitPriceMinor": 1,
+      "priceDecade": "USD:0",
+      "weight": 1
+    },
+    {
+      "currency": "USD",
+      "exponent": 2,
+      "unitPriceMinor": 999,
+      "priceDecade": "USD:2",
+      "weight": 1
+    },
+    {
+      "currency": "USD",
+      "exponent": 2,
+      "unitPriceMinor": 1000,
+      "priceDecade": "USD:3",
+      "weight": 2
+    },
+    {
+      "currency": "USD",
+      "exponent": 2,
+      "unitPriceMinor": 9999,
+      "priceDecade": "USD:3",
+      "weight": 2
+    },
+    {
+      "currency": "USD",
+      "exponent": 2,
+      "unitPriceMinor": 10000,
+      "priceDecade": "USD:4",
+      "weight": 3
+    },
+    {
+      "currency": "USD",
+      "exponent": 2,
+      "unitPriceMinor": 99999,
+      "priceDecade": "USD:4",
+      "weight": 3
+    },
+    {
+      "currency": "USD",
+      "exponent": 2,
+      "unitPriceMinor": 100000,
+      "priceDecade": "USD:5",
+      "weight": 4
+    },
+    {
+      "currency": "USD",
+      "exponent": 2,
+      "unitPriceMinor": 999999,
+      "priceDecade": "USD:5",
+      "weight": 4
+    },
+    {
+      "currency": "USD",
+      "exponent": 2,
+      "unitPriceMinor": 1000000,
+      "priceDecade": "USD:6",
+      "weight": 5
+    },
+    {
+      "currency": "USD",
+      "exponent": 2,
+      "unitPriceMinor": 250000000,
+      "priceDecade": "USD:8",
+      "weight": 5
+    },
+    {
+      "currency": "EUR",
+      "exponent": 2,
+      "unitPriceMinor": 999,
+      "priceDecade": "EUR:2",
+      "weight": 1
+    },
+    {
+      "currency": "EUR",
+      "exponent": 2,
+      "unitPriceMinor": 1000,
+      "priceDecade": "EUR:3",
+      "weight": 2
+    },
+    {
+      "currency": "EUR",
+      "exponent": 2,
+      "unitPriceMinor": 1000000,
+      "priceDecade": "EUR:6",
+      "weight": 5
+    },
+    {
+      "currency": "GBP",
+      "exponent": 2,
+      "unitPriceMinor": 999,
+      "priceDecade": "GBP:2",
+      "weight": 1
+    },
+    {
+      "currency": "GBP",
+      "exponent": 2,
+      "unitPriceMinor": 1000,
+      "priceDecade": "GBP:3",
+      "weight": 2
+    },
+    {
+      "currency": "GBP",
+      "exponent": 2,
+      "unitPriceMinor": 1000000,
+      "priceDecade": "GBP:6",
+      "weight": 5
+    },
+    {
+      "currency": "CHF",
+      "exponent": 2,
+      "unitPriceMinor": 999,
+      "priceDecade": "CHF:2",
+      "weight": 1
+    },
+    {
+      "currency": "CHF",
+      "exponent": 2,
+      "unitPriceMinor": 1000,
+      "priceDecade": "CHF:3",
+      "weight": 2
+    },
+    {
+      "currency": "CHF",
+      "exponent": 2,
+      "unitPriceMinor": 1000000,
+      "priceDecade": "CHF:6",
+      "weight": 5
+    },
+    {
+      "currency": "CAD",
+      "exponent": 2,
+      "unitPriceMinor": 999,
+      "priceDecade": "CAD:2",
+      "weight": 1
+    },
+    {
+      "currency": "CAD",
+      "exponent": 2,
+      "unitPriceMinor": 1000,
+      "priceDecade": "CAD:3",
+      "weight": 2
+    },
+    {
+      "currency": "CAD",
+      "exponent": 2,
+      "unitPriceMinor": 1000000,
+      "priceDecade": "CAD:6",
+      "weight": 5
+    },
+    {
+      "currency": "AUD",
+      "exponent": 2,
+      "unitPriceMinor": 999,
+      "priceDecade": "AUD:2",
+      "weight": 1
+    },
+    {
+      "currency": "AUD",
+      "exponent": 2,
+      "unitPriceMinor": 1000,
+      "priceDecade": "AUD:3",
+      "weight": 2
+    },
+    {
+      "currency": "AUD",
+      "exponent": 2,
+      "unitPriceMinor": 1000000,
+      "priceDecade": "AUD:6",
+      "weight": 5
+    },
+    {
+      "currency": "JPY",
+      "exponent": 0,
+      "unitPriceMinor": 1,
+      "priceDecade": "JPY:0",
+      "weight": 1
+    },
+    {
+      "currency": "JPY",
+      "exponent": 0,
+      "unitPriceMinor": 999,
+      "priceDecade": "JPY:2",
+      "weight": 1
+    },
+    {
+      "currency": "JPY",
+      "exponent": 0,
+      "unitPriceMinor": 1000,
+      "priceDecade": "JPY:3",
+      "weight": 2
+    },
+    {
+      "currency": "JPY",
+      "exponent": 0,
+      "unitPriceMinor": 9999,
+      "priceDecade": "JPY:3",
+      "weight": 2
+    },
+    {
+      "currency": "JPY",
+      "exponent": 0,
+      "unitPriceMinor": 10000,
+      "priceDecade": "JPY:4",
+      "weight": 3
+    },
+    {
+      "currency": "JPY",
+      "exponent": 0,
+      "unitPriceMinor": 100000,
+      "priceDecade": "JPY:5",
+      "weight": 4
+    },
+    {
+      "currency": "JPY",
+      "exponent": 0,
+      "unitPriceMinor": 999999,
+      "priceDecade": "JPY:5",
+      "weight": 4
+    },
+    {
+      "currency": "JPY",
+      "exponent": 0,
+      "unitPriceMinor": 1000000,
+      "priceDecade": "JPY:6",
+      "weight": 5
+    },
+    {
+      "currency": "BTC",
+      "exponent": 8,
+      "unitPriceMinor": 1,
+      "priceDecade": "BTC:0",
+      "weight": 1
+    },
+    {
+      "currency": "BTC",
+      "exponent": 8,
+      "unitPriceMinor": 9999,
+      "priceDecade": "BTC:3",
+      "weight": 1
+    },
+    {
+      "currency": "BTC",
+      "exponent": 8,
+      "unitPriceMinor": 10000,
+      "priceDecade": "BTC:4",
+      "weight": 2
+    },
+    {
+      "currency": "BTC",
+      "exponent": 8,
+      "unitPriceMinor": 99999,
+      "priceDecade": "BTC:4",
+      "weight": 2
+    },
+    {
+      "currency": "BTC",
+      "exponent": 8,
+      "unitPriceMinor": 100000,
+      "priceDecade": "BTC:5",
+      "weight": 3
+    },
+    {
+      "currency": "BTC",
+      "exponent": 8,
+      "unitPriceMinor": 999999,
+      "priceDecade": "BTC:5",
+      "weight": 3
+    },
+    {
+      "currency": "BTC",
+      "exponent": 8,
+      "unitPriceMinor": 1000000,
+      "priceDecade": "BTC:6",
+      "weight": 4
+    },
+    {
+      "currency": "BTC",
+      "exponent": 8,
+      "unitPriceMinor": 9999999,
+      "priceDecade": "BTC:6",
+      "weight": 4
+    },
+    {
+      "currency": "BTC",
+      "exponent": 8,
+      "unitPriceMinor": 10000000,
+      "priceDecade": "BTC:7",
+      "weight": 5
+    },
+    {
+      "currency": "BTC",
+      "exponent": 8,
+      "unitPriceMinor": 2100000000000000,
+      "priceDecade": "BTC:15",
+      "weight": 5
+    },
+    {
+      "currency": "SAT",
+      "exponent": 0,
+      "unitPriceMinor": 1,
+      "priceDecade": "SAT:0",
+      "weight": 1
+    },
+    {
+      "currency": "SAT",
+      "exponent": 0,
+      "unitPriceMinor": 9999,
+      "priceDecade": "SAT:3",
+      "weight": 1
+    },
+    {
+      "currency": "SAT",
+      "exponent": 0,
+      "unitPriceMinor": 10000,
+      "priceDecade": "SAT:4",
+      "weight": 2
+    },
+    {
+      "currency": "SAT",
+      "exponent": 0,
+      "unitPriceMinor": 100000,
+      "priceDecade": "SAT:5",
+      "weight": 3
+    },
+    {
+      "currency": "SAT",
+      "exponent": 0,
+      "unitPriceMinor": 10000000,
+      "priceDecade": "SAT:7",
+      "weight": 5
+    },
+    {
+      "currency": "BTC",
+      "exponent": 0,
+      "unitPriceMinor": 1,
+      "priceDecade": "BTC:8",
+      "weight": 5
+    },
+    {
+      "currency": "BTC",
+      "exponent": 11,
+      "unitPriceMinor": 1000,
+      "priceDecade": "BTC:0",
+      "weight": 1
+    },
+    {
+      "currency": "BTC",
+      "exponent": 11,
+      "unitPriceMinor": 999,
+      "priceDecade": null,
+      "weight": 1
+    },
+    {
+      "currency": "USD",
+      "exponent": 3,
+      "unitPriceMinor": 10000,
+      "priceDecade": "USD:3",
+      "weight": 2
+    },
+    {
+      "currency": "USD",
+      "exponent": 2,
+      "unitPriceMinor": 0,
+      "priceDecade": null,
+      "weight": 1
+    },
+    {
+      "currency": "BTC",
+      "exponent": 8,
+      "unitPriceMinor": 0,
+      "priceDecade": null,
+      "weight": 1
+    },
+    {
+      "currency": "XYZ",
+      "exponent": 2,
+      "unitPriceMinor": 1000000,
+      "priceDecade": "XYZ:6",
+      "weight": 1
+    }
+  ]
+}

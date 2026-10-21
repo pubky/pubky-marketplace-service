@@ -841,7 +841,12 @@ ratings for the order.
 
 `review.create` writes one review per listing and issues one purchase
 attestation per listing; the attestations share the order's `order_ref` and
-each binds its listing. Within 24 hours of their first review of the order, a
+each binds its listing. Every purchase attestation, the seller's included,
+carries `price_decade`: the log decade of the bound listing's unit price paid,
+`{CURRENCY}:{k}` in the listing's own currency code, decaded in the specs
+price weight table's minor unit (sats for `BTC` and `SAT`, cents for `USD`,
+`EUR`, `GBP`, `CHF`, `CAD` and `AUD`, yen for `JPY`). The order-total
+`amount_band` stays consent-only. Within 24 hours of their first review of the order, a
 buyer may create again to add listings not yet reviewed, and either reviewer
 may `review.update` the listings they reviewed (v1 terms edit the first line).
 Reviewing a listing twice is refused with `INVALID_STATE`; past the window,

@@ -20,7 +20,10 @@
 //! the salt can link it back to an order. `completed_on` is day-granularity.
 //! The optional `amount_band` log-decade band is emitted only under
 //! both-sides consent (ratified D2): the seller's standing preference AND
-//! the reviewer's per-review opt-in.
+//! the reviewer's per-review opt-in. `price_decade`, the log decade of the
+//! bound listing's unit price paid, is always emitted (reviews decision
+//! RV1): it discloses only the order of magnitude the public listing price
+//! already shows.
 //!
 //! Key custody (ratified D6): the secret lives in the `ATTESTOR_SECRET_KEY`
 //! environment variable (KMS/env-held, same process as the service), to be
@@ -229,7 +232,8 @@ impl Attestor {
     /// Issues the durable purchase attestation for one (order, reviewer)
     /// pair. `role` is the record-vocabulary direction
     /// (`buyer_reviewing_seller` / `seller_reviewing_buyer`); `amount_band`
-    /// must already have passed the D2 both-sides consent gate.
+    /// must already have passed the D2 both-sides consent gate;
+    /// `price_decade` is [`price_decade`] of the listing's unit price paid.
     #[allow(clippy::too_many_arguments)]
     pub fn issue_purchase_attestation(
         &self,
@@ -240,6 +244,7 @@ impl Attestor {
         listing_uri: &str,
         completed_on: &str,
         amount_band: Option<String>,
+        price_decade: Option<String>,
         now: DateTime<Utc>,
     ) -> IssuedAttestation {
         let order_ref = self.order_ref(order_id);
@@ -257,6 +262,9 @@ impl Attestor {
         });
         if let Some(band) = amount_band {
             claims["amount_band"] = json!(band);
+        }
+        if let Some(decade) = price_decade {
+            claims["price_decade"] = json!(decade);
         }
         claims["iat"] = json!(now.timestamp());
         let jws = self.sign_compact(PURCHASE_ATTESTATION_TYP, &claims);
@@ -377,6 +385,49 @@ pub fn amount_band(currency: &str, total_minor: i64) -> Option<String> {
     Some(format!("{currency}:{}", total_minor.ilog10()))
 }
 
+/// The specs price weight table's minor units (`pubky-app-specs`
+/// `PRICE_WEIGHT_CURRENCIES`): the exponent each currency is decaded at.
+pub const PRICE_DECADE_EXPONENTS: &[(&str, i64)] = &[
+    ("USD", 2),
+    ("EUR", 2),
+    ("GBP", 2),
+    ("CHF", 2),
+    ("CAD", 2),
+    ("AUD", 2),
+    ("JPY", 0),
+    ("BTC", 8),
+    ("SAT", 0),
+];
+
+/// i64 minor units cap a decade at 18, the most the claim may carry.
+const MAX_PRICE_DECADE: i64 = 18;
+
+/// The `price_decade` claim for a unit price of `unit_price_minor` at
+/// `exponent` decimal places of `currency`, exactly as the specs helper
+/// `price_decade(currency, exponent, unit_price_minor)` computes it, e.g.
+/// `("USD", 2, 4_999)` -> `USD:3` and `("BTC", 8, 25_000)` -> `BTC:4`.
+///
+/// The currency code is kept as written (`BTC` is never rewritten to
+/// `SAT`). A table currency is decaded in the table's minor unit, so a price
+/// at another exponent shifts the decade by `table exponent - exponent`; a
+/// currency outside the table keeps its own minor-unit decade. Decades above
+/// 18 are written as 18. `None`, and no claim, for a non-positive price or
+/// one below a single table minor unit.
+pub fn price_decade(currency: &str, exponent: i64, unit_price_minor: i64) -> Option<String> {
+    if unit_price_minor < 1 {
+        return None;
+    }
+    let shift = PRICE_DECADE_EXPONENTS
+        .iter()
+        .find(|(code, _)| *code == currency)
+        .map_or(0, |(_, table_exponent)| table_exponent - exponent);
+    let decade = i64::from(unit_price_minor.ilog10()) + shift;
+    if decade < 0 {
+        return None;
+    }
+    Some(format!("{currency}:{}", decade.min(MAX_PRICE_DECADE)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,7 +494,31 @@ mod tests {
             "pubky://ppppp/pub/pubky.app/marketplace/v1/listings/x",
             "2026-08-20",
             Some("SAT:5".to_string()),
+            Some("SAT:4".to_string()),
             now,
+        );
+        let keys: Vec<&str> = issued
+            .claims
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "v",
+                "iss",
+                "sub",
+                "cpk",
+                "role",
+                "listing",
+                "order_ref",
+                "completed_on",
+                "amount_band",
+                "price_decade",
+                "iat"
+            ]
         );
         let mut parts = issued.jws.split('.');
         let header_b64 = parts.next().unwrap();
@@ -677,6 +752,83 @@ mod tests {
         assert_eq!(amount_band("USD", 1), Some("USD:0".to_string()));
         assert_eq!(amount_band("USD", 99), Some("USD:1".to_string()));
         assert_eq!(amount_band("USD", 0), None);
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct PriceWeightVector {
+        currency: String,
+        exponent: i64,
+        unit_price_minor: i64,
+        price_decade: Option<String>,
+        #[allow(dead_code)]
+        weight: u8,
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct PriceWeightVectors {
+        #[allow(dead_code)]
+        description: String,
+        vectors: Vec<PriceWeightVector>,
+    }
+
+    #[test]
+    fn price_decade_matches_the_specs_vectors() {
+        let fixture: PriceWeightVectors =
+            serde_json::from_str(include_str!("../tests/fixtures/price-weight-vectors.json"))
+                .expect("vector fixture parses");
+        for (code, _) in PRICE_DECADE_EXPONENTS {
+            assert!(
+                fixture
+                    .vectors
+                    .iter()
+                    .any(|vector| vector.currency == *code),
+                "no vector for {code}"
+            );
+        }
+        for vector in &fixture.vectors {
+            assert_eq!(
+                price_decade(&vector.currency, vector.exponent, vector.unit_price_minor),
+                vector.price_decade,
+                "{} {} at exponent {}",
+                vector.currency,
+                vector.unit_price_minor,
+                vector.exponent
+            );
+        }
+    }
+
+    #[test]
+    fn price_decade_keeps_the_code_and_shifts_to_the_table_unit() {
+        assert_eq!(price_decade("BTC", 8, 25_000).as_deref(), Some("BTC:4"));
+        assert_eq!(price_decade("SAT", 0, 25_000).as_deref(), Some("SAT:4"));
+        assert_eq!(price_decade("BTC", 0, 1).as_deref(), Some("BTC:8"));
+        assert_eq!(price_decade("BTC", 11, 999), None);
+        assert_eq!(price_decade("USD", 3, 10_000).as_deref(), Some("USD:3"));
+        assert_eq!(price_decade("JPY", 2, 45_000).as_deref(), Some("JPY:2"));
+        assert_eq!(price_decade("BTC", 0, i64::MAX).as_deref(), Some("BTC:18"));
+        assert_eq!(price_decade("XYZ", 5, 1_000).as_deref(), Some("XYZ:3"));
+        assert_eq!(price_decade("USD", 2, 0), None);
+        assert_eq!(price_decade("USD", 2, -1_000), None);
+    }
+
+    #[test]
+    fn every_registry_currency_is_decaded_at_its_registry_exponent() {
+        use marketplace_domain::currency::{Currency, SUPPORTED_CODES};
+        let codes: Vec<&str> = SUPPORTED_CODES.split(", ").collect();
+        assert_eq!(codes.len(), PRICE_DECADE_EXPONENTS.len());
+        for code in codes {
+            let currency = Currency::parse(code).expect(code);
+            assert_eq!(
+                PRICE_DECADE_EXPONENTS
+                    .iter()
+                    .find(|(table_code, _)| *table_code == code)
+                    .map(|(_, exponent)| *exponent),
+                Some(i64::from(currency.exponent())),
+                "{code}"
+            );
+        }
     }
 
     #[test]

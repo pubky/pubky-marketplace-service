@@ -1153,6 +1153,7 @@ attestation per reviewed listing inside the review transaction, all sharing
 the order's `order_ref` (re-fetchable via
 `GET /v1/orders/{id}/review-attestations`, and the first line's via
 `GET /v1/orders/{id}/review-attestation`, participant-scoped, idempotent),
+each carrying the `price_decade` of its listing's unit price paid,
 the D2 amount-band consent gate applies (`attestation.set_band_consent`
 command + `GET /v1/sellers/{pubky}/band-consent` read), external refunds
 append `attestation_annotations` rows keyed by the
@@ -1327,8 +1328,8 @@ compare it.
 | `return.receive` | CAS 409 vs order `revision` | `returns.rs:171` |
 | `refund.record_external` | CAS 409 vs order `revision` | `returns.rs:251` |
 | `refund.confirm_destination` | CAS 409 vs order `revision` | `refund_destination.rs:27` |
-| `review.create` | CAS 409 vs order `revision` | `reviews.rs:214` |
-| `review.update` | CAS 409 vs order `revision` | `reviews.rs:571` |
+| `review.create` | CAS 409 vs order `revision` | `reviews.rs:229` |
+| `review.update` | CAS 409 vs order `revision` | `reviews.rs:587` |
 | `attestation.set_band_consent` | CAS 409 vs stored consent revision (`0` on first write) | `attestation.rs:47` |
 
 Handler paths are under `crates/service/src/handlers/`.
