@@ -230,6 +230,10 @@ pub fn build_router(state: AppState) -> Router {
             get(queries::get_review_attestation),
         )
         .route(
+            "/v1/orders/{id}/review-attestations",
+            get(queries::get_review_attestations),
+        )
+        .route(
             "/v1/sellers/{pubky}/band-consent",
             get(queries::get_band_consent),
         )

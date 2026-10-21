@@ -1316,18 +1316,83 @@ pub struct ConfirmRefundDestinationPayload {
 
 /// Review terms shared by `review.create` and `review.update` (the update
 /// command is this service only; the prototype had no review editing).
+///
+/// Two shapes, exactly one per command. v1 carries one `rating` and `text`:
+/// a buyer's v1 review rates the order's first line, a seller's rates the
+/// buyer. v2 (buyer only) carries one entry per reviewed listing in `items`
+/// and the optional per-order `seller` ratings. Absent fields are not
+/// serialized, so a v1 command keeps its request hash.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewTermsPayload {
     pub order_id: Uuid,
-    pub rating: i64,
-    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rating: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub items: Option<Vec<ReviewItemTerms>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seller: Option<SellerRatingTerms>,
     /// Buyer-side amount-band opt-in (ratified D2, ADR 0024): the purchase
     /// attestation carries an amount band only when this is true AND the
     /// seller's standing band-consent preference allows it. Defaults to
     /// false; ignored by `review.update` (the attestation is immutable).
     #[serde(default)]
     pub allow_amount_band: bool,
+}
+
+/// One listing of the order, rated by the buyer. `listing_id` is the
+/// seller's record id (the part after `listing:{seller}_` in the line's
+/// aggregate id); `text` is optional.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewItemTerms {
+    pub listing_id: String,
+    pub rating: i64,
+    #[serde(default)]
+    pub text: String,
+}
+
+/// The buyer's per-order seller ratings, written identically on every item
+/// review of the order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SellerRatingTerms {
+    pub shipping: i64,
+    pub communication: i64,
+}
+
+/// A validated [`ReviewTermsPayload`], by shape.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ReviewTerms<'a> {
+    /// v1: one rating and text for the order.
+    Order { rating: i64, text: &'a str },
+    /// v2: one rating and text per listing, plus the optional seller ratings.
+    Items {
+        items: &'a [ReviewItemTerms],
+        seller: Option<SellerRatingTerms>,
+    },
+}
+
+/// At most one item per checkout line (`checkout.create` admits 50).
+pub const MAX_REVIEW_ITEMS: usize = 50;
+
+impl ReviewTermsPayload {
+    /// The payload's shape. Only meaningful on a payload that passed
+    /// `parse_command`, which admits exactly one shape.
+    pub fn terms(&self) -> ReviewTerms<'_> {
+        match &self.items {
+            Some(items) => ReviewTerms::Items {
+                items,
+                seller: self.seller,
+            },
+            None => ReviewTerms::Order {
+                rating: self.rating.expect("v1 review terms carry a rating"),
+                text: self.text.as_deref().expect("v1 review terms carry text"),
+            },
+        }
+    }
 }
 
 /// Seller's standing amount-band consent (ratified D2): whether purchase
@@ -2302,10 +2367,81 @@ fn validate_review_terms(
     wrap: fn(ReviewTermsPayload) -> CommandPayload,
 ) -> Result<CommandPayload, Vec<ValidationIssue>> {
     let mut issues = Vec::new();
-    if !(1..=5).contains(&payload.rating) {
-        issues.push(issue("payload.rating", "Expected a rating between 1 and 5"));
+    let validate_rating = |path: &str, rating: Option<i64>, issues: &mut Vec<ValidationIssue>| {
+        if !rating.is_some_and(|rating| (1..=5).contains(&rating)) {
+            issues.push(issue(path, "Expected a rating between 1 and 5"));
+        }
+    };
+    match payload.items.as_mut() {
+        None => {
+            validate_rating("payload.rating", payload.rating, &mut issues);
+            match payload.text.as_mut() {
+                Some(text) => validate_trimmed("payload.text", text, 1, 5_000, &mut issues),
+                None => issues.push(issue(
+                    "payload.text",
+                    "Expected between 1 and 5000 characters",
+                )),
+            }
+            if payload.seller.is_some() {
+                issues.push(issue(
+                    "payload.seller",
+                    "Seller ratings are sent with items",
+                ));
+            }
+        }
+        Some(items) => {
+            if payload.rating.is_some() || payload.text.is_some() {
+                issues.push(issue(
+                    "payload.items",
+                    "Send either rating and text or items, not both",
+                ));
+            }
+            if items.is_empty() || items.len() > MAX_REVIEW_ITEMS {
+                issues.push(issue(
+                    "payload.items",
+                    &format!("Expected between 1 and {MAX_REVIEW_ITEMS} items"),
+                ));
+            }
+            let mut seen = std::collections::HashSet::new();
+            for (index, item) in items.iter_mut().enumerate() {
+                if !entity_id_regex().is_match(&item.listing_id) {
+                    issues.push(issue(
+                        &format!("payload.items.{index}.listing_id"),
+                        "Expected a path-safe commerce identifier",
+                    ));
+                } else if !seen.insert(item.listing_id.clone()) {
+                    issues.push(issue(
+                        &format!("payload.items.{index}.listing_id"),
+                        "Expected each listing once",
+                    ));
+                }
+                validate_rating(
+                    &format!("payload.items.{index}.rating"),
+                    Some(item.rating),
+                    &mut issues,
+                );
+                validate_trimmed(
+                    &format!("payload.items.{index}.text"),
+                    &mut item.text,
+                    0,
+                    5_000,
+                    &mut issues,
+                );
+            }
+            if let Some(seller) = payload.seller {
+                validate_rating(
+                    "payload.seller.shipping",
+                    Some(seller.shipping),
+                    &mut issues,
+                );
+                validate_rating(
+                    "payload.seller.communication",
+                    Some(seller.communication),
+                    &mut issues,
+                );
+            }
+        }
     }
-    validate_trimmed("payload.text", &mut payload.text, 1, 5_000, &mut issues);
     if issues.is_empty() {
         Ok(wrap(payload))
     } else {
@@ -3559,6 +3695,157 @@ mod tests {
         );
         let issues = parse_command(&zero_rating).expect_err("rating 0 invalid");
         assert!(issues.iter().any(|i| i.path == "payload.rating"));
+    }
+
+    #[test]
+    fn v1_review_terms_keep_their_canonical_payload() {
+        let order_id = "00000000-0000-4000-8000-00000000aaaa";
+        let command = parse_command(&order_command_json(
+            "review.create",
+            json!({ "order_id": order_id, "rating": 5, "text": "  Accurate and fast. " }),
+        ))
+        .expect("v1 review parses");
+        assert_eq!(
+            command.canonical_json()["payload"],
+            json!({
+                "order_id": order_id,
+                "rating": 5,
+                "text": "Accurate and fast.",
+                "allow_amount_band": false,
+            })
+        );
+        let CommandPayload::CreateReview(payload) = &command.payload else {
+            panic!("wrong payload");
+        };
+        assert_eq!(
+            payload.terms(),
+            ReviewTerms::Order {
+                rating: 5,
+                text: "Accurate and fast."
+            }
+        );
+    }
+
+    #[test]
+    fn v2_review_terms_rate_each_listing_and_the_seller() {
+        let order_id = "00000000-0000-4000-8000-00000000aaaa";
+        let command = parse_command(&order_command_json(
+            "review.create",
+            json!({
+                "order_id": order_id,
+                "items": [
+                    { "listing_id": "boots_01", "rating": 5, "text": " Warm. " },
+                    { "listing_id": "laces_02", "rating": 3 },
+                ],
+                "seller": { "shipping": 4, "communication": 5 },
+            }),
+        ))
+        .expect("v2 review parses");
+        let CommandPayload::CreateReview(payload) = &command.payload else {
+            panic!("wrong payload");
+        };
+        let ReviewTerms::Items { items, seller } = payload.terms() else {
+            panic!("v2 shape expected");
+        };
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].text, "Warm.");
+        assert_eq!(items[1].text, "", "item text is optional");
+        assert_eq!(
+            seller,
+            Some(SellerRatingTerms {
+                shipping: 4,
+                communication: 5
+            })
+        );
+        assert!(command.canonical_json()["payload"].get("rating").is_none());
+
+        let update = parse_command(&order_command_json(
+            "review.update",
+            json!({ "order_id": order_id, "items": [{ "listing_id": "boots_01", "rating": 4 }] }),
+        ))
+        .expect("v2 update parses");
+        assert_eq!(update.kind(), "review.update");
+    }
+
+    #[test]
+    fn review_terms_admit_exactly_one_shape() {
+        let order_id = "00000000-0000-4000-8000-00000000aaaa";
+        let item = json!({ "listing_id": "boots_01", "rating": 5 });
+        for (payload, path) in [
+            (
+                json!({ "order_id": order_id, "rating": 5, "text": "x", "items": [item] }),
+                "payload.items",
+            ),
+            (
+                json!({ "order_id": order_id, "rating": 5, "text": "x",
+                        "seller": { "shipping": 5, "communication": 5 } }),
+                "payload.seller",
+            ),
+            (
+                json!({ "order_id": order_id, "text": "x" }),
+                "payload.rating",
+            ),
+            (json!({ "order_id": order_id, "rating": 5 }), "payload.text"),
+            (
+                json!({ "order_id": order_id, "rating": 5, "text": "   " }),
+                "payload.text",
+            ),
+            (
+                json!({ "order_id": order_id, "items": [] }),
+                "payload.items",
+            ),
+            (
+                json!({ "order_id": order_id, "items": [item, item] }),
+                "payload.items.1.listing_id",
+            ),
+            (
+                json!({ "order_id": order_id,
+                        "items": [{ "listing_id": "../boots", "rating": 5 }] }),
+                "payload.items.0.listing_id",
+            ),
+            (
+                json!({ "order_id": order_id,
+                        "items": [{ "listing_id": "boots_01", "rating": 6 }] }),
+                "payload.items.0.rating",
+            ),
+            (
+                json!({ "order_id": order_id,
+                        "items": [{ "listing_id": "boots_01", "rating": 5,
+                                    "text": "x".repeat(5_001) }] }),
+                "payload.items.0.text",
+            ),
+            (
+                json!({ "order_id": order_id, "items": [item],
+                        "seller": { "shipping": 0, "communication": 5 } }),
+                "payload.seller.shipping",
+            ),
+            (
+                json!({ "order_id": order_id, "items": [item],
+                        "seller": { "shipping": 5, "communication": 9 } }),
+                "payload.seller.communication",
+            ),
+        ] {
+            let issues = parse_command(&order_command_json("review.create", payload.clone()))
+                .expect_err(&format!("{payload} must be refused"));
+            assert!(
+                issues.iter().any(|i| i.path == path),
+                "{payload}: expected an issue at {path}, got {issues:?}"
+            );
+        }
+        let too_many: Vec<Value> = (0..=MAX_REVIEW_ITEMS)
+            .map(|index| json!({ "listing_id": format!("l{index}"), "rating": 5 }))
+            .collect();
+        let issues = parse_command(&order_command_json(
+            "review.create",
+            json!({ "order_id": order_id, "items": too_many }),
+        ))
+        .expect_err("51 items refused");
+        assert!(issues.iter().any(|i| i.path == "payload.items"));
+        assert!(parse_command(&order_command_json(
+            "review.create",
+            json!({ "order_id": order_id, "items": [item], "seller": { "shipping": 5 } }),
+        ))
+        .is_err());
     }
 
     #[test]

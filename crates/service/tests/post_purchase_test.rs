@@ -775,7 +775,7 @@ async fn replays_each_post_purchase_command_idempotently(pool: PgPool) {
 }
 
 // New in the Rust service: review uniqueness is decided by the
-// reviews_one_per_order_role constraint even when two same-role commands
+// reviews_one_per_order_role_listing constraint even when two same-role commands
 // race — the competing uncommitted insert forces the handler through the
 // constraint instead of its sequential pre-check.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
