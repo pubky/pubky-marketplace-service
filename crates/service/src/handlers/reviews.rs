@@ -27,7 +27,6 @@ use crate::handlers::{
 };
 use crate::model::{OrderRow, ReviewRow};
 use crate::queries::ORDER_COLUMNS;
-use crate::refusal_audit::RefusalKind;
 use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
 
 /// How long a reviewer may add items to and edit their review of an order,
@@ -119,7 +118,7 @@ fn resolve_terms<'a>(
     };
     if role == "seller" {
         return Err(CommandFailure::refused(
-            RefusalKind::InvalidCommand,
+            crate::refusal_audit::RefusalKind::InvalidCommand,
             ErrorCode::InvalidCommand,
             "A seller reviews the buyer once per order, with a rating and text.",
         ));
@@ -131,7 +130,7 @@ fn resolve_terms<'a>(
             .find(|listing| listing.listing_id == item.listing_id)
         else {
             return Err(CommandFailure::refused(
-                RefusalKind::InvalidCommand,
+                crate::refusal_audit::RefusalKind::InvalidCommand,
                 ErrorCode::InvalidCommand,
                 &format!("Listing {} is not part of this order.", item.listing_id),
             ));
@@ -180,7 +179,7 @@ fn window_closed(existing: &[ReviewRow], now: DateTime<Utc>) -> Option<CommandFa
     let opened = existing.iter().map(|row| row.created_at).min()?;
     (now > opened + chrono::Duration::seconds(REVIEW_EDIT_WINDOW_SECONDS)).then(|| {
         CommandFailure::refused(
-            RefusalKind::InvalidState,
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "The review edit window has closed.",
         )
@@ -225,7 +224,7 @@ pub async fn create(
     // compare-and-swap (different items).
     let Some(order) = fetch_order(tx, payload.order_id).await? else {
         return Ok(Err(CommandFailure::refused(
-            RefusalKind::NotFound,
+            crate::refusal_audit::RefusalKind::NotFound,
             ErrorCode::NotFound,
             "The order was not found.",
         )));
@@ -235,7 +234,7 @@ pub async fn create(
     }
     if !REVIEWABLE_STATES.contains(&order.state.as_str()) {
         return Ok(Err(CommandFailure::refused(
-            RefusalKind::InvalidState,
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "The order is not eligible for review.",
         )));
@@ -265,7 +264,7 @@ pub async fn create(
             ),
         };
         return Ok(Err(CommandFailure::refused(
-            RefusalKind::InvalidState,
+            crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             &message,
         )));
@@ -360,7 +359,7 @@ pub async fn create(
             .fetch_one(&mut **tx)
             .await?;
         return Ok(Err(CommandFailure::refused_with_revision(
-            RefusalKind::RevisionConflict,
+            crate::refusal_audit::RefusalKind::RevisionConflict,
             ErrorCode::RevisionConflict,
             "The order revision is stale.",
             current.0,
@@ -577,7 +576,7 @@ pub async fn update(
 ) -> Result<HandlerResult, sqlx::Error> {
     let Some(order) = fetch_order_for_update(tx, payload.order_id).await? else {
         return Ok(Err(CommandFailure::refused(
-            RefusalKind::NotFound,
+            crate::refusal_audit::RefusalKind::NotFound,
             ErrorCode::NotFound,
             "The order was not found.",
         )));
@@ -611,7 +610,7 @@ pub async fn update(
                 )
             };
             return Ok(Err(CommandFailure::refused(
-                RefusalKind::NotFound,
+                crate::refusal_audit::RefusalKind::NotFound,
                 ErrorCode::NotFound,
                 &message,
             )));
