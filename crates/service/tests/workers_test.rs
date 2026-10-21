@@ -131,6 +131,65 @@ async fn worker_expires_reservations_and_offers_and_closes_auctions_on_server_ti
     );
 }
 
+// An auction registered while its start was still ahead of the service clock
+// (a seller clock running fast) is started on server time with no bid, and
+// then closes on server time like any other.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn worker_starts_a_scheduled_auction_then_closes_it_on_server_time(pool: PgPool) {
+    let app = test_app(pool).await;
+    let holder = Uuid::new_v4();
+    let seller = new_actor(&app).await;
+    let mut register = register_auction_command(&seller.pubky);
+    register["payload"]["auction_terms"]["starts_at"] = json!("2026-08-19T22:01:00.000Z");
+    let (status, body) = execute(&app, &seller.token, &register).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let auction_status = || async {
+        let (auction, revision): (serde_json::Value, i64) =
+            sqlx::query_as("SELECT auction, server_revision FROM listings WHERE aggregate_id = $1")
+                .bind(listing_aggregate(&seller.pubky))
+                .fetch_one(&app.pool)
+                .await
+                .expect("auction listing exists");
+        (auction["status"].clone(), revision)
+    };
+    assert_eq!(auction_status().await, (json!("scheduled"), 1));
+
+    let summary = run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    assert_eq!(summary.auctions_started, 0, "not due before its start");
+
+    app.clock.advance_seconds(61);
+    let summary = run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    assert_eq!(summary.auctions_started, 1);
+    assert_eq!(summary.auctions_closed, 0);
+    assert_eq!(auction_status().await, (json!("active"), 2));
+    let summary = run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    assert_eq!(
+        summary.auctions_started, 0,
+        "a started auction is not restarted"
+    );
+
+    app.clock.advance_seconds(600);
+    let summary = run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    assert_eq!(summary.auctions_closed, 1);
+    assert_eq!(auction_status().await.0, json!("unsold"));
+    assert_eq!(
+        count(
+            &app.pool,
+            "SELECT COUNT(*) FROM events WHERE kind = 'auction.started'"
+        )
+        .await,
+        1
+    );
+}
+
 // Two instances cannot hold the same task lease at the same time; the lease
 // is recoverable after it lapses.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
