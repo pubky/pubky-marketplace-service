@@ -16,7 +16,7 @@ const PRODUCTION_ENVIRONMENT_ID = "404919ad-fb95-4621-9f45-b7f993dfa8ae";
 const STAGING_IMAGE =
   "ghcr.io/pubky/pubky-marketplace-service@sha256:f8046b0c295aeb88b61a1f0a73dcd1e8eafccbc06eb424f5e858ef2ae96799b8";
 const PRODUCTION_IMAGE =
-  "ghcr.io/pubky/pubky-marketplace-service@sha256:f8046b0c295aeb88b61a1f0a73dcd1e8eafccbc06eb424f5e858ef2ae96799b8";
+  "ghcr.io/pubky/pubky-marketplace-service@sha256:b498078ce0de1548fd6b4e2fd5b4a1a20175c6db6b12594a20995f1d81166ff5";
 
 const sharedDeploy = {
   healthcheckPath: "/ready",
