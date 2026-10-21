@@ -15,7 +15,7 @@ async fn migration_0082_adds_the_command_kind_and_is_rerunnable(pool: PgPool) {
     .expect("0082 must be directly rerunnable");
 
     let kinds: Vec<(i16, String)> = sqlx::query_as(
-        "SELECT id, name FROM command_refusal_command_kinds WHERE id >= 41 ORDER BY id",
+        "SELECT id, name FROM command_refusal_command_kinds WHERE id = 41 ORDER BY id",
     )
     .fetch_all(&pool)
     .await

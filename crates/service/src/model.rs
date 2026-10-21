@@ -1957,6 +1957,10 @@ pub struct ReviewRow {
     pub communication: Option<i32>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Set by `review.withdraw` when the reviewer removed the review from
+    /// public view; `review.update` clears it. Only the reviewer's own views
+    /// carry it.
+    pub public_removed_at: Option<DateTime<Utc>>,
     /// Whether the order's reviews are still double-blind: a review window
     /// is open on the order and its reviews are not yet released. Computed
     /// by the query that read the row, never stored.
@@ -1964,7 +1968,8 @@ pub struct ReviewRow {
 }
 
 impl ReviewRow {
-    /// The review as its reviewer sees it, and as it reads once released.
+    /// The review as the counterparty reads it once released. It never
+    /// carries `public_removed`: a withdrawal is the author's own state.
     pub fn view(&self) -> Value {
         json!({
             "id": self.id,
@@ -1981,12 +1986,26 @@ impl ReviewRow {
         })
     }
 
+    /// The review as its author sees it: [`Self::view`] plus
+    /// `public_removed: true` while the review is withdrawn (omitted
+    /// otherwise).
+    pub fn own_view(&self) -> Value {
+        let mut view = self.view();
+        if self.public_removed_at.is_some() {
+            view["public_removed"] = json!(true);
+        }
+        view
+    }
+
     /// The review as `viewer` may read it. Until the order's reviews are
     /// released, a review by anyone else shows only that its role has
     /// submitted.
     pub fn view_for(&self, viewer: &str) -> Value {
         if self.withheld && self.reviewer_pubky != viewer {
             return json!({ "role": self.reviewer_role, "submitted": true });
+        }
+        if self.reviewer_pubky == viewer {
+            return self.own_view();
         }
         self.view()
     }

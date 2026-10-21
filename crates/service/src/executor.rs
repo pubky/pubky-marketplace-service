@@ -623,6 +623,7 @@ fn command_kind(payload: &CommandPayload) -> CommandKind {
         CommandPayload::ConfirmRefundDestination(_) => CommandKind::ConfirmRefundDestination,
         CommandPayload::CreateReview(_) => CommandKind::CreateReview,
         CommandPayload::UpdateReview(_) => CommandKind::UpdateReview,
+        CommandPayload::WithdrawReview(_) => CommandKind::WithdrawReview,
         CommandPayload::SetBandConsent(_) => CommandKind::SetBandConsent,
     }
 }
@@ -924,6 +925,9 @@ async fn dispatch(
         }
         CommandPayload::UpdateReview(payload) => {
             crate::handlers::reviews::update(tx, actor, command, payload, now).await
+        }
+        CommandPayload::WithdrawReview(payload) => {
+            crate::handlers::reviews::withdraw(tx, actor, command, payload, now).await
         }
         CommandPayload::SetBandConsent(payload) => {
             crate::handlers::attestation::set_band_consent(tx, actor, command, payload, now).await
