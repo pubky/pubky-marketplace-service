@@ -49,7 +49,7 @@ async fn annotate(pool: &PgPool, outcome: &str) -> Result<(), sqlx::Error> {
 }
 
 async fn outcomes(pool: &PgPool) -> Vec<String> {
-    sqlx::query_scalar("SELECT outcome FROM attestation_annotations ORDER BY outcome")
+    sqlx::query_scalar("SELECT outcome FROM attestation_annotations ORDER BY outcome COLLATE \"C\"")
         .fetch_all(pool)
         .await
         .expect("outcomes")
