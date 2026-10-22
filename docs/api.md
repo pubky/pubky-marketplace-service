@@ -415,8 +415,8 @@ request failed, so clients should branch on HTTP status first, and parse
    `COMMERCE_UNAVAILABLE_IN_REGION` exists only while `REGION_MODES` blocks a
    region (see [Region modes](../README.md#region-modes)). It refuses
    `checkout.create`, `offer.create`, `offer.checkout` and `auction.place_bid`
-   (which must carry `payload.buyer_country`, 422 `INVALID_COMMAND` without it),
-   `payment.prepare_locks` and the first `POST /v0/orders/{id}/payment-method`
+   (`payload.buyer_country` is optional here: the request country decides, and
+   a declared country is checked when present), `payment.prepare_locks` and the first `POST /v0/orders/{id}/payment-method`
    of an order. `reason` is `buyer_region_blocked` (the declared country is
    blocked), `buyer_ip_blocked` (the request country from the header named by
    `CLIENT_COUNTRY_HEADER` is blocked, whatever the buyer declared) or

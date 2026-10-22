@@ -319,7 +319,7 @@ the command's transaction and after a stored replay is answered:
 
 | Entry point | Refused with | Reasons |
 |---|---|---|
-| `checkout.create`, `offer.create`, `offer.checkout`, `auction.place_bid` | `COMMERCE_UNAVAILABLE_IN_REGION` (409) | `buyer_region_blocked` (declared country), `buyer_ip_blocked`, `buyer_region_unknown`; the command must carry `buyer_country` |
+| `checkout.create`, `offer.create`, `offer.checkout`, `auction.place_bid` | `COMMERCE_UNAVAILABLE_IN_REGION` (409) | `buyer_region_blocked` (declared country), `buyer_ip_blocked`, `buyer_region_unknown`; `buyer_country` is optional (the IP country decides), and required only while a region is `nuanced` |
 | the same four, on a listing whose seller's shop country is blocked | `SELLER_UNAVAILABLE_IN_REGION` (409) | `seller_region_blocked` (the shop record is read, fail closed) |
 | `payment.prepare_locks`, `POST /v0/orders/{id}/payment-method` (the first bind) | as above | the order's declared country, the request's IP and the seller's shop country |
 | `listing.register`, `listing.sync`, `drop.sync`, `PUT /v0/sellers/me/payment-config` | `SELLER_UNAVAILABLE_IN_REGION` (409) | `seller_region_blocked` (shop country), `seller_ip_blocked` (the seller's own request); an unknown origin is `COMMERCE_UNAVAILABLE_IN_REGION` `buyer_region_unknown` |

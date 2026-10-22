@@ -262,9 +262,9 @@ pub async fn gate(
     let Some(country) = buyer_country_of(&command.payload) else {
         return Ok(FencePlan::off());
     };
-    let Some(country) = country else {
+    if country.is_none() && modes.has_nuanced_country() {
         return Err(missing_country());
-    };
+    }
     let mut sellers: Vec<String> = listings
         .iter()
         .filter(|listing| listing.live)
@@ -276,7 +276,7 @@ pub async fn gate(
     let mut plan = FencePlan {
         enabled: true,
         modes: modes.clone(),
-        buyer_country: Some(country.to_string()),
+        buyer_country: country.map(str::to_string),
         sellers: BTreeMap::new(),
     };
     if sellers.is_empty() {
@@ -294,7 +294,7 @@ pub async fn gate(
                 SELLER_BLOCKED_MESSAGE,
             ));
         }
-        if let Some(failure) = region_verdict(modes, facts, country) {
+        if let Some(failure) = country.and_then(|country| region_verdict(modes, facts, country)) {
             return Err(failure);
         }
     }
@@ -403,7 +403,7 @@ pub async fn check_new_order(
     if !plan.enabled {
         return Ok(());
     }
-    let (Some(facts), Some(country)) = (plan.facts(seller_pubky), plan.buyer_country()) else {
+    let Some(facts) = plan.facts(seller_pubky) else {
         // The gate read every live seller of the command; an order for a
         // seller it did not read is not one the fence can vouch for.
         return Err(unavailable());
@@ -413,7 +413,7 @@ pub async fn check_new_order(
         &plan.modes,
         seller_pubky,
         facts,
-        country,
+        plan.buyer_country(),
         Some(order),
         now,
     )
@@ -530,13 +530,13 @@ pub async fn check_limits(
     modes: &RegionModes,
     seller_pubky: &str,
     facts: &SellerFacts,
-    buyer_country: &str,
+    buyer_country: Option<&str>,
     order: Option<NewOrder<'_>>,
     now: DateTime<Utc>,
 ) -> Result<(), CommandFailure> {
     let annual_limit = modes.annual_limit_applies(facts.country.as_deref());
-    let reconfirmation =
-        facts.status == SellerStatus::Private && modes.reconfirmation_applies(buyer_country);
+    let reconfirmation = facts.status == SellerStatus::Private
+        && buyer_country.is_some_and(|country| modes.reconfirmation_applies(country));
     if !annual_limit && !reconfirmation {
         return Ok(());
     }

@@ -207,6 +207,12 @@ impl RegionModes {
             || self.countries.values().any(|mode| *mode == Mode::Blocked)
     }
 
+    /// Whether any named country is nuanced: only then do C3 and C4 need the
+    /// buyer's declared country.
+    pub fn has_nuanced_country(&self) -> bool {
+        self.countries.values().any(|mode| *mode == Mode::Nuanced)
+    }
+
     /// Whether digital items are held back for any region.
     pub fn holds_digital(&self) -> bool {
         self.unknown_mode() == Mode::Nuanced

@@ -296,19 +296,24 @@ async fn an_open_region_is_untouched(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn the_buyer_country_is_required_while_a_region_is_blocked(pool: PgPool) {
+async fn the_declared_country_is_optional_while_the_ip_decides_in_a_blocked_region(pool: PgPool) {
     let (setup, homeserver) = test_app_with_shop_homeserver(pool).await;
     let seller = seller_in(&setup, &homeserver, "CH", None).await;
     let app = launch(&setup);
     let buyer = new_actor(&app).await;
-    let missing = execute_from(&app, &buyer.token, &checkout(&seller, 1, None), Some("CH")).await;
-    assert_eq!(missing.0, StatusCode::UNPROCESSABLE_ENTITY, "{}", missing.1);
-    assert_eq!(missing.1["error"]["code"], json!("INVALID_COMMAND"));
-    assert_eq!(
-        missing.1["error"]["issues"][0]["path"],
-        json!("payload.buyer_country")
+    assert_commerce_refused(
+        &execute_from(&app, &buyer.token, &checkout(&seller, 1, None), Some("US")).await,
+        "buyer_ip_blocked",
+    );
+    assert_commerce_refused(
+        &execute_from(&app, &buyer.token, &checkout(&seller, 1, None), None).await,
+        "buyer_region_unknown",
     );
     assert_eq!(orders(&app).await, 0);
+    assert_accepted(
+        &execute_from(&app, &buyer.token, &checkout(&seller, 1, None), Some("CH")).await,
+    );
+    assert_eq!(orders(&app).await, 1);
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
@@ -372,11 +377,13 @@ async fn offer_create_is_refused_in_a_blocked_region_and_passes_in_an_open_one(p
         &execute_from(&app, &buyer.token, &offer(Some("CH")), None).await,
         "buyer_region_unknown",
     );
-    let missing = execute_from(&app, &buyer.token, &offer(None), Some("CH")).await;
-    assert_eq!(missing.0, StatusCode::UNPROCESSABLE_ENTITY, "{}", missing.1);
+    assert_commerce_refused(
+        &execute_from(&app, &buyer.token, &offer(None), Some("US")).await,
+        "buyer_ip_blocked",
+    );
     assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM offers").await, 0);
 
-    assert_accepted(&execute_from(&app, &buyer.token, &offer(Some("CH")), Some("CH")).await);
+    assert_accepted(&execute_from(&app, &buyer.token, &offer(None), Some("CH")).await);
     assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM offers").await, 1);
 }
 
@@ -482,11 +489,13 @@ async fn a_bid_is_refused_in_a_blocked_region_and_passes_in_an_open_one(pool: Pg
         &execute_from(&app, &bidder.token, &bid(Some("CH")), None).await,
         "buyer_region_unknown",
     );
-    let missing = execute_from(&app, &bidder.token, &bid(None), Some("CH")).await;
-    assert_eq!(missing.0, StatusCode::UNPROCESSABLE_ENTITY, "{}", missing.1);
+    assert_commerce_refused(
+        &execute_from(&app, &bidder.token, &bid(None), Some("US")).await,
+        "buyer_ip_blocked",
+    );
     assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM bids").await, 0);
 
-    assert_accepted(&execute_from(&app, &bidder.token, &bid(Some("CH")), Some("CH")).await);
+    assert_accepted(&execute_from(&app, &bidder.token, &bid(None), Some("CH")).await);
     assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM bids").await, 1);
 }
 

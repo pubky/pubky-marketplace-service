@@ -7,8 +7,7 @@
 //! hold (a stored result is answered first):
 //!
 //! - **Buying:** `checkout.create` (which carries drop claims),
-//!   `offer.create`, `offer.checkout` and `auction.place_bid` need the
-//!   buyer's `buyer_country`, and are refused with
+//!   `offer.create`, `offer.checkout` and `auction.place_bid` are refused with
 //!   `COMMERCE_UNAVAILABLE_IN_REGION` (409) when the declared country is
 //!   blocked (`buyer_region_blocked`), when the request's own country from
 //!   the trusted edge header is blocked (`buyer_ip_blocked`), or when the
@@ -48,8 +47,7 @@ use crate::homeserver::HomeserverFetchOutcome;
 use crate::listing_lifecycle::{lifecycle_of_record, ListingLifecycle};
 use crate::refusal_audit::RefusalKind;
 use crate::region_fence::{
-    missing_country, read_sellers, region_refusal, unavailable, REASON_SELLER_REGION_BLOCKED,
-    SELLER_BLOCKED_MESSAGE,
+    read_sellers, region_refusal, unavailable, REASON_SELLER_REGION_BLOCKED, SELLER_BLOCKED_MESSAGE,
 };
 use crate::region_policy::{Block, IpBlock};
 use crate::result::CommandFailure;
@@ -129,11 +127,8 @@ pub async fn gate(
         | CommandPayload::CreateOffer(_)
         | CommandPayload::OfferCheckout(_)
         | CommandPayload::PlaceBid(_) => {
-            let Some(country) = crate::region_fence::buyer_country_of(&command.payload).flatten()
-            else {
-                return Err(missing_country());
-            };
-            buyer_check(state, Some(country), edge)
+            let country = crate::region_fence::buyer_country_of(&command.payload).flatten();
+            buyer_check(state, country, edge)
         }
         CommandPayload::PrepareLocks(payload) => {
             let order: Option<OrderFacts> = sqlx::query_as(
