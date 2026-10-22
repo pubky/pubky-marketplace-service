@@ -1,0 +1,17 @@
+[package]
+name = "specs-parity"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+publish = false
+description = "Checks the service's attestor records against the pubky-app-specs crate"
+
+# Its own workspace and lockfile: pubky-app-specs depends on pubky 0.9, whose
+# pkarr pins an ed25519 pre-release that cannot share a dependency graph with
+# the service's pubky 0.16. See crates/service/src/attestor_records.rs.
+[workspace]
+
+[dependencies]
+# Pin: the tag v0.6.2-marketplace.16, by commit.
+pubky-app-specs = { git = "https://github.com/BitcoinErrorLog/pubky-app-specs", rev = "5ef6e31e89530a58e66044a08fb6baf704adabc7" }
+serde_json = "1"

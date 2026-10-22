@@ -5125,6 +5125,7 @@ pub struct WorkerSummary {
     pub refusal_audit_rows_purged: u64,
     pub listings_tombstoned: u64,
     pub reviews_released: u64,
+    pub attestor_records_published: u64,
 }
 
 /// Samples the bounded sole source once per server-time bucket, one sample
@@ -5496,6 +5497,13 @@ pub async fn run_once(
         .await;
         release_lease(&state.pool, TASK_REVIEW_RELEASE, holder, now).await?;
         summary.reviews_released = result?;
+    }
+    // The attestor's own records (profile, refund and return annotations). A
+    // failed pass is logged inside and retried under each path's backoff, so it
+    // never holds up the tasks after it.
+    if state.attestor_publisher.is_some() {
+        summary.attestor_records_published =
+            crate::attestor_publish::run_pass(state, holder, now).await;
     }
     // Pickup maintenance runs only when the sealing keys are configured:
     // the retention purge of pinned versions/snapshots whose referencing

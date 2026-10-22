@@ -575,8 +575,9 @@ async fn refund_outcomes_annotate_the_order_ref(pool: PgPool) {
     let order_ref = attestor.order_ref(order_id.parse().expect("uuid"));
 
     // The peer-to-peer return flow: the buyer requests, the seller approves
-    // and receives, then records the externally evidenced refund — the
-    // refund annotates the order_ref (never revokes anything).
+    // and receives (the return annotates the order_ref `returned`), then records
+    // the externally evidenced refund, which annotates it `refunded`. Neither
+    // revokes anything.
     let (status, body) = execute(
         &app,
         &buyer.token,
@@ -624,7 +625,10 @@ async fn refund_outcomes_annotate_the_order_ref(pool: PgPool) {
     .fetch_all(&app.pool)
     .await
     .expect("annotations readable");
-    assert_eq!(outcomes, vec![("refunded".to_string(),)]);
+    assert_eq!(
+        outcomes,
+        vec![("refunded".to_string(),), ("returned".to_string(),)]
+    );
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]

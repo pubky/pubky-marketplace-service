@@ -11,6 +11,8 @@ pub use test_migrator::TEST_MIGRATOR;
 
 pub mod address_search;
 pub mod attestor;
+pub mod attestor_publish;
+pub mod attestor_records;
 pub mod auth;
 pub mod automation;
 pub mod bitcoin_review;
@@ -109,6 +111,11 @@ pub struct AppState {
     /// stat job does not run (fail closed;
     /// see [`attestor::Attestor::from_env`]).
     pub attestor: Option<Arc<Attestor>>,
+    /// Writes the attestor's profile and annotations to its own homeserver
+    /// (`ATTESTOR_PUBLISH_ENABLED`). `None` when publishing is off: the worker
+    /// task does not run and no network call is made (see
+    /// [`attestor_publish::AttestorPublisher::from_env`]).
+    pub attestor_publisher: Option<Arc<attestor_publish::AttestorPublisher>>,
     /// Reads a recorded USDT refund's transaction on Arbitrum One
     /// (`ARBITRUM_RPC_URL`); `None` records it unchecked.
     pub refund_chain: Option<Arc<dyn refund_chain::RefundChain>>,
@@ -212,6 +219,7 @@ impl AppState {
             config: Arc::new(config),
             locks: None,
             attestor: None,
+            attestor_publisher: None,
             refund_chain: None,
             homeserver: None,
             command_flights: command_flight::CommandFlights::default(),
@@ -240,6 +248,14 @@ impl AppState {
 
     pub fn with_attestor(mut self, attestor: Option<Arc<Attestor>>) -> Self {
         self.attestor = attestor;
+        self
+    }
+
+    pub fn with_attestor_publisher(
+        mut self,
+        publisher: Option<Arc<attestor_publish::AttestorPublisher>>,
+    ) -> Self {
+        self.attestor_publisher = publisher;
         self
     }
 

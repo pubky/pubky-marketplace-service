@@ -179,12 +179,14 @@ pub async fn approve(
         actor,
         command,
         payload,
+        None,
         ReturnStep {
             from_order_state: "return_requested",
             to_order_state: "return_approved",
             to_return_state: "approved",
             invalid_message: "No return is pending approval.",
             event_kind: "return.approved",
+            annotation: None,
         },
         now,
     )
@@ -283,11 +285,15 @@ pub async fn cancel(
     .await
 }
 
+/// `return.receive`: the seller has the goods back, which completes the return.
+/// The attestor annotates the order's `order_ref` with `returned` (the refund,
+/// when the seller records one, annotates it with `refunded`).
 pub async fn receive(
     tx: &mut Transaction<'_, Postgres>,
     actor: &str,
     command: &Command,
     payload: &OrderActionPayload,
+    attestor: Option<&crate::attestor::Attestor>,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     advance_return(
@@ -295,12 +301,14 @@ pub async fn receive(
         actor,
         command,
         payload,
+        attestor,
         ReturnStep {
             from_order_state: "return_approved",
             to_order_state: "return_received",
             to_return_state: "received",
             invalid_message: "The return is not approved.",
             event_kind: "return.received",
+            annotation: Some("returned"),
         },
         now,
     )
@@ -313,6 +321,8 @@ struct ReturnStep {
     to_return_state: &'static str,
     invalid_message: &'static str,
     event_kind: &'static str,
+    /// The attestor outcome the step records against the order's `order_ref`.
+    annotation: Option<&'static str>,
 }
 
 /// Seller-driven return progression shared by approve and receive: the order
@@ -323,6 +333,7 @@ async fn advance_return(
     actor: &str,
     command: &Command,
     payload: &OrderActionPayload,
+    attestor: Option<&crate::attestor::Attestor>,
     step: ReturnStep,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
@@ -384,6 +395,13 @@ async fn advance_return(
     .bind(now)
     .fetch_one(&mut **tx)
     .await?;
+
+    if let (Some(outcome), Some(attestor)) = (step.annotation, attestor) {
+        crate::handlers::attestation::insert_annotation(
+            tx, attestor, updated.id, outcome, None, now,
+        )
+        .await?;
+    }
 
     let recipient = updated.buyer_pubky.clone();
     finish_order_action(

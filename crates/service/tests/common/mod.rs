@@ -3,6 +3,7 @@
 //! through the full HTTP stack, including Pubky AuthToken auth.
 #![allow(dead_code)]
 
+pub mod attestor_records;
 pub mod connector_provider;
 pub mod fx_feed;
 pub mod paykit_review;
