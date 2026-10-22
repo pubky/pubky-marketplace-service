@@ -46,6 +46,13 @@ pub enum ErrorCode {
     /// The cart has a digital line and the buyer's country is in the EU-27
     /// or is GB. Only returned while `DIGITAL_REGION_BLOCK_ENABLED` is on.
     DigitalUnavailableInRegion,
+    /// The request's region is blocked for commerce: the buyer's declared
+    /// country or the request's own country is a `blocked` region, or the
+    /// request's country is unknown while unknown origins are blocked.
+    /// `error.reason` is `buyer_region_blocked`, `buyer_ip_blocked` or
+    /// `buyer_region_unknown`. Only returned while `REGION_MODES` blocks a
+    /// region.
+    CommerceUnavailableInRegion,
 }
 
 impl ErrorCode {
@@ -75,7 +82,8 @@ impl ErrorCode {
             | ErrorCode::ListingNotActive
             | ErrorCode::SellerUnavailableInRegion
             | ErrorCode::SellerAnnualLimitReached
-            | ErrorCode::DigitalUnavailableInRegion => 409,
+            | ErrorCode::DigitalUnavailableInRegion
+            | ErrorCode::CommerceUnavailableInRegion => 409,
             ErrorCode::UpstreamUnavailable => 503,
         }
     }

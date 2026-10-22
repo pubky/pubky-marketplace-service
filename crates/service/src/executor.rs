@@ -147,13 +147,50 @@ pub async fn execute_with_edge(
         }
     }
 
+    // Commerce in a blocked region (`REGION_MODES`): buying, starting a
+    // payment and selling are refused for a blocked declared country, a
+    // blocked or unknown IP country and a blocked seller shop country. Only
+    // the commands that start new commerce are checked; a replay is answered
+    // from its stored result.
+    if state.config.region_policy().commerce_active()
+        && crate::commerce_region::is_gated(&command.payload)
+        && stored_command_result(&state.pool, actor, command.command_id)
+            .await?
+            .is_none()
+    {
+        if let Err(failure) = crate::commerce_region::gate(state, actor, &command, edge).await {
+            log_command(
+                actor,
+                command.kind(),
+                &command.command_id.to_string(),
+                &command.aggregate_id,
+                "refused",
+                Some(failure.code()),
+                Some(failure.message()),
+                command.expected_revision,
+                started.elapsed().as_millis() as u64,
+            );
+            enqueue_refusal(
+                state,
+                actor,
+                state.clock.now(),
+                SurfaceKind::V1Command,
+                command_kind(&command.payload),
+                failure.refusal_kind(),
+                Some(command.command_id),
+            );
+            return Ok(failure_response(&failure));
+        }
+    }
+
     // The EU scope fence (legal launch plan C2-C4), when `EU_FENCE_ENABLED`
-    // is on: a command that sells needs the buyer's country, and a buyer in
-    // the EU-27 or GB buys only from a declared private seller. The sellers'
-    // shop records are read here for the same reason as above. A replay is
-    // answered from its stored result.
+    // is on or `REGION_MODES` restricts a region: a command that sells needs
+    // the buyer's country, a buyer in a nuanced region buys only from a
+    // declared private seller, and a seller in a blocked region sells to
+    // nobody. The sellers' shop records are read here for the same reason as
+    // above. A replay is answered from its stored result.
     let mut fence = crate::region_fence::FencePlan::off();
-    if state.config.eu_fence_enabled
+    if state.config.region_policy().fence_active()
         && crate::region_fence::buyer_country_of(&command.payload).is_some()
         && stored_command_result(&state.pool, actor, command.command_id)
             .await?
@@ -191,9 +228,9 @@ pub async fn execute_with_edge(
     }
 
     // No digital sales to EU or UK buyers (legal launch plan C3b), when
-    // `DIGITAL_REGION_BLOCK_ENABLED` is on. A replay is answered from its
-    // stored result.
-    if state.config.digital_region_block_enabled
+    // `DIGITAL_REGION_BLOCK_ENABLED` is on or `REGION_MODES` has a nuanced
+    // region. A replay is answered from its stored result.
+    if state.config.region_policy().digital_active()
         && stored_command_result(&state.pool, actor, command.command_id)
             .await?
             .is_none()
@@ -796,7 +833,7 @@ async fn dispatch(
                 state.locks.as_deref(),
                 state.homeserver.as_deref(),
                 state.config.locks_payment_window_seconds,
-                state.config.eu_fence_enabled,
+                state.config.region_policy().fence_modes(),
                 now,
             )
             .await

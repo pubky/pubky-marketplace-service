@@ -642,6 +642,10 @@ pub async fn put_payment_config(
     Extension(actor): Extension<Actor>,
     request: Request,
 ) -> Response {
+    let edge = crate::digital_region::EdgeContext::from_headers(
+        request.headers(),
+        &state.config.client_country_header,
+    );
     let usdt_flag = state.config.usdt_payments_enabled;
     let (body, usdt_consent) = if usdt_flag {
         match Json::<PutPaymentConfigUsdtBody>::from_request(request, &state).await {
@@ -664,6 +668,14 @@ pub async fn put_payment_config(
     };
     if let Err(response) = payments_runtime(&state) {
         return *response;
+    }
+    if let Err(failure) = crate::commerce_region::gate_payment_setup(&state, &actor.0, &edge).await
+    {
+        return method_error(
+            failure.code(),
+            failure.reason().unwrap_or("region_blocked"),
+            failure.message(),
+        );
     }
     if body.stripe_payment_link.is_some()
         || body
@@ -1484,12 +1496,27 @@ pub async fn bind_payment_method(
     State(state): State<AppState>,
     Extension(actor): Extension<Actor>,
     Path(order_id): Path<Uuid>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<BindPaymentMethodBody>,
 ) -> Response {
     let payments = match payments_runtime(&state) {
         Ok(payments) => payments,
         Err(response) => return *response,
     };
+    // Starting a payment from a blocked region is refused; a re-bind of the
+    // method already bound is not a start and passes.
+    let edge = crate::digital_region::EdgeContext::from_headers(
+        &headers,
+        &state.config.client_country_header,
+    );
+    if let Err(failure) = crate::commerce_region::gate_bind(&state, &actor.0, order_id, &edge).await
+    {
+        return method_error(
+            failure.code(),
+            failure.reason().unwrap_or("region_blocked"),
+            failure.message(),
+        );
+    }
     let method = body.method.as_str();
     let usdt_enabled = state.config.usdt_payments_enabled;
     let Some(bind) = BindMethod::parse(method, usdt_enabled) else {
@@ -1989,8 +2016,9 @@ pub async fn bind_payment_method(
     // The EU seller's annual limit (legal launch plan C4) at payment start:
     // the buyer is not asked to pay a seller who has reached it. Before any
     // listing lock, so the per-seller counter lock stays first.
-    if state.config.eu_fence_enabled {
-        if let Err(failure) = crate::region_fence::recheck_at_payment(&mut tx, order.id, now).await
+    if let Some(modes) = state.config.region_policy().fence_modes() {
+        if let Err(failure) =
+            crate::region_fence::recheck_at_payment(&mut tx, modes, order.id, now).await
         {
             return method_error(
                 failure.code(),

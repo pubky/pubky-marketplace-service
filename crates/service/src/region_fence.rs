@@ -1,17 +1,21 @@
-//! The EU scope fence (legal launch plan C2-C4), behind `EU_FENCE_ENABLED`.
+//! The EU scope fence (legal launch plan C2-C4), behind `EU_FENCE_ENABLED`
+//! or, with `REGION_MODES` set, for every nuanced region
+//! ([`crate::region_policy`]).
 //!
 //! The launch design keeps business-seller duties out of EU sales by
 //! limiting what the service accepts, from facts the sellers and buyers
 //! publish themselves:
 //!
-//! - **C3, regional gate.** A buyer in the EU-27 or GB can buy only from a
-//!   seller who declared `sellerStatus: "private"` in their own shop record.
+//! - **C3, regional gate.** A buyer in a nuanced region (the EU-27 and GB
+//!   unless `REGION_MODES` says otherwise) can buy only from a seller who
+//!   declared `sellerStatus: "private"` in their own shop record.
 //!   A seller who declared `"trader"`, or declared nothing, is unavailable to
 //!   these buyers: `SELLER_UNAVAILABLE_IN_REGION` with reason
 //!   `business_seller` or `undeclared_seller`. GB is in C3 because UK
 //!   consumers buying from a business have a 14-day withdrawal right under
 //!   the Consumer Contracts Regulations 2013; C4 below stays EU-only (DAC7).
-//! - **C4, annual limit.** A seller whose shop country is in the EU-27 stops
+//! - **C4, annual limit.** A seller whose shop country is in the EU-27 and is
+//!   a nuanced region stops
 //!   at 29 paid sales and EUR 2,000 of paid orders per calendar year (UTC),
 //!   whichever comes first: `SELLER_ANNUAL_LIMIT_REACHED`. Only paid orders
 //!   count (a confirmed payment, whatever became of the order afterwards, so
@@ -42,7 +46,12 @@
 //! winning order is created by the close and is not refused there, since the
 //! bidder already won; the limit is enforced at the bid and again at payment.
 //!
-//! With the flag off nothing here refuses and no shop record is read.
+//! A seller whose shop country is a blocked region cannot sell at all:
+//! [`gate`] refuses every buyer command on their listings with
+//! `SELLER_UNAVAILABLE_IN_REGION`, reason `seller_region_blocked`, from the
+//! same shop record read.
+//!
+//! With the fence off nothing here refuses and no shop record is read.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -50,9 +59,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Datelike, TimeZone, Utc};
 use marketplace_domain::commands::{Command, CommandPayload};
-use marketplace_domain::region::{
-    is_eu_country, is_private_seller_only_country, shop_country_from_record, SellerStatus, EU_27,
-};
+use marketplace_domain::region::{shop_country_from_record, SellerStatus, EU_27};
 use marketplace_domain::{Currency, ErrorCode, ValidationIssue};
 use serde_json::Value;
 use sqlx::{PgConnection, Postgres, Transaction};
@@ -62,6 +69,7 @@ use uuid::Uuid;
 use crate::homeserver::{HomeserverFetchOutcome, HomeserverListingClient};
 use crate::listing_moderation::SoldListing;
 use crate::refusal_audit::RefusalKind;
+use crate::region_policy::RegionModes;
 use crate::result::CommandFailure;
 use crate::AppState;
 
@@ -72,11 +80,15 @@ pub const ANNUAL_SALES_LIMIT: i64 = 29;
 pub const ANNUAL_EUR_LIMIT_CENTS: u64 = 200_000;
 
 pub const REGION_MESSAGE: &str = "This seller doesn't sell to buyers in the EU or UK.";
+/// A buyer command on a listing whose seller's shop country is blocked.
+pub const SELLER_BLOCKED_MESSAGE: &str = "This seller can't sell on Pubky Market right now.";
 pub const RECONFIRM_MESSAGE: &str =
     "This seller must confirm they still sell as a private individual before selling again.";
 pub const LIMIT_MESSAGE: &str = "This seller isn't taking new orders right now.";
 pub const REASON_BUSINESS: &str = "business_seller";
 pub const REASON_UNDECLARED: &str = "undeclared_seller";
+/// The seller's shop country is a blocked region.
+pub const REASON_SELLER_REGION_BLOCKED: &str = "seller_region_blocked";
 pub const REASON_RECONFIRM: &str = "private_seller_reconfirmation_required";
 pub const REASON_SALES_LIMIT: &str = "annual_sales_limit";
 pub const REASON_AMOUNT_LIMIT: &str = "annual_amount_limit";
@@ -132,10 +144,6 @@ impl SellerFacts {
             status_confirmed_at: None,
         }
     }
-
-    pub fn resident_in_eu(&self) -> bool {
-        self.country.as_deref().is_some_and(is_eu_country)
-    }
 }
 
 /// What [`gate`] learned for one command, handed to the handler that
@@ -144,6 +152,7 @@ impl SellerFacts {
 #[derive(Debug, Clone, Default)]
 pub struct FencePlan {
     pub enabled: bool,
+    modes: RegionModes,
     buyer_country: Option<String>,
     sellers: BTreeMap<String, SellerFacts>,
 }
@@ -180,7 +189,7 @@ pub fn buyer_country_of(payload: &CommandPayload) -> Option<Option<&str>> {
     }
 }
 
-fn region_refusal(reason: &'static str, message: &str) -> CommandFailure {
+pub(crate) fn region_refusal(reason: &'static str, message: &str) -> CommandFailure {
     CommandFailure::refused_with_reason(
         RefusalKind::InvalidState,
         ErrorCode::SellerUnavailableInRegion,
@@ -198,7 +207,7 @@ fn limit_refusal(reason: &'static str) -> CommandFailure {
     )
 }
 
-fn unavailable() -> CommandFailure {
+pub(crate) fn unavailable() -> CommandFailure {
     CommandFailure::refused(
         RefusalKind::UpstreamUnavailable,
         ErrorCode::UpstreamUnavailable,
@@ -206,7 +215,7 @@ fn unavailable() -> CommandFailure {
     )
 }
 
-fn missing_country() -> CommandFailure {
+pub(crate) fn missing_country() -> CommandFailure {
     CommandFailure::refused_with_issues(
         RefusalKind::InvalidCommand,
         ErrorCode::InvalidCommand,
@@ -219,10 +228,14 @@ fn missing_country() -> CommandFailure {
     )
 }
 
-/// The refusal C3 gives a buyer in the EU-27 or GB for a seller who is not a
+/// The refusal C3 gives a buyer in a nuanced region for a seller who is not a
 /// declared private seller; `None` when the sale is open.
-pub fn region_verdict(facts: &SellerFacts, buyer_country: &str) -> Option<CommandFailure> {
-    if !is_private_seller_only_country(buyer_country) {
+pub fn region_verdict(
+    modes: &RegionModes,
+    facts: &SellerFacts,
+    buyer_country: &str,
+) -> Option<CommandFailure> {
+    if !modes.private_seller_only(buyer_country) {
         return None;
     }
     match facts.status {
@@ -235,16 +248,17 @@ pub fn region_verdict(facts: &SellerFacts, buyer_country: &str) -> Option<Comman
 /// Runs before the command's transaction. With the fence off, or for a
 /// command that sells nothing, returns [`FencePlan::off`]. Otherwise the
 /// buyer's country is required, every live seller's shop record is read
-/// (fail closed), C3 is applied, and an offer or bid on a seller already at
-/// an annual limit is refused.
+/// (fail closed), a seller whose shop country is blocked is refused, C3 is
+/// applied, and an offer or bid on a seller already at an annual limit is
+/// refused.
 pub async fn gate(
     state: &AppState,
     command: &Command,
     listings: &[SoldListing],
 ) -> Result<FencePlan, CommandFailure> {
-    if !state.config.eu_fence_enabled {
+    let Some(modes) = state.config.region_policy().fence_modes() else {
         return Ok(FencePlan::off());
-    }
+    };
     let Some(country) = buyer_country_of(&command.payload) else {
         return Ok(FencePlan::off());
     };
@@ -261,6 +275,7 @@ pub async fn gate(
     let now = state.clock.now();
     let mut plan = FencePlan {
         enabled: true,
+        modes: modes.clone(),
         buyer_country: Some(country.to_string()),
         sellers: BTreeMap::new(),
     };
@@ -273,7 +288,13 @@ pub async fn gate(
     plan.sellers = read_sellers(homeserver, &sellers, now).await?;
     for seller in &sellers {
         let facts = &plan.sellers[seller];
-        if let Some(failure) = region_verdict(facts, country) {
+        if modes.shop_country_blocked(facts.country.as_deref()) {
+            return Err(region_refusal(
+                REASON_SELLER_REGION_BLOCKED,
+                SELLER_BLOCKED_MESSAGE,
+            ));
+        }
+        if let Some(failure) = region_verdict(modes, facts, country) {
             return Err(failure);
         }
     }
@@ -287,13 +308,13 @@ pub async fn gate(
         })?;
         for seller in &sellers {
             let facts = &plan.sellers[seller];
-            check_limits(&mut conn, seller, facts, country, None, now).await?;
+            check_limits(&mut conn, modes, seller, facts, country, None, now).await?;
         }
     }
     Ok(plan)
 }
 
-async fn read_sellers(
+pub(crate) async fn read_sellers(
     homeserver: Arc<dyn HomeserverListingClient>,
     sellers: &[String],
     now: DateTime<Utc>,
@@ -387,7 +408,16 @@ pub async fn check_new_order(
         // seller it did not read is not one the fence can vouch for.
         return Err(unavailable());
     };
-    check_limits(tx, seller_pubky, facts, country, Some(order), now).await
+    check_limits(
+        tx,
+        &plan.modes,
+        seller_pubky,
+        facts,
+        country,
+        Some(order),
+        now,
+    )
+    .await
 }
 
 /// Counted usage in a window.
@@ -497,14 +527,16 @@ async fn eur_cents(
 /// offer or a bid). `Err` carries the refusal the caller returns as is.
 pub async fn check_limits(
     conn: &mut PgConnection,
+    modes: &RegionModes,
     seller_pubky: &str,
     facts: &SellerFacts,
     buyer_country: &str,
     order: Option<NewOrder<'_>>,
     now: DateTime<Utc>,
 ) -> Result<(), CommandFailure> {
-    let annual_limit = facts.resident_in_eu();
-    let reconfirmation = facts.status == SellerStatus::Private && is_eu_country(buyer_country);
+    let annual_limit = modes.annual_limit_applies(facts.country.as_deref());
+    let reconfirmation =
+        facts.status == SellerStatus::Private && modes.reconfirmation_applies(buyer_country);
     if !annual_limit && !reconfirmation {
         return Ok(());
     }
@@ -584,6 +616,7 @@ pub async fn check_limits(
 /// refusals for those paths.
 pub async fn recheck_at_payment(
     tx: &mut Transaction<'_, Postgres>,
+    modes: &RegionModes,
     order_id: Uuid,
     now: DateTime<Utc>,
 ) -> Result<(), CommandFailure> {
@@ -602,9 +635,12 @@ pub async fn recheck_at_payment(
     let Some(order) = row else {
         return Err(unavailable());
     };
-    let annual_limit = order.seller_country.as_deref().is_some_and(is_eu_country);
+    let annual_limit = modes.annual_limit_applies(order.seller_country.as_deref());
     let reconfirmation = order.seller_status.as_deref() == Some(SellerStatus::Private.as_str())
-        && order.buyer_country.as_deref().is_some_and(is_eu_country);
+        && order
+            .buyer_country
+            .as_deref()
+            .is_some_and(|country| modes.reconfirmation_applies(country));
     if !annual_limit && !reconfirmation {
         return Ok(());
     }
@@ -741,9 +777,9 @@ pub async fn get_annual_limit(
             "The seller was not found.",
         ));
     }
-    if !state.config.eu_fence_enabled {
+    let Some(modes) = state.config.region_policy().fence_modes() else {
         return reply(StatusCode::OK, json!({ "enabled": false }));
-    }
+    };
     let now = state.clock.now();
     let Some(homeserver) = state.homeserver.clone() else {
         return failure(unavailable());
@@ -763,7 +799,8 @@ pub async fn get_annual_limit(
         }
     };
     let year = year_start(now);
-    let annual = if facts.resident_in_eu() {
+    let resident_in_eu = modes.annual_limit_applies(facts.country.as_deref());
+    let annual = if resident_in_eu {
         match usage(&mut conn, &seller_pubky, year, Scope::AllBuyers, None, now).await {
             Ok(annual) => Some(annual),
             Err(refusal) => return failure(refusal),
@@ -780,7 +817,7 @@ pub async fn get_annual_limit(
         "limit_reached": limit_reached,
     });
     if own {
-        body["resident_in_eu"] = json!(facts.resident_in_eu());
+        body["resident_in_eu"] = json!(resident_in_eu);
         body["sales_limit"] = json!(ANNUAL_SALES_LIMIT);
         body["eur_limit_cents"] = json!(ANNUAL_EUR_LIMIT_CENTS);
         if let Some(annual) = annual {
@@ -847,7 +884,7 @@ mod tests {
         assert_eq!(facts.status, SellerStatus::Private);
         assert_eq!(facts.country.as_deref(), Some("DE"));
         assert_eq!(facts.status_confirmed_at, Some(at("2026-10-01T08:00:00Z")));
-        assert!(facts.resident_in_eu());
+        assert!(RegionModes::legacy_nuanced().annual_limit_applies(facts.country.as_deref()));
     }
 
     #[test]
@@ -866,7 +903,7 @@ mod tests {
     fn a_record_with_nothing_is_undeclared_and_not_resident() {
         let facts = SellerFacts::from_shop_record(&json!({}), at("2026-10-23T12:00:00Z"));
         assert_eq!(facts, SellerFacts::undeclared());
-        assert!(!facts.resident_in_eu());
+        assert!(!RegionModes::legacy_nuanced().annual_limit_applies(facts.country.as_deref()));
     }
 
     #[test]
@@ -880,32 +917,62 @@ mod tests {
             ..SellerFacts::undeclared()
         };
         let undeclared = SellerFacts::undeclared();
-        assert!(region_verdict(&private, "DE").is_none());
+        let modes = RegionModes::legacy_nuanced();
+        assert!(region_verdict(&modes, &private, "DE").is_none());
         assert_eq!(
-            region_verdict(&trader, "DE").and_then(|failure| failure.reason()),
+            region_verdict(&modes, &trader, "DE").and_then(|failure| failure.reason()),
             Some(REASON_BUSINESS)
         );
         assert_eq!(
-            region_verdict(&undeclared, "FR").and_then(|failure| failure.reason()),
+            region_verdict(&modes, &undeclared, "FR").and_then(|failure| failure.reason()),
             Some(REASON_UNDECLARED)
         );
         for country in ["GB", "IE"] {
-            assert!(region_verdict(&private, country).is_none(), "{country}");
+            assert!(
+                region_verdict(&modes, &private, country).is_none(),
+                "{country}"
+            );
             assert_eq!(
-                region_verdict(&trader, country).and_then(|failure| failure.reason()),
+                region_verdict(&modes, &trader, country).and_then(|failure| failure.reason()),
                 Some(REASON_BUSINESS),
                 "{country}"
             );
             assert_eq!(
-                region_verdict(&undeclared, country).and_then(|failure| failure.reason()),
+                region_verdict(&modes, &undeclared, country).and_then(|failure| failure.reason()),
                 Some(REASON_UNDECLARED),
                 "{country}"
             );
         }
         for outside in ["CH", "US", "NO", "BR", "UK"] {
-            assert!(region_verdict(&trader, outside).is_none(), "{outside}");
-            assert!(region_verdict(&undeclared, outside).is_none(), "{outside}");
+            assert!(
+                region_verdict(&modes, &trader, outside).is_none(),
+                "{outside}"
+            );
+            assert!(
+                region_verdict(&modes, &undeclared, outside).is_none(),
+                "{outside}"
+            );
         }
+    }
+
+    #[test]
+    fn c3_follows_the_modes_not_a_fixed_country_list() {
+        let trader = SellerFacts {
+            status: SellerStatus::Trader,
+            ..SellerFacts::undeclared()
+        };
+        let modes = RegionModes::parse("EU=nuanced,DE=open,US=nuanced,GB=blocked").unwrap();
+        assert!(region_verdict(&modes, &trader, "FR").is_some());
+        assert!(region_verdict(&modes, &trader, "US").is_some());
+        assert!(
+            region_verdict(&modes, &trader, "DE").is_none(),
+            "an open member state buys from anyone"
+        );
+        assert!(
+            region_verdict(&modes, &trader, "GB").is_none(),
+            "a blocked country is refused earlier, by the commerce gate"
+        );
+        assert!(region_verdict(&RegionModes::default(), &trader, "FR").is_none());
     }
 
     #[test]

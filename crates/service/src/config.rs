@@ -6,6 +6,7 @@ use url::Url;
 use crate::payment_attempt::{MarketplaceAssets, MarketplaceContract};
 use crate::payments::{PaykitApi, ENV_PAYKIT_SERVER_API};
 use crate::refusal_audit::AuditKeys;
+use crate::region_policy::{RegionModes, RegionPolicy};
 
 /// Default PayPal Website Payments Standard checkout (`_xclick`).
 pub const DEFAULT_PAYPAL_CHECKOUT_URL: &str = "https://www.paypal.com/cgi-bin/webscr";
@@ -201,6 +202,12 @@ pub struct Config {
     /// delivery kind, or a Locks listing) need `buyer_country` and are
     /// refused with `DIGITAL_UNAVAILABLE_IN_REGION` for those buyers.
     pub digital_region_block_enabled: bool,
+    /// The per-region commerce modes (`REGION_MODES`; see
+    /// [`crate::region_policy`]). `None` when unset: the two flags above keep
+    /// their exact behaviour. When set it wins: every nuanced region runs C3,
+    /// C4 and C3b whatever those flags say, and a blocked region has no
+    /// buying, selling or paid unlocks.
+    pub region_modes: Option<RegionModes>,
     /// The request header the trusted edge sets to the client's country from
     /// its IP (`CLIENT_COUNTRY_HEADER`, default `x-client-region`), read for the
     /// digital hold. On GCP the load balancer's custom request header
@@ -260,6 +267,15 @@ pub struct Config {
 }
 
 impl Config {
+    /// The region policy these settings describe: `REGION_MODES` when set,
+    /// else the two legacy flags with their separate toggles.
+    pub fn region_policy(&self) -> RegionPolicy<'_> {
+        match &self.region_modes {
+            Some(modes) => RegionPolicy::explicit(modes),
+            None => RegionPolicy::legacy(self.eu_fence_enabled, self.digital_region_block_enabled),
+        }
+    }
+
     pub fn from_env() -> anyhow::Result<Self> {
         let database_url = std::env::var("DATABASE_URL")
             .map_err(|_| anyhow::anyhow!("DATABASE_URL must be set"))?;
@@ -401,6 +417,25 @@ impl Config {
             env_bool("REQUIRE_ENCRYPTED_DELIVERY_ADDRESS", false)?;
         let eu_fence_enabled = env_bool("EU_FENCE_ENABLED", false)?;
         let digital_region_block_enabled = env_bool("DIGITAL_REGION_BLOCK_ENABLED", false)?;
+        let region_modes = match std::env::var("REGION_MODES") {
+            Ok(raw) => {
+                let modes = RegionModes::parse(&raw)?;
+                for flag in ["EU_FENCE_ENABLED", "DIGITAL_REGION_BLOCK_ENABLED"] {
+                    if std::env::var_os(flag).is_some() {
+                        tracing::warn!(
+                            flag,
+                            "{flag} is ignored because REGION_MODES is set; REGION_MODES decides \
+                             every region's mode"
+                        );
+                    }
+                }
+                Some(modes)
+            }
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                anyhow::bail!("REGION_MODES must be valid UTF-8")
+            }
+        };
         let client_country_header = std::env::var("CLIENT_COUNTRY_HEADER")
             .ok()
             .map(|value| value.trim().to_ascii_lowercase())
@@ -488,6 +523,7 @@ impl Config {
             require_encrypted_delivery_address,
             eu_fence_enabled,
             digital_region_block_enabled,
+            region_modes,
             client_country_header,
             pickup_dispute_retention_days,
             digital_delivery_max_bytes,
@@ -558,6 +594,7 @@ impl Config {
             require_encrypted_delivery_address: false,
             eu_fence_enabled: false,
             digital_region_block_enabled: false,
+            region_modes: None,
             client_country_header: DEFAULT_CLIENT_COUNTRY_HEADER.to_string(),
             pickup_dispute_retention_days: 30,
             digital_delivery_max_bytes: DEFAULT_DIGITAL_DELIVERY_MAX_BYTES,
@@ -1071,6 +1108,118 @@ mod tests {
                 .contains(&AUTOMATION_RATE_LIMIT_MAX_TOKENS.to_string()),
             "unexpected: {error}"
         );
+    }
+
+    /// Collects what `tracing` logs while it is alive in this thread.
+    #[derive(Clone, Default)]
+    struct LogBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log buffer").extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
+        type Writer = LogBuffer;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn from_env_with_region_env(
+        region_modes: Option<&str>,
+        eu_fence: Option<&str>,
+        digital: Option<&str>,
+    ) -> (anyhow::Result<Config>, String) {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let logs = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, || {
+            from_env_with(&[
+                ("REGION_MODES", region_modes),
+                ("EU_FENCE_ENABLED", eu_fence),
+                ("DIGITAL_REGION_BLOCK_ENABLED", digital),
+            ])
+        });
+        let text = String::from_utf8(logs.0.lock().expect("log buffer").clone()).expect("utf8");
+        (result, text)
+    }
+
+    #[test]
+    fn region_modes_unset_keeps_the_legacy_flags_and_their_separate_toggles() {
+        for (fence, digital, expect_fence, expect_digital) in [
+            (None, None, false, false),
+            (Some("true"), None, true, false),
+            (None, Some("1"), false, true),
+            (Some("1"), Some("true"), true, true),
+        ] {
+            let (config, logs) = from_env_with_region_env(None, fence, digital);
+            let config = config.expect("from_env succeeds");
+            assert!(config.region_modes.is_none());
+            let policy = config.region_policy();
+            assert_eq!(policy.fence_active(), expect_fence);
+            assert_eq!(policy.digital_active(), expect_digital);
+            assert!(!policy.commerce_active());
+            assert!(!logs.contains("REGION_MODES"), "no warning: {logs}");
+        }
+    }
+
+    #[test]
+    fn region_modes_set_wins_and_warns_when_a_legacy_flag_is_also_set() {
+        let (config, logs) = from_env_with_region_env(
+            Some("EU=blocked,GB=blocked,US=blocked"),
+            Some("false"),
+            None,
+        );
+        let config = config.expect("from_env succeeds");
+        let policy = config.region_policy();
+        assert!(policy.commerce_active());
+        assert!(policy.fence_active());
+        assert!(!policy.digital_active());
+        assert!(
+            logs.contains("WARN") && logs.contains("EU_FENCE_ENABLED is ignored"),
+            "warns about the ignored flag: {logs}"
+        );
+        assert!(!logs.contains("DIGITAL_REGION_BLOCK_ENABLED"), "{logs}");
+
+        let (_, logs) = from_env_with_region_env(Some("none"), Some("true"), Some("true"));
+        assert!(logs.contains("EU_FENCE_ENABLED is ignored"), "{logs}");
+        assert!(
+            logs.contains("DIGITAL_REGION_BLOCK_ENABLED is ignored"),
+            "{logs}"
+        );
+
+        let (_, logs) = from_env_with_region_env(Some("none"), None, None);
+        assert!(logs.is_empty(), "no legacy flag, no warning: {logs}");
+    }
+
+    #[test]
+    fn region_modes_none_turns_every_path_off_whatever_the_legacy_flags_say() {
+        let (config, _) = from_env_with_region_env(Some("none"), Some("true"), Some("true"));
+        let config = config.expect("from_env succeeds");
+        let policy = config.region_policy();
+        assert!(!policy.fence_active());
+        assert!(!policy.digital_active());
+        assert!(!policy.commerce_active());
+    }
+
+    #[test]
+    fn a_malformed_region_modes_stops_the_service_with_a_clear_error() {
+        for raw in ["", "EU", "EU=closed", "EUR=blocked", "none,EU=blocked"] {
+            let (config, _) = from_env_with_region_env(Some(raw), None, None);
+            let error = config.expect_err(raw).to_string();
+            assert!(error.contains("REGION_MODES"), "{raw:?}: {error}");
+        }
     }
 
     #[test]

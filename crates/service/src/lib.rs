@@ -16,6 +16,7 @@ pub mod automation;
 pub mod bitcoin_review;
 pub mod clock;
 pub mod command_flight;
+pub mod commerce_region;
 pub mod config;
 pub mod connectors;
 pub mod content_lock;
@@ -52,6 +53,7 @@ pub mod refund_destination;
 pub mod refusal_audit;
 pub mod refusal_audit_admin;
 pub mod region_fence;
+pub mod region_policy;
 pub mod reserve_secrecy;
 pub mod resolve_delivery;
 pub mod result;
@@ -86,9 +88,10 @@ use crate::refusal_audit::RefusalAuditRuntime;
 pub struct ConfirmKeys<'a> {
     pub pickup: Option<&'a PickupKeys>,
     pub digital: Option<&'a DigitalKeys>,
-    /// `EU_FENCE_ENABLED`: confirmation re-checks the seller's annual limit
+    /// The region modes C3 and C4 read, when the fence is on: confirmation
+    /// re-checks the seller's annual limit
     /// ([`region_fence::recheck_at_payment`]).
-    pub eu_fence_enabled: bool,
+    pub fence: Option<&'a region_policy::RegionModes>,
 }
 
 #[derive(Clone)]
@@ -196,7 +199,7 @@ impl AppState {
         ConfirmKeys {
             pickup: self.pickup.as_deref(),
             digital: self.digital.as_deref(),
-            eu_fence_enabled: self.config.eu_fence_enabled,
+            fence: self.config.region_policy().fence_modes(),
         }
     }
 }

@@ -1825,6 +1825,86 @@ pub async fn execute(app: &TestApp, token: &str, body: &Value) -> (StatusCode, V
     .await
 }
 
+/// [`send`] with the country the trusted edge puts on the request, under the
+/// default header name; `None` sends no header.
+pub async fn send_from(
+    router: Router,
+    method: &str,
+    uri: &str,
+    token: Option<&str>,
+    body: &Value,
+    ip_country: Option<&str>,
+) -> (StatusCode, Value) {
+    let mut request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("content-type", "application/json");
+    if let Some(token) = token {
+        request = request.header("authorization", format!("Bearer {token}"));
+    }
+    if let Some(country) = ip_country {
+        request = request.header("x-client-region", country);
+    }
+    let response = router
+        .oneshot(
+            request
+                .body(Body::from(
+                    serde_json::to_vec(body).expect("body serializes"),
+                ))
+                .expect("request builds"),
+        )
+        .await
+        .expect("request executes");
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body collects")
+        .to_bytes();
+    let value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).expect("body is JSON")
+    };
+    (status, value)
+}
+
+/// [`execute`] from a client whose IP is in `ip_country`.
+pub async fn execute_from(
+    app: &TestApp,
+    token: &str,
+    body: &Value,
+    ip_country: Option<&str>,
+) -> (StatusCode, Value) {
+    mirror_listing_registration(body);
+    send_from(
+        app.router.clone(),
+        "POST",
+        "/v1/commands",
+        Some(token),
+        body,
+        ip_country,
+    )
+    .await
+}
+
+/// The same app (database, clock, homeserver double) under another
+/// configuration, for tests that set the world up with a policy off and then
+/// switch it on.
+pub fn reconfigured(app: &TestApp, edit: impl FnOnce(&mut Config)) -> TestApp {
+    let mut config = (*app.state.config).clone();
+    edit(&mut config);
+    let mut state = app.state.clone();
+    state.config = Arc::new(config);
+    TestApp {
+        router: build_router(state.clone()),
+        pool: app.pool.clone(),
+        clock: app.clock.clone(),
+        state,
+    }
+}
+
 fn mirror_listing_registration(command: &Value) {
     if let Some((seller_pubky, listing_id, record)) = registration_record(command) {
         command_mirror_records()

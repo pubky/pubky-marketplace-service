@@ -1,5 +1,6 @@
 //! No digital sales to EU or UK buyers at launch (legal launch plan C3b),
-//! behind `DIGITAL_REGION_BLOCK_ENABLED`.
+//! behind `DIGITAL_REGION_BLOCK_ENABLED` or, with `REGION_MODES` set, for
+//! every nuanced region ([`crate::region_policy`]).
 //!
 //! For electronically supplied services sold through a platform, EU VAT
 //! treats the platform as the supplier when it authorises the charge or the
@@ -31,6 +32,12 @@
 //! logged; physical lines never need it. The edge must set the header itself
 //! and overwrite any value the client sent.
 //!
+//! The hold is not limited to the EU and UK when `REGION_MODES` names other
+//! nuanced regions: a digital line is held for a buyer whose declared or IP
+//! country is nuanced, and refused with the reason `region_buyer` or
+//! `region_ip` and a message that names no region. An unknown IP country is
+//! held when `UNKNOWN` resolves to anything but `open`.
+//!
 //! The flag is independent of `EU_FENCE_ENABLED`. With it on, a command that
 //! contains a digital line must carry `buyer_country` (the Shop asks for it
 //! on digital listings); a command with no digital line does not need one on
@@ -47,12 +54,19 @@ use crate::AppState;
 
 pub const DIGITAL_UNAVAILABLE_MESSAGE: &str =
     "Digital items aren't available to buyers in the EU or UK yet.";
+/// For a nuanced region outside the EU-27 and GB.
+pub const DIGITAL_UNAVAILABLE_IN_REGION_MESSAGE: &str =
+    "Digital items aren't available to buyers in your region yet.";
 pub const REASON_EU_BUYER: &str = "eu_buyer";
 pub const REASON_GB_BUYER: &str = "gb_buyer";
 /// The IP country is in the EU-27.
 pub const REASON_EU_IP: &str = "eu_ip";
 /// The IP country is GB.
 pub const REASON_GB_IP: &str = "gb_ip";
+/// The declared country is a nuanced region outside the EU-27 and GB.
+pub const REASON_REGION_BUYER: &str = "region_buyer";
+/// The IP country is a nuanced region outside the EU-27 and GB.
+pub const REASON_REGION_IP: &str = "region_ip";
 /// No usable IP country: digital lines fail closed.
 pub const REASON_REGION_UNKNOWN: &str = "buyer_region_unknown";
 
@@ -62,6 +76,11 @@ pub struct EdgeContext {
     /// The client's country from the edge header, uppercase ISO alpha-2.
     /// `None` when the header is absent or holds no usable country.
     pub client_country: Option<String>,
+    /// Whether the request came through the edge from a person's client
+    /// (`POST /v1/commands`, the seller HTTP routes). A command the service
+    /// issues for automation (`listings/sync-many`, connectors) has no
+    /// client IP, so only the shop country applies to it.
+    pub interactive: bool,
 }
 
 impl EdgeContext {
@@ -77,18 +96,23 @@ impl EdgeContext {
                     && value.bytes().all(|byte| byte.is_ascii_uppercase())
                     && value != "XX"
             });
-        Self { client_country }
+        Self {
+            client_country,
+            interactive: true,
+        }
     }
 }
 
-/// Whether digital sales are held back for a buyer in `country_code`.
-pub fn blocked_country(country_code: &str) -> Option<&'static str> {
-    if is_eu_country(country_code) {
-        Some(REASON_EU_BUYER)
-    } else if country_code == GB {
-        Some(REASON_GB_BUYER)
-    } else {
-        None
+/// The refusal reason for a held country: the EU-27 and GB keep their own
+/// reasons, any other nuanced region gets the generic one.
+fn held_reason(country_code: &str, ip: bool) -> &'static str {
+    match (is_eu_country(country_code), country_code == GB, ip) {
+        (true, _, false) => REASON_EU_BUYER,
+        (true, _, true) => REASON_EU_IP,
+        (false, true, false) => REASON_GB_BUYER,
+        (false, true, true) => REASON_GB_IP,
+        (false, false, false) => REASON_REGION_BUYER,
+        (false, false, true) => REASON_REGION_IP,
     }
 }
 
@@ -112,10 +136,14 @@ pub fn line_is_digital(listing: &ListingFlavor, chosen: Option<FulfillmentMethod
 }
 
 fn blocked(reason: &'static str) -> CommandFailure {
+    let message = match reason {
+        REASON_REGION_BUYER | REASON_REGION_IP => DIGITAL_UNAVAILABLE_IN_REGION_MESSAGE,
+        _ => DIGITAL_UNAVAILABLE_MESSAGE,
+    };
     CommandFailure::refused_with_reason(
         RefusalKind::InvalidState,
         ErrorCode::DigitalUnavailableInRegion,
-        DIGITAL_UNAVAILABLE_MESSAGE,
+        message,
         reason,
     )
 }
@@ -174,17 +202,18 @@ async fn flavors(
         .collect())
 }
 
-/// Runs before the command's transaction. `Ok` when the flag is off, the
-/// command is not gated, no line is digital or the buyer is outside the
-/// EU-27 and GB.
+/// Runs before the command's transaction. `Ok` when the hold is off, the
+/// command is not gated, no line is digital or the buyer is in no nuanced
+/// region.
 pub async fn gate(
     state: &AppState,
     command: &Command,
     edge: &EdgeContext,
 ) -> Result<(), CommandFailure> {
-    if !state.config.digital_region_block_enabled {
+    if !state.config.region_policy().digital_active() {
         return Ok(());
     }
+    let modes = state.config.region_policy().modes();
     let wanted = gated_listings(command);
     if wanted.is_empty() {
         return Ok(());
@@ -206,15 +235,15 @@ pub async fn gate(
     let Some(country) = crate::region_fence::buyer_country_of(&command.payload).flatten() else {
         return Err(missing_country());
     };
-    if let Some(reason) = blocked_country(country) {
-        return Err(blocked(reason));
+    if modes.digital_held(country) {
+        return Err(blocked(held_reason(country, false)));
     }
     match edge.client_country.as_deref() {
-        Some(ip_country) => match blocked_country(ip_country) {
-            Some(REASON_GB_BUYER) => Err(blocked(REASON_GB_IP)),
-            Some(_) => Err(blocked(REASON_EU_IP)),
-            None => Ok(()),
-        },
+        Some(ip_country) if modes.digital_held(ip_country) => {
+            Err(blocked(held_reason(ip_country, true)))
+        }
+        Some(_) => Ok(()),
+        None if modes.unknown_mode() == crate::region_policy::Mode::Open => Ok(()),
         None => {
             tracing::error!(
                 header = %state.config.client_country_header,
@@ -238,13 +267,27 @@ mod tests {
     }
 
     #[test]
-    fn the_blocked_countries_are_the_eu_27_and_gb() {
+    fn the_eu_27_and_gb_keep_their_reasons_and_other_regions_get_a_generic_one() {
         for code in marketplace_domain::region::EU_27 {
-            assert_eq!(blocked_country(code), Some(REASON_EU_BUYER), "{code}");
+            assert_eq!(held_reason(code, false), REASON_EU_BUYER, "{code}");
+            assert_eq!(held_reason(code, true), REASON_EU_IP, "{code}");
         }
-        assert_eq!(blocked_country("GB"), Some(REASON_GB_BUYER));
-        for code in ["US", "CH", "NO", "IS", "LI", "BR", "JP", "UK", "gb", ""] {
-            assert_eq!(blocked_country(code), None, "{code}");
+        assert_eq!(held_reason("GB", false), REASON_GB_BUYER);
+        assert_eq!(held_reason("GB", true), REASON_GB_IP);
+        assert_eq!(held_reason("US", false), REASON_REGION_BUYER);
+        assert_eq!(held_reason("US", true), REASON_REGION_IP);
+    }
+
+    #[test]
+    fn only_a_generic_reason_swaps_the_message() {
+        for reason in [REASON_EU_BUYER, REASON_GB_BUYER, REASON_EU_IP, REASON_GB_IP] {
+            assert_eq!(blocked(reason).message(), DIGITAL_UNAVAILABLE_MESSAGE);
+        }
+        for reason in [REASON_REGION_BUYER, REASON_REGION_IP] {
+            assert_eq!(
+                blocked(reason).message(),
+                DIGITAL_UNAVAILABLE_IN_REGION_MESSAGE
+            );
         }
     }
 
