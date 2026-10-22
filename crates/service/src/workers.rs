@@ -1902,6 +1902,7 @@ async fn apply_completed_lifecycle(
                 keys,
                 &payment,
                 &order,
+                false,
                 row.id,
                 &payment.buyer_pubky,
                 now,
@@ -1911,9 +1912,9 @@ async fn apply_completed_lifecycle(
                 Ok(outcome) => {
                     let correlation_outcome = match outcome {
                         LateMoneyOutcome::Completed => "payment_confirmed",
-                        LateMoneyOutcome::RefundRequired | LateMoneyOutcome::HeldLateSettlement => {
-                            "manual_review"
-                        }
+                        LateMoneyOutcome::RefundRequired
+                        | LateMoneyOutcome::HeldLateSettlement
+                        | LateMoneyOutcome::AmountMismatch => "manual_review",
                     };
                     mark_correlation_completed(&mut tx, row.id, correlation_outcome, now).await?;
                     tx.commit().await?;
@@ -2102,7 +2103,7 @@ async fn claim_due_paykit_orders(
 /// observation is compared with the USDT amount paykit-server offered for the
 /// request, and an observation that names no amount is never a mismatch here
 /// (paykit-server's own `amount_matched` still decides).
-fn observed_differs_from_offer(
+pub(crate) fn observed_differs_from_offer(
     order: &crate::model::OrderRow,
     observation: &crate::payments::PaykitObservation,
 ) -> bool {
@@ -2295,10 +2296,14 @@ async fn set_payment_finality(
 /// order can no longer accept (or an amount mismatch paykit observed) routes
 /// the payment to `manual_review`. A LATE entry — the payment already
 /// expired, OR the producer's mandatory `late_settlement` flag marking a
-/// settlement outside the invoice's window — NEVER auto-pays: it enters
-/// the existing durable `manual_review` path and freezes the reported
-/// observation onto the order, so a later resolution's audit snapshot
-/// carries the facts the seller acted on.
+/// settlement outside the invoice's window — takes the late-money fork
+/// (`apply_late_money`) with the observation frozen onto the order first, so
+/// a later resolution's audit snapshot carries the facts the seller acted
+/// on. A late amount mismatch never pays: it enters the same
+/// `amount_mismatch` `manual_review` as on-time money, before any unit is
+/// re-taken. Only an exact late payment can complete a still-free order
+/// (`late_completion`); a unit that is gone is named `refund_required`, and
+/// a still-held order waits as `late_settlement`.
 async fn freeze_paykit_observation(
     tx: &mut Transaction<'_, Postgres>,
     order_id: Uuid,
@@ -2424,11 +2429,13 @@ async fn apply_confirmed_paykit_payment(
                 row.id
             );
         };
+        let amount_mismatch = !amount_matched || observed_differs_from_offer(&order, observation);
         match apply_late_money(
             &mut tx,
             keys,
             &payment,
             &order,
+            amount_mismatch,
             row.id,
             &row.buyer_pubky,
             now,
@@ -3305,10 +3312,10 @@ async fn apply_status_outcome(
         } => {
             // The producer's mandatory late-settlement flag governs BEFORE
             // any mode-based handling: a late confirmed settlement NEVER
-            // auto-pays (exclusive) and NEVER enters
-            // awaiting_seller_confirmation (shared_manual) — it takes the
-            // existing durable manual-review entry with the observation
-            // frozen.
+            // enters awaiting_seller_confirmation (shared_manual) — it takes
+            // the late-money fork with the observation frozen. A mismatched
+            // amount, a gone unit or a still-held order waits in durable
+            // manual review; only an exact payment completes a free unit.
             if facts.late_settlement {
                 return apply_confirmed_paykit_payment(
                     &state.pool,

@@ -2969,6 +2969,7 @@ async fn apply_fiat_paid(
             state.confirm_keys(),
             &payment,
             &order,
+            false,
             command_id,
             actor,
             now,

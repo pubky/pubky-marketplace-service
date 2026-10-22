@@ -708,7 +708,9 @@ async fn route_released_settlement(
         anyhow::bail!("order vanished while routing a released paykit attempt");
     };
 
-    if !amount_matched {
+    let amount_mismatch =
+        !amount_matched || crate::workers::observed_differs_from_offer(&order, observation);
+    if amount_mismatch {
         // Not the amount the released invoice asked for: a human decides.
         let (revision,): (i64,) = sqlx::query_as(
             "UPDATE payments SET state = 'manual_review', revision = revision + 1, \
@@ -753,6 +755,7 @@ async fn route_released_settlement(
         state.confirm_keys(),
         &payment,
         &order,
+        amount_mismatch,
         attempt.order_id,
         &order.buyer_pubky,
         now,

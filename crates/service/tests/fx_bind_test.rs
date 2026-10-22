@@ -923,6 +923,81 @@ async fn settlement_only_exact_non_late_exclusive_auto_pays(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn late_exclusive_settlement_pays_only_the_exact_quote(pool: PgPool) {
+    let fixture = fx_fixture(pool.clone()).await;
+    let now = fixture.app.clock.now();
+    seed_fx_samples(&pool, RATE, now, 3).await;
+    let after_window = now + Duration::seconds(7300);
+
+    let settle_late = |observed_delta: i64| {
+        let fixture = &fixture;
+        let pool = &pool;
+        async move {
+            let order = checkout_usd(&fixture.app, &fixture.seller, &fixture.buyer).await;
+            let (status, body) =
+                bind_bitcoin(&fixture.app, &fixture.buyer.token, &order.order_id).await;
+            assert_eq!(status, StatusCode::OK, "bind failed: {body}");
+            activate_bound(fixture).await;
+            let total_sats = order_facts(pool, &order.order_id)
+                .await
+                .paykit_total_sats
+                .expect("invoice total");
+            assert!(
+                expire_due_payment_windows(&fixture.app.state, after_window)
+                    .await
+                    .expect("window sweep runs")
+                    >= 1
+            );
+            let reference = attempt_reference(Uuid::parse_str(&order.order_id).unwrap(), 1);
+            // paykit-server calls the amount matched; only the frozen quote
+            // can tell the marketplace the figure is wrong.
+            let mut late = bitcoin_status_v2(
+                "confirmed",
+                true,
+                "exclusive",
+                Some("fx-late-delta-txid"),
+                u64::try_from(total_sats + observed_delta).ok(),
+                Some(2),
+            );
+            late["late_settlement"] = json!(true);
+            fixture.paykit.set_status(&reference, late);
+            assert!(poll_now(&fixture.app, after_window + Duration::seconds(60)).await >= 1);
+            order.order_id
+        }
+    };
+
+    let order_id = settle_late(0).await;
+    assert_eq!(
+        order_facts(&pool, &order_id).await.state,
+        "paid",
+        "an exact late payment completes the free order"
+    );
+    assert_eq!(payment_state(&pool, &order_id).await, "confirmed");
+
+    for delta in [1_000, -1_000] {
+        let order_id = settle_late(delta).await;
+        let facts = order_facts(&pool, &order_id).await;
+        assert_ne!(
+            facts.state, "paid",
+            "a late mismatch (delta {delta}) never pays"
+        );
+        assert!(!facts.stock_held, "the unit is not re-taken");
+        assert_eq!(payment_state(&pool, &order_id).await, "manual_review");
+        let reason: Option<String> =
+            sqlx::query_scalar("SELECT review_reason FROM payments WHERE order_id = $1")
+                .bind(Uuid::parse_str(&order_id).unwrap())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(reason.as_deref(), Some("amount_mismatch"));
+        assert!(
+            facts.bitcoin_quoted_sats.is_some(),
+            "review keeps the quote"
+        );
+    }
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn refunds_derive_from_the_frozen_observation_only(pool: PgPool) {
     install_log_capture();
     let fixture = fx_fixture(pool.clone()).await;
