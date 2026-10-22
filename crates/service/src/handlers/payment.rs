@@ -123,8 +123,10 @@ pub async fn advance(
             .await?;
         // The annual limit at payment start, before any listing lock so the
         // per-seller counter lock stays first (`docs/lock-order.md`).
-        if keys.eu_fence_enabled && payload.target == SandboxPaymentTarget::Confirmed {
-            if let Err(failure) = crate::region_fence::recheck_at_payment(tx, order.id, now).await {
+        if let (Some(modes), SandboxPaymentTarget::Confirmed) = (keys.fence, payload.target) {
+            if let Err(failure) =
+                crate::region_fence::recheck_at_payment(tx, modes, order.id, now).await
+            {
                 return Ok(Err(failure));
             }
         }
@@ -284,8 +286,10 @@ pub(crate) async fn confirm_order(
     // which is the manual-review route. First among the confirmation locks:
     // the per-seller counter lock comes before the drop and listing rows
     // (`docs/lock-order.md`).
-    if keys.eu_fence_enabled {
-        if let Err(failure) = crate::region_fence::recheck_at_payment(tx, order.id, now).await {
+    if let Some(modes) = keys.fence {
+        if let Err(failure) =
+            crate::region_fence::recheck_at_payment(tx, modes, order.id, now).await
+        {
             return Ok(Err(failure));
         }
     }
