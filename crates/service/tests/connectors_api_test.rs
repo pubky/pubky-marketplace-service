@@ -135,7 +135,7 @@ async fn health_reports_connectors_only_while_enabled(pool: PgPool) {
         json!(["shopify", "woocommerce"])
     );
     assert!(
-        !health.to_string().contains("client-john"),
+        !health.to_string().contains("client-legacy"),
         "no app detail is public"
     );
 }
@@ -344,7 +344,7 @@ async fn a_draft_connection_has_an_unguessable_id_urls_and_a_day_to_live(pool: P
             ("content-type", "application/json"),
             ("authorization", &format!("Bearer {}", seller.token)),
         ],
-        serde_json::to_vec(&json!({ "provider": "shopify", "domain": SHOP, "app_key": "john" }))
+        serde_json::to_vec(&json!({ "provider": "shopify", "domain": SHOP, "app_key": "legacy" }))
             .expect("body"),
     )
     .await;

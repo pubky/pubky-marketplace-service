@@ -1,4 +1,4 @@
--- Operator step for leftover unbound pending_payment carts (Pav 10 Sep class).
+-- Operator step for leftover unbound pending_payment carts (10 Sep class).
 -- NOT a sqlx migration. Do not run at migrate-at-boot. Do not run in this
 -- implementation wave. Dry-run the SELECTs first (read-only, exact-ID
 -- counts/ids only, no PII). Apply the UPDATE only

@@ -183,7 +183,7 @@ function check() {
   const stream = [
     { owner_id: pubky, id: 'a', title: 'anything' },
     { owner_id: 'z'.repeat(52), id: 'b', title: TITLE('pickup') },
-    { owner_id: 'z'.repeat(52), id: 'c', title: 'Pav test: active, buy me' },
+    { owner_id: 'z'.repeat(52), id: 'c', title: 'QA test: active, buy me' },
   ];
   if (fixtureLeaks(stream, [pubky]).map((l) => l.id).join() !== 'a,b') failures.push('leak detection');
   if (fixtureLeaks(stream, []).length !== 1) failures.push('leak detection by title only');
