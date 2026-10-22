@@ -92,6 +92,22 @@ jobs:
       # pass `postgres -c max_connections=`.
       - run: bash scripts/ci-test.sh
 
+  specs-parity:
+    name: specs-parity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - name: Install native build deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/specs-parity
+      # The service's attestor records are a port of pubky-app-specs; this
+      # holds them to the crate (README: tools/specs-parity).
+      - run: cargo run --release --locked --manifest-path tools/specs-parity/Cargo.toml
+
   migrations:
     name: migrations
     runs-on: ubuntu-24.04

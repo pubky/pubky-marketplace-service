@@ -175,6 +175,13 @@ Configuration is environment-based. Window keys and their defaults also live in
 | `LOCKS_POLL_SECONDS` | `30` | minimum interval between lifecycle lookups per pending correlation |
 | `ATTESTOR_SECRET_KEY` | unset | 32-byte hex Ed25519 secret of the attestor identity (ADR 0024); its z-base-32 public key is the attestor pubky |
 | `ATTESTOR_ORDER_SALT` | unset | 32-byte hex salt for `order_ref` hashing; must stay stable for the attestor identity's lifetime |
+| `ATTESTOR_PUBLISH_ENABLED` | `false` | `true` publishes the attestor's profile and its refund and return annotations to its own homeserver (see [Attestor records](#attestor-records)); needs the two `ATTESTOR_*` secrets above and the five settings below. Off, the service starts, behaves and calls out exactly as before |
+| `ATTESTOR_HOMESERVER` | unset | pubky (52-character z-base-32) of the homeserver that holds the attestor's account; the attestor's PKARR record must point at it. Required when publishing is enabled |
+| `ATTESTOR_OPERATOR_URL` | unset | https URL of the operator's website, written into the profile. Required when publishing is enabled |
+| `ATTESTOR_POLICY_URL` | unset | https URL of the attestor's issuance policy page, written into the profile. Required when publishing is enabled |
+| `ATTESTOR_KEYS` | unset | JSON array of the keys the attestor has issued with, each `{"pubky", "validFrom", "validUntil"?, "compromisedFrom"?}` (RFC 3339 datetimes with an offset, at most 16 keys). Must list the current attestor key. Add a rotated key with its `validUntil`, or `compromisedFrom` for a leaked one. Required when publishing is enabled |
+| `ATTESTOR_OPERATOR_NAME` | `Pubky Market` | operator display name in the profile (1 to 100 characters) |
+| `ATTESTOR_SUCCESSOR` | unset | pubky of the attestor that takes over from this one, to announce a rotation in the profile |
 | `STRIPE_KEY_ENCRYPTION_KEY` | unset | 32-byte hex key sealing seller secrets (Shippo API tokens) at rest; setting it enables the `/v0` payment-methods surface. The name is a legacy of the removed Stripe rail and is kept so deployments need no change |
 | `ARBITRUM_RPC_URL` | unset | Arbitrum One JSON-RPC endpoint (http(s)); setting it checks a recorded USDT refund's transaction on Arbitrum. See [USDT refund destination](#usdt-refund-destination) |
 | `PAYKIT_SERVER_URL` | unset | paykit-server base URL; setting it enables the bitcoin method |
@@ -1158,12 +1165,64 @@ the D2 amount-band consent gate applies (`attestation.set_band_consent`
 command + `GET /v1/sellers/{pubky}/band-consent` read), external refunds
 append `attestation_annotations` rows keyed by the
 salted `order_ref`, and the worker signs weekly per-seller stat attestations
-into `seller_stat_attestations`. Publication of annotations and stat
-attestations to the attestor's homeserver is Phase 3 of the trust &
-reputation plan (`pubky/pubky-marketplace`
-[`docs/ecommerce/trust-reputation-plan.md`](https://github.com/pubky/pubky-marketplace/blob/master/docs/ecommerce/trust-reputation-plan.md)) and is
-not part of this service yet — the rows accumulate here as the publisher's
-ground truth.
+into `seller_stat_attestations`. The annotations are published to
+the attestor's homeserver when `ATTESTOR_PUBLISH_ENABLED` is set (see
+[Attestor records](#attestor-records)); stat attestations are Phase 3 of the
+trust & reputation plan (`pubky/pubky-marketplace`
+[`docs/ecommerce/trust-reputation-plan.md`](https://github.com/pubky/pubky-marketplace/blob/master/docs/ecommerce/trust-reputation-plan.md)) and
+are not published by this service yet — those rows accumulate here as the
+publisher's ground truth.
+
+#### Attestor records
+
+With `ATTESTOR_PUBLISH_ENABLED=true` the worker signs in to the attestor's
+homeserver as the attestor key and writes two kinds of record, so that a refund
+or a return shows next to the review it concerns and a key rotation can be
+announced. The index serves them
+(`GET /v0/marketplace/attestor/{id}/profile` and `/annotations?order_refs=`).
+
+- **The profile**, `/pub/pubky.app/marketplace/v1/attestor/profile`: the
+  operator (`ATTESTOR_OPERATOR_NAME`, `_URL`, `ATTESTOR_POLICY_URL`), the key
+  list and successor (`ATTESTOR_KEYS`, `ATTESTOR_SUCCESSOR`) and the issuance
+  policy, which the service states from what it does: the edit window, the
+  blind window (`REVIEW_BLIND_WINDOW_DAYS`), `amountBand: "both-sides
+  consent"`, `minOrderValue: null` and `priceDecade`. `priceDecade` is `never`
+  while the purchase attestations this service issues carry no price decade
+  (`ISSUES_PRICE_DECADE` in `attestor.rs`, which the change that signs the
+  claim sets to `true`, turning the profile to `always`).
+- **One annotation per attested order**,
+  `.../attestor/annotations/{order_ref}`: the order's `returned` outcome
+  (written when the seller records `return.receive`) and `refunded` outcome
+  (written when a refund is recorded), each with its day, in the order they
+  happened. Only an `order_ref` this attestor issued a purchase attestation
+  for is ever written, and no annotation is written before it has an outcome.
+  `refund_reversal_cancelled` is not an outcome: it records that PayPal
+  cancelled a refund reversal and the order went back to the state the refund
+  had replaced, so it takes back the latest `refunded`; an annotation left
+  with no outcome is written once more, empty, so the public record stops
+  claiming the refund.
+
+Every record is signed (a compact JWS with a detached payload over the
+RFC 8785 canonical record) with the attestor key, so a verifier needs no trust
+in the homeserver. A record is written when its content differs from what
+`attestor_publications` says was written; an annotation's `revision` is raised
+by one on every change, and the index replaces an annotation by a higher
+revision. One publisher runs at a time (the `attestor_publish` worker lease,
+renewed before every write). A failed write is retried with a backoff that
+doubles from 15 seconds to an hour, kept in `attestor_publish_attempts`, so it
+holds across restarts and instances; a pass writes at most
+`DELIVERY_SWEEP_BATCH_SIZE` records. The record types are those of
+`pubky-app-specs` (tag `v0.6.2-marketplace.16`); the service holds a port of
+them, kept equal to the crate by `tools/specs-parity` (see
+[`tools/specs-parity/README.md`](tools/specs-parity/README.md)).
+
+**Before enabling it.** The index (`marketplace-nexus` with the attestor
+records, IX5) must be live first: it has no backfill, so a record written before
+it is indexed only when it is written again. The attestor's account must exist
+on the homeserver the index polls (it indexes only that one), and the attestor's
+PKARR record must point at `ATTESTOR_HOMESERVER`; the publisher refuses to write
+to any other homeserver. Startup refuses to run with publishing enabled and a
+setting missing, invalid, or a key list that omits the attestor's own key.
 
 With an attestor configured, participants can also fetch a **receipt
 attestation** (`GET /v1/receipts/{receipt_id}/attestation`,

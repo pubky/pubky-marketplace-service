@@ -439,6 +439,40 @@ DELETE FROM _sqlx_migrations WHERE version = 89;
 The catalog row stays; the table is append-only and the row is harmless to an
 older image.
 
+## Attestor publisher (0090)
+
+0090 creates `attestor_publications` (what the publisher wrote to the
+attestor's homeserver: revision and a hash of the content, one row per attestor
+and path) and `attestor_publish_attempts` (the write in flight or last failed,
+with its backoff), both new and empty, and widens
+`attestation_annotations_outcome_check` to accept `returned` beside
+`refunded` and `refund_reversal_cancelled`. The widened check cannot be violated
+by an existing row, so it is added `NOT VALID` and validated, which keeps the
+table lock short; `lock_timeout` like 0050. The annotations table stays
+append-only. Directly rerunnable: the tables use `IF NOT EXISTS` and a rerun
+keeps what the publisher recorded.
+
+**Deploy mode: rolling.** A binary from before 0090 never writes `returned` (a
+return it completes records no annotation) and never reads the new tables.
+Nothing an old binary does breaks. A new binary running before the migration
+fails its `returned` insert, so the migration applies first, as at every boot.
+
+### Backing out 0090
+
+Additive: an image from before it runs on the migrated database. By hand,
+after the old image is serving and publishing is off:
+
+```sql
+DROP TABLE IF EXISTS attestor_publish_attempts;
+DROP TABLE IF EXISTS attestor_publications;
+DELETE FROM _sqlx_migrations WHERE version = 90;
+```
+
+The widened check stays: it is a superset of the old one, so it holds for
+every row an older image writes, and any `returned` rows stay valid. Dropping the tables forgets what was written, so a later publisher
+writes every record again (at revision 1; the index treats an equal revision as
+a replacement).
+
 ## Numbers claimed by open pull requests
 
 `main` has 0001 to 0079 (0068 and 0069 were never used). A new migration must
@@ -452,6 +486,7 @@ assume it is free:
 | 0082 | `0082_cancel_return_command_kind.sql` | `return.cancel` refusal-audit command kind |
 | 0083 to 0086 | `0083_review_items.sql` to `0086_review_item_keys.sql` | per-item reviews and seller ratings |
 | 0089 | `0089_review_withdrawal.sql` | `reviews.public_removed_at` and the `review.withdraw` refusal-audit command kind (0087 and 0088 are the double-blind review window) |
+| 0090 | `0090_attestor_publisher.sql` | the attestor publisher's tables and the `returned` annotation outcome |
 
 This table describes unmerged work and goes stale as pull requests land; trust
 `crates/service/migrations/` on `main` over it. sqlx does not reject two files
