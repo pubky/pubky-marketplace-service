@@ -338,7 +338,7 @@ request failed, so clients should branch on HTTP status first, and parse
    | `REVISION_CONFLICT`, `IDEMPOTENCY_CONFLICT`, `INSUFFICIENT_INVENTORY`, `INVARIANT_VIOLATION`, `OFFER_EXPIRED`, `INVALID_STATE`, `AUCTION_CLOSED`, `BID_TOO_LOW`, `SELLER_REGISTRATION_REQUIRED` | 409 |
    | `AWARD_EXPIRED`, `AWARD_ALREADY_CONVERTED`, `AWARD_QUANTITY_MISMATCH`, `AWARD_VARIANT_MISMATCH`, `AWARD_LISTING_CHANGED`, `AWARD_HOLD_MISSING` | 409 |
    | `LISTING_MODERATED`, `LISTING_NOT_ACTIVE` | 409 |
-   | `SELLER_UNAVAILABLE_IN_REGION`, `SELLER_ANNUAL_LIMIT_REACHED`, `DIGITAL_UNAVAILABLE_IN_REGION` | 409 |
+   | `SELLER_UNAVAILABLE_IN_REGION`, `SELLER_ANNUAL_LIMIT_REACHED`, `DIGITAL_UNAVAILABLE_IN_REGION`, `COMMERCE_UNAVAILABLE_IN_REGION` | 409 |
    | `UPSTREAM_UNAVAILABLE` | 503 (retriable) |
 
    A command error may also carry `issues` and `reason` fields.
@@ -373,7 +373,8 @@ request failed, so clients should branch on HTTP status first, and parse
    `viewer_bid.minimum_next_bid`.
 
    `SELLER_UNAVAILABLE_IN_REGION` and `SELLER_ANNUAL_LIMIT_REACHED` exist only
-   while `EU_FENCE_ENABLED` is on (see [EU scope fence](../README.md#eu-scope-fence)).
+   while `EU_FENCE_ENABLED` is on, or `REGION_MODES` restricts a region (see
+   [EU scope fence](../README.md#eu-scope-fence)).
    With it on, `checkout.create`, `offer.create`, `offer.checkout` and
    `auction.place_bid` must carry `payload.buyer_country` (ISO 3166-1 alpha-2,
    uppercase; 422 `INVALID_COMMAND` with an issue at `payload.buyer_country`
@@ -410,6 +411,31 @@ request failed, so clients should branch on HTTP status first, and parse
    request country the digital line is refused with `reason:
    "buyer_region_unknown"`. Such a command must carry `buyer_country` (422
    `INVALID_COMMAND` without it).
+
+   `COMMERCE_UNAVAILABLE_IN_REGION` exists only while `REGION_MODES` blocks a
+   region (see [Region modes](../README.md#region-modes)). It refuses
+   `checkout.create`, `offer.create`, `offer.checkout` and `auction.place_bid`
+   (which must carry `payload.buyer_country`, 422 `INVALID_COMMAND` without it),
+   `payment.prepare_locks` and the first `POST /v0/orders/{id}/payment-method`
+   of an order. `reason` is `buyer_region_blocked` (the declared country is
+   blocked), `buyer_ip_blocked` (the request country from the header named by
+   `CLIENT_COUNTRY_HEADER` is blocked, whatever the buyer declared) or
+   `buyer_region_unknown` (no usable request country while unknown origins are
+   blocked; also the answer to a seller's own request in that case). The
+   message is "Buying and selling aren't available in your region yet." or, for
+   an unknown origin, "We can't tell where you are, so buying and selling are
+   paused." In the same mode `SELLER_UNAVAILABLE_IN_REGION` also has `reason`
+   `seller_region_blocked` (the seller's shop country is blocked: refused on
+   every buyer command on their listings, on `payment.prepare_locks`, the bind,
+   and on the seller's own `listing.register`, `listing.sync`, `drop.sync` and
+   `PUT /v0/sellers/me/payment-config`) and `seller_ip_blocked` (the seller's
+   own interactive request comes from a blocked country). Webhooks, payment
+   confirmation, refunds, cancellation, returns, fulfillment, reviews, reads and
+   listing takedowns are never refused for region.
+
+   With `REGION_MODES`, `DIGITAL_UNAVAILABLE_IN_REGION` also answers any
+   nuanced country: `reason` `region_buyer` or `region_ip` for a country
+   outside the EU-27 and GB.
 
    `GET /v1/sellers/{seller_pubky}/annual-limit` answers `{"enabled": false}`
    with the fence off. On, it answers `enabled`, `year` and `limit_reached` to

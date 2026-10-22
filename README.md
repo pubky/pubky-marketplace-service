@@ -198,7 +198,8 @@ Configuration is environment-based. Window keys and their defaults also live in
 | `REQUIRE_ENCRYPTED_DELIVERY_ADDRESS` | `false` | `true`/`1` refuses a checkout or award checkout that carries a plaintext `delivery_address` (422 `INVALID_COMMAND`, reason `encrypted_delivery_required`); only sealed envelopes are accepted. Leave unset until the Shop version that seals is the deployed one (see [Sealed delivery address](#sealed-delivery-address)) |
 | `EU_FENCE_ENABLED` | `false` | `true`/`1` turns on the EU scope fence (legal launch plan C2-C4): `buyer_country` becomes required on the selling commands, a buyer in the EU-27 or GB buys only from sellers whose shop record says `sellerStatus: "private"`, and sellers whose shop country is in the EU-27 stop at 29 paid sales or EUR 2,000 of paid orders a calendar year (checked at checkout and again at payment). Off, `buyer_country` is accepted and stored and nothing is refused on these grounds. See [EU scope fence](#eu-scope-fence) |
 | `DIGITAL_REGION_BLOCK_ENABLED` | `false` | `true`/`1` refuses `checkout.create` (which carries drop claims) and `offer.checkout` that contain a digital line (any digital delivery kind, or a Locks listing) when `payload.buyer_country` is in the EU-27 or is `GB`: `DIGITAL_UNAVAILABLE_IN_REGION` (409), reason `eu_buyer` or `gb_buyer` for the declared country, `eu_ip` or `gb_ip` for the request's own country (read from `CLIENT_COUNTRY_HEADER`), `buyer_region_unknown` when the edge sent none; such a command must carry `buyer_country`. Independent of `EU_FENCE_ENABLED`. Off, nothing is refused. See [Digital sales to EU and UK buyers](#digital-sales-to-eu-and-uk-buyers) |
-| `CLIENT_COUNTRY_HEADER` | `x-client-region` | Name of the request header the trusted edge sets to the client's country (ISO alpha-2) from its IP. Read only by the digital hold (`DIGITAL_REGION_BLOCK_ENABLED`). GCP: a load-balancer custom request header `X-Client-Region:{client_region}`. The edge must set it itself and overwrite any value the client sent. Missing or unusable with the digital hold on: digital lines are refused (`buyer_region_unknown`) and an `ALERT digital_region_client_country_missing` is logged |
+| `REGION_MODES` | unset | per-region commerce modes, `SELECTOR=MODE,...`: `SELECTOR` is an ISO 3166-1 alpha-2 code, `EU` (the 27 member states; later entries override earlier ones) or `UNKNOWN`; `MODE` is `open`, `nuanced` or `blocked`; `none` opens every region. Unset keeps `EU_FENCE_ENABLED` and `DIGITAL_REGION_BLOCK_ENABLED` exactly as they were. Set, it wins and those two are ignored (a startup warning names each one that is also set). A malformed value stops the service at start. Launch value: `EU=blocked,GB=blocked,US=blocked`. See [Region modes](#region-modes) |
+| `CLIENT_COUNTRY_HEADER` | `x-client-region` | Name of the request header the trusted edge sets to the client's country (ISO alpha-2) from its IP. Read by the digital hold (`DIGITAL_REGION_BLOCK_ENABLED`) and by every commerce check of `REGION_MODES`. GCP: a load-balancer custom request header `X-Client-Region:{client_region}`. The edge must set it itself and overwrite any value the client sent. Missing or unusable with the digital hold on: digital lines are refused (`buyer_region_unknown`) and an `ALERT digital_region_client_country_missing` is logged |
 | `ADDRESS_SEARCH_UPSTREAM_URL` | `https://photon.komoot.io` | Photon geocoder behind `POST /v0/address/suggest`. HTTPS only (http for loopback in tests). Point it at a self-hosted Photon to stop using the public instance |
 | `ADDRESS_SEARCH_DISABLED` | unset | `1`/`true` turns the address proxy off; the route answers `address_search_unavailable` |
 | `ADDRESS_SEARCH_CLIENT_IP_HEADER` | unset | name of a header set by a trusted edge that carries the client address (last value is used); unset keys the per-client limit on the socket peer |
@@ -260,9 +261,94 @@ so a moderation placed meanwhile is seen on the next command and lifting one
 takes effect once the cached answer expires. Orders created before a listing
 was moderated are not cancelled by this check.
 
+### Region modes
+
+`REGION_MODES` says what each region may do on Pubky Market, so each legal
+outcome is a configuration change and not a rebuild. It is read once at start.
+
+```
+REGION_MODES=EU=blocked,GB=blocked,US=blocked   # launch
+REGION_MODES=EU=nuanced,GB=nuanced,US=blocked   # counsel accepts the nuanced design for the EU and UK
+REGION_MODES=EU=blocked,GB=blocked              # the US is unlocked
+REGION_MODES=EU=nuanced,GB=nuanced              # both: the behaviour before this setting
+REGION_MODES=none                               # emergency open: every region open
+```
+
+- **Grammar.** Comma-separated `SELECTOR=MODE`, case-insensitive, spaces around
+  entries ignored. `SELECTOR` is an ISO 3166-1 alpha-2 code (stored uppercase),
+  `EU` (AT BE BG CY CZ DE DK EE ES FI FR GR HR HU IE IT LT LU LV MT NL PL PT
+  RO SE SI SK; the United Kingdom is `GB`, `UK` is refused) or `UNKNOWN`. Later
+  entries override earlier ones, so `EU=nuanced,DE=blocked` blocks only
+  Germany. A country no entry names is `open`. `none` must be the whole value.
+  An empty value, an entry that is not `SELECTOR=MODE`, an unknown mode or an
+  unknown selector stops the service at start with an error naming the entry.
+- **Modes.** `open`: no commerce restriction. `nuanced`: today's behaviour, the
+  [EU scope fence](#eu-scope-fence) (C3: a buyer there buys only from a seller
+  who declared private; C4: the annual limit for sellers resident in the EU-27,
+  applied when that seller's country is nuanced, and the re-confirmation point
+  for buyers in a nuanced EU country) and the [digital hold](#digital-sales-to-eu-and-uk-buyers)
+  (C3b), each for the countries marked `nuanced`, whatever the two legacy flags
+  say. `blocked`: no buying, no starting a payment, no selling and no paid
+  unlocks for people in the region.
+- **`UNKNOWN`** is the mode of a request whose IP country cannot be determined
+  (header absent, malformed, `XX`, `T1`). Omitted, it is the strictest mode any
+  country has: with one region blocked an unknown origin is blocked for
+  commerce, and with only nuanced regions it is held for digital items only, as
+  before. `UNKNOWN=open` lets an unlocated buyer through.
+- **Back-compat.** With `REGION_MODES` unset, `EU_FENCE_ENABLED` and
+  `DIGITAL_REGION_BLOCK_ENABLED` behave exactly as before: each turns on its
+  own gate for the EU-27 and GB as nuanced regions, and nothing is ever
+  blocked. Setting `REGION_MODES` replaces both: nuanced regions run C3, C4 and
+  C3b together, and the service logs a warning for each legacy flag still set.
+- **Flip order.** The Shop reads the same grammar (`PUBKY_RUNTIME_REGION_MODES`).
+  To tighten, change the Shop first and then this service; to loosen, change
+  this service first and then the Shop, so the Shop never offers what the
+  service still refuses and never hides what the service accepts. The Lock
+  Server's `POST /proof-bundles` list (451 for `blocked` and `nuanced`
+  regions) is edge configuration and moves with them.
+
+What a blocked region cannot do, decided from three facts: the **declared
+country** (the buyer's `buyer_country`, or the seller's shop country from their
+own shop record), the **IP country** (the header named by
+`CLIENT_COUNTRY_HEADER`, set and overwritten by the trusted edge) and the
+**unknown origin**. A buyer command is refused when the declared country OR the
+IP country is blocked, or when the IP country is unknown and `UNKNOWN` resolves
+to `blocked`; declaring Switzerland from a US IP, or sending no header, does
+not get around it. Only commands that start new commerce are checked, before
+the command's transaction and after a stored replay is answered:
+
+| Entry point | Refused with | Reasons |
+|---|---|---|
+| `checkout.create`, `offer.create`, `offer.checkout`, `auction.place_bid` | `COMMERCE_UNAVAILABLE_IN_REGION` (409) | `buyer_region_blocked` (declared country), `buyer_ip_blocked`, `buyer_region_unknown`; the command must carry `buyer_country` |
+| the same four, on a listing whose seller's shop country is blocked | `SELLER_UNAVAILABLE_IN_REGION` (409) | `seller_region_blocked` (the shop record is read, fail closed) |
+| `payment.prepare_locks`, `POST /v0/orders/{id}/payment-method` (the first bind) | as above | the order's declared country, the request's IP and the seller's shop country |
+| `listing.register`, `listing.sync`, `drop.sync`, `PUT /v0/sellers/me/payment-config` | `SELLER_UNAVAILABLE_IN_REGION` (409) | `seller_region_blocked` (shop country), `seller_ip_blocked` (the seller's own request); an unknown origin is `COMMERCE_UNAVAILABLE_IN_REGION` `buyer_region_unknown` |
+
+`listing.sync` is refused only when it would publish or update a live listing;
+a sync of a record that is gone, paused, ended or removed is never refused, so a
+takedown always goes through. `POST /v1/listings/sync-many` has no browser IP,
+so only the seller's shop country applies to it.
+
+Never checked, so that nobody is trapped with money in flight: PayPal IPN and
+other webhooks, Paykit callbacks, payment confirmation (`payment.sandbox_advance`,
+`payment.register_locks`, the Bitcoin confirmation and resolve routes, fiat
+mark-paid and confirm-received), refunds, cancellation, returns, fulfillment,
+shipping and delivery confirmation, reviews, reading orders, receipts and
+queries, listing takedowns, the connectors' inbound webhooks and health. A
+re-bind of the payment method an order already carries is a read, not a start.
+
+The refusal messages are the Shop's copy: "Buying and selling aren't available
+in your region yet." (`buyer_region_blocked`, `buyer_ip_blocked`), "We can't
+tell where you are, so buying and selling are paused." (`buyer_region_unknown`),
+"Selling isn't available in your region yet." (the seller's own commands) and
+"This seller can't sell on Pubky Market right now." (a buyer command on a
+blocked seller). With no blocked region in force nothing here reads the
+database, a shop record or the header.
+
 ### EU scope fence
 
-Legal launch plan C1-C4, behind `EU_FENCE_ENABLED` (default off). The seller
+Legal launch plan C1-C4, behind `EU_FENCE_ENABLED` (default off), or for the
+nuanced regions of [`REGION_MODES`](#region-modes). The seller
 declares who they are in their own shop record (`sellerStatus`: `private` or
 `trader`; absent or anything else is undeclared and counts as a business) and
 their shop country (`location.countryCode`); the buyer's client sends the
@@ -342,7 +428,11 @@ The Shop reads `GET /v1/sellers/{seller_pubky}/annual-limit` (see
 ### Digital sales to EU and UK buyers
 
 Legal launch plan C3b, behind `DIGITAL_REGION_BLOCK_ENABLED` (default off,
-independent of `EU_FENCE_ENABLED`). EU VAT presumes a platform that authorises
+independent of `EU_FENCE_ENABLED`), or for the nuanced regions of
+[`REGION_MODES`](#region-modes). With `REGION_MODES` a nuanced country outside
+the EU-27 and GB is held too, with `reason` `region_buyer` (declared) or
+`region_ip` and the message "Digital items aren't available to buyers in your
+region yet."; an unknown IP country is held unless `UNKNOWN` is `open`. EU VAT presumes a platform that authorises
 the charge or the delivery of an electronic service to be its supplier
 (IR 282/2011 Art. 9a), and the UK has the same platform rule. The service
 releases file, link and text items and Locks items itself, so with the flag on

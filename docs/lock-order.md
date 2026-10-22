@@ -6,7 +6,8 @@ with `40P01`; that transaction rolls back completely.
 
 ## Seller counters before everything
 
-With `EU_FENCE_ENABLED` on, `checkout.create` and `offer.checkout` take one
+With `EU_FENCE_ENABLED` on (or `REGION_MODES` restricting a region),
+`checkout.create` and `offer.checkout` take one
 transaction-scoped advisory lock per seller, `pg_advisory_xact_lock(
 hashtextextended(seller_pubky, 6381))`, in ascending seller order, as the first
 locks of the transaction: before the drop row, the listing rows and the
