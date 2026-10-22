@@ -43,6 +43,14 @@ use crate::clock::format_timestamp;
 pub const ENV_ATTESTOR_SECRET_KEY: &str = "ATTESTOR_SECRET_KEY";
 pub const ENV_ATTESTOR_ORDER_SALT: &str = "ATTESTOR_ORDER_SALT";
 
+/// Whether the purchase attestations this service issues carry `price_decade`.
+/// The attestor profile states it as `issuancePolicy.priceDecade` (`always`
+/// when true, `never` otherwise), so the profile is truthful about what a
+/// verifier will find. The change that starts signing the claim sets this to
+/// true; `purchase_attestation_claims_follow_the_price_decade_policy` fails
+/// until it does.
+pub const ISSUES_PRICE_DECADE: bool = false;
+
 /// JOSE `typ` of a v1 purchase attestation (spec fork: normative reference
 /// in `pubky-app-specs` `marketplace_attestation.rs`).
 pub const PURCHASE_ATTESTATION_TYP: &str = "pubky-purchase-attestation+v1";
@@ -206,6 +214,12 @@ impl Attestor {
             pubky,
             order_salt,
         })
+    }
+
+    /// The Ed25519 secret, for the records the publisher signs and the
+    /// homeserver account it signs in as.
+    pub(crate) fn secret_key_bytes(&self) -> [u8; 32] {
+        self.signing_key.to_bytes()
     }
 
     /// The attestor's pubky: the z-base-32 encoding of its Ed25519
@@ -429,6 +443,26 @@ mod tests {
         )
         .unwrap();
         assert_ne!(attestor.order_ref(order), other_salt.order_ref(order));
+    }
+
+    #[test]
+    fn purchase_attestation_claims_follow_the_price_decade_policy() {
+        let issued = attestor().issue_purchase_attestation(
+            Uuid::from_u128(7),
+            &"o".repeat(52),
+            &"p".repeat(52),
+            "buyer_reviewing_seller",
+            "pubky://ppppp/pub/pubky.app/marketplace/v1/listings/x",
+            "2026-08-20",
+            None,
+            "2026-08-21T12:00:00Z".parse().unwrap(),
+        );
+        assert_eq!(
+            issued.claims.get("price_decade").is_some(),
+            ISSUES_PRICE_DECADE,
+            "the attestor profile's priceDecade follows ISSUES_PRICE_DECADE; \
+             change them together"
+        );
     }
 
     #[test]

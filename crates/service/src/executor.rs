@@ -891,7 +891,15 @@ async fn dispatch(
             crate::handlers::returns::approve(tx, actor, command, payload, now).await
         }
         CommandPayload::ReceiveReturn(payload) => {
-            crate::handlers::returns::receive(tx, actor, command, payload, now).await
+            crate::handlers::returns::receive(
+                tx,
+                actor,
+                command,
+                payload,
+                state.attestor.as_deref(),
+                now,
+            )
+            .await
         }
         CommandPayload::CancelReturn(payload) => {
             crate::handlers::returns::cancel(tx, actor, command, payload, now).await

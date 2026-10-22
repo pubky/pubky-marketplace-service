@@ -59,6 +59,18 @@ async fn main() -> anyhow::Result<()> {
     // without salt, or salt without key) refuses to start rather than
     // issuing attestations with unlinkable order refs.
     let attestor = marketplace_service::attestor::Attestor::from_env()?;
+    // The publisher is off unless ATTESTOR_PUBLISH_ENABLED is true; enabled, a
+    // missing setting or key refuses to start.
+    let attestor_publisher =
+        marketplace_service::attestor_publish::AttestorPublisher::from_env(attestor.as_deref())?;
+    tracing::info!(
+        attestor_publishing = if attestor_publisher.is_some() {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        "attestor publishing mode resolved"
+    );
     // Fail closed for payment methods: STRIPE_KEY_ENCRYPTION_KEY (the
     // seller-secret key, a legacy name) enables the surface, and the Paykit
     // pair (server URL + signing key) is all-or-nothing within it.
@@ -229,6 +241,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState::new(pool, Arc::new(SystemClock), config)
         .with_locks(locks)
         .with_attestor(attestor)
+        .with_attestor_publisher(attestor_publisher)
         .with_homeserver(Some(homeserver))
         .with_refund_chain(refund_chain)
         .with_listing_moderation(Some(listing_moderation))
