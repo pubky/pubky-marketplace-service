@@ -430,8 +430,12 @@ request failed, so clients should branch on HTTP status first, and parse
    and on the seller's own `listing.register`, `listing.sync`, `drop.sync` and
    `PUT /v0/sellers/me/payment-config`) and `seller_ip_blocked` (the seller's
    own interactive request comes from a blocked country). Webhooks, payment
-   confirmation, refunds, cancellation, returns, fulfillment, reviews, reads and
-   listing takedowns are never refused for region.
+   confirmation, refunds, cancellation, returns, fulfillment, reviews, reads,
+   listing takedowns and `GET /v0/sellers/me/payment-config` are never refused
+   for region. Neither is changing the declared country: the seller's shop
+   record is written to their homeserver, not to the service, and the service
+   reads it afresh on every selling command, so a seller who moved sells again
+   as soon as the record names an open country and the request comes from one.
 
    With `REGION_MODES`, `DIGITAL_UNAVAILABLE_IN_REGION` also answers any
    nuanced country: `reason` `region_buyer` or `region_ip` for a country

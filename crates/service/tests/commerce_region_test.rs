@@ -1117,6 +1117,65 @@ async fn seller_payment_setup_is_refused_for_a_blocked_shop_country_or_ip(pool: 
     assert_eq!(ok.0, StatusCode::OK, "{}", ok.1);
 }
 
+/// Changing the declared country is a write of the seller's own shop record to
+/// their homeserver, which the service never sees; it reads that record afresh
+/// on every selling command. So a seller who moved is never stuck behind the
+/// country they left: the next command from an open region goes through.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_seller_who_moves_to_an_open_country_can_sell_again_at_once(pool: PgPool) {
+    let world = paypal_world(pool).await;
+    let app = launch(&world.setup);
+    let seller = new_actor(&app).await;
+    world
+        .homeserver
+        .put_shop_record(&seller.pubky, shop_record(&seller, None, "GB"));
+
+    assert_refused(
+        &put_config(&app, &seller.token, Some("CH")).await,
+        StatusCode::CONFLICT,
+        "SELLER_UNAVAILABLE_IN_REGION",
+        "seller_region_blocked",
+        SELLING_MESSAGE,
+    );
+    let read = send_from(
+        app.router.clone(),
+        "GET",
+        "/v0/sellers/me/payment-config",
+        Some(&seller.token),
+        &json!({}),
+        Some("GB"),
+    )
+    .await;
+    assert_eq!(
+        read.0,
+        StatusCode::OK,
+        "reading the payment config is never refused for region: {}",
+        read.1
+    );
+
+    world
+        .homeserver
+        .put_shop_record(&seller.pubky, shop_record(&seller, None, "CH"));
+
+    let still_blocked_here = put_config(&app, &seller.token, Some("GB")).await;
+    assert_refused(
+        &still_blocked_here,
+        StatusCode::CONFLICT,
+        "SELLER_UNAVAILABLE_IN_REGION",
+        "seller_ip_blocked",
+        SELLING_MESSAGE,
+    );
+    let from_an_open_country = put_config(&app, &seller.token, Some("CH")).await;
+    assert_eq!(
+        from_an_open_country.0,
+        StatusCode::OK,
+        "{}",
+        from_an_open_country.1
+    );
+    let listing = register_command(&seller.pubky, 5);
+    assert_accepted(&execute_from(&app, &seller.token, &listing, Some("CH")).await);
+}
+
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn sync_many_checks_the_shop_country_only_and_reads_no_ip(pool: PgPool) {
     let (setup, homeserver) = test_app_with_homeserver(pool).await;
