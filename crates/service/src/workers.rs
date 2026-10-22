@@ -4940,7 +4940,9 @@ async fn assume_due_deliveries_batch(
 /// `return_approved`, `return_received`, and `cancel_requested` are their
 /// own order states, so such an order never matches the `state =
 /// 'delivered'` claim or the compare-and-swap. The event is attributed to
-/// the system actor, never a peer.
+/// the system actor, never a peer. The sweep never reads the return policy:
+/// `return.request` takes `completed` orders too, within the window counted
+/// from delivery, so completing inside that window loses no return.
 pub async fn complete_due_delivered_orders(
     pool: &PgPool,
     now: DateTime<Utc>,
