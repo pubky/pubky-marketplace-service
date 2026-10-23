@@ -164,13 +164,14 @@ async fn main() -> anyhow::Result<()> {
         ),
         None => tracing::info!("attestation issuance disabled (no attestor key configured)"),
     }
-    // A request or worker pass waits at most 5 s for a connection, instead of
-    // the sqlx default of 30 s, and then fails with `PoolTimedOut`; the same
-    // 5 s also bounds opening a new connection. At boot the service still
-    // waits up to 30 s for the database, as with the sqlx default.
+    // A request or worker pass waits at most 15 s for a connection, instead of
+    // the sqlx default of 30 s, and then fails with `PoolTimedOut`. 15 s stays
+    // above the longest time a connection is held across an upstream call (the
+    // 10 s Paykit HTTP timeout). The same 15 s also bounds opening a new
+    // connection. At boot the service still waits up to 30 s for the database.
     let pool = PgPoolOptions::new()
         .max_connections(20)
-        .acquire_timeout(Duration::from_secs(5))
+        .acquire_timeout(POOL_ACQUIRE_WAIT)
         .connect_lazy(&config.database_url)?;
     wait_for_database(&pool, BOOT_DATABASE_WAIT).await?;
     marketplace_service::migrations::run(&pool).await?;
@@ -278,10 +279,14 @@ async fn main() -> anyhow::Result<()> {
 /// How long the service waits at boot for the first database connection.
 const BOOT_DATABASE_WAIT: Duration = Duration::from_secs(30);
 
+/// How long a request or worker pass waits for a pooled connection.
+const POOL_ACQUIRE_WAIT: Duration = Duration::from_secs(15);
+
 /// Waits up to `budget` for the first connection. Each attempt is bounded by
-/// the pool's acquire timeout (5 s at boot), so only `PoolTimedOut` is retried:
-/// sqlx already retries a refused or still-starting server within one attempt,
-/// and any other error (a wrong password or URL) fails the boot at once.
+/// the pool's acquire timeout (`POOL_ACQUIRE_WAIT` at boot), so only
+/// `PoolTimedOut` is retried: sqlx already retries a refused or still-starting
+/// server within one attempt, and any other error (a wrong password or URL)
+/// fails the boot at once.
 async fn wait_for_database(pool: &sqlx::PgPool, budget: Duration) -> Result<(), sqlx::Error> {
     let deadline = std::time::Instant::now() + budget;
     loop {
@@ -302,10 +307,10 @@ async fn wait_for_database(pool: &sqlx::PgPool, budget: Duration) -> Result<(), 
 mod tests {
     use std::time::{Duration, Instant};
 
-    use sqlx::postgres::PgPoolOptions;
+    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    use super::{env_filter, wait_for_database};
+    use super::{env_filter, wait_for_database, BOOT_DATABASE_WAIT, POOL_ACQUIRE_WAIT};
 
     #[test]
     fn dependency_directives_remain_at_warn() {
@@ -330,6 +335,35 @@ mod tests {
             .acquire_timeout(Duration::from_millis(100))
             .connect_lazy(url)
             .expect("valid database URL")
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn boot_wait_returns_the_first_connection_to_the_pool(
+        pool_options: PgPoolOptions,
+        connect_options: PgConnectOptions,
+    ) {
+        // A lazy pool, as at boot: it holds no connection until the wait opens one.
+        let pool = pool_options
+            .acquire_timeout(POOL_ACQUIRE_WAIT)
+            .connect_lazy_with(connect_options);
+        assert_eq!(pool.size(), 0);
+
+        let started = Instant::now();
+        let result = wait_for_database(&pool, BOOT_DATABASE_WAIT).await;
+        let elapsed = started.elapsed();
+
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
+        assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}");
+        // The connection goes back to the pool on a spawned task.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while pool.num_idle() != 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the connection returns to the pool as idle");
+        assert_eq!(pool.size(), 1);
+        pool.close().await;
     }
 
     #[tokio::test]
