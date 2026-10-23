@@ -11,12 +11,14 @@ use std::time::Duration;
 
 use axum::http::{HeaderMap, StatusCode};
 use axum::Router;
-use marketplace_service::clock::Clock;
+use chrono::{DateTime, Utc};
+use marketplace_service::clock::{format_timestamp, Clock};
 use marketplace_service::handlers::drops::{apply_time_transitions, fetch_drop_for_update};
+use marketplace_service::model::DropRow;
 use marketplace_service::workers::transition_due_drops;
 use serde_json::{json, Value};
-use sqlx::PgPool;
-use tokio::task::JoinSet;
+use sqlx::{PgPool, Postgres, Transaction};
+use tokio::task::{JoinHandle, JoinSet};
 use uuid::Uuid;
 
 use common::{
@@ -34,6 +36,8 @@ const ENDS_IN: i64 = 1_200;
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// Concurrent reads at the start boundary, below the per-test pool size of 5.
 const CONCURRENT_READS: usize = 4;
+/// Seconds the clock moves on while a read waits on the drop row lock.
+const LOCK_WAIT: i64 = 7;
 
 fn public_drop_uri(seller_pubky: &str) -> String {
     format!("/v0/drops/{seller_pubky}/{DROP_ID}")
@@ -139,6 +143,78 @@ async fn public_drop_while_row_is_locked(
     read.expect("the read does not wait for the drop row lock")
 }
 
+/// Locks the drop row `FOR UPDATE` in a holder transaction, spawns a public
+/// read, and returns once that read waits on the row lock. By then the read's
+/// unlocked SELECT has already seen the row as it was before the holder
+/// writes. Returns the holder, the row it locked, and the pending read.
+async fn spawn_read_waiting_on_the_row_lock(
+    app: &TestApp,
+    aggregate_id: &str,
+    uri: String,
+) -> (
+    Transaction<'static, Postgres>,
+    DropRow,
+    JoinHandle<(StatusCode, HeaderMap, Value)>,
+) {
+    let mut holder = app.pool.begin().await.expect("holder begins");
+    let (holder_pid,): (i32,) = sqlx::query_as("SELECT pg_backend_pid()")
+        .fetch_one(&mut *holder)
+        .await
+        .expect("holder pid");
+    let locked_row = fetch_drop_for_update(&mut holder, aggregate_id)
+        .await
+        .expect("holder locks the drop row")
+        .expect("the drop exists");
+
+    let router = app.router.clone();
+    let read = tokio::spawn(async move { public_drop(router, &uri).await });
+
+    let started = tokio::time::Instant::now();
+    loop {
+        let waiting: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+             WHERE datname = current_database() AND pid <> $1 \
+             AND wait_event_type = 'Lock' \
+             AND query ILIKE '%FROM drops%' AND query ILIKE '%FOR UPDATE%')",
+        )
+        .bind(holder_pid)
+        .fetch_one(&app.pool)
+        .await
+        .expect("lock-wait probe");
+        if waiting {
+            break;
+        }
+        assert!(
+            started.elapsed() < READ_TIMEOUT,
+            "the read never waited on the drop row lock"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    (holder, locked_row, read)
+}
+
+/// The occurrence time of the drop's one `drop.started` event and the drop
+/// row's `updated_at`.
+async fn start_event_and_row_times(
+    pool: &PgPool,
+    aggregate_id: &str,
+) -> (DateTime<Utc>, DateTime<Utc>) {
+    let occurred_at: DateTime<Utc> = sqlx::query_scalar(
+        "SELECT occurred_at FROM events WHERE aggregate_id = $1 AND kind = 'drop.started'",
+    )
+    .bind(aggregate_id)
+    .fetch_one(pool)
+    .await
+    .expect("the drop.started event exists");
+    let updated_at: DateTime<Utc> =
+        sqlx::query_scalar("SELECT updated_at FROM drops WHERE aggregate_id = $1")
+            .bind(aggregate_id)
+            .fetch_one(pool)
+            .await
+            .expect("the drop exists");
+    (occurred_at, updated_at)
+}
+
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn public_drop_read_takes_no_row_lock_when_nothing_is_due(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
@@ -236,43 +312,12 @@ async fn a_read_that_waits_on_the_lock_applies_nothing_the_holder_already_applie
     app.clock.advance_seconds(STARTS_IN + 1);
     let now = app.clock.now();
 
-    let mut holder = app.pool.begin().await.expect("holder begins");
-    let (holder_pid,): (i32,) = sqlx::query_as("SELECT pg_backend_pid()")
-        .fetch_one(&mut *holder)
-        .await
-        .expect("holder pid");
-    let locked_row = fetch_drop_for_update(&mut holder, &aggregate_id)
-        .await
-        .expect("holder locks the drop row")
-        .expect("the drop exists");
-
-    let router = app.router.clone();
-    let uri = public_drop_uri(&seller.pubky);
-    let read = tokio::spawn(async move { public_drop(router, &uri).await });
-
     // Once the read waits on the row lock, its unlocked SELECT has already
     // seen the drop announced with the start due.
-    let started = tokio::time::Instant::now();
-    loop {
-        let waiting: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
-             WHERE datname = current_database() AND pid <> $1 \
-             AND wait_event_type = 'Lock' \
-             AND query ILIKE '%FROM drops%' AND query ILIKE '%FOR UPDATE%')",
-        )
-        .bind(holder_pid)
-        .fetch_one(&app.pool)
-        .await
-        .expect("lock-wait probe");
-        if waiting {
-            break;
-        }
-        assert!(
-            started.elapsed() < READ_TIMEOUT,
-            "the read never waited on the drop row lock"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    let (mut holder, locked_row, read) =
+        spawn_read_waiting_on_the_row_lock(&app, &aggregate_id, public_drop_uri(&seller.pubky))
+            .await;
+    app.clock.advance_seconds(LOCK_WAIT);
 
     // The holder applies the start first. A read that applied its stale
     // unlocked row would write revision 2 again and fail on the events
@@ -290,11 +335,48 @@ async fn a_read_that_waits_on_the_lock_applies_nothing_the_holder_already_applie
     assert_eq!(status, StatusCode::OK, "public read failed: {body}");
     assert_eq!(body["drop"]["state"], json!("live"));
     assert_eq!(body["drop"]["revision"], json!(2));
+    // The server time is taken once the lock is granted, not before the wait.
+    assert_eq!(
+        body["drop"]["server_time"],
+        json!(ts_after(STARTS_IN + 1 + LOCK_WAIT))
+    );
     assert_eq!(
         stored_drop(&app.pool, &aggregate_id).await,
         ("live".to_owned(), 2)
     );
     assert_eq!(drop_started_events(&app.pool).await, 1);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_read_that_waits_on_the_lock_stamps_the_transition_after_the_wait(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let (seller, aggregate_id) = announced_drop(&app, &homeserver, None).await;
+    app.clock.advance_seconds(STARTS_IN + 1);
+
+    let (holder, _, read) =
+        spawn_read_waiting_on_the_row_lock(&app, &aggregate_id, public_drop_uri(&seller.pubky))
+            .await;
+    app.clock.advance_seconds(LOCK_WAIT);
+    // The holder applies nothing, so the read applies the start itself.
+    holder.rollback().await.expect("holder rolls back");
+
+    let (status, _, body) = tokio::time::timeout(READ_TIMEOUT, read)
+        .await
+        .expect("the read finishes once the holder rolls back")
+        .expect("read task runs");
+    let after_wait = ts_after(STARTS_IN + 1 + LOCK_WAIT);
+    assert_eq!(status, StatusCode::OK, "public read failed: {body}");
+    assert_eq!(body["drop"]["state"], json!("live"));
+    assert_eq!(body["drop"]["revision"], json!(2));
+    assert_eq!(body["drop"]["server_time"], json!(after_wait));
+    assert_eq!(
+        stored_drop(&app.pool, &aggregate_id).await,
+        ("live".to_owned(), 2)
+    );
+    assert_eq!(drop_started_events(&app.pool).await, 1);
+    let (occurred_at, updated_at) = start_event_and_row_times(&app.pool, &aggregate_id).await;
+    assert_eq!(format_timestamp(occurred_at), after_wait);
+    assert_eq!(format_timestamp(updated_at), after_wait);
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]

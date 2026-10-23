@@ -973,9 +973,8 @@ pub async fn get_public_drop(
     State(state): State<AppState>,
     Path((seller_pubky, drop_id)): Path<(String, String)>,
 ) -> Response {
-    let now = state.clock.now();
-    let drop = match read_public_drop(&state, &seller_pubky, &drop_id, now).await {
-        Ok(Some(drop)) => drop,
+    let (drop, now) = match read_public_drop(&state, &seller_pubky, &drop_id).await {
+        Ok(Some(read)) => read,
         Ok(None) => {
             return with_cache_control(
                 query_error(ErrorCode::NotFound, "The drop was not found."),
@@ -1027,14 +1026,16 @@ const PUBLIC_DROP_CACHE_CONTROL: &str = "public, max-age=1";
 /// is due (announced past `starts_at`, or live past `ends_at`) does it re-read
 /// the row `FOR UPDATE` and apply the transition from that locked row, so a
 /// read that races the sweep or another read finds it already applied and
-/// writes nothing. Lock order: the drop row, then (inside the transition) its
-/// `drop_listings` bindings.
+/// writes nothing. The locked path reads the clock again once the lock is
+/// granted, and returns that instant with the row as the server time. Lock
+/// order: the drop row, then (inside the transition) its `drop_listings`
+/// bindings.
 async fn read_public_drop(
     state: &AppState,
     seller_pubky: &str,
     drop_id: &str,
-    now: DateTime<Utc>,
-) -> Result<Option<DropRow>, sqlx::Error> {
+) -> Result<Option<(DropRow, DateTime<Utc>)>, sqlx::Error> {
+    let now = state.clock.now();
     let drop: Option<DropRow> = sqlx::query_as(&format!(
         "SELECT {DROP_COLUMNS} FROM drops WHERE seller_pubky = $1 AND drop_id = $2"
     ))
@@ -1046,7 +1047,7 @@ async fn read_public_drop(
         return Ok(None);
     };
     if !crate::handlers::drops::transition_due(&drop, now) {
-        return Ok(Some(drop));
+        return Ok(Some((drop, now)));
     }
 
     let mut tx = state.pool.begin().await?;
@@ -1055,10 +1056,11 @@ async fn read_public_drop(
     else {
         return Ok(None);
     };
+    let now = state.clock.now();
     let drop = crate::handlers::drops::apply_time_transitions(&mut tx, locked, Uuid::new_v4(), now)
         .await?;
     tx.commit().await?;
-    Ok(Some(drop))
+    Ok(Some((drop, now)))
 }
 
 fn with_cache_control(mut response: Response, value: &'static str) -> Response {
