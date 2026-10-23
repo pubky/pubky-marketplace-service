@@ -164,15 +164,7 @@ async fn main() -> anyhow::Result<()> {
         ),
         None => tracing::info!("attestation issuance disabled (no attestor key configured)"),
     }
-    // A request or worker pass waits at most 15 s for a connection, instead of
-    // the sqlx default of 30 s, and then fails with `PoolTimedOut`. 15 s stays
-    // above the longest time a connection is held across an upstream call (the
-    // 10 s Paykit HTTP timeout). The same 15 s also bounds opening a new
-    // connection. At boot the service still waits up to 30 s for the database.
-    let pool = PgPoolOptions::new()
-        .max_connections(20)
-        .acquire_timeout(POOL_ACQUIRE_WAIT)
-        .connect_lazy(&config.database_url)?;
+    let pool = main_pool_options().connect_lazy(&config.database_url)?;
     wait_for_database(&pool, BOOT_DATABASE_WAIT).await?;
     marketplace_service::migrations::run(&pool).await?;
     tracing::info!("database migrations applied");
@@ -282,6 +274,17 @@ const BOOT_DATABASE_WAIT: Duration = Duration::from_secs(30);
 /// How long a request or worker pass waits for a pooled connection.
 const POOL_ACQUIRE_WAIT: Duration = Duration::from_secs(15);
 
+// A request or worker pass waits at most 15 s for a connection, instead of
+// the sqlx default of 30 s, and then fails with `PoolTimedOut`. 15 s stays
+// above the longest time a connection is held across an upstream call (the
+// 10 s Paykit HTTP timeout). The same 15 s also bounds opening a new
+// connection. At boot the service still waits up to 30 s for the database.
+fn main_pool_options() -> PgPoolOptions {
+    PgPoolOptions::new()
+        .max_connections(20)
+        .acquire_timeout(POOL_ACQUIRE_WAIT)
+}
+
 /// Waits up to `budget` for the first connection. Each attempt is bounded by
 /// the pool's acquire timeout (`POOL_ACQUIRE_WAIT` at boot), so only
 /// `PoolTimedOut` is retried: sqlx already retries a refused or still-starting
@@ -310,7 +313,9 @@ mod tests {
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    use super::{env_filter, wait_for_database, BOOT_DATABASE_WAIT, POOL_ACQUIRE_WAIT};
+    use super::{
+        env_filter, main_pool_options, wait_for_database, BOOT_DATABASE_WAIT, POOL_ACQUIRE_WAIT,
+    };
 
     #[test]
     fn dependency_directives_remain_at_warn() {
@@ -327,6 +332,17 @@ mod tests {
                 "{directive} missing from {filter}"
             );
         }
+    }
+
+    #[test]
+    fn main_pool_waits_longer_than_the_paykit_http_timeout() {
+        let options = main_pool_options();
+        assert_eq!(options.get_acquire_timeout(), POOL_ACQUIRE_WAIT);
+        assert_eq!(options.get_max_connections(), 20);
+        // `HTTP_TIMEOUT` in payments.rs (private), the longest time a
+        // connection is held across an upstream call.
+        let paykit_http_timeout = Duration::from_secs(10);
+        assert!(POOL_ACQUIRE_WAIT > paykit_http_timeout);
     }
 
     /// A pool whose every attempt gives up after 100 ms.
