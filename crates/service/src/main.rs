@@ -164,8 +164,11 @@ async fn main() -> anyhow::Result<()> {
         ),
         None => tracing::info!("attestation issuance disabled (no attestor key configured)"),
     }
+    // A request or worker pass waits at most 5 s for a connection, instead of
+    // the sqlx default of 30 s, and then fails with `PoolTimedOut`.
     let pool = PgPoolOptions::new()
         .max_connections(20)
+        .acquire_timeout(Duration::from_secs(5))
         .connect(&config.database_url)
         .await?;
     marketplace_service::migrations::run(&pool).await?;
