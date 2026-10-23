@@ -258,6 +258,41 @@ async fn the_largest_safe_total_is_charged_exactly(pool: sqlx::PgPool) {
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_pickup_order_at_the_largest_safe_total_is_not_charged_shipping(pool: sqlx::PgPool) {
+    let app = test_app(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    // Shipped, this listing would go above the bound by its shipping.
+    let mut listing = register_priced(&seller.pubky, MAX_SAFE_INTEGER, 1);
+    listing["payload"]["fulfillment_methods"] = json!(["shipping", "pickup"]);
+    register(&app, &seller, &listing).await;
+
+    // A pickup checkout carries no delivery address.
+    let mut pickup = checkout(&seller.pubky, 1);
+    pickup["payload"]["lines"][0]["fulfillment"] = json!("pickup");
+    pickup["payload"]
+        .as_object_mut()
+        .expect("checkout payload")
+        .remove("delivery_address");
+
+    let (status, body) = execute(&app, &buyer.token, &pickup).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["result"]["orders"][0]["fulfillment"],
+        json!("pickup"),
+        "{body}"
+    );
+    assert_seller_order(
+        &app,
+        &body,
+        &buyer,
+        &seller,
+        (MAX_SAFE_INTEGER, 0, MAX_SAFE_INTEGER),
+    )
+    .await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_drop_bound_checkout_above_the_largest_safe_total_is_refused_and_writes_nothing(
     pool: sqlx::PgPool,
 ) {
