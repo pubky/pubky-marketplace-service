@@ -12,10 +12,12 @@ use std::time::Duration;
 use axum::http::{HeaderMap, StatusCode};
 use axum::Router;
 use marketplace_service::clock::Clock;
+use marketplace_service::handlers::drops::{apply_time_transitions, fetch_drop_for_update};
 use marketplace_service::workers::transition_due_drops;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use tokio::task::JoinSet;
+use uuid::Uuid;
 
 use common::{
     count, drop_aggregate, drop_record_json, execute, new_actor, register_command,
@@ -228,6 +230,74 @@ async fn public_read_racing_the_drop_sweep_records_one_start(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_read_that_waits_on_the_lock_applies_nothing_the_holder_already_applied(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let (seller, aggregate_id) = announced_drop(&app, &homeserver, None).await;
+    app.clock.advance_seconds(STARTS_IN + 1);
+    let now = app.clock.now();
+
+    let mut holder = app.pool.begin().await.expect("holder begins");
+    let (holder_pid,): (i32,) = sqlx::query_as("SELECT pg_backend_pid()")
+        .fetch_one(&mut *holder)
+        .await
+        .expect("holder pid");
+    let locked_row = fetch_drop_for_update(&mut holder, &aggregate_id)
+        .await
+        .expect("holder locks the drop row")
+        .expect("the drop exists");
+
+    let router = app.router.clone();
+    let uri = public_drop_uri(&seller.pubky);
+    let read = tokio::spawn(async move { public_drop(router, &uri).await });
+
+    // Once the read waits on the row lock, its unlocked SELECT has already
+    // seen the drop announced with the start due.
+    let started = tokio::time::Instant::now();
+    loop {
+        let waiting: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+             WHERE datname = current_database() AND pid <> $1 \
+             AND wait_event_type = 'Lock' \
+             AND query ILIKE '%FROM drops%' AND query ILIKE '%FOR UPDATE%')",
+        )
+        .bind(holder_pid)
+        .fetch_one(&app.pool)
+        .await
+        .expect("lock-wait probe");
+        if waiting {
+            break;
+        }
+        assert!(
+            started.elapsed() < READ_TIMEOUT,
+            "the read never waited on the drop row lock"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // The holder applies the start first. A read that applied its stale
+    // unlocked row would write revision 2 again and fail on the events
+    // (aggregate_id, revision) unique constraint.
+    let applied = apply_time_transitions(&mut holder, locked_row, Uuid::new_v4(), now)
+        .await
+        .expect("holder applies the start");
+    assert_eq!(applied.revision, 2);
+    holder.commit().await.expect("holder commits");
+
+    let (status, _, body) = tokio::time::timeout(READ_TIMEOUT, read)
+        .await
+        .expect("the read finishes once the holder commits")
+        .expect("read task runs");
+    assert_eq!(status, StatusCode::OK, "public read failed: {body}");
+    assert_eq!(body["drop"]["state"], json!("live"));
+    assert_eq!(body["drop"]["revision"], json!(2));
+    assert_eq!(
+        stored_drop(&app.pool, &aggregate_id).await,
+        ("live".to_owned(), 2)
+    );
+    assert_eq!(drop_started_events(&app.pool).await, 1);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn public_drop_read_has_short_public_caching_and_a_miss_is_not_cached(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
     let (seller, _) = announced_drop(&app, &homeserver, None).await;
@@ -307,6 +377,13 @@ async fn a_public_read_alone_closes_a_live_drop_past_ends_at(pool: PgPool) {
     app.clock.advance_seconds(STARTS_IN + 1);
 
     let (status, _, body) = public_drop(app.router.clone(), &uri).await;
+    assert_eq!(status, StatusCode::OK, "public read failed: {body}");
+    assert_eq!(body["drop"]["state"], json!("live"));
+    assert_eq!(body["drop"]["revision"], json!(2));
+
+    // Live with ends_at still ahead has nothing due, so a read does not
+    // touch the row lock.
+    let (status, _, body) = public_drop_while_row_is_locked(&app, &aggregate_id, &uri).await;
     assert_eq!(status, StatusCode::OK, "public read failed: {body}");
     assert_eq!(body["drop"]["state"], json!("live"));
     assert_eq!(body["drop"]["revision"], json!(2));
