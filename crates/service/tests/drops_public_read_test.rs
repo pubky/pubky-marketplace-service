@@ -88,31 +88,89 @@ async fn drop_started_events(pool: &PgPool) -> i64 {
     .await
 }
 
+async fn drop_ended_events(pool: &PgPool) -> i64 {
+    count(
+        pool,
+        "SELECT COUNT(*) FROM events WHERE kind = 'drop.ended'",
+    )
+    .await
+}
+
+/// The persisted state and revision of the drop row.
+async fn stored_drop(pool: &PgPool, aggregate_id: &str) -> (String, i64) {
+    sqlx::query_as("SELECT state, revision FROM drops WHERE aggregate_id = $1")
+        .bind(aggregate_id)
+        .fetch_one(pool)
+        .await
+        .expect("the drop exists")
+}
+
+/// All bindings of the drop in `drop_listings`, and how many are active.
+async fn binding_counts(pool: &PgPool, aggregate_id: &str) -> (i64, i64) {
+    sqlx::query_as(
+        "SELECT COUNT(*), COUNT(*) FILTER (WHERE active) FROM drop_listings \
+         WHERE drop_aggregate_id = $1",
+    )
+    .bind(aggregate_id)
+    .fetch_one(pool)
+    .await
+    .expect("binding counts load")
+}
+
+/// Reads the public drop while another transaction holds its row
+/// `FOR UPDATE`, as a checkout on this drop would. Panics if the read does
+/// not finish within [`READ_TIMEOUT`], that is, if it waits for the row lock.
+async fn public_drop_while_row_is_locked(
+    app: &TestApp,
+    aggregate_id: &str,
+    uri: &str,
+) -> (StatusCode, HeaderMap, Value) {
+    let mut holder = app.pool.begin().await.expect("holder begins");
+    sqlx::query("SELECT 1 FROM drops WHERE aggregate_id = $1 FOR UPDATE")
+        .bind(aggregate_id)
+        .execute(&mut *holder)
+        .await
+        .expect("holder locks the drop row");
+
+    let read = tokio::time::timeout(READ_TIMEOUT, public_drop(app.router.clone(), uri)).await;
+    holder.rollback().await.expect("holder rolls back");
+    read.expect("the read does not wait for the drop row lock")
+}
+
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn public_drop_read_takes_no_row_lock_when_nothing_is_due(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
     let (seller, aggregate_id) = announced_drop(&app, &homeserver, None).await;
 
-    // Another transaction holds the drop row, as a checkout on this drop
-    // would.
-    let mut holder = app.pool.begin().await.expect("holder begins");
-    sqlx::query("SELECT 1 FROM drops WHERE aggregate_id = $1 FOR UPDATE")
-        .bind(&aggregate_id)
-        .execute(&mut *holder)
-        .await
-        .expect("holder locks the drop row");
-
-    let read = tokio::time::timeout(
-        READ_TIMEOUT,
-        public_drop(app.router.clone(), &public_drop_uri(&seller.pubky)),
-    )
-    .await;
-    holder.rollback().await.expect("holder rolls back");
-
-    let (status, _, body) = read.expect("the read does not wait for the drop row lock");
+    let (status, _, body) =
+        public_drop_while_row_is_locked(&app, &aggregate_id, &public_drop_uri(&seller.pubky)).await;
     assert_eq!(status, StatusCode::OK, "public read failed: {body}");
     assert_eq!(body["drop"]["state"], json!("announced"));
     assert_eq!(body["drop"]["revision"], json!(1));
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn public_read_of_a_live_drop_takes_no_row_lock(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let (seller, aggregate_id) = announced_drop(&app, &homeserver, None).await;
+    let uri = public_drop_uri(&seller.pubky);
+    app.clock.advance_seconds(STARTS_IN + 1);
+
+    // The first read past starts_at applies the start and persists it.
+    let (status, _, body) = public_drop(app.router.clone(), &uri).await;
+    assert_eq!(status, StatusCode::OK, "public read failed: {body}");
+    assert_eq!(body["drop"]["state"], json!("live"));
+    assert_eq!(
+        stored_drop(&app.pool, &aggregate_id).await,
+        ("live".to_owned(), 2)
+    );
+
+    // A live drop with no ends_at has nothing due, so the next read does
+    // not touch the row lock.
+    let (status, _, body) = public_drop_while_row_is_locked(&app, &aggregate_id, &uri).await;
+    assert_eq!(status, StatusCode::OK, "public read failed: {body}");
+    assert_eq!(body["drop"]["state"], json!("live"));
+    assert_eq!(body["drop"]["revision"], json!(2));
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
@@ -193,12 +251,7 @@ async fn public_drop_read_has_short_public_caching_and_a_miss_is_not_cached(pool
 async fn public_reads_past_ends_at_close_the_drop_once(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
     let (seller, aggregate_id) = announced_drop(&app, &homeserver, Some(ENDS_IN)).await;
-    let (state_before, revision_before): (String, i64) =
-        sqlx::query_as("SELECT state, revision FROM drops WHERE aggregate_id = $1")
-            .bind(&aggregate_id)
-            .fetch_one(&app.pool)
-            .await
-            .expect("the drop exists");
+    let (state_before, revision_before) = stored_drop(&app.pool, &aggregate_id).await;
     assert_eq!(state_before, "announced");
     // The whole window elapses with no command or sweep touching the drop,
     // so the due transition goes straight from announced to ended_closed.
@@ -236,33 +289,51 @@ async fn public_reads_past_ends_at_close_the_drop_once(pool: PgPool) {
         assert_eq!(headers["cache-control"], "public, max-age=1");
     }
 
-    let (state_after, revision_after): (String, i64) =
-        sqlx::query_as("SELECT state, revision FROM drops WHERE aggregate_id = $1")
-            .bind(&aggregate_id)
-            .fetch_one(&app.pool)
-            .await
-            .expect("the drop exists");
+    let (state_after, revision_after) = stored_drop(&app.pool, &aggregate_id).await;
     assert_eq!(state_after, "ended_closed");
     assert_eq!(revision_after, revision_before + 1);
-    assert_eq!(
-        count(
-            &app.pool,
-            "SELECT COUNT(*) FROM events WHERE kind = 'drop.ended'"
-        )
-        .await,
-        1
-    );
+    assert_eq!(drop_ended_events(&app.pool).await, 1);
     assert_eq!(drop_started_events(&app.pool).await, 0);
-    let (bindings, active_bindings): (i64, i64) = sqlx::query_as(
-        "SELECT COUNT(*), COUNT(*) FILTER (WHERE active) FROM drop_listings \
-         WHERE drop_aggregate_id = $1",
-    )
-    .bind(&aggregate_id)
-    .fetch_one(&app.pool)
-    .await
-    .expect("binding counts load");
+    let (bindings, active_bindings) = binding_counts(&app.pool, &aggregate_id).await;
     assert_eq!(bindings, 1, "the drop binds boots_01");
     assert_eq!(active_bindings, 0, "a closed drop deactivates its bindings");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_public_read_alone_closes_a_live_drop_past_ends_at(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let (seller, aggregate_id) = announced_drop(&app, &homeserver, Some(ENDS_IN)).await;
+    let uri = public_drop_uri(&seller.pubky);
+    app.clock.advance_seconds(STARTS_IN + 1);
+
+    let (status, _, body) = public_drop(app.router.clone(), &uri).await;
+    assert_eq!(status, StatusCode::OK, "public read failed: {body}");
+    assert_eq!(body["drop"]["state"], json!("live"));
+    assert_eq!(body["drop"]["revision"], json!(2));
+
+    // No sweep runs: the read past ends_at applies the close itself.
+    app.clock.advance_seconds(ENDS_IN - STARTS_IN);
+    let (status, headers, body) = public_drop(app.router.clone(), &uri).await;
+    assert_eq!(status, StatusCode::OK, "public read failed: {body}");
+    assert_eq!(body["drop"]["state"], json!("ended_closed"));
+    assert_eq!(body["drop"]["revision"], json!(3));
+    assert_eq!(headers["cache-control"], "public, max-age=1");
+
+    assert_eq!(
+        stored_drop(&app.pool, &aggregate_id).await,
+        ("ended_closed".to_owned(), 3)
+    );
+    assert_eq!(drop_started_events(&app.pool).await, 1);
+    assert_eq!(drop_ended_events(&app.pool).await, 1);
+    let (bindings, active_bindings) = binding_counts(&app.pool, &aggregate_id).await;
+    assert_eq!(bindings, 1, "the drop binds boots_01");
+    assert_eq!(active_bindings, 0, "a closed drop deactivates its bindings");
+
+    // A closed drop has nothing due, so a later read does not touch the row
+    // lock either.
+    let (status, _, body) = public_drop_while_row_is_locked(&app, &aggregate_id, &uri).await;
+    assert_eq!(status, StatusCode::OK, "public read failed: {body}");
+    assert_eq!(body["drop"]["state"], json!("ended_closed"));
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
