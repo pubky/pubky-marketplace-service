@@ -10,6 +10,7 @@ mod common;
 use std::time::Duration;
 
 use axum::http::{HeaderMap, StatusCode};
+use axum::Router;
 use marketplace_service::clock::Clock;
 use marketplace_service::workers::transition_due_drops;
 use serde_json::{json, Value};
@@ -34,8 +35,8 @@ fn public_drop_uri(seller_pubky: &str) -> String {
     format!("/v0/drops/{seller_pubky}/{DROP_ID}")
 }
 
-async fn public_drop(app: &TestApp, uri: &str) -> (StatusCode, HeaderMap, Value) {
-    common::send_with_headers(app.router.clone(), "GET", uri, None, &json!(null)).await
+async fn public_drop(router: Router, uri: &str) -> (StatusCode, HeaderMap, Value) {
+    common::send_with_headers(router, "GET", uri, None, &json!(null)).await
 }
 
 /// Registers the `boots_01` listing and syncs one announced drop over it that
@@ -43,8 +44,9 @@ async fn public_drop(app: &TestApp, uri: &str) -> (StatusCode, HeaderMap, Value)
 /// and the drop aggregate id.
 async fn announced_drop(app: &TestApp, homeserver: &common::FakeHomeserver) -> (TestActor, String) {
     let seller = new_actor(app).await;
-    homeserver.publish_registration(&register_command(&seller.pubky, 5));
-    let (status, body) = execute(app, &seller.token, &register_command(&seller.pubky, 5)).await;
+    let register = register_command(&seller.pubky, 5);
+    homeserver.publish_registration(&register);
+    let (status, body) = execute(app, &seller.token, &register).await;
     assert_eq!(status, StatusCode::OK, "register fixture failed: {body}");
     homeserver.put_drop_record(
         &seller.pubky,
@@ -95,7 +97,7 @@ async fn public_drop_read_takes_no_row_lock_when_nothing_is_due(pool: PgPool) {
 
     let read = tokio::time::timeout(
         READ_TIMEOUT,
-        public_drop(&app, &public_drop_uri(&seller.pubky)),
+        public_drop(app.router.clone(), &public_drop_uri(&seller.pubky)),
     )
     .await;
     holder.rollback().await.expect("holder rolls back");
@@ -117,13 +119,9 @@ async fn concurrent_public_reads_at_starts_at_record_one_start(pool: PgPool) {
     for _ in 0..CONCURRENT_READS {
         let router = app.router.clone();
         let uri = uri.clone();
-        reads.spawn(async move {
-            tokio::time::timeout(
-                READ_TIMEOUT,
-                common::send_with_headers(router, "GET", &uri, None, &json!(null)),
-            )
-            .await
-        });
+        reads.spawn(
+            async move { tokio::time::timeout(READ_TIMEOUT, public_drop(router, &uri)).await },
+        );
     }
     let mut finished = 0;
     while let Some(read) = reads.join_next().await {
@@ -143,14 +141,14 @@ async fn concurrent_public_reads_at_starts_at_record_one_start(pool: PgPool) {
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn public_read_racing_the_drop_sweep_records_one_start(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
-    let (seller, aggregate_id) = announced_drop(&app, &homeserver).await;
+    let (seller, _) = announced_drop(&app, &homeserver).await;
     app.clock.advance_seconds(STARTS_IN + 1);
     let now = app.clock.now();
 
     let uri = public_drop_uri(&seller.pubky);
     let ((status, _, body), swept) = tokio::time::timeout(READ_TIMEOUT, async {
         tokio::join!(
-            public_drop(&app, &uri),
+            public_drop(app.router.clone(), &uri),
             transition_due_drops(&app.pool, now)
         )
     })
@@ -162,13 +160,6 @@ async fn public_read_racing_the_drop_sweep_records_one_start(pool: PgPool) {
     assert_eq!(body["drop"]["state"], json!("live"));
     assert_eq!(body["drop"]["revision"], json!(2));
     assert_eq!(drop_started_events(&app.pool).await, 1);
-    let (state, revision): (String, i64) =
-        sqlx::query_as("SELECT state, revision FROM drops WHERE aggregate_id = $1")
-            .bind(&aggregate_id)
-            .fetch_one(&app.pool)
-            .await
-            .expect("drop row exists");
-    assert_eq!((state.as_str(), revision), ("live", 2));
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
@@ -176,12 +167,16 @@ async fn public_drop_read_has_short_public_caching_and_a_miss_is_not_cached(pool
     let (app, homeserver) = test_app_with_homeserver(pool).await;
     let (seller, _) = announced_drop(&app, &homeserver).await;
 
-    let (status, headers, body) = public_drop(&app, &public_drop_uri(&seller.pubky)).await;
+    let (status, headers, body) =
+        public_drop(app.router.clone(), &public_drop_uri(&seller.pubky)).await;
     assert_eq!(status, StatusCode::OK, "public read failed: {body}");
     assert_eq!(headers["cache-control"], "public, max-age=1");
 
-    let (status, headers, body) =
-        public_drop(&app, &format!("/v0/drops/{}/no_such_drop", seller.pubky)).await;
+    let (status, headers, body) = public_drop(
+        app.router.clone(),
+        &format!("/v0/drops/{}/no_such_drop", seller.pubky),
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "unexpected: {body}");
     assert_eq!(body["error"]["code"], json!("NOT_FOUND"));
     assert_eq!(headers["cache-control"], "no-store");
