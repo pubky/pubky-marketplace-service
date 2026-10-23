@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use marketplace_domain::commands::{
     CheckoutLine, Command, CreateCheckoutPayload, DigitalDeliveryKind, FulfillmentMethod,
 };
+use marketplace_domain::money::MAX_SAFE_INTEGER;
 use marketplace_domain::state_machines::{can_transition, listing_machine};
 use marketplace_domain::{ids, ErrorCode};
 use serde_json::{json, Value};
@@ -377,6 +378,18 @@ pub async fn handle(
         _ => {}
     }
 
+    // Every amount is computed before the first order is written, so a
+    // checkout whose total exceeds MAX_SAFE_INTEGER writes nothing.
+    let Some((line_subtotals, order_amounts)) =
+        checkout_amounts(&resolved, &line_unit_prices, &groups)
+    else {
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidCommand,
+            ErrorCode::InvalidCommand,
+            "The order total exceeds the largest supported amount.",
+        )));
+    };
+
     let delivery_address = payload
         .delivery_address
         .as_ref()
@@ -384,9 +397,14 @@ pub async fn handle(
     let mut orders: Vec<Value> = Vec::with_capacity(groups.len());
     let mut payments: Vec<Value> = Vec::with_capacity(groups.len());
     let mut event_ids: Vec<Uuid> = Vec::with_capacity(groups.len());
-    for (seller_pubky, group_method, indices) in &groups {
+    for ((seller_pubky, group_method, indices), amounts) in groups.iter().zip(&order_amounts) {
         // Pickup and digital orders carry no address and no shipping charge.
         let unshipped = *group_method != FulfillmentMethod::Shipping;
+        let OrderAmounts {
+            subtotal_minor,
+            shipping_minor,
+            total_minor,
+        } = *amounts;
         let lines: Vec<Value> = indices
             .iter()
             .map(|&index| {
@@ -403,7 +421,7 @@ pub async fn handle(
                         listing.unit_price_exponent,
                     ),
                     "subtotal": money_json(
-                        line_unit_prices[index] * line.quantity,
+                        line_subtotals[index],
                         &listing.unit_price_currency,
                         listing.unit_price_exponent,
                     ),
@@ -443,27 +461,6 @@ pub async fn handle(
                 line_json
             })
             .collect();
-        let subtotal_minor: i64 = indices
-            .iter()
-            .map(|&index| {
-                let (line, _) = &resolved[index];
-                line_unit_prices[index] * line.quantity
-            })
-            .sum();
-        // Shipping is the seller-signed flat rate, charged once per order
-        // line (quantity-independent) — and ONLY on shipped orders: a
-        // pickup order's shipping is zero, never charged and refunded later
-        // (§A2). The price the buyer pays is exactly the seller's listed
-        // price plus that shipping — nothing else is added.
-        let shipping_minor: i64 = if unshipped {
-            0
-        } else {
-            indices
-                .iter()
-                .map(|&index| resolved[index].1.shipping_minor)
-                .sum()
-        };
-        let total_minor = subtotal_minor + shipping_minor;
         let order_id = Uuid::new_v4();
         let payment_id = Uuid::new_v4();
         let seller_has_rail = crate::queries::seller_has_rail(tx, seller_pubky).await?;
@@ -778,4 +775,63 @@ pub async fn handle(
             "payments": payments,
         }),
     }))
+}
+
+/// The money amounts of one order the checkout creates.
+#[derive(Clone, Copy)]
+struct OrderAmounts {
+    subtotal_minor: i64,
+    shipping_minor: i64,
+    total_minor: i64,
+}
+
+/// Every order money amount of a checkout, computed with checked arithmetic
+/// (matches the offer path): each line's subtotal, indexed like `resolved`,
+/// and each order's amounts, aligned with `groups`. `None` when any amount
+/// falls outside `0..=MAX_SAFE_INTEGER`.
+fn checkout_amounts(
+    resolved: &[(&CheckoutLine, ListingRow)],
+    line_unit_prices: &[i64],
+    groups: &[(String, FulfillmentMethod, Vec<usize>)],
+) -> Option<(Vec<i64>, Vec<OrderAmounts>)> {
+    let line_subtotals = resolved
+        .iter()
+        .zip(line_unit_prices)
+        .map(|((line, _), unit_price)| safe_amount(unit_price.checked_mul(line.quantity)))
+        .collect::<Option<Vec<i64>>>()?;
+    let order_amounts = groups
+        .iter()
+        .map(|(_, method, indices)| {
+            let subtotal_minor = checked_sum(indices.iter().map(|&index| line_subtotals[index]))?;
+            // Shipping is the seller-signed flat rate, charged once per order
+            // line (quantity-independent) — and ONLY on shipped orders: a
+            // pickup order's shipping is zero, never charged and refunded
+            // later (§A2). The price the buyer pays is exactly the seller's
+            // listed price plus that shipping — nothing else is added.
+            let shipping_minor = if *method == FulfillmentMethod::Shipping {
+                checked_sum(
+                    indices
+                        .iter()
+                        .map(|&index| resolved[index].1.shipping_minor),
+                )?
+            } else {
+                0
+            };
+            let total_minor = safe_amount(subtotal_minor.checked_add(shipping_minor))?;
+            Some(OrderAmounts {
+                subtotal_minor,
+                shipping_minor,
+                total_minor,
+            })
+        })
+        .collect::<Option<Vec<OrderAmounts>>>()?;
+    Some((line_subtotals, order_amounts))
+}
+
+fn checked_sum(mut amounts: impl Iterator<Item = i64>) -> Option<i64> {
+    safe_amount(amounts.try_fold(0i64, |sum, amount| sum.checked_add(amount)))
+}
+
+fn safe_amount(amount: Option<i64>) -> Option<i64> {
+    amount.filter(|amount| (0..=MAX_SAFE_INTEGER).contains(amount))
 }
