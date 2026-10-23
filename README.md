@@ -2024,9 +2024,15 @@ session: `{ "drop": { seller_pubky, drop_id, aggregate_id, state, format,
 starts_at, ends_at, stock_display, total_quantity, per_buyer_limit,
 remaining, remaining_band, revision, server_time } }`. `server_time` is the
 service clock now, in the canonical wire timestamp format — clients correct
-countdowns from it. The read applies the same lazy server-time transitions
-gating uses (inside a transaction with the drop row locked), so a public
-read never shows `announced` after `startsAt`. Stock-display redaction is
+countdowns from it. The read takes no row lock unless a scheduled
+transition is due (announced past `startsAt`, or live past `endsAt`); then
+it locks the drop row and applies the same lazy server-time transitions
+gating uses, so a public read never shows `announced` after `startsAt`. A
+`200` carries `Cache-Control: public, max-age=1`, kept below the Shop's 2 s
+poll around `startsAt` because a cached copy skews the `server_time`
+countdown correction by up to its age; a `404` or `500` carries
+`Cache-Control: no-store`, so a drop that is synced right after a miss is
+seen on the next read. Stock-display redaction is
 SERVER-side; an exact count never leaves the service under bands/hidden:
 
 | `stock_display` | `remaining` | `remaining_band` |
