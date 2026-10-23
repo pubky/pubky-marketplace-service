@@ -165,12 +165,14 @@ async fn main() -> anyhow::Result<()> {
         None => tracing::info!("attestation issuance disabled (no attestor key configured)"),
     }
     // A request or worker pass waits at most 5 s for a connection, instead of
-    // the sqlx default of 30 s, and then fails with `PoolTimedOut`.
+    // the sqlx default of 30 s, and then fails with `PoolTimedOut`; the same
+    // 5 s also bounds opening a new connection. At boot the service still
+    // waits up to 30 s for the database, as with the sqlx default.
     let pool = PgPoolOptions::new()
         .max_connections(20)
         .acquire_timeout(Duration::from_secs(5))
-        .connect(&config.database_url)
-        .await?;
+        .connect_lazy(&config.database_url)?;
+    wait_for_database(&pool).await?;
     marketplace_service::migrations::run(&pool).await?;
     tracing::info!("database migrations applied");
     let audit_writer_options: PgConnectOptions = config.refusal_audit_database_url.parse()?;
@@ -271,6 +273,26 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
     Ok(())
+}
+
+/// Waits up to 30 s at boot for the first connection. Each attempt is bounded
+/// by the pool's 5 s acquire timeout, so only `PoolTimedOut` is retried: sqlx
+/// already retries a refused or still-starting server within one attempt, and
+/// any other error (a wrong password or URL) fails the boot at once.
+async fn wait_for_database(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match pool.acquire().await {
+            Ok(connection) => {
+                drop(connection);
+                return Ok(());
+            }
+            Err(sqlx::Error::PoolTimedOut) if std::time::Instant::now() < deadline => {
+                tracing::warn!("database not reachable yet; retrying");
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 #[cfg(test)]
