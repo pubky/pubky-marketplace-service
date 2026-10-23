@@ -25,6 +25,8 @@ use common::{
 const DROP_ID: &str = "winter_drop";
 /// Seconds after the fixture instant at which the drop starts.
 const STARTS_IN: i64 = 600;
+/// Seconds after the fixture instant at which a drop with an end closes.
+const ENDS_IN: i64 = 1_200;
 /// Upper bound for one read. A read stuck behind a row lock never returns,
 /// so a bounded wait turns that into a failure instead of a hung test.
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
@@ -40,9 +42,14 @@ async fn public_drop(router: Router, uri: &str) -> (StatusCode, HeaderMap, Value
 }
 
 /// Registers the `boots_01` listing and syncs one announced drop over it that
-/// starts [`STARTS_IN`] seconds after the fixture instant. Returns the seller
-/// and the drop aggregate id.
-async fn announced_drop(app: &TestApp, homeserver: &common::FakeHomeserver) -> (TestActor, String) {
+/// starts [`STARTS_IN`] seconds after the fixture instant and, when `ends_in`
+/// is given, ends `ends_in` seconds after the fixture instant. Returns the
+/// seller and the drop aggregate id.
+async fn announced_drop(
+    app: &TestApp,
+    homeserver: &common::FakeHomeserver,
+    ends_in: Option<i64>,
+) -> (TestActor, String) {
     let seller = new_actor(app).await;
     let register = register_command(&seller.pubky, 5);
     homeserver.publish_registration(&register);
@@ -57,7 +64,7 @@ async fn announced_drop(app: &TestApp, homeserver: &common::FakeHomeserver) -> (
             1,
             &["boots_01"],
             &ts_after(STARTS_IN),
-            None,
+            ends_in.map(ts_after).as_deref(),
             5,
             2,
         ),
@@ -84,7 +91,7 @@ async fn drop_started_events(pool: &PgPool) -> i64 {
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn public_drop_read_takes_no_row_lock_when_nothing_is_due(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
-    let (seller, aggregate_id) = announced_drop(&app, &homeserver).await;
+    let (seller, aggregate_id) = announced_drop(&app, &homeserver, None).await;
 
     // Another transaction holds the drop row, as a checkout on this drop
     // would.
@@ -111,7 +118,7 @@ async fn public_drop_read_takes_no_row_lock_when_nothing_is_due(pool: PgPool) {
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn concurrent_public_reads_at_starts_at_record_one_start(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
-    let (seller, _) = announced_drop(&app, &homeserver).await;
+    let (seller, _) = announced_drop(&app, &homeserver, None).await;
     app.clock.advance_seconds(STARTS_IN + 1);
 
     let uri = public_drop_uri(&seller.pubky);
@@ -141,7 +148,7 @@ async fn concurrent_public_reads_at_starts_at_record_one_start(pool: PgPool) {
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn public_read_racing_the_drop_sweep_records_one_start(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
-    let (seller, _) = announced_drop(&app, &homeserver).await;
+    let (seller, _) = announced_drop(&app, &homeserver, None).await;
     app.clock.advance_seconds(STARTS_IN + 1);
     let now = app.clock.now();
 
@@ -165,7 +172,7 @@ async fn public_read_racing_the_drop_sweep_records_one_start(pool: PgPool) {
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn public_drop_read_has_short_public_caching_and_a_miss_is_not_cached(pool: PgPool) {
     let (app, homeserver) = test_app_with_homeserver(pool).await;
-    let (seller, _) = announced_drop(&app, &homeserver).await;
+    let (seller, _) = announced_drop(&app, &homeserver, None).await;
 
     let (status, headers, body) =
         public_drop(app.router.clone(), &public_drop_uri(&seller.pubky)).await;
@@ -179,5 +186,100 @@ async fn public_drop_read_has_short_public_caching_and_a_miss_is_not_cached(pool
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "unexpected: {body}");
     assert_eq!(body["error"]["code"], json!("NOT_FOUND"));
+    assert_eq!(headers["cache-control"], "no-store");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn public_reads_past_ends_at_close_the_drop_once(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let (seller, aggregate_id) = announced_drop(&app, &homeserver, Some(ENDS_IN)).await;
+    let (state_before, revision_before): (String, i64) =
+        sqlx::query_as("SELECT state, revision FROM drops WHERE aggregate_id = $1")
+            .bind(&aggregate_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("the drop exists");
+    assert_eq!(state_before, "announced");
+    // The whole window elapses with no command or sweep touching the drop,
+    // so the due transition goes straight from announced to ended_closed.
+    app.clock.advance_seconds(ENDS_IN + 1);
+    let now = app.clock.now();
+
+    let uri = public_drop_uri(&seller.pubky);
+    let mut reads = JoinSet::new();
+    for _ in 0..CONCURRENT_READS {
+        let router = app.router.clone();
+        let uri = uri.clone();
+        reads.spawn(async move { public_drop(router, &uri).await });
+    }
+    let (responses, swept) = tokio::time::timeout(READ_TIMEOUT, async {
+        tokio::join!(
+            async {
+                let mut responses = Vec::new();
+                while let Some(read) = reads.join_next().await {
+                    responses.push(read.expect("read task runs"));
+                }
+                responses
+            },
+            transition_due_drops(&app.pool, now)
+        )
+    })
+    .await
+    .expect("the reads and the sweep all finish");
+    swept.expect("the sweep succeeds");
+
+    assert_eq!(responses.len(), CONCURRENT_READS);
+    for (status, headers, body) in responses {
+        assert_eq!(status, StatusCode::OK, "public read failed: {body}");
+        assert_eq!(body["drop"]["state"], json!("ended_closed"));
+        assert_eq!(body["drop"]["revision"], json!(revision_before + 1));
+        assert_eq!(headers["cache-control"], "public, max-age=1");
+    }
+
+    let (state_after, revision_after): (String, i64) =
+        sqlx::query_as("SELECT state, revision FROM drops WHERE aggregate_id = $1")
+            .bind(&aggregate_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("the drop exists");
+    assert_eq!(state_after, "ended_closed");
+    assert_eq!(revision_after, revision_before + 1);
+    assert_eq!(
+        count(
+            &app.pool,
+            "SELECT COUNT(*) FROM events WHERE kind = 'drop.ended'"
+        )
+        .await,
+        1
+    );
+    assert_eq!(drop_started_events(&app.pool).await, 0);
+    let (bindings, active_bindings): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COUNT(*) FILTER (WHERE active) FROM drop_listings \
+         WHERE drop_aggregate_id = $1",
+    )
+    .bind(&aggregate_id)
+    .fetch_one(&app.pool)
+    .await
+    .expect("binding counts load");
+    assert_eq!(bindings, 1, "the drop binds boots_01");
+    assert_eq!(active_bindings, 0, "a closed drop deactivates its bindings");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_failed_public_drop_read_is_not_cached(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let (seller, _) = announced_drop(&app, &homeserver, None).await;
+    // The app shares this pool, so once it is closed the read cannot get a
+    // connection and fails.
+    app.pool.close().await;
+
+    let (status, headers, body) =
+        public_drop(app.router.clone(), &public_drop_uri(&seller.pubky)).await;
+    assert_eq!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "unexpected: {body}"
+    );
+    assert_eq!(body["error"]["code"], json!("INTERNAL"));
     assert_eq!(headers["cache-control"], "no-store");
 }
