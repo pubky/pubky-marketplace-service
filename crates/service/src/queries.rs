@@ -960,45 +960,29 @@ fn remaining_band(remaining: i64, total: i64) -> &'static str {
 /// exposes only `remaining_band` ([`remaining_band`]), `hidden` exposes
 /// neither — an exact count never leaves the service under bands/hidden.
 ///
-/// The read applies the same lazy server-time transitions gating uses,
-/// inside a transaction with the drop row locked, so a public read never
-/// shows `announced` after `starts_at`. `server_time` is the service clock
-/// now, in the canonical wire timestamp format — clients correct their
-/// countdowns from it instead of trusting local clocks.
+/// The read takes no row lock unless a scheduled transition is due
+/// ([`read_public_drop`]), so a public read never shows `announced` after
+/// `starts_at`. `server_time` is the service clock now, in the canonical wire
+/// timestamp format — clients correct their countdowns from it instead of
+/// trusting local clocks.
+///
+/// A `200` carries [`PUBLIC_DROP_CACHE_CONTROL`]; a `404` or `500` carries
+/// `no-store`, so a client that syncs the drop after a miss sees it on the
+/// next read.
 pub async fn get_public_drop(
     State(state): State<AppState>,
     Path((seller_pubky, drop_id)): Path<(String, String)>,
 ) -> Response {
-    let mut tx = match state.pool.begin().await {
-        Ok(tx) => tx,
-        Err(error) => return internal_error("public drop", &error),
+    let (drop, now) = match read_public_drop(&state, &seller_pubky, &drop_id).await {
+        Ok(Some(read)) => read,
+        Ok(None) => {
+            return with_cache_control(
+                query_error(ErrorCode::NotFound, "The drop was not found."),
+                "no-store",
+            )
+        }
+        Err(error) => return with_cache_control(internal_error("public drop", &error), "no-store"),
     };
-    let drop: Option<DropRow> = match sqlx::query_as(&format!(
-        "SELECT {DROP_COLUMNS} FROM drops \
-         WHERE seller_pubky = $1 AND drop_id = $2 FOR UPDATE"
-    ))
-    .bind(&seller_pubky)
-    .bind(&drop_id)
-    .fetch_optional(&mut *tx)
-    .await
-    {
-        Ok(drop) => drop,
-        Err(error) => return internal_error("public drop", &error),
-    };
-    let Some(drop) = drop else {
-        return query_error(ErrorCode::NotFound, "The drop was not found.");
-    };
-    let now = state.clock.now();
-    let drop =
-        match crate::handlers::drops::apply_time_transitions(&mut tx, drop, Uuid::new_v4(), now)
-            .await
-        {
-            Ok(drop) => drop,
-            Err(error) => return internal_error("public drop", &error),
-        };
-    if let Err(error) = tx.commit().await {
-        return internal_error("public drop", &error);
-    }
 
     let (remaining, band) = match drop.stock_display.as_str() {
         "exact" => (json!(drop.remaining_quantity), Value::Null),
@@ -1008,7 +992,7 @@ pub async fn get_public_drop(
         ),
         _ => (Value::Null, Value::Null),
     };
-    (
+    let response = (
         StatusCode::OK,
         Json(json!({
             "drop": {
@@ -1029,7 +1013,63 @@ pub async fn get_public_drop(
             },
         })),
     )
-        .into_response()
+        .into_response();
+    with_cache_control(response, PUBLIC_DROP_CACHE_CONTROL)
+}
+
+/// One second: a cached copy skews a client countdown by up to `max-age`
+/// (`server_time`), and the Shop polls every 2 s around `starts_at`.
+const PUBLIC_DROP_CACHE_CONTROL: &str = "public, max-age=1";
+
+/// Reads the public drop without a row lock, so steady-state reads do not
+/// queue behind checkout on the same drop. Only when a scheduled transition
+/// is due (announced past `starts_at`, or live past `ends_at`) does it re-read
+/// the row `FOR UPDATE` and apply the transition from that locked row, so a
+/// read that races the sweep or another read finds it already applied and
+/// writes nothing. It reads the clock once the unlocked read has its pool
+/// connection and row, and the locked path reads it again once the lock is
+/// granted; each returns its instant with the row as the server time. Lock
+/// order: the drop row, then (inside the transition) its `drop_listings`
+/// bindings.
+async fn read_public_drop(
+    state: &AppState,
+    seller_pubky: &str,
+    drop_id: &str,
+) -> Result<Option<(DropRow, DateTime<Utc>)>, sqlx::Error> {
+    let drop: Option<DropRow> = sqlx::query_as(&format!(
+        "SELECT {DROP_COLUMNS} FROM drops WHERE seller_pubky = $1 AND drop_id = $2"
+    ))
+    .bind(seller_pubky)
+    .bind(drop_id)
+    .fetch_optional(&state.pool)
+    .await?;
+    let now = state.clock.now();
+    let Some(drop) = drop else {
+        return Ok(None);
+    };
+    if !crate::handlers::drops::transition_due(&drop, now) {
+        return Ok(Some((drop, now)));
+    }
+
+    let mut tx = state.pool.begin().await?;
+    let Some(locked) =
+        crate::handlers::drops::fetch_drop_for_update(&mut tx, &drop.aggregate_id).await?
+    else {
+        return Ok(None);
+    };
+    let now = state.clock.now();
+    let drop = crate::handlers::drops::apply_time_transitions(&mut tx, locked, Uuid::new_v4(), now)
+        .await?;
+    tx.commit().await?;
+    Ok(Some((drop, now)))
+}
+
+fn with_cache_control(mut response: Response, value: &'static str) -> Response {
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static(value),
+    );
+    response
 }
 
 /// `GET /v0/listings/{seller_pubky}/{listing_id}/availability`: public, no

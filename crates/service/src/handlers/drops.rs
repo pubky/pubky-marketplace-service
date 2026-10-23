@@ -96,6 +96,13 @@ fn is_active_state(state: &str) -> bool {
     matches!(state, "announced" | "live")
 }
 
+/// Whether server time has moved this drop past a scheduled transition that
+/// [`apply_time_transitions`] would write now: announced past `starts_at`, or
+/// live (or announced) past `ends_at`.
+pub(crate) fn transition_due(drop: &DropRow, now: DateTime<Utc>) -> bool {
+    is_active_state(&drop.state) && derived_state(drop.starts_at, drop.ends_at, now) != drop.state
+}
+
 /// `drop.sync`: convergent registration from the seller's homeserver record.
 pub async fn sync(
     tx: &mut Transaction<'_, Postgres>,
@@ -655,13 +662,10 @@ pub async fn apply_time_transitions(
     command_id: Uuid,
     now: DateTime<Utc>,
 ) -> Result<DropRow, sqlx::Error> {
-    if !is_active_state(&drop.state) {
+    if !transition_due(&drop, now) {
         return Ok(drop);
     }
     let target = derived_state(drop.starts_at, drop.ends_at, now);
-    if target == drop.state {
-        return Ok(drop);
-    }
     debug_assert!(can_transition(&drop_machine(), &drop.state, target));
 
     let new_revision = drop.revision + 1;
