@@ -172,7 +172,7 @@ async fn main() -> anyhow::Result<()> {
         .max_connections(20)
         .acquire_timeout(Duration::from_secs(5))
         .connect_lazy(&config.database_url)?;
-    wait_for_database(&pool).await?;
+    wait_for_database(&pool, BOOT_DATABASE_WAIT).await?;
     marketplace_service::migrations::run(&pool).await?;
     tracing::info!("database migrations applied");
     let audit_writer_options: PgConnectOptions = config.refusal_audit_database_url.parse()?;
@@ -275,12 +275,15 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Waits up to 30 s at boot for the first connection. Each attempt is bounded
-/// by the pool's 5 s acquire timeout, so only `PoolTimedOut` is retried: sqlx
-/// already retries a refused or still-starting server within one attempt, and
-/// any other error (a wrong password or URL) fails the boot at once.
-async fn wait_for_database(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+/// How long the service waits at boot for the first database connection.
+const BOOT_DATABASE_WAIT: Duration = Duration::from_secs(30);
+
+/// Waits up to `budget` for the first connection. Each attempt is bounded by
+/// the pool's acquire timeout (5 s at boot), so only `PoolTimedOut` is retried:
+/// sqlx already retries a refused or still-starting server within one attempt,
+/// and any other error (a wrong password or URL) fails the boot at once.
+async fn wait_for_database(pool: &sqlx::PgPool, budget: Duration) -> Result<(), sqlx::Error> {
+    let deadline = std::time::Instant::now() + budget;
     loop {
         match pool.acquire().await {
             Ok(connection) => {
@@ -297,7 +300,12 @@ async fn wait_for_database(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::env_filter;
+    use std::time::{Duration, Instant};
+
+    use sqlx::postgres::PgPoolOptions;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::{env_filter, wait_for_database};
 
     #[test]
     fn dependency_directives_remain_at_warn() {
@@ -314,5 +322,93 @@ mod tests {
                 "{directive} missing from {filter}"
             );
         }
+    }
+
+    /// A pool whose every attempt gives up after 100 ms.
+    fn pool_for(url: &str) -> sqlx::PgPool {
+        PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(100))
+            .connect_lazy(url)
+            .expect("valid database URL")
+    }
+
+    #[tokio::test]
+    async fn boot_wait_retries_a_refused_server_until_the_budget_runs_out() {
+        // Bind a free port, then close it so every connection is refused.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind a local port")
+            .local_addr()
+            .expect("local address")
+            .port();
+        let pool = pool_for(&format!("postgres://u:p@127.0.0.1:{port}/db"));
+        let budget = Duration::from_millis(400);
+
+        let started = Instant::now();
+        let result = wait_for_database(&pool, budget).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(result, Err(sqlx::Error::PoolTimedOut)),
+            "expected PoolTimedOut, got {result:?}"
+        );
+        // More than one 100 ms attempt ran before the wait gave up.
+        assert!(elapsed >= budget, "gave up after {elapsed:?}");
+        assert!(elapsed < Duration::from_secs(3), "took {elapsed:?}");
+    }
+
+    #[tokio::test]
+    async fn boot_wait_fails_at_once_on_a_rejected_login() {
+        // A server that answers every startup message with a FATAL 28P01
+        // (invalid_password) ErrorResponse. sqlx retries only 53300 and 57P03
+        // while connecting, so this error reaches the wait on the first attempt.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a local port");
+        let port = listener.local_addr().expect("local address").port();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut length = [0u8; 4];
+                if socket.read_exact(&mut length).await.is_err() {
+                    continue;
+                }
+                let mut startup =
+                    vec![0u8; (u32::from_be_bytes(length) as usize).saturating_sub(4)];
+                if socket.read_exact(&mut startup).await.is_err() {
+                    continue;
+                }
+                let mut fields = Vec::new();
+                for (tag, value) in [
+                    (b'S', "FATAL"),
+                    (b'V', "FATAL"),
+                    (b'C', "28P01"),
+                    (b'M', "password authentication failed for user \"u\""),
+                ] {
+                    fields.push(tag);
+                    fields.extend_from_slice(value.as_bytes());
+                    fields.push(0);
+                }
+                fields.push(0);
+                let mut frame = vec![b'E'];
+                frame.extend_from_slice(&(fields.len() as u32 + 4).to_be_bytes());
+                frame.extend_from_slice(&fields);
+                let _ = socket.write_all(&frame).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        let pool = pool_for(&format!(
+            "postgres://u:p@127.0.0.1:{port}/db?sslmode=disable"
+        ));
+
+        let started = Instant::now();
+        let result = wait_for_database(&pool, Duration::from_secs(10)).await;
+        let elapsed = started.elapsed();
+
+        match result {
+            Err(sqlx::Error::Database(error)) => {
+                assert_eq!(error.code().as_deref(), Some("28P01"));
+            }
+            other => panic!("expected the 28P01 database error, got {other:?}"),
+        }
+        assert!(elapsed < Duration::from_secs(3), "took {elapsed:?}");
     }
 }
