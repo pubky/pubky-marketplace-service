@@ -1026,8 +1026,9 @@ const PUBLIC_DROP_CACHE_CONTROL: &str = "public, max-age=1";
 /// is due (announced past `starts_at`, or live past `ends_at`) does it re-read
 /// the row `FOR UPDATE` and apply the transition from that locked row, so a
 /// read that races the sweep or another read finds it already applied and
-/// writes nothing. The locked path reads the clock again once the lock is
-/// granted, and returns that instant with the row as the server time. Lock
+/// writes nothing. It reads the clock once the unlocked read has its pool
+/// connection and row, and the locked path reads it again once the lock is
+/// granted; each returns its instant with the row as the server time. Lock
 /// order: the drop row, then (inside the transition) its `drop_listings`
 /// bindings.
 async fn read_public_drop(
@@ -1035,7 +1036,6 @@ async fn read_public_drop(
     seller_pubky: &str,
     drop_id: &str,
 ) -> Result<Option<(DropRow, DateTime<Utc>)>, sqlx::Error> {
-    let now = state.clock.now();
     let drop: Option<DropRow> = sqlx::query_as(&format!(
         "SELECT {DROP_COLUMNS} FROM drops WHERE seller_pubky = $1 AND drop_id = $2"
     ))
@@ -1043,6 +1043,7 @@ async fn read_public_drop(
     .bind(drop_id)
     .fetch_optional(&state.pool)
     .await?;
+    let now = state.clock.now();
     let Some(drop) = drop else {
         return Ok(None);
     };

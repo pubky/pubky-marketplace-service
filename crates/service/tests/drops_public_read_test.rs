@@ -38,6 +38,10 @@ const READ_TIMEOUT: Duration = Duration::from_secs(5);
 const CONCURRENT_READS: usize = 4;
 /// Seconds the clock moves on while a read waits on the drop row lock.
 const LOCK_WAIT: i64 = 7;
+/// Seconds the clock moves on while a read waits for a pool connection.
+const CONNECTION_WAIT: i64 = 3;
+/// Scheduler turns a spawned read gets to reach the pool wait.
+const SCHEDULER_TURNS: usize = 50;
 
 fn public_drop_uri(seller_pubky: &str) -> String {
     format!("/v0/drops/{seller_pubky}/{DROP_ID}")
@@ -377,6 +381,49 @@ async fn a_read_that_waits_on_the_lock_stamps_the_transition_after_the_wait(pool
     let (occurred_at, updated_at) = start_event_and_row_times(&app.pool, &aggregate_id).await;
     assert_eq!(format_timestamp(occurred_at), after_wait);
     assert_eq!(format_timestamp(updated_at), after_wait);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_public_read_takes_the_server_time_after_waiting_for_a_connection(pool: PgPool) {
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let (seller, _) = announced_drop(&app, &homeserver, None).await;
+
+    // The router shares this pool. Holding every connection makes the read
+    // wait in the pool before its unlocked SELECT.
+    let pool_size = app.pool.options().get_max_connections();
+    let mut held = Vec::new();
+    for _ in 0..pool_size {
+        held.push(app.pool.acquire().await.expect("hold a pool connection"));
+    }
+    assert_eq!(app.pool.num_idle(), 0, "every connection is held");
+
+    let router = app.router.clone();
+    let uri = public_drop_uri(&seller.pubky);
+    let read = tokio::spawn(async move { public_drop(router, &uri).await });
+    // The test runtime is single-threaded, so the read runs only while this
+    // task yields. It needs no I/O before the pool wait, so a few turns let
+    // it reach that wait.
+    for _ in 0..SCHEDULER_TURNS {
+        tokio::task::yield_now().await;
+    }
+    assert!(!read.is_finished(), "the read waits for a pool connection");
+
+    app.clock.advance_seconds(CONNECTION_WAIT);
+    drop(held.pop());
+    let (status, _, body) = tokio::time::timeout(READ_TIMEOUT, read)
+        .await
+        .expect("the read finishes once a connection is free")
+        .expect("read task runs");
+    drop(held);
+
+    // Nothing is due, so the read takes no lock; its server time is the
+    // instant it got the connection, not the instant it started waiting.
+    assert_eq!(status, StatusCode::OK, "public read failed: {body}");
+    assert_eq!(body["drop"]["state"], json!("announced"));
+    assert_eq!(
+        body["drop"]["server_time"],
+        json!(ts_after(CONNECTION_WAIT))
+    );
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
