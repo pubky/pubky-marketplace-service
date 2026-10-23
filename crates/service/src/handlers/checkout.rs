@@ -786,7 +786,7 @@ struct OrderAmounts {
 }
 
 /// Every order money amount of a checkout, computed with checked arithmetic
-/// (matches the offer path): each line's subtotal, indexed like `resolved`,
+/// as the offer path does: each line's subtotal, indexed like `resolved`,
 /// and each order's amounts, aligned with `groups`. `None` when any amount
 /// falls outside `0..=MAX_SAFE_INTEGER`.
 fn checkout_amounts(

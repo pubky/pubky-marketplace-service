@@ -43,6 +43,24 @@ async fn register(app: &TestApp, seller: &TestActor, command: &Value) {
     assert_eq!(status, StatusCode::OK, "registration failed: {body}");
 }
 
+/// A seller with `boots_01` registered by `register_priced`, and a buyer.
+async fn priced_listing(
+    pool: sqlx::PgPool,
+    price: i64,
+    shipping: i64,
+) -> (TestApp, TestActor, TestActor) {
+    let app = test_app(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    register(
+        &app,
+        &seller,
+        &register_priced(&seller.pubky, price, shipping),
+    )
+    .await;
+    (app, seller, buyer)
+}
+
 async fn rows_for(app: &TestApp, table: &str, buyer: &TestActor) -> i64 {
     sqlx::query_scalar(&format!(
         "SELECT COUNT(*) FROM {table} WHERE buyer_pubky = $1"
@@ -80,15 +98,7 @@ async fn assert_refused_and_nothing_written(app: &TestApp, buyer: &TestActor, ch
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_line_subtotal_above_the_largest_safe_total_is_refused(pool: sqlx::PgPool) {
-    let app = test_app(pool).await;
-    let seller = new_actor(&app).await;
-    let buyer = new_actor(&app).await;
-    register(
-        &app,
-        &seller,
-        &register_priced(&seller.pubky, MAX_SAFE_INTEGER, 0),
-    )
-    .await;
+    let (app, seller, buyer) = priced_listing(pool, MAX_SAFE_INTEGER, 0).await;
 
     assert_refused_and_nothing_written(&app, &buyer, &checkout(&seller.pubky, STOCK)).await;
 }
@@ -115,15 +125,7 @@ async fn a_variant_line_subtotal_above_the_largest_safe_total_is_refused(pool: s
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn an_order_subtotal_above_the_largest_safe_total_is_refused(pool: sqlx::PgPool) {
-    let app = test_app(pool).await;
-    let seller = new_actor(&app).await;
-    let buyer = new_actor(&app).await;
-    register(
-        &app,
-        &seller,
-        &register_priced(&seller.pubky, MAX_SAFE_INTEGER, 0),
-    )
-    .await;
+    let (app, seller, buyer) = priced_listing(pool, MAX_SAFE_INTEGER, 0).await;
     let mut second = register_listing_command(&seller.pubky, "boots_02", STOCK, 1);
     second["payload"]["unit_price"] = money(MAX_SAFE_INTEGER);
     second["payload"]["shipping_minor"] = json!(0);
@@ -140,30 +142,14 @@ async fn an_order_subtotal_above_the_largest_safe_total_is_refused(pool: sqlx::P
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn shipping_that_lifts_the_total_above_the_largest_safe_total_is_refused(pool: sqlx::PgPool) {
-    let app = test_app(pool).await;
-    let seller = new_actor(&app).await;
-    let buyer = new_actor(&app).await;
-    register(
-        &app,
-        &seller,
-        &register_priced(&seller.pubky, MAX_SAFE_INTEGER, 1),
-    )
-    .await;
+    let (app, seller, buyer) = priced_listing(pool, MAX_SAFE_INTEGER, 1).await;
 
     assert_refused_and_nothing_written(&app, &buyer, &checkout(&seller.pubky, 1)).await;
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn the_largest_safe_total_is_charged_exactly(pool: sqlx::PgPool) {
-    let app = test_app(pool).await;
-    let seller = new_actor(&app).await;
-    let buyer = new_actor(&app).await;
-    register(
-        &app,
-        &seller,
-        &register_priced(&seller.pubky, MAX_SAFE_INTEGER, 0),
-    )
-    .await;
+    let (app, seller, buyer) = priced_listing(pool, MAX_SAFE_INTEGER, 0).await;
 
     let (status, body) = execute(&app, &buyer.token, &checkout(&seller.pubky, 1)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
