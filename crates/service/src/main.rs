@@ -275,10 +275,13 @@ const BOOT_DATABASE_WAIT: Duration = Duration::from_secs(30);
 const POOL_ACQUIRE_WAIT: Duration = Duration::from_secs(15);
 
 // A request or worker pass waits at most 15 s for a connection, instead of
-// the sqlx default of 30 s, and then fails with `PoolTimedOut`. 15 s stays
-// above the longest time a connection is held across an upstream call (the
-// 10 s Paykit HTTP timeout). The same 15 s also bounds opening a new
-// connection. At boot the service still waits up to 30 s for the database.
+// the sqlx default of 30 s. That covers a payment-method bind, which holds
+// its transaction across the 10 s Paykit HTTP timeout. A command
+// transaction can hold a connection across a longer upstream read: the
+// deliverable read-back in `digital_delivery.set` (up to 120 s). A request
+// waiting behind one fails with `PoolTimedOut` after 15 s rather than 30 s.
+// The same 15 s also bounds opening a new connection. At boot the service
+// still waits up to `BOOT_DATABASE_WAIT` for the database.
 fn main_pool_options() -> PgPoolOptions {
     PgPoolOptions::new()
         .max_connections(20)
@@ -335,14 +338,10 @@ mod tests {
     }
 
     #[test]
-    fn main_pool_waits_longer_than_the_paykit_http_timeout() {
+    fn main_pool_options_bound_the_acquire_wait() {
         let options = main_pool_options();
         assert_eq!(options.get_acquire_timeout(), POOL_ACQUIRE_WAIT);
         assert_eq!(options.get_max_connections(), 20);
-        // `HTTP_TIMEOUT` in payments.rs (private), the longest time a
-        // connection is held across an upstream call.
-        let paykit_http_timeout = Duration::from_secs(10);
-        assert!(POOL_ACQUIRE_WAIT > paykit_http_timeout);
     }
 
     /// A pool whose every attempt gives up after 100 ms.
