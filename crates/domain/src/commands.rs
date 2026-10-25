@@ -1340,7 +1340,8 @@ pub struct ReviewTermsPayload {
     /// Buyer-side amount-band opt-in (ratified D2, ADR 0024): the purchase
     /// attestation carries an amount band only when this is true AND the
     /// seller's standing band-consent preference allows it. Defaults to
-    /// false; ignored by `review.update` (the attestation is immutable).
+    /// false; ignored on a seller's review and by `review.update` (the
+    /// attestation is immutable).
     #[serde(default)]
     pub allow_amount_band: bool,
 }

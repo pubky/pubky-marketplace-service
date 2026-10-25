@@ -20,7 +20,7 @@
 //! the salt can link it back to an order. `completed_on` is day-granularity.
 //! The optional `amount_band` log-decade band is emitted only under
 //! both-sides consent (ratified D2): the seller's standing preference AND
-//! the reviewer's per-review opt-in.
+//! the buyer's per-review opt-in.
 //!
 //! Key custody (ratified D6): the secret lives in the `ATTESTOR_SECRET_KEY`
 //! environment variable (KMS/env-held, same process as the service), to be

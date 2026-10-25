@@ -339,7 +339,8 @@ pub async fn create(
     // in each published record.
     if let Some(attestor) = attestor {
         let context =
-            AttestationContext::for_order(tx, &order, payload.allow_amount_band, now).await?;
+            AttestationContext::for_order(tx, &order, actor, payload.allow_amount_band, now)
+                .await?;
         for item in &items {
             issue_attestation(
                 tx,
@@ -665,7 +666,8 @@ impl AttestationContext {
     async fn for_order(
         tx: &mut Transaction<'_, Postgres>,
         order: &OrderRow,
-        reviewer_allows_band: bool,
+        reviewer: &str,
+        buyer_requested_band: bool,
         now: DateTime<Utc>,
     ) -> Result<Self, sqlx::Error> {
         // The delivery confirmation when the order was delivered, otherwise
@@ -683,16 +685,16 @@ impl AttestationContext {
             .format("%Y-%m-%d")
             .to_string();
 
-        // D2 both-sides consent: the band is included only when the seller's
-        // standing preference allows it AND the reviewer opted in.
+        // D2: the band needs the seller's standing consent AND the buyer's
+        // per-review opt-in. Only the buyer's own review carries that opt-in.
+        let buyer_opted_in = buyer_requested_band && reviewer == order.buyer_pubky;
         let seller_allows: Option<(bool,)> = sqlx::query_as(
             "SELECT allows_amount_band FROM attestation_band_consents WHERE seller_pubky = $1",
         )
         .bind(&order.seller_pubky)
         .fetch_optional(&mut **tx)
         .await?;
-        let band = if reviewer_allows_band && seller_allows.map(|(allows,)| allows).unwrap_or(false)
-        {
+        let band = if buyer_opted_in && seller_allows.map(|(allows,)| allows).unwrap_or(false) {
             amount_band(&order.currency, order.total_minor)
         } else {
             None

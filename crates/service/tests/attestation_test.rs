@@ -403,6 +403,106 @@ async fn amount_band_requires_both_sides_consent(pool: PgPool) {
     assert_eq!(body["allows_amount_band"], json!(false));
 }
 
+/// The stored claims of one reviewer's attestation on an order.
+async fn stored_claims(pool: &PgPool, order_id: &str, reviewer_pubky: &str) -> Value {
+    let (claims,): (Value,) = sqlx::query_as(
+        "SELECT claims FROM review_attestations WHERE order_id = $1::uuid AND reviewer_pubky = $2",
+    )
+    .bind(order_id)
+    .bind(reviewer_pubky)
+    .fetch_one(pool)
+    .await
+    .expect("stored attestation");
+    claims
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn amount_band_needs_the_buyers_own_opt_in(pool: PgPool) {
+    let app = test_app_with_attestor(pool).await;
+    let seller_review = json!({ "rating": 5, "text": "Great buyer.", "allow_amount_band": true });
+
+    // Case 1: the seller consents and sets the flag on their own review ->
+    // the flag is ignored on a seller's review, so no band.
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (status, body) = execute(
+        &app,
+        &seller.token,
+        &band_consent_command(&seller.pubky, 0, true, 306),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "consent failed: {body}");
+    let order_id = delivered_order(&app, &seller, &buyer).await;
+    let (status, reviewed) = execute(
+        &app,
+        &seller.token,
+        &order_command("review.create", &order_id, 4, seller_review.clone(), 2_213),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "seller review failed: {reviewed}");
+    let claims = verify_jws(reviewed["result"]["attestation"]["jws"].as_str().unwrap());
+    assert_eq!(claims["role"], json!("seller_reviewing_buyer"));
+    assert!(
+        claims.get("amount_band").is_none(),
+        "flag is ignored on a seller's review"
+    );
+    assert!(
+        stored_claims(&app.pool, &order_id, &seller.pubky)
+            .await
+            .get("amount_band")
+            .is_none(),
+        "stored seller attestation has no band"
+    );
+
+    // Case 2: on a consenting seller's order, the buyer opts in and gets the
+    // band (14,796 minor units of USD -> USD:4); the seller's later review
+    // with the flag still gets none, and the buyer's band stays.
+    let seller2 = new_actor(&app).await;
+    let buyer2 = new_actor(&app).await;
+    let (status, body) = execute(
+        &app,
+        &seller2.token,
+        &band_consent_command(&seller2.pubky, 0, true, 307),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "consent failed: {body}");
+    let order_id2 = delivered_order(&app, &seller2, &buyer2).await;
+    let (status, reviewed) = execute(
+        &app,
+        &buyer2.token,
+        &order_command(
+            "review.create",
+            &order_id2,
+            4,
+            json!({ "rating": 5, "text": "Great.", "allow_amount_band": true }),
+            2_214,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "buyer review failed: {reviewed}");
+    let claims = verify_jws(reviewed["result"]["attestation"]["jws"].as_str().unwrap());
+    assert_eq!(claims["amount_band"], json!("USD:4"));
+
+    let (status, reviewed) = execute(
+        &app,
+        &seller2.token,
+        &order_command("review.create", &order_id2, 5, seller_review, 2_215),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "seller review failed: {reviewed}");
+    let claims = verify_jws(reviewed["result"]["attestation"]["jws"].as_str().unwrap());
+    assert_eq!(claims["role"], json!("seller_reviewing_buyer"));
+    assert!(
+        claims.get("amount_band").is_none(),
+        "band needs the buyer's own opt-in"
+    );
+    assert_eq!(
+        stored_claims(&app.pool, &order_id2, &buyer2.pubky).await["amount_band"],
+        json!("USD:4"),
+        "the buyer's stored attestation keeps its band"
+    );
+}
+
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn band_consent_endpoint_defaults_to_false_and_conflicts_are_surfaced(pool: PgPool) {
     let app = test_app_with_attestor(pool).await;
