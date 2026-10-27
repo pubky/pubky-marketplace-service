@@ -1,4 +1,4 @@
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -348,6 +348,52 @@ pub struct RegisterListingPayload {
     /// canonical JSON (the idempotency hash input).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub variants: Vec<VariantStock>,
+    /// The record's `preorder`: the item sells before stock exists and ships
+    /// on or after `ships_from`. Serialized only when set so other listings
+    /// keep byte-identical canonical JSON (the idempotency hash input).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preorder: Option<ListingPreorder>,
+}
+
+/// A preorder on a fixed-price physical listing: the buyer pays now, the
+/// seller ships on or after `ships_from` (a UTC date). When the order is
+/// still unshipped `grace_days` after that date, the buyer may cancel it
+/// without the seller's approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListingPreorder {
+    pub ships_from: NaiveDate,
+    pub grace_days: i64,
+}
+
+/// Grace days a preorder takes when the record leaves them out.
+pub const PREORDER_DEFAULT_GRACE_DAYS: i64 = 7;
+/// The grace period a seller may set, in days.
+pub const PREORDER_GRACE_DAYS: std::ops::RangeInclusive<i64> = 1..=30;
+/// The furthest a preorder's ships-from date may be when it is published.
+pub const PREORDER_MAX_LEAD_DAYS: i64 = 90;
+
+impl ListingPreorder {
+    /// When the buyer may cancel an unshipped order alone: the start (UTC) of
+    /// the day `grace_days` after `ships_from`.
+    pub fn ship_by(&self) -> DateTime<Utc> {
+        preorder_ship_by(self.ships_from, self.grace_days)
+    }
+
+    /// Whether a seller may publish this ships-from date now: after today
+    /// (UTC) and at most 90 days out.
+    pub fn ships_from_publishable(&self, now: DateTime<Utc>) -> bool {
+        let today = now.date_naive();
+        self.ships_from > today
+            && self.ships_from <= today + chrono::Duration::days(PREORDER_MAX_LEAD_DAYS)
+    }
+}
+
+/// [`ListingPreorder::ship_by`] for the frozen columns of an order.
+pub fn preorder_ship_by(ships_from: NaiveDate, grace_days: i64) -> DateTime<Utc> {
+    (ships_from + chrono::Duration::days(grace_days))
+        .and_time(chrono::NaiveTime::MIN)
+        .and_utc()
 }
 
 /// One enabled variant of a listing record: the units the seller holds of it
@@ -1940,6 +1986,28 @@ fn validate_listing_payload(
             "A Locks listing must be digital-only: fulfillment methods must be exactly [digital]",
         ));
     }
+    // A preorder is a fixed-price physical sale: an auction has no stock to
+    // wait for and a digital item has nothing to ship. The ships-from date
+    // is checked against server time where the listing is written.
+    if let Some(preorder) = &payload.preorder {
+        if payload.sale_format != SaleFormat::FixedPrice
+            || payload.digital_lock.is_some()
+            || payload
+                .fulfillment_methods
+                .contains(&FulfillmentMethod::Digital)
+        {
+            issues.push(issue(
+                "payload.preorder",
+                "A preorder must be a fixed-price physical listing",
+            ));
+        }
+        if !PREORDER_GRACE_DAYS.contains(&preorder.grace_days) {
+            issues.push(issue(
+                "payload.preorder.grace_days",
+                "Expected grace days between 1 and 30",
+            ));
+        }
+    }
     if let Some(lock) = &mut payload.digital_lock {
         // Persist only the canonical bare form: a Shop-authored
         // `pubky://<creator>/pub/app.locks/<id>.json` policy URI and its
@@ -3173,6 +3241,61 @@ mod tests {
             serde_json::to_value(&typed).unwrap(),
             json!({ "path": "p", "message": "m", "reason": "currency_unsupported" })
         );
+    }
+
+    fn issue_paths(command: &Value) -> Vec<String> {
+        match parse_command(command) {
+            Ok(_) => Vec::new(),
+            Err(issues) => issues.into_iter().map(|issue| issue.path).collect(),
+        }
+    }
+
+    #[test]
+    fn a_preorder_is_a_fixed_price_physical_listing_with_a_bounded_grace() {
+        let mut command = register_command_json();
+        command["payload"]["preorder"] = json!({ "ships_from": "2026-09-30", "grace_days": 7 });
+        let parsed = parse_command(&command).expect("valid preorder");
+        let CommandPayload::RegisterListing(payload) = parsed.payload else {
+            panic!("expected register payload");
+        };
+        let preorder = payload.preorder.expect("preorder kept");
+        assert_eq!(
+            preorder.ship_by(),
+            "2026-10-07T00:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
+
+        for grace in [0, 31] {
+            command["payload"]["preorder"]["grace_days"] = json!(grace);
+            assert_eq!(issue_paths(&command), ["payload.preorder.grace_days"]);
+        }
+        command["payload"]["preorder"]["grace_days"] = json!(7);
+        command["payload"]["fulfillment_methods"] = json!(["shipping", "digital"]);
+        assert_eq!(issue_paths(&command), ["payload.preorder"]);
+    }
+
+    #[test]
+    fn a_preorder_ships_from_tomorrow_to_ninety_days_out() {
+        let now: DateTime<Utc> = "2026-09-01T23:59:00Z".parse().unwrap();
+        let preorder = |date: &str| ListingPreorder {
+            ships_from: date.parse().unwrap(),
+            grace_days: 7,
+        };
+        assert!(!preorder("2026-09-01").ships_from_publishable(now));
+        assert!(preorder("2026-09-02").ships_from_publishable(now));
+        assert!(preorder("2026-11-30").ships_from_publishable(now));
+        assert!(!preorder("2026-12-01").ships_from_publishable(now));
+    }
+
+    #[test]
+    fn a_listing_without_a_preorder_serializes_as_before() {
+        let parsed = parse_command(&register_command_json()).expect("valid command");
+        let CommandPayload::RegisterListing(payload) = parsed.payload else {
+            panic!("expected register payload");
+        };
+        assert!(serde_json::to_value(&payload)
+            .unwrap()
+            .get("preorder")
+            .is_none());
     }
 
     #[test]

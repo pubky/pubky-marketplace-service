@@ -1,5 +1,5 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use marketplace_domain::Money;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -117,6 +117,11 @@ pub struct ListingRow {
     /// carries the record's `priceOverride`s and read, under the listing row
     /// lock, by the checkout that charges them.
     pub variant_prices: Option<Value>,
+    /// The registered record's `preorder` (migration 0091): the date the
+    /// item ships from and the grace days after it. Both NULL for a listing
+    /// that sells stock on hand.
+    pub preorder_ships_from: Option<NaiveDate>,
+    pub preorder_grace_days: Option<i32>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -282,6 +287,11 @@ impl ListingRow {
         }
         if let Some(prices) = &self.variant_prices {
             projection["variant_prices"] = prices.clone();
+        }
+        if let (Some(ships_from), Some(grace_days)) =
+            (self.preorder_ships_from, self.preorder_grace_days)
+        {
+            projection["preorder"] = json!({ "ships_from": ships_from, "grace_days": grace_days });
         }
         crate::reserve_secrecy::ensure_reserve_free(&projection)
             .map_err(|_| ListingProjectionError)?;
@@ -594,6 +604,10 @@ impl BidRow {
     }
 }
 
+/// The cancellation reason of a preorder the buyer cancelled alone after its
+/// ship-by deadline.
+pub const PREORDER_LATE_REASON: &str = "preorder_late";
+
 #[derive(Clone, FromRow)]
 pub struct OrderRow {
     pub id: Uuid,
@@ -665,6 +679,14 @@ pub struct OrderRow {
     /// (`{accepts_returns, return_window_days}`, see
     /// [`crate::return_policy`]); NULL when none was captured.
     pub return_policy: Option<Value>,
+    /// The preorder terms frozen at the payment start (migration 0091): the
+    /// latest ships-from date and grace days among the order's preorder
+    /// lines. NULL for an order with no preorder line.
+    pub preorder_ships_from: Option<NaiveDate>,
+    pub preorder_grace_days: Option<i32>,
+    /// When the preorder_overdue sweep found the order still unshipped after
+    /// its ship-by deadline.
+    pub preorder_overdue_at: Option<DateTime<Utc>>,
     pub return_request: Option<Value>,
     pub external_refund: Option<Value>,
     /// The buyer-bound payment method (`bitcoin` | `paypal`; historical rows may
@@ -844,6 +866,9 @@ impl std::fmt::Debug for OrderRow {
             .field("delivery_assume_days", &self.delivery_assume_days)
             .field("auto_complete_days", &self.auto_complete_days)
             .field("return_policy", &self.return_policy)
+            .field("preorder_ships_from", &self.preorder_ships_from)
+            .field("preorder_grace_days", &self.preorder_grace_days)
+            .field("preorder_overdue_at", &self.preorder_overdue_at)
             .field("return_request", &self.return_request)
             .field("external_refund", &self.external_refund)
             .field("payment_method", &self.payment_method)
@@ -970,6 +995,9 @@ impl OrderRow {
             delivery_assume_days: None,
             auto_complete_days: None,
             return_policy: None,
+            preorder_ships_from: None,
+            preorder_grace_days: None,
+            preorder_overdue_at: None,
             return_request: None,
             external_refund: None,
             payment_method: None,
@@ -1097,6 +1125,34 @@ impl OrderRow {
                 "format": "plaintext_v1",
                 "address": address,
             })
+        })
+    }
+
+    /// The order's ship-by deadline when it carries a preorder: after it, an
+    /// order still `paid` may be cancelled by the buyer alone.
+    pub fn preorder_ship_by(&self) -> Option<DateTime<Utc>> {
+        Some(marketplace_domain::commands::preorder_ship_by(
+            self.preorder_ships_from?,
+            i64::from(self.preorder_grace_days?),
+        ))
+    }
+
+    /// A late preorder the buyer cancelled: the seller owes the refund and
+    /// records it with `refund.record_external`.
+    pub fn preorder_refund_due(&self) -> bool {
+        self.state == "cancelled"
+            && self.cancellation_reason.as_deref() == Some(PREORDER_LATE_REASON)
+    }
+
+    fn preorder_view(&self) -> Value {
+        let Some(ship_by) = self.preorder_ship_by() else {
+            return Value::Null;
+        };
+        json!({
+            "ships_from": self.preorder_ships_from,
+            "grace_days": self.preorder_grace_days,
+            "ship_by": format_timestamp(ship_by),
+            "overdue_at": self.preorder_overdue_at.map(format_timestamp),
         })
     }
 
@@ -1294,6 +1350,8 @@ impl OrderRow {
         view["delivery_assume_days"] = json!(self.delivery_assume_days);
         view["auto_complete_days"] = json!(self.auto_complete_days);
         view["return_policy"] = json!(self.return_policy);
+        view["preorder"] = self.preorder_view();
+        view["refund_due"] = json!(self.preorder_refund_due());
         view["paykit_delivery_state"] = json!(self.paykit_delivery_state);
         view["payment_reversed_at"] = self.payment_reversed_at.map(format_timestamp).into();
         view["payment_reversal_cancelled_at"] = self

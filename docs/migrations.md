@@ -473,6 +473,34 @@ every row an older image writes, and any `returned` rows stay valid. Dropping th
 writes every record again (at revision 1; the index treats an equal revision as
 a replacement).
 
+## Preorders (0091, 0092)
+
+0091 adds the nullable `listings.preorder_ships_from` (DATE) and
+`listings.preorder_grace_days`, the registered record's preorder, and the same
+pair on `orders`, frozen at the payment start, with `orders.preorder_overdue_at`
+(no default, no index, `lock_timeout` like 0050). 0092 builds the partial
+`orders_preorder_overdue_due_idx` for the `preorder_overdue` worker, as one
+`CREATE INDEX CONCURRENTLY` in a `-- no-transaction` file. Directly rerunnable.
+
+**Deploy mode: rolling.** A binary from before 0091 neither reads nor writes
+the columns: a listing it registers new sells as stock on hand until a new
+binary syncs it, and its edits leave the stored preorder as it was.
+
+### Backing out 0091 and 0092
+
+Additive: an image from before them runs on the migrated database. By hand,
+after the old image is serving:
+
+```sql
+DROP INDEX CONCURRENTLY IF EXISTS orders_preorder_overdue_due_idx;
+ALTER TABLE orders DROP COLUMN IF EXISTS preorder_overdue_at;
+ALTER TABLE orders DROP COLUMN IF EXISTS preorder_grace_days;
+ALTER TABLE orders DROP COLUMN IF EXISTS preorder_ships_from;
+ALTER TABLE listings DROP COLUMN IF EXISTS preorder_grace_days;
+ALTER TABLE listings DROP COLUMN IF EXISTS preorder_ships_from;
+DELETE FROM _sqlx_migrations WHERE version IN (91, 92);
+```
+
 ## Numbers claimed by open pull requests
 
 `main` has 0001 to 0079 (0068 and 0069 were never used). A new migration must
@@ -487,6 +515,7 @@ assume it is free:
 | 0083 to 0086 | `0083_review_items.sql` to `0086_review_item_keys.sql` | per-item reviews and seller ratings |
 | 0089 | `0089_review_withdrawal.sql` | `reviews.public_removed_at` and the `review.withdraw` refusal-audit command kind (0087 and 0088 are the double-blind review window) |
 | 0090 | `0090_attestor_publisher.sql` | the attestor publisher's tables and the `returned` annotation outcome |
+| 0091, 0092 | `0091_listing_preorders.sql`, `0092_orders_preorder_overdue_idx.sql` | preorder listings and the overdue sweep index |
 
 This table describes unmerged work and goes stale as pull requests land; trust
 `crates/service/migrations/` on `main` over it. sqlx does not reject two files

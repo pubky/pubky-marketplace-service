@@ -25,7 +25,7 @@ crates/service     axum HTTP service: Postgres schema (sqlx migrations),
                    idempotency, command handlers, Locks lifecycle
                    verification (encrypted correlations, HMAC lookup
                    tokens, Lock Server client), background worker runtime
-                   (see "Background workers": 24 lease-guarded tasks plus
+                   (see "Background workers": 25 lease-guarded tasks plus
                    the webhook delivery worker). Besides the server binary
                    (`marketplace-service`) it builds the operator binaries
                    `refusal-audit-admin` and `paykit-attempts-admin`.
@@ -1975,6 +1975,54 @@ notifications, with all those fields, and scans every column and the logs for
 them. The buyer-typed transaction reference of `POST
 /v0/orders/{id}/fiat/mark-paid` is the buyer's own input, not IPN data.
 
+## Preorders
+
+A seller lists a physical item before stock exists: the buyer pays the full
+price now and the seller ships on or after a date. It is not a
+[drop](#drops-adr-0026); it is a `preorder` on an ordinary listing.
+
+- **Record and registration.** The listing record carries
+  `preorder: { shipsFrom, graceDays }`, where `shipsFrom` is a UTC date
+  (`YYYY-MM-DD`) and `graceDays` is 1 to 30 (7 when left out).
+  `listing.register` takes the same block as
+  `preorder: { ships_from, grace_days }`, and `listing.sync` derives it from
+  the record. A malformed block refuses the sync. A preorder is refused on an
+  auction, a Locks listing or a listing with `digital` fulfillment. The
+  preorder cap is the listing's quantity.
+- **Ships-from date.** On a new or revived listing, and whenever the record
+  changes the block, `shipsFrom` must be after today (UTC) and at most 90 days
+  out, or the write is refused with reason `preorder_ships_from_out_of_range`.
+  A listing whose date has passed keeps syncing while the block stays the
+  same.
+- **Frozen on the order.** At the order's first payment lock point, with the
+  seller's periods, the order freezes the preorder of its lines
+  (`orders.preorder_ships_from`, `orders.preorder_grace_days`). The line with
+  the latest deadline sets them, so an order mixing a preorder with stock on
+  hand waits for the preorder. A later edit of the listing never moves an
+  open order's deadline.
+- **Ship-by deadline.** The deadline is the start (UTC) of the day
+  `graceDays` after `shipsFrom`. Until then, cancelling works as for any
+  order: the buyer requests and the seller approves. From then on, while the
+  order is still `paid` (unshipped), `order.cancel_request` cancels it at once
+  without the seller (`paid → cancelled`). It records
+  `order.cancelled_preorder_late` with `cancellation_reason` `preorder_late`,
+  and the stock returns to the listing as on an approved cancel.
+- **Overdue sweep.** The `preorder_overdue` worker stamps
+  `orders.preorder_overdue_at` on paid preorders past their deadline, records
+  `order.preorder_overdue` and sends `order_preorder_overdue` to both parties.
+  The order stays `paid` and the seller may still ship it. The buyer's exit
+  reads server time, not the stamp.
+- **Refund.** The service never moves money. A cancelled late preorder
+  projects `refund_due: true` until the seller records the refund with
+  `refund.record_external` (`cancelled → refunded_external`).
+- **Projections.** The listing carries
+  `preorder: { ships_from, grace_days }` when set. The order carries
+  `preorder: { ships_from, grace_days, ship_by, overdue_at }` (or `null`) and
+  `refund_due`.
+- **Reputation and limits.** A late-preorder cancel is not counted against
+  the seller's completion rate (like `order.cancelled_terms_change`). A paid
+  preorder counts toward the EU private-seller limits like any sale.
+
 ## Drops (ADR-0026)
 
 Timed, limited releases. A drop is registered by the convergent `drop.sync`
@@ -2296,14 +2344,14 @@ Not served, deliberately (no fabricated or empty-by-default reads):
 
 ## Background workers (tasks 3.4, 4.5)
 
-One worker runtime (`crates/service/src/workers.rs`) drains 24 lease-guarded
+One worker runtime (`crates/service/src/workers.rs`) drains 25 lease-guarded
 server-time tasks: `reservation_expiry`, `drop_transitions`, `offer_expiry`,
 `auction_close`, `outbox`, `locks_verification`, `paykit_verification`,
 `payment_window`, `stat_attestations`, `delivery_autocomplete`,
 `pickup_reseal`, `digital_reseal`, `priv_key_reseal`, `delivery_email_purge`,
 `delivery_address_purge`, `read_rate_purge`, `pickup_retention`, `seller_confirmation_window`,
 `manual_review_watch`, `paykit_resolve_delivery`, `fx_sampler`,
-`refusal_audit_retention`, `listing_deletions` and `review_release`. Webhook delivery runs in a
+`refusal_audit_retention`, `listing_deletions`, `review_release` and `preorder_overdue`. Webhook delivery runs in a
 separate worker (`spawn_webhook_worker` in `crates/service/src/automation.rs`;
 see [`docs/api.md`](docs/api.md#webhooks)).
 

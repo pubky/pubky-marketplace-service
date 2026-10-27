@@ -114,7 +114,7 @@ async fn apply(
 ) -> Result<u64, sqlx::Error> {
     match event.kind.as_str() {
         "payment.confirmed" => on_payment_confirmed(tx, now, event).await,
-        "order.cancelled" | "order.cancelled_terms_change" => {
+        "order.cancelled" | "order.cancelled_terms_change" | "order.cancelled_preorder_late" => {
             let Some(order_id) = order_id_of(&event.aggregate_id) else {
                 return Ok(0);
             };

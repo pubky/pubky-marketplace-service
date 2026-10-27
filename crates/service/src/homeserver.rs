@@ -1210,6 +1210,22 @@ struct ListingRecord {
     fulfillment_methods: Vec<String>,
     #[serde(default)]
     digital_lock: Option<RecordDigitalLock>,
+    /// Typed strictly: a present `preorder` that does not parse fails the
+    /// whole record, so a sync never sells a preorder as stock on hand.
+    #[serde(default)]
+    preorder: Option<RecordPreorder>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RecordPreorder {
+    ships_from: chrono::NaiveDate,
+    #[serde(default = "default_preorder_grace_days")]
+    grace_days: i64,
+}
+
+fn default_preorder_grace_days() -> i64 {
+    marketplace_domain::commands::PREORDER_DEFAULT_GRACE_DAYS
 }
 
 /// The flat shipping the service will charge per order line: the cheapest
@@ -1383,6 +1399,12 @@ pub fn registration_payload_from_record(
         fulfillment_methods,
         digital_lock,
         variants,
+        preorder: record
+            .preorder
+            .map(|preorder| marketplace_domain::commands::ListingPreorder {
+                ships_from: preorder.ships_from,
+                grace_days: preorder.grace_days,
+            }),
     }))
 }
 
@@ -1916,6 +1938,28 @@ mod tests {
                 "present-but-invalid lock metadata refuses the derivation"
             );
         }
+    }
+
+    #[test]
+    fn a_record_preorder_parses_with_the_default_grace_and_refuses_when_malformed() {
+        let seller = "y".repeat(52);
+        let mut record = record_json();
+        record["preorder"] = json!({ "shipsFrom": "2026-12-01" });
+        let payload = registration_payload_from_record(&seller, "l", &record)
+            .expect("record parses")
+            .expect("listing record");
+        assert_eq!(
+            payload.preorder,
+            Some(marketplace_domain::commands::ListingPreorder {
+                ships_from: "2026-12-01".parse().unwrap(),
+                grace_days: 7,
+            })
+        );
+        record["preorder"] = json!({ "shipsFrom": "next month" });
+        assert!(matches!(
+            registration_payload_from_record(&seller, "l", &record),
+            Ok(None)
+        ));
     }
 
     fn drop_record_json(seller: &str) -> Value {

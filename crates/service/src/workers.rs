@@ -91,6 +91,7 @@ pub const TASK_FX_SAMPLER: &str = "fx_sampler";
 pub const TASK_REFUSAL_AUDIT_RETENTION: &str = "refusal_audit_retention";
 pub const TASK_LISTING_DELETIONS: &str = "listing_deletions";
 pub const TASK_REVIEW_RELEASE: &str = "review_release";
+pub const TASK_PREORDER_OVERDUE: &str = "preorder_overdue";
 
 static AWARD_EXPIRY_RETRY_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -4724,6 +4725,91 @@ pub async fn assume_due_deliveries(
     Ok(assumed)
 }
 
+/// Marks paid preorders whose ship-by deadline (`preorder_ships_from` plus
+/// `preorder_grace_days`, frozen at payment) has passed: stamps
+/// `preorder_overdue_at`, records `order.preorder_overdue` and tells the buyer
+/// (who may now cancel alone) and the seller (who owes the refund if they do).
+/// The order stays `paid`; the seller may still ship it.
+pub async fn mark_overdue_preorders(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+    batch_size: i64,
+    max_batches: u32,
+) -> anyhow::Result<u64> {
+    let mut marked = 0u64;
+    for _ in 0..max_batches {
+        let pass = mark_overdue_preorders_batch(pool, now, batch_size).await?;
+        marked += pass.processed;
+        if pass.claimed < batch_size as u64 {
+            break;
+        }
+    }
+    Ok(marked)
+}
+
+async fn mark_overdue_preorders_batch(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+    batch_size: i64,
+) -> anyhow::Result<DeliverySweepClaim> {
+    let mut tx = pool.begin().await?;
+    let due: Vec<(Uuid, String, String, i64)> = sqlx::query_as(
+        "SELECT id, buyer_pubky, seller_pubky, revision FROM orders \
+         WHERE state = 'paid' AND preorder_ships_from IS NOT NULL \
+         AND preorder_overdue_at IS NULL \
+         AND (preorder_ships_from + preorder_grace_days)::timestamp AT TIME ZONE 'UTC' <= $1 \
+         ORDER BY id LIMIT $2 FOR UPDATE SKIP LOCKED",
+    )
+    .bind(now)
+    .bind(batch_size)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    let claimed = due.len() as u64;
+    for (order_id, buyer_pubky, seller_pubky, revision) in &due {
+        let revision = revision + 1;
+        sqlx::query(
+            "UPDATE orders SET revision = $2, preorder_overdue_at = $3, updated_at = $3 \
+             WHERE id = $1",
+        )
+        .bind(order_id)
+        .bind(revision)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        let aggregate_id = ids::order_aggregate_id(*order_id);
+        let event_id = crate::executor::insert_event(
+            &mut tx,
+            Uuid::new_v4(),
+            &aggregate_id,
+            revision,
+            SYSTEM_ACTOR,
+            "order.preorder_overdue",
+            now,
+        )
+        .await?;
+        for recipient in [buyer_pubky, seller_pubky] {
+            insert_notification_intent(
+                &mut tx,
+                event_id,
+                "order_preorder_overdue",
+                recipient,
+                SYSTEM_ACTOR,
+                &aggregate_id,
+                None,
+                now,
+            )
+            .await?;
+        }
+        tracing::info!(order_id = %order_id, "preorder unshipped past its ship-by deadline");
+    }
+    tx.commit().await?;
+    Ok(DeliverySweepClaim {
+        claimed,
+        processed: claimed,
+    })
+}
+
 /// Assumes delivery of paid digital orders the seller never marked
 /// delivered: a manual ("I'll email it" / "I'll send it in messages") order
 /// that sits in `paid` past its frozen delivered-assumption period, counted
@@ -5126,6 +5212,7 @@ pub struct WorkerSummary {
     pub listings_tombstoned: u64,
     pub reviews_released: u64,
     pub attestor_records_published: u64,
+    pub preorders_overdue: u64,
 }
 
 /// Samples the bounded sole source once per server-time bucket, one sample
@@ -5498,6 +5585,27 @@ pub async fn run_once(
         release_lease(&state.pool, TASK_REVIEW_RELEASE, holder, now).await?;
         summary.reviews_released = result?;
     }
+    // Preorders still unshipped at their frozen ship-by deadline: the order
+    // is marked overdue and both parties are told the buyer may now cancel.
+    if try_acquire_lease(
+        &state.pool,
+        TASK_PREORDER_OVERDUE,
+        holder,
+        now,
+        lease_seconds,
+    )
+    .await?
+    {
+        let result = mark_overdue_preorders(
+            &state.pool,
+            now,
+            state.config.delivery_sweep_batch_size,
+            DELIVERY_SWEEP_MAX_BATCHES,
+        )
+        .await;
+        release_lease(&state.pool, TASK_PREORDER_OVERDUE, holder, now).await?;
+        summary.preorders_overdue = result?;
+    }
     // The attestor's own records (profile, refund and return annotations). A
     // failed pass is logged inside and retried under each path's backoff, so it
     // never holds up the tasks after it.
@@ -5772,6 +5880,8 @@ struct SellerOrderStats {
     /// The order's terminal cancel was a buyer-protection exit (§A3):
     /// `order.cancelled_terms_change` excludes the WHOLE order from
     /// `terminated_badly`, including any `refund.recorded_external` leg.
+    /// A late preorder's `order.cancelled_preorder_late` does the same: no
+    /// reputation penalty for a late preorder yet.
     terms_change_cancelled: Option<bool>,
     /// The order completed on server time (the `order_auto_complete`
     /// sweep), as opposed to a buyer review.
@@ -5826,10 +5936,12 @@ pub async fn generate_due_stat_attestations(
                BOOL_OR(e.kind = 'order.cancelled') AS cancelled, \
                (BOOL_OR(e.kind = 'refund.recorded_external') \
                 AND o.state = 'refunded_external') AS refunded, \
-               BOOL_OR(e.kind = 'order.cancelled_terms_change') AS terms_change_cancelled, \
+               BOOL_OR(e.kind IN ('order.cancelled_terms_change', \
+                                  'order.cancelled_preorder_late')) AS terms_change_cancelled, \
                BOOL_OR(e.kind = 'order.completed') AS auto_completed, \
                BOOL_OR(e.kind IN ('order.cancel_requested', 'order.cancelled', \
-                                  'order.cancelled_terms_change', 'return.requested')) \
+                                  'order.cancelled_terms_change', 'order.cancelled_preorder_late', \
+                                  'return.requested')) \
                  AS buyer_disputed, \
                o.fulfillment AS fulfillment, \
                (SELECT h.confirmed_by FROM pickup_handovers h WHERE h.order_id = o.id) \
@@ -5983,6 +6095,7 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
                             delivery_addresses_purged = summary.delivery_addresses_purged,
                             listings_tombstoned = summary.listings_tombstoned,
                             reviews_released = summary.reviews_released,
+                            preorders_overdue = summary.preorders_overdue,
                             "worker pass completed"
                         );
                     }

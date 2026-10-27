@@ -15,6 +15,11 @@
 //! cancelled order is the externally evidenced `refund.record_external`
 //! (ADR-0019 §7 — the service never claims to move funds).
 //!
+//! A preorder still `paid` at its ship-by deadline (`ships_from` plus the
+//! grace days, frozen at payment) is the buyer's to cancel alone: the
+//! request cancels it at once with reason `preorder_late`, and the seller
+//! owes the refund through `refund.record_external`.
+//!
 //! Drop-stamped orders (ADR-0026): both release paths — the immediate
 //! cancel of an unpaid order and the seller's approval of a paid one — also
 //! credit the stamped drop's counters, in the same transaction and with the
@@ -120,6 +125,13 @@ pub async fn request(
     } else {
         false
     };
+    // The late preorder exit: a paid order still unshipped at its frozen
+    // ship-by deadline cancels without the seller's approval. Server time
+    // decides, so a sweep that has not run yet never holds the buyer back.
+    let preorder_late = order.state == "paid"
+        && order
+            .preorder_ship_by()
+            .is_some_and(|ship_by| now >= ship_by);
 
     // An unpaid order cancels immediately and releases its hold — when one
     // exists; a paid order awaits the seller's approval (prototype engine
@@ -135,6 +147,10 @@ pub async fn request(
         // terminal cancel is `order.cancelled_terms_change`, including any
         // `refund.recorded_external` leg on it.
         ("cancelled", "order.cancelled_terms_change")
+    } else if preorder_late {
+        // Its own event kind: like a terms change, it stays out of the
+        // seller's `terminated_badly` count (no reputation penalty yet).
+        ("cancelled", "order.cancelled_preorder_late")
     } else {
         ("cancel_requested", "order.cancel_requested")
     };
@@ -166,7 +182,7 @@ pub async fn request(
                 );
             }
         }
-    } else if unilateral {
+    } else if unilateral || preorder_late {
         // The unilateral exit reuses `approve`'s release path VERBATIM
         // (§A8): the payment confirmation moved the quantities
         // reserved -> sold, so the reversal credits a stamped drop first
@@ -198,7 +214,11 @@ pub async fn request(
     .bind(order.id)
     .bind(order.revision)
     .bind(to_state)
-    .bind(&payload.reason)
+    .bind(if preorder_late {
+        crate::model::PREORDER_LATE_REASON
+    } else {
+        payload.reason.as_str()
+    })
     .bind(now)
     .fetch_one(&mut **tx)
     .await?;

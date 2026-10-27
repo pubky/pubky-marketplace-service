@@ -278,9 +278,10 @@ pub fn order_machine() -> AggregateMachine {
             // The unilateral buyer exits (§A3): while a post-payment pickup
             // terms change exists, or while the bounded post-reveal
             // withdrawal window is open, `order.cancel_request` moves the
-            // order straight to `cancelled` with no seller approval. The
-            // contract format has no actor or condition field; the handlers
-            // enforce both.
+            // order straight to `cancelled` with no seller approval. So does
+            // a preorder still `paid` at its frozen ship-by deadline
+            // (`preorder_late`). The contract format has no actor or
+            // condition field; the handlers enforce both.
             t("paid", "cancelled", vec![Command("order.cancel_request")]),
             t(
                 "ready_for_pickup",

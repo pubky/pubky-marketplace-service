@@ -17,6 +17,10 @@
 //! seller limits re-checked where money is taken read them from the order
 //! (`region_fence::recheck_at_payment`).
 //!
+//! It freezes the preorder terms of the order's listings (`shipsFrom`,
+//! `graceDays`), so the buyer's late-cancel deadline is the one they paid
+//! under.
+//!
 //! It also freezes the seller's Bitcoin confirmation option (legal launch plan
 //! B4): `bitcoinConfirmation: "seller"` in the shop record means the seller
 //! confirms their own Bitcoin payments (`orders.seller_confirms_bitcoin`
@@ -195,9 +199,35 @@ pub async fn capture_for_order(
     .bind(declaration.status_confirmed_at)
     .execute(&mut **tx)
     .await?;
+    freeze_preorder(tx, order_id).await?;
     if let Some(homeserver) = homeserver {
         crate::return_policy::capture_for_order(tx, homeserver, order_id, seller_pubky).await?;
     }
+    Ok(())
+}
+
+/// Freezes the preorder terms of the order's listings, as registered now:
+/// the line with the latest ship-by deadline sets the order's. An order with
+/// no preorder line keeps NULL.
+async fn freeze_preorder(
+    tx: &mut Transaction<'_, Postgres>,
+    order_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE orders SET preorder_ships_from = latest.ships_from, \
+         preorder_grace_days = latest.grace_days \
+         FROM (SELECT l.preorder_ships_from AS ships_from, l.preorder_grace_days AS grace_days \
+               FROM orders o \
+               CROSS JOIN LATERAL jsonb_array_elements(o.lines) AS line \
+               JOIN listings l ON l.aggregate_id = line->>'listing_aggregate_id' \
+               WHERE o.id = $1 AND l.preorder_ships_from IS NOT NULL \
+                 AND l.preorder_grace_days IS NOT NULL \
+               ORDER BY l.preorder_ships_from + l.preorder_grace_days DESC LIMIT 1) AS latest \
+         WHERE orders.id = $1",
+    )
+    .bind(order_id)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 

@@ -372,6 +372,9 @@ pub(crate) async fn apply_registration(
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     let current_revision = current.as_ref().map(|c| c.server_revision).unwrap_or(0);
+    if let Some(refusal) = refuse_unpublishable_preorder(payload, current, now) {
+        return Ok(Err(refusal));
+    }
     let variants: &[VariantStock] = if payload.sale_format == SaleFormat::FixedPrice {
         &payload.variants
     } else {
@@ -504,6 +507,10 @@ pub(crate) async fn apply_registration(
     });
     let new_revision = current_revision + 1;
     let variant_prices = variant_prices_json(variants);
+    let preorder_ships_from = payload.preorder.map(|preorder| preorder.ships_from);
+    let preorder_grace_days = payload
+        .preorder
+        .and_then(|preorder| i32::try_from(preorder.grace_days).ok());
     let fulfillment_methods: Vec<String> = payload
         .fulfillment_methods
         .iter()
@@ -522,8 +529,8 @@ pub(crate) async fn apply_registration(
              available_quantity, reserved_quantity, sold_quantity, unit_price_amount_minor, \
              unit_price_currency, unit_price_exponent, shipping_minor, sale_format, auction, \
              fulfillment_methods, digital_lock_policy_uri, digital_lock_criterion_id, updated_at, \
-             variant_prices) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23) \
+             variant_prices, preorder_ships_from, preorder_grace_days) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25) \
              ON CONFLICT (aggregate_id) DO NOTHING",
         )
         .bind(aggregate_id)
@@ -549,6 +556,8 @@ pub(crate) async fn apply_registration(
         .bind(payload.digital_lock.as_ref().map(|lock| &lock.criterion_id))
         .bind(now)
         .bind(&variant_prices)
+        .bind(preorder_ships_from)
+        .bind(preorder_grace_days)
         .execute(&mut **tx)
         .await?;
         inserted.rows_affected() == 1
@@ -559,7 +568,7 @@ pub(crate) async fn apply_registration(
              unit_price_amount_minor = $10, unit_price_currency = $11, unit_price_exponent = $12, \
              shipping_minor = $13, sale_format = $14, auction = $15, fulfillment_methods = $16, \
              digital_lock_policy_uri = $17, digital_lock_criterion_id = $18, updated_at = $19, \
-             variant_prices = $20, \
+             variant_prices = $20, preorder_ships_from = $21, preorder_grace_days = $22, \
              recreated_at = CASE WHEN deleted_at IS NULL THEN recreated_at ELSE $19 END, \
              generation = CASE WHEN deleted_at IS NULL THEN generation ELSE generation + 1 END, \
              deleted_at = NULL, deleted_event_cursor = NULL \
@@ -585,6 +594,8 @@ pub(crate) async fn apply_registration(
         .bind(payload.digital_lock.as_ref().map(|lock| &lock.criterion_id))
         .bind(now)
         .bind(&variant_prices)
+        .bind(preorder_ships_from)
+        .bind(preorder_grace_days)
         .execute(&mut **tx)
         .await?;
         updated.rows_affected() == 1
@@ -641,6 +652,35 @@ pub(crate) async fn apply_registration(
         result: json!({ "kind": "listing", "listing": projection }),
     }))
 }
+
+/// A preorder's ships-from date is checked against server time when it is
+/// published: on a new or revived listing, or when the record changes it.
+/// A listing whose date has passed still syncs and edits as long as the
+/// date stays the same.
+fn refuse_unpublishable_preorder(
+    payload: &RegisterListingPayload,
+    current: Option<&ListingRow>,
+    now: DateTime<Utc>,
+) -> Option<CommandFailure> {
+    let preorder = payload.preorder?;
+    let unchanged = current.is_some_and(|listing| {
+        !listing.is_deleted()
+            && listing.preorder_ships_from == Some(preorder.ships_from)
+            && listing.preorder_grace_days.map(i64::from) == Some(preorder.grace_days)
+    });
+    if unchanged || preorder.ships_from_publishable(now) {
+        return None;
+    }
+    Some(CommandFailure::refused_with_reason(
+        crate::refusal_audit::RefusalKind::InvalidCommand,
+        ErrorCode::InvalidCommand,
+        "A preorder must ship from a date after today and at most 90 days out.",
+        PREORDER_SHIPS_FROM_OUT_OF_RANGE,
+    ))
+}
+
+/// The refusal reason for a preorder date in the past or too far out.
+pub const PREORDER_SHIPS_FROM_OUT_OF_RANGE: &str = "preorder_ships_from_out_of_range";
 
 /// The enabled variants that sell at their own price, as the listing row
 /// stores and projects them; `None` when every variant sells at the
