@@ -2003,6 +2003,16 @@ pub fn put_command_mirror_record(seller_pubky: &str, listing_id: &str, record: V
         .insert((seller_pubky.to_string(), listing_id.to_string()), record);
 }
 
+/// The listing record the mirror homeserver holds, as a register command
+/// mirrored it or a test put it.
+pub fn command_mirror_record(seller_pubky: &str, listing_id: &str) -> Option<Value> {
+    command_mirror_records()
+        .lock()
+        .expect("command mirror records lock")
+        .get(&(seller_pubky.to_string(), listing_id.to_string()))
+        .cloned()
+}
+
 /// Sets the seller lifecycle `state` on a record the mirror homeserver holds,
 /// as the Shop does when the seller pauses or reactivates a listing.
 pub fn set_command_mirror_record_state(seller_pubky: &str, listing_id: &str, state: &str) {

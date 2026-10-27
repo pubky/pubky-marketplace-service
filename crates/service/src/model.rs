@@ -604,9 +604,7 @@ impl BidRow {
     }
 }
 
-/// The cancellation reason of a preorder the buyer cancelled alone after its
-/// ship-by deadline.
-pub const PREORDER_LATE_REASON: &str = "preorder_late";
+pub use marketplace_domain::commands::PREORDER_LATE_REASON;
 
 #[derive(Clone, FromRow)]
 pub struct OrderRow {

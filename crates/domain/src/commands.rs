@@ -366,6 +366,10 @@ pub struct ListingPreorder {
     pub grace_days: i64,
 }
 
+/// The cancellation reason of a preorder the buyer cancelled alone after its
+/// ship-by deadline. Reserved: a buyer's request cannot carry it.
+pub const PREORDER_LATE_REASON: &str = "preorder_late";
+
 /// Grace days a preorder takes when the record leaves them out.
 pub const PREORDER_DEFAULT_GRACE_DAYS: i64 = 7;
 /// The grace period a seller may set, in days.
@@ -2310,6 +2314,14 @@ fn validate_request_cancellation(
 ) -> Result<CommandPayload, Vec<ValidationIssue>> {
     let mut issues = Vec::new();
     validate_trimmed("payload.reason", &mut payload.reason, 1, 500, &mut issues);
+    // The service alone sets this reason, on a late preorder's cancel; the
+    // order's `refund_due` reads it.
+    if payload.reason == PREORDER_LATE_REASON {
+        issues.push(issue(
+            "payload.reason",
+            "This cancellation reason is set by the service",
+        ));
+    }
     if issues.is_empty() {
         Ok(CommandPayload::RequestCancellation(payload))
     } else {

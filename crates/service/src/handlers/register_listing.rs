@@ -657,7 +657,7 @@ pub(crate) async fn apply_registration(
 /// published: on a new or revived listing, or when the record changes it.
 /// A listing whose date has passed still syncs and edits as long as the
 /// date stays the same.
-fn refuse_unpublishable_preorder(
+pub(crate) fn refuse_unpublishable_preorder(
     payload: &RegisterListingPayload,
     current: Option<&ListingRow>,
     now: DateTime<Utc>,

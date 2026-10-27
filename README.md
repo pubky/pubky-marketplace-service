@@ -1993,7 +1993,9 @@ price now and the seller ships on or after a date. It is not a
   changes the block, `shipsFrom` must be after today (UTC) and at most 90 days
   out, or the write is refused with reason `preorder_ships_from_out_of_range`.
   A listing whose date has passed keeps syncing while the block stays the
-  same.
+  same. A listing registered without its record's preorder (an older binary,
+  or a client that sent none) takes it on a `listing.sync` at the same record
+  revision, under the same window.
 - **Frozen on the order.** At the order's first payment lock point, with the
   seller's periods, the order freezes the preorder of its lines
   (`orders.preorder_ships_from`, `orders.preorder_grace_days`). The line with
@@ -2005,7 +2007,8 @@ price now and the seller ships on or after a date. It is not a
   order: the buyer requests and the seller approves. From then on, while the
   order is still `paid` (unshipped), `order.cancel_request` cancels it at once
   without the seller (`paid → cancelled`). It records
-  `order.cancelled_preorder_late` with `cancellation_reason` `preorder_late`,
+  `order.cancelled_preorder_late` with `cancellation_reason` `preorder_late`, a
+  reason only the service sets (a request carrying it is refused),
   and the stock returns to the listing as on an approved cancel.
 - **Overdue sweep.** The `preorder_overdue` worker stamps
   `orders.preorder_overdue_at` on paid preorders past their deadline, records

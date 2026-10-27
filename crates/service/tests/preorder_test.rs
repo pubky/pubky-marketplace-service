@@ -12,8 +12,9 @@ use serde_json::{json, Value};
 use sqlx::PgPool;
 
 use common::{
-    checkout_command, count, execute, new_actor, order_command, payment_command, register_command,
-    send, test_app, TestActor, TestApp,
+    checkout_command, command_mirror_record, count, execute, new_actor, order_command,
+    payment_command, put_command_mirror_record, register_command, send, sync_command, test_app,
+    TestActor, TestApp,
 };
 use marketplace_service::clock::Clock;
 use marketplace_service::workers::{drain_outbox, mark_overdue_preorders};
@@ -271,4 +272,53 @@ async fn a_late_preorder_is_the_buyers_to_cancel_and_the_sellers_to_refund(pool:
     assert_eq!(status, StatusCode::OK, "refund failed: {body}");
     assert_eq!(body["result"]["order"]["state"], json!("refunded_external"));
     assert_eq!(body["result"]["order"]["refund_due"], json!(false));
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_buyer_cannot_claim_the_late_preorder_reason(pool: PgPool) {
+    let app = test_app(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order_id = paid_preorder(&app, &seller, &buyer).await;
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &order_command(
+            "order.cancel_request",
+            &order_id,
+            2,
+            json!({ "reason": "preorder_late" }),
+            1_400,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(
+        order(&app, &order_id, &buyer.token).await["refund_due"],
+        json!(false)
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_sync_at_the_same_revision_takes_the_records_preorder(pool: PgPool) {
+    let app = test_app(pool).await;
+    let seller = new_actor(&app).await;
+    let (status, body) = execute(&app, &seller.token, &register_command(&seller.pubky, 2)).await;
+    assert_eq!(status, StatusCode::OK, "register failed: {body}");
+    assert_eq!(body["result"]["listing"].get("preorder"), None);
+
+    let mut record = command_mirror_record(&seller.pubky, "boots_01").expect("mirrored record");
+    record["preorder"] = json!({ "shipsFrom": SHIPS_FROM, "graceDays": 7 });
+    put_command_mirror_record(&seller.pubky, "boots_01", record);
+    let (status, body) = execute(
+        &app,
+        &seller.token,
+        &sync_command(&seller.pubky, "boots_01", 1_500),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "sync failed: {body}");
+    assert_eq!(
+        body["result"]["listing"]["preorder"],
+        json!({ "ships_from": SHIPS_FROM, "grace_days": 7 })
+    );
 }

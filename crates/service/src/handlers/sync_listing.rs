@@ -307,8 +307,32 @@ async fn sync(
             // state) is touched.
             let registration_variant_prices =
                 crate::handlers::register_listing::variant_prices_json(&registration.variants);
+            // A listing registered without its record's preorder (an older
+            // binary, or a client that sent none) takes it here, under the
+            // same publish window as a new preorder; outside it the listing
+            // keeps what it has.
+            let registration_preorder = (
+                registration.preorder.map(|preorder| preorder.ships_from),
+                registration
+                    .preorder
+                    .and_then(|preorder| i32::try_from(preorder.grace_days).ok()),
+            );
+            let current_preorder = (current.preorder_ships_from, current.preorder_grace_days);
+            let heal_preorder = registration_preorder != current_preorder
+                && crate::handlers::register_listing::refuse_unpublishable_preorder(
+                    &registration,
+                    Some(current),
+                    now,
+                )
+                .is_none();
+            let healed_preorder = if heal_preorder {
+                registration_preorder
+            } else {
+                current_preorder
+            };
             if registration.listing_revision == current.listing_revision
-                && (registration.shipping_minor != current.shipping_minor
+                && (heal_preorder
+                    || registration.shipping_minor != current.shipping_minor
                     || registration_variant_prices != current.variant_prices
                     || registration_methods != current.fulfillment_methods
                     || registration
@@ -325,7 +349,8 @@ async fn sync(
                 let healed: crate::model::ListingRow = sqlx::query_as(&format!(
                     "UPDATE listings SET server_revision = server_revision + 1, \
                      shipping_minor = $2, fulfillment_methods = $3, digital_lock_policy_uri = $4, \
-                     digital_lock_criterion_id = $5, updated_at = $6, variant_prices = $7 \
+                     digital_lock_criterion_id = $5, updated_at = $6, variant_prices = $7, \
+                     preorder_ships_from = $8, preorder_grace_days = $9 \
                      WHERE aggregate_id = $1 \
                      RETURNING {}",
                     crate::handlers::LISTING_COLUMNS
@@ -347,6 +372,8 @@ async fn sync(
                 )
                 .bind(now)
                 .bind(&registration_variant_prices)
+                .bind(healed_preorder.0)
+                .bind(healed_preorder.1)
                 .fetch_one(&mut **tx)
                 .await?;
                 let event_id = crate::executor::insert_event(
