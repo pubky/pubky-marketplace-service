@@ -483,3 +483,108 @@ async fn a_matched_sighting_is_stored_as_matched_and_a_later_short_report_cannot
     assert_eq!(states(&fx.app.pool, &order_id).await.0, "pending_payment");
     assert_eq!(confirmed_events(&fx.app.pool, &payment_id).await, 0);
 }
+
+// --- seller confirmation as the deployment default (PAYMENT_CONFIRMATION) ----
+
+async fn seller_mode_fixture(pool: PgPool) -> Fixture {
+    let mut config = marketplace_service::config::Config::for_tests();
+    config.payment_confirmation = marketplace_service::config::PaymentConfirmation::Seller;
+    let (app, paykit, _ipn) = common::test_app_with_payments_config(pool, config).await;
+    let homeserver = spawn_fake_homeserver().await;
+    let app = with_shop_homeserver(app, &homeserver);
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    Fixture {
+        app,
+        paykit,
+        status: FakePaykitStatus::default(),
+        homeserver,
+        seller,
+        buyer,
+    }
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn in_seller_mode_every_upstream_payment_waits_without_any_opt_in(pool: PgPool) {
+    let fx = seller_mode_fixture(pool).await;
+    // No shop record option, and an unreadable record: the deployment decides.
+    for record in [Some(shop_record(&fx.seller, json!({}))), None] {
+        match record {
+            Some(record) => fx.homeserver.put_shop_record(&fx.seller.pubky, record),
+            None => fx.homeserver.fail_shop_record(&fx.seller.pubky),
+        }
+        let (order_id, payment_id, reference) = upstream_bound(&fx).await;
+        fx.status.set_outcome(&reference, confirmed(false));
+        assert!(poll_now(&fx.app, &fx.status, fx.app.clock.now()).await >= 1);
+        assert_eq!(
+            states(&fx.app.pool, &order_id).await,
+            (
+                "pending_payment".to_string(),
+                "awaiting_seller_confirmation".to_string(),
+                "awaiting_entitlement".to_string()
+            )
+        );
+        assert_eq!(confirmed_events(&fx.app.pool, &payment_id).await, 0);
+        let (code, body) = confirm_call(&fx.app, &fx.seller.token, &order_id, &json!({})).await;
+        assert_eq!(code, StatusCode::OK, "{body}");
+        assert_eq!(confirmed_events(&fx.app.pool, &payment_id).await, 1);
+    }
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn in_seller_mode_underpaid_and_late_money_keep_their_routes(pool: PgPool) {
+    let fx = seller_mode_fixture(pool).await;
+    fx.homeserver
+        .put_shop_record(&fx.seller.pubky, shop_record(&fx.seller, json!({})));
+    let (order_id, payment_id, reference) = upstream_bound(&fx).await;
+    fx.status.set_outcome(&reference, confirmed_short());
+    poll_now(&fx.app, &fx.status, fx.app.clock.now()).await;
+    assert_eq!(
+        payment_review_reason(&fx.app.pool, &payment_id)
+            .await
+            .as_deref(),
+        Some("amount_mismatch")
+    );
+    assert_ne!(
+        states(&fx.app.pool, &order_id).await.1,
+        "awaiting_seller_confirmation"
+    );
+
+    let (order_id, _, reference) = upstream_bound(&fx).await;
+    fx.app.clock.advance_seconds(3 * 3_600);
+    fx.status.set_outcome(&reference, confirmed(true));
+    poll_now(&fx.app, &fx.status, fx.app.clock.now()).await;
+    assert_ne!(
+        states(&fx.app.pool, &order_id).await.1,
+        "awaiting_seller_confirmation"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn in_seller_mode_a_retired_fork_order_keeps_its_creators_mode(pool: PgPool) {
+    let fx = seller_mode_fixture(pool).await;
+    fx.homeserver
+        .put_shop_record(&fx.seller.pubky, shop_record(&fx.seller, json!({})));
+    let (order_id, _, reference) =
+        bound_order(&fx.app, &fx.paykit, &fx.seller, &fx.buyer, "exclusive").await;
+    fx.status.set_outcome(&reference, confirmed(false));
+    assert!(poll_now(&fx.app, &fx.status, fx.app.clock.now()).await >= 1);
+    assert_eq!(states(&fx.app.pool, &order_id).await.0, "paid");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_order_frozen_before_the_switch_existed_reads_as_automatic(pool: PgPool) {
+    let fx = seller_mode_fixture(pool).await;
+    fx.homeserver
+        .put_shop_record(&fx.seller.pubky, shop_record(&fx.seller, json!({})));
+    let (order_id, payment_id, reference) = upstream_bound(&fx).await;
+    sqlx::query("UPDATE orders SET payment_confirmation = NULL WHERE id = $1")
+        .bind(Uuid::parse_str(&order_id).expect("order uuid"))
+        .execute(&fx.app.pool)
+        .await
+        .expect("present the order as pre-0091");
+    fx.status.set_outcome(&reference, confirmed(false));
+    assert!(poll_now(&fx.app, &fx.status, fx.app.clock.now()).await >= 1);
+    assert_eq!(states(&fx.app.pool, &order_id).await.0, "paid");
+    assert_eq!(confirmed_events(&fx.app.pool, &payment_id).await, 1);
+}

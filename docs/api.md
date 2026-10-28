@@ -2032,6 +2032,7 @@ Liveness plus a capability summary. Always `200` while the process is up:
   "digital_delivery_available": true,
   "digital_delivery_max_bytes": 1048576,
   "priv_keys_available": false,
+  "payment_confirmation": "seller",
   "commit": "2f844c1084c4",
   "paykit_rail": { "bitcoin_offer_available": true, "age_seconds": 12 }
 }
@@ -2046,7 +2047,13 @@ The capability fields reflect how this deployment is configured (for example
 `priv_keys_available` is `true` only when the `/priv` key-encryption key is
 set). `paykit_rail.bitcoin_offer_available` and `paykit_rail.age_seconds` describe
 the last successful Paykit rail probe and are both `null` until one has
-succeeded. A health check must not treat these flags as failures.
+succeeded. `payment_confirmation` is the deployment's `PAYMENT_CONFIRMATION`
+(`seller` or `automatic`), which new orders freeze when their payment starts;
+each order carries its own frozen value as `payment_confirmation`, with
+`gateway_payment_seen_at` set once PayPal reported a payment the seller has
+yet to confirm (see
+[Seller-confirmed payment](../README.md#seller-confirmed-payment)). A health
+check must not treat these flags as failures.
 
 ### `GET /ready`
 

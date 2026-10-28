@@ -19,7 +19,7 @@ use common::paykit_review::{
 };
 use common::*;
 use marketplace_service::clock::Clock;
-use marketplace_service::config::Config;
+use marketplace_service::config::{Config, PaymentConfirmation};
 use marketplace_service::payment_attempt::{MarketplaceAssets, MarketplaceContract};
 use marketplace_service::payments::{attempt_reference, PaykitApi};
 use marketplace_service::workers::drain_outbox;
@@ -119,12 +119,17 @@ async fn put_config(app: &TestApp, token: &str, body: Value) {
 }
 
 async fn fixture(pool: PgPool, setup: Setup) -> Fixture {
-    let (app, paykit, fx) = test_app_with_paykit_fx_config(
-        pool.clone(),
-        config(setup.usdt_flag, setup.multi_asset, setup.usdt_listed),
-        setup.api,
-    )
-    .await;
+    fixture_confirmed_by(pool, setup, PaymentConfirmation::Automatic).await
+}
+
+async fn fixture_confirmed_by(
+    pool: PgPool,
+    setup: Setup,
+    payment_confirmation: PaymentConfirmation,
+) -> Fixture {
+    let mut config = config(setup.usdt_flag, setup.multi_asset, setup.usdt_listed);
+    config.payment_confirmation = payment_confirmation;
+    let (app, paykit, fx) = test_app_with_paykit_fx_config(pool.clone(), config, setup.api).await;
     if setup.multi_asset {
         paykit.use_multi_asset_contract();
     }
@@ -2892,4 +2897,389 @@ async fn a_voided_paykit_bind_leaves_nothing_on_a_later_paypal_bind(pool: PgPool
     .await
     .expect("order row");
     assert_eq!(leftovers, (None, None, None, None));
+}
+
+// ---------------------------------------------------------------------------
+// Seller-confirmed payment (PAYMENT_CONFIRMATION=seller)
+// ---------------------------------------------------------------------------
+
+async fn seller_fixture(pool: PgPool) -> Fixture {
+    fixture_confirmed_by(pool, Setup::both(), PaymentConfirmation::Seller).await
+}
+
+async fn stored_confirmation(pool: &PgPool, order_id: &str) -> Option<String> {
+    sqlx::query_scalar("SELECT payment_confirmation FROM orders WHERE id = $1")
+        .bind(uuid(order_id))
+        .fetch_one(pool)
+        .await
+        .expect("order row")
+}
+
+async fn confirm(f: &Fixture, token: &str, order_id: &str) -> (StatusCode, Value) {
+    common::paykit_review::confirm_call(&f.app, token, order_id, &json!({})).await
+}
+
+async fn payment_confirmed_events(pool: &PgPool, order_id: &str) -> i64 {
+    count(
+        pool,
+        "SELECT COUNT(*) FROM events e JOIN payments p ON e.aggregate_id = 'payment:' || p.id::text \
+         WHERE p.order_id = $1 AND e.kind = 'payment.confirmed'",
+        order_id,
+    )
+    .await
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn who_marks_the_order_paid_freezes_at_the_bind(pool: PgPool) {
+    let f = seller_fixture(pool.clone()).await;
+    let active = active_order(&f).await;
+    assert_eq!(
+        stored_confirmation(&pool, &active.order.order_id)
+            .await
+            .as_deref(),
+        Some("seller")
+    );
+    let view = read_order(&f, &f.buyer.token, &active.order.order_id).await;
+    assert_eq!(view["payment_confirmation"], json!("seller"));
+    let (status, health) = send(f.app.router.clone(), "GET", "/health", None, &Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(health["payment_confirmation"], json!("seller"));
+
+    let g = fixture(pool.clone(), Setup::both()).await;
+    let active = active_order(&g).await;
+    assert_eq!(
+        stored_confirmation(&pool, &active.order.order_id)
+            .await
+            .as_deref(),
+        Some("automatic")
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn seller_confirmed_usdt_waits_for_the_seller_while_finality_is_tracked(pool: PgPool) {
+    let f = seller_fixture(pool.clone()).await;
+    let active = active_order(&f).await;
+    let order_id = active.order.order_id.clone();
+    f.paykit.set_marketplace_status(
+        active.invoice,
+        usdt_status(
+            active.invoice,
+            active.deadline,
+            usdt_leg(1, true, true, false),
+        ),
+    );
+    assert_eq!(poll_now(&f.app, at(1)).await, 1);
+    let stored = facts(&pool, &order_id).await;
+    assert_eq!(
+        stored.state, "pending_payment",
+        "the transfer alone pays nothing"
+    );
+    assert_eq!(
+        stored.paykit_request_state.as_deref(),
+        Some("awaiting_seller_confirmation")
+    );
+    assert_eq!(stored.payment_asset.as_deref(), Some("USDT"));
+    assert_eq!(stored.payment_finality.as_deref(), Some("pending"));
+    assert_eq!(
+        payment_row(&pool, &order_id).await.0,
+        "awaiting_entitlement"
+    );
+    assert_eq!(payment_confirmed_events(&pool, &order_id).await, 0);
+    let seen = delivered_notifications(&f.app, &f.seller.token, "usdt_payment_seen").await;
+    assert_eq!(seen.len(), 1, "the seller is told the transfer arrived");
+    let view = read_order(&f, &f.buyer.token, &order_id).await;
+    assert_eq!(view["next_actor"], json!("seller"));
+
+    // Finality moves while the seller decides; the order still waits.
+    f.paykit.set_marketplace_status(
+        active.invoice,
+        usdt_status(
+            active.invoice,
+            active.deadline,
+            usdt_leg(220, true, true, true),
+        ),
+    );
+    poll_now(&f.app, at(2)).await;
+    let stored = facts(&pool, &order_id).await;
+    assert_eq!(stored.payment_finality.as_deref(), Some("final"));
+    assert_eq!(stored.state, "pending_payment");
+
+    // Only the listing's seller may attest it.
+    let (status, _) = confirm(&f, &f.buyer.token, &order_id).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, body) = confirm(&f, &f.seller.token, &order_id).await;
+    assert_eq!(status, StatusCode::OK, "seller confirms: {body}");
+    assert_eq!(body["order"]["state"], json!("paid"));
+    assert_eq!(payment_confirmed_events(&pool, &order_id).await, 1);
+    let receipt: (String, i64, i32) =
+        sqlx::query_as("SELECT currency, total_minor, exponent FROM receipts WHERE order_id = $1")
+            .bind(uuid(&order_id))
+            .fetch_one(&pool)
+            .await
+            .expect("receipt");
+    assert_eq!(
+        (receipt.0.as_str(), receipt.1, receipt.2),
+        ("USDT", TOTAL_USDT_UNITS as i64, 6),
+        "the receipt follows the rail recorded at entry"
+    );
+    let stored = facts(&pool, &order_id).await;
+    let (status, body) = execute(
+        &f.app,
+        &f.seller.token,
+        &ship(&order_id, stored.revision, 31),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "a final transfer ships: {body}");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_seller_confirmed_usdt_transfer_that_disappears_is_marked_and_reverted(pool: PgPool) {
+    let f = seller_fixture(pool.clone()).await;
+    let active = active_order(&f).await;
+    let order_id = active.order.order_id.clone();
+    f.paykit.set_marketplace_status(
+        active.invoice,
+        usdt_status(
+            active.invoice,
+            active.deadline,
+            usdt_leg(2, true, true, false),
+        ),
+    );
+    poll_now(&f.app, at(1)).await;
+    f.paykit.set_marketplace_status(
+        active.invoice,
+        nothing_observed(active.invoice, active.deadline),
+    );
+    poll_now(&f.app, at(2)).await;
+    let stored = facts(&pool, &order_id).await;
+    assert_eq!(stored.payment_finality.as_deref(), Some("reverted"));
+    assert_eq!(
+        stored.paykit_request_state.as_deref(),
+        Some("awaiting_seller_confirmation"),
+        "the order neither advances nor silently reverts"
+    );
+    let disappeared: Option<bool> = sqlx::query_scalar(
+        "SELECT (paykit_observation->>'disappeared')::boolean FROM orders WHERE id = $1",
+    )
+    .bind(uuid(&order_id))
+    .fetch_one(&pool)
+    .await
+    .expect("observation");
+    assert_eq!(disappeared, Some(true));
+
+    // The transfer comes back: pending again, still waiting for the seller.
+    f.paykit.set_marketplace_status(
+        active.invoice,
+        usdt_status(
+            active.invoice,
+            active.deadline,
+            usdt_leg(3, true, true, false),
+        ),
+    );
+    poll_now(&f.app, at(3)).await;
+    let stored = facts(&pool, &order_id).await;
+    assert_eq!(stored.payment_finality.as_deref(), Some("pending"));
+    assert_eq!(stored.state, "pending_payment");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn seller_confirmed_late_or_short_usdt_keeps_its_review_route(pool: PgPool) {
+    for (matched, on_time) in [(false, true), (true, false)] {
+        let f = seller_fixture(pool.clone()).await;
+        let active = active_order(&f).await;
+        let order_id = active.order.order_id.clone();
+        f.paykit.set_marketplace_status(
+            active.invoice,
+            status_body(
+                active.invoice,
+                active.deadline,
+                StatusSpec {
+                    payment_state: "confirmed",
+                    bitcoin: None,
+                    usdt: Some(usdt_leg(1, matched, on_time, false)),
+                    paid_asset: None,
+                },
+            ),
+        );
+        poll_now(&f.app, at(1)).await;
+        let stored = facts(&pool, &order_id).await;
+        assert_ne!(
+            stored.paykit_request_state.as_deref(),
+            Some("awaiting_seller_confirmation"),
+            "matched {matched}, on time {on_time}"
+        );
+        assert_ne!(stored.state, "paid");
+        assert_ne!(payment_row(&pool, &order_id).await.0, "confirmed");
+    }
+    // A matched transfer of another amount than offered is never shown as waiting.
+    let f = seller_fixture(pool.clone()).await;
+    let active = active_order(&f).await;
+    let order_id = active.order.order_id.clone();
+    let mut leg = usdt_leg(1, true, true, false);
+    leg["observed_amount"] = json!((TOTAL_USDT_UNITS + 10_000).to_string());
+    f.paykit.set_marketplace_status(
+        active.invoice,
+        usdt_status(active.invoice, active.deadline, leg),
+    );
+    poll_now(&f.app, at(1)).await;
+    let (state, _, _, _, reason) = payment_row(&pool, &order_id).await;
+    assert_eq!(
+        (state.as_str(), reason.as_deref()),
+        ("manual_review", Some("amount_mismatch"))
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn seller_confirmed_bitcoin_through_the_paykit_method_waits_and_records_its_rail(
+    pool: PgPool,
+) {
+    let f = seller_fixture(pool.clone()).await;
+    let active = active_order(&f).await;
+    let order_id = active.order.order_id.clone();
+    f.paykit.set_marketplace_status(
+        active.invoice,
+        status_body(
+            active.invoice,
+            active.deadline,
+            StatusSpec {
+                payment_state: "confirmed",
+                bitcoin: Some(bitcoin_leg(3, true)),
+                usdt: None,
+                paid_asset: Some("BTC"),
+            },
+        ),
+    );
+    assert_eq!(poll_now(&f.app, at(1)).await, 1);
+    let stored = facts(&pool, &order_id).await;
+    assert_eq!(stored.state, "pending_payment");
+    assert_eq!(
+        stored.paykit_request_state.as_deref(),
+        Some("awaiting_seller_confirmation")
+    );
+    assert_eq!(
+        stored.payment_asset.as_deref(),
+        Some("BTC"),
+        "the rail is recorded at entry, so a refund can follow it"
+    );
+    let seen = delivered_notifications(&f.app, &f.seller.token, "bitcoin_payment_seen").await;
+    assert_eq!(seen.len(), 1);
+    let (status, body) = confirm(&f, &f.seller.token, &order_id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["order"]["state"], json!("paid"));
+    assert_eq!(payment_confirmed_events(&pool, &order_id).await, 1);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_unconfirmed_usdt_payment_goes_to_review_and_the_seller_resolves_it_paid(pool: PgPool) {
+    let f = seller_fixture(pool.clone()).await;
+    let active = active_order(&f).await;
+    let order_id = active.order.order_id.clone();
+    f.paykit.set_marketplace_status(
+        active.invoice,
+        usdt_status(
+            active.invoice,
+            active.deadline,
+            usdt_leg(1, true, true, false),
+        ),
+    );
+    poll_now(&f.app, at(1)).await;
+    let routed = marketplace_service::bitcoin_review::route_due_seller_confirmation_windows(
+        &f.app.state,
+        at(1)
+            + Duration::seconds(
+                marketplace_service::bitcoin_review::SELLER_CONFIRMATION_WINDOW_SECONDS + 1,
+            ),
+    )
+    .await
+    .expect("window reaper runs");
+    assert_eq!(routed, 1);
+    assert_eq!(payment_row(&pool, &order_id).await.0, "manual_review");
+    let (status, body) = resolve_call(
+        &f.app,
+        &f.seller.token,
+        &order_id,
+        Some(Uuid::new_v4()),
+        &json!({ "outcome": "paid" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let view = read_order(&f, &f.buyer.token, &order_id).await;
+    assert_eq!(view["state"], json!("paid"));
+    assert_eq!(view["payment_asset"], json!("USDT"));
+}
+
+// --- interleaving (money path) ----------------------------------------------
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn concurrent_usdt_confirmations_polls_and_the_window_reaper_pay_exactly_once(pool: PgPool) {
+    let f = seller_fixture(pool.clone()).await;
+    let active = active_order(&f).await;
+    let order_id = active.order.order_id.clone();
+    f.paykit.set_marketplace_status(
+        active.invoice,
+        usdt_status(
+            active.invoice,
+            active.deadline,
+            usdt_leg(1, true, true, false),
+        ),
+    );
+    poll_now(&f.app, at(1)).await;
+    assert_eq!(
+        facts(&pool, &order_id)
+            .await
+            .paykit_request_state
+            .as_deref(),
+        Some("awaiting_seller_confirmation")
+    );
+    f.paykit.set_marketplace_status(
+        active.invoice,
+        usdt_status(
+            active.invoice,
+            active.deadline,
+            usdt_leg(220, true, true, true),
+        ),
+    );
+    let reaper_at = at(2)
+        + Duration::seconds(
+            marketplace_service::bitcoin_review::SELLER_CONFIRMATION_WINDOW_SECONDS,
+        );
+    let (first, second, _polled, reaped) = tokio::join!(
+        confirm(&f, &f.seller.token, &order_id),
+        confirm(&f, &f.seller.token, &order_id),
+        poll_now(&f.app, at(2)),
+        marketplace_service::bitcoin_review::route_due_seller_confirmation_windows(
+            &f.app.state,
+            reaper_at,
+        ),
+    );
+    let reaped = reaped.expect("window reaper runs");
+    let answers = [first, second];
+    let paid_by_seller = answers
+        .iter()
+        .filter(|(code, _)| *code == StatusCode::OK)
+        .count();
+    for (code, body) in &answers {
+        if *code != StatusCode::OK {
+            assert_eq!(*code, StatusCode::CONFLICT, "{body}");
+        }
+    }
+    let payment = payment_row(&pool, &order_id).await.0;
+    if reaped == 1 {
+        // The reaper won: the payment waits in review, never paid twice.
+        assert_eq!(paid_by_seller, 0, "{answers:?}");
+        assert_eq!(payment, "manual_review");
+        assert_eq!(payment_confirmed_events(&pool, &order_id).await, 0);
+    } else {
+        assert!(paid_by_seller >= 1, "{answers:?}");
+        assert_eq!(payment, "confirmed");
+        assert_eq!(facts(&pool, &order_id).await.state, "paid");
+        assert_eq!(payment_confirmed_events(&pool, &order_id).await, 1);
+    }
+    let receipts = count(
+        &pool,
+        "SELECT COUNT(*) FROM receipts WHERE order_id = $1",
+        &order_id,
+    )
+    .await;
+    assert!(receipts <= 1, "at most one receipt: {receipts}");
 }

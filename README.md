@@ -189,6 +189,7 @@ Configuration is environment-based. Window keys and their defaults also live in
 | `PAYKIT_SERVER_API` | `fork` | which paykit-server the service speaks to: `fork` (today's production server) or `upstream` (`pubky/paykit-server` with the signed-services allowlist, first shipped in v0.1.0-rc9, #55; the latest tagged release is v0.1.0-rc11). Set only together with `PAYKIT_SERVER_URL`. See [Paykit server API](#paykit-server-api) |
 | `PAYKIT_SETUP_STATUS_TIMEOUT_SECONDS` | `8` | how long the signed upstream `POST /setup/status` may take, in whole seconds (1–30). paykit-server answers `ready` for a set-up seller in 2 to 3.5 s, so it does not share the 3 s timeout of the other availability reads. Set only together with `PAYKIT_SERVER_URL` |
 | `PAYKIT_MAX_PREPARE_TTL_SECONDS` | `900` | largest remaining upstream Paykit preparation TTL Marketplace accepts (60–86400). Align with producer `prepare_ttl_seconds`; a longer response is voided and its bind/inventory transaction rolls back. Up to 60 additional seconds are accepted only for bounded cross-service clock skew |
+| `PAYMENT_CONFIRMATION` | `seller` | who marks an order paid: `seller` (the seller's attestation is the only way Bitcoin, USDT and PayPal money pays an order; Paykit's report and PayPal's notification only inform the seller) or `automatic` (the earlier behaviour, the seller's own Bitcoin option included). Frozen on each order at its payment start. See [Seller-confirmed payment](#seller-confirmed-payment) |
 | `USDT_PAYMENTS_ENABLED` | `false` | the USDT feature flag (`true`/`1` or `false`/`0`). On, `/health` reports `usdt_payments.available`, the seller consent and readiness keys exist, and a `paykit` order may be paid in USDT; off, none of that exists and every Bitcoin and PayPal response is unchanged. See [USDT payments](#usdt-payments-flagged-default-off) |
 | `PAYKIT_MARKETPLACE_ASSETS` | `BTC` | the assets the deployed paykit-server's Marketplace prepare can carry: comma-separated `BTC` (required) and `USDT`. `USDT` is accepted only with `PAYKIT_SERVER_API=upstream`, and USDT is offered only when `PAYKIT_MARKETPLACE_CONTRACT` is `multi_asset` too. See [The single Paykit bind](#the-single-paykit-bind) |
 | `PAYKIT_MARKETPLACE_CONTRACT` | `legacy` | which request body the service sends to paykit-server's Marketplace prepare and activate: `legacy` (rc16 `amount_sats`, Bitcoin only) or `multi_asset` (a denomination and amount, optionally narrowed). `multi_asset` needs `PAYKIT_SERVER_API=upstream` and is independent of USDT: set it as soon as the deployed paykit-server speaks the multi-asset contract (which refuses the legacy body), with USDT still off |
@@ -199,7 +200,7 @@ Configuration is environment-based. Window keys and their defaults also live in
 | `REVIEW_BLIND_WINDOW_DAYS` | `0` | days after an order becomes reviewable during which its reviews are double-blind (0 to 90; `0` is off and changes nothing). Inside the window each side's review and the reviewer's attestations are withheld from the other until both have reviewed or the window ends, and a seller's review after it is refused. Keep it at `0` until the Shop handles pending reviews; see [Reviews](docs/api.md#double-blind-reviews) |
 | `DELIVERY_SWEEP_BATCH_SIZE` | `100` | rows claimed per inner delivery/auto-complete sweep pass (≥ 1); the worker loops until a short batch or the per-lease cap |
 | `PUBLIC_APP_ORIGIN` | unset | the web app's public URL: an origin, plus the mount path when the Shop is served under one (e.g. `https://shop.pubky.app`, or `https://pubky.app/shop`); no query, fragment, credentials or `.`/`..` path segments. When set, hosted checkouts that support a return destination (PayPal `_xclick`) send the buyer back to `{value}/marketplace/orders` after commit/cancel |
-| `PUBLIC_SERVICE_ORIGIN` | unset | this service's own public origin; when set, PayPal checkout links carry `notify_url={origin}/v0/paypal/ipn` so PayPal's IPN pays the order automatically (postback-verified, matched against seller email + exact order total) and records the seller's PayPal refunds and the buyer's reversals on it. Unset, PayPal stays participant-attested |
+| `PUBLIC_SERVICE_ORIGIN` | unset | this service's own public origin; when set, PayPal checkout links carry `notify_url={origin}/v0/paypal/ipn` so PayPal's IPN (postback-verified, matched against seller email + exact order total) pays the order under `PAYMENT_CONFIRMATION=automatic` or tells the seller under `seller`, and records the seller's PayPal refunds and the buyer's reversals on it. Unset, PayPal stays participant-attested |
 | `PAYPAL_IPN_VERIFY_URL` | `https://ipnpb.paypal.com/cgi-bin/webscr` | PayPal's IPN validation endpoint; tests point it at a local double |
 | `PAYPAL_CHECKOUT_URL` | `https://www.paypal.com/cgi-bin/webscr` | PayPal `_xclick` checkout base. HTTPS only; host must be `www.paypal.com` (live) or `www.sandbox.paypal.com`. Default stays live. |
 | `REQUIRE_ENCRYPTED_DELIVERY_ADDRESS` | `false` | `true`/`1` refuses a checkout or award checkout that carries a plaintext `delivery_address` (422 `INVALID_COMMAND`, reason `encrypted_delivery_required`); only sealed envelopes are accepted. Leave unset until the Shop version that seals is the deployed one (see [Sealed delivery address](#sealed-delivery-address)) |
@@ -474,20 +475,56 @@ and overwrite any client-sent value.
   (`offers_unavailable_for_digital`), and auctions ship only.
 - Buyers from every other country, and physical lines, are unaffected.
 
-### Seller confirmation of Bitcoin payments
+### Seller-confirmed payment
 
-Legal launch plan B4, a seller option that is off unless the seller turns it
-on. A seller whose shop record says `bitcoinConfirmation: "seller"` confirms
-their own Bitcoin payments made through Paykit. Upstream Paykit reports every
-order as `exclusive`, so Bitcoin money seen on time would pay the order by
-itself. For an opted-in seller the service reads that report as
-`shared_manual` instead (`orders.seller_confirms_bitcoin`, frozen when the
-order's payment starts, so the option applies to new orders only): money that
-matches the order's amount enters the existing `awaiting_seller_confirmation`
-window, Paykit's report only informs the seller (`bitcoin_payment_seen`), and
-the seller's confirmation (`POST /v0/orders/{id}/confirm-bitcoin-payment`) is
-the only way the order is paid. The seller has 24 hours; after that the payment
-goes to manual review.
+`PAYMENT_CONFIRMATION` decides who turns observed money into a paid order. It
+is frozen on the order when its payment starts (`orders.payment_confirmation`,
+migration 0091), so changing it applies to new orders only, and `/health`
+reports it as `payment_confirmation`. An order whose payment started before
+0091 reads as `automatic`.
+
+**`seller` (the default).** The service still presents the payment request
+and watches for the money, but what it sees is a hint for the seller. Only the
+seller's attestation pays the order:
+
+- **Bitcoin (Paykit, upstream):** every order takes the seller-confirmation
+  flow below, whatever the shop record says.
+- **USDT (Paykit, upstream):** an included, on-time transfer of the offered
+  amount enters the same `awaiting_seller_confirmation` window instead of
+  paying. The paid rail and the transfer's finality are recorded at entry and
+  finality keeps being polled while the seller decides; a transfer that is no
+  longer reported is marked `disappeared` and its finality `reverted`. The
+  seller confirms with the same `POST /v0/orders/{id}/confirm-bitcoin-payment`
+  (`usdt_payment_seen` tells them it arrived). Physical fulfilment still waits
+  for a final transfer after the order is paid.
+- **PayPal:** a postback-verified `Completed` notification that matches the
+  seller's email, the currency and the amount still stores the PayPal payment
+  id and receiver snapshot, so refund and reversal notifications keep
+  matching. It does not pay: it stamps `gateway_payment_seen_at`, records the
+  PayPal transaction id as the order's reference, extends the hold to the
+  24-hour seller window, and notifies the seller (`paypal_payment_seen`). The
+  seller pays the order with `POST /v0/orders/{id}/fiat/confirm-received`
+  (`fiat_verification: "seller-attested"`). After the window the ordinary
+  expiry cancels the order; a later seller confirmation takes the late-money
+  path. A confirmation is refused with `payment_taken_back` while PayPal
+  reports the money refunded or reversed.
+- The buyer cannot cancel once money is seen (a Paykit sighting or a PayPal
+  notification), and `next_actor` is the seller.
+- Late money, short money and money on both rails keep their review routes. An
+  order on the retired fork API keeps its Paykit creator's own mode. Locks
+  orders are paid by the Lock Server's lifecycle as before.
+
+**`automatic`.** The earlier behaviour: a matching Paykit report or a
+verified PayPal notification pays the order. A seller whose shop record says
+`bitcoinConfirmation: "seller"` still confirms their own Bitcoin payments
+(legal launch plan B4, `orders.seller_confirms_bitcoin`, frozen at the payment
+start; NULL when the record was unreadable, read as not opted in).
+
+**The seller-confirmation window.** Money that matches the order's amount
+enters `awaiting_seller_confirmation`, the hold (and an auction winner's
+reservation) is extended 24 hours, and Paykit's report only informs the seller
+(`bitcoin_payment_seen`). The seller's confirmation is the only way the order
+is paid. After 24 hours without it the payment goes to manual review.
 
 - **Underpaid money is not shown to the seller as matching.** A `confirmed`
   report whose amount does not match goes to manual review with the
@@ -498,13 +535,9 @@ goes to manual review.
   (`confirmation_observation_mismatch`).
 - **Locks orders are not held.** A Locks order is paid when the Lock Server
   reports the lifecycle completed; the Lock Server issues the unlock itself, so
-  the service cannot hold something it does not release. The option covers
-  Paykit Bitcoin payments only, and the Shop copy says so
+  the service cannot hold something it does not release
   (`a_sellers_bitcoin_confirmation_option_does_not_hold_a_locks_order`).
-- A late settlement still takes the late path, USDT is not affected, an order
-  on the fork API keeps the creator's own mode, and an order whose shop record
-  was unreadable at the payment start is not held (an
-  `ALERT seller_terms_fallback_unreadable_shop_record` is logged).
+- A late settlement still takes the late path whatever the mode.
 
 ### Listing lifecycle
 

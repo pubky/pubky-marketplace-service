@@ -473,6 +473,30 @@ every row an older image writes, and any `returned` rows stay valid. Dropping th
 writes every record again (at revision 1; the index treats an equal revision as
 a replacement).
 
+## Seller-confirmed payment (0091)
+
+0091 adds two nullable `orders` columns with no default and no index
+(`lock_timeout` like 0079): `payment_confirmation` (`seller` or `automatic`,
+bounded by `orders_payment_confirmation_values`), frozen at the order's first
+payment start from `PAYMENT_CONFIRMATION`, and `gateway_payment_seen_at`, the
+verified PayPal notification on a seller-confirmed order. An order whose
+payment started before 0091 keeps NULL, which reads as `automatic`.
+
+**Deploy mode: rolling.** A binary from before 0091 never sets or reads them
+and pays automatically; a new binary freezes the mode at each new payment
+start, so an order started under an old binary stays automatic.
+
+### Backing out 0091
+
+Additive: an image from before it runs on the migrated database, and it pays
+every open order automatically again. By hand, after the old image is serving:
+
+```sql
+ALTER TABLE orders DROP COLUMN IF EXISTS payment_confirmation,
+                   DROP COLUMN IF EXISTS gateway_payment_seen_at;
+DELETE FROM _sqlx_migrations WHERE version = 91;
+```
+
 ## Numbers claimed by open pull requests
 
 `main` has 0001 to 0079 (0068 and 0069 were never used). A new migration must
@@ -487,6 +511,8 @@ assume it is free:
 | 0083 to 0086 | `0083_review_items.sql` to `0086_review_item_keys.sql` | per-item reviews and seller ratings |
 | 0089 | `0089_review_withdrawal.sql` | `reviews.public_removed_at` and the `review.withdraw` refusal-audit command kind (0087 and 0088 are the double-blind review window) |
 | 0090 | `0090_attestor_publisher.sql` | the attestor publisher's tables and the `returned` annotation outcome |
+| 0091 | `0091_seller_confirmed_payment.sql` | `orders.payment_confirmation` and `orders.gateway_payment_seen_at` (seller-confirmed payment) |
+| 0092 | `0092_digital_release.sql` | `orders.digital_released_at` (digital release split from payment), stacked on 0091 |
 
 This table describes unmerged work and goes stale as pull requests land; trust
 `crates/service/migrations/` on `main` over it. sqlx does not reject two files
@@ -597,4 +623,3 @@ applies it at once.
 scratch database) pins the backfill on a database migrated through 0061 (the last migration
 before 0070 in this tree; 0062 to 0069 are the connectors' and are not here), the
 rerun, each trigger, the old-binary write, and the table's checks.
-
