@@ -269,6 +269,39 @@ pub struct Config {
     /// (`orders.payment_confirmation`), so changing it never moves an open
     /// order.
     pub payment_confirmation: PaymentConfirmation,
+    /// Who releases a paid order's instant digital lines to the buyer
+    /// (`DIGITAL_RELEASE`, default `seller`). Frozen on each such order when
+    /// it is paid (`orders.digital_release`).
+    pub digital_release: DigitalRelease,
+}
+
+/// Who releases a paid order's instant digital lines (`DIGITAL_RELEASE`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DigitalRelease {
+    /// The lines are pinned at payment and wait for the seller's release
+    /// (`fulfillment.release_digital`, or a confirmation that asks for it).
+    #[default]
+    Seller,
+    /// The earlier behaviour: the payment confirmation releases them.
+    Payment,
+}
+
+impl DigitalRelease {
+    pub fn parse(raw: Option<&str>) -> anyhow::Result<Self> {
+        match raw.map(str::trim) {
+            None | Some("") | Some("seller") => Ok(Self::Seller),
+            Some("payment") => Ok(Self::Payment),
+            Some(_) => anyhow::bail!("DIGITAL_RELEASE must be seller or payment"),
+        }
+    }
+
+    /// The value frozen in `orders.digital_release`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Seller => "seller",
+            Self::Payment => "payment",
+        }
+    }
 }
 
 /// Who turns observed money into a paid order (`PAYMENT_CONFIRMATION`).
@@ -515,6 +548,8 @@ impl Config {
         )?;
         let payment_confirmation =
             PaymentConfirmation::parse(std::env::var("PAYMENT_CONFIRMATION").ok().as_deref())?;
+        let digital_release =
+            DigitalRelease::parse(std::env::var("DIGITAL_RELEASE").ok().as_deref())?;
         Ok(Self {
             bind_addr,
             database_url,
@@ -575,6 +610,7 @@ impl Config {
             paykit_marketplace_assets,
             paykit_marketplace_contract,
             payment_confirmation,
+            digital_release,
         })
     }
 
@@ -649,6 +685,7 @@ impl Config {
             // The suites written against automatic settlement keep running
             // it; the seller-confirmed suites set `Seller` explicitly.
             payment_confirmation: PaymentConfirmation::Automatic,
+            digital_release: DigitalRelease::Payment,
         }
     }
 }
@@ -918,7 +955,7 @@ mod tests {
     use super::{
         automation_rate_capacity, parse_app_base, parse_days, parse_paypal_checkout_url,
         parse_review_blind_window_days, refusal_audit_keys_from_env, reject_audit_url_reuse,
-        required_postgres_url, validate_postgres_url, Config, PaymentConfirmation,
+        required_postgres_url, validate_postgres_url, Config, DigitalRelease, PaymentConfirmation,
         AUTOMATION_RATE_LIMIT_MAX_TOKENS, DEFAULT_AUTO_COMPLETE_DAYS, DEFAULT_DELIVERY_ASSUME_DAYS,
         DEFAULT_PAYPAL_CHECKOUT_URL,
     };
@@ -1467,6 +1504,7 @@ mod tests {
             ("PAYKIT_MARKETPLACE_CONTRACT", None),
             ("PAYKIT_SERVER_API", None),
             ("PAYMENT_CONFIRMATION", None),
+            ("DIGITAL_RELEASE", None),
         ];
         vars.extend_from_slice(extra);
         let _guard = EnvGuard::set(&vars);
@@ -1526,6 +1564,29 @@ mod tests {
             let refused = from_env_with(&[("PAYMENT_CONFIRMATION", Some(value))]).expect_err(value);
             assert!(
                 refused.to_string().contains("PAYMENT_CONFIRMATION"),
+                "{value:?}: {refused}"
+            );
+        }
+    }
+
+    #[test]
+    fn digital_release_defaults_to_the_seller() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let config = from_env_with(&[]).expect("defaults parse");
+        assert_eq!(config.digital_release, DigitalRelease::Seller);
+        for (value, expected) in [
+            ("seller", DigitalRelease::Seller),
+            ("", DigitalRelease::Seller),
+            ("payment", DigitalRelease::Payment),
+        ] {
+            let config = from_env_with(&[("DIGITAL_RELEASE", Some(value))])
+                .unwrap_or_else(|error| panic!("{value}: {error}"));
+            assert_eq!(config.digital_release, expected, "{value:?}");
+        }
+        for value in ["Seller", "automatic", "true"] {
+            let refused = from_env_with(&[("DIGITAL_RELEASE", Some(value))]).expect_err(value);
+            assert!(
+                refused.to_string().contains("DIGITAL_RELEASE"),
                 "{value:?}: {refused}"
             );
         }

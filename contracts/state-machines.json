@@ -428,6 +428,10 @@
               "name": "fulfillment.deliver_digital"
             },
             {
+              "trigger": "command",
+              "name": "fulfillment.release_digital"
+            },
+            {
               "trigger": "server",
               "name": "digital_delivery"
             }
@@ -843,6 +847,7 @@
         "fulfillment.mark_ready",
         "fulfillment.confirm_pickup",
         "fulfillment.deliver_digital",
+        "fulfillment.release_digital",
         "order.set_delivery_email",
         "return.request",
         "return.approve",

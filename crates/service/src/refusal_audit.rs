@@ -292,10 +292,11 @@ pub enum CommandKind {
     UpdateTracking = 40,
     CancelReturn = 41,
     WithdrawReview = 42,
+    ReleaseDigital = 43,
 }
 
 impl CommandKind {
-    pub const ALL: [Self; 43] = [
+    pub const ALL: [Self; 44] = [
         Self::InvalidEnvelope,
         Self::RegisterListing,
         Self::SyncListing,
@@ -339,6 +340,7 @@ impl CommandKind {
         Self::UpdateTracking,
         Self::CancelReturn,
         Self::WithdrawReview,
+        Self::ReleaseDigital,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -386,6 +388,7 @@ impl CommandKind {
             Self::UpdateTracking => "update_tracking",
             Self::CancelReturn => "cancel_return",
             Self::WithdrawReview => "withdraw_review",
+            Self::ReleaseDigital => "release_digital",
         }
     }
 }

@@ -94,6 +94,9 @@ pub struct ConfirmKeys<'a> {
     /// re-checks the seller's annual limit
     /// ([`region_fence::recheck_at_payment`]).
     pub fence: Option<&'a region_policy::RegionModes>,
+    /// Who releases instant digital lines on the orders this confirmation
+    /// pays (`DIGITAL_RELEASE`).
+    pub digital_release: config::DigitalRelease,
 }
 
 #[derive(Clone)]
@@ -207,6 +210,7 @@ impl AppState {
             pickup: self.pickup.as_deref(),
             digital: self.digital.as_deref(),
             fence: self.config.region_policy().fence_modes(),
+            digital_release: self.config.digital_release,
         }
     }
 }

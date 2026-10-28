@@ -206,6 +206,8 @@
           "created_at": "<timestamp:1>",
           "delivery_assume_days": null,
           "delivery_assumed": false,
+          "digital_release": null,
+          "digital_released_at": null,
           "drop_aggregate_id": null,
           "edition": null,
           "external_refund": null,

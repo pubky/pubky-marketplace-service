@@ -650,6 +650,7 @@ fn command_kind(payload: &CommandPayload) -> CommandKind {
         CommandPayload::ClearDigitalDelivery(_) => CommandKind::ClearDigitalDelivery,
         CommandPayload::SetDeliveryEmail(_) => CommandKind::SetDeliveryEmail,
         CommandPayload::DeliverDigital(_) => CommandKind::DeliverDigital,
+        CommandPayload::ReleaseDigital(_) => CommandKind::ReleaseDigital,
         CommandPayload::MarkReadyForPickup(_) => CommandKind::MarkReadyForPickup,
         CommandPayload::ConfirmPickup(_) => CommandKind::ConfirmPickup,
         CommandPayload::RequestReturn(_) => CommandKind::RequestReturn,
@@ -914,6 +915,9 @@ async fn dispatch(
         }
         CommandPayload::DeliverDigital(payload) => {
             crate::handlers::digital_manual::deliver_digital(tx, actor, command, payload, now).await
+        }
+        CommandPayload::ReleaseDigital(payload) => {
+            crate::handlers::digital_manual::release_digital(tx, actor, command, payload, now).await
         }
         CommandPayload::MarkReadyForPickup(payload) => {
             crate::handlers::fulfillment::mark_ready(tx, actor, command, payload, now).await

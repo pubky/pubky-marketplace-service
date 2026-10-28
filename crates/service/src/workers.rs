@@ -4849,7 +4849,10 @@ pub async fn assume_due_deliveries(
 /// that sits in `paid` past its frozen delivered-assumption period, counted
 /// from the receipt's issue instant (the payment), moves `paid → delivered`
 /// exactly as a shipped order does after shipment. Instant-only digital
-/// orders are delivered at payment and never wait here. An open
+/// orders are delivered at their release and never wait here, and an order
+/// whose instant lines still wait for the seller's release
+/// (`DIGITAL_RELEASE=seller`) is never assumed delivered: the buyer has
+/// nothing to open until the seller releases it. An open
 /// cancellation request (`cancel_requested`) takes the order out of the
 /// sweep by construction, and so does a PayPal reversal outstanding on the
 /// order (`payment_reversed_at`): the seller cannot read the address while
@@ -4871,6 +4874,7 @@ async fn assume_due_digital_deliveries_batch(
          FROM orders o JOIN receipts r ON r.order_id = o.id \
          WHERE o.state = 'paid' AND o.fulfillment = 'digital' \
          AND o.payment_reversed_at IS NULL \
+         AND (o.digital_release IS DISTINCT FROM 'seller' OR o.digital_released_at IS NOT NULL) \
          AND r.issued_at <= $1 - interval '1 day' * COALESCE(o.delivery_assume_days::bigint, $2) \
          ORDER BY o.id LIMIT $3 FOR UPDATE OF o SKIP LOCKED",
     )

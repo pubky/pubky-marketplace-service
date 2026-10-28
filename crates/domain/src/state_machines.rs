@@ -255,13 +255,15 @@ pub fn order_machine() -> AggregateMachine {
             // `digital_delivery` is the confirmation of an order whose every
             // line is released on the order page (file, link, text): it
             // leaves `paid` for `delivered` in the receipt transaction
-            // (digital delivery design §3.6).
+            // (digital delivery design §3.6) when the payment releases them,
+            // or at the seller's `fulfillment.release_digital` otherwise.
             t(
                 "paid",
                 "delivered",
                 vec![
                     Command("fulfillment.confirm_pickup"),
                     Command("fulfillment.deliver_digital"),
+                    Command("fulfillment.release_digital"),
                     Server("digital_delivery"),
                 ],
             ),
@@ -487,6 +489,7 @@ pub fn order_machine() -> AggregateMachine {
             "fulfillment.mark_ready",
             "fulfillment.confirm_pickup",
             "fulfillment.deliver_digital",
+            "fulfillment.release_digital",
             "order.set_delivery_email",
             "return.request",
             "return.approve",
@@ -1061,6 +1064,9 @@ mod tests {
         assert!(delivered
             .via
             .contains(&Command("fulfillment.deliver_digital")));
+        assert!(delivered
+            .via
+            .contains(&Command("fulfillment.release_digital")));
         assert!(delivered
             .via
             .contains(&Command("fulfillment.confirm_pickup")));
