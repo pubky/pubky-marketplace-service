@@ -344,13 +344,17 @@ async fn automatic_confirmation_still_pays_on_the_verified_notification(pool: Pg
 
 // --- interleaving (money path) ----------------------------------------------
 
-/// Waits until a session of this test's database is blocked on a lock.
-async fn wait_for_lock_waiter(pool: &PgPool) {
+/// Waits until a session is blocked by `blocker` (the reversal's backend) on
+/// the payment row lock the confirmation takes, so no other lock wait in the
+/// cluster can stand in for it.
+async fn wait_for_payment_lock_waiter(pool: &PgPool, blocker: i32) {
     for _ in 0..500 {
         let waiting: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM pg_stat_activity \
-             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+             WHERE datname = current_database() AND $1 = ANY(pg_blocking_pids(pid)) \
+             AND query LIKE '%FROM payments WHERE order_id = $1 FOR UPDATE%'",
         )
+        .bind(blocker)
         .fetch_one(pool)
         .await
         .expect("lock waiters");
@@ -372,6 +376,10 @@ async fn a_reversal_recorded_while_the_seller_confirms_is_seen_under_the_lock(po
     // A reversal notification in flight: it holds the payment row, as
     // `paypal_refund` does, and records the reversal on the order.
     let mut reversal = pool.begin().await.expect("reversal transaction");
+    let reversal_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *reversal)
+        .await
+        .expect("reversal backend");
     sqlx::query("SELECT id FROM payments WHERE order_id = $1 FOR UPDATE")
         .bind(order_uuid)
         .execute(&mut *reversal)
@@ -399,7 +407,7 @@ async fn a_reversal_recorded_while_the_seller_confirms_is_seen_under_the_lock(po
         )
         .await
     });
-    wait_for_lock_waiter(&pool).await;
+    wait_for_payment_lock_waiter(&pool, reversal_pid).await;
     reversal.commit().await.expect("reversal commits");
 
     let (status, body) = confirm.await.expect("confirmation task");
