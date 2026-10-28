@@ -903,6 +903,114 @@ async fn seven_day_inactivity_records_seller_unresponsive(pool: PgPool) {
         .expect("condition 7 query"));
 }
 
+/// A held review relabelled as a USDT order, the way the refund-destination
+/// tests carry one: `payment_method = 'usdt'`.
+async fn usdt_review(app: &TestApp, paykit: &FakePaykit) -> (TestActor, String, DateTime<Utc>) {
+    let seller = new_actor(app).await;
+    let buyer = new_actor(app).await;
+    let (order_id, _reference) = into_manual_review_held(app, paykit, &seller, &buyer).await;
+    sqlx::query("UPDATE orders SET payment_method = 'usdt' WHERE id = $1")
+        .bind(Uuid::parse_str(&order_id).unwrap())
+        .execute(&app.pool)
+        .await
+        .expect("usdt method");
+    let entered_at: DateTime<Utc> =
+        sqlx::query_scalar("SELECT manual_review_entered_at FROM payments WHERE order_id = $1")
+            .bind(Uuid::parse_str(&order_id).unwrap())
+            .fetch_one(&app.pool)
+            .await
+            .expect("entry stamp");
+    (seller, order_id, entered_at)
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_usdt_review_gets_the_sla_notice_and_the_seven_day_reaper(pool: PgPool) {
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
+    let (seller, order_id, entered_at) = usdt_review(&app, &paykit).await;
+
+    let (alerts, abandoned) = watch_manual_reviews(
+        &app.state,
+        entered_at + chrono::Duration::days(MANUAL_REVIEW_INACTIVITY_DAYS),
+    )
+    .await
+    .expect("watch runs");
+    assert_eq!((alerts, abandoned), (1, 1));
+    let overdue = count(
+        &pool,
+        &format!(
+            "SELECT COUNT(*) FROM outbox WHERE kind = 'notification.bitcoin_manual_review' \
+             AND payload->>'review_reason' = 'seller_response_overdue' \
+             AND payload->>'recipient_pubky' = '{}' \
+             AND payload->>'aggregate_id' LIKE '%{order_id}'",
+            seller.pubky
+        ),
+    )
+    .await;
+    assert_eq!(overdue, 1, "the seller is told the review is overdue");
+    let facts = payment_facts(&pool, &order_id).await;
+    assert_eq!(facts.state, "expired");
+    assert_eq!(facts.outcome.as_deref(), Some("abandoned"));
+    assert_eq!(facts.basis.as_deref(), Some("seller_unresponsive"));
+    assert_eq!(order_row_state(&pool, &order_id).await.0, "cancelled");
+}
+
+/// The seller's resolve and the reaper, released together on a USDT review:
+/// exactly one resolution, whichever wins.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn usdt_seller_and_reaper_share_one_cas(pool: PgPool) {
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
+
+    // Reaper first: it abandons, and the seller's later resolve is refused.
+    let (seller, order_id, entered_at) = usdt_review(&app, &paykit).await;
+    let at = entered_at + chrono::Duration::days(MANUAL_REVIEW_INACTIVITY_DAYS);
+    let (_, abandoned) = watch_manual_reviews(&app.state, at)
+        .await
+        .expect("watch runs");
+    assert_eq!(abandoned, 1);
+    let (status, response) = resolve_call(
+        &app,
+        &seller.token,
+        &order_id,
+        Some(Uuid::new_v4()),
+        &json!({ "outcome": "paid" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
+    assert_eq!(response["error"]["reason"], json!("already_resolved"));
+
+    // Released together: exactly one winner per round.
+    for round in 0..4i64 {
+        let (seller, order_id, entered_at) = usdt_review(&app, &paykit).await;
+        let at = entered_at
+            + chrono::Duration::days(MANUAL_REVIEW_INACTIVITY_DAYS)
+            + chrono::Duration::seconds(round);
+        let body = json!({ "outcome": "paid" });
+        let ((status, response), watched) = tokio::join!(
+            resolve_call(&app, &seller.token, &order_id, Some(Uuid::new_v4()), &body),
+            watch_manual_reviews(&app.state, at),
+        );
+        let (_, abandoned) = watched.expect("watch runs");
+        let resolutions: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM paykit_manual_resolutions WHERE order_id = $1",
+        )
+        .bind(Uuid::parse_str(&order_id).unwrap())
+        .fetch_one(&pool)
+        .await
+        .expect("resolution count");
+        assert_eq!(resolutions, 1, "round {round}: exactly one resolution");
+        let basis = payment_facts(&pool, &order_id).await.basis;
+        if status == StatusCode::OK {
+            assert_eq!(abandoned, 0, "round {round}");
+            assert_eq!(basis.as_deref(), Some("seller_attestation"));
+        } else {
+            assert_eq!(status, StatusCode::CONFLICT, "{response}");
+            assert_eq!(response["error"]["reason"], json!("already_resolved"));
+            assert_eq!(abandoned, 1, "round {round}");
+            assert_eq!(basis.as_deref(), Some("seller_unresponsive"));
+        }
+    }
+}
+
 /// Seller and seven-day reaper at exactly T+7d: deterministic orderings
 /// plus barrier-overlapped transactions, exactly one winner throughout.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]

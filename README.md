@@ -1173,7 +1173,8 @@ Three exits, each one CAS with every effect in the same transaction:
   two-business-day seller-response SLA (alert only) and the seven-day
   inactivity clock.
 - **Seller resolve / the seven-day reaper**
-  (`POST /v0/orders/{id}/bitcoin/resolve`, Paykit-Bitcoin scope only):
+  (`POST /v0/orders/{id}/bitcoin/resolve`, Paykit Bitcoin and USDT orders;
+  the SLA alert and the reaper cover the same orders):
   one shared CAS (`state='manual_review' AND resolution_outcome IS NULL`)
   applies `paid` (existing confirmation effects; late entries reacquire
   inventory in lock order or fail `409 stock_unavailable`), `refunded`
