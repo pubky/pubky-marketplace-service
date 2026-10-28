@@ -10,6 +10,7 @@ mod common;
 
 use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
+use common::lock_order::{hold_order_row, wait_until_blocked_by};
 use common::paykit_review::{
     auction_winning_order, bound_order, enable_bitcoin, into_manual_review_held,
     into_manual_review_late, into_manual_review_mismatch, poll_now, resolve_call,
@@ -29,6 +30,7 @@ use marketplace_service::workers::{
 use serde_json::{json, Value};
 use sqlx::{Acquire, PgPool};
 use std::str::FromStr;
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 const TOTAL_SATS: i64 = 51_200 + 437;
@@ -1003,42 +1005,42 @@ async fn a_usdt_review_gets_the_sla_notice_and_the_seven_day_reaper(pool: PgPool
     assert_eq!(order_row_state(&pool, &order_id).await.0, "cancelled");
 }
 
-/// The seller's resolve and the reaper, released together on a USDT review:
-/// exactly one resolution, whichever wins.
+/// The seller's resolve and the reaper on a USDT review, in both orders,
+/// forced: a test transaction holds the order row, the first contender is
+/// seen blocked on it (holding the payment row), the second is seen blocked
+/// behind the first, and only then is the row released. Exactly one
+/// resolution, and it is the first one's.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn usdt_seller_and_reaper_share_one_cas(pool: PgPool) {
     let (app, paykit) = test_app_with_payments(pool.clone()).await;
-
-    // Reaper first: it abandons, and the seller's later resolve is refused.
-    let (seller, order_id, entered_at) = usdt_review(&app, &paykit).await;
-    let at = entered_at + chrono::Duration::days(MANUAL_REVIEW_INACTIVITY_DAYS);
-    let (_, abandoned) = watch_manual_reviews(&app.state, at)
-        .await
-        .expect("watch runs");
-    assert_eq!(abandoned, 1);
-    let (status, response) = resolve_call(
-        &app,
-        &seller.token,
-        &order_id,
-        Some(Uuid::new_v4()),
-        &json!({ "outcome": "paid" }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CONFLICT, "{response}");
-    assert_eq!(response["error"]["reason"], json!("already_resolved"));
-
-    // Released together: exactly one winner per round.
-    for round in 0..4i64 {
+    for reaper_first in [true, false] {
         let (seller, order_id, entered_at) = usdt_review(&app, &paykit).await;
-        let at = entered_at
-            + chrono::Duration::days(MANUAL_REVIEW_INACTIVITY_DAYS)
-            + chrono::Duration::seconds(round);
+        let at = entered_at + chrono::Duration::days(MANUAL_REVIEW_INACTIVITY_DAYS);
+        let (holder, holder_pid) = hold_order_row(&pool, Uuid::parse_str(&order_id).unwrap()).await;
+        let second_go = Notify::new();
+        let reaper = async {
+            if !reaper_first {
+                second_go.notified().await;
+            }
+            watch_manual_reviews(&app.state, at)
+                .await
+                .expect("watch runs")
+        };
         let body = json!({ "outcome": "paid" });
-        let ((status, response), watched) = tokio::join!(
-            resolve_call(&app, &seller.token, &order_id, Some(Uuid::new_v4()), &body),
-            watch_manual_reviews(&app.state, at),
-        );
-        let (_, abandoned) = watched.expect("watch runs");
+        let resolve = async {
+            if reaper_first {
+                second_go.notified().await;
+            }
+            resolve_call(&app, &seller.token, &order_id, Some(Uuid::new_v4()), &body).await
+        };
+        let release = async {
+            let first = wait_until_blocked_by(&pool, &[holder_pid], &[]).await;
+            second_go.notify_one();
+            wait_until_blocked_by(&pool, &[holder_pid, first], &[first]).await;
+            holder.commit().await.expect("release the order row");
+        };
+        let ((_, abandoned), (status, response), ()) = tokio::join!(reaper, resolve, release);
+
         let resolutions: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM paykit_manual_resolutions WHERE order_id = $1",
         )
@@ -1046,16 +1048,17 @@ async fn usdt_seller_and_reaper_share_one_cas(pool: PgPool) {
         .fetch_one(&pool)
         .await
         .expect("resolution count");
-        assert_eq!(resolutions, 1, "round {round}: exactly one resolution");
+        assert_eq!(resolutions, 1, "reaper first: {reaper_first}");
         let basis = payment_facts(&pool, &order_id).await.basis;
-        if status == StatusCode::OK {
-            assert_eq!(abandoned, 0, "round {round}");
-            assert_eq!(basis.as_deref(), Some("seller_attestation"));
-        } else {
+        if reaper_first {
+            assert_eq!(abandoned, 1);
             assert_eq!(status, StatusCode::CONFLICT, "{response}");
             assert_eq!(response["error"]["reason"], json!("already_resolved"));
-            assert_eq!(abandoned, 1, "round {round}");
             assert_eq!(basis.as_deref(), Some("seller_unresponsive"));
+        } else {
+            assert_eq!(status, StatusCode::OK, "{response}");
+            assert_eq!(abandoned, 0, "the losing reaper changes nothing");
+            assert_eq!(basis.as_deref(), Some("seller_attestation"));
         }
     }
 }

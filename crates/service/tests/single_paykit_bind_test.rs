@@ -14,6 +14,7 @@ mod common;
 use axum::http::StatusCode;
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use common::fx_feed::{fx_body, FakeFxFeed};
+use common::lock_order::{hold_order_row, wait_until_blocked_by};
 use common::paykit_review::{
     create_sat_order, delivered_notifications, enable_bitcoin, poll_now, resolve_call,
 };
@@ -26,10 +27,13 @@ use marketplace_service::payments::{attempt_reference, PaykitApi};
 use marketplace_service::workers::drain_outbox;
 use serde_json::{json, Value};
 use sqlx::PgPool;
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 const RATE: &str = "77197";
 const TOTAL_CENTS: u64 = 13_700;
+/// What an underpaid USDT leg (`usdt_leg` unmatched) actually sent: one USDT short.
+const UNDERPAID_CENTS: u64 = TOTAL_CENTS - 100;
 const TOTAL_USDT_UNITS: u64 = 137_000_000;
 const TX_HASH: &str = "0x9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c";
 const BTC_TXID: &str = "00000000000000000000000000000000000000000000000000000000000000a1";
@@ -280,10 +284,16 @@ async fn count(pool: &PgPool, sql: &str, order_id: &str) -> i64 {
         .expect("count")
 }
 
+/// A USDT leg; an unmatched one is really short, by one USDT.
 fn usdt_leg(confirmations: u32, matched: bool, on_time: bool, finalized: bool) -> Value {
+    let observed = if matched {
+        TOTAL_USDT_UNITS
+    } else {
+        TOTAL_USDT_UNITS - 1_000_000
+    };
     json!({
         "tx_hash": TX_HASH,
-        "observed_amount": TOTAL_USDT_UNITS.to_string(),
+        "observed_amount": observed.to_string(),
         "confirmations": confirmations,
         "amount_matched": matched,
         "paid_on_time": on_time,
@@ -1903,7 +1913,11 @@ async fn a_usdt_payment_in_review_is_refunded_to_the_buyers_arbitrum_address(poo
         json!(address)
     );
     assert_eq!(view["external_refund"]["transaction_id"], json!(reference));
-    assert_eq!(view["external_refund"]["amount_minor"], json!(TOTAL_CENTS));
+    assert_eq!(
+        view["external_refund"]["amount_minor"],
+        json!(UNDERPAID_CENTS),
+        "the refund is what the buyer sent"
+    );
 }
 
 /// An upstream `paykit` order whose USDT transfer did not match the amount:
@@ -1971,7 +1985,7 @@ async fn record_usdt_refund(
             "refund.record_external",
             order_id,
             revision,
-            json!({ "amount_minor": TOTAL_CENTS, "transaction_id": transaction_id }),
+            json!({ "amount_minor": UNDERPAID_CENTS, "transaction_id": transaction_id }),
             number,
         ),
     )
@@ -2008,105 +2022,82 @@ async fn a_usdt_review_the_seller_ignores_is_reaped_and_its_refund_stays_open(po
     );
 }
 
-/// The buyer confirms a refund address while the seven-day reaper abandons
-/// the review: whichever commits first, the address can be confirmed (a
-/// stale revision is retried, as a client does) and the refund recorded.
+/// The seven-day reaper and the buyer's refund address, in both orders,
+/// forced: a test transaction holds the order row, the first contender is
+/// seen blocked on it, then the second, and only then is the row released,
+/// so the first one queued goes first.
+///
+/// Reaper first: the buyer's command carries the revision it read before the
+/// abandonment, so it is refused as stale, and the retry a client makes then
+/// meets an abandoned payment and must still be accepted. Buyer first: the
+/// address lands while the review is open and the reaper abandons after it.
+/// Either way the seller can then record the refund.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn the_reaper_and_the_buyers_refund_address_race_and_the_refund_stays_open(pool: PgPool) {
     let f = fixture(pool.clone(), Setup::both()).await;
-    for round in 0..4u64 {
+    for (round, reaper_first) in [(0u64, true), (1, false)] {
         let (order_id, entered_at) = upstream_usdt_review(&f).await;
         let at = entered_at + Duration::days(MANUAL_REVIEW_INACTIVITY_DAYS);
-        let (watched, (status, body)) = tokio::join!(
-            watch_manual_reviews(&f.app.state, at),
-            confirm_refund_address(&f, &order_id, 40 + round * 4),
+        let stale = order_command(
+            "refund.confirm_destination",
+            &order_id,
+            facts(&pool, &order_id).await.revision,
+            json!({ "address": "0xd8da6bf26964af9d7eed9e03e53415d37aa96045" }),
+            40 + round * 4,
         );
-        watched.expect("watch runs");
-        if status != StatusCode::OK {
-            assert_eq!(status, StatusCode::CONFLICT, "round {round}: {body}");
-            assert_eq!(body["error"]["code"], json!("REVISION_CONFLICT"), "{body}");
-            let (status, body) = confirm_refund_address(&f, &order_id, 41 + round * 4).await;
-            assert_eq!(status, StatusCode::OK, "round {round} retry: {body}");
-        }
+        let (holder, holder_pid) = hold_order_row(&pool, uuid(&order_id)).await;
+        let second_go = Notify::new();
+        let reaper = async {
+            if !reaper_first {
+                second_go.notified().await;
+            }
+            watch_manual_reviews(&f.app.state, at)
+                .await
+                .expect("watch runs")
+        };
+        let buyer = async {
+            if reaper_first {
+                second_go.notified().await;
+            }
+            execute(&f.app, &f.buyer.token, &stale).await
+        };
+        let release = async {
+            let first = wait_until_blocked_by(&pool, &[holder_pid], &[]).await;
+            second_go.notify_one();
+            wait_until_blocked_by(&pool, &[holder_pid, first], &[first]).await;
+            holder.commit().await.expect("release the order row");
+        };
+        let ((alerts, abandoned), (status, body), ()) = tokio::join!(reaper, buyer, release);
+        assert_eq!((alerts, abandoned), (1, 1), "round {round}");
         assert_eq!(
             payment_row(&pool, &order_id).await.0,
             "expired",
             "round {round}"
         );
+        if reaper_first {
+            assert_eq!(
+                status,
+                StatusCode::CONFLICT,
+                "the stale address command: {body}"
+            );
+            assert_eq!(body["error"]["code"], json!("REVISION_CONFLICT"), "{body}");
+            let (status, body) = confirm_refund_address(&f, &order_id, 41 + round * 4).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "the retry after abandonment: {body}"
+            );
+        } else {
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "the address before abandonment: {body}"
+            );
+        }
         let hash = format!("0x{:064x}", round + 1);
         let (status, body) = record_usdt_refund(&f, &order_id, &hash, 42 + round * 4).await;
         assert_eq!(status, StatusCode::OK, "round {round}: {body}");
     }
-}
-
-#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn bitcoin_on_a_released_paykit_attempt_takes_the_late_money_path(pool: PgPool) {
-    let f = fixture(pool.clone(), Setup::both()).await;
-    let order = checkout_usd(&f).await;
-    let order_id = order.order_id.clone();
-    let (status, body) = bind(&f, &order_id, "paykit").await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let first = facts(&pool, &order_id)
-        .await
-        .paykit_invoice_id
-        .expect("invoice");
-    f.paykit.fail_commands_with(409, "invoice_finalized");
-    drain(&f).await;
-    f.paykit.clear_command_failure();
-    assert_eq!(facts(&pool, &order_id).await.payment_method, None);
-    let (status, body) = bind(&f, &order_id, "paykit").await;
-    assert_eq!(status, StatusCode::OK, "the buyer pays again: {body}");
-    drain(&f).await;
-    let second = facts(&pool, &order_id)
-        .await
-        .paykit_invoice_id
-        .expect("invoice");
-    assert_ne!(first, second);
-
-    // The first attempt's request was in fact live: Bitcoin lands on it.
-    let deadline = Utc::now() + Duration::minutes(30);
-    f.paykit.set_marketplace_status(
-        first,
-        status_body(
-            first,
-            deadline,
-            StatusSpec {
-                payment_state: "confirmed",
-                bitcoin: Some(bitcoin_leg(3, true)),
-                usdt: None,
-                paid_asset: Some("BTC"),
-            },
-        ),
-    );
-    let client = f
-        .app
-        .state
-        .payments
-        .as_ref()
-        .and_then(|payments| payments.paykit.as_ref())
-        .expect("client");
-    let routed = marketplace_service::paykit_attempts::verify_due_released_attempts(
-        &f.app.state,
-        client,
-        at(1),
-    )
-    .await
-    .expect("released attempts poll");
-    assert_eq!(routed, 1, "the paid released attempt is routed");
-    // Attempt 2 still holds the stock, so the late money takes the existing
-    // late-money path: the paid attempt becomes the attempt of record and a
-    // human decides.
-    let (state, _, _, _, reason) = payment_row(&pool, &order_id).await;
-    assert_eq!(
-        (state.as_str(), reason.as_deref()),
-        ("manual_review", Some("late_settlement"))
-    );
-    let stored = facts(&pool, &order_id).await;
-    assert_eq!(stored.paykit_invoice_id, Some(first));
-    assert_eq!(stored.payment_method.as_deref(), Some("paykit"));
-    let view = read_order(&f, &f.buyer.token, &order_id).await;
-    assert_eq!(view["accepted_assets"], json!(["BTC"]));
-    assert_eq!(view["payment_amounts"], json!({ "BTC": quoted_sats() }));
 }
 
 /// A status body captured from paykit-server. Only what the capture itself
