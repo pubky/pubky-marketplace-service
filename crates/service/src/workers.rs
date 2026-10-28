@@ -1903,6 +1903,7 @@ async fn apply_completed_lifecycle(
                 &payment,
                 &order,
                 false,
+                false,
                 row.id,
                 &payment.buyer_pubky,
                 now,
@@ -1914,6 +1915,7 @@ async fn apply_completed_lifecycle(
                         LateMoneyOutcome::Completed => "payment_confirmed",
                         LateMoneyOutcome::RefundRequired
                         | LateMoneyOutcome::HeldLateSettlement
+                        | LateMoneyOutcome::SellerReview
                         | LateMoneyOutcome::AmountMismatch => "manual_review",
                     };
                     mark_correlation_completed(&mut tx, row.id, correlation_outcome, now).await?;
@@ -2323,8 +2325,9 @@ async fn set_payment_finality(
 /// on. A late amount mismatch never pays: it enters the same
 /// `amount_mismatch` `manual_review` as on-time money, before any unit is
 /// re-taken. Only an exact late payment can complete a still-free order
-/// (`late_completion`); a unit that is gone is named `refund_required`, and
-/// a still-held order waits as `late_settlement`.
+/// (`late_completion`), and on a seller-confirmed order not even that: it
+/// waits as `late_settlement` for the seller. A unit that is gone is named
+/// `refund_required`, and a still-held order waits as `late_settlement`.
 async fn freeze_paykit_observation(
     tx: &mut Transaction<'_, Postgres>,
     order_id: Uuid,
@@ -2457,6 +2460,7 @@ async fn apply_confirmed_paykit_payment(
             &payment,
             &order,
             amount_mismatch,
+            order.seller_confirms_paykit_payment(),
             row.id,
             &row.buyer_pubky,
             now,

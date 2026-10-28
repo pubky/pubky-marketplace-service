@@ -510,9 +510,14 @@ seller's attestation pays the order:
   reports the money refunded or reversed.
 - The buyer cannot cancel once money is seen (a Paykit sighting or a PayPal
   notification), and `next_actor` is the seller.
-- Late money, short money and money on both rails keep their review routes. An
-  order on the retired fork API keeps its Paykit creator's own mode. Locks
-  orders are paid by the Lock Server's lifecycle as before.
+- Short money and money on both rails keep their review routes. Late Paykit
+  money never pays by itself: where `automatic` would complete an order whose
+  unit is still free, it waits in `manual_review` with
+  `review_reason=late_settlement` and the seller's `paid` resolution
+  (`POST /v0/orders/{id}/bitcoin/resolve`) re-takes the unit and pays it. A
+  gone unit is still named `refund_required`. An order on the retired fork API
+  keeps its Paykit creator's own mode. Locks orders are paid by the Lock
+  Server's lifecycle as before.
 
 **`automatic`.** The earlier behaviour: a matching Paykit report or a
 verified PayPal notification pays the order. A seller whose shop record says

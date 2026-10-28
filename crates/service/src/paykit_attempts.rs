@@ -756,6 +756,7 @@ async fn route_released_settlement(
         &payment,
         &order,
         amount_mismatch,
+        order.seller_confirms_paykit_payment(),
         attempt.order_id,
         &order.buyer_pubky,
         now,

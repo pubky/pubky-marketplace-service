@@ -9,14 +9,14 @@
 mod common;
 
 use axum::http::StatusCode;
-use common::paykit_review::{bound_order, confirm_call};
+use common::paykit_review::{bound_order, confirm_call, resolve_call};
 use common::{
     exclusive_facts, new_actor, spawn_fake_homeserver, test_app_with_payments,
     with_shop_homeserver, FakeHomeserver, FakePaykitStatus, TestActor, TestApp,
 };
 use marketplace_service::clock::Clock;
 use marketplace_service::payments::{PaykitObservation, PaykitStatusFacts, PaykitStatusOutcome};
-use marketplace_service::workers::verify_due_paykit_payments;
+use marketplace_service::workers::{expire_due_payment_windows, verify_due_paykit_payments};
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -558,6 +558,147 @@ async fn in_seller_mode_underpaid_and_late_money_keep_their_routes(pool: PgPool)
         states(&fx.app.pool, &order_id).await.1,
         "awaiting_seller_confirmation"
     );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn in_seller_mode_late_money_for_a_free_unit_waits_for_the_seller(pool: PgPool) {
+    let fx = seller_mode_fixture(pool).await;
+    fx.homeserver
+        .put_shop_record(&fx.seller.pubky, shop_record(&fx.seller, json!({})));
+    let (order_id, payment_id, reference) = upstream_bound(&fx).await;
+    let after_window = fx.app.clock.now() + chrono::Duration::seconds(7_300);
+    assert!(
+        expire_due_payment_windows(&fx.app.state, after_window)
+            .await
+            .expect("payment-window reaper runs")
+            >= 1
+    );
+    assert_eq!(
+        states(&fx.app.pool, &order_id).await,
+        (
+            "cancelled".to_string(),
+            "pending".to_string(),
+            "expired".to_string()
+        )
+    );
+
+    // The money arrives after the window while the unit is still free: it
+    // is not paid by the observation, the seller is asked to resolve it.
+    fx.status.set_outcome(&reference, confirmed(true));
+    assert!(
+        poll_now(
+            &fx.app,
+            &fx.status,
+            after_window + chrono::Duration::seconds(60)
+        )
+        .await
+            >= 1
+    );
+    let (order_state, _, payment_state) = states(&fx.app.pool, &order_id).await;
+    assert_eq!(order_state, "cancelled");
+    assert_eq!(payment_state, "manual_review");
+    assert_eq!(
+        payment_review_reason(&fx.app.pool, &payment_id)
+            .await
+            .as_deref(),
+        Some("late_settlement")
+    );
+    assert_eq!(confirmed_events(&fx.app.pool, &payment_id).await, 0);
+    let receipts = common::count(
+        &fx.app.pool,
+        &format!("SELECT COUNT(*) FROM receipts WHERE order_id = '{order_id}'"),
+    )
+    .await;
+    assert_eq!(receipts, 0);
+    let stock_held: bool = sqlx::query_scalar("SELECT stock_held FROM orders WHERE id = $1")
+        .bind(Uuid::parse_str(&order_id).expect("order uuid"))
+        .fetch_one(&fx.app.pool)
+        .await
+        .expect("order row");
+    assert!(
+        !stock_held,
+        "the free unit is not taken until the seller decides"
+    );
+    let notices = common::count(
+        &fx.app.pool,
+        &format!(
+            "SELECT COUNT(*) FROM outbox WHERE kind = 'notification.bitcoin_manual_review' \
+             AND payload->>'review_reason' = 'late_settlement' \
+             AND payload->>'recipient_pubky' = '{}' \
+             AND payload->>'aggregate_id' LIKE '%{order_id}'",
+            fx.seller.pubky
+        ),
+    )
+    .await;
+    assert_eq!(notices, 1, "the seller is told to resolve it");
+
+    // The seller's own `paid` resolution re-takes the unit and pays the order.
+    let (code, body) = resolve_call(
+        &fx.app,
+        &fx.seller.token,
+        &order_id,
+        Some(Uuid::new_v4()),
+        &json!({ "outcome": "paid" }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(states(&fx.app.pool, &order_id).await.0, "paid");
+    assert_eq!(confirmed_events(&fx.app.pool, &payment_id).await, 1);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn in_seller_mode_concurrent_polls_of_late_money_enter_one_review_and_pay_nothing(
+    pool: PgPool,
+) {
+    let fx = seller_mode_fixture(pool).await;
+    fx.homeserver
+        .put_shop_record(&fx.seller.pubky, shop_record(&fx.seller, json!({})));
+    let (order_id, payment_id, reference) = upstream_bound(&fx).await;
+    let after_window = fx.app.clock.now() + chrono::Duration::seconds(7_300);
+    expire_due_payment_windows(&fx.app.state, after_window)
+        .await
+        .expect("payment-window reaper runs");
+    fx.status.set_outcome(&reference, confirmed(true));
+    let at = after_window + chrono::Duration::seconds(60);
+    let (_, _, _) = tokio::join!(
+        verify_due_paykit_payments(&fx.app.state, &fx.status, at),
+        verify_due_paykit_payments(&fx.app.state, &fx.status, at),
+        verify_due_paykit_payments(&fx.app.state, &fx.status, at),
+    );
+    let (order_state, _, payment_state) = states(&fx.app.pool, &order_id).await;
+    assert_eq!(order_state, "cancelled");
+    assert_eq!(payment_state, "manual_review");
+    assert_eq!(confirmed_events(&fx.app.pool, &payment_id).await, 0);
+    let reviews = common::count(
+        &fx.app.pool,
+        &format!(
+            "SELECT COUNT(*) FROM events WHERE kind = 'payment.manual_review' \
+             AND aggregate_id = 'payment:{payment_id}'"
+        ),
+    )
+    .await;
+    assert_eq!(reviews, 1);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn in_automatic_mode_late_money_for_a_free_unit_still_completes_the_order(pool: PgPool) {
+    let fx = fixture(pool).await;
+    fx.homeserver
+        .put_shop_record(&fx.seller.pubky, shop_record(&fx.seller, json!({})));
+    let (order_id, payment_id, reference) = upstream_bound(&fx).await;
+    let after_window = fx.app.clock.now() + chrono::Duration::seconds(7_300);
+    expire_due_payment_windows(&fx.app.state, after_window)
+        .await
+        .expect("payment-window reaper runs");
+    fx.status.set_outcome(&reference, confirmed(true));
+    poll_now(
+        &fx.app,
+        &fx.status,
+        after_window + chrono::Duration::seconds(60),
+    )
+    .await;
+    assert_eq!(states(&fx.app.pool, &order_id).await.0, "paid");
+    assert_eq!(confirmed_events(&fx.app.pool, &payment_id).await, 1);
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]

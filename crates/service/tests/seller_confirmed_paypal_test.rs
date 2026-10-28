@@ -344,6 +344,78 @@ async fn automatic_confirmation_still_pays_on_the_verified_notification(pool: Pg
 
 // --- interleaving (money path) ----------------------------------------------
 
+/// Waits until a session of this test's database is blocked on a lock.
+async fn wait_for_lock_waiter(pool: &PgPool) {
+    for _ in 0..500 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_stat_activity \
+             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("lock waiters");
+        if waiting > 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("the confirmation never waited on the payment lock");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_reversal_recorded_while_the_seller_confirms_is_seen_under_the_lock(pool: PgPool) {
+    let app = app_confirmed_by(pool.clone(), PaymentConfirmation::Seller).await;
+    let order = pending_paypal_order(&app).await;
+    post_ipn(&app, "completed.ipn", &order.id).await;
+    let order_uuid = Uuid::parse_str(&order.id).expect("order uuid");
+
+    // A reversal notification in flight: it holds the payment row, as
+    // `paypal_refund` does, and records the reversal on the order.
+    let mut reversal = pool.begin().await.expect("reversal transaction");
+    sqlx::query("SELECT id FROM payments WHERE order_id = $1 FOR UPDATE")
+        .bind(order_uuid)
+        .execute(&mut *reversal)
+        .await
+        .expect("payment lock");
+    sqlx::query("UPDATE orders SET payment_reversed_at = $2 WHERE id = $1")
+        .bind(order_uuid)
+        .bind(app.clock.now())
+        .execute(&mut *reversal)
+        .await
+        .expect("record the reversal");
+
+    // The seller confirms meanwhile: the request reads the order before the
+    // reversal commits, then waits on the payment lock.
+    let router = app.router.clone();
+    let token = order.seller.token.clone();
+    let id = order.id.clone();
+    let confirm = tokio::spawn(async move {
+        send(
+            router,
+            "POST",
+            &format!("/v0/orders/{id}/fiat/confirm-received"),
+            Some(&token),
+            &json!({}),
+        )
+        .await
+    });
+    wait_for_lock_waiter(&pool).await;
+    reversal.commit().await.expect("reversal commits");
+
+    let (status, body) = confirm.await.expect("confirmation task");
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["reason"], json!("payment_taken_back"));
+    assert_eq!(facts(&pool, &order.id).await.state, "pending_payment");
+    assert_eq!(confirmed_events(&pool, &order.id).await, 0);
+    let receipts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM receipts WHERE order_id = $1::uuid")
+            .bind(&order.id)
+            .fetch_one(&pool)
+            .await
+            .expect("receipt count");
+    assert_eq!(receipts, 0);
+}
+
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn concurrent_notifications_and_seller_confirmations_pay_exactly_once(pool: PgPool) {
     let app = app_confirmed_by(pool.clone(), PaymentConfirmation::Seller).await;

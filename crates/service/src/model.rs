@@ -1208,6 +1208,13 @@ impl OrderRow {
         }
     }
 
+    /// Whether only the seller marks this upstream Paykit order paid. A
+    /// retired fork order keeps its creator's allocation mode instead.
+    pub fn seller_confirms_paykit_payment(&self) -> bool {
+        self.paykit_api.as_deref() == Some("upstream")
+            && self.payment_confirmation.as_deref() == Some("seller")
+    }
+
     pub fn fiat_verification(&self) -> Value {
         match self.payment_method.as_deref() {
             Some("stripe") => json!("processor"),

@@ -2996,6 +2996,21 @@ async fn apply_fiat_paid(
                 "The order was not found.",
             )
         })?;
+    // Money PayPal already reports refunded or reversed is not money the
+    // seller holds: confirming it would pay an order nobody paid for. Read
+    // under the payment lock, which a refund or reversal notification takes
+    // before it records either.
+    if verified_by == "seller"
+        && order.receipt_id.is_none()
+        && (order.external_refund.is_some() || order.payment_reversed_at.is_some())
+    {
+        let _ = tx.rollback().await;
+        return Err(method_error(
+            ErrorCode::InvalidState,
+            "payment_taken_back",
+            "PayPal reports this payment refunded or reversed, so it cannot be confirmed as received.",
+        ));
+    }
     // A verified payment whose auction hold the expiry sweep already lapsed
     // takes the same fork as an expired payment: the unit is re-taken when
     // free, otherwise the payment is named `refund_required`.
@@ -3010,6 +3025,7 @@ async fn apply_fiat_paid(
             state.confirm_keys(),
             &payment,
             &order,
+            false,
             false,
             command_id,
             actor,
@@ -3468,17 +3484,6 @@ pub async fn confirm_fiat_received(
             ErrorCode::InvalidState,
             "method_mismatch",
             "Receipt confirmation applies only to PayPal-bound orders.",
-        );
-    }
-    // Money PayPal already reports refunded or reversed is not money the
-    // seller holds: confirming it would pay an order nobody paid for.
-    if order.receipt_id.is_none()
-        && (order.external_refund.is_some() || order.payment_reversed_at.is_some())
-    {
-        return method_error(
-            ErrorCode::InvalidState,
-            "payment_taken_back",
-            "PayPal reports this payment refunded or reversed, so it cannot be confirmed as received.",
         );
     }
     match apply_fiat_paid(
