@@ -2302,8 +2302,9 @@ pub async fn watch_manual_reviews(
 ) -> anyhow::Result<(u64, u64)> {
     let pool = &state.pool;
     // Eligible scope: the orders the seller's resolve endpoint accepts (Paykit
-    // Bitcoin, and USDT by method or by the asset paid), Paykit adapter,
-    // unresolved, pins present. Read without row locks; each row's own CAS
+    // Bitcoin, and USDT by method or by the asset paid, with the same pins:
+    // request reference, invoice id, and the stack pair on the fork only),
+    // Paykit adapter, unresolved. Read without row locks; each row's own CAS
     // decides.
     let rows: Vec<(Uuid, DateTime<Utc>, Option<DateTime<Utc>>)> = sqlx::query_as(
         "SELECT p.order_id, p.manual_review_entered_at, p.manual_review_sla_alerted_at \
@@ -2311,10 +2312,10 @@ pub async fn watch_manual_reviews(
          WHERE p.adapter = 'paykit' \
          AND (o.payment_method IN ('bitcoin', 'paykit', 'usdt') OR o.payment_asset = 'USDT') \
          AND p.state = 'manual_review' AND p.resolution_outcome IS NULL \
-         AND o.paykit_request_reference IS NOT NULL \
+         AND o.paykit_request_reference IS NOT NULL AND o.paykit_invoice_id IS NOT NULL \
          AND ((o.paykit_api = 'fork' AND o.paykit_stack_id IS NOT NULL \
                AND o.paykit_stack_endpoint IS NOT NULL) \
-              OR (o.paykit_api = 'upstream' AND o.paykit_invoice_id IS NOT NULL \
+              OR (o.paykit_api = 'upstream' \
                   AND o.paykit_stack_id IS NULL AND o.paykit_stack_endpoint IS NULL)) \
          ORDER BY p.manual_review_entered_at LIMIT 100",
     )

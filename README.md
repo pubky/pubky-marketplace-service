@@ -974,7 +974,10 @@ USDT rail); every other order is unchanged. It is not gated by
   EIP-55 checksum, while an all-lower or all-upper one carries none and is
   accepted. Surrounding whitespace is trimmed and the address is stored as
   entered. The order needs to be paid in USDT and the payment received
-  (`confirmed`) or in manual review. The buyer may replace the address
+  (`confirmed`) or in manual review, or a review closed as `abandoned` (by
+  the seller or the seven-day reaper): that money was received, so its
+  refund stays open, and the seller records it on the cancelled order with
+  `refund.record_external`. The buyer may replace the address
   until a refund is recorded; every confirmation advances the order revision,
   appends the event `refund.destination_confirmed` and sends the seller the
   `refund_destination_confirmed` notification. There is no way to ask for "the

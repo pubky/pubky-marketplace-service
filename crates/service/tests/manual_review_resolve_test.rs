@@ -823,6 +823,55 @@ async fn unpinned_reviews_are_not_selected_by_the_sla_watcher(pool: PgPool) {
     );
 }
 
+/// The watcher asks for the same pins as the resolve endpoint: a fork review
+/// with its stack pair but no invoice id is one the seller could not resolve
+/// either, so it is neither alerted nor reaped.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_fork_review_without_an_invoice_id_is_not_selected_by_the_watcher(pool: PgPool) {
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (order_id, _reference) = into_manual_review_held(&app, &paykit, &seller, &buyer).await;
+    sqlx::query("UPDATE orders SET paykit_invoice_id = NULL WHERE id = $1")
+        .bind(Uuid::parse_str(&order_id).unwrap())
+        .execute(&pool)
+        .await
+        .expect("drop the invoice pin");
+    let entered_at: DateTime<Utc> =
+        sqlx::query_scalar("SELECT manual_review_entered_at FROM payments WHERE order_id = $1")
+            .bind(Uuid::parse_str(&order_id).unwrap())
+            .fetch_one(&pool)
+            .await
+            .expect("entry stamp");
+
+    let (status, body) = resolve_call(
+        &app,
+        &seller.token,
+        &order_id,
+        Some(Uuid::new_v4()),
+        &json!({ "outcome": "abandoned" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["reason"], json!("missing_pin"));
+
+    let (alerts, abandoned) = watch_manual_reviews(
+        &app.state,
+        entered_at + chrono::Duration::days(MANUAL_REVIEW_INACTIVITY_DAYS),
+    )
+    .await
+    .expect("watch runs");
+    assert_eq!((alerts, abandoned), (0, 0));
+    let sla_alerted: Option<DateTime<Utc>> =
+        sqlx::query_scalar("SELECT manual_review_sla_alerted_at FROM payments WHERE order_id = $1")
+            .bind(Uuid::parse_str(&order_id).unwrap())
+            .fetch_one(&pool)
+            .await
+            .expect("sla stamp");
+    assert_eq!(sla_alerted, None);
+    assert_eq!(payment_facts(&pool, &order_id).await.state, "manual_review");
+}
+
 // ---------------------------------------------------------------------------
 // The seven-day inactivity reaper
 // ---------------------------------------------------------------------------

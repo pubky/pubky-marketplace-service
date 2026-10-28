@@ -18,6 +18,7 @@ use common::paykit_review::{
     create_sat_order, delivered_notifications, enable_bitcoin, poll_now, resolve_call,
 };
 use common::*;
+use marketplace_service::bitcoin_review::{watch_manual_reviews, MANUAL_REVIEW_INACTIVITY_DAYS};
 use marketplace_service::clock::Clock;
 use marketplace_service::config::Config;
 use marketplace_service::payment_attempt::{MarketplaceAssets, MarketplaceContract};
@@ -1903,6 +1904,139 @@ async fn a_usdt_payment_in_review_is_refunded_to_the_buyers_arbitrum_address(poo
     );
     assert_eq!(view["external_refund"]["transaction_id"], json!(reference));
     assert_eq!(view["external_refund"]["amount_minor"], json!(TOTAL_CENTS));
+}
+
+/// An upstream `paykit` order whose USDT transfer did not match the amount:
+/// the payment waits in review on the USDT rail (`payment_asset = 'USDT'`).
+async fn upstream_usdt_review(f: &Fixture) -> (String, DateTime<Utc>) {
+    let active = active_order(f).await;
+    let order_id = active.order.order_id.clone();
+    f.paykit.set_marketplace_status(
+        active.invoice,
+        status_body(
+            active.invoice,
+            active.deadline,
+            StatusSpec {
+                payment_state: "confirmed",
+                bitcoin: None,
+                usdt: Some(usdt_leg(1, false, true, false)),
+                paid_asset: None,
+            },
+        ),
+    );
+    poll_now(&f.app, at(1)).await;
+    let (method, asset, entered_at): (Option<String>, Option<String>, Option<DateTime<Utc>>) =
+        sqlx::query_as(
+            "SELECT o.payment_method, o.payment_asset, p.manual_review_entered_at \
+             FROM orders o JOIN payments p ON p.order_id = o.id WHERE o.id = $1",
+        )
+        .bind(uuid(&order_id))
+        .fetch_one(&f.app.pool)
+        .await
+        .expect("review facts");
+    assert_eq!(
+        (method.as_deref(), asset.as_deref()),
+        (Some("paykit"), Some("USDT"))
+    );
+    (order_id, entered_at.expect("in review"))
+}
+
+async fn confirm_refund_address(f: &Fixture, order_id: &str, number: u64) -> (StatusCode, Value) {
+    let revision = facts(&f.app.pool, order_id).await.revision;
+    execute(
+        &f.app,
+        &f.buyer.token,
+        &order_command(
+            "refund.confirm_destination",
+            order_id,
+            revision,
+            json!({ "address": "0xd8da6bf26964af9d7eed9e03e53415d37aa96045" }),
+            number,
+        ),
+    )
+    .await
+}
+
+async fn record_usdt_refund(
+    f: &Fixture,
+    order_id: &str,
+    transaction_id: &str,
+    number: u64,
+) -> (StatusCode, Value) {
+    let revision = facts(&f.app.pool, order_id).await.revision;
+    execute(
+        &f.app,
+        &f.seller.token,
+        &order_command(
+            "refund.record_external",
+            order_id,
+            revision,
+            json!({ "amount_minor": TOTAL_CENTS, "transaction_id": transaction_id }),
+            number,
+        ),
+    )
+    .await
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_usdt_review_the_seller_ignores_is_reaped_and_its_refund_stays_open(pool: PgPool) {
+    let f = fixture(pool.clone(), Setup::both()).await;
+    let (order_id, entered_at) = upstream_usdt_review(&f).await;
+
+    let (alerts, abandoned) = watch_manual_reviews(
+        &f.app.state,
+        entered_at + Duration::days(MANUAL_REVIEW_INACTIVITY_DAYS),
+    )
+    .await
+    .expect("watch runs");
+    assert_eq!((alerts, abandoned), (1, 1));
+    let (state, _, _, _, _) = payment_row(&pool, &order_id).await;
+    assert_eq!(state, "expired");
+    assert_eq!(facts(&pool, &order_id).await.state, "cancelled");
+
+    // The money was received: the buyer can still give a refund address and
+    // the seller can still record the refund to it.
+    let (status, body) = confirm_refund_address(&f, &order_id, 31).await;
+    assert_eq!(status, StatusCode::OK, "address after abandonment: {body}");
+    let (status, body) = record_usdt_refund(&f, &order_id, TX_HASH, 32).await;
+    assert_eq!(status, StatusCode::OK, "refund after abandonment: {body}");
+    let view = read_order(&f, &f.buyer.token, &order_id).await;
+    assert_eq!(view["state"], json!("refunded_external"));
+    assert_eq!(
+        view["external_refund"]["destination_address"],
+        json!("0xd8da6bf26964af9d7eed9e03e53415d37aa96045")
+    );
+}
+
+/// The buyer confirms a refund address while the seven-day reaper abandons
+/// the review: whichever commits first, the address can be confirmed (a
+/// stale revision is retried, as a client does) and the refund recorded.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn the_reaper_and_the_buyers_refund_address_race_and_the_refund_stays_open(pool: PgPool) {
+    let f = fixture(pool.clone(), Setup::both()).await;
+    for round in 0..4u64 {
+        let (order_id, entered_at) = upstream_usdt_review(&f).await;
+        let at = entered_at + Duration::days(MANUAL_REVIEW_INACTIVITY_DAYS);
+        let (watched, (status, body)) = tokio::join!(
+            watch_manual_reviews(&f.app.state, at),
+            confirm_refund_address(&f, &order_id, 40 + round * 4),
+        );
+        watched.expect("watch runs");
+        if status != StatusCode::OK {
+            assert_eq!(status, StatusCode::CONFLICT, "round {round}: {body}");
+            assert_eq!(body["error"]["code"], json!("REVISION_CONFLICT"), "{body}");
+            let (status, body) = confirm_refund_address(&f, &order_id, 41 + round * 4).await;
+            assert_eq!(status, StatusCode::OK, "round {round} retry: {body}");
+        }
+        assert_eq!(
+            payment_row(&pool, &order_id).await.0,
+            "expired",
+            "round {round}"
+        );
+        let hash = format!("0x{:064x}", round + 1);
+        let (status, body) = record_usdt_refund(&f, &order_id, &hash, 42 + round * 4).await;
+        assert_eq!(status, StatusCode::OK, "round {round}: {body}");
+    }
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
