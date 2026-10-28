@@ -522,16 +522,12 @@ pub async fn release_digital(
             "Only the seller may release this purchase.",
         )));
     }
-    if order.state != "paid" {
-        let message = if order.state == "cancel_requested" {
-            "This order has a cancellation request; approve or decline it first."
-        } else {
-            "The order is not awaiting delivery."
-        };
-        return Ok(Err(CommandFailure::refused(
+    if let Some(taken_back) = payment_taken_back(&order) {
+        return Ok(Err(CommandFailure::refused_with_reason(
             RefusalKind::InvalidState,
             ErrorCode::InvalidState,
-            message,
+            taken_back.message(),
+            taken_back.reason(),
         )));
     }
     if !crate::handlers::digital_orders::awaits_seller_release(&order) {
@@ -542,12 +538,11 @@ pub async fn release_digital(
             REASON_NOT_AWAITING_RELEASE,
         )));
     }
-    if let Some(taken_back) = payment_taken_back(&order) {
-        return Ok(Err(CommandFailure::refused_with_reason(
+    if order.state == "cancel_requested" {
+        return Ok(Err(CommandFailure::refused(
             RefusalKind::InvalidState,
             ErrorCode::InvalidState,
-            taken_back.message(),
-            taken_back.reason(),
+            "This order has a cancellation request; approve or decline it first.",
         )));
     }
     let Some((updated, delivered)) = apply_seller_release(tx, &order, now).await? else {

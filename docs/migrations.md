@@ -507,10 +507,28 @@ released. It also appends `release_digital` (id 43) to the refusal-audit
 command-kind catalog. Every order paid before 0092 keeps NULL, which reads as
 released at payment, so nothing is backfilled and no purchase is withheld.
 
-**Deploy mode: rolling.** A binary from before 0092 never sets or reads the
-columns and releases at payment; an order it pays keeps NULL and stays
-readable under the new binary. The new binary refuses `fulfillment.release_digital`
-on such an order (`not_awaiting_release`), since it is already released.
+**Deploy mode: two-phase.** The migration itself is safe under a rolling
+deploy, but `DIGITAL_RELEASE=seller` is not, and `seller` is the default. A
+binary from before 0092 never reads the columns: it serves an order's pinned
+lines on the receipt alone, and its delivered-assumption sweep and manual
+delivery can move an order to `delivered` without stamping
+`digital_released_at`. While old and new binaries serve together, an order a
+new binary froze as `seller` is therefore not held back by the old ones.
+
+1. Deploy the new binary with `DIGITAL_RELEASE=payment` set explicitly. Every
+   order it pays freezes `payment` and is released at payment, exactly as an
+   old binary does, so the overlap changes nothing.
+2. Once no binary from before 0092 is serving, set `DIGITAL_RELEASE=seller`
+   (or remove the override) and roll the new binaries. Every binary now honours
+   each order's frozen value, so binaries with either setting can overlap.
+
+If the order of these steps is missed, nothing is stranded: an order an old
+binary pays keeps NULL and reads as released, and a `seller` order an old
+binary moved to `delivered` reads as released too (only a `paid` order, or one
+with a pending cancellation request, waits for a release). The new binary
+refuses `fulfillment.release_digital` on either (`not_awaiting_release`). What
+is lost is the hold itself: those buyers could open the purchase before the
+seller released it.
 
 ### Backing out 0092
 

@@ -189,7 +189,7 @@ Configuration is environment-based. Window keys and their defaults also live in
 | `PAYKIT_SERVER_API` | `fork` | which paykit-server the service speaks to: `fork` (today's production server) or `upstream` (`pubky/paykit-server` with the signed-services allowlist, first shipped in v0.1.0-rc9, #55; the latest tagged release is v0.1.0-rc11). Set only together with `PAYKIT_SERVER_URL`. See [Paykit server API](#paykit-server-api) |
 | `PAYKIT_SETUP_STATUS_TIMEOUT_SECONDS` | `8` | how long the signed upstream `POST /setup/status` may take, in whole seconds (1–30). paykit-server answers `ready` for a set-up seller in 2 to 3.5 s, so it does not share the 3 s timeout of the other availability reads. Set only together with `PAYKIT_SERVER_URL` |
 | `PAYKIT_MAX_PREPARE_TTL_SECONDS` | `900` | largest remaining upstream Paykit preparation TTL Marketplace accepts (60–86400). Align with producer `prepare_ttl_seconds`; a longer response is voided and its bind/inventory transaction rolls back. Up to 60 additional seconds are accepted only for bounded cross-service clock skew |
-| `DIGITAL_RELEASE` | `seller` | who releases a paid order's instant digital lines (file, link, text) to the buyer: `seller` (the payment pins them and they wait for the seller's `fulfillment.release_digital`, or a seller confirmation sent with `release_digital: true`) or `payment` (the earlier behaviour: the payment confirmation releases them). Frozen on each such order when it is paid. See [Digital delivery](#digital-delivery) |
+| `DIGITAL_RELEASE` | `seller` | who releases a paid order's instant digital lines (file, link, text) to the buyer: `seller` (the payment pins them and they wait for the seller's `fulfillment.release_digital`, or a seller confirmation sent with `release_digital: true`) or `payment` (the earlier behaviour: the payment confirmation releases them). Frozen on each such order when it is paid. The first deploy of migration 0092 runs with `payment` until no older binary serves ([two-phase](docs/migrations.md#digital-release-0092)). See [Digital delivery](#digital-delivery) |
 | `PAYMENT_CONFIRMATION` | `seller` | who marks an order paid: `seller` (the seller's attestation is the only way Bitcoin, USDT and PayPal money pays an order; Paykit's report and PayPal's notification only inform the seller) or `automatic` (the earlier behaviour, the seller's own Bitcoin option included). Frozen on each order at its payment start. See [Seller-confirmed payment](#seller-confirmed-payment) |
 | `USDT_PAYMENTS_ENABLED` | `false` | the USDT feature flag (`true`/`1` or `false`/`0`). On, `/health` reports `usdt_payments.available`, the seller consent and readiness keys exist, and a `paykit` order may be paid in USDT; off, none of that exists and every Bitcoin and PayPal response is unchanged. See [USDT payments](#usdt-payments-flagged-default-off) |
 | `PAYKIT_MARKETPLACE_ASSETS` | `BTC` | the assets the deployed paykit-server's Marketplace prepare can carry: comma-separated `BTC` (required) and `USDT`. `USDT` is accepted only with `PAYKIT_SERVER_API=upstream`, and USDT is offered only when `PAYKIT_MARKETPLACE_CONTRACT` is `multi_asset` too. See [The single Paykit bind](#the-single-paykit-bind) |
@@ -1945,14 +1945,19 @@ Who releases the pinned lines is frozen on the order when it is paid
   `digital_released_at`; when no email or message line is left to mark, the
   order moves `paid` to `delivered` and the buyer is told (`order_delivered`),
   otherwise the buyer is told the instant lines are ready (`digital_released`).
-  A release is refused while PayPal reports the money taken back. The
-  delivered-assumption sweep never assumes an unreleased order delivered.
+  A release is refused while PayPal reports the money taken back, and the
+  buyer's read names the refund or reversal before the missing release. The
+  delivered-assumption sweep never assumes an unreleased order delivered. A
+  late PayPal confirmation that pays the order releases it the same way.
 - `payment`: the confirmation releases them, and an order whose every line is
   instant is delivered at once, as before.
 
 An order paid before 0092 (or by an earlier binary) has no frozen value and
-reads as released at payment. Locks orders are unchanged: the Lock Server
-issues the unlock.
+reads as released at payment. Only a `paid` order, or one with a pending
+cancellation request, waits for a release: an order that an earlier binary
+moved on to `delivered` without stamping it reads as released. Deploying 0092
+is two-phase (see [`docs/migrations.md`](docs/migrations.md)). Locks orders are
+unchanged: the Lock Server issues the unlock.
 
 The buyer opens one line at a time with
 `GET /v1/orders/{id}/digital-delivery/{line_index}` (`Cache-Control:
@@ -1975,7 +1980,8 @@ The `order_auto_complete` sweep then completes it after the frozen
 auto-complete period (`autoCompleteDays`, else `AUTO_COMPLETE_DAYS`), which
 starts the sealed address's retention clock. An open cancellation request or
 a PayPal reversal outstanding on the order holds the assumption; instant-only
-orders are delivered at payment and never wait for it. A background
+orders are delivered by their release (at payment under `DIGITAL_RELEASE=payment`)
+and never wait for it. A background
 worker deletes the sealed address after its retention (see
 `BUYER_EMAIL_RETENTION_DAYS`), and `/ready` reports `unavailable` if the purge
 falls behind.

@@ -184,8 +184,12 @@ async fn paypal_text_order(app: &TestApp) -> (TestActor, TestActor, String) {
 }
 
 async fn post_completed_ipn(app: &TestApp, order_id: &str) -> StatusCode {
+    post_ipn(app, "completed.ipn", order_id).await
+}
+
+async fn post_ipn(app: &TestApp, name: &str, order_id: &str) -> StatusCode {
     let path = format!(
-        "{}/tests/fixtures/paypal_ipn/completed.ipn",
+        "{}/tests/fixtures/paypal_ipn/{name}",
         env!("CARGO_MANIFEST_DIR")
     );
     let text = std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{path}: {error}"));
@@ -349,9 +353,93 @@ async fn only_the_seller_releases_and_only_once(pool: PgPool) {
     let (status, body) = release(&app, &seller.token, &order_id).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(
+        body["error"]["reason"],
+        json!("not_awaiting_release"),
+        "a repeat is told it is already released: {body}"
+    );
+    assert_eq!(
         events(&app, &order_id, "fulfillment.digital_delivered").await,
         1
     );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_order_a_binary_from_before_0092_delivered_stays_readable(pool: PgPool) {
+    let (app, _paykit) =
+        app_with(pool, PaymentConfirmation::Automatic, DigitalRelease::Seller).await;
+    let (seller, buyer, order_id) = paypal_text_order(&app).await;
+    post_completed_ipn(&app, &order_id).await;
+    assert_eq!(facts(&app, &order_id).await.state, "paid");
+
+    // During a rolling deploy an older binary never stamps the release: its
+    // delivered-assumption sweep moves the order on by itself.
+    sqlx::query(
+        "UPDATE orders SET state = 'delivered', digital_delivered_at = $2, \
+         revision = revision + 1 WHERE id = $1::uuid",
+    )
+    .bind(&order_id)
+    .bind(app.clock.now())
+    .execute(&app.pool)
+    .await
+    .expect("present the order as delivered by a binary from before 0092");
+
+    let (status, body) = read_line(&app, &buyer.token, &order_id, 0).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["lines"][0]["text"], json!(TEXT), "{body}");
+    let (status, body) = release(&app, &seller.token, &order_id).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["reason"], json!("not_awaiting_release"));
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_reversed_payment_is_named_before_the_missing_release(pool: PgPool) {
+    let (app, _paykit) =
+        app_with(pool, PaymentConfirmation::Automatic, DigitalRelease::Seller).await;
+    let (seller, buyer, order_id) = paypal_text_order(&app).await;
+    post_completed_ipn(&app, &order_id).await;
+    assert_eq!(
+        post_ipn(&app, "reversal-full.ipn", &order_id).await,
+        StatusCode::OK
+    );
+    let (status, body) = read_line(&app, &buyer.token, &order_id, 0).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["reason"], json!("payment_reversed"), "{body}");
+    let (status, body) = release(&app, &seller.token, &order_id).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["reason"], json!("payment_reversed"), "{body}");
+    assert!(!facts(&app, &order_id).await.released);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_late_paypal_confirmation_releases_when_asked(pool: PgPool) {
+    let (app, _paykit) = app_with(pool, PaymentConfirmation::Seller, DigitalRelease::Seller).await;
+    let (seller, buyer, order_id) = paypal_text_order(&app).await;
+    post_completed_ipn(&app, &order_id).await;
+    // The seller window and the ordinary expiry both pass.
+    app.clock.advance_seconds(26 * 3_600);
+    marketplace_service::workers::expire_due_payment_windows(&app.state, app.clock.now())
+        .await
+        .expect("sweep runs");
+    assert_eq!(facts(&app, &order_id).await.state, "cancelled");
+
+    let (status, body) = send(
+        app.router.clone(),
+        "POST",
+        &format!("/v0/orders/{order_id}/fiat/confirm-received"),
+        Some(&seller.token),
+        &json!({ "release_digital": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let done = facts(&app, &order_id).await;
+    assert!(done.receipt, "the late confirmation paid the order");
+    assert_eq!((done.state.as_str(), done.released), ("delivered", true));
+    assert_eq!(
+        buyer_notices(&app, &order_id, &buyer, "order_delivered").await,
+        1
+    );
+    let (status, body) = read_line(&app, &buyer.token, &order_id, 0).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
@@ -582,6 +670,43 @@ async fn mark_emailed(app: &TestApp, seller: &TestActor, order_id: &str) -> (Sta
 }
 
 // --- interleaving ------------------------------------------------------------
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn concurrent_late_paypal_confirmations_pay_and_release_once(pool: PgPool) {
+    let (app, _paykit) = app_with(pool, PaymentConfirmation::Seller, DigitalRelease::Seller).await;
+    let (seller, buyer, order_id) = paypal_text_order(&app).await;
+    post_completed_ipn(&app, &order_id).await;
+    app.clock.advance_seconds(26 * 3_600);
+    marketplace_service::workers::expire_due_payment_windows(&app.state, app.clock.now())
+        .await
+        .expect("sweep runs");
+    let path = format!("/v0/orders/{order_id}/fiat/confirm-received");
+    let body = json!({ "release_digital": true });
+    let confirm = || {
+        send(
+            app.router.clone(),
+            "POST",
+            &path,
+            Some(&seller.token),
+            &body,
+        )
+    };
+    let (first, second) = tokio::join!(confirm(), confirm());
+    for (status, body) in [&first, &second] {
+        assert_eq!(*status, StatusCode::OK, "{body}");
+    }
+    let done = facts(&app, &order_id).await;
+    assert_eq!((done.state.as_str(), done.released), ("delivered", true));
+    assert_eq!(events(&app, &order_id, "receipt.issued").await, 1);
+    assert_eq!(
+        events(&app, &order_id, "fulfillment.digital_delivered").await,
+        1
+    );
+    assert_eq!(
+        buyer_notices(&app, &order_id, &buyer, "order_delivered").await,
+        1
+    );
+}
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn concurrent_releases_and_a_cancel_request_have_one_winner(pool: PgPool) {

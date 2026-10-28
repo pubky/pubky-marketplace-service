@@ -3047,6 +3047,17 @@ async fn apply_fiat_paid(
                     ));
                 };
                 settle_gateway(&mut tx, state, order_id, gateway, now).await?;
+                // A late order the confirmation paid releases like an on-time
+                // one; any other outcome leaves nothing waiting for release.
+                let order = if release_digital {
+                    crate::handlers::digital_manual::release_with_confirmation(
+                        &mut tx, order, actor, now,
+                    )
+                    .await
+                    .map_err(|error| internal("digital release", &error))?
+                } else {
+                    order
+                };
                 let response = order_response(&mut tx, &order, "", json!({ "verified": true }))
                     .await
                     .map_err(|error| internal("order projection", &error))?;

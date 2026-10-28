@@ -60,9 +60,14 @@ pub(crate) fn has_instant_lines(order: &OrderRow) -> bool {
 
 /// Whether a paid order's instant lines still wait for the seller's release
 /// (`orders.digital_release = 'seller'`). An order frozen before the switch
-/// existed released at payment and never waits.
+/// existed released at payment and never waits. Only a `paid` order (or one
+/// with a pending cancellation request) can wait: an order a binary from
+/// before 0092 delivered without stamping the release was released by that
+/// delivery.
 pub(crate) fn awaits_seller_release(order: &OrderRow) -> bool {
-    order.digital_release.as_deref() == Some("seller") && order.digital_released_at.is_none()
+    order.digital_release.as_deref() == Some("seller")
+        && order.digital_released_at.is_none()
+        && matches!(order.state.as_str(), "paid" | "cancel_requested")
 }
 
 /// Whether every line of a digital order is released on the order page.
@@ -406,13 +411,6 @@ pub async fn get_order_digital_delivery(
             Some("not_paid"),
         );
     }
-    if awaits_seller_release(&order) {
-        return read_error(
-            ErrorCode::InvalidState,
-            "The purchase is available once the seller releases it.",
-            Some("not_released"),
-        );
-    }
     if let Some(taken_back) = payment_taken_back(&order) {
         return read_error(
             ErrorCode::InvalidState,
@@ -425,6 +423,13 @@ pub async fn get_order_digital_delivery(
             ErrorCode::InvalidState,
             "The order was refunded or cancelled; the purchase is no longer available.",
             Some("delivery_ended"),
+        );
+    }
+    if awaits_seller_release(&order) {
+        return read_error(
+            ErrorCode::InvalidState,
+            "The purchase is available once the seller releases it.",
+            Some("not_released"),
         );
     }
     let pins: Vec<PinRow> = match sqlx::query_as(
