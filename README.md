@@ -934,10 +934,12 @@ working unchanged (Bitcoin only, its projection unchanged).
   paykit-server named no first one, so no rail was recorded and a refund has
   none to follow: resolve as `paid` or `abandoned` and return each payment
   from the seller's wallet) and `refund_amount_unrecordable` (a USD order
-  whose USDT terms carry no paid exponent that converts to cents, so the
-  amount cannot be recorded as a refund: return it from the wallet and resolve
-  as `abandoned`). A USDT amount between two cents is not refused: it is
-  recorded as the lower cent, as `refund.record_external` caps it.
+  whose USDT terms carry no paid exponent that converts to cents, or that
+  received less than one cent, so the amount cannot be recorded as a refund:
+  return it from the wallet and resolve as `abandoned`). A USDT amount between
+  two cents is not refused: it is recorded as the lower cent, as
+  `refund.record_external` caps it. Less than one cent caps
+  `refund.record_external` at 0, so a seller's record is refused as well.
 - **Finality bound.** A USDT payment is polled for finality for 7 days from
   `payment_finality_at` while `pending` or `reverted`. A payment still in either state past
   that bound is held for an operator (`needs_review`, `detected_unconfirmed`,

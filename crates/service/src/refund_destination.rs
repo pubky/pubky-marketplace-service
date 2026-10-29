@@ -219,6 +219,15 @@ pub fn received_refund_amount_minor(order: &OrderRow) -> Option<i64> {
     usdt_units_per_order_unit(order).map(|divisor| received / divisor)
 }
 
+/// The USDT amount a refund of the whole payment records, when it records
+/// anything: `None` for no USDT terms, an unconvertible exponent, and a USD
+/// order paid less than one cent, which floors to 0 and fails the refund
+/// constraint. The cap stays [`received_refund_amount_minor`]'s 0, so a
+/// seller's record of such an order is refused too.
+pub fn recordable_refund_amount_minor(order: &OrderRow) -> Option<i64> {
+    received_refund_amount_minor(order).filter(|amount| *amount > 0)
+}
+
 /// The most a refund of this order may record, in the units the refund is
 /// recorded in: the order total, or for a USDT-paid order the USDT it
 /// received (`received_refund_amount_minor`). An underpaid USDT order is
@@ -333,6 +342,17 @@ mod tests {
         let mut no_paid_exponent = usdt_order("USD", Some(137_000_000));
         no_paid_exponent.payment_exponent = None;
         assert_eq!(received_refund_amount_minor(&no_paid_exponent), None);
+        // Less than a cent floors to 0: capped at 0, never recordable.
+        for dust in [1, 9_999] {
+            let order = usdt_order("USD", Some(dust));
+            assert_eq!(received_refund_amount_minor(&order), Some(0));
+            assert_eq!(refund_cap_minor(&order), 0);
+            assert_eq!(recordable_refund_amount_minor(&order), None);
+        }
+        assert_eq!(
+            recordable_refund_amount_minor(&usdt_order("USD", Some(10_000))),
+            Some(1)
+        );
         assert_eq!(refund_cap_minor(&no_paid_exponent), 13_700);
         assert_eq!(
             received_refund_amount_minor(&usdt_order("EUR", Some(148_539_999))),

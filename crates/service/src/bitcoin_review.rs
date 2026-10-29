@@ -902,16 +902,17 @@ pub async fn resolve_bitcoin_payment(
             );
         }
         // A USDT refund is recorded in the units `received_refund_amount_minor`
-        // gives; an order whose USDT terms don't convert to them cannot record one.
-        if usdt_order && refund_destination::received_refund_amount_minor(&order).is_none() {
+        // gives; an order whose USDT terms don't convert to them, or whose
+        // USD payment is less than one cent, cannot record one.
+        if usdt_order && refund_destination::recordable_refund_amount_minor(&order).is_none() {
             return audited_resolve_refusal(
                 &state,
                 &actor.0,
                 Some(resolution_id),
                 ErrorCode::InvalidState,
                 ReviewReason::RefundAmountUnrecordable,
-                "The USDT amount received cannot be expressed in this order's currency, so \
-                 it cannot be recorded as a refund here. Return the payment from your own \
+                "The USDT amount received cannot be expressed in this order's currency, or \
+                 is less than one cent, so it cannot be recorded as a refund here. Return the payment from your own \
                  wallet and resolve this order as abandoned.",
             );
         }
@@ -2006,7 +2007,7 @@ async fn apply_refunded_effects(
         None
     };
     let amount_minor = if usdt_destination.is_some() {
-        refund_destination::received_refund_amount_minor(order)
+        refund_destination::recordable_refund_amount_minor(order)
     } else {
         order.paykit_observed_sats
     };
@@ -2014,7 +2015,8 @@ async fn apply_refunded_effects(
         return Err(ResolutionFailure::Internal(
             "refund requires manual confirmation".into(),
             if usdt_destination.is_some() {
-                "the order's USDT amount does not convert to order units".into()
+                "the order's USDT amount does not convert to a positive amount in order units"
+                    .into()
             } else {
                 "the Paykit observed amount has not been frozen".into()
             },

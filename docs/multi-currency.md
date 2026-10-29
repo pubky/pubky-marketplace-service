@@ -109,7 +109,10 @@ the USDT paid (`refund_destination::received_refund_amount_minor` and
 its USDT refund in cents, capped at the USDT received in whole cents, not at
 the order total: a transfer for another amount than quoted is refunded as it
 arrived, an overpayment included. A received amount between two cents is the
-lower cent, both as the cap and as the manual-review refunded resolution.
+lower cent, both as the cap and as the manual-review refunded resolution. Less
+than one cent is a cap of 0: nothing can be recorded, and the resolution
+refuses with `refund_amount_unrecordable`
+(`refund_destination::recordable_refund_amount_minor`).
 
 ## What the order records
 
