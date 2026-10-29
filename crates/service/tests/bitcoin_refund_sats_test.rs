@@ -171,6 +171,11 @@ async fn assert_capped_at(app: &TestApp, bitcoin: Bitcoin, cap: i64) {
         ("refunded_external".into(), Some(cap))
     );
     assert_eq!(recorded_unit(app, &order_id).await.as_deref(), Some("sat"));
+    assert_eq!(
+        read_order(app, &buyer.token, &order_id).await["external_refund_full"],
+        json!(true),
+        "the buyer reads the refund of everything received as full"
+    );
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
@@ -191,6 +196,11 @@ async fn a_partial_refund_of_a_usd_priced_bitcoin_order_is_in_sats_too(pool: PgP
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let order_id = cancelled_bitcoin_order(&app, &seller, &buyer, USD_PRICED).await;
+    assert_eq!(
+        read_order(&app, &buyer.token, &order_id).await["external_refund_full"],
+        Value::Null,
+        "nothing is refunded yet"
+    );
     // More sats than the order's cents, and half of what was paid.
     assert_eq!(
         record(&app, &seller, &order_id, 25_819, Some("sat")).await,
@@ -199,6 +209,26 @@ async fn a_partial_refund_of_a_usd_priced_bitcoin_order_is_in_sats_too(pool: PgP
     assert_eq!(
         recorded(&app, &order_id).await,
         ("refunded_external".into(), Some(25_819))
+    );
+    // The state is `refunded_external` either way: the buyer, who sees no
+    // `refund_cap`, reads the partial refund from the flag.
+    for token in [&buyer.token, &seller.token] {
+        assert_eq!(
+            read_order(&app, token, &order_id).await["external_refund_full"],
+            json!(false)
+        );
+    }
+    // A record that names no unit is not read against the sats cap.
+    sqlx::query(
+        "UPDATE orders SET external_refund = external_refund - 'amount_unit' WHERE id = $1::uuid",
+    )
+    .bind(&order_id)
+    .execute(&app.pool)
+    .await
+    .expect("an unnamed record");
+    assert_eq!(
+        read_order(&app, &buyer.token, &order_id).await["external_refund_full"],
+        Value::Null
     );
 }
 

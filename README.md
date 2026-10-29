@@ -1784,7 +1784,12 @@ and refund branches):
   (`refund_unit_required`), the amount an older client enters in the order
   total's units. Every record names its unit as
   `external_refund.amount_unit`; migration 0093 named every earlier one the
-  way its writer recorded it. A CHECK constraint
+  way its writer recorded it. Every participant's projection carries
+  `external_refund_full`: whether the record reaches that cap in its unit
+  (null without a record, or for one that names another unit or none). A
+  partial refund leaves the order `refunded_external` like a full one, and
+  only the seller sees the cap, so this is how a buyer tells them apart. A
+  CHECK constraint
   (`orders_external_refund_within_total`, migration 0093) keeps the recorded
   amount within the largest of the order total, the amount paid and the
   sats observed.

@@ -312,6 +312,17 @@ impl RefundTerms {
             "exponent": self.exponent,
         })
     }
+
+    /// Whether a refund record covers everything a refund may be: `None`
+    /// when it names no unit, or another unit than these terms, so its
+    /// amount cannot be read against the cap.
+    pub fn covered_by(&self, record: &Value) -> Option<bool> {
+        if RefundUnit::of_record(record)? != self.unit {
+            return None;
+        }
+        let amount = record.get("amount_minor")?.as_i64()?;
+        Some(amount >= self.cap_minor)
+    }
 }
 
 /// What was actually paid, in the unit a refund of it is recorded in: the
@@ -773,6 +784,25 @@ mod tests {
                 RefundUnit::Order
             );
         }
+    }
+
+    #[test]
+    fn a_refund_is_full_only_when_it_reaches_the_cap_in_the_same_unit() {
+        let terms = RefundTerms {
+            unit: RefundUnit::Sat,
+            cap_minor: 51_637,
+            exponent: 0,
+        };
+        let sats = |amount: i64| json!({"amount_minor": amount, "amount_unit": "sat"});
+        assert_eq!(terms.covered_by(&sats(51_637)), Some(true));
+        assert_eq!(terms.covered_by(&sats(25_819)), Some(false));
+        // Cents, or a record that names no unit, are not read against sats.
+        assert_eq!(
+            terms.covered_by(&json!({"amount_minor": 13_700, "amount_unit": "order"})),
+            None
+        );
+        assert_eq!(terms.covered_by(&json!({"amount_minor": 51_637})), None);
+        assert_eq!(terms.covered_by(&json!({"amount_unit": "sat"})), None);
     }
 
     #[test]
