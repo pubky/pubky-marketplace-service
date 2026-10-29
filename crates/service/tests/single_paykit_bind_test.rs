@@ -2100,6 +2100,76 @@ async fn the_reaper_and_the_buyers_refund_address_race_and_the_refund_stays_open
     }
 }
 
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn bitcoin_on_a_released_paykit_attempt_takes_the_late_money_path(pool: PgPool) {
+    let f = fixture(pool.clone(), Setup::both()).await;
+    let order = checkout_usd(&f).await;
+    let order_id = order.order_id.clone();
+    let (status, body) = bind(&f, &order_id, "paykit").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let first = facts(&pool, &order_id)
+        .await
+        .paykit_invoice_id
+        .expect("invoice");
+    f.paykit.fail_commands_with(409, "invoice_finalized");
+    drain(&f).await;
+    f.paykit.clear_command_failure();
+    assert_eq!(facts(&pool, &order_id).await.payment_method, None);
+    let (status, body) = bind(&f, &order_id, "paykit").await;
+    assert_eq!(status, StatusCode::OK, "the buyer pays again: {body}");
+    drain(&f).await;
+    let second = facts(&pool, &order_id)
+        .await
+        .paykit_invoice_id
+        .expect("invoice");
+    assert_ne!(first, second);
+
+    // The first attempt's request was in fact live: Bitcoin lands on it.
+    let deadline = Utc::now() + Duration::minutes(30);
+    f.paykit.set_marketplace_status(
+        first,
+        status_body(
+            first,
+            deadline,
+            StatusSpec {
+                payment_state: "confirmed",
+                bitcoin: Some(bitcoin_leg(3, true)),
+                usdt: None,
+                paid_asset: Some("BTC"),
+            },
+        ),
+    );
+    let client = f
+        .app
+        .state
+        .payments
+        .as_ref()
+        .and_then(|payments| payments.paykit.as_ref())
+        .expect("client");
+    let routed = marketplace_service::paykit_attempts::verify_due_released_attempts(
+        &f.app.state,
+        client,
+        at(1),
+    )
+    .await
+    .expect("released attempts poll");
+    assert_eq!(routed, 1, "the paid released attempt is routed");
+    // Attempt 2 still holds the stock, so the late money takes the existing
+    // late-money path: the paid attempt becomes the attempt of record and a
+    // human decides.
+    let (state, _, _, _, reason) = payment_row(&pool, &order_id).await;
+    assert_eq!(
+        (state.as_str(), reason.as_deref()),
+        ("manual_review", Some("late_settlement"))
+    );
+    let stored = facts(&pool, &order_id).await;
+    assert_eq!(stored.paykit_invoice_id, Some(first));
+    assert_eq!(stored.payment_method.as_deref(), Some("paykit"));
+    let view = read_order(&f, &f.buyer.token, &order_id).await;
+    assert_eq!(view["accepted_assets"], json!(["BTC"]));
+    assert_eq!(view["payment_amounts"], json!({ "BTC": quoted_sats() }));
+}
+
 /// A status body captured from paykit-server. Only what the capture itself
 /// replaces is changed (the invoice and its two instants), plus the amounts,
 /// which the capture made for a 5-cent request: they are set to this order's
