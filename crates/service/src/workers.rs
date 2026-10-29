@@ -1903,6 +1903,7 @@ async fn apply_completed_lifecycle(
                 &payment,
                 &order,
                 false,
+                false,
                 row.id,
                 &payment.buyer_pubky,
                 now,
@@ -1914,6 +1915,7 @@ async fn apply_completed_lifecycle(
                         LateMoneyOutcome::Completed => "payment_confirmed",
                         LateMoneyOutcome::RefundRequired
                         | LateMoneyOutcome::HeldLateSettlement
+                        | LateMoneyOutcome::SellerReview
                         | LateMoneyOutcome::AmountMismatch => "manual_review",
                     };
                     mark_correlation_completed(&mut tx, row.id, correlation_outcome, now).await?;
@@ -2043,6 +2045,27 @@ struct ClaimedPaykitOrder {
     /// The seller's Bitcoin confirmation option frozen at the payment start
     /// (`orders.seller_confirms_bitcoin`); NULL reads as not opted in.
     seller_confirms_bitcoin: Option<bool>,
+    /// Who marks the order paid, frozen at the payment start
+    /// (`orders.payment_confirmation`); NULL reads as `automatic`.
+    payment_confirmation: Option<String>,
+}
+
+impl ClaimedPaykitOrder {
+    /// Whether every on-time matching Paykit payment of this order, Bitcoin
+    /// and USDT alike, waits for the seller's attestation
+    /// (`PAYMENT_CONFIRMATION=seller` at the payment start). An order on the
+    /// retired fork API keeps its creator's own mode.
+    fn seller_confirms_payment(&self) -> bool {
+        self.paykit_api == "upstream" && self.payment_confirmation.as_deref() == Some("seller")
+    }
+
+    /// Whether this order's Bitcoin payments wait for the seller: every
+    /// payment of a seller-confirmed order, or the seller's own Bitcoin
+    /// opt-in on an automatic one.
+    fn seller_confirms_bitcoin_payment(&self) -> bool {
+        self.seller_confirms_payment()
+            || (self.paykit_api == "upstream" && self.seller_confirms_bitcoin == Some(true))
+    }
 }
 
 /// Claims a batch of bitcoin orders due for a paykit status poll by stamping
@@ -2088,7 +2111,7 @@ async fn claim_due_paykit_orders(
              FOR UPDATE OF o SKIP LOCKED\
          ) RETURNING id, payment_id, buyer_pubky, seller_pubky, paykit_invoice_id, paykit_api, \
          paykit_request_reference, paykit_request_state, paykit_expires_at, paykit_allocation_mode, \
-         paykit_stack_id, paykit_stack_endpoint, seller_confirms_bitcoin",
+         paykit_stack_id, paykit_stack_endpoint, seller_confirms_bitcoin, payment_confirmation",
     )
     .bind(now)
     .bind(now - chrono::Duration::seconds(poll_seconds))
@@ -2302,8 +2325,9 @@ async fn set_payment_finality(
 /// on. A late amount mismatch never pays: it enters the same
 /// `amount_mismatch` `manual_review` as on-time money, before any unit is
 /// re-taken. Only an exact late payment can complete a still-free order
-/// (`late_completion`); a unit that is gone is named `refund_required`, and
-/// a still-held order waits as `late_settlement`.
+/// (`late_completion`), and on a seller-confirmed order not even that: it
+/// waits as `late_settlement` for the seller. A unit that is gone is named
+/// `refund_required`, and a still-held order waits as `late_settlement`.
 async fn freeze_paykit_observation(
     tx: &mut Transaction<'_, Postgres>,
     order_id: Uuid,
@@ -2436,6 +2460,7 @@ async fn apply_confirmed_paykit_payment(
             &payment,
             &order,
             amount_mismatch,
+            order.seller_confirms_paykit_payment(),
             row.id,
             &row.buyer_pubky,
             now,
@@ -2789,15 +2814,23 @@ async fn mark_paykit_detected(
 /// inside. This path NEVER transitions the order to `paid` — the seller's
 /// attestation is the only exit — and a late observation (payment already
 /// expired) never enters the state; it takes the existing late path.
+#[allow(clippy::too_many_arguments)]
 async fn apply_shared_manual_observation(
     pool: &PgPool,
     row: &ClaimedPaykitOrder,
     observed_state: &str,
     amount_matched: bool,
     observation: &crate::payments::PaykitObservation,
+    usdt: Option<&PaykitUsdtObservation>,
     keys: crate::ConfirmKeys<'_>,
     now: DateTime<Utc>,
 ) -> anyhow::Result<bool> {
+    let settlement = |late_settlement| Settlement {
+        amount_matched,
+        observation,
+        late_settlement,
+        usdt,
+    };
     // A fork order resolves through the pinned stack; an upstream order has
     // no stack and carries neither pin.
     let resolution_pins_present = match row.paykit_api.as_str() {
@@ -2831,14 +2864,7 @@ async fn apply_shared_manual_observation(
         // manual_review; a detected one only advances the display state.
         tx.rollback().await?;
         if observed_state == "confirmed" {
-            return apply_confirmed_paykit_payment(
-                pool,
-                row,
-                Settlement::bitcoin(amount_matched, observation, false),
-                keys,
-                now,
-            )
-            .await;
+            return apply_confirmed_paykit_payment(pool, row, settlement(false), keys, now).await;
         }
         if row.paykit_request_state != "detected" {
             sqlx::query(MARK_PAYKIT_DETECTED)
@@ -2852,6 +2878,12 @@ async fn apply_shared_manual_observation(
     let Some(order) = fetch_order_for_update(&mut tx, row.id).await? else {
         anyhow::bail!("paykit order {} is missing", row.id);
     };
+    // A USDT amount that differs from what paykit-server offered is never
+    // shown to the seller as waiting: it takes the amount-mismatch review.
+    if usdt.is_some() && observed_differs_from_offer(&order, observation) {
+        tx.rollback().await?;
+        return apply_confirmed_paykit_payment(pool, row, settlement(false), keys, now).await;
+    }
     let observation_doc = crate::bitcoin_review::observation_json(
         observed_state,
         amount_matched,
@@ -2881,6 +2913,10 @@ async fn apply_shared_manual_observation(
     .fetch_optional(&mut *tx)
     .await?;
     if let Some((revision,)) = entered {
+        // The rail the money arrived on is recorded at entry, so the seller's
+        // confirmation, a review and a refund all follow it, and a USDT
+        // transfer's finality keeps being tracked while the seller decides.
+        record_settlement_rail(&mut tx, row.id, observation, usdt, now).await?;
         // The seller is the only exit to `paid`: tell them the payment was
         // seen and that it waits for their confirmation.
         let event_id = crate::executor::insert_event(
@@ -2893,10 +2929,15 @@ async fn apply_shared_manual_observation(
             now,
         )
         .await?;
+        let seen_kind = if usdt.is_some() {
+            "usdt_payment_seen"
+        } else {
+            "bitcoin_payment_seen"
+        };
         insert_notification_intent(
             &mut tx,
             event_id,
-            "bitcoin_payment_seen",
+            seen_kind,
             &order.seller_pubky,
             SYSTEM_ACTOR,
             &ids::order_aggregate_id(row.id),
@@ -2997,9 +3038,10 @@ async fn apply_report_inside_seller_window(
         PaykitStatusOutcome::Detected { facts } => {
             ("detected", facts.amount_matched.unwrap_or(true), facts)
         }
-        PaykitStatusOutcome::ManualReview { .. } | PaykitStatusOutcome::UsdtObserved { .. } => {
-            return Ok(false)
+        PaykitStatusOutcome::UsdtObserved { usdt, .. } => {
+            return refresh_usdt_inside_seller_window(pool, row, usdt, now).await
         }
+        PaykitStatusOutcome::ManualReview { .. } => return Ok(false),
         PaykitStatusOutcome::Undetected | PaykitStatusOutcome::ActiveUndetected { .. } => {
             return mark_shared_manual_disappeared(pool, row, now).await
         }
@@ -3069,15 +3111,69 @@ async fn refresh_inside_seller_window(
     Ok(true)
 }
 
+/// A USDT report for an order waiting for its seller. An order that entered
+/// on its USDT transfer refreshes the transfer's facts and finality, under the
+/// canonical payment-then-order lock; a transfer the report no longer shows
+/// in a block is marked `disappeared` and its finality `reverted`. Nothing
+/// advances the order. An order that entered on Bitcoin ignores the USDT leg
+/// here: once paid, the settled poll holds second-rail money for review.
+async fn refresh_usdt_inside_seller_window(
+    pool: &PgPool,
+    row: &ClaimedPaykitOrder,
+    usdt: &PaykitUsdtObservation,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    let mut tx = pool.begin().await?;
+    let payment_state: Option<(String,)> =
+        sqlx::query_as("SELECT state FROM payments WHERE id = $1 FOR UPDATE")
+            .bind(row.payment_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if payment_state.as_ref().map(|(state,)| state.as_str()) != Some("awaiting_entitlement") {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    let Some(order) = fetch_order_for_update(&mut tx, row.id).await? else {
+        anyhow::bail!("paykit order {} is missing", row.id);
+    };
+    if order.payment_asset.as_deref() != Some("USDT") {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    let observation = usdt.as_observation();
+    let observation_doc = crate::bitcoin_review::observation_json(
+        "confirmed",
+        usdt.amount_matched,
+        &observation,
+        now,
+        !usdt.included(),
+    );
+    if !refresh_seller_confirmation_facts(&mut tx, row, &observation_doc, &observation, now).await?
+    {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    let finality = if usdt.included() {
+        finality_of(usdt)
+    } else {
+        "reverted"
+    };
+    set_payment_finality(&mut tx, row.id, finality, now).await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
 /// A disappearance/reorg fact for an order awaiting seller confirmation:
 /// the observation is marked `disappeared` and shown to the seller; the
-/// order does not silently revert and does not advance (Q10).
+/// order does not silently revert and does not advance (Q10). A USDT
+/// transfer that is no longer reported also has its finality `reverted`.
 async fn mark_shared_manual_disappeared(
     pool: &PgPool,
     row: &ClaimedPaykitOrder,
     now: DateTime<Utc>,
 ) -> anyhow::Result<bool> {
-    sqlx::query(
+    let mut tx = pool.begin().await?;
+    let marked = sqlx::query(
         "UPDATE orders SET paykit_observation = jsonb_set(paykit_observation, '{disappeared}', 'true'), \
          updated_at = $2 \
          WHERE id = $1 AND paykit_request_state = 'awaiting_seller_confirmation' \
@@ -3085,8 +3181,12 @@ async fn mark_shared_manual_disappeared(
     )
     .bind(row.id)
     .bind(now)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    if marked.rows_affected() == 1 {
+        set_payment_finality(&mut tx, row.id, "reverted", now).await?;
+    }
+    tx.commit().await?;
     Ok(false)
 }
 
@@ -3158,15 +3258,17 @@ async fn apply_upstream_manual_review(
     Ok(true)
 }
 
-/// The seller's Bitcoin confirmation option (legal launch plan B4). Upstream
-/// Paykit reports every order as `exclusive`, so a Bitcoin payment on time
-/// would pay the order by itself. For an order whose seller opted in at the
-/// payment start (`orders.seller_confirms_bitcoin`) the report is read as
-/// `shared_manual` instead: on-time matching money enters the existing
+/// Seller confirmation of Bitcoin payments. Upstream Paykit reports every
+/// order as `exclusive`, so a Bitcoin payment on time would pay the order by
+/// itself. For an order frozen as seller-confirmed at its payment start
+/// (`orders.payment_confirmation = 'seller'`, or the seller's own opt-in in
+/// `orders.seller_confirms_bitcoin` on an automatic order) the report is read
+/// as `shared_manual` instead: on-time matching money enters the existing
 /// seller-confirmation window and only the seller's attestation pays the
 /// order, and Paykit's report only informs the seller. A late settlement still
-/// takes the late path whatever the mode. USDT is not affected, and an order
-/// that did not opt in (or whose option was never read) is untouched.
+/// takes the late path whatever the mode. The USDT leg is handled by
+/// [`apply_usdt_observation`], and an automatic order whose seller did not opt
+/// in (or whose option was never read) is untouched.
 ///
 /// Only money that matches the order's amount waits for the seller. A
 /// `confirmed` report whose amount does not match keeps the `exclusive` mode, so
@@ -3178,7 +3280,7 @@ fn with_seller_confirmation(
     outcome: PaykitStatusOutcome,
     row: &ClaimedPaykitOrder,
 ) -> PaykitStatusOutcome {
-    if row.paykit_api != "upstream" || row.seller_confirms_bitcoin != Some(true) {
+    if !row.seller_confirms_bitcoin_payment() {
         return outcome;
     }
     fn shared(mut facts: crate::payments::PaykitStatusFacts) -> crate::payments::PaykitStatusFacts {
@@ -3222,12 +3324,12 @@ fn with_seller_confirmation(
     }
 }
 
-/// Whether the order's Bitcoin payments wait for the seller: a fork order the
-/// creator's mode pinned to `shared_manual`, or an upstream order whose seller
-/// opted in.
+/// Whether the order's payments wait for the seller: a fork order the
+/// creator's mode pinned to `shared_manual`, or an upstream order frozen as
+/// seller-confirmed (or whose seller opted in for Bitcoin).
 fn waits_for_seller(row: &ClaimedPaykitOrder) -> bool {
     row.paykit_allocation_mode.as_deref() == Some("shared_manual")
-        || (row.paykit_api == "upstream" && row.seller_confirms_bitcoin == Some(true))
+        || row.seller_confirms_bitcoin_payment()
 }
 
 /// Applies the polled paykit status for ONE claimed order. Errors
@@ -3338,6 +3440,7 @@ async fn apply_status_outcome(
                         "confirmed",
                         amount_matched,
                         &facts.observation,
+                        None,
                         state.confirm_keys(),
                         now,
                     )
@@ -3410,6 +3513,7 @@ async fn apply_status_outcome(
                         "detected",
                         facts.amount_matched.unwrap_or(true),
                         &facts.observation,
+                        None,
                         state.confirm_keys(),
                         now,
                     )
@@ -3457,12 +3561,28 @@ async fn apply_usdt_observation(
         return apply_dual_rail_review(state, row, usdt, &bitcoin, paid_asset, now).await;
     }
     if usdt.included() {
+        let observation = usdt.as_observation();
+        // A seller-confirmed order's on-time matching transfer waits for the
+        // seller like Bitcoin does; late or short money keeps its review route.
+        if row.seller_confirms_payment() && usdt.amount_matched && usdt.paid_on_time {
+            return apply_shared_manual_observation(
+                &state.pool,
+                row,
+                "confirmed",
+                true,
+                &observation,
+                Some(usdt),
+                state.confirm_keys(),
+                now,
+            )
+            .await;
+        }
         return apply_confirmed_paykit_payment(
             &state.pool,
             row,
             Settlement {
                 amount_matched: usdt.amount_matched,
-                observation: &usdt.as_observation(),
+                observation: &observation,
                 late_settlement: !usdt.paid_on_time,
                 usdt: Some(usdt),
             },

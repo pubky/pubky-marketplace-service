@@ -2013,6 +2013,19 @@ pub async fn bind_payment_method(
     {
         return internal("seller delivery terms capture", &error);
     }
+    // Who marks this order paid is frozen with the terms, at the first
+    // payment start, so a later change to the deployment never moves it.
+    if let Err(error) = sqlx::query(
+        "UPDATE orders SET payment_confirmation = $2 \
+         WHERE id = $1 AND payment_confirmation IS NULL",
+    )
+    .bind(order.id)
+    .bind(state.config.payment_confirmation.as_str())
+    .execute(&mut *tx)
+    .await
+    {
+        return internal("payment confirmation capture", &error);
+    }
     // The EU seller's annual limit (legal launch plan C4) at payment start:
     // the buyer is not asked to pay a seller who has reached it. Before any
     // listing lock, so the per-seller counter lock stays first.
@@ -2983,6 +2996,21 @@ async fn apply_fiat_paid(
                 "The order was not found.",
             )
         })?;
+    // Money PayPal already reports refunded or reversed is not money the
+    // seller holds: confirming it would pay an order nobody paid for. Read
+    // under the payment lock, which a refund or reversal notification takes
+    // before it records either.
+    if verified_by == "seller"
+        && order.receipt_id.is_none()
+        && (order.external_refund.is_some() || order.payment_reversed_at.is_some())
+    {
+        let _ = tx.rollback().await;
+        return Err(method_error(
+            ErrorCode::InvalidState,
+            "payment_taken_back",
+            "PayPal reports this payment refunded or reversed, so it cannot be confirmed as received.",
+        ));
+    }
     // A verified payment whose auction hold the expiry sweep already lapsed
     // takes the same fork as an expired payment: the unit is re-taken when
     // free, otherwise the payment is named `refund_required`.
@@ -2997,6 +3025,7 @@ async fn apply_fiat_paid(
             state.confirm_keys(),
             &payment,
             &order,
+            false,
             false,
             command_id,
             actor,
@@ -3476,6 +3505,103 @@ pub async fn confirm_fiat_received(
 /// participant pubky, so confirmation notifications fan out to both sides.
 const PAYPAL_GATEWAY_ACTOR: &str = "paypal-ipn";
 
+/// A verified, matching PayPal `Completed` notification for a seller-confirmed
+/// order (`PAYMENT_CONFIRMATION=seller`). It never pays the order: the
+/// seller's `confirm-received` does. In one transaction under the PayPal
+/// payment lock, then the payment row, then the order row:
+///
+/// - the PayPal payment id, the receiver snapshot and any held refund naming
+///   it settle exactly as for an automatic order, so refund and reversal
+///   notifications keep matching;
+/// - the first notification stamps `gateway_payment_seen_at`, records the
+///   PayPal transaction id as the order's reference, and notifies the seller
+///   (`paypal_payment_seen`);
+/// - while the payment is still open, the hold is extended to the
+///   seller-confirmation window so the buyer, who demonstrably paid, does not
+///   lose the item to the short PayPal window. After that window the
+///   ordinary expiry applies, and a later seller confirmation takes the late
+///   path.
+async fn record_gateway_payment_seen(
+    state: &AppState,
+    order_id: Uuid,
+    transaction_ref: Option<&str>,
+    gateway: Option<&paypal_refund::GatewayPayment<'_>>,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    let mut tx = state.pool.begin().await?;
+    if let Some(gateway) = gateway {
+        paypal_refund::lock_paypal_payment(&mut tx, gateway.txn_id).await?;
+    }
+    let Some(payment) = fetch_payment_for_order_update(&mut tx, order_id).await? else {
+        anyhow::bail!("paypal order {order_id} has no payment");
+    };
+    let Some(order) = fetch_order_for_update(&mut tx, order_id).await? else {
+        anyhow::bail!("paypal order {order_id} is missing");
+    };
+    if let Some(gateway) = gateway {
+        paypal_refund::settle_verified_payment(&mut tx, state, order_id, gateway, now).await?;
+    }
+    if order.gateway_payment_seen_at.is_none() {
+        let deadline = now
+            + chrono::Duration::seconds(crate::bitcoin_review::SELLER_CONFIRMATION_WINDOW_SECONDS);
+        let open = payment.state == "awaiting_entitlement" && order.state == "pending_payment";
+        let (revision,): (i64,) = sqlx::query_as(
+            "UPDATE orders SET gateway_payment_seen_at = $2, \
+             fiat_transaction_ref = COALESCE($3, fiat_transaction_ref), \
+             hold_expires_at = CASE WHEN $4 AND stock_held AND auction_aggregate_id IS NULL \
+                 THEN GREATEST(COALESCE(hold_expires_at, $5), $5) ELSE hold_expires_at END, \
+             revision = revision + 1, updated_at = $2 \
+             WHERE id = $1 RETURNING revision",
+        )
+        .bind(order_id)
+        .bind(now)
+        .bind(transaction_ref)
+        .bind(open)
+        .bind(deadline)
+        .fetch_one(&mut *tx)
+        .await?;
+        if open {
+            if let Some(auction_aggregate_id) = &order.auction_aggregate_id {
+                sqlx::query(
+                    "UPDATE reservations SET expires_at = GREATEST(expires_at, $3), updated_at = $4 \
+                     WHERE listing_aggregate_id = $1 AND buyer_pubky = $2 AND status = 'active'",
+                )
+                .bind(auction_aggregate_id)
+                .bind(&order.buyer_pubky)
+                .bind(deadline)
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        let event_id = insert_event(
+            &mut tx,
+            Uuid::new_v4(),
+            &ids::order_aggregate_id(order_id),
+            revision,
+            PAYPAL_GATEWAY_ACTOR,
+            "order.gateway_payment_seen",
+            now,
+        )
+        .await?;
+        if payment.state != "confirmed" {
+            insert_notification_intent(
+                &mut tx,
+                event_id,
+                "paypal_payment_seen",
+                &order.seller_pubky,
+                PAYPAL_GATEWAY_ACTOR,
+                &ids::order_aggregate_id(order_id),
+                None,
+                now,
+            )
+            .await?;
+        }
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Parses a decimal money string (`"147.96"`) into minor units under the
 /// order's exponent, strictly: the fraction must carry exactly the
 /// exponent's digits (PayPal always sends the currency's full precision).
@@ -3591,6 +3717,23 @@ pub async fn paypal_ipn(State(state): State<AppState>, body: String) -> Response
     // naming this payment settle in one transaction under the payment lock.
     let gateway = paypal_refund::paypal_transaction_id(txn_id)
         .map(|txn_id| paypal_refund::GatewayPayment::from_fields(txn_id, &merchant_email, &fields));
+    if order.payment_confirmation.as_deref() == Some("seller") {
+        return match record_gateway_payment_seen(
+            &state,
+            order_id,
+            transaction_ref,
+            gateway.as_ref(),
+            state.clock.now(),
+        )
+        .await
+        {
+            Ok(()) => StatusCode::OK.into_response(),
+            Err(error) => {
+                tracing::error!(%order_id, error = %error, "paypal ipn seller hint failed");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
+        };
+    }
     let confirmed = match apply_fiat_paid(
         &state,
         PAYPAL_GATEWAY_ACTOR,

@@ -22,12 +22,13 @@ use uuid::Uuid;
 const ORDER_TOTAL_CENTS: i64 = 13_700;
 const ORDER_TOTAL_MILLIONTHS: i64 = 137_000_000;
 
-const HEALTH_KEYS: [&str; 8] = [
+const HEALTH_KEYS: [&str; 9] = [
     "commit",
     "digital_delivery_available",
     "digital_delivery_max_bytes",
     "offer_checkout",
     "paykit_rail",
+    "payment_confirmation",
     "pickup_available",
     "priv_keys_available",
     "status",

@@ -82,7 +82,7 @@ pub const ORDER_COLUMNS: &str =
      paykit_payment_amounts, payment_finality, payment_finality_at, \
      paykit_second_rail_at, usd_conversion_pair, usd_conversion_source, \
      usd_conversion_usd_rate, usd_conversion_currency_rate, usd_conversion_fetched_at, \
-     usd_conversion_cents";
+     usd_conversion_cents, payment_confirmation, gateway_payment_seen_at";
 
 pub const PAYMENT_COLUMNS: &str = "id, order_id, buyer_pubky, seller_pubky, revision, adapter, \
      state, confirmations, amount_minor, currency, exponent, \

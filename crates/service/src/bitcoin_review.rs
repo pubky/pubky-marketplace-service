@@ -1548,6 +1548,8 @@ pub(crate) enum LateMoneyOutcome {
     Completed,
     RefundRequired,
     HeldLateSettlement,
+    /// A free unit on a seller-confirmed order: the seller resolves it.
+    SellerReview,
     AmountMismatch,
 }
 
@@ -1585,10 +1587,12 @@ pub(crate) async fn auction_hold_lapsed(
 /// with `review_reason=amount_mismatch`, exactly as on-time money does, and
 /// is decided before any stock, limit or delivery check: it never completes
 /// the order and never re-takes the unit. Of the rest, stock free completes
-/// the order (`late_completion`). Stock gone stamps `refund_required` and
-/// never pays. A still-held pending order keeps the existing
-/// `manual_review` path with `review_reason=late_settlement` and does not
-/// reacquire.
+/// the order (`late_completion`), unless `seller_decides`: money a
+/// seller-confirmed order's seller has not attested waits in `manual_review`
+/// with `review_reason=late_settlement` instead, and the seller's `paid`
+/// resolution completes it. Stock gone stamps `refund_required` and never
+/// pays. A still-held pending order keeps the existing `manual_review` path
+/// with `review_reason=late_settlement` and does not reacquire.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn apply_late_money(
     tx: &mut Transaction<'_, Postgres>,
@@ -1596,6 +1600,7 @@ pub(crate) async fn apply_late_money(
     payment: &PaymentRow,
     order: &OrderRow,
     amount_mismatch: bool,
+    seller_decides: bool,
     command_id: Uuid,
     event_actor: &str,
     now: DateTime<Utc>,
@@ -1657,30 +1662,7 @@ pub(crate) async fn apply_late_money(
     }
     let still_held = order.state == "pending_payment" && order.stock_held;
     if still_held {
-        let event_id = stamp_review_reason(
-            tx,
-            payment,
-            "late_settlement",
-            "manual_review",
-            command_id,
-            event_actor,
-            now,
-        )
-        .await?;
-        if payment.adapter == "paykit" {
-            insert_bitcoin_manual_review_intent(
-                tx,
-                event_id,
-                &order.seller_pubky,
-                order.id,
-                BitcoinReviewNotice::LateSettlement,
-                now,
-            )
-            .await
-            .map_err(|e| {
-                ResolutionFailure::Internal("review notification".into(), e.to_string())
-            })?;
-        }
+        hold_late_settlement(tx, payment, order, command_id, event_actor, now).await?;
         return Ok(LateMoneyOutcome::HeldLateSettlement);
     }
 
@@ -1714,16 +1696,23 @@ pub(crate) async fn apply_late_money(
     }
     // A failed reacquire must leave nothing behind: the reservation flip or
     // drop debit it already made would otherwise outlive the refund path.
+    // When the seller decides, the reacquire only tells a free unit from a
+    // gone one and is always undone: the seller's `paid` resolution re-takes
+    // the unit itself.
     let mut reacquire = sqlx::Acquire::begin(&mut **tx)
         .await
         .map_err(|e| ResolutionFailure::Internal("reacquire savepoint".into(), e.to_string()))?;
     let reacquired = reacquire_hold(&mut reacquire, order, now).await;
     match reacquired {
-        Ok(()) => reacquire.commit().await,
-        Err(_) => reacquire.rollback().await,
+        Ok(()) if !seller_decides => reacquire.commit().await,
+        _ => reacquire.rollback().await,
     }
     .map_err(|e| ResolutionFailure::Internal("reacquire savepoint".into(), e.to_string()))?;
     match reacquired {
+        Ok(()) if seller_decides => {
+            hold_late_settlement(tx, payment, order, command_id, event_actor, now).await?;
+            Ok(LateMoneyOutcome::SellerReview)
+        }
         Ok(()) => complete_late_order(tx, keys, payment, order, command_id, event_actor, now)
             .await
             .map(|_| LateMoneyOutcome::Completed),
@@ -1742,6 +1731,41 @@ pub(crate) async fn apply_late_money(
         }
         Err(other) => Err(other),
     }
+}
+
+/// Late money that waits for the seller: payment `manual_review` with
+/// `review_reason = late_settlement`, and a Paykit seller told to resolve it.
+async fn hold_late_settlement(
+    tx: &mut Transaction<'_, Postgres>,
+    payment: &PaymentRow,
+    order: &OrderRow,
+    command_id: Uuid,
+    event_actor: &str,
+    now: DateTime<Utc>,
+) -> Result<(), ResolutionFailure> {
+    let event_id = stamp_review_reason(
+        tx,
+        payment,
+        "late_settlement",
+        "manual_review",
+        command_id,
+        event_actor,
+        now,
+    )
+    .await?;
+    if payment.adapter == "paykit" {
+        insert_bitcoin_manual_review_intent(
+            tx,
+            event_id,
+            &order.seller_pubky,
+            order.id,
+            BitcoinReviewNotice::LateSettlement,
+            now,
+        )
+        .await
+        .map_err(|e| ResolutionFailure::Internal("review notification".into(), e.to_string()))?;
+    }
+    Ok(())
 }
 
 /// The #50 stock-gone shape: payment `manual_review` with

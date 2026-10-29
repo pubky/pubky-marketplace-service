@@ -28,8 +28,10 @@
 //! in the same transaction — activation state `voided`, the undelivered
 //! `paykit.activate` row stamped, one `paykit.void` row enqueued — so no
 //! activation can publish it afterwards. Once money is observed on the
-//! request (`detected`, `awaiting_seller_confirmation`, `confirmed`) the
-//! buyer can no longer cancel: the hold stays with the payment it backs.
+//! request (`detected`, `awaiting_seller_confirmation`, `confirmed`), or
+//! PayPal has reported a payment the seller has yet to confirm
+//! (`gateway_payment_seen_at`), the buyer can no longer cancel: the hold
+//! stays with the payment it backs.
 
 use chrono::{DateTime, Utc};
 use marketplace_domain::commands::{OrderActionPayload, RequestCancellationPayload};
@@ -90,7 +92,9 @@ pub async fn request(
             "This order can no longer be cancelled.",
         )));
     }
-    if order.state == "pending_payment" && paykit_money_observed(&order) {
+    if order.state == "pending_payment"
+        && (paykit_money_observed(&order) || order.gateway_payment_seen_at.is_some())
+    {
         return Ok(Err(CommandFailure::refused(
             crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,

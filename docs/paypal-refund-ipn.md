@@ -35,7 +35,11 @@ PayPal's `receiver_id` account id when the IPN carries one
 (`paypal_receiver_id`). The first verified payment is kept; a unique index
 lets one PayPal payment pay one order. The write happens in every payment
 state, so a `Completed` IPN that arrives after the seller confirmed receipt
-by hand still stores it.
+by hand still stores it. On a seller-confirmed order
+(`PAYMENT_CONFIRMATION=seller`) the `Completed` IPN never pays the order, but
+it stores the payment id and receiver snapshot the same way, so refunds keep
+matching; a seller confirmation is refused while a refund or reversal is
+recorded on the unpaid order.
 
 A refund-class notification must name the snapshot receiver: the same
 `receiver_id`, or `receiver_email`/`business` equal to the snapshot email. The

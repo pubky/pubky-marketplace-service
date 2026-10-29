@@ -264,6 +264,43 @@ pub struct Config {
     /// independent of USDT: it is set once the deployed paykit-server speaks
     /// the multi-asset contract, whether or not USDT is offered.
     pub paykit_marketplace_contract: MarketplaceContract,
+    /// Who marks an order paid (`PAYMENT_CONFIRMATION`, default `seller`).
+    /// Frozen on each order at its first payment start
+    /// (`orders.payment_confirmation`), so changing it never moves an open
+    /// order.
+    pub payment_confirmation: PaymentConfirmation,
+}
+
+/// Who turns observed money into a paid order (`PAYMENT_CONFIRMATION`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PaymentConfirmation {
+    /// The seller's attestation is the only way Bitcoin, USDT and PayPal
+    /// money pays an order. Paykit's chain report and PayPal's notification
+    /// are shown to the seller as hints.
+    #[default]
+    Seller,
+    /// The earlier behaviour: a matching Paykit report or a verified PayPal
+    /// notification pays the order, except for Bitcoin orders of sellers who
+    /// opted in with `bitcoinConfirmation: "seller"`.
+    Automatic,
+}
+
+impl PaymentConfirmation {
+    pub fn parse(raw: Option<&str>) -> anyhow::Result<Self> {
+        match raw.map(str::trim) {
+            None | Some("") | Some("seller") => Ok(Self::Seller),
+            Some("automatic") => Ok(Self::Automatic),
+            Some(_) => anyhow::bail!("PAYMENT_CONFIRMATION must be seller or automatic"),
+        }
+    }
+
+    /// The value frozen in `orders.payment_confirmation`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Seller => "seller",
+            Self::Automatic => "automatic",
+        }
+    }
 }
 
 impl Config {
@@ -476,6 +513,8 @@ impl Config {
             std::env::var("PAYKIT_MARKETPLACE_CONTRACT").ok().as_deref(),
             paykit_api,
         )?;
+        let payment_confirmation =
+            PaymentConfirmation::parse(std::env::var("PAYMENT_CONFIRMATION").ok().as_deref())?;
         Ok(Self {
             bind_addr,
             database_url,
@@ -535,6 +574,7 @@ impl Config {
             usdt_payments_enabled,
             paykit_marketplace_assets,
             paykit_marketplace_contract,
+            payment_confirmation,
         })
     }
 
@@ -606,6 +646,9 @@ impl Config {
             usdt_payments_enabled: false,
             paykit_marketplace_assets: MarketplaceAssets::BTC_ONLY,
             paykit_marketplace_contract: MarketplaceContract::Legacy,
+            // The suites written against automatic settlement keep running
+            // it; the seller-confirmed suites set `Seller` explicitly.
+            payment_confirmation: PaymentConfirmation::Automatic,
         }
     }
 }
@@ -875,8 +918,9 @@ mod tests {
     use super::{
         automation_rate_capacity, parse_app_base, parse_days, parse_paypal_checkout_url,
         parse_review_blind_window_days, refusal_audit_keys_from_env, reject_audit_url_reuse,
-        required_postgres_url, validate_postgres_url, Config, AUTOMATION_RATE_LIMIT_MAX_TOKENS,
-        DEFAULT_AUTO_COMPLETE_DAYS, DEFAULT_DELIVERY_ASSUME_DAYS, DEFAULT_PAYPAL_CHECKOUT_URL,
+        required_postgres_url, validate_postgres_url, Config, PaymentConfirmation,
+        AUTOMATION_RATE_LIMIT_MAX_TOKENS, DEFAULT_AUTO_COMPLETE_DAYS, DEFAULT_DELIVERY_ASSUME_DAYS,
+        DEFAULT_PAYPAL_CHECKOUT_URL,
     };
     use crate::payment_attempt::{MarketplaceAssets, MarketplaceContract};
 
@@ -1422,6 +1466,7 @@ mod tests {
             ("PAYKIT_MARKETPLACE_ASSETS", None),
             ("PAYKIT_MARKETPLACE_CONTRACT", None),
             ("PAYKIT_SERVER_API", None),
+            ("PAYMENT_CONFIRMATION", None),
         ];
         vars.extend_from_slice(extra);
         let _guard = EnvGuard::set(&vars);
@@ -1458,6 +1503,29 @@ mod tests {
                 from_env_with(&[("USDT_PAYMENTS_ENABLED", Some(value))]).expect_err(value);
             assert!(
                 refused.to_string().contains("USDT_PAYMENTS_ENABLED"),
+                "{value:?}: {refused}"
+            );
+        }
+    }
+
+    #[test]
+    fn payment_confirmation_defaults_to_the_seller() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let config = from_env_with(&[]).expect("defaults parse");
+        assert_eq!(config.payment_confirmation, PaymentConfirmation::Seller);
+        for (value, expected) in [
+            ("seller", PaymentConfirmation::Seller),
+            ("", PaymentConfirmation::Seller),
+            ("automatic", PaymentConfirmation::Automatic),
+        ] {
+            let config = from_env_with(&[("PAYMENT_CONFIRMATION", Some(value))])
+                .unwrap_or_else(|error| panic!("{value}: {error}"));
+            assert_eq!(config.payment_confirmation, expected, "{value:?}");
+        }
+        for value in ["Seller", "auto", "service", "true"] {
+            let refused = from_env_with(&[("PAYMENT_CONFIRMATION", Some(value))]).expect_err(value);
+            assert!(
+                refused.to_string().contains("PAYMENT_CONFIRMATION"),
                 "{value:?}: {refused}"
             );
         }

@@ -812,6 +812,12 @@ pub struct OrderRow {
     /// When money was first seen on the rail that did not pay the order.
     /// Never serialized.
     pub paykit_second_rail_at: Option<DateTime<Utc>>,
+    /// Who marks the order paid, frozen at its first payment start
+    /// (`seller` | `automatic`); NULL before that, read as `automatic`.
+    pub payment_confirmation: Option<String>,
+    /// When a verified, matching PayPal `Completed` notification reached a
+    /// seller-confirmed order: a hint for the seller, never a transition.
+    pub gateway_payment_seen_at: Option<DateTime<Utc>>,
 }
 
 impl std::fmt::Debug for OrderRow {
@@ -1036,6 +1042,8 @@ impl OrderRow {
             payment_finality: None,
             payment_finality_at: None,
             paykit_second_rail_at: None,
+            payment_confirmation: None,
+            gateway_payment_seen_at: None,
         }
     }
 
@@ -1189,6 +1197,24 @@ impl OrderRow {
             && !self.has_delivery_address()
     }
 
+    /// Who marks this order paid: `seller` or `automatic`, NULL until its
+    /// payment starts. An order frozen before the switch existed reads
+    /// `automatic`.
+    pub fn payment_confirmation_mode(&self) -> Option<&str> {
+        match self.payment_confirmation.as_deref() {
+            Some(mode) => Some(mode),
+            None if self.payment_method.is_some() => Some("automatic"),
+            None => None,
+        }
+    }
+
+    /// Whether only the seller marks this upstream Paykit order paid. A
+    /// retired fork order keeps its creator's allocation mode instead.
+    pub fn seller_confirms_paykit_payment(&self) -> bool {
+        self.paykit_api.as_deref() == Some("upstream")
+            && self.payment_confirmation.as_deref() == Some("seller")
+    }
+
     pub fn fiat_verification(&self) -> Value {
         match self.payment_method.as_deref() {
             Some("stripe") => json!("processor"),
@@ -1212,7 +1238,7 @@ impl OrderRow {
         next_actor_for_order(
             &self.state,
             self.payment_method.is_some(),
-            self.payment_reported_at.is_some(),
+            self.payment_reported_at.is_some() || self.gateway_payment_seen_at.is_some(),
             self.seller_has_rail,
             self.paykit_request_state.as_deref(),
             None,
@@ -1295,6 +1321,8 @@ impl OrderRow {
         view["auto_complete_days"] = json!(self.auto_complete_days);
         view["return_policy"] = json!(self.return_policy);
         view["paykit_delivery_state"] = json!(self.paykit_delivery_state);
+        view["payment_confirmation"] = json!(self.payment_confirmation_mode());
+        view["gateway_payment_seen_at"] = self.gateway_payment_seen_at.map(format_timestamp).into();
         view["payment_reversed_at"] = self.payment_reversed_at.map(format_timestamp).into();
         view["payment_reversal_cancelled_at"] = self
             .payment_reversal_cancelled_at

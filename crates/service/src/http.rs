@@ -400,6 +400,7 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
         "digital_delivery_available": state.digital_delivery_available(),
         "digital_delivery_max_bytes": state.config.digital_delivery_max_bytes,
         "priv_keys_available": state.priv_keys.is_some(),
+        "payment_confirmation": state.config.payment_confirmation.as_str(),
         "commit": build_commit(),
         "paykit_rail": {
             "bitcoin_offer_available": bitcoin_offer_available,
