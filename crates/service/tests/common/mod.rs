@@ -6,6 +6,7 @@
 pub mod attestor_records;
 pub mod connector_provider;
 pub mod fx_feed;
+pub mod lock_order;
 pub mod paykit_review;
 pub mod paykit_server_67_75;
 pub mod paykit_server_u4;

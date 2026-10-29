@@ -21,8 +21,15 @@ use crate::result::{CommandFailure, HandlerResult};
 pub const REASON_INVALID_REFUND_DESTINATION: &str = "invalid_refund_destination";
 
 /// A USDT payment the seller holds (paid) or is reviewing: the two states a
-/// refund can follow. A pending, expired or abandoned payment owes nothing.
+/// refund can follow. A pending or expired payment owes nothing, except one
+/// a manual review closed as `abandoned` (by the seller or the seven-day
+/// reaper): that money was received, and the seller can still refund it.
 const REFUNDABLE_PAYMENT_STATES: [&str; 2] = ["confirmed", "manual_review"];
+
+fn refundable(state: &str, resolution_outcome: Option<&str>) -> bool {
+    REFUNDABLE_PAYMENT_STATES.contains(&state)
+        || (state == "expired" && resolution_outcome == Some("abandoned"))
+}
 
 pub async fn confirm(
     tx: &mut Transaction<'_, Postgres>,
@@ -63,14 +70,14 @@ pub async fn confirm(
             REASON_INVALID_REFUND_DESTINATION,
         )));
     }
-    let payment_state: Option<String> =
-        sqlx::query_scalar("SELECT state FROM payments WHERE order_id = $1")
+    let payment: Option<(String, Option<String>)> =
+        sqlx::query_as("SELECT state, resolution_outcome FROM payments WHERE order_id = $1")
             .bind(order.id)
             .fetch_optional(&mut **tx)
             .await?;
-    if !payment_state
-        .as_deref()
-        .is_some_and(|state| REFUNDABLE_PAYMENT_STATES.contains(&state))
+    if !payment
+        .as_ref()
+        .is_some_and(|(state, outcome)| refundable(state, outcome.as_deref()))
     {
         return Ok(Err(CommandFailure::refused(
             RefusalKind::InvalidState,

@@ -10,6 +10,7 @@ mod common;
 
 use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
+use common::lock_order::{hold_order_row, wait_until_blocked_by};
 use common::paykit_review::{
     auction_winning_order, bound_order, enable_bitcoin, into_manual_review_held,
     into_manual_review_late, into_manual_review_mismatch, poll_now, resolve_call,
@@ -29,6 +30,7 @@ use marketplace_service::workers::{
 use serde_json::{json, Value};
 use sqlx::{Acquire, PgPool};
 use std::str::FromStr;
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 const TOTAL_SATS: i64 = 51_200 + 437;
@@ -823,6 +825,55 @@ async fn unpinned_reviews_are_not_selected_by_the_sla_watcher(pool: PgPool) {
     );
 }
 
+/// The watcher asks for the same pins as the resolve endpoint: a fork review
+/// with its stack pair but no invoice id is one the seller could not resolve
+/// either, so it is neither alerted nor reaped.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_fork_review_without_an_invoice_id_is_not_selected_by_the_watcher(pool: PgPool) {
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (order_id, _reference) = into_manual_review_held(&app, &paykit, &seller, &buyer).await;
+    sqlx::query("UPDATE orders SET paykit_invoice_id = NULL WHERE id = $1")
+        .bind(Uuid::parse_str(&order_id).unwrap())
+        .execute(&pool)
+        .await
+        .expect("drop the invoice pin");
+    let entered_at: DateTime<Utc> =
+        sqlx::query_scalar("SELECT manual_review_entered_at FROM payments WHERE order_id = $1")
+            .bind(Uuid::parse_str(&order_id).unwrap())
+            .fetch_one(&pool)
+            .await
+            .expect("entry stamp");
+
+    let (status, body) = resolve_call(
+        &app,
+        &seller.token,
+        &order_id,
+        Some(Uuid::new_v4()),
+        &json!({ "outcome": "abandoned" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["reason"], json!("missing_pin"));
+
+    let (alerts, abandoned) = watch_manual_reviews(
+        &app.state,
+        entered_at + chrono::Duration::days(MANUAL_REVIEW_INACTIVITY_DAYS),
+    )
+    .await
+    .expect("watch runs");
+    assert_eq!((alerts, abandoned), (0, 0));
+    let sla_alerted: Option<DateTime<Utc>> =
+        sqlx::query_scalar("SELECT manual_review_sla_alerted_at FROM payments WHERE order_id = $1")
+            .bind(Uuid::parse_str(&order_id).unwrap())
+            .fetch_one(&pool)
+            .await
+            .expect("sla stamp");
+    assert_eq!(sla_alerted, None);
+    assert_eq!(payment_facts(&pool, &order_id).await.state, "manual_review");
+}
+
 // ---------------------------------------------------------------------------
 // The seven-day inactivity reaper
 // ---------------------------------------------------------------------------
@@ -901,6 +952,115 @@ async fn seven_day_inactivity_records_seller_unresponsive(pool: PgPool) {
     assert!(condition_seven_clear(&pool, &paykit.stack_id())
         .await
         .expect("condition 7 query"));
+}
+
+/// A held review relabelled as a USDT order, the way the refund-destination
+/// tests carry one: `payment_method = 'usdt'`.
+async fn usdt_review(app: &TestApp, paykit: &FakePaykit) -> (TestActor, String, DateTime<Utc>) {
+    let seller = new_actor(app).await;
+    let buyer = new_actor(app).await;
+    let (order_id, _reference) = into_manual_review_held(app, paykit, &seller, &buyer).await;
+    sqlx::query("UPDATE orders SET payment_method = 'usdt' WHERE id = $1")
+        .bind(Uuid::parse_str(&order_id).unwrap())
+        .execute(&app.pool)
+        .await
+        .expect("usdt method");
+    let entered_at: DateTime<Utc> =
+        sqlx::query_scalar("SELECT manual_review_entered_at FROM payments WHERE order_id = $1")
+            .bind(Uuid::parse_str(&order_id).unwrap())
+            .fetch_one(&app.pool)
+            .await
+            .expect("entry stamp");
+    (seller, order_id, entered_at)
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_usdt_review_gets_the_sla_notice_and_the_seven_day_reaper(pool: PgPool) {
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
+    let (seller, order_id, entered_at) = usdt_review(&app, &paykit).await;
+
+    let (alerts, abandoned) = watch_manual_reviews(
+        &app.state,
+        entered_at + chrono::Duration::days(MANUAL_REVIEW_INACTIVITY_DAYS),
+    )
+    .await
+    .expect("watch runs");
+    assert_eq!((alerts, abandoned), (1, 1));
+    let overdue = count(
+        &pool,
+        &format!(
+            "SELECT COUNT(*) FROM outbox WHERE kind = 'notification.bitcoin_manual_review' \
+             AND payload->>'review_reason' = 'seller_response_overdue' \
+             AND payload->>'recipient_pubky' = '{}' \
+             AND payload->>'aggregate_id' LIKE '%{order_id}'",
+            seller.pubky
+        ),
+    )
+    .await;
+    assert_eq!(overdue, 1, "the seller is told the review is overdue");
+    let facts = payment_facts(&pool, &order_id).await;
+    assert_eq!(facts.state, "expired");
+    assert_eq!(facts.outcome.as_deref(), Some("abandoned"));
+    assert_eq!(facts.basis.as_deref(), Some("seller_unresponsive"));
+    assert_eq!(order_row_state(&pool, &order_id).await.0, "cancelled");
+}
+
+/// The seller's resolve and the reaper on a USDT review, in both orders,
+/// forced: a test transaction holds the order row, the first contender is
+/// seen blocked on it (holding the payment row), the second is seen blocked
+/// behind the first, and only then is the row released. Exactly one
+/// resolution, and it is the first one's.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn usdt_seller_and_reaper_share_one_cas(pool: PgPool) {
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
+    for reaper_first in [true, false] {
+        let (seller, order_id, entered_at) = usdt_review(&app, &paykit).await;
+        let at = entered_at + chrono::Duration::days(MANUAL_REVIEW_INACTIVITY_DAYS);
+        let (holder, holder_pid) = hold_order_row(&pool, Uuid::parse_str(&order_id).unwrap()).await;
+        let second_go = Notify::new();
+        let reaper = async {
+            if !reaper_first {
+                second_go.notified().await;
+            }
+            watch_manual_reviews(&app.state, at)
+                .await
+                .expect("watch runs")
+        };
+        let body = json!({ "outcome": "paid" });
+        let resolve = async {
+            if reaper_first {
+                second_go.notified().await;
+            }
+            resolve_call(&app, &seller.token, &order_id, Some(Uuid::new_v4()), &body).await
+        };
+        let release = async {
+            let first = wait_until_blocked_by(&pool, &[holder_pid], &[]).await;
+            second_go.notify_one();
+            wait_until_blocked_by(&pool, &[holder_pid, first], &[first]).await;
+            holder.commit().await.expect("release the order row");
+        };
+        let ((_, abandoned), (status, response), ()) = tokio::join!(reaper, resolve, release);
+
+        let resolutions: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM paykit_manual_resolutions WHERE order_id = $1",
+        )
+        .bind(Uuid::parse_str(&order_id).unwrap())
+        .fetch_one(&pool)
+        .await
+        .expect("resolution count");
+        assert_eq!(resolutions, 1, "reaper first: {reaper_first}");
+        let basis = payment_facts(&pool, &order_id).await.basis;
+        if reaper_first {
+            assert_eq!(abandoned, 1);
+            assert_eq!(status, StatusCode::CONFLICT, "{response}");
+            assert_eq!(response["error"]["reason"], json!("already_resolved"));
+            assert_eq!(basis.as_deref(), Some("seller_unresponsive"));
+        } else {
+            assert_eq!(status, StatusCode::OK, "{response}");
+            assert_eq!(abandoned, 0, "the losing reaper changes nothing");
+            assert_eq!(basis.as_deref(), Some("seller_attestation"));
+        }
+    }
 }
 
 /// Seller and seven-day reaper at exactly T+7d: deterministic orderings
