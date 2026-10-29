@@ -525,6 +525,17 @@ verified PayPal notification pays the order. A seller whose shop record says
 (legal launch plan B4, `orders.seller_confirms_bitcoin`, frozen at the payment
 start; NULL when the record was unreadable, read as not opted in).
 
+**GCP prod runs pinned.** Until counsel answers (decision SC1, 29 Oct), GCP
+prod sets `PAYMENT_CONFIRMATION=automatic` and `DIGITAL_RELEASE=payment`
+explicitly, so deploying this code there changes nothing in how orders are
+paid or released. What a pinned deploy does change:
+- `/health` and the order projection carry the new fields
+  (`payment_confirmation`, `gateway_payment_seen_at`);
+- `confirm-received` refuses `payment_taken_back` while PayPal reports the
+  unpaid money refunded or reversed;
+- an opted-in seller's Bitcoin payment records its rail when it enters the
+  seller window rather than at settlement.
+
 **The seller-confirmation window.** Money that matches the order's amount
 enters `awaiting_seller_confirmation`, the hold (and an auction winner's
 reservation) is extended 24 hours, and Paykit's report only informs the seller
