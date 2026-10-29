@@ -529,9 +529,12 @@ start; NULL when the record was unreadable, read as not opted in).
 **GCP prod runs pinned.** Until counsel answers (decision SC1, 29 Oct), GCP
 prod sets `PAYMENT_CONFIRMATION=automatic` and `DIGITAL_RELEASE=payment`
 explicitly, so deploying this code there changes nothing in how orders are
-paid or released. What a pinned deploy does change:
+paid or released. That pinned state is also phase one of the two-phase 0092
+deploy, so the overlap with older binaries is safe. What a pinned deploy does change:
 - `/health` and the order projection carry the new fields
-  (`payment_confirmation`, `gateway_payment_seen_at`);
+  (`payment_confirmation`, `gateway_payment_seen_at`, `digital_release`,
+  `digital_released_at`), and a seller's `fulfillment.release_digital` is
+  refused `not_awaiting_release` (every order releases at payment);
 - `confirm-received` refuses `payment_taken_back` while PayPal reports the
   unpaid money refunded or reversed;
 - an opted-in seller's Bitcoin payment records its rail when it enters the
