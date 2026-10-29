@@ -206,32 +206,28 @@ pub async fn attach_to_views(
 /// records it. `payment_amount_minor` is what the observed transfer carried
 /// (a transfer for another amount than quoted included), so a mismatched
 /// payment is refunded as it arrived. A USD order records it in order units
-/// (cents); an order priced in anything else records the paid asset's own
-/// units (USDT0 millionths), because its price is not in a unit a USDT refund
-/// can be expressed in. `None` when the order carries no USDT terms or a USD
-/// order received an amount that is not a whole number of order units.
+/// (cents), and an amount between two cents as the lower one; an order priced
+/// in anything else records the paid asset's own units (USDT0 millionths),
+/// because its price is not in a unit a USDT refund can be expressed in.
+/// `None` when the order carries no USDT terms, or a USD order's paid exponent
+/// does not convert to cents.
 pub fn received_refund_amount_minor(order: &OrderRow) -> Option<i64> {
     let received = order.payment_amount_minor?;
     if order.currency != "USD" {
         return Some(received);
     }
-    let divisor = usdt_units_per_order_unit(order)?;
-    (received % divisor == 0).then_some(received / divisor)
+    usdt_units_per_order_unit(order).map(|divisor| received / divisor)
 }
 
 /// The most a refund of this order may record, in the units the refund is
 /// recorded in: the order total, or for a USDT-paid order the USDT it
-/// received. An underpaid USDT order is capped below its total and an overpaid
-/// one may record its excess. A USD order records whole cents, so a received
-/// amount between two cents caps at the lower one.
+/// received (`received_refund_amount_minor`). An underpaid USDT order is
+/// capped below its total and an overpaid one may record its excess.
 pub fn refund_cap_minor(order: &OrderRow) -> i64 {
-    let Some(received) = order.payment_amount_minor.filter(|_| is_usdt_order(order)) else {
+    if !is_usdt_order(order) {
         return order.total_minor;
-    };
-    if order.currency != "USD" {
-        return received;
     }
-    usdt_units_per_order_unit(order).map_or(order.total_minor, |divisor| received / divisor)
+    received_refund_amount_minor(order).unwrap_or(order.total_minor)
 }
 
 /// How many of the paid asset's base units make one order unit of a USD
@@ -329,10 +325,15 @@ mod tests {
             received_refund_amount_minor(&usdt_order("USD", Some(138_000_000))),
             Some(13_800)
         );
+        // Between two cents: the lower one, like the cap.
         assert_eq!(
-            received_refund_amount_minor(&usdt_order("USD", Some(137_000_001))),
-            None
+            received_refund_amount_minor(&usdt_order("USD", Some(137_009_999))),
+            Some(13_700)
         );
+        let mut no_paid_exponent = usdt_order("USD", Some(137_000_000));
+        no_paid_exponent.payment_exponent = None;
+        assert_eq!(received_refund_amount_minor(&no_paid_exponent), None);
+        assert_eq!(refund_cap_minor(&no_paid_exponent), 13_700);
         assert_eq!(
             received_refund_amount_minor(&usdt_order("EUR", Some(148_539_999))),
             Some(148_539_999)

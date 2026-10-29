@@ -2383,12 +2383,13 @@ async fn both_rails_without_a_named_first_rail_leaves_the_paid_rail_to_the_opera
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn a_usdt_refund_with_an_amount_that_is_not_whole_cents_is_a_typed_refusal(pool: PgPool) {
+async fn a_usdt_review_refund_between_two_cents_records_the_lower_cent(pool: PgPool) {
     let f = fixture(pool.clone(), Setup::both()).await;
     let active = active_order(&f).await;
     let order_id = active.order.order_id.clone();
     // A matched transfer for a different amount than offered goes to review
-    // with a USDT amount that is not a whole number of cents.
+    // with a USDT amount that is not a whole number of cents: the refunded
+    // resolution records it in cents rounded down, like `refund.record_external`.
     let mut leg = usdt_leg(1, true, true, false);
     leg["observed_amount"] = json!((TOTAL_USDT_UNITS + 1).to_string());
     f.paykit.set_marketplace_status(
@@ -2422,24 +2423,10 @@ async fn a_usdt_refund_with_an_amount_that_is_not_whole_cents_is_a_typed_refusal
         &json!({ "outcome": "refunded", "external_refund_reference": reference }),
     )
     .await;
-    assert_eq!(status, StatusCode::CONFLICT, "not a 500: {body}");
-    assert_eq!(
-        body["error"]["reason"],
-        json!("refund_amount_unrecordable"),
-        "{body}"
-    );
-    assert_eq!(payment_row(&pool, &order_id).await.0, "manual_review");
-    assert_eq!(facts(&pool, &order_id).await.state, "pending_payment");
-    // The seller can still close the review without recording the refund.
-    let (status, body) = resolve_call(
-        &f.app,
-        &f.seller.token,
-        &order_id,
-        Some(Uuid::new_v4()),
-        &json!({ "outcome": "abandoned", "reason": "refunded from my wallet" }),
-    )
-    .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    let view = read_order(&f, &f.buyer.token, &order_id).await;
+    assert_eq!(view["state"], json!("refunded_external"));
+    assert_eq!(view["external_refund"]["amount_minor"], json!(TOTAL_CENTS));
 }
 
 /// paykit-server's body for a confirmed USDT transfer of another amount than

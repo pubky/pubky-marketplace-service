@@ -108,7 +108,8 @@ the USDT paid (`refund_destination::received_refund_amount_minor` and
 `refund_cap_minor` treat every non-USD order that way). A USD order records
 its USDT refund in cents, capped at the USDT received in whole cents, not at
 the order total: a transfer for another amount than quoted is refunded as it
-arrived, an overpayment included.
+arrived, an overpayment included. A received amount between two cents is the
+lower cent, both as the cap and as the manual-review refunded resolution.
 
 ## What the order records
 

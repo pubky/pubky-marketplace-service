@@ -901,8 +901,8 @@ pub async fn resolve_bitcoin_payment(
                  this order as paid or abandoned and return each payment from your own wallet.",
             );
         }
-        // A USDT refund is recorded in order units: an amount that is not a
-        // whole number of them cannot be.
+        // A USDT refund is recorded in the units `received_refund_amount_minor`
+        // gives; an order whose USDT terms don't convert to them cannot record one.
         if usdt_order && refund_destination::received_refund_amount_minor(&order).is_none() {
             return audited_resolve_refusal(
                 &state,
@@ -910,9 +910,9 @@ pub async fn resolve_bitcoin_payment(
                 Some(resolution_id),
                 ErrorCode::InvalidState,
                 ReviewReason::RefundAmountUnrecordable,
-                "The USDT amount received is not a whole number of cents, so it cannot be \
-                 recorded as a refund here. Return the payment from your own wallet and \
-                 resolve this order as abandoned.",
+                "The USDT amount received cannot be expressed in this order's currency, so \
+                 it cannot be recorded as a refund here. Return the payment from your own \
+                 wallet and resolve this order as abandoned.",
             );
         }
     }
@@ -2014,7 +2014,7 @@ async fn apply_refunded_effects(
         return Err(ResolutionFailure::Internal(
             "refund requires manual confirmation".into(),
             if usdt_destination.is_some() {
-                "the order carries no whole-unit USDT quote".into()
+                "the order's USDT amount does not convert to order units".into()
             } else {
                 "the Paykit observed amount has not been frozen".into()
             },
