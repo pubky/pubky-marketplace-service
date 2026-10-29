@@ -1316,7 +1316,16 @@ pub struct RecordExternalRefundPayload {
     pub order_id: Uuid,
     pub amount_minor: i64,
     pub transaction_id: String,
+    /// The unit `amount_minor` is in, as the seller's `refund_cap` names it:
+    /// `order`, `sat` or `usdt0`. The service refuses a unit other than the
+    /// order's. Serialized only when present so older clients keep
+    /// byte-identical canonical JSON (the idempotency hash input).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amount_unit: Option<String>,
 }
+
+/// The units a recorded refund may name (`RecordExternalRefundPayload::amount_unit`).
+pub const REFUND_AMOUNT_UNITS: [&str; 3] = ["order", "sat", "usdt0"];
 
 /// `refund.confirm_destination` (buyer, own USDT order only): the Arbitrum
 /// One USDT address the seller refunds to. The service validates the shape
@@ -2366,6 +2375,13 @@ fn validate_record_external_refund(
         200,
         &mut issues,
     );
+    if payload
+        .amount_unit
+        .as_deref()
+        .is_some_and(|unit| !REFUND_AMOUNT_UNITS.contains(&unit))
+    {
+        issues.push(issue("payload.amount_unit", "Expected order, sat or usdt0"));
+    }
     if issues.is_empty() {
         Ok(CommandPayload::RecordExternalRefund(payload))
     } else {
@@ -3747,12 +3763,41 @@ mod tests {
         let issues = parse_command(&missing_evidence).expect_err("evidence under 8 chars invalid");
         assert!(issues.iter().any(|i| i.path == "payload.transaction_id"));
 
+        let unknown_unit = order_command_json(
+            "refund.record_external",
+            json!({ "order_id": order_id, "amount_minor": 100, "transaction_id": "bitcoin-tx-evidence-123", "amount_unit": "cents" }),
+        );
+        let issues = parse_command(&unknown_unit).expect_err("unknown unit invalid");
+        assert!(issues.iter().any(|i| i.path == "payload.amount_unit"));
+
         let zero_rating = order_command_json(
             "review.create",
             json!({ "order_id": order_id, "rating": 0, "text": "x" }),
         );
         let issues = parse_command(&zero_rating).expect_err("rating 0 invalid");
         assert!(issues.iter().any(|i| i.path == "payload.rating"));
+    }
+
+    #[test]
+    fn a_refund_names_its_unit_only_when_the_client_sends_one() {
+        let order_id = "00000000-0000-4000-8000-00000000aaaa";
+        let without = parse_command(&order_command_json(
+            "refund.record_external",
+            json!({ "order_id": order_id, "amount_minor": 100, "transaction_id": "bitcoin-tx-evidence-123" }),
+        ))
+        .expect("a refund without a unit parses");
+        assert_eq!(
+            without.canonical_json()["payload"],
+            json!({ "order_id": order_id, "amount_minor": 100, "transaction_id": "bitcoin-tx-evidence-123" })
+        );
+        for unit in REFUND_AMOUNT_UNITS {
+            let with = parse_command(&order_command_json(
+                "refund.record_external",
+                json!({ "order_id": order_id, "amount_minor": 100, "transaction_id": "bitcoin-tx-evidence-123", "amount_unit": unit }),
+            ))
+            .expect("a refund with a known unit parses");
+            assert_eq!(with.canonical_json()["payload"]["amount_unit"], json!(unit));
+        }
     }
 
     #[test]

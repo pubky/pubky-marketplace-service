@@ -13,8 +13,9 @@
 //! method, and an order bound through `paykit` whose payment settled on the
 //! USDT rail (`payment_asset`). An order paid any other way never reads or
 //! writes it, so a refund always follows the rail that was paid. The unit and
-//! cap of a recorded refund ([`refund_cap_minor`]) cover every rail: what was
-//! actually paid, in sats for Bitcoin.
+//! cap of a recorded refund ([`refund_terms`]) cover every rail: what was
+//! actually paid, in sats for Bitcoin. Every refund record names its unit
+//! ([`RefundUnit`]).
 
 use std::collections::HashMap;
 
@@ -26,6 +27,7 @@ use uuid::Uuid;
 
 use crate::clock::format_timestamp;
 use crate::model::OrderRow;
+use crate::payment_attempt::OfferedAssets;
 
 /// The `orders.payment_method` of an order paid in USDT.
 pub const USDT_PAYMENT_METHOD: &str = "usdt";
@@ -39,8 +41,15 @@ pub const SOURCE_BUYER_ENTERED: &str = "buyer_entered";
 /// Whether the order was paid with USDT: bound to the legacy `usdt` method,
 /// or settled on the USDT rail of a Paykit request.
 pub fn is_usdt_order(order: &OrderRow) -> bool {
-    order.payment_method.as_deref() == Some(USDT_PAYMENT_METHOD)
-        || order.payment_asset.as_deref() == Some(REFUND_ASSET)
+    is_usdt_payment(
+        order.payment_method.as_deref(),
+        order.payment_asset.as_deref(),
+    )
+}
+
+/// [`is_usdt_order`] on the two `orders` columns it reads.
+pub fn is_usdt_payment(payment_method: Option<&str>, payment_asset: Option<&str>) -> bool {
+    payment_method == Some(USDT_PAYMENT_METHOD) || payment_asset == Some(REFUND_ASSET)
 }
 
 fn hex_body(address: &str) -> Option<&str> {
@@ -230,20 +239,115 @@ pub fn recordable_refund_amount_minor(order: &OrderRow) -> Option<i64> {
     received_refund_amount_minor(order).filter(|amount| *amount > 0)
 }
 
-/// The most a refund of this order may record, in the units the refund is
-/// recorded in: the sats a Bitcoin-paid Paykit order received, whatever its
-/// price currency; for a USDT-paid order the USDT it received
-/// (`received_refund_amount_minor`), so an underpaid USDT order is capped
-/// below its total and an overpaid one may record its excess; the order total
-/// otherwise.
-pub fn refund_cap_minor(order: &OrderRow) -> i64 {
+/// The unit a recorded refund's `amount_minor` is in. Every refund written
+/// since migration 0093 names it as `external_refund.amount_unit`, and 0093
+/// named it on every refund written before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefundUnit {
+    /// The order currency's minor units.
+    Order,
+    /// Sats: the order was paid on the Bitcoin rail.
+    Sat,
+    /// USDT0 base units: a USDT-paid order priced in anything but USD.
+    Usdt0,
+}
+
+impl RefundUnit {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Order => "order",
+            Self::Sat => "sat",
+            Self::Usdt0 => "usdt0",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "order" => Some(Self::Order),
+            "sat" => Some(Self::Sat),
+            "usdt0" => Some(Self::Usdt0),
+            _ => None,
+        }
+    }
+
+    /// The unit a refund record names, if it names one.
+    pub fn of_record(record: &Value) -> Option<Self> {
+        record
+            .get("amount_unit")
+            .and_then(Value::as_str)
+            .and_then(Self::parse)
+    }
+
+    /// The unit of a refund recorded before refunds named one, as the code
+    /// that wrote it recorded it: the refunded manual-review resolution
+    /// (`by_review`) wrote a Bitcoin order's frozen observed sats, and every
+    /// other writer the order total's units, except USDT0 for a USDT-paid
+    /// order priced in anything but USD. Migration 0093 applies the same rule.
+    pub fn unnamed(usdt_paid: bool, currency: &str, by_review: bool) -> Self {
+        match (usdt_paid, by_review) {
+            (true, _) if currency != "USD" => Self::Usdt0,
+            (true, _) => Self::Order,
+            (false, true) => Self::Sat,
+            (false, false) => Self::Order,
+        }
+    }
+}
+
+/// What a refund of this order is recorded in and capped at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefundTerms {
+    pub unit: RefundUnit,
+    pub cap_minor: i64,
+    /// The decimal places of `unit`: 0 for sats, the paid asset's for
+    /// USDT0, the order's own otherwise.
+    pub exponent: i32,
+}
+
+impl RefundTerms {
+    /// The seller's projection: what a refund is entered in and up to.
+    pub fn view(&self) -> Value {
+        json!({
+            "amount_minor": self.cap_minor,
+            "unit": self.unit.as_str(),
+            "exponent": self.exponent,
+        })
+    }
+}
+
+/// What was actually paid, in the unit a refund of it is recorded in: the
+/// sats an order paid on the Bitcoin rail received, whatever its price
+/// currency; for a USDT-paid order the USDT it received
+/// ([`received_refund_amount_minor`]), in USDT0 units when it is priced in
+/// anything but USD, so an underpaid USDT order is capped below its total and
+/// an overpaid one may record its excess; the order total otherwise.
+pub fn refund_terms(order: &OrderRow) -> RefundTerms {
     if let Some(sats) = BitcoinPayment::of(order).received_sats() {
-        return sats;
+        return RefundTerms {
+            unit: RefundUnit::Sat,
+            cap_minor: sats,
+            exponent: 0,
+        };
     }
     if !is_usdt_order(order) {
-        return order.total_minor;
+        return RefundTerms {
+            unit: RefundUnit::Order,
+            cap_minor: order.total_minor,
+            exponent: order.exponent,
+        };
     }
-    received_refund_amount_minor(order).unwrap_or(order.total_minor)
+    let cap_minor = received_refund_amount_minor(order).unwrap_or(order.total_minor);
+    if order.currency != "USD" {
+        return RefundTerms {
+            unit: RefundUnit::Usdt0,
+            cap_minor,
+            exponent: order.payment_exponent.map_or(USDT0_EXPONENT, i32::from),
+        };
+    }
+    RefundTerms {
+        unit: RefundUnit::Order,
+        cap_minor,
+        exponent: order.exponent,
+    }
 }
 
 /// How many of the paid asset's base units make one order unit of a USD
@@ -252,6 +356,11 @@ fn usdt_units_per_order_unit(order: &OrderRow) -> Option<i64> {
     let paid_exponent = i32::from(order.payment_exponent?);
     let steps = u32::try_from(paid_exponent.checked_sub(order.exponent)?).ok()?;
     10_i64.checked_pow(steps).filter(|divisor| *divisor > 0)
+}
+
+/// Whether the order's own minor unit is the sat.
+pub fn priced_in_sats(currency: &str, exponent: i32) -> bool {
+    matches!((currency, exponent), ("SAT", 0) | ("BTC", 8))
 }
 
 /// The `orders` columns a Bitcoin payment's sats are read from.
@@ -264,6 +373,8 @@ pub struct BitcoinPayment<'a> {
     pub paykit_total_sats: Option<i64>,
     /// Both rails were paid (`paykit_second_rail_at`).
     pub second_rail_paid: bool,
+    /// The request offered USDT as well as Bitcoin.
+    pub usdt_offered: bool,
 }
 
 impl<'a> BitcoinPayment<'a> {
@@ -275,16 +386,22 @@ impl<'a> BitcoinPayment<'a> {
             paykit_observed_sats: order.paykit_observed_sats,
             paykit_total_sats: order.paykit_total_sats,
             second_rail_paid: order.paykit_second_rail_at.is_some(),
+            usdt_offered: usdt_offered(
+                order.paykit_accepted_assets.as_deref(),
+                order.paykit_payment_amounts.as_ref(),
+            ),
         }
     }
 
     /// The sats an order paid on the Bitcoin rail received, which its
     /// refunds are recorded in: the observed amount frozen at settlement,
     /// else the settled Bitcoin terms, else the payable its request asked
-    /// for, payment code included. `None` for any other order: USDT (its
-    /// asset is recorded at settlement), PayPal, an order with no sats on
-    /// record, and one paid on both rails with no first rail named, whose
-    /// refund follows no single rail.
+    /// for, payment code included. `None` for any other order: USDT, PayPal,
+    /// an order with no sats on record, one paid on both rails with no first
+    /// rail named, whose refund follows no single rail, and one that records
+    /// no rail while its request offered USDT and no Bitcoin was observed
+    /// (settlement leaves the asset unrecorded for an unknown denomination or
+    /// a payment that names no amount, so the money may have been USDT).
     pub fn received_sats(&self) -> Option<i64> {
         if !matches!(
             self.payment_method,
@@ -292,9 +409,10 @@ impl<'a> BitcoinPayment<'a> {
         ) {
             return None;
         }
+        let only_bitcoin_possible = self.paykit_observed_sats.is_some() || !self.usdt_offered;
         let settled_in_bitcoin = match self.payment_asset {
             Some(BITCOIN_ASSET) => true,
-            None if !self.second_rail_paid => false,
+            None if !self.second_rail_paid && only_bitcoin_possible => false,
             _ => return None,
         };
         let settled = self.payment_amount_minor.filter(|_| settled_in_bitcoin);
@@ -305,10 +423,22 @@ impl<'a> BitcoinPayment<'a> {
     }
 }
 
+/// Whether a Paykit request offered USDT: by the assets paykit-server derived
+/// for it, or by its offered amounts. A request with neither is the legacy
+/// Bitcoin-only `amount_sats` request.
+pub fn usdt_offered(accepted_assets: Option<&[String]>, payment_amounts: Option<&Value>) -> bool {
+    accepted_assets.is_some_and(|assets| assets.iter().any(|asset| asset == REFUND_ASSET))
+        || payment_amounts
+            .and_then(OfferedAssets::from_json)
+            .is_some_and(|offered| offered.usdt_units.is_some())
+}
+
 const PAYKIT_PAYMENT_METHOD: &str = "paykit";
 const BITCOIN_PAYMENT_METHOD: &str = "bitcoin";
 /// The `orders.payment_asset` of a Paykit payment settled on the Bitcoin rail.
 const BITCOIN_ASSET: &str = "BTC";
+/// USDT0's decimal places, for an order whose USDT terms name none.
+const USDT0_EXPONENT: i32 = 6;
 
 #[cfg(test)]
 mod tests {
@@ -346,37 +476,45 @@ mod tests {
 
     #[test]
     fn a_usd_usdt_refund_is_capped_at_the_usdt_received_not_the_total() {
-        // Exactly the quote: the cap is the total, as before.
+        // Exactly the quote: the cap is the total, as before, in cents.
         assert_eq!(
-            refund_cap_minor(&usdt_order("USD", Some(137_000_000))),
-            13_700
+            refund_terms(&usdt_order("USD", Some(137_000_000))),
+            RefundTerms {
+                unit: RefundUnit::Order,
+                cap_minor: 13_700,
+                exponent: 2,
+            }
         );
         // One USDT short: no more than arrived.
         assert_eq!(
-            refund_cap_minor(&usdt_order("USD", Some(136_000_000))),
+            refund_terms(&usdt_order("USD", Some(136_000_000))).cap_minor,
             13_600
         );
         // One USDT over: the excess is refundable.
         assert_eq!(
-            refund_cap_minor(&usdt_order("USD", Some(138_000_000))),
+            refund_terms(&usdt_order("USD", Some(138_000_000))).cap_minor,
             13_800
         );
         // Between two cents: the lower one, never more than arrived.
         assert_eq!(
-            refund_cap_minor(&usdt_order("USD", Some(137_009_999))),
+            refund_terms(&usdt_order("USD", Some(137_009_999))).cap_minor,
             13_700
         );
         // No USDT terms recorded: the total.
-        assert_eq!(refund_cap_minor(&usdt_order("USD", None)), 13_700);
+        assert_eq!(refund_terms(&usdt_order("USD", None)).cap_minor, 13_700);
     }
 
     #[test]
     fn a_non_usd_usdt_refund_is_capped_at_the_usdt0_received() {
         assert_eq!(
-            refund_cap_minor(&usdt_order("EUR", Some(148_539_999))),
-            148_539_999
+            refund_terms(&usdt_order("EUR", Some(148_539_999))),
+            RefundTerms {
+                unit: RefundUnit::Usdt0,
+                cap_minor: 148_539_999,
+                exponent: 6,
+            }
         );
-        assert_eq!(refund_cap_minor(&usdt_order("EUR", None)), 13_700);
+        assert_eq!(refund_terms(&usdt_order("EUR", None)).cap_minor, 13_700);
     }
 
     #[test]
@@ -384,7 +522,7 @@ mod tests {
         let mut paypal = usdt_order("USD", Some(138_000_000));
         paypal.payment_method = Some("paypal".to_string());
         paypal.payment_asset = None;
-        assert_eq!(refund_cap_minor(&paypal), 13_700);
+        assert_eq!(refund_terms(&paypal).cap_minor, 13_700);
     }
 
     #[test]
@@ -409,14 +547,14 @@ mod tests {
         for dust in [1, 9_999] {
             let order = usdt_order("USD", Some(dust));
             assert_eq!(received_refund_amount_minor(&order), Some(0));
-            assert_eq!(refund_cap_minor(&order), 0);
+            assert_eq!(refund_terms(&order).cap_minor, 0);
             assert_eq!(recordable_refund_amount_minor(&order), None);
         }
         assert_eq!(
             recordable_refund_amount_minor(&usdt_order("USD", Some(10_000))),
             Some(1)
         );
-        assert_eq!(refund_cap_minor(&no_paid_exponent), 13_700);
+        assert_eq!(refund_terms(&no_paid_exponent).cap_minor, 13_700);
         assert_eq!(
             received_refund_amount_minor(&usdt_order("EUR", Some(148_539_999))),
             Some(148_539_999)
@@ -515,6 +653,7 @@ mod tests {
             paykit_observed_sats: None,
             paykit_total_sats: Some(51_637),
             second_rail_paid: false,
+            usdt_offered: false,
         }
     }
 
@@ -562,5 +701,86 @@ mod tests {
             ..bitcoin(None)
         };
         assert_eq!(unbound.received_sats(), None);
+    }
+
+    #[test]
+    fn an_unrecorded_rail_is_bitcoin_only_when_usdt_was_not_possible() {
+        // The request offered USDT and settlement recorded no rail: the money
+        // may have been USDT, so no sats cap applies.
+        let offered_usdt = BitcoinPayment {
+            usdt_offered: true,
+            ..bitcoin(None)
+        };
+        assert_eq!(offered_usdt.received_sats(), None);
+        // Bitcoin observed on such a request is the rail that was paid.
+        let observed = BitcoinPayment {
+            paykit_observed_sats: Some(51_000),
+            ..offered_usdt
+        };
+        assert_eq!(observed.received_sats(), Some(51_000));
+        // A recorded Bitcoin rail needs no observation.
+        let recorded = BitcoinPayment {
+            payment_asset: Some(BITCOIN_ASSET),
+            ..offered_usdt
+        };
+        assert_eq!(recorded.received_sats(), Some(51_637));
+    }
+
+    #[test]
+    fn usdt_is_offered_by_accepted_assets_or_offered_amounts() {
+        assert!(!usdt_offered(None, None));
+        assert!(!usdt_offered(Some(&["BTC".to_string()]), None));
+        assert!(usdt_offered(
+            Some(&["BTC".to_string(), "USDT".to_string()]),
+            None
+        ));
+        assert!(usdt_offered(
+            None,
+            Some(&json!({"BTC": 51_637, "USDT": 40_000_000}))
+        ));
+        assert!(!usdt_offered(None, Some(&json!({"BTC": 51_637}))));
+    }
+
+    #[test]
+    fn refund_units_round_trip_and_unknown_ones_are_not_named() {
+        for unit in [RefundUnit::Order, RefundUnit::Sat, RefundUnit::Usdt0] {
+            assert_eq!(RefundUnit::parse(unit.as_str()), Some(unit));
+            assert_eq!(
+                RefundUnit::of_record(&json!({"amount_unit": unit.as_str()})),
+                Some(unit)
+            );
+        }
+        assert_eq!(RefundUnit::parse("cents"), None);
+        assert_eq!(RefundUnit::of_record(&json!({"amount_minor": 5})), None);
+        assert_eq!(RefundUnit::of_record(&json!({"amount_unit": 5})), None);
+    }
+
+    #[test]
+    fn an_unnamed_refund_is_read_in_the_unit_its_writer_used() {
+        // A refunded review recorded a Bitcoin order's frozen observed sats.
+        assert_eq!(RefundUnit::unnamed(false, "USD", true), RefundUnit::Sat);
+        assert_eq!(RefundUnit::unnamed(false, "EUR", true), RefundUnit::Sat);
+        // Every other writer recorded the order total's units.
+        assert_eq!(RefundUnit::unnamed(false, "USD", false), RefundUnit::Order);
+        // A USDT order is in USDT0 unless priced in USD, by either writer.
+        for by_review in [false, true] {
+            assert_eq!(
+                RefundUnit::unnamed(true, "EUR", by_review),
+                RefundUnit::Usdt0
+            );
+            assert_eq!(
+                RefundUnit::unnamed(true, "USD", by_review),
+                RefundUnit::Order
+            );
+        }
+    }
+
+    #[test]
+    fn sats_are_the_order_unit_of_sat_and_btc_prices_only() {
+        assert!(priced_in_sats("SAT", 0));
+        assert!(priced_in_sats("BTC", 8));
+        assert!(!priced_in_sats("BTC", 2));
+        assert!(!priced_in_sats("USD", 2));
+        assert!(!priced_in_sats("SAT", 2));
     }
 }

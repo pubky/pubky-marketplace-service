@@ -26,7 +26,9 @@ use crate::handlers::{fetch_order_for_update, finish_order_action, guard_order_a
 use crate::model::OrderRow;
 use crate::queries::ORDER_COLUMNS;
 use crate::refund_chain::{RefundChain, RefundChainOutcome};
-use crate::refund_destination::{self, is_transaction_hash, is_usdt_order};
+use crate::refund_destination::{
+    self, is_transaction_hash, is_usdt_order, RefundTerms, RefundUnit,
+};
 use crate::result::{CommandFailure, HandlerResult};
 use crate::return_policy::{self, ReturnPolicy, ReturnRefusal};
 
@@ -37,6 +39,8 @@ pub const REASON_REFUND_TRANSACTION_NOT_FOUND: &str = "refund_transaction_not_fo
 pub const REASON_REFUND_TRANSACTION_REVERTED: &str = "refund_transaction_reverted";
 pub const REASON_REFUND_TRANSACTION_WRONG_RECIPIENT: &str = "refund_transaction_wrong_recipient";
 pub const REASON_REFUND_TRANSACTION_ALREADY_RECORDED: &str = "refund_transaction_already_recorded";
+pub const REASON_REFUND_UNIT_MISMATCH: &str = "refund_unit_mismatch";
+pub const REASON_REFUND_UNIT_REQUIRED: &str = "refund_unit_required";
 pub const REASON_RETURNS_NOT_ACCEPTED: &str = "returns_not_accepted";
 pub const REASON_RETURN_WINDOW_CLOSED: &str = "return_window_closed";
 
@@ -416,6 +420,37 @@ async fn advance_return(
     .await
 }
 
+/// Refuses a refund amount whose unit is not the one the order records its
+/// refunds in. A client that names no unit predates sats refunds: it enters
+/// the order total's units, which are not sats on a fiat-priced order paid
+/// on the Bitcoin rail, so that amount is refused rather than misread.
+fn unit_refusal(
+    order: &OrderRow,
+    terms: &RefundTerms,
+    named: Option<&str>,
+) -> Option<CommandFailure> {
+    match named.map(RefundUnit::parse) {
+        Some(Some(unit)) if unit == terms.unit => None,
+        Some(_) => Some(CommandFailure::refused_with_reason(
+            crate::refusal_audit::RefusalKind::InvalidState,
+            ErrorCode::InvalidState,
+            "The refund amount is in another unit than this order's refunds; reload the order.",
+            REASON_REFUND_UNIT_MISMATCH,
+        )),
+        None if terms.unit == RefundUnit::Sat
+            && !refund_destination::priced_in_sats(&order.currency, order.exponent) =>
+        {
+            Some(CommandFailure::refused_with_reason(
+                crate::refusal_audit::RefusalKind::InvalidState,
+                ErrorCode::InvalidState,
+                "This order's refund is recorded in sats; reload the order.",
+                REASON_REFUND_UNIT_REQUIRED,
+            ))
+        }
+        None => None,
+    }
+}
+
 pub async fn record_external_refund(
     tx: &mut Transaction<'_, Postgres>,
     actor: &str,
@@ -466,8 +501,14 @@ pub async fn record_external_refund(
     let refundable_state = matches!(order.state.as_str(), "return_received" | "cancelled")
         || (order.fulfillment == "digital"
             && matches!(order.state.as_str(), "delivered" | "completed"));
+    let terms = refund_destination::refund_terms(&order);
+    if refundable_state {
+        if let Some(refusal) = unit_refusal(&order, &terms, payload.amount_unit.as_deref()) {
+            return Ok(Err(refusal));
+        }
+    }
     if !refundable_state
-        || payload.amount_minor > refund_destination::refund_cap_minor(&order)
+        || payload.amount_minor > terms.cap_minor
         || recorded_minor.is_none_or(|recorded| payload.amount_minor < recorded)
     {
         return Ok(Err(CommandFailure::refused(
@@ -574,6 +615,7 @@ pub async fn record_external_refund(
 
     let mut external_refund = json!({
         "amount_minor": payload.amount_minor,
+        "amount_unit": terms.unit.as_str(),
         "transaction_id": payload.transaction_id,
         "recorded_at": format_timestamp(now),
     });

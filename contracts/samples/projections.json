@@ -958,6 +958,11 @@
         "pickup_terms_changed": false,
         "priced_from": "listing",
         "receipt_id": null,
+        "refund_cap": {
+          "amount_minor": 51637,
+          "exponent": 0,
+          "unit": "sat"
+        },
         "return_policy": null,
         "return_request": null,
         "reviews": [],
@@ -1106,6 +1111,11 @@
             "pickup_terms_changed": false,
             "priced_from": "listing",
             "receipt_id": "<uuid:10>",
+            "refund_cap": {
+              "amount_minor": 13700,
+              "exponent": 2,
+              "unit": "order"
+            },
             "return_policy": null,
             "return_request": null,
             "reviews": [],
@@ -1265,6 +1275,11 @@
         "pickup_terms_changed": false,
         "priced_from": "listing",
         "receipt_id": null,
+        "refund_cap": {
+          "amount_minor": 51637,
+          "exponent": 0,
+          "unit": "sat"
+        },
         "return_policy": null,
         "return_request": null,
         "reviews": [],
@@ -1422,6 +1437,11 @@
         "pickup_terms_changed": false,
         "priced_from": "listing",
         "receipt_id": null,
+        "refund_cap": {
+          "amount_minor": 51637,
+          "exponent": 0,
+          "unit": "sat"
+        },
         "return_policy": null,
         "return_request": null,
         "reviews": [],
@@ -1574,6 +1594,11 @@
         "pickup_terms_changed": false,
         "priced_from": "listing",
         "receipt_id": "<uuid:13>",
+        "refund_cap": {
+          "amount_minor": 13700,
+          "exponent": 2,
+          "unit": "order"
+        },
         "return_policy": null,
         "return_request": null,
         "reviews": [],
@@ -1732,6 +1757,11 @@
         "pickup_terms_changed": false,
         "priced_from": "listing",
         "receipt_id": "<uuid:10>",
+        "refund_cap": {
+          "amount_minor": 13700,
+          "exponent": 2,
+          "unit": "order"
+        },
         "return_policy": null,
         "return_request": null,
         "reviews": [],

@@ -1173,6 +1173,10 @@ impl OrderRow {
         if actor == self.seller_pubky {
             view["paykit_observation"] = seller_observation(self.paykit_observation.as_ref());
             view["paykit_observed_sats"] = self.paykit_observed_sats.into();
+            // What `refund.record_external` takes: the amount it caps at and
+            // the unit it is entered in. Seller-only, like the observed sats
+            // a Bitcoin cap is.
+            view["refund_cap"] = crate::refund_destination::refund_terms(self).view();
             view["paykit_seller_confirmation_entered_at"] = self
                 .paykit_seller_confirmation_entered_at
                 .map(format_timestamp)

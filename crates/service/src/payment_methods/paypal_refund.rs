@@ -26,6 +26,7 @@ use crate::executor::insert_event;
 use crate::handlers::{fetch_order_for_update, insert_notification_intent};
 use crate::model::OrderRow;
 use crate::queries::ORDER_COLUMNS;
+use crate::refund_destination::RefundUnit;
 use crate::AppState;
 
 /// Order states holding a confirmed payment, from which recorded refunds
@@ -612,6 +613,7 @@ async fn record_on_order(
         (effective > 0).then(|| {
             json!({
                 "amount_minor": effective.min(order.total_minor),
+                "amount_unit": RefundUnit::Order.as_str(),
                 "transaction_id": txn,
                 "recorded_at": format_timestamp(recorded_at),
             })

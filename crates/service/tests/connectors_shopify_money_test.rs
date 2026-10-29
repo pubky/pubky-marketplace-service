@@ -638,6 +638,86 @@ async fn a_partial_refund_on_the_usdt_rail_is_mirrored_in_the_order_currency_the
     partial_refund_on_rail(pool, "usdt").await;
 }
 
+/// The queued mirror of a 50.00 USD refund the seller recorded, consumed once
+/// the order reads as paid on the Bitcoin rail (51,637 sats asked for its
+/// 137.00 total) and the record and order are as `edit` leaves them. With
+/// `by_review`, the refund is the one a refunded manual-review resolution
+/// wrote.
+async fn mirror_on_the_bitcoin_rail(pool: PgPool, edit: &str, by_review: bool) -> Value {
+    let mut s = pushed(pool).await;
+    assert_eq!(s.total_minor, 13_700);
+    s.record_refund(5_000).await;
+    sqlx::query(&format!(
+        "UPDATE orders SET payment_method = 'paykit', paykit_total_sats = 51637, {edit} \
+         WHERE id = $1::uuid"
+    ))
+    .bind(&s.order_id)
+    .execute(&s.app.pool)
+    .await
+    .expect("bitcoin rail");
+    if by_review {
+        sqlx::query(
+            "INSERT INTO paykit_manual_resolutions (order_id, payment_id, resolution_id, \
+             outcome, basis, resolved_at, resolved_by_pubky, refund_reference, request_hash, \
+             response, event_id, created_at) \
+             SELECT o.id, o.payment_id, gen_random_uuid(), 'refunded', 'seller_attestation', \
+             now(), o.seller_pubky, 'bitcoin-tx-0001', 'h', '{}', \
+             (SELECT e.id FROM events e WHERE e.aggregate_id = 'order:' || o.id::text \
+              ORDER BY e.sequence LIMIT 1), now() \
+             FROM orders o WHERE o.id = $1::uuid",
+        )
+        .bind(&s.order_id)
+        .execute(&s.app.pool)
+        .await
+        .expect("refunded resolution");
+    }
+    s.pass().await;
+    s.refund_actions().await[0].2.clone()
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_refund_recorded_in_the_order_currency_stays_in_it_on_the_bitcoin_rail(pool: PgPool) {
+    // Named by the service that recorded it.
+    let named = mirror_on_the_bitcoin_rail(pool, "revision = revision", false).await;
+    assert_eq!(named["amount_minor"], 5_000, "{named}");
+    assert!(named.get("blocked_code").is_none(), "{named}");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_unnamed_refund_is_read_in_the_unit_its_writer_used(pool: PgPool) {
+    // Recorded before refunds named a unit, or by a replica of the previous
+    // release during the rollout: `refund.record_external` wrote cents.
+    let unnamed = "external_refund = external_refund - 'amount_unit'";
+    let cents = mirror_on_the_bitcoin_rail(pool, unnamed, false).await;
+    assert_eq!(cents["amount_minor"], 5_000, "{cents}");
+    assert!(cents["basis"].is_null(), "{cents}");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_unnamed_refund_written_by_a_refunded_review_is_read_in_sats(pool: PgPool) {
+    let unnamed = "external_refund = external_refund - 'amount_unit'";
+    let sats = mirror_on_the_bitcoin_rail(pool, unnamed, true).await;
+    // 5,000 of the 51,637 sats received for 137.00 USD is 13.27 USD.
+    assert_eq!(sats["amount_minor"], 1_327, "{sats}");
+    let basis = sats["basis"].as_str().expect("a basis");
+    assert!(
+        basis.contains("5000 of the 51637 sats received for 137.00 USD"),
+        "{basis}"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_sats_refund_with_both_rails_paid_is_left_to_the_seller(pool: PgPool) {
+    let both_rails = "external_refund = jsonb_set(external_refund, '{amount_unit}', '\"sat\"'), \
+                      paykit_second_rail_at = now()";
+    let blocked = mirror_on_the_bitcoin_rail(pool, both_rails, false).await;
+    assert_eq!(
+        blocked["blocked_code"], "refund_amount_unconvertible",
+        "{blocked}"
+    );
+    assert!(blocked.get("amount_minor").is_none(), "{blocked}");
+}
+
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_refund_reversed_before_it_is_consumed_mirrors_nothing(pool: PgPool) {
     let mut s = pushed(pool).await;

@@ -24,3 +24,34 @@ ALTER TABLE orders ADD CONSTRAINT orders_external_refund_within_total CHECK (
             COALESCE(paykit_observed_sats, total_minor)
         )
 ) NOT VALID;
+
+-- Every refund now names the unit of its `amount_minor` as `amount_unit`:
+-- `order` (the order currency's minor units), `sat`, or `usdt0` (USDT0 base
+-- units). A refund recorded before this release named none, and the order
+-- columns cannot tell its unit apart from the new rule's, so it is named here
+-- the way its writer recorded it: the refunded review resolution (one
+-- `paykit_manual_resolutions` row per order, written in the refund's own
+-- transaction) recorded a Bitcoin order's frozen observed sats, every other
+-- writer the order total's units, and both recorded a USDT-paid order priced
+-- in anything but USD in USDT0 units. `RefundUnit::unnamed` reads a record a
+-- replica of the previous release writes during the rollout the same way.
+-- Only `amount_unit` is added: the amount, transaction id and `recorded_at`
+-- that identify a mirrored refund are unchanged, and a rerun skips a named
+-- record.
+UPDATE orders o
+SET external_refund = o.external_refund || jsonb_build_object(
+    'amount_unit',
+    CASE
+        WHEN (o.payment_method = 'usdt' OR o.payment_asset = 'USDT')
+            AND o.currency <> 'USD' THEN 'usdt0'
+        WHEN o.payment_method = 'usdt' OR o.payment_asset = 'USDT' THEN 'order'
+        WHEN EXISTS (
+            SELECT 1 FROM paykit_manual_resolutions r
+            WHERE r.order_id = o.id AND r.outcome = 'refunded'
+        ) THEN 'sat'
+        ELSE 'order'
+    END
+)
+WHERE o.external_refund IS NOT NULL
+  AND jsonb_typeof(o.external_refund) = 'object'
+  AND NOT (o.external_refund ? 'amount_unit');

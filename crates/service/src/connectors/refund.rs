@@ -6,23 +6,26 @@
 //! asked to do, in two steps no provider repeats:
 //!
 //! 1. **Unit.** The queued mirror carries the recorded total in the order
-//!    currency. [`OrderBasis::recorded_unit`] applies
-//!    `refund_destination::refund_cap_minor`'s rule:
-//!    - An order paid on the Bitcoin rail records its refund in the sats it
-//!      received, payment code included, whatever its price currency
+//!    currency. The record names its unit (`external_refund.amount_unit`,
+//!    [`RefundUnit`]); a record written before refunds named one is read in
+//!    the unit its writer used ([`RefundUnit::unnamed`], the rule migration
+//!    0093 backfilled). [`OrderBasis::recorded_unit`] maps it:
+//!    - `sat`: an order paid on the Bitcoin rail records its refund in the
+//!      sats it received, payment code included, whatever its price currency
 //!      ([`BitcoinPayment::received_sats`]). [`order_currency_amount`] takes
 //!      a sats refund on a sats-priced order as it is, clamped to the order
 //!      total when it includes the payment code or an overpayment, and
 //!      converts one on a fiat-priced order in proportion to the sats
 //!      received, rounded half up to the minor unit and never above the
-//!      total, with the basis for the store refund's note.
-//!    - A USDT-paid order (`payment_method = 'usdt'` or
+//!      total, with the basis for the store refund's note. A fiat-priced
+//!      order with no single Bitcoin payment to convert against is blocked.
+//!    - `usdt0`: a USDT-paid order (`payment_method = 'usdt'` or
 //!      `payment_asset = 'USDT'`) priced in anything but USD records its
 //!      refund in USDT0 units, the paid asset's own
-//!      (`refund_destination::refund_cap_minor` and
+//!      (`refund_destination::refund_terms` and
 //!      `received_refund_amount_minor`, from the multi-currency change, #133).
-//!    - Any other order records in the order currency. A USD order paid in
-//!      USDT is capped at the USDT it received instead of its total, so an
+//!    - `order`: any other refund is in the order currency. A USD order paid
+//!      in USDT is capped at the USDT it received instead of its total, so an
 //!      overpaid one can record more than its total; the store, which was
 //!      paid the total, is mirrored the total.
 //!
@@ -43,13 +46,14 @@
 //!
 //! Every connector table is created by migrations 0062 and later of the
 //! connector PRs and `CONNECTORS_ENABLED` defaults off, so no mirror queued
-//! under an older refund shape (an amount in sats or USDT with an
-//! `amount_unit` label) can exist on any database: the payload written here
-//! is the only one the worker has ever read.
+//! under an older mirror payload shape (an amount in sats or USDT with an
+//! `amount_unit` label) can exist on any database: the payload written here,
+//! always in the order currency, is the only one the worker has ever read.
 
 use super::provider::{ProviderError, StoreRefundTotals};
 #[cfg(doc)]
 use crate::refund_destination::BitcoinPayment;
+use crate::refund_destination::{priced_in_sats, RefundUnit};
 
 /// Blocked-mirror reason: the recorded unit cannot be turned into the order
 /// currency.
@@ -67,19 +71,20 @@ pub enum RecordedUnit {
     /// order's `payment_exponent`; it is `None` when the order carries no
     /// USDT terms to read it from.
     Usdt0 { exponent: Option<i32> },
-    /// Sats, of the `received` sats the order was paid.
-    Sats { received: i64 },
+    /// Sats, of the `received` sats the order was paid on the Bitcoin rail;
+    /// `None` when no single Bitcoin payment is on record.
+    Sats { received: Option<i64> },
 }
 
 /// The order facts a refund is recorded and converted against, as the
-/// `orders` columns hold them.
+/// `orders` columns hold them, and the unit the refund record is in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrderBasis {
     pub currency: String,
     pub exponent: i32,
     pub total_minor: i64,
-    pub payment_method: Option<String>,
-    pub payment_asset: Option<String>,
+    /// The unit of the recorded refund's `amount_minor`.
+    pub unit: RefundUnit,
     pub payment_exponent: Option<i32>,
     /// The order's recorded conversion to USD cents (`orders.usd_conversion_*`,
     /// migration 0061); `None` for every order bound without one.
@@ -87,6 +92,8 @@ pub struct OrderBasis {
     /// The sats the order received on the Bitcoin rail
     /// ([`BitcoinPayment::received_sats`]); `None` off that rail.
     pub received_sats: Option<i64>,
+    /// The order was paid in USDT (`refund_destination::is_usdt_payment`).
+    pub usdt_paid: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,27 +106,17 @@ pub struct UsdConversion {
 }
 
 impl OrderBasis {
-    /// The unit `refund.record_external` records this order's refunds in:
-    /// exactly `refund_destination::refund_cap_minor`'s rule, sats for an
-    /// order paid on the Bitcoin rail, USDT0 units for a USDT-paid order
-    /// priced in anything but USD, the order currency otherwise.
+    /// The recorded refund's unit, with what converting it needs.
     pub fn recorded_unit(&self) -> RecordedUnit {
-        if let Some(received) = self.received_sats {
-            return RecordedUnit::Sats { received };
-        }
-        if self.usdt_paid() && self.currency != "USD" {
-            RecordedUnit::Usdt0 {
+        match self.unit {
+            RefundUnit::Order => RecordedUnit::OrderCurrency,
+            RefundUnit::Usdt0 => RecordedUnit::Usdt0 {
                 exponent: self.payment_exponent,
-            }
-        } else {
-            RecordedUnit::OrderCurrency
+            },
+            RefundUnit::Sat => RecordedUnit::Sats {
+                received: self.received_sats,
+            },
         }
-    }
-
-    /// `refund_destination::is_usdt_order`'s rule on the basis columns.
-    fn usdt_paid(&self) -> bool {
-        self.payment_method.as_deref() == Some("usdt")
-            || self.payment_asset.as_deref() == Some("USDT")
     }
 }
 
@@ -147,7 +144,7 @@ pub fn order_currency_amount(
     recorded_minor: i64,
 ) -> Result<OrderCurrencyAmount, Blocked> {
     match order.recorded_unit() {
-        RecordedUnit::OrderCurrency if order.usdt_paid() && recorded_minor > order.total_minor => {
+        RecordedUnit::OrderCurrency if order.usdt_paid && recorded_minor > order.total_minor => {
             Ok(OrderCurrencyAmount {
                 amount_minor: order.total_minor,
                 basis: Some(format!(
@@ -209,10 +206,10 @@ pub fn order_currency_amount(
 /// as the refund is of the sats received.
 fn sats_in_order_currency(
     order: &OrderBasis,
-    received: i64,
+    received: Option<i64>,
     recorded_minor: i64,
 ) -> Result<OrderCurrencyAmount, Blocked> {
-    if is_priced_in_sats(order) {
+    if priced_in_sats(&order.currency, order.exponent) {
         let amount_minor = recorded_minor.min(order.total_minor);
         let basis = (recorded_minor > order.total_minor).then(|| {
             format!(
@@ -227,6 +224,16 @@ fn sats_in_order_currency(
             basis,
         });
     }
+    let Some(received) = received else {
+        return Err(Blocked {
+            code: REFUND_AMOUNT_UNCONVERTIBLE,
+            detail: format!(
+                "The refund is recorded in sats and the order, priced in {}, has no single \
+                 Bitcoin payment to convert it against; record it in the store by hand.",
+                order.currency
+            ),
+        });
+    };
     let Some(converted) = proportional(recorded_minor, order.total_minor, received) else {
         return Err(Blocked {
             code: REFUND_AMOUNT_UNCONVERTIBLE,
@@ -246,14 +253,6 @@ fn sats_in_order_currency(
             order.currency,
         )),
     })
-}
-
-/// SAT (exponent 0) and BTC (exponent 8) both count sats as their minor unit.
-fn is_priced_in_sats(order: &OrderBasis) -> bool {
-    matches!(
-        (order.currency.as_str(), order.exponent),
-        ("SAT", 0) | ("BTC", 8)
-    )
 }
 
 /// `recorded x total / received`, rounded half up and never above the total.
@@ -356,8 +355,7 @@ mod tests {
     fn order(
         currency: &str,
         total_minor: i64,
-        method: Option<&str>,
-        asset: Option<&str>,
+        unit: RefundUnit,
         exponent: Option<i32>,
         conversion: Option<(&str, i64)>,
     ) -> OrderBasis {
@@ -365,14 +363,14 @@ mod tests {
             currency: currency.into(),
             exponent: 2,
             total_minor,
-            payment_method: method.map(str::to_string),
-            payment_asset: asset.map(str::to_string),
+            unit,
             payment_exponent: exponent,
             conversion: conversion.map(|(pair, cents)| UsdConversion {
                 pair: pair.into(),
                 cents,
             }),
             received_sats: None,
+            usdt_paid: false,
         }
     }
 
@@ -380,7 +378,7 @@ mod tests {
         OrderBasis {
             exponent,
             received_sats: Some(received),
-            ..order(currency, total_minor, Some("paykit"), None, None, None)
+            ..order(currency, total_minor, RefundUnit::Sat, None, None)
         }
     }
 
@@ -388,8 +386,7 @@ mod tests {
         order(
             "EUR",
             13_700,
-            Some("paykit"),
-            Some("USDT"),
+            RefundUnit::Usdt0,
             Some(6),
             Some(("EURUSD", 14_854)),
         )
@@ -405,7 +402,7 @@ mod tests {
 
     #[test]
     fn an_order_in_its_own_currency_records_in_it() {
-        let usd = order("USD", 5_000, Some("usdt"), Some("USDT"), Some(6), None);
+        let usd = order("USD", 5_000, RefundUnit::Order, Some(6), None);
         assert_eq!(usd.recorded_unit(), RecordedUnit::OrderCurrency);
         assert_eq!(
             order_currency_amount(&usd, 1_234).expect("amount"),
@@ -420,7 +417,10 @@ mod tests {
     fn an_overpaid_usd_usdt_refund_mirrors_the_order_total() {
         // 50.00 USD overpaid by 1.00 USDT and refunded as received: the store
         // was paid 50.00, so it is mirrored 50.00 and says why.
-        let usd = order("USD", 5_000, Some("paykit"), Some("USDT"), Some(6), None);
+        let usd = OrderBasis {
+            usdt_paid: true,
+            ..order("USD", 5_000, RefundUnit::Order, Some(6), None)
+        };
         let mirrored = order_currency_amount(&usd, 5_100).expect("amount");
         assert_eq!(mirrored.amount_minor, 5_000);
         let basis = mirrored.basis.expect("a basis");
@@ -441,7 +441,7 @@ mod tests {
         );
         // Any other rail keeps what was recorded: its record is capped at the
         // total already.
-        let paypal = order("USD", 5_000, Some("paypal"), None, None, None);
+        let paypal = order("USD", 5_000, RefundUnit::Order, None, None);
         assert_eq!(
             order_currency_amount(&paypal, 5_100)
                 .expect("amount")
@@ -451,35 +451,59 @@ mod tests {
     }
 
     #[test]
-    fn the_unit_rule_is_the_one_refund_cap_minor_applies() {
-        // A USDT-paid order priced in anything but USD: by the legacy method,
-        // or by the asset a Paykit request settled on.
-        let by_method = order("EUR", 100, Some("usdt"), None, None, None);
-        let by_asset = order("EUR", 100, Some("paykit"), Some("USDT"), Some(6), None);
+    fn the_recorded_unit_is_the_one_the_record_names() {
         assert_eq!(
-            by_method.recorded_unit(),
+            order("EUR", 100, RefundUnit::Usdt0, None, None).recorded_unit(),
             RecordedUnit::Usdt0 { exponent: None }
         );
         assert_eq!(
-            by_asset.recorded_unit(),
+            order("EUR", 100, RefundUnit::Usdt0, Some(6), None).recorded_unit(),
             RecordedUnit::Usdt0 { exponent: Some(6) }
         );
-        // The Bitcoin rail records in sats, whatever the price currency.
         for currency in ["USD", "SAT"] {
             assert_eq!(
                 bitcoin_order(currency, 2, 100, 51_637).recorded_unit(),
-                RecordedUnit::Sats { received: 51_637 }
+                RecordedUnit::Sats {
+                    received: Some(51_637)
+                }
             );
         }
-        // Any other rail, or a USD price, records in the order currency.
-        for other in [
-            order("EUR", 100, Some("bitcoin"), None, None, None),
-            order("EUR", 100, Some("paypal"), None, None, None),
-            order("EUR", 100, None, None, None, None),
-            order("USD", 100, Some("usdt"), Some("USDT"), Some(6), None),
-        ] {
-            assert_eq!(other.recorded_unit(), RecordedUnit::OrderCurrency);
-        }
+        // An order-unit record stays in the order currency even when the
+        // order now reads as paid on the Bitcoin rail: a refund recorded
+        // before refunds were in sats.
+        let legacy = OrderBasis {
+            unit: RefundUnit::Order,
+            ..bitcoin_order("USD", 2, 13_700, 51_637)
+        };
+        assert_eq!(legacy.recorded_unit(), RecordedUnit::OrderCurrency);
+        assert_eq!(
+            order_currency_amount(&legacy, 13_700).expect("as recorded"),
+            OrderCurrencyAmount {
+                amount_minor: 13_700,
+                basis: None
+            }
+        );
+    }
+
+    #[test]
+    fn a_sats_refund_on_a_fiat_price_with_no_single_bitcoin_payment_is_blocked() {
+        // A refunded review recorded the observed sats of an order paid on
+        // both rails: no received amount to convert it against.
+        let both_rails = order("USD", 13_700, RefundUnit::Sat, None, None);
+        let blocked = order_currency_amount(&both_rails, 51_637).expect_err("blocked");
+        assert_eq!(blocked.code, REFUND_AMOUNT_UNCONVERTIBLE);
+        assert!(blocked.detail.contains("by hand"), "{}", blocked.detail);
+        // A sats price needs no conversion.
+        let sats_price = OrderBasis {
+            exponent: 0,
+            ..order("SAT", 50_000, RefundUnit::Sat, None, None)
+        };
+        assert_eq!(
+            order_currency_amount(&sats_price, 20_000)
+                .expect("as recorded")
+                .amount_minor,
+            20_000
+        );
     }
 
     #[test]
@@ -512,8 +536,7 @@ mod tests {
         let tie = order(
             "EUR",
             100,
-            Some("usdt"),
-            None,
+            RefundUnit::Usdt0,
             Some(6),
             Some(("EURUSD", 200)),
         );
@@ -544,12 +567,11 @@ mod tests {
 
     #[test]
     fn an_order_with_no_recorded_conversion_or_no_usdt_terms_is_blocked() {
-        let no_conversion = order("EUR", 13_700, Some("usdt"), None, Some(6), None);
+        let no_conversion = order("EUR", 13_700, RefundUnit::Usdt0, Some(6), None);
         let no_terms = order(
             "EUR",
             13_700,
-            Some("usdt"),
-            None,
+            RefundUnit::Usdt0,
             None,
             Some(("EURUSD", 14_854)),
         );

@@ -557,20 +557,44 @@ than its payable (`paykit_total_sats`). The refunded review resolution has
 always recorded that amount, so before 0093 it failed the constraint on an
 overpaid order. The bound only widens, so it is added `NOT VALID` like 0060's
 and every existing row already satisfies it; `lock_timeout` like 0050.
-Directly rerunnable.
+
+It then names the unit of every refund already recorded, adding
+`external_refund.amount_unit` (`order`, `sat` or `usdt0`) to each record that
+has none, the way its writer recorded it: the refunded review resolution (its
+`paykit_manual_resolutions` row is written in the refund's own transaction)
+recorded a Bitcoin order's frozen observed sats; every other writer the order
+total's units; both a USDT-paid order priced in anything but USD in USDT0
+units. A cents refund of a fiat-priced Bitcoin order therefore keeps reading
+as cents after the release starts recording such refunds in sats. Only the
+key is added: the amount, transaction id and `recorded_at` that identify a
+mirrored refund (`connectors/outbox.rs`) are unchanged, so nothing mirrors
+again. The update touches only rows holding a refund, like 0087's backfill.
+Directly rerunnable: a named record is skipped.
 
 **Deploy mode: rolling.** A binary from before 0093 caps
 `refund.record_external` at the order total, which the wider bound always
 admits, and its review resolution writes the observed amount the wider bound
-was made for. Nothing an old binary does breaks. A new binary running before
-the migration refuses, with the constraint, only a refund above the payable
-of an overpaid order, so the migration applies first, as at every boot.
+was made for. It ignores `amount_unit`, and a record it writes during the
+rollout names none; the new binary reads such a record with the same rule the
+backfill applied (`RefundUnit::unnamed`, with the
+`paykit_manual_resolutions` lookup), so it is read in the unit it was written
+in. A refund an older Shop sends without `amount_unit` is refused
+(`refund_unit_required`) when the new binary would read it as sats on a
+fiat-priced order, never recorded in the wrong unit. One path stays
+old-binary-shaped: with `CONNECTORS_ENABLED` on, an old replica's connector
+worker that consumes the event of a sats refund a new replica recorded on a
+fiat-priced order mirrors the sats as order units. Where connectors are on,
+finish the rollout (or stop the old replicas' connector workers) before
+sellers record Bitcoin refunds. A new binary running before the migration
+refuses, with the constraint, only a refund above the payable of an overpaid
+order, so the migration applies first, as at every boot.
 
 ### Backing out 0093
 
-An image from before it runs on the migrated database. Restoring 0060's bound
-would make every later write to an order holding a refund above its payable
-fail, so keep the wider bound and only forget the version:
+An image from before it runs on the migrated database and ignores
+`amount_unit`. Restoring 0060's bound would make every later write to an
+order holding a refund above its payable fail, so keep the wider bound and
+the named units, and only forget the version:
 
 ```sql
 DELETE FROM _sqlx_migrations WHERE version = 93;

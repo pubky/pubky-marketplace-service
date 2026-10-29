@@ -106,6 +106,11 @@
           "payment_reversed_at": null,
           "priced_from": "listing",
           "receipt_id": null,
+          "refund_cap": {
+            "amount_minor": 51637,
+            "exponent": 0,
+            "unit": "sat"
+          },
           "return_policy": null,
           "return_request": null,
           "revision": 4,
@@ -475,6 +480,11 @@
           "payment_reversed_at": null,
           "priced_from": "listing",
           "receipt_id": "<uuid:9>",
+          "refund_cap": {
+            "amount_minor": 51637,
+            "exponent": 0,
+            "unit": "sat"
+          },
           "return_policy": null,
           "return_request": null,
           "revision": 4,
@@ -583,6 +593,7 @@
           "edition": null,
           "external_refund": {
             "amount_minor": 51637,
+            "amount_unit": "sat",
             "recorded_at": "<timestamp:2>",
             "transaction_id": "tx-contract-refund"
           },
@@ -648,6 +659,11 @@
           "payment_reversed_at": null,
           "priced_from": "listing",
           "receipt_id": null,
+          "refund_cap": {
+            "amount_minor": 51637,
+            "exponent": 0,
+            "unit": "sat"
+          },
           "return_policy": null,
           "return_request": null,
           "revision": 5,
@@ -792,6 +808,11 @@
           "payment_reversed_at": null,
           "priced_from": "listing",
           "receipt_id": "<uuid:9>",
+          "refund_cap": {
+            "amount_minor": 51637,
+            "exponent": 0,
+            "unit": "sat"
+          },
           "return_policy": null,
           "return_request": null,
           "revision": 4,

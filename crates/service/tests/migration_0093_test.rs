@@ -3,7 +3,8 @@
 //! that already holds refunds. A refund of the observed amount above the
 //! payable is refused before the migration and recorded after it, anything
 //! above every bound is still refused, every existing refund still satisfies
-//! the constraint, and the file reruns as a no-op.
+//! the constraint, and the file reruns as a no-op. Every refund recorded
+//! before it is named in the unit its writer recorded (`amount_unit`).
 
 use std::borrow::Cow;
 
@@ -135,6 +136,252 @@ async fn the_sats_an_overpaid_order_received_are_refundable_after_the_migration(
     .execute(&pool)
     .await
     .expect("every existing refund satisfies the widened bound");
+}
+
+struct LegacyRefund {
+    currency: &'static str,
+    exponent: i32,
+    total_minor: i64,
+    payment_method: &'static str,
+    /// `payment_asset` and the terms it settled on.
+    settled: Option<(&'static str, i64, i16)>,
+    amount_minor: i64,
+    refunded_by_review: bool,
+}
+
+/// A cancelled order refunded before 0093, by `refund.record_external` or a
+/// refunded manual-review resolution, its record naming no unit.
+async fn seed_legacy_refund(pool: &PgPool, refund: &LegacyRefund) -> Uuid {
+    let order_id = Uuid::new_v4();
+    let payment_id = Uuid::new_v4();
+    let (asset, network, amount, exponent, basis) = match refund.settled {
+        Some((asset, amount, exponent)) => (
+            Some(asset),
+            Some("arbitrum-one"),
+            Some(amount),
+            Some(exponent),
+            Some("request"),
+        ),
+        None => (None, None, None, None, None),
+    };
+    sqlx::query(
+        "INSERT INTO orders (id, buyer_pubky, seller_pubky, revision, state, lines, \
+         delivery_address, subtotal_minor, shipping_minor, total_minor, currency, exponent, \
+         guarantee_policy_version, payment_id, payment_method, payment_asset, payment_network, \
+         payment_amount_minor, payment_exponent, payment_quote_basis, paykit_observed_sats, \
+         paykit_total_sats, external_refund, created_at, updated_at) \
+         VALUES ($1, 'buyer', 'seller', 4, 'refunded_external', '[]', NULL, $2, 0, $2, $3, $4, \
+         1, $5, $6, $7, $8, $9, $10, $11, $12, $12, \
+         jsonb_build_object('amount_minor', $13::bigint, 'transaction_id', 'legacy-refund-1', \
+         'recorded_at', '2026-10-01T12:00:00.000Z'), now(), now())",
+    )
+    .bind(order_id)
+    .bind(refund.total_minor)
+    .bind(refund.currency)
+    .bind(refund.exponent)
+    .bind(payment_id)
+    .bind(refund.payment_method)
+    .bind(asset)
+    .bind(network)
+    .bind(amount)
+    .bind(exponent)
+    .bind(basis)
+    .bind(refund.refunded_by_review.then_some(refund.amount_minor))
+    .bind(refund.amount_minor)
+    .execute(pool)
+    .await
+    .expect("seed refunded order");
+    if refund.refunded_by_review {
+        sqlx::query(
+            "INSERT INTO payments (id, order_id, buyer_pubky, seller_pubky, revision, adapter, \
+             state, confirmations, amount_minor, currency, exponent, created_at, updated_at) \
+             VALUES ($1, $2, 'buyer', 'seller', 1, 'paykit', 'confirmed', 0, $3, $4, $5, \
+             now(), now())",
+        )
+        .bind(payment_id)
+        .bind(order_id)
+        .bind(refund.total_minor)
+        .bind(refund.currency)
+        .bind(refund.exponent)
+        .execute(pool)
+        .await
+        .expect("seed payment");
+        let event_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO events (id, command_id, aggregate_id, revision, actor_pubky, kind, \
+             occurred_at) VALUES ($1, $2, $3, 1, 'seller', 'payment.resolved', now())",
+        )
+        .bind(event_id)
+        .bind(Uuid::new_v4())
+        .bind(format!("payment:{payment_id}"))
+        .execute(pool)
+        .await
+        .expect("seed event");
+        sqlx::query(
+            "INSERT INTO paykit_manual_resolutions (order_id, payment_id, resolution_id, \
+             outcome, basis, resolved_at, resolved_by_pubky, refund_reference, request_hash, \
+             response, event_id, created_at) \
+             VALUES ($1, $2, $3, 'refunded', 'seller_attestation', now(), 'seller', \
+             'legacy-refund-1', 'h', '{}', $4, now())",
+        )
+        .bind(order_id)
+        .bind(payment_id)
+        .bind(Uuid::new_v4())
+        .bind(event_id)
+        .execute(pool)
+        .await
+        .expect("seed refunded resolution");
+    }
+    order_id
+}
+
+async fn refund_record(pool: &PgPool, order_id: Uuid) -> Option<serde_json::Value> {
+    sqlx::query_scalar("SELECT external_refund FROM orders WHERE id = $1")
+        .bind(order_id)
+        .fetch_one(pool)
+        .await
+        .expect("order")
+}
+
+#[sqlx::test(migrations = false)]
+async fn every_earlier_refund_is_named_in_the_unit_its_writer_recorded(pool: PgPool) {
+    common::restore_0032_retention_connlimit(&pool).await;
+    through(92)
+        .run(&pool)
+        .await
+        .expect("every migration before 0093 applies");
+
+    let cases = [
+        (
+            "a refunded review recorded the Bitcoin order's observed sats",
+            LegacyRefund {
+                currency: "USD",
+                exponent: 2,
+                total_minor: 13_700,
+                payment_method: "paykit",
+                settled: None,
+                amount_minor: 13_000,
+                refunded_by_review: true,
+            },
+            "sat",
+        ),
+        (
+            "the seller recorded a Bitcoin order's refund in the order total's units",
+            LegacyRefund {
+                currency: "USD",
+                exponent: 2,
+                total_minor: 13_700,
+                payment_method: "paykit",
+                settled: Some(("BTC", 51_637, 8)),
+                amount_minor: 13_700,
+                refunded_by_review: false,
+            },
+            "order",
+        ),
+        (
+            "a USDT order priced in USD recorded in cents",
+            LegacyRefund {
+                currency: "USD",
+                exponent: 2,
+                total_minor: 13_700,
+                payment_method: "paykit",
+                settled: Some(("USDT", 137_000_000, 6)),
+                amount_minor: 13_700,
+                refunded_by_review: true,
+            },
+            "order",
+        ),
+        (
+            "a USDT order priced in EUR recorded in USDT0 units",
+            LegacyRefund {
+                currency: "EUR",
+                exponent: 2,
+                total_minor: 13_700,
+                payment_method: "paykit",
+                settled: Some(("USDT", 148_540_000, 6)),
+                amount_minor: 148_540_000,
+                refunded_by_review: false,
+            },
+            "usdt0",
+        ),
+        (
+            "the legacy USDT method priced in EUR recorded in USDT0 units",
+            LegacyRefund {
+                currency: "EUR",
+                exponent: 2,
+                total_minor: 13_700,
+                payment_method: "usdt",
+                settled: None,
+                amount_minor: 13_700,
+                refunded_by_review: false,
+            },
+            "usdt0",
+        ),
+        (
+            "a PayPal refund is in the order total's units",
+            LegacyRefund {
+                currency: "EUR",
+                exponent: 2,
+                total_minor: 13_700,
+                payment_method: "paypal",
+                settled: None,
+                amount_minor: 5_000,
+                refunded_by_review: false,
+            },
+            "order",
+        ),
+    ];
+    let mut seeded = Vec::new();
+    for (case, refund, unit) in &cases {
+        seeded.push((
+            *case,
+            seed_legacy_refund(&pool, refund).await,
+            *unit,
+            refund.amount_minor,
+        ));
+    }
+    let unrefunded = seed_overpaid_bitcoin_order(&pool).await;
+
+    ALL_MIGRATIONS.run(&pool).await.expect("0093 applies");
+
+    for (case, order_id, unit, amount_minor) in &seeded {
+        let record = refund_record(&pool, *order_id).await.expect("a refund");
+        assert_eq!(record["amount_unit"], json!(unit), "{case}");
+        assert_eq!(record["amount_minor"], json!(amount_minor), "{case}");
+        assert_eq!(record["transaction_id"], json!("legacy-refund-1"), "{case}");
+        assert_eq!(
+            record["recorded_at"],
+            json!("2026-10-01T12:00:00.000Z"),
+            "{case}: the mirrored refund's identity is unchanged"
+        );
+    }
+    assert_eq!(
+        refund_record(&pool, unrefunded).await,
+        None,
+        "an order with no refund gains none"
+    );
+
+    // A rerun leaves a named record as it is, even one it would name
+    // otherwise.
+    let (_, named, _, _) = seeded[1];
+    sqlx::query(
+        "UPDATE orders SET external_refund = external_refund || '{\"amount_unit\": \"sat\"}' \
+         WHERE id = $1",
+    )
+    .bind(named)
+    .execute(&pool)
+    .await
+    .expect("name the unit");
+    let mut tx = pool.begin().await.expect("tx");
+    sqlx::raw_sql(MIGRATION_0093)
+        .execute(&mut *tx)
+        .await
+        .expect("0093 reruns");
+    tx.commit().await.expect("commit");
+    assert_eq!(
+        refund_record(&pool, named).await.expect("a refund")["amount_unit"],
+        json!("sat")
+    );
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]

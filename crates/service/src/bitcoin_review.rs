@@ -54,7 +54,7 @@ use crate::handlers::{
 use crate::model::{seller_observation, OrderRow, PaymentRow};
 use crate::payments::PaykitObservation;
 use crate::queries::{ORDER_COLUMNS, PAYMENT_COLUMNS};
-use crate::refund_destination::{self, is_transaction_hash, is_usdt_order};
+use crate::refund_destination::{self, is_transaction_hash, is_usdt_order, RefundUnit};
 use crate::workers::SYSTEM_ACTOR;
 use crate::AppState;
 
@@ -2067,8 +2067,14 @@ async fn apply_refunded_effects(
             },
         ));
     };
+    let unit = match &usdt_destination {
+        Some(_) if order.currency != "USD" => RefundUnit::Usdt0,
+        Some(_) => RefundUnit::Order,
+        None => RefundUnit::Sat,
+    };
     let mut external_refund = json!({
         "amount_minor": amount_minor,
+        "amount_unit": unit.as_str(),
         "transaction_id": input.refund_reference,
         "recorded_at": format_timestamp(now),
     });
