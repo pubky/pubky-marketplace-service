@@ -2,15 +2,18 @@
 //!
 //! A refund Pubky records (`refund.record_external`) carries an amount in the
 //! order currency's minor units, capped at the order total, on every rail:
-//! Bitcoin and USDT included. The framework turns it into what a provider is
-//! asked to do, in two steps no provider repeats:
+//! Bitcoin and USDT included. A USDT-paid order is capped at the USDT it
+//! received instead, so an overpaid USD order can record more than its total;
+//! the store, which was paid the total, is mirrored the total. The framework
+//! turns it into what a provider is asked to do, in two steps no provider
+//! repeats:
 //!
 //! 1. **Unit.** The queued mirror carries the recorded total in the order
 //!    currency. The one exception is the one `refund_destination` makes: a
 //!    USDT-paid order (`payment_method = 'usdt'` or `payment_asset = 'USDT'`)
 //!    priced in anything but USD records its refund in USDT0 units, the paid
 //!    asset's own (`refund_destination::refund_cap_minor` and
-//!    `quoted_refund_amount_minor`, from the multi-currency change, #133).
+//!    `received_refund_amount_minor`, from the multi-currency change, #133).
 //!    [`OrderBasis::recorded_unit`] applies that same rule.
 //!    [`order_currency_amount`] converts such a refund to the order currency
 //!    with the order's own recorded conversion (`orders.usd_conversion_pair`
@@ -83,15 +86,19 @@ impl OrderBasis {
     /// a USDT-paid order priced in anything but USD, the order currency
     /// otherwise.
     pub fn recorded_unit(&self) -> RecordedUnit {
-        let usdt_paid = self.payment_method.as_deref() == Some("usdt")
-            || self.payment_asset.as_deref() == Some("USDT");
-        if usdt_paid && self.currency != "USD" {
+        if self.usdt_paid() && self.currency != "USD" {
             RecordedUnit::Usdt0 {
                 exponent: self.payment_exponent,
             }
         } else {
             RecordedUnit::OrderCurrency
         }
+    }
+
+    /// `refund_destination::is_usdt_order`'s rule on the basis columns.
+    fn usdt_paid(&self) -> bool {
+        self.payment_method.as_deref() == Some("usdt")
+            || self.payment_asset.as_deref() == Some("USDT")
     }
 }
 
@@ -119,6 +126,17 @@ pub fn order_currency_amount(
     recorded_minor: i64,
 ) -> Result<OrderCurrencyAmount, Blocked> {
     match order.recorded_unit() {
+        RecordedUnit::OrderCurrency if order.usdt_paid() && recorded_minor > order.total_minor => {
+            Ok(OrderCurrencyAmount {
+                amount_minor: order.total_minor,
+                basis: Some(format!(
+                    "Refunded {} {} in USDT, more than the order total because the buyer \
+                     overpaid; the store records the order total.",
+                    decimal(i128::from(recorded_minor), order.exponent),
+                    order.currency,
+                )),
+            })
+        }
         RecordedUnit::OrderCurrency => Ok(OrderCurrencyAmount {
             amount_minor: recorded_minor,
             basis: None,
@@ -299,6 +317,40 @@ mod tests {
                 amount_minor: 1_234,
                 basis: None
             }
+        );
+    }
+
+    #[test]
+    fn an_overpaid_usd_usdt_refund_mirrors_the_order_total() {
+        // 50.00 USD overpaid by 1.00 USDT and refunded as received: the store
+        // was paid 50.00, so it is mirrored 50.00 and says why.
+        let usd = order("USD", 5_000, Some("paykit"), Some("USDT"), Some(6), None);
+        let mirrored = order_currency_amount(&usd, 5_100).expect("amount");
+        assert_eq!(mirrored.amount_minor, 5_000);
+        let basis = mirrored.basis.expect("a basis");
+        assert!(basis.contains("51.00 USD in USDT"), "{basis}");
+        assert!(basis.contains("the buyer overpaid"), "{basis}");
+        assert_eq!(
+            amount_to_mirror(
+                mirrored.amount_minor,
+                "USD",
+                &StoreRefundTotals {
+                    currency: "USD".into(),
+                    paid_minor: 5_000,
+                    refunded_minor: 0,
+                },
+            )
+            .expect("mirrors"),
+            Some(5_000)
+        );
+        // Any other rail keeps what was recorded: its record is capped at the
+        // total already.
+        let paypal = order("USD", 5_000, Some("paypal"), None, None, None);
+        assert_eq!(
+            order_currency_amount(&paypal, 5_100)
+                .expect("amount")
+                .amount_minor,
+            5_100
         );
     }
 

@@ -903,7 +903,7 @@ pub async fn resolve_bitcoin_payment(
         }
         // A USDT refund is recorded in order units: an amount that is not a
         // whole number of them cannot be.
-        if usdt_order && refund_destination::quoted_refund_amount_minor(&order).is_none() {
+        if usdt_order && refund_destination::received_refund_amount_minor(&order).is_none() {
             return audited_resolve_refusal(
                 &state,
                 &actor.0,
@@ -1989,7 +1989,7 @@ async fn apply_refunded_effects(
         ));
     }
     // A Bitcoin refund is the frozen observed amount in sats. A USDT refund
-    // is the quoted USDT amount in order units, sent to the address the
+    // is the USDT amount received in order units, sent to the address the
     // buyer confirmed, which is copied into the record.
     let usdt_destination = if is_usdt_order(order) {
         let destination = refund_destination::fetch(tx, order.id)
@@ -2006,7 +2006,7 @@ async fn apply_refunded_effects(
         None
     };
     let amount_minor = if usdt_destination.is_some() {
-        refund_destination::quoted_refund_amount_minor(order)
+        refund_destination::received_refund_amount_minor(order)
     } else {
         order.paykit_observed_sats
     };

@@ -995,9 +995,12 @@ USDT rail); every other order is unchanged. It is not gated by
   printable characters for a Bitcoin order and unchanged; a USDT order takes the
   66-character hash instead. The address is copied into `external_refund` as
   `destination_address`, so a later change cannot rewrite the record. A
-  manual-review USDT refund records the quoted USDT amount in order units
+  manual-review USDT refund records the USDT amount received in order units
   (cents) for a USD order, and in the paid asset's own units (USDT0
-  millionths) for an order priced in anything else.
+  millionths) for an order priced in anything else. `refund.record_external`
+  on a USDT order is capped at the USDT received, not the order total: an
+  underpaid order records no more than arrived and an overpaid one may record
+  its excess. A USD order's cap is the received amount in whole cents.
 - **Checking it on Arbitrum.** With `ARBITRUM_RPC_URL` set,
   `refund.record_external` on a USDT order reads the transaction's receipt and
   sums the USDT0 it sent to the confirmed address. A hash Arbitrum doesn't show
@@ -1701,7 +1704,8 @@ and refund branches):
   seller evidence** — an external transaction id of at least 8 characters —
   and advances the order to `refunded_external`. The service never claims
   to have moved funds (ADR-0019 §7); a CHECK constraint keeps the recorded
-  amount within the order total.
+  amount within the larger of the order total and the amount paid
+  (migration 0060).
 - **PayPal refunds and reversals.** A postback-verified `Refunded`,
   `Reversed`, or `Canceled_Reversal` IPN is never dropped: it is recorded
   once per PayPal `txn_id` on the order whose gateway-verified payment is its
