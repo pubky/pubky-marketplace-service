@@ -29,6 +29,7 @@ use uuid::Uuid;
 use super::ledger;
 use super::refund;
 use super::store::{self, ConnectionRow};
+use crate::refund_destination::BitcoinPayment;
 
 pub const CURSOR_NAME: &str = "events";
 const BATCH: i64 = 200;
@@ -218,7 +219,9 @@ async fn on_payment_confirmed(
 
 /// `currency, exponent, total_minor, payment_method, payment_asset,
 /// payment_exponent, usd_conversion_pair, usd_conversion_cents,
-/// external_refund`.
+/// external_refund`, then the Bitcoin payment: `payment_amount_minor,
+/// paykit_observed_sats, paykit_total_sats` and whether
+/// `paykit_second_rail_at` is set.
 type RefundOrderRow = (
     String,
     i32,
@@ -229,6 +232,10 @@ type RefundOrderRow = (
     Option<String>,
     Option<i64>,
     Option<serde_json::Value>,
+    Option<i64>,
+    Option<i64>,
+    Option<i64>,
+    bool,
 );
 
 async fn on_refund_recorded(
@@ -254,7 +261,9 @@ async fn mirror_current_refund(
     }
     let row: Option<RefundOrderRow> = sqlx::query_as(
         "SELECT currency, exponent, total_minor, payment_method, payment_asset, \
-                payment_exponent, usd_conversion_pair, usd_conversion_cents, external_refund \
+                payment_exponent, usd_conversion_pair, usd_conversion_cents, external_refund, \
+                payment_amount_minor, paykit_observed_sats, paykit_total_sats, \
+                paykit_second_rail_at IS NOT NULL \
          FROM orders WHERE id = $1",
     )
     .bind(order_id)
@@ -270,10 +279,23 @@ async fn mirror_current_refund(
         conversion_pair,
         conversion_cents,
         external_refund,
+        payment_amount_minor,
+        paykit_observed_sats,
+        paykit_total_sats,
+        second_rail_paid,
     )) = row
     else {
         return Ok(());
     };
+    let received_sats = BitcoinPayment {
+        payment_method: payment_method.as_deref(),
+        payment_asset: payment_asset.as_deref(),
+        payment_amount_minor,
+        paykit_observed_sats,
+        paykit_total_sats,
+        second_rail_paid,
+    }
+    .received_sats();
     let basis = refund::OrderBasis {
         currency,
         exponent,
@@ -285,6 +307,7 @@ async fn mirror_current_refund(
             (Some(pair), Some(cents)) if cents > 0 => Some(refund::UsdConversion { pair, cents }),
             _ => None,
         },
+        received_sats,
     };
     let external_refund = external_refund.as_ref();
     // The refund is read as the order holds it now. A refund reversed since

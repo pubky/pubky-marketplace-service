@@ -112,7 +112,9 @@ arrived, an overpayment included. A received amount between two cents is the
 lower cent, both as the cap and as the manual-review refunded resolution. Less
 than one cent is a cap of 0: nothing can be recorded, and the resolution
 refuses with `refund_amount_unrecordable`
-(`refund_destination::recordable_refund_amount_minor`).
+(`refund_destination::recordable_refund_amount_minor`). A Bitcoin refund is
+recorded in sats and capped at the sats received, payment code included,
+whatever the price currency (`refund_destination::BitcoinPayment`).
 
 ## What the order records
 

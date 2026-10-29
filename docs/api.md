@@ -651,7 +651,10 @@ periods frozen on the order, `null` when the seller left one unset),
 `return_request`, `external_refund`, `fulfillment`,
 `payment_method`, `created_at`, `updated_at`.
 
-Money is in minor units with `currency` and `exponent`. Anything a seller
+Money is in minor units with `currency` and `exponent`, except
+`external_refund.amount_minor`, which is in what the buyer paid: sats for an
+order paid on the Bitcoin rail and USDT0 millionths for a USDT-paid order
+priced in anything but USD. Anything a seller
 needs to ship an order (the delivery address) is read through the
 participant-scoped application routes, not through this export.
 
@@ -1949,7 +1952,8 @@ set only when the buyer shared it. A cancel after the push sets the order to
 with `api_refund: false`, so the store's books match and no money moves. The
 refund amount is the refund total Pubky recorded, in the order currency's minor
 units (the framework converts anything else before a provider is called; the
-provider never converts). What is added to the store order is the difference:
+provider never converts: a sats refund of a fiat-priced order in proportion to
+the sats received, a USDT0 refund with the order's own conversion). What is added to the store order is the difference:
 the recorded total, capped at the payment, minus what the store already shows
 refunded (ours from an earlier record, or the merchant's own). A repeat, a
 smaller later record or a merchant who already refunded as much adds nothing,

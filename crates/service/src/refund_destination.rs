@@ -9,10 +9,12 @@
 //! wallet, and records the Arbitrum transaction hash. Nothing here verifies
 //! the refund on Arbitrum: it is a record of what the seller said they did.
 //!
-//! Everything in this module applies to orders paid in USDT only: the legacy
-//! `usdt` method, and an order bound through `paykit` whose payment settled
-//! on the USDT rail (`payment_asset`). An order paid any other way never
-//! reads or writes it, so a refund always follows the rail that was paid.
+//! The destination applies to orders paid in USDT only: the legacy `usdt`
+//! method, and an order bound through `paykit` whose payment settled on the
+//! USDT rail (`payment_asset`). An order paid any other way never reads or
+//! writes it, so a refund always follows the rail that was paid. The unit and
+//! cap of a recorded refund ([`refund_cap_minor`]) cover every rail: what was
+//! actually paid, in sats for Bitcoin.
 
 use std::collections::HashMap;
 
@@ -229,10 +231,15 @@ pub fn recordable_refund_amount_minor(order: &OrderRow) -> Option<i64> {
 }
 
 /// The most a refund of this order may record, in the units the refund is
-/// recorded in: the order total, or for a USDT-paid order the USDT it
-/// received (`received_refund_amount_minor`). An underpaid USDT order is
-/// capped below its total and an overpaid one may record its excess.
+/// recorded in: the sats a Bitcoin-paid Paykit order received, whatever its
+/// price currency; for a USDT-paid order the USDT it received
+/// (`received_refund_amount_minor`), so an underpaid USDT order is capped
+/// below its total and an overpaid one may record its excess; the order total
+/// otherwise.
 pub fn refund_cap_minor(order: &OrderRow) -> i64 {
+    if let Some(sats) = BitcoinPayment::of(order).received_sats() {
+        return sats;
+    }
     if !is_usdt_order(order) {
         return order.total_minor;
     }
@@ -246,6 +253,62 @@ fn usdt_units_per_order_unit(order: &OrderRow) -> Option<i64> {
     let steps = u32::try_from(paid_exponent.checked_sub(order.exponent)?).ok()?;
     10_i64.checked_pow(steps).filter(|divisor| *divisor > 0)
 }
+
+/// The `orders` columns a Bitcoin payment's sats are read from.
+#[derive(Debug, Clone, Copy)]
+pub struct BitcoinPayment<'a> {
+    pub payment_method: Option<&'a str>,
+    pub payment_asset: Option<&'a str>,
+    pub payment_amount_minor: Option<i64>,
+    pub paykit_observed_sats: Option<i64>,
+    pub paykit_total_sats: Option<i64>,
+    /// Both rails were paid (`paykit_second_rail_at`).
+    pub second_rail_paid: bool,
+}
+
+impl<'a> BitcoinPayment<'a> {
+    pub fn of(order: &'a OrderRow) -> Self {
+        Self {
+            payment_method: order.payment_method.as_deref(),
+            payment_asset: order.payment_asset.as_deref(),
+            payment_amount_minor: order.payment_amount_minor,
+            paykit_observed_sats: order.paykit_observed_sats,
+            paykit_total_sats: order.paykit_total_sats,
+            second_rail_paid: order.paykit_second_rail_at.is_some(),
+        }
+    }
+
+    /// The sats an order paid on the Bitcoin rail received, which its
+    /// refunds are recorded in: the observed amount frozen at settlement,
+    /// else the settled Bitcoin terms, else the payable its request asked
+    /// for, payment code included. `None` for any other order: USDT (its
+    /// asset is recorded at settlement), PayPal, an order with no sats on
+    /// record, and one paid on both rails with no first rail named, whose
+    /// refund follows no single rail.
+    pub fn received_sats(&self) -> Option<i64> {
+        if !matches!(
+            self.payment_method,
+            Some(PAYKIT_PAYMENT_METHOD | BITCOIN_PAYMENT_METHOD)
+        ) {
+            return None;
+        }
+        let settled_in_bitcoin = match self.payment_asset {
+            Some(BITCOIN_ASSET) => true,
+            None if !self.second_rail_paid => false,
+            _ => return None,
+        };
+        let settled = self.payment_amount_minor.filter(|_| settled_in_bitcoin);
+        self.paykit_observed_sats
+            .or(settled)
+            .or(self.paykit_total_sats)
+            .filter(|sats| *sats > 0)
+    }
+}
+
+const PAYKIT_PAYMENT_METHOD: &str = "paykit";
+const BITCOIN_PAYMENT_METHOD: &str = "bitcoin";
+/// The `orders.payment_asset` of a Paykit payment settled on the Bitcoin rail.
+const BITCOIN_ASSET: &str = "BTC";
 
 #[cfg(test)]
 mod tests {
@@ -442,5 +505,62 @@ mod tests {
         ] {
             assert!(!is_transaction_hash(&hash), "{hash:?}");
         }
+    }
+
+    fn bitcoin(asset: Option<&'static str>) -> BitcoinPayment<'static> {
+        BitcoinPayment {
+            payment_method: Some(PAYKIT_PAYMENT_METHOD),
+            payment_asset: asset,
+            payment_amount_minor: None,
+            paykit_observed_sats: None,
+            paykit_total_sats: Some(51_637),
+            second_rail_paid: false,
+        }
+    }
+
+    #[test]
+    fn a_bitcoin_refund_is_capped_at_the_sats_received() {
+        // A fork order records no asset: the payable, payment code included.
+        assert_eq!(bitcoin(None).received_sats(), Some(51_637));
+        // The observed amount wins over the payable, short or over.
+        for observed in [50_000, 60_000] {
+            let paid = BitcoinPayment {
+                paykit_observed_sats: Some(observed),
+                ..bitcoin(None)
+            };
+            assert_eq!(paid.received_sats(), Some(observed));
+        }
+        // Settled Bitcoin terms are sats (exponent 8).
+        let settled = BitcoinPayment {
+            payment_amount_minor: Some(52_000),
+            ..bitcoin(Some(BITCOIN_ASSET))
+        };
+        assert_eq!(settled.received_sats(), Some(52_000));
+        // The Bitcoin-only bind keeps the legacy method name.
+        let legacy = BitcoinPayment {
+            payment_method: Some(BITCOIN_PAYMENT_METHOD),
+            ..bitcoin(None)
+        };
+        assert_eq!(legacy.received_sats(), Some(51_637));
+    }
+
+    #[test]
+    fn no_sats_cap_off_the_bitcoin_rail() {
+        assert_eq!(bitcoin(Some(REFUND_ASSET)).received_sats(), None);
+        let both_rails = BitcoinPayment {
+            second_rail_paid: true,
+            ..bitcoin(None)
+        };
+        assert_eq!(both_rails.received_sats(), None);
+        let paypal = BitcoinPayment {
+            payment_method: Some("paypal"),
+            ..bitcoin(None)
+        };
+        assert_eq!(paypal.received_sats(), None);
+        let unbound = BitcoinPayment {
+            paykit_total_sats: None,
+            ..bitcoin(None)
+        };
+        assert_eq!(unbound.received_sats(), None);
     }
 }

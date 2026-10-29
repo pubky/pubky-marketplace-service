@@ -1764,9 +1764,18 @@ and refund branches):
   `return_received`/`cancelled`) records **independently supplied
   seller evidence** — an external transaction id of at least 8 characters —
   and advances the order to `refunded_external`. The service never claims
-  to have moved funds (ADR-0019 §7); a CHECK constraint keeps the recorded
-  amount within the larger of the order total and the amount paid
-  (migration 0060).
+  to have moved funds (ADR-0019 §7). The amount is in what was actually
+  paid and capped at it (`refund_destination::refund_cap_minor`): for an
+  order paid on the Bitcoin rail, sats, at most the sats received (the
+  observed amount frozen at settlement, else the payable, payment code
+  included), whatever the price currency, as the refunded review resolution
+  records it; for a USDT-paid order, at most the USDT received, in USDT0
+  millionths for an order priced in anything but USD and in whole cents
+  (rounded down) for a USD one, so an overpaid USD order may record more
+  than its total; otherwise the order total. A CHECK constraint
+  (`orders_external_refund_within_total`, migration 0093) keeps the recorded
+  amount within the largest of the order total, the amount paid and the
+  sats observed.
 - **PayPal refunds and reversals.** A postback-verified `Refunded`,
   `Reversed`, or `Canceled_Reversal` IPN is never dropped: it is recorded
   once per PayPal `txn_id` on the order whose gateway-verified payment is its

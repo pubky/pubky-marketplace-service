@@ -548,6 +548,34 @@ DELETE FROM _sqlx_migrations WHERE version = 92;
 The catalog row stays; the table is append-only and the row is harmless to an
 older image.
 
+## Bitcoin refunds in the sats received (0093)
+
+0093 drops and re-adds `orders_external_refund_within_total` with one more
+bound, `COALESCE(paykit_observed_sats, total_minor)`: a Bitcoin refund is
+recorded in the sats the order received, and an overpaid order observed more
+than its payable (`paykit_total_sats`). The refunded review resolution has
+always recorded that amount, so before 0093 it failed the constraint on an
+overpaid order. The bound only widens, so it is added `NOT VALID` like 0060's
+and every existing row already satisfies it; `lock_timeout` like 0050.
+Directly rerunnable.
+
+**Deploy mode: rolling.** A binary from before 0093 caps
+`refund.record_external` at the order total, which the wider bound always
+admits, and its review resolution writes the observed amount the wider bound
+was made for. Nothing an old binary does breaks. A new binary running before
+the migration refuses, with the constraint, only a refund above the payable
+of an overpaid order, so the migration applies first, as at every boot.
+
+### Backing out 0093
+
+An image from before it runs on the migrated database. Restoring 0060's bound
+would make every later write to an order holding a refund above its payable
+fail, so keep the wider bound and only forget the version:
+
+```sql
+DELETE FROM _sqlx_migrations WHERE version = 93;
+```
+
 ## Numbers claimed by open pull requests
 
 `main` has 0001 to 0079 (0068 and 0069 were never used). A new migration must
@@ -564,6 +592,7 @@ assume it is free:
 | 0090 | `0090_attestor_publisher.sql` | the attestor publisher's tables and the `returned` annotation outcome |
 | 0091 | `0091_seller_confirmed_payment.sql` | `orders.payment_confirmation` and `orders.gateway_payment_seen_at` (seller-confirmed payment) |
 | 0092 | `0092_digital_release.sql` | `orders.digital_release`, `orders.digital_released_at` and the `release_digital` command kind (digital release split from payment), stacked on 0091 |
+| 0093 | `0093_bitcoin_refund_received_sats.sql` | Bitcoin refunds in the sats received, stacked on 0092 |
 
 This table describes unmerged work and goes stale as pull requests land; trust
 `crates/service/migrations/` on `main` over it. sqlx does not reject two files
