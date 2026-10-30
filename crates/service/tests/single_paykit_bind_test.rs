@@ -2583,12 +2583,13 @@ async fn both_rails_without_a_named_first_rail_leaves_the_paid_rail_to_the_opera
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn a_usdt_refund_with_an_amount_that_is_not_whole_cents_is_a_typed_refusal(pool: PgPool) {
+async fn a_usdt_review_refund_between_two_cents_records_the_lower_cent(pool: PgPool) {
     let f = fixture(pool.clone(), Setup::both()).await;
     let active = active_order(&f).await;
     let order_id = active.order.order_id.clone();
     // A matched transfer for a different amount than offered goes to review
-    // with a USDT amount that is not a whole number of cents.
+    // with a USDT amount that is not a whole number of cents: the refunded
+    // resolution records it in cents rounded down, like `refund.record_external`.
     let mut leg = usdt_leg(1, true, true, false);
     leg["observed_amount"] = json!((TOTAL_USDT_UNITS + 1).to_string());
     f.paykit.set_marketplace_status(
@@ -2622,23 +2623,275 @@ async fn a_usdt_refund_with_an_amount_that_is_not_whole_cents_is_a_typed_refusal
         &json!({ "outcome": "refunded", "external_refund_reference": reference }),
     )
     .await;
-    assert_eq!(status, StatusCode::CONFLICT, "not a 500: {body}");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let view = read_order(&f, &f.buyer.token, &order_id).await;
+    assert_eq!(view["state"], json!("refunded_external"));
+    assert_eq!(view["external_refund"]["amount_minor"], json!(TOTAL_CENTS));
+}
+
+/// paykit-server's body for a confirmed USDT transfer of another amount than
+/// it offered (`usdt-underpaid.json`): not matched, and no rail paid.
+fn mismatched_usdt_status(active: &Active, leg: Value) -> Value {
+    status_body(
+        active.invoice,
+        active.deadline,
+        StatusSpec {
+            payment_state: "confirmed",
+            bitcoin: None,
+            usdt: Some(leg),
+            paid_asset: None,
+        },
+    )
+}
+
+/// A USD order whose USDT transfer carried `received` units instead of the
+/// quote: manual review, the buyer's refund address, then the seller closes
+/// the review as abandoned, which cancels the order with the money still to
+/// return.
+async fn abandoned_mismatched_usdt_order(
+    f: &Fixture,
+    received: u64,
+    command_number: u64,
+) -> String {
+    let active = active_order(f).await;
+    let order_id = active.order.order_id.clone();
+    let mut leg = usdt_leg(1, false, true, false);
+    leg["observed_amount"] = json!(received.to_string());
+    f.paykit
+        .set_marketplace_status(active.invoice, mismatched_usdt_status(&active, leg));
+    poll_now(&f.app, at(1)).await;
+    let (state, _, _, _, reason) = payment_row(&f.app.pool, &order_id).await;
+    assert_eq!(
+        (state.as_str(), reason.as_deref()),
+        ("manual_review", Some("amount_mismatch"))
+    );
+    let revision = facts(&f.app.pool, &order_id).await.revision;
+    let (status, body) = execute(
+        &f.app,
+        &f.buyer.token,
+        &order_command(
+            "refund.confirm_destination",
+            &order_id,
+            revision,
+            json!({ "address": "0xd8da6bf26964af9d7eed9e03e53415d37aa96045" }),
+            command_number,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "address confirmed: {body}");
+    let (status, body) = resolve_call(
+        &f.app,
+        &f.seller.token,
+        &order_id,
+        Some(Uuid::new_v4()),
+        &json!({ "outcome": "abandoned", "reason": "returning it from my wallet" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "abandoned: {body}");
+    assert_eq!(facts(&f.app.pool, &order_id).await.state, "cancelled");
+    order_id
+}
+
+async fn record_refund(
+    f: &Fixture,
+    order_id: &str,
+    amount_minor: u64,
+    transaction_id: &str,
+    command_number: u64,
+) -> (StatusCode, Value) {
+    let revision = facts(&f.app.pool, order_id).await.revision;
+    execute(
+        &f.app,
+        &f.seller.token,
+        &order_command(
+            "refund.record_external",
+            order_id,
+            revision,
+            json!({ "amount_minor": amount_minor, "transaction_id": transaction_id }),
+            command_number,
+        ),
+    )
+    .await
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_underpaid_usdt_refund_is_capped_at_what_arrived_not_the_total(pool: PgPool) {
+    let f = fixture(pool.clone(), Setup::both()).await;
+    // One USDT short of the 137.00 quote.
+    let order_id = abandoned_mismatched_usdt_order(&f, TOTAL_USDT_UNITS - 1_000_000, 51).await;
+    let received_cents = TOTAL_CENTS - 100;
+    let view = read_order(&f, &f.buyer.token, &order_id).await;
+    assert_eq!(
+        view["payment_amount_minor"],
+        json!(TOTAL_USDT_UNITS - 1_000_000)
+    );
+
+    let hash = format!("0x{}", "a1b2".repeat(16));
+    let (status, body) = record_refund(&f, &order_id, TOTAL_CENTS, &hash, 52).await;
+    assert_eq!(status, StatusCode::CONFLICT, "more than arrived: {body}");
+    assert_eq!(body["error"]["code"], json!("INVALID_STATE"), "{body}");
+    assert_eq!(facts(&pool, &order_id).await.state, "cancelled");
+
+    let (status, body) = record_refund(&f, &order_id, received_cents, &hash, 53).await;
+    assert_eq!(status, StatusCode::OK, "what arrived: {body}");
+    let view = read_order(&f, &f.buyer.token, &order_id).await;
+    assert_eq!(view["state"], json!("refunded_external"));
+    assert_eq!(
+        view["external_refund"]["amount_minor"],
+        json!(received_cents)
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_overpaid_usdt_refund_may_return_the_excess(pool: PgPool) {
+    let f = fixture(pool.clone(), Setup::both()).await;
+    // One USDT over the 137.00 quote.
+    let order_id = abandoned_mismatched_usdt_order(&f, TOTAL_USDT_UNITS + 1_000_000, 61).await;
+    let received_cents = TOTAL_CENTS + 100;
+
+    let hash = format!("0x{}", "c3d4".repeat(16));
+    let (status, body) = record_refund(&f, &order_id, received_cents + 1, &hash, 62).await;
+    assert_eq!(status, StatusCode::CONFLICT, "more than arrived: {body}");
+    assert_eq!(body["error"]["code"], json!("INVALID_STATE"), "{body}");
+
+    let (status, body) = record_refund(&f, &order_id, received_cents, &hash, 63).await;
+    assert_eq!(status, StatusCode::OK, "the whole amount received: {body}");
+    let view = read_order(&f, &f.seller.token, &order_id).await;
+    assert_eq!(view["state"], json!("refunded_external"));
+    assert_eq!(
+        view["external_refund"]["amount_minor"],
+        json!(received_cents)
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_overpaid_usdt_review_resolved_as_refunded_records_what_arrived(pool: PgPool) {
+    let f = fixture(pool.clone(), Setup::both()).await;
+    let active = active_order(&f).await;
+    let order_id = active.order.order_id.clone();
+    let mut leg = usdt_leg(1, false, true, false);
+    leg["observed_amount"] = json!((TOTAL_USDT_UNITS + 1_000_000).to_string());
+    f.paykit
+        .set_marketplace_status(active.invoice, mismatched_usdt_status(&active, leg));
+    poll_now(&f.app, at(1)).await;
+    let revision = facts(&pool, &order_id).await.revision;
+    let (status, body) = execute(
+        &f.app,
+        &f.buyer.token,
+        &order_command(
+            "refund.confirm_destination",
+            &order_id,
+            revision,
+            json!({ "address": "0xd8da6bf26964af9d7eed9e03e53415d37aa96045" }),
+            81,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = resolve_call(
+        &f.app,
+        &f.seller.token,
+        &order_id,
+        Some(Uuid::new_v4()),
+        &json!({
+            "outcome": "refunded",
+            "external_refund_reference": format!("0x{}", "0a1b".repeat(16)),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let view = read_order(&f, &f.buyer.token, &order_id).await;
+    assert_eq!(view["state"], json!("refunded_external"));
+    assert_eq!(
+        view["external_refund"]["amount_minor"],
+        json!(TOTAL_CENTS + 100)
+    );
+}
+
+/// A USD order whose USDT transfer carried `dust` millionths, less than one
+/// cent: the refunded resolution has no cent to record and refuses with
+/// `refund_amount_unrecordable`, leaving the review open.
+async fn a_usdt_review_refund_of_dust_is_unrecordable(pool: PgPool, dust: u64) {
+    let f = fixture(pool.clone(), Setup::both()).await;
+    let active = active_order(&f).await;
+    let order_id = active.order.order_id.clone();
+    let mut leg = usdt_leg(1, false, true, false);
+    leg["observed_amount"] = json!(dust.to_string());
+    f.paykit
+        .set_marketplace_status(active.invoice, mismatched_usdt_status(&active, leg));
+    poll_now(&f.app, at(1)).await;
+    assert_eq!(payment_row(&pool, &order_id).await.0, "manual_review");
+    let before = facts(&pool, &order_id).await;
+    assert_eq!(before.payment_asset.as_deref(), Some("USDT"));
+    let (status, body) = execute(
+        &f.app,
+        &f.buyer.token,
+        &order_command(
+            "refund.confirm_destination",
+            &order_id,
+            before.revision,
+            json!({ "address": "0xd8da6bf26964af9d7eed9e03e53415d37aa96045" }),
+            91,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let revision = facts(&pool, &order_id).await.revision;
+    let (status, body) = resolve_call(
+        &f.app,
+        &f.seller.token,
+        &order_id,
+        Some(Uuid::new_v4()),
+        &json!({
+            "outcome": "refunded",
+            "external_refund_reference": format!("0x{}", "d0d0".repeat(16)),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(
         body["error"]["reason"],
         json!("refund_amount_unrecordable"),
         "{body}"
     );
     assert_eq!(payment_row(&pool, &order_id).await.0, "manual_review");
-    assert_eq!(facts(&pool, &order_id).await.state, "pending_payment");
-    // The seller can still close the review without recording the refund.
-    let (status, body) = resolve_call(
-        &f.app,
-        &f.seller.token,
-        &order_id,
-        Some(Uuid::new_v4()),
-        &json!({ "outcome": "abandoned", "reason": "refunded from my wallet" }),
-    )
-    .await;
+    let after = facts(&pool, &order_id).await;
+    assert_eq!(after.revision, revision, "the order is untouched");
+    let view = read_order(&f, &f.seller.token, &order_id).await;
+    assert_eq!(view["external_refund"], Value::Null);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_usdt_review_refund_of_one_millionth_is_unrecordable(pool: PgPool) {
+    a_usdt_review_refund_of_dust_is_unrecordable(pool, 1).await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_usdt_review_refund_just_short_of_a_cent_is_unrecordable(pool: PgPool) {
+    a_usdt_review_refund_of_dust_is_unrecordable(pool, 9_999).await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_recorded_refund_of_usdt_dust_is_refused_with_a_typed_error(pool: PgPool) {
+    let f = fixture(pool.clone(), Setup::both()).await;
+    // 0.009999 USDT arrived: the cap is 0 cents, so no record fits.
+    let order_id = abandoned_mismatched_usdt_order(&f, 9_999, 95).await;
+    let hash = format!("0x{}", "d1d1".repeat(16));
+    let (status, body) = record_refund(&f, &order_id, 1, &hash, 96).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], json!("INVALID_STATE"), "{body}");
+    assert_eq!(facts(&pool, &order_id).await.state, "cancelled");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_usdt_amount_between_two_cents_caps_the_refund_at_the_lower_cent(pool: PgPool) {
+    let f = fixture(pool.clone(), Setup::both()).await;
+    // 138.009999 USDT: 138.00 is what can be recorded in cents.
+    let order_id = abandoned_mismatched_usdt_order(&f, TOTAL_USDT_UNITS + 1_009_999, 71).await;
+    let hash = format!("0x{}", "e5f6".repeat(16));
+    let (status, body) = record_refund(&f, &order_id, TOTAL_CENTS + 101, &hash, 72).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let (status, body) = record_refund(&f, &order_id, TOTAL_CENTS + 100, &hash, 73).await;
     assert_eq!(status, StatusCode::OK, "{body}");
 }
 

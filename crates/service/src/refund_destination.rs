@@ -202,38 +202,163 @@ pub async fn attach_to_views(
     Ok(())
 }
 
-/// The USDT amount the order was quoted, as a refund of the whole payment
-/// records it. A USD order records it in order units (cents); an order priced
+/// The USDT amount the order received, as a refund of the whole payment
+/// records it. `payment_amount_minor` is what the observed transfer carried
+/// (a transfer for another amount than quoted included), so a mismatched
+/// payment is refunded as it arrived. A USD order records it in order units
+/// (cents), and an amount between two cents as the lower one; an order priced
 /// in anything else records the paid asset's own units (USDT0 millionths),
 /// because its price is not in a unit a USDT refund can be expressed in.
-/// `None` when the order carries no USDT terms or a USD quote is not a whole
-/// number of order units.
-pub fn quoted_refund_amount_minor(order: &OrderRow) -> Option<i64> {
-    let sent = order.payment_amount_minor?;
+/// `None` when the order carries no USDT terms, or a USD order's paid exponent
+/// does not convert to cents.
+pub fn received_refund_amount_minor(order: &OrderRow) -> Option<i64> {
+    let received = order.payment_amount_minor?;
     if order.currency != "USD" {
-        return Some(sent);
+        return Some(received);
     }
-    let sent_exponent = i32::from(order.payment_exponent?);
-    let steps = u32::try_from(sent_exponent.checked_sub(order.exponent)?).ok()?;
-    let divisor = 10_i64.checked_pow(steps)?;
-    (sent % divisor == 0).then_some(sent / divisor)
+    usdt_units_per_order_unit(order).map(|divisor| received / divisor)
+}
+
+/// The USDT amount a refund of the whole payment records, when it records
+/// anything: `None` for no USDT terms, an unconvertible exponent, and a USD
+/// order paid less than one cent, which floors to 0 and fails the refund
+/// constraint. The cap stays [`received_refund_amount_minor`]'s 0, so a
+/// seller's record of such an order is refused too.
+pub fn recordable_refund_amount_minor(order: &OrderRow) -> Option<i64> {
+    received_refund_amount_minor(order).filter(|amount| *amount > 0)
 }
 
 /// The most a refund of this order may record, in the units the refund is
-/// recorded in: the order total, or for a USDT-paid order priced in anything
-/// but USD the USDT0 amount that was paid.
+/// recorded in: the order total, or for a USDT-paid order the USDT it
+/// received (`received_refund_amount_minor`). An underpaid USDT order is
+/// capped below its total and an overpaid one may record its excess.
 pub fn refund_cap_minor(order: &OrderRow) -> i64 {
-    match (is_usdt_order(order), order.currency.as_str()) {
-        (true, currency) if currency != "USD" => {
-            order.payment_amount_minor.unwrap_or(order.total_minor)
-        }
-        _ => order.total_minor,
+    if !is_usdt_order(order) {
+        return order.total_minor;
     }
+    received_refund_amount_minor(order).unwrap_or(order.total_minor)
+}
+
+/// How many of the paid asset's base units make one order unit of a USD
+/// order: `10^(payment_exponent - exponent)`.
+fn usdt_units_per_order_unit(order: &OrderRow) -> Option<i64> {
+    let paid_exponent = i32::from(order.payment_exponent?);
+    let steps = u32::try_from(paid_exponent.checked_sub(order.exponent)?).ok()?;
+    10_i64.checked_pow(steps).filter(|divisor| *divisor > 0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A 137.00 order paid on the USDT rail with `received` USDT0 millionths.
+    fn usdt_order(currency: &str, received: Option<i64>) -> OrderRow {
+        let mut row = OrderRow::new_for_insert(
+            Uuid::nil(),
+            None,
+            None,
+            "buyer".to_string(),
+            "seller".to_string(),
+            true,
+            json!([]),
+            None,
+            13_700,
+            0,
+            13_700,
+            currency.to_string(),
+            2,
+            Uuid::nil(),
+            false,
+            None,
+            "shipping".to_string(),
+            Utc::now(),
+            "listing".to_string(),
+        );
+        row.payment_method = Some("paykit".to_string());
+        row.payment_asset = Some(REFUND_ASSET.to_string());
+        row.payment_amount_minor = received;
+        row.payment_exponent = Some(6);
+        row
+    }
+
+    #[test]
+    fn a_usd_usdt_refund_is_capped_at_the_usdt_received_not_the_total() {
+        // Exactly the quote: the cap is the total, as before.
+        assert_eq!(
+            refund_cap_minor(&usdt_order("USD", Some(137_000_000))),
+            13_700
+        );
+        // One USDT short: no more than arrived.
+        assert_eq!(
+            refund_cap_minor(&usdt_order("USD", Some(136_000_000))),
+            13_600
+        );
+        // One USDT over: the excess is refundable.
+        assert_eq!(
+            refund_cap_minor(&usdt_order("USD", Some(138_000_000))),
+            13_800
+        );
+        // Between two cents: the lower one, never more than arrived.
+        assert_eq!(
+            refund_cap_minor(&usdt_order("USD", Some(137_009_999))),
+            13_700
+        );
+        // No USDT terms recorded: the total.
+        assert_eq!(refund_cap_minor(&usdt_order("USD", None)), 13_700);
+    }
+
+    #[test]
+    fn a_non_usd_usdt_refund_is_capped_at_the_usdt0_received() {
+        assert_eq!(
+            refund_cap_minor(&usdt_order("EUR", Some(148_539_999))),
+            148_539_999
+        );
+        assert_eq!(refund_cap_minor(&usdt_order("EUR", None)), 13_700);
+    }
+
+    #[test]
+    fn an_order_paid_another_way_is_capped_at_its_total() {
+        let mut paypal = usdt_order("USD", Some(138_000_000));
+        paypal.payment_method = Some("paypal".to_string());
+        paypal.payment_asset = None;
+        assert_eq!(refund_cap_minor(&paypal), 13_700);
+    }
+
+    #[test]
+    fn the_whole_refund_is_the_usdt_received_in_recorded_units() {
+        assert_eq!(
+            received_refund_amount_minor(&usdt_order("USD", Some(136_000_000))),
+            Some(13_600)
+        );
+        assert_eq!(
+            received_refund_amount_minor(&usdt_order("USD", Some(138_000_000))),
+            Some(13_800)
+        );
+        // Between two cents: the lower one, like the cap.
+        assert_eq!(
+            received_refund_amount_minor(&usdt_order("USD", Some(137_009_999))),
+            Some(13_700)
+        );
+        let mut no_paid_exponent = usdt_order("USD", Some(137_000_000));
+        no_paid_exponent.payment_exponent = None;
+        assert_eq!(received_refund_amount_minor(&no_paid_exponent), None);
+        // Less than a cent floors to 0: capped at 0, never recordable.
+        for dust in [1, 9_999] {
+            let order = usdt_order("USD", Some(dust));
+            assert_eq!(received_refund_amount_minor(&order), Some(0));
+            assert_eq!(refund_cap_minor(&order), 0);
+            assert_eq!(recordable_refund_amount_minor(&order), None);
+        }
+        assert_eq!(
+            recordable_refund_amount_minor(&usdt_order("USD", Some(10_000))),
+            Some(1)
+        );
+        assert_eq!(refund_cap_minor(&no_paid_exponent), 13_700);
+        assert_eq!(
+            received_refund_amount_minor(&usdt_order("EUR", Some(148_539_999))),
+            Some(148_539_999)
+        );
+    }
 
     // The EIP-55 reference vectors (EIP-55, "Test Cases").
     const CHECKSUMMED: [&str; 8] = [

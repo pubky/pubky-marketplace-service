@@ -986,9 +986,13 @@ working unchanged (Bitcoin only, its projection unchanged).
   `error.reason`): `refund_rail_unknown` (both rails were paid and
   paykit-server named no first one, so no rail was recorded and a refund has
   none to follow: resolve as `paid` or `abandoned` and return each payment
-  from the seller's wallet) and `refund_amount_unrecordable` (a USDT amount on
-  a USD order that is not a whole number of cents, so it cannot be recorded as
-  a refund: return it from the wallet and resolve as `abandoned`).
+  from the seller's wallet) and `refund_amount_unrecordable` (a USD order
+  whose USDT terms carry no paid exponent that converts to cents, or that
+  received less than one cent, so the amount cannot be recorded as a refund:
+  return it from the wallet and resolve as `abandoned`). A USDT amount between
+  two cents is not refused: it is recorded as the lower cent, as
+  `refund.record_external` caps it. Less than one cent caps
+  `refund.record_external` at 0, so a seller's record is refused as well.
 - **Finality bound.** A USDT payment is polled for finality for 7 days from
   `payment_finality_at` while `pending` or `reverted`. A payment still in either state past
   that bound is held for an operator (`needs_review`, `detected_unconfirmed`,
@@ -1051,9 +1055,12 @@ USDT rail); every other order is unchanged. It is not gated by
   printable characters for a Bitcoin order and unchanged; a USDT order takes the
   66-character hash instead. The address is copied into `external_refund` as
   `destination_address`, so a later change cannot rewrite the record. A
-  manual-review USDT refund records the quoted USDT amount in order units
-  (cents) for a USD order, and in the paid asset's own units (USDT0
-  millionths) for an order priced in anything else.
+  manual-review USDT refund records the USDT amount received in order units
+  (cents, rounded down) for a USD order, and in the paid asset's own units (USDT0
+  millionths) for an order priced in anything else. `refund.record_external`
+  on a USDT order is capped at the USDT received, not the order total: an
+  underpaid order records no more than arrived and an overpaid one may record
+  its excess. A USD order's cap is the received amount in whole cents.
 - **Checking it on Arbitrum.** With `ARBITRUM_RPC_URL` set,
   `refund.record_external` on a USDT order reads the transaction's receipt and
   sums the USDT0 it sent to the confirmed address. A hash Arbitrum doesn't show
@@ -1758,7 +1765,8 @@ and refund branches):
   seller evidence** — an external transaction id of at least 8 characters —
   and advances the order to `refunded_external`. The service never claims
   to have moved funds (ADR-0019 §7); a CHECK constraint keeps the recorded
-  amount within the order total.
+  amount within the larger of the order total and the amount paid
+  (migration 0060).
 - **PayPal refunds and reversals.** A postback-verified `Refunded`,
   `Reversed`, or `Canceled_Reversal` IPN is never dropped: it is recorded
   once per PayPal `txn_id` on the order whose gateway-verified payment is its
