@@ -94,7 +94,10 @@ async fn refunded(pool: &PgPool, order_id: Uuid) -> Option<i64> {
 #[sqlx::test(migrations = false)]
 async fn the_sats_an_overpaid_order_received_are_refundable_after_the_migration(pool: PgPool) {
     common::restore_0032_retention_connlimit(&pool).await;
-    through(90).run(&pool).await.expect("0001..0090 apply");
+    through(92)
+        .run(&pool)
+        .await
+        .expect("every migration before 0093 applies");
 
     let existing = seed_overpaid_bitcoin_order(&pool).await;
     record_refund(&pool, existing, PAYABLE_SATS)
