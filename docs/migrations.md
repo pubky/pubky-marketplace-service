@@ -356,7 +356,10 @@ each line's listing record from the homeserver with the seller's shop record
 and freezes `{accepts_returns, return_window_days}` (the most generous of the
 lines). `return.request` refuses a return on a final-sale order
 (`returns_not_accepted`) and after the window counted from delivery
-(`return_window_closed`). NULL, for an unreadable record, a record without a
+(`return_window_closed`). The window does not depend on the auto-complete
+sweep: `return.request` takes `delivered` and `completed` orders alike, so an
+order the sweep completed inside its window still takes a return until the
+window closes. NULL, for an unreadable record, a record without a
 usable `returnPolicy` or an order paid before 0081, takes a return as before.
 A binary from before 0081 never sets or reads it.
 
