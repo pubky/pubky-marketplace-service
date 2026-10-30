@@ -21,7 +21,7 @@ use axum::{Extension, Json};
 use chrono::{DateTime, Utc};
 use marketplace_domain::commands::{
     DeliverDigitalPayload, DeliveryEmail, DigitalDeliveryChannel, DigitalDeliveryKind,
-    SetDeliveryEmailPayload,
+    ReleaseDigitalPayload, SetDeliveryEmailPayload,
 };
 use marketplace_domain::{ids, Command, ErrorCode};
 use serde_json::json;
@@ -52,6 +52,7 @@ pub const REASON_INVALID_EMAIL: &str = "invalid_delivery_email";
 pub const REASON_ALREADY_EMAILED: &str = "already_emailed";
 pub const REASON_WRONG_CHANNEL: &str = "wrong_delivery_channel";
 pub const REASON_EMAIL_MISSING: &str = "email_missing";
+pub const REASON_NOT_AWAITING_RELEASE: &str = "not_awaiting_release";
 
 pub(crate) fn invalid_email() -> CommandFailure {
     CommandFailure::refused_with_reason(
@@ -369,7 +370,11 @@ pub async fn deliver_digital(
     let message_done = !kinds.contains("message")
         || message_marked
         || payload.channel == DigitalDeliveryChannel::Message;
-    let delivered = email_done && message_done;
+    // Instant lines that still wait for the seller's release keep the order
+    // `paid`: marking the manual lines alone does not deliver it.
+    let delivered = email_done
+        && message_done
+        && !crate::handlers::digital_orders::awaits_seller_release(&order);
     let updated: OrderRow = sqlx::query_as(&format!(
         "UPDATE orders SET revision = revision + 1, updated_at = $3, \
          state = CASE WHEN $4 THEN 'delivered' ELSE state END, \
@@ -396,6 +401,170 @@ pub async fn deliver_digital(
         ("fulfillment.digital_channel_delivered", None)
     };
     order_action_success(tx, actor, command, &updated, event_kind, notify, now).await
+}
+
+/// Releases the instant lines of a paid order that waits for its seller's
+/// release, in the caller's transaction holding the order row. When no email
+/// or message line is left to mark, the order moves `paid → delivered`.
+/// Returns the order as updated and whether it was delivered, or `None` when
+/// the order no longer waits (another release won).
+pub(crate) async fn apply_seller_release(
+    tx: &mut Transaction<'_, Postgres>,
+    order: &OrderRow,
+    now: DateTime<Utc>,
+) -> Result<Option<(OrderRow, bool)>, sqlx::Error> {
+    let kinds = manual_kinds(order);
+    let email_marked = email_row(tx, order.id)
+        .await?
+        .is_some_and(|row| row.emailed_at.is_some());
+    let (message_delivered_at,): (Option<DateTime<Utc>>,) =
+        sqlx::query_as("SELECT digital_message_delivered_at FROM orders WHERE id = $1")
+            .bind(order.id)
+            .fetch_one(&mut **tx)
+            .await?;
+    let delivered = (!kinds.contains("email") || email_marked)
+        && (!kinds.contains("message") || message_delivered_at.is_some());
+    let updated: Option<OrderRow> = sqlx::query_as(&format!(
+        "UPDATE orders SET revision = revision + 1, updated_at = $2, digital_released_at = $2, \
+         state = CASE WHEN $3 THEN 'delivered' ELSE state END, \
+         digital_delivered_at = CASE WHEN $3 THEN $2 ELSE digital_delivered_at END \
+         WHERE id = $1 AND state = 'paid' AND digital_release = 'seller' \
+         AND digital_released_at IS NULL RETURNING {ORDER_COLUMNS}"
+    ))
+    .bind(order.id)
+    .bind(now)
+    .bind(delivered)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(updated.map(|updated| (updated, delivered)))
+}
+
+/// The event and the buyer's notification for a release: the order's
+/// delivery when nothing else is left, else the release of its instant lines.
+pub(crate) fn release_event(delivered: bool) -> (&'static str, &'static str) {
+    if delivered {
+        ("fulfillment.digital_delivered", "order_delivered")
+    } else {
+        ("fulfillment.digital_released", "digital_released")
+    }
+}
+
+/// A seller's payment confirmation that also releases the purchase (the
+/// confirm endpoints' `release_digital: true`), inside the confirmation's
+/// transaction: the release is its own step with its own event and buyer
+/// notification. An order whose lines do not wait for the seller is returned
+/// unchanged.
+pub(crate) async fn release_with_confirmation(
+    tx: &mut Transaction<'_, Postgres>,
+    order: OrderRow,
+    actor: &str,
+    now: DateTime<Utc>,
+) -> Result<OrderRow, sqlx::Error> {
+    if !crate::handlers::digital_orders::awaits_seller_release(&order)
+        || payment_taken_back(&order).is_some()
+    {
+        return Ok(order);
+    }
+    let Some((updated, delivered)) = apply_seller_release(tx, &order, now).await? else {
+        return Ok(order);
+    };
+    let (event_kind, notification) = release_event(delivered);
+    let aggregate = ids::order_aggregate_id(updated.id);
+    let event_id = insert_event(
+        tx,
+        Uuid::new_v4(),
+        &aggregate,
+        updated.revision,
+        actor,
+        event_kind,
+        now,
+    )
+    .await?;
+    insert_notification_intent(
+        tx,
+        event_id,
+        notification,
+        &updated.buyer_pubky,
+        actor,
+        &aggregate,
+        None,
+        now,
+    )
+    .await?;
+    Ok(updated)
+}
+
+/// `fulfillment.release_digital` (seller, own order only): releases a paid
+/// order's instant lines to the buyer when they wait for the seller
+/// (`DIGITAL_RELEASE=seller`). The order-revision compare-and-swap makes a
+/// racing cancel request, mark-delivered or second release single-winner.
+pub async fn release_digital(
+    tx: &mut Transaction<'_, Postgres>,
+    actor: &str,
+    command: &Command,
+    payload: &ReleaseDigitalPayload,
+    now: DateTime<Utc>,
+) -> Result<HandlerResult, sqlx::Error> {
+    let Some(order) = fetch_order_for_update(tx, payload.order_id).await? else {
+        return Ok(Err(CommandFailure::refused(
+            RefusalKind::NotFound,
+            ErrorCode::NotFound,
+            "The order was not found.",
+        )));
+    };
+    if let Some(failure) = guard_order_action(actor, command, &order) {
+        return Ok(Err(failure));
+    }
+    if order.seller_pubky != actor {
+        return Ok(Err(CommandFailure::refused(
+            RefusalKind::Unauthorized,
+            ErrorCode::Unauthorized,
+            "Only the seller may release this purchase.",
+        )));
+    }
+    if let Some(taken_back) = payment_taken_back(&order) {
+        return Ok(Err(CommandFailure::refused_with_reason(
+            RefusalKind::InvalidState,
+            ErrorCode::InvalidState,
+            taken_back.message(),
+            taken_back.reason(),
+        )));
+    }
+    if !crate::handlers::digital_orders::awaits_seller_release(&order) {
+        return Ok(Err(CommandFailure::refused_with_reason(
+            RefusalKind::InvalidState,
+            ErrorCode::InvalidState,
+            "Nothing in this order waits for your release.",
+            REASON_NOT_AWAITING_RELEASE,
+        )));
+    }
+    if order.state == "cancel_requested" {
+        return Ok(Err(CommandFailure::refused(
+            RefusalKind::InvalidState,
+            ErrorCode::InvalidState,
+            "This order has a cancellation request; approve or decline it first.",
+        )));
+    }
+    let Some((updated, delivered)) = apply_seller_release(tx, &order, now).await? else {
+        return Ok(Err(CommandFailure::refused_with_reason(
+            RefusalKind::InvalidState,
+            ErrorCode::InvalidState,
+            "Nothing in this order waits for your release.",
+            REASON_NOT_AWAITING_RELEASE,
+        )));
+    };
+    let (event_kind, notification) = release_event(delivered);
+    let buyer = updated.buyer_pubky.clone();
+    order_action_success(
+        tx,
+        actor,
+        command,
+        &updated,
+        event_kind,
+        Some((notification, buyer.as_str())),
+        now,
+    )
+    .await
 }
 
 fn read_error(code: ErrorCode, message: &str, reason: Option<&str>) -> Response {

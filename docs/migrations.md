@@ -497,6 +497,54 @@ ALTER TABLE orders DROP COLUMN IF EXISTS payment_confirmation,
 DELETE FROM _sqlx_migrations WHERE version = 91;
 ```
 
+## Digital release (0092)
+
+0092 adds two nullable `orders` columns with no default and no index
+(`lock_timeout` like 0091): `digital_release` (`seller` or `payment`, bounded
+by `orders_digital_release_values`), frozen when an order with an instant
+digital line is paid, and `digital_released_at`, when those lines were
+released. It also appends `release_digital` (id 43) to the refusal-audit
+command-kind catalog. Every order paid before 0092 keeps NULL, which reads as
+released at payment, so nothing is backfilled and no purchase is withheld.
+
+**Deploy mode: two-phase.** The migration itself is safe under a rolling
+deploy, but `DIGITAL_RELEASE=seller` is not, and `seller` is the default. A
+binary from before 0092 never reads the columns: it serves an order's pinned
+lines on the receipt alone, and its delivered-assumption sweep and manual
+delivery can move an order to `delivered` without stamping
+`digital_released_at`. While old and new binaries serve together, an order a
+new binary froze as `seller` is therefore not held back by the old ones.
+
+1. Deploy the new binary with `DIGITAL_RELEASE=payment` set explicitly. Every
+   order it pays freezes `payment` and is released at payment, exactly as an
+   old binary does, so the overlap changes nothing.
+2. Once no binary from before 0092 is serving, set `DIGITAL_RELEASE=seller`
+   (or remove the override) and roll the new binaries. Every binary now honours
+   each order's frozen value, so binaries with either setting can overlap.
+
+If the order of these steps is missed, nothing is stranded: an order an old
+binary pays keeps NULL and reads as released, and a `seller` order an old
+binary moved to `delivered` reads as released too (only a `paid` order, or one
+with a pending cancellation request, waits for a release). The new binary
+refuses `fulfillment.release_digital` on either (`not_awaiting_release`). What
+is lost is the hold itself: those buyers could open the purchase before the
+seller released it.
+
+### Backing out 0092
+
+Additive: an image from before it runs on the migrated database, and an order
+that waits for its seller's release becomes readable again under it (the old
+read gates on the receipt only). By hand, after the old image is serving:
+
+```sql
+ALTER TABLE orders DROP COLUMN IF EXISTS digital_release,
+                   DROP COLUMN IF EXISTS digital_released_at;
+DELETE FROM _sqlx_migrations WHERE version = 92;
+```
+
+The catalog row stays; the table is append-only and the row is harmless to an
+older image.
+
 ## Numbers claimed by open pull requests
 
 `main` has 0001 to 0079 (0068 and 0069 were never used). A new migration must
@@ -512,7 +560,7 @@ assume it is free:
 | 0089 | `0089_review_withdrawal.sql` | `reviews.public_removed_at` and the `review.withdraw` refusal-audit command kind (0087 and 0088 are the double-blind review window) |
 | 0090 | `0090_attestor_publisher.sql` | the attestor publisher's tables and the `returned` annotation outcome |
 | 0091 | `0091_seller_confirmed_payment.sql` | `orders.payment_confirmation` and `orders.gateway_payment_seen_at` (seller-confirmed payment) |
-| 0092 | `0092_digital_release.sql` | `orders.digital_released_at` (digital release split from payment), stacked on 0091 |
+| 0092 | `0092_digital_release.sql` | `orders.digital_release`, `orders.digital_released_at` and the `release_digital` command kind (digital release split from payment), stacked on 0091 |
 
 This table describes unmerged work and goes stale as pull requests land; trust
 `crates/service/migrations/` on `main` over it. sqlx does not reject two files

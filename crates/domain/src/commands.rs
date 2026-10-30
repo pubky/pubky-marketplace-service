@@ -96,6 +96,7 @@ pub enum CommandPayload {
     ClearDigitalDelivery(ClearDigitalDeliveryPayload),
     SetDeliveryEmail(SetDeliveryEmailPayload),
     DeliverDigital(DeliverDigitalPayload),
+    ReleaseDigital(ReleaseDigitalPayload),
     MarkReadyForPickup(OrderActionPayload),
     ConfirmPickup(OrderActionPayload),
     RequestReturn(RequestReturnPayload),
@@ -142,6 +143,7 @@ impl Command {
             CommandPayload::ClearDigitalDelivery(_) => "digital_delivery.clear",
             CommandPayload::SetDeliveryEmail(_) => "order.set_delivery_email",
             CommandPayload::DeliverDigital(_) => "fulfillment.deliver_digital",
+            CommandPayload::ReleaseDigital(_) => "fulfillment.release_digital",
             CommandPayload::MarkReadyForPickup(_) => "fulfillment.mark_ready",
             CommandPayload::ConfirmPickup(_) => "fulfillment.confirm_pickup",
             CommandPayload::RequestReturn(_) => "return.request",
@@ -189,6 +191,7 @@ impl Command {
             CommandPayload::ClearDigitalDelivery(p) => serde_json::to_value(p),
             CommandPayload::SetDeliveryEmail(p) => serde_json::to_value(p),
             CommandPayload::DeliverDigital(p) => serde_json::to_value(p),
+            CommandPayload::ReleaseDigital(p) => serde_json::to_value(p),
             CommandPayload::ConfirmDelivery(p)
             | CommandPayload::ApproveCancellation(p)
             | CommandPayload::ApproveReturn(p)
@@ -772,6 +775,15 @@ impl DigitalDeliveryChannel {
 pub struct DeliverDigitalPayload {
     pub order_id: Uuid,
     pub channel: DigitalDeliveryChannel,
+}
+
+/// `fulfillment.release_digital` (seller, own order only): releases the
+/// paid order's instant lines (file, link, text) to the buyer when the order
+/// waits for the seller's release (`DIGITAL_RELEASE=seller`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseDigitalPayload {
+    pub order_id: Uuid,
 }
 
 /// Offer terms shared by `offer.create` and `offer.counter`
@@ -1564,6 +1576,9 @@ pub fn parse_command(raw: &Value) -> Result<Command, Vec<ValidationIssue>> {
         }
         "fulfillment.deliver_digital" => {
             parse_payload(&envelope.payload).map(CommandPayload::DeliverDigital)?
+        }
+        "fulfillment.release_digital" => {
+            parse_payload(&envelope.payload).map(CommandPayload::ReleaseDigital)?
         }
         "fulfillment.mark_ready" => {
             parse_payload(&envelope.payload).map(CommandPayload::MarkReadyForPickup)?
@@ -3684,6 +3699,10 @@ mod tests {
                 json!({ "order_id": order_id, "reason": "Changed mind" }),
             ),
             ("order.cancel_approve", json!({ "order_id": order_id })),
+            (
+                "fulfillment.release_digital",
+                json!({ "order_id": order_id }),
+            ),
             (
                 "return.request",
                 json!({ "order_id": order_id, "reason": "Differs", "requested_amount_minor": 14_796 }),

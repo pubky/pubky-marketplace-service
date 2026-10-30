@@ -30,6 +30,14 @@
             "null"
           ]
         },
+        "release_digital": {
+          "default": null,
+          "description": "Also release the order's instant digital lines when they wait for the seller (`DIGITAL_RELEASE=seller`): the release is recorded as its own step in the same transaction. Ignored for an order with none.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "txid": {
           "default": null,
           "description": "Legacy optional fields: never read as facts. When present they must EQUAL the stored observation exactly, or the call is rejected with `confirmation_observation_mismatch` (Sol P1: the audit trail says what happened, not what the seller typed).",

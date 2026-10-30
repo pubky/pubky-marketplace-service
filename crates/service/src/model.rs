@@ -818,6 +818,12 @@ pub struct OrderRow {
     /// When a verified, matching PayPal `Completed` notification reached a
     /// seller-confirmed order: a hint for the seller, never a transition.
     pub gateway_payment_seen_at: Option<DateTime<Utc>>,
+    /// Who releases the order's instant digital lines, frozen when it was
+    /// paid (`seller` | `payment`); NULL when it has none or was paid before
+    /// the switch existed, which reads as `payment`.
+    pub digital_release: Option<String>,
+    /// When the instant lines were released to the buyer.
+    pub digital_released_at: Option<DateTime<Utc>>,
 }
 
 impl std::fmt::Debug for OrderRow {
@@ -1044,6 +1050,8 @@ impl OrderRow {
             paykit_second_rail_at: None,
             payment_confirmation: None,
             gateway_payment_seen_at: None,
+            digital_release: None,
+            digital_released_at: None,
         }
     }
 
@@ -1323,6 +1331,8 @@ impl OrderRow {
         view["paykit_delivery_state"] = json!(self.paykit_delivery_state);
         view["payment_confirmation"] = json!(self.payment_confirmation_mode());
         view["gateway_payment_seen_at"] = self.gateway_payment_seen_at.map(format_timestamp).into();
+        view["digital_release"] = json!(self.digital_release);
+        view["digital_released_at"] = self.digital_released_at.map(format_timestamp).into();
         view["payment_reversed_at"] = self.payment_reversed_at.map(format_timestamp).into();
         view["payment_reversal_cancelled_at"] = self
             .payment_reversal_cancelled_at

@@ -509,7 +509,13 @@ pub(crate) async fn confirm_order(
         )
         .await?;
     }
-    let delivered_now = is_digital && crate::handlers::digital_orders::all_lines_instant(&order);
+    // Who releases the instant lines is frozen with the receipt: the payment
+    // itself under `DIGITAL_RELEASE=payment`, the seller afterwards under
+    // `seller`, so a later change to the switch never moves a paid order.
+    let has_instant = crate::handlers::digital_orders::has_instant_lines(&order);
+    let release_now = keys.digital_release == crate::config::DigitalRelease::Payment;
+    let delivered_now =
+        is_digital && release_now && crate::handlers::digital_orders::all_lines_instant(&order);
     let confirmed_state = if delivered_now { "delivered" } else { "paid" };
 
     // The hold clears with the conversion: the stock is sold now, so no
@@ -517,7 +523,9 @@ pub(crate) async fn confirm_order(
     let updated_order: OrderRow = sqlx::query_as(&format!(
         "UPDATE orders SET revision = revision + 1, state = $6, receipt_id = $2, \
          edition = $3, stock_held = false, hold_expires_at = NULL, lines = $5, updated_at = $4, \
-         digital_delivered_at = CASE WHEN $6 = 'delivered' THEN $4 ELSE digital_delivered_at END \
+         digital_delivered_at = CASE WHEN $6 = 'delivered' THEN $4 ELSE digital_delivered_at END, \
+         digital_release = CASE WHEN $7 THEN $8 ELSE digital_release END, \
+         digital_released_at = CASE WHEN $7 AND $9 THEN $4 ELSE digital_released_at END \
          WHERE id = $1 RETURNING {ORDER_COLUMNS}"
     ))
     .bind(order.id)
@@ -526,6 +534,9 @@ pub(crate) async fn confirm_order(
     .bind(now)
     .bind(&pinned_lines)
     .bind(confirmed_state)
+    .bind(has_instant)
+    .bind(keys.digital_release.as_str())
+    .bind(release_now)
     .fetch_one(&mut **tx)
     .await?;
     let receipt_event_id = insert_event(

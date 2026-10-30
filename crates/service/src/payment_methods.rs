@@ -2957,6 +2957,7 @@ fn spawn_courtesy_void(
 /// settled in the same transaction under its payment lock: the payment id,
 /// the receiver snapshot, and every held refund naming it
 /// ([`paypal_refund::settle_verified_payment`]).
+#[allow(clippy::too_many_arguments)]
 async fn apply_fiat_paid(
     state: &AppState,
     actor: &str,
@@ -2964,6 +2965,7 @@ async fn apply_fiat_paid(
     transaction_ref: Option<&str>,
     verified_by: &str,
     gateway: Option<&paypal_refund::GatewayPayment<'_>>,
+    release_digital: bool,
     now: DateTime<Utc>,
 ) -> Result<Response, Response> {
     let mut tx = state
@@ -3045,6 +3047,17 @@ async fn apply_fiat_paid(
                     ));
                 };
                 settle_gateway(&mut tx, state, order_id, gateway, now).await?;
+                // A late order the confirmation paid releases like an on-time
+                // one; any other outcome leaves nothing waiting for release.
+                let order = if release_digital {
+                    crate::handlers::digital_manual::release_with_confirmation(
+                        &mut tx, order, actor, now,
+                    )
+                    .await
+                    .map_err(|error| internal("digital release", &error))?
+                } else {
+                    order
+                };
                 let response = order_response(&mut tx, &order, "", json!({ "verified": true }))
                     .await
                     .map_err(|error| internal("order projection", &error))?;
@@ -3201,6 +3214,18 @@ async fn apply_fiat_paid(
                 .map_err(|error| internal("payment confirmation notification", &error))?;
             }
             settle_gateway(&mut tx, state, order_id, gateway, now).await?;
+            let confirmed_order = if release_digital {
+                crate::handlers::digital_manual::release_with_confirmation(
+                    &mut tx,
+                    confirmed_order,
+                    actor,
+                    now,
+                )
+                .await
+                .map_err(|error| internal("digital release", &error))?
+            } else {
+                confirmed_order
+            };
             let response =
                 order_response(&mut tx, &confirmed_order, "", json!({ "verified": true }))
                     .await
@@ -3446,6 +3471,16 @@ pub async fn mark_fiat_paid(
     }
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfirmReceivedBody {
+    /// Also release the order's instant digital lines when they wait for the
+    /// seller (`DIGITAL_RELEASE=seller`), as its own step in the same
+    /// transaction.
+    #[serde(default)]
+    release_digital: Option<bool>,
+}
+
 /// `POST /v0/orders/{id}/fiat/confirm-received` (seller session): the seller
 /// attests the PayPal payment arrived, which pays the order. This is the
 /// deliberate `seller-attested` leg of PayPal verification.
@@ -3453,7 +3488,21 @@ pub async fn confirm_fiat_received(
     State(state): State<AppState>,
     Extension(actor): Extension<Actor>,
     Path(order_id): Path<Uuid>,
+    body: axum::body::Bytes,
 ) -> Response {
+    // The body is optional: clients that predate `release_digital` send none,
+    // `{}` or `null`.
+    let release_digital = match serde_json::from_slice::<Option<ConfirmReceivedBody>>(&body) {
+        _ if body.iter().all(u8::is_ascii_whitespace) => false,
+        Ok(body) => body.is_some_and(|body| body.release_digital == Some(true)),
+        Err(_) => {
+            return method_error(
+                ErrorCode::InvalidCommand,
+                "invalid_body",
+                "The request body must be a JSON object with an optional release_digital.",
+            )
+        }
+    };
     if payments_runtime(&state).is_err() {
         return method_error(
             ErrorCode::UpstreamUnavailable,
@@ -3493,6 +3542,7 @@ pub async fn confirm_fiat_received(
         None,
         "seller",
         None,
+        release_digital,
         state.clock.now(),
     )
     .await
@@ -3741,6 +3791,7 @@ pub async fn paypal_ipn(State(state): State<AppState>, body: String) -> Response
         transaction_ref,
         "gateway",
         gateway.as_ref(),
+        false,
         state.clock.now(),
     )
     .await

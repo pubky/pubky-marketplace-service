@@ -266,6 +266,11 @@ pub struct ConfirmBitcoinPaymentBody {
     txid: Option<String>,
     #[serde(default)]
     confirmed_amount_sats: Option<i64>,
+    /// Also release the order's instant digital lines when they wait for the
+    /// seller (`DIGITAL_RELEASE=seller`): the release is recorded as its own
+    /// step in the same transaction. Ignored for an order with none.
+    #[serde(default)]
+    release_digital: Option<bool>,
 }
 
 /// The seller's attestation that the observed payment is this buyer's.
@@ -285,6 +290,7 @@ pub async fn confirm_bitcoin_payment(
             reason: None,
             txid: None,
             confirmed_amount_sats: None,
+            release_digital: None,
         });
     if body
         .reason
@@ -571,6 +577,21 @@ pub async fn confirm_bitcoin_payment(
             _ => internal("resolve outbox", &"unexpected resolution failure"),
         };
     }
+    let confirmed_order = if body.release_digital == Some(true) {
+        match crate::handlers::digital_manual::release_with_confirmation(
+            &mut tx,
+            confirmed_order,
+            &actor.0,
+            now,
+        )
+        .await
+        {
+            Ok(order) => order,
+            Err(error) => return internal("digital release", &error),
+        }
+    } else {
+        confirmed_order
+    };
     let reviews = match crate::handlers::fetch_order_reviews(&mut tx, order_id).await {
         Ok(reviews) => reviews,
         Err(error) => return internal("order projection", &error),

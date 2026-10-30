@@ -2033,6 +2033,7 @@ Liveness plus a capability summary. Always `200` while the process is up:
   "digital_delivery_max_bytes": 1048576,
   "priv_keys_available": false,
   "payment_confirmation": "seller",
+  "digital_release": "seller",
   "commit": "2f844c1084c4",
   "paykit_rail": { "bitcoin_offer_available": true, "age_seconds": 12 }
 }
@@ -2052,7 +2053,11 @@ succeeded. `payment_confirmation` is the deployment's `PAYMENT_CONFIRMATION`
 each order carries its own frozen value as `payment_confirmation`, with
 `gateway_payment_seen_at` set once PayPal reported a payment the seller has
 yet to confirm (see
-[Seller-confirmed payment](../README.md#seller-confirmed-payment)). A health
+[Seller-confirmed payment](../README.md#seller-confirmed-payment)).
+`digital_release` is the deployment's `DIGITAL_RELEASE` (`seller` or
+`payment`); a paid order with instant digital lines carries its frozen
+`digital_release` and `digital_released_at` (see
+[Digital delivery](../README.md#digital-delivery)). A health
 check must not treat these flags as failures.
 
 ### `GET /ready`

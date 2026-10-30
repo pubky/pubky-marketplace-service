@@ -153,7 +153,7 @@ async fn existing_reviews_stay_published_and_the_file_reruns(pool: PgPool) {
     assert_eq!(removed_at(&pool, seller_review).await, None);
 
     let kinds: Vec<(i16, String)> = sqlx::query_as(
-        "SELECT id, name FROM command_refusal_command_kinds WHERE id >= 42 ORDER BY id",
+        "SELECT id, name FROM command_refusal_command_kinds WHERE id = 42 ORDER BY id",
     )
     .fetch_all(&pool)
     .await
