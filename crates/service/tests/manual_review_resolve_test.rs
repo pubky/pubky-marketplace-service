@@ -187,6 +187,7 @@ async fn held_entry_resolves_paid_refunded_and_abandoned(pool: PgPool) {
             .expect("refund record");
     assert_eq!(external_refund["transaction_id"], json!("tx-12345"));
     assert_eq!(external_refund["amount_minor"], json!(TOTAL_SATS));
+    assert_eq!(external_refund["amount_unit"], json!("sat"));
     let outbox = outbox_facts(&pool, &order_id).await;
     assert_eq!(outbox.len(), 1);
     assert_eq!(outbox[0].0, "refunded");

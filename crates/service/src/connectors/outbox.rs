@@ -29,6 +29,7 @@ use uuid::Uuid;
 use super::ledger;
 use super::refund;
 use super::store::{self, ConnectionRow};
+use crate::refund_destination::{is_usdt_payment, usdt_offered, BitcoinPayment, RefundUnit};
 
 pub const CURSOR_NAME: &str = "events";
 const BATCH: i64 = 200;
@@ -216,20 +217,28 @@ async fn on_payment_confirmed(
     Ok(queued)
 }
 
-/// `currency, exponent, total_minor, payment_method, payment_asset,
-/// payment_exponent, usd_conversion_pair, usd_conversion_cents,
-/// external_refund`.
-type RefundOrderRow = (
-    String,
-    i32,
-    i64,
-    Option<String>,
-    Option<String>,
-    Option<i16>,
-    Option<String>,
-    Option<i64>,
-    Option<serde_json::Value>,
-);
+/// The `orders` columns a recorded refund is mirrored against.
+#[derive(sqlx::FromRow)]
+struct RefundOrderRow {
+    currency: String,
+    exponent: i32,
+    total_minor: i64,
+    payment_method: Option<String>,
+    payment_asset: Option<String>,
+    payment_exponent: Option<i16>,
+    usd_conversion_pair: Option<String>,
+    usd_conversion_cents: Option<i64>,
+    external_refund: Option<serde_json::Value>,
+    payment_amount_minor: Option<i64>,
+    paykit_observed_sats: Option<i64>,
+    paykit_total_sats: Option<i64>,
+    second_rail_paid: bool,
+    paykit_accepted_assets: Option<Vec<String>>,
+    paykit_payment_amounts: Option<serde_json::Value>,
+    /// A refunded manual-review resolution wrote the refund: before refunds
+    /// named their unit, the one writer that recorded sats.
+    refunded_by_review: bool,
+}
 
 async fn on_refund_recorded(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -254,39 +263,54 @@ async fn mirror_current_refund(
     }
     let row: Option<RefundOrderRow> = sqlx::query_as(
         "SELECT currency, exponent, total_minor, payment_method, payment_asset, \
-                payment_exponent, usd_conversion_pair, usd_conversion_cents, external_refund \
+                payment_exponent, usd_conversion_pair, usd_conversion_cents, external_refund, \
+                payment_amount_minor, paykit_observed_sats, paykit_total_sats, \
+                paykit_second_rail_at IS NOT NULL AS second_rail_paid, \
+                paykit_accepted_assets, paykit_payment_amounts, \
+                EXISTS (SELECT 1 FROM paykit_manual_resolutions r \
+                        WHERE r.order_id = orders.id AND r.outcome = 'refunded') \
+                    AS refunded_by_review \
          FROM orders WHERE id = $1",
     )
     .bind(order_id)
     .fetch_optional(&mut **tx)
     .await?;
-    let Some((
-        currency,
-        exponent,
-        total_minor,
-        payment_method,
-        payment_asset,
-        payment_exponent,
-        conversion_pair,
-        conversion_cents,
-        external_refund,
-    )) = row
-    else {
+    let Some(row) = row else {
         return Ok(());
     };
+    let received_sats = BitcoinPayment {
+        payment_method: row.payment_method.as_deref(),
+        payment_asset: row.payment_asset.as_deref(),
+        payment_amount_minor: row.payment_amount_minor,
+        paykit_observed_sats: row.paykit_observed_sats,
+        paykit_total_sats: row.paykit_total_sats,
+        second_rail_paid: row.second_rail_paid,
+        usdt_offered: usdt_offered(
+            row.paykit_accepted_assets.as_deref(),
+            row.paykit_payment_amounts.as_ref(),
+        ),
+    }
+    .received_sats();
+    let usdt_paid = is_usdt_payment(row.payment_method.as_deref(), row.payment_asset.as_deref());
+    let unit = row
+        .external_refund
+        .as_ref()
+        .and_then(RefundUnit::of_record)
+        .unwrap_or_else(|| RefundUnit::unnamed(usdt_paid, &row.currency, row.refunded_by_review));
     let basis = refund::OrderBasis {
-        currency,
-        exponent,
-        total_minor,
-        payment_method,
-        payment_asset,
-        payment_exponent: payment_exponent.map(i32::from),
-        conversion: match (conversion_pair, conversion_cents) {
+        currency: row.currency,
+        exponent: row.exponent,
+        total_minor: row.total_minor,
+        unit,
+        payment_exponent: row.payment_exponent.map(i32::from),
+        conversion: match (row.usd_conversion_pair, row.usd_conversion_cents) {
             (Some(pair), Some(cents)) if cents > 0 => Some(refund::UsdConversion { pair, cents }),
             _ => None,
         },
+        received_sats,
+        usdt_paid,
     };
-    let external_refund = external_refund.as_ref();
+    let external_refund = row.external_refund.as_ref();
     // The refund is read as the order holds it now. A refund reversed since
     // the event left none, and there is nothing to mirror.
     let Some(recorded) = external_refund

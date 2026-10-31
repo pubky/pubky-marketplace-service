@@ -651,7 +651,11 @@ periods frozen on the order, `null` when the seller left one unset),
 `return_request`, `external_refund`, `fulfillment`,
 `payment_method`, `created_at`, `updated_at`.
 
-Money is in minor units with `currency` and `exponent`. Anything a seller
+Money is in minor units with `currency` and `exponent`, except
+`external_refund.amount_minor`, which is in what the buyer paid and named by
+`external_refund.amount_unit`: `sat` for an order paid on the Bitcoin rail,
+`usdt0` (USDT0 millionths) for a USDT-paid order priced in anything but USD,
+and `order` (the order currency's minor units) otherwise. Anything a seller
 needs to ship an order (the delivery address) is read through the
 participant-scoped application routes, not through this export.
 
@@ -1729,9 +1733,16 @@ on `X-Shopify-Event-Id`.
   Pubky refund is `refundCreate` with a manual `REFUND` transaction against the
   order's sale. The framework owns the arithmetic (`connectors/refund.rs`): the
   recorded amount is the Pubky books' refunded **total** in the order currency's
-  minor units on every rail (a USDT-paid order priced in another currency is
-  converted with the order's own recorded conversion, and the conversion basis
-  goes in the note), and the provider is asked only for the difference to what
+  minor units on every rail, read in the unit the refund record names
+  (`external_refund.amount_unit`): a USDT0 refund of a USDT-paid order priced
+  in another currency is converted with the order's own recorded conversion; a
+  sats refund of an order paid on the Bitcoin rail stands as recorded, up to
+  the total, when the order is priced in sats, and is otherwise converted in
+  proportion to the sats received, rounded half up and never above the total;
+  the conversion basis goes in the note. A sats refund of a fiat-priced order
+  with no single Bitcoin payment to convert against (both rails paid) is
+  quarantined as `refund_amount_unconvertible` for the seller to record by
+  hand. The provider is asked only for the difference to what
   the store already shows refunded. The Shopify provider reports that figure
   (`refunded_total`: the sale amount and `totalRefundedSet`, the merchant's own
   refunds included) and records the difference; the store refuses a refund
@@ -1949,7 +1960,8 @@ set only when the buyer shared it. A cancel after the push sets the order to
 with `api_refund: false`, so the store's books match and no money moves. The
 refund amount is the refund total Pubky recorded, in the order currency's minor
 units (the framework converts anything else before a provider is called; the
-provider never converts). What is added to the store order is the difference:
+provider never converts: a sats refund of a fiat-priced order in proportion to
+the sats received, a USDT0 refund with the order's own conversion). What is added to the store order is the difference:
 the recorded total, capped at the payment, minus what the store already shows
 refunded (ours from an earlier record, or the merchant's own). A repeat, a
 smaller later record or a merchant who already refunded as much adds nothing,

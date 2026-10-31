@@ -1173,6 +1173,10 @@ impl OrderRow {
         if actor == self.seller_pubky {
             view["paykit_observation"] = seller_observation(self.paykit_observation.as_ref());
             view["paykit_observed_sats"] = self.paykit_observed_sats.into();
+            // What `refund.record_external` takes: the amount it caps at and
+            // the unit it is entered in. Seller-only, like the observed sats
+            // a Bitcoin cap is.
+            view["refund_cap"] = crate::refund_destination::refund_terms(self).view();
             view["paykit_seller_confirmation_entered_at"] = self
                 .paykit_seller_confirmation_entered_at
                 .map(format_timestamp)
@@ -1334,6 +1338,13 @@ impl OrderRow {
         view["digital_release"] = json!(self.digital_release);
         view["digital_released_at"] = self.digital_released_at.map(format_timestamp).into();
         view["payment_reversed_at"] = self.payment_reversed_at.map(format_timestamp).into();
+        // Every participant's: whether the recorded refund covers all that was
+        // paid, which a buyer cannot read from the seller-only `refund_cap`.
+        view["external_refund_full"] = self
+            .external_refund
+            .as_ref()
+            .and_then(|record| crate::refund_destination::refund_terms(self).covered_by(record))
+            .into();
         view["payment_reversal_cancelled_at"] = self
             .payment_reversal_cancelled_at
             .map(format_timestamp)

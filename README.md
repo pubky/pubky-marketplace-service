@@ -1077,8 +1077,10 @@ USDT rail); every other order is unchanged. It is not gated by
   or execute a refund).
 - **Refusals** (closed `error.reason` tokens): `invalid_refund_destination`
   (422), `refund_destination_required` (409) and `invalid_refund_reference`
-  (422). A wrong sender, order method or payment state is a plain
-  `UNAUTHORIZED` or `INVALID_STATE`.
+  (422); on every rail, `refund_unit_mismatch` (409, the `amount_unit` sent is
+  not the order's `refund_cap.unit`) and `refund_unit_required` (409, a sats
+  refund of a fiat-priced order sent without `amount_unit`). A wrong sender,
+  order method or payment state is a plain `UNAUTHORIZED` or `INVALID_STATE`.
 - **Storage.** `order_refund_destinations` (migration 0054), one row per order.
 
 ### Address autocomplete proxy
@@ -1764,9 +1766,33 @@ and refund branches):
   `return_received`/`cancelled`) records **independently supplied
   seller evidence** — an external transaction id of at least 8 characters —
   and advances the order to `refunded_external`. The service never claims
-  to have moved funds (ADR-0019 §7); a CHECK constraint keeps the recorded
-  amount within the larger of the order total and the amount paid
-  (migration 0060).
+  to have moved funds (ADR-0019 §7). The amount is in what was actually
+  paid and capped at it (`refund_destination::refund_terms`): for an
+  order paid on the Bitcoin rail, sats, at most the sats received (the
+  observed amount frozen at settlement, else the payable, payment code
+  included), whatever the price currency, as the refunded review resolution
+  records it; for a USDT-paid order, at most the USDT received, in USDT0
+  millionths for an order priced in anything but USD and in whole cents
+  (rounded down) for a USD one, so an overpaid USD order may record more
+  than its total; otherwise the order total. An order that records no paid
+  rail while its request offered USDT, and no Bitcoin was observed, is not
+  treated as Bitcoin. The seller's order projection carries `refund_cap`
+  (`amount_minor`, `unit`, `exponent`). The command takes an optional
+  `amount_unit` (`order`, `sat` or `usdt0`): a unit other than the order's
+  is refused (`refund_unit_mismatch`), and a refund that names none is
+  refused when it would be sats on a fiat-priced order
+  (`refund_unit_required`), the amount an older client enters in the order
+  total's units. Every record names its unit as
+  `external_refund.amount_unit`; migration 0093 named every earlier one the
+  way its writer recorded it. Every participant's projection carries
+  `external_refund_full`: whether the record reaches that cap in its unit
+  (null without a record, or for one that names another unit or none). A
+  partial refund leaves the order `refunded_external` like a full one, and
+  only the seller sees the cap, so this is how a buyer tells them apart. A
+  CHECK constraint
+  (`orders_external_refund_within_total`, migration 0093) keeps the recorded
+  amount within the largest of the order total, the amount paid and the
+  sats observed.
 - **PayPal refunds and reversals.** A postback-verified `Refunded`,
   `Reversed`, or `Canceled_Reversal` IPN is never dropped: it is recorded
   once per PayPal `txn_id` on the order whose gateway-verified payment is its

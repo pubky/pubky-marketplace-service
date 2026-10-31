@@ -17,7 +17,7 @@ use marketplace_service::clock::Clock;
 use marketplace_service::connectors::ledger;
 use marketplace_service::connectors::outbox;
 use marketplace_service::connectors::worker;
-use serde_json::json;
+use serde_json::{json, Value};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -978,6 +978,24 @@ async fn refund_order(s: &Scenario) {
 /// The seller records an external refund of `amount_minor`, through the
 /// return flow.
 async fn refund_order_of(s: &Scenario, amount_minor: i64) {
+    refund_order_with(
+        s,
+        json!({ "amount_minor": amount_minor, "transaction_id": "bitcoin-tx-1" }),
+    )
+    .await;
+}
+
+/// The seller records an external refund of `sats`, named as sats, through
+/// the return flow.
+async fn refund_order_in_sats(s: &Scenario, sats: i64) {
+    refund_order_with(
+        s,
+        json!({ "amount_minor": sats, "transaction_id": "bitcoin-tx-1", "amount_unit": "sat" }),
+    )
+    .await;
+}
+
+async fn refund_order_with(s: &Scenario, refund: Value) {
     let order_id = s.order.order_id.as_str();
     for (seller, kind, revision, payload, number) in [
         (
@@ -997,13 +1015,7 @@ async fn refund_order_of(s: &Scenario, amount_minor: i64) {
         ),
         (true, "return.approve", 5, json!({}), 1_213),
         (true, "return.receive", 6, json!({}), 1_214),
-        (
-            true,
-            "refund.record_external",
-            7,
-            json!({ "amount_minor": amount_minor, "transaction_id": "bitcoin-tx-1" }),
-            1_215,
-        ),
+        (true, "refund.record_external", 7, refund, 1_215),
     ] {
         let token = if seller {
             &s.seller.token
@@ -2150,6 +2162,55 @@ async fn record_a_usdt0_refund(s: &Scenario, millionths: i64) {
     .execute(&s.app.pool)
     .await
     .expect("refund event");
+}
+
+/// Records that the paid order's 137.00 USD were paid as `received` sats
+/// through Paykit.
+async fn paid_in_sats(s: &Scenario, received: i64) {
+    sqlx::query(
+        "UPDATE orders SET payment_method = 'paykit', paykit_total_sats = $2, \
+         paykit_observed_sats = $2 WHERE id = $1::uuid",
+    )
+    .bind(&s.order.order_id)
+    .bind(received)
+    .execute(&s.app.pool)
+    .await
+    .expect("pay in sats");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_sats_refund_of_a_usd_priced_order_is_mirrored_in_proportion_in_cents(pool: PgPool) {
+    let s = scenario(pool).await;
+    assert_eq!(s.order.total_minor, 13_700);
+    paid_in_sats(&s, 51_637).await;
+    s.pass().await;
+    assert_eq!(s.push().await.0, "created");
+    // Half the sats received, recorded by the seller in sats.
+    refund_order_in_sats(&s, 25_819).await;
+    s.pass().await;
+    let refund = last_refund(&s);
+    assert_eq!(refund.amount_minor, 6_850, "half of 137.00 USD");
+    assert_eq!(refund.recorded_total_minor, 6_850);
+    assert_eq!(refund.order_currency, "USD");
+    assert!(!refund.full);
+    let basis = refund.basis.expect("the basis is recorded for the note");
+    assert!(
+        basis.contains("25819 of the 51637 sats received for 137.00 USD"),
+        "{basis}"
+    );
+    assert_eq!(s.store.refund_calls.load(Ordering::SeqCst), 1);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_sats_refund_of_everything_received_is_the_whole_order(pool: PgPool) {
+    let s = scenario(pool).await;
+    paid_in_sats(&s, 51_637).await;
+    s.pass().await;
+    refund_order_in_sats(&s, 51_637).await;
+    s.pass().await;
+    let refund = last_refund(&s);
+    assert_eq!(refund.amount_minor, s.order.total_minor);
+    assert!(refund.full);
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]

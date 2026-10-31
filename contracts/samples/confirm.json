@@ -211,6 +211,7 @@
           "drop_aggregate_id": null,
           "edition": null,
           "external_refund": null,
+          "external_refund_full": null,
           "fiat_checkout_url": null,
           "fiat_transaction_ref": null,
           "fiat_verification": null,
@@ -273,6 +274,11 @@
           "payment_reversed_at": null,
           "priced_from": "listing",
           "receipt_id": "<uuid:5>",
+          "refund_cap": {
+            "amount_minor": 51637,
+            "exponent": 0,
+            "unit": "sat"
+          },
           "return_policy": null,
           "return_request": null,
           "reviews": [],

@@ -105,14 +105,19 @@ price or less than one unit of the settlement asset more, never less.
 
 A USDT refund of a non-USD order is recorded in USDT0 millionths and capped at
 the USDT paid (`refund_destination::received_refund_amount_minor` and
-`refund_cap_minor` treat every non-USD order that way). A USD order records
+`refund_terms` treat every non-USD order that way). A USD order records
 its USDT refund in cents, capped at the USDT received in whole cents, not at
 the order total: a transfer for another amount than quoted is refunded as it
 arrived, an overpayment included. A received amount between two cents is the
 lower cent, both as the cap and as the manual-review refunded resolution. Less
 than one cent is a cap of 0: nothing can be recorded, and the resolution
 refuses with `refund_amount_unrecordable`
-(`refund_destination::recordable_refund_amount_minor`).
+(`refund_destination::recordable_refund_amount_minor`). A Bitcoin refund is
+recorded in sats and capped at the sats received, payment code included,
+whatever the price currency (`refund_destination::BitcoinPayment`). The
+record names its unit (`external_refund.amount_unit`: `order`, `sat` or
+`usdt0`), so a reader never infers it from the order columns, which a later
+settlement may change.
 
 ## What the order records
 
