@@ -42,6 +42,7 @@ pub mod locks;
 pub(crate) mod logging;
 pub mod migrations;
 pub mod model;
+pub mod moderation_decisions;
 pub mod paykit_attempts;
 pub mod payment_attempt;
 pub mod payment_availability;
