@@ -509,6 +509,76 @@ pub struct StartConnectRequest {
     params: Option<Value>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ResolveShopQuery {
+    #[serde(default)]
+    provider: String,
+    #[serde(default)]
+    domain: String,
+}
+
+/// `GET /v1/connectors/resolve?provider=shopify&domain=shop.example`: what
+/// store a merchant's address names, before anything is connected.
+///
+/// A Shopify store is often known by its own domain; the connection is keyed
+/// by its `*.myshopify.com` domain. The answer is `{shop, domain}`: the
+/// canonical shop to pass to `POST /v1/connectors`, and the custom domain that
+/// was looked up (`null` when the input already was the canonical shop). A
+/// domain that is not a Shopify store answers `422 not_a_shopify_store`; one
+/// that is a store's secondary domain answers `422 not_primary_domain`.
+/// Nothing is stored. The lookup follows the outbound rules in
+/// [`super::providers::shopify::resolve`].
+pub async fn resolve_shop(
+    State(state): State<AppState>,
+    Extension(_actor): Extension<Actor>,
+    Query(query): Query<ResolveShopQuery>,
+) -> Response {
+    let runtime = match runtime(&state) {
+        Ok(runtime) => runtime,
+        Err(response) => return response,
+    };
+    let Some(kind) = ProviderKind::parse(&query.provider) else {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_provider",
+            "The provider must be shopify or woocommerce.",
+        );
+    };
+    let Some(provider) = runtime.providers.get(kind) else {
+        return provider_unavailable();
+    };
+    if query.domain.chars().count() > MAX_FIELD_CHARS {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_domain",
+            "The store address is too long.",
+        );
+    }
+    match call(runtime, provider.resolve_shop(&query.domain)).await {
+        Ok(resolved) => respond(
+            StatusCode::OK,
+            json!({
+                "schema_version": 1,
+                "kind": "connector_shop",
+                "provider": kind.as_str(),
+                "shop": resolved.shop,
+                "domain": resolved.domain,
+            }),
+        ),
+        Err(ProviderError::Invalid(reason)) => error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_domain",
+            &store::truncate(&reason, 200),
+        ),
+        Err(ProviderError::Rejected { code, message }) => error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &code,
+            &store::truncate(&message, 200),
+        ),
+        Err(failure) => provider_failure(StatusCode::BAD_GATEWAY, failure),
+    }
+}
+
 /// `POST /v1/connectors`: the signed-in seller starts connecting a store.
 ///
 /// This creates the **draft connection**: a random, unguessable id and an
