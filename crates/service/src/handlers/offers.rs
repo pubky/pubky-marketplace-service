@@ -20,7 +20,7 @@ use crate::handlers::{
 };
 use crate::homeserver::{
     award_terms_from_bytes, award_terms_from_bytes_for_variant, AwardListingSnapshot,
-    AwardVariantSnapshot, HomeserverListingClient, HomeserverRawFetchOutcome,
+    AwardShipping, AwardVariantSnapshot, HomeserverListingClient, HomeserverRawFetchOutcome,
 };
 use crate::model::{ListingRow, OfferRow, ReservationRow};
 use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
@@ -34,7 +34,8 @@ pub const OFFER_COLUMNS: &str = "id, aggregate_id, listing_aggregate_id, buyer_p
      accepted_listing_title, accepted_listing_revision, accepted_listing_record_sha256, \
      accepted_variant_id, accepted_variant_sku, accepted_variant_options, accepted_shipping_minor, \
      accepted_subtotal_minor, accepted_total_minor, accepted_fulfillment, converted_order_id, \
-     converted_at, expiry_reason, accepted_fulfillment_methods";
+     converted_at, expiry_reason, accepted_fulfillment_methods, destination_country, \
+     shipping_choice, accepted_shipping_quotes";
 
 /// Acceptance holds the inventory for 30 minutes, as in the prototype engine.
 const ACCEPTED_OFFER_HOLD_SECONDS: i64 = 30 * 60;
@@ -59,12 +60,24 @@ fn history_entry(
     })
 }
 
+/// How the award snapshot's record prices a line's shipping.
+fn snapshot_line_shipping(snapshot: &AwardListingSnapshot) -> crate::shipping::LineShipping {
+    match &snapshot.shipping {
+        AwardShipping::Flat => crate::shipping::LineShipping::Flat(snapshot.shipping_minor),
+        AwardShipping::Profile(profile_id) => {
+            crate::shipping::LineShipping::Profile(profile_id.clone())
+        }
+        AwardShipping::Zones(zones) => crate::shipping::LineShipping::Inline(zones.clone()),
+    }
+}
+
 pub async fn create(
     tx: &mut Transaction<'_, Postgres>,
     actor: &str,
     command: &Command,
     payload: &OfferTermsPayload,
     homeserver: Option<&dyn HomeserverListingClient>,
+    shipping: &crate::shipping::ShippingPlan,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     let Some(listing) = fetch_live_listing(tx, &command.aggregate_id).await? else {
@@ -149,6 +162,44 @@ pub async fn create(
     } else {
         None
     };
+    // The record's own shipping terms price the offer when the record was
+    // read; otherwise the registered listing row does.
+    let line_shipping = match terms.as_ref() {
+        Some(snapshot) => snapshot_line_shipping(snapshot),
+        None => match crate::shipping::LineShipping::from_row(&listing) {
+            Ok(line_shipping) => line_shipping,
+            Err(error) => return Ok(Err(error.failure())),
+        },
+    };
+    // Zones carried by the registered row alone are pinned by nothing the
+    // buyer can name: a profile is pinned by its hash and a record by its
+    // revision. With no record read, an offer on such a listing waits for one.
+    if terms.is_none() && matches!(line_shipping, crate::shipping::LineShipping::Inline(_)) {
+        return Ok(Err(CommandFailure::refused_with_reason(
+            crate::refusal_audit::RefusalKind::InvalidState,
+            ErrorCode::ShippingUnavailable,
+            "The seller's listing record could not be read. Try again shortly.",
+            crate::shipping::REASON_LISTING_RECORD_UNAVAILABLE,
+        )));
+    }
+    let priced_shipping = match crate::shipping::price_single_line(
+        shipping,
+        &listing.seller_pubky,
+        crate::shipping::PricedLine {
+            listing_aggregate_id: listing.aggregate_id.clone(),
+            quantity: payload.quantity,
+            shipping: line_shipping,
+        },
+        crate::shipping::Asset {
+            currency: &listing.unit_price_currency,
+            exponent: listing.unit_price_exponent,
+        },
+        payload.destination_country.as_deref(),
+        payload.shipping_choice.as_ref(),
+    ) {
+        Ok(priced) => priced,
+        Err(error) => return Ok(Err(error.failure())),
+    };
     let selected_variant = terms.as_ref().and_then(|snapshot| {
         (snapshot.variants.len() == 1).then(|| snapshot.variants[0].id.clone())
     });
@@ -158,10 +209,14 @@ pub async fn create(
             "title": snapshot.title,
             "currency": snapshot.currency,
             "exponent": snapshot.exponent,
-            "shipping_minor": snapshot.shipping_minor,
+            "shipping_minor": priced_shipping.shipping_minor,
             "variant": selected_variant.clone(),
         })
     });
+    let shipping_choice = payload
+        .shipping_choice
+        .as_ref()
+        .map(|choice| serde_json::to_value(choice).expect("shipping choice serializes"));
 
     let aggregate_id = ids::offer_aggregate_id(command.command_id);
     let expires_at = now + chrono::Duration::seconds(payload.expires_in_seconds);
@@ -183,9 +238,10 @@ pub async fn create(
         "INSERT INTO offers (id, aggregate_id, listing_aggregate_id, buyer_pubky, seller_pubky, \
          revision, state, offered_by, amount_minor, currency, exponent, quantity, message, \
          history, expires_at, created_at, updated_at, variant_id, terms_listing_revision, \
-         terms_listing_record_sha256, terms_snapshot, buyer_country) \
+         terms_listing_record_sha256, terms_snapshot, buyer_country, destination_country, \
+         shipping_choice) \
          VALUES ($1, $2, $3, $4, $5, 1, 'pending', $4, $6, $7, $8, $9, $10, $11, $12, $13, $13, \
-                 $14, $15, $16, $17, $18) \
+                 $14, $15, $16, $17, $18, $19, $20) \
          RETURNING {OFFER_COLUMNS}"
     ))
     .bind(command.command_id)
@@ -206,6 +262,8 @@ pub async fn create(
     .bind(terms.as_ref().map(|snapshot| snapshot.raw_sha256.clone()))
     .bind(&terms_snapshot)
     .bind(&payload.buyer_country)
+    .bind(&payload.destination_country)
+    .bind(&shipping_choice)
     .fetch_one(&mut **tx)
     .await?;
 
@@ -368,6 +426,18 @@ pub async fn counter(
     } else {
         None
     };
+    // The buyer's rate on inline zones names no record hash, so the record the
+    // offer was priced against is the only pin. A counter that moves it would
+    // let the new record's rate of the same id replace the one the buyer saw.
+    let inline_choice = offer
+        .shipping_choice
+        .as_ref()
+        .is_some_and(|choice| choice.get("listing_aggregate_id").is_some());
+    if let (true, Some(snapshot)) = (inline_choice, refreshed_terms.as_ref()) {
+        if offer.terms_listing_record_sha256.as_deref() != Some(snapshot.raw_sha256.as_str()) {
+            return Ok(Err(crate::shipping::PricingError::ProfileChanged.failure()));
+        }
+    }
     let Some(listing) = fetch_live_listing(tx, &offer.listing_aggregate_id)
         .await?
         .filter(|listing| listing.accepts_commitment_created_at(offer.created_at))
@@ -477,6 +547,7 @@ pub async fn accept(
     command: &Command,
     payload: &OfferActionPayload,
     homeserver: Option<&dyn HomeserverListingClient>,
+    shipping: &crate::shipping::ShippingPlan,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     let locator: Option<OfferRow> =
@@ -557,6 +628,7 @@ pub async fn accept(
                 currency: locator.currency.clone(),
                 exponent: locator.exponent,
                 shipping_minor: 0,
+                shipping: AwardShipping::Flat,
                 // Without a seller-signed record there is no pickup authority:
                 // the award stays shipping-only, as before.
                 fulfillment_methods: vec!["shipping".to_string()],
@@ -579,6 +651,7 @@ pub async fn accept(
             Ok(offer) => offer,
             Err(failure) => return Ok(Err(failure)),
         };
+    let fetched_identity_present = fetched_identity.is_some();
     if let Some((fetched_seller, fetched_aggregate, fetched_listing_id)) = fetched_identity {
         let current_listing = fetch_listing(tx, &offer.listing_aggregate_id).await?;
         if offer.seller_pubky != fetched_seller
@@ -662,6 +735,41 @@ pub async fn accept(
             "The offer listing is unavailable.",
         )));
     };
+    // The accepted quantity and the buyer's rate price the award's shipping,
+    // from the record the offer pinned (or, with no record read, from the
+    // registered row). A profile that changed since the buyer chose is
+    // `SHIPPING_CHANGED`: the buyer makes a new offer.
+    let line_shipping = if fetched_identity_present {
+        snapshot_line_shipping(&snapshot)
+    } else {
+        match crate::shipping::LineShipping::from_row(&listing) {
+            Ok(line_shipping) => line_shipping,
+            Err(error) => return Ok(Err(error.failure())),
+        }
+    };
+    let stored_choice: Option<marketplace_domain::commands::ShippingChoice> = offer
+        .shipping_choice
+        .clone()
+        .and_then(|choice| serde_json::from_value(choice).ok());
+    let priced_shipping = match crate::shipping::price_single_line(
+        shipping,
+        &offer.seller_pubky,
+        crate::shipping::PricedLine {
+            listing_aggregate_id: offer.listing_aggregate_id.clone(),
+            quantity: offer.quantity,
+            shipping: line_shipping,
+        },
+        crate::shipping::Asset {
+            currency: &snapshot.currency,
+            exponent: snapshot.exponent,
+        },
+        offer.destination_country.as_deref(),
+        stored_choice.as_ref(),
+    ) {
+        Ok(priced) => priced,
+        Err(error) => return Ok(Err(error.failure())),
+    };
+    let accepted_shipping_minor = priced_shipping.shipping_minor;
     let rows = crate::variant_stock::lock_rows(tx, &listing.aggregate_id).await?;
     let keyed = crate::variant_stock::tracks_variants(&rows);
     let row = match crate::variant_stock::resolve(&rows, Some(variant.id.as_str())) {
@@ -746,6 +854,7 @@ pub async fn accept(
          accepted_listing_record_sha256 = $9, accepted_variant_id = $10,
          accepted_variant_sku = $11, accepted_variant_options = $12, accepted_shipping_minor = $13,
          accepted_subtotal_minor = $14, accepted_total_minor = $15,
+         accepted_shipping_quotes = $18,
          accepted_fulfillment = 'shipping', accepted_fulfillment_methods = $17,
          history = history || $16::jsonb
          WHERE id = $1 RETURNING {OFFER_COLUMNS}"
@@ -762,7 +871,7 @@ pub async fn accept(
     .bind(&variant.id)
     .bind(variant.sku.as_deref())
     .bind(&variant.options)
-    .bind(snapshot.shipping_minor)
+    .bind(accepted_shipping_minor)
     .bind(
         offer
             .amount_minor
@@ -773,7 +882,7 @@ pub async fn accept(
         offer
             .amount_minor
             .checked_mul(offer.quantity)
-            .and_then(|subtotal| subtotal.checked_add(snapshot.shipping_minor))
+            .and_then(|subtotal| subtotal.checked_add(accepted_shipping_minor))
             .ok_or_else(|| sqlx::Error::Protocol("offer total overflow".to_string()))?,
     )
     .bind(json!([history_entry(
@@ -786,6 +895,7 @@ pub async fn accept(
         now,
     )]))
     .bind(&snapshot.fulfillment_methods)
+    .bind(priced_shipping.quotes_json())
     .fetch_one(&mut **tx)
     .await?;
 

@@ -307,8 +307,12 @@ async fn sync(
             // state) is touched.
             let registration_variant_prices =
                 crate::handlers::register_listing::variant_prices_json(&registration.variants);
+            let registration_zones =
+                crate::handlers::register_listing::shipping_zones_json(&registration);
             if registration.listing_revision == current.listing_revision
                 && (registration.shipping_minor != current.shipping_minor
+                    || registration.shipping_profile_id != current.shipping_profile_id
+                    || registration_zones != current.shipping_zones
                     || registration_variant_prices != current.variant_prices
                     || registration_methods != current.fulfillment_methods
                     || registration
@@ -325,7 +329,8 @@ async fn sync(
                 let healed: crate::model::ListingRow = sqlx::query_as(&format!(
                     "UPDATE listings SET server_revision = server_revision + 1, \
                      shipping_minor = $2, fulfillment_methods = $3, digital_lock_policy_uri = $4, \
-                     digital_lock_criterion_id = $5, updated_at = $6, variant_prices = $7 \
+                     digital_lock_criterion_id = $5, updated_at = $6, variant_prices = $7, \
+                     shipping_profile_id = $8, shipping_zones = $9 \
                      WHERE aggregate_id = $1 \
                      RETURNING {}",
                     crate::handlers::LISTING_COLUMNS
@@ -347,6 +352,8 @@ async fn sync(
                 )
                 .bind(now)
                 .bind(&registration_variant_prices)
+                .bind(&registration.shipping_profile_id)
+                .bind(&registration_zones)
                 .fetch_one(&mut **tx)
                 .await?;
                 let event_id = crate::executor::insert_event(

@@ -260,6 +260,24 @@ pub async fn execute_with_edge(
         }
     }
 
+    // Zone-priced shipping reads the sellers' shipping profiles and shop
+    // records here, before the transaction, for the same reason: a slow
+    // homeserver never holds a listing row lock. A replay is answered from
+    // its stored result.
+    let mut shipping = crate::shipping::ShippingPlan::off();
+    if matches!(
+        command.payload,
+        CommandPayload::CreateCheckout(_)
+            | CommandPayload::CreateOffer(_)
+            | CommandPayload::AcceptOffer(_)
+            | CommandPayload::PlaceBid(_)
+    ) && stored_command_result(&state.pool, actor, command.command_id)
+        .await?
+        .is_none()
+    {
+        shipping = crate::shipping::ShippingPlan::read(state, &command).await?;
+    }
+
     // A `listing.register` that needs the seller's public record reads it
     // here, before the transaction and the command's advisory lock, so a slow
     // homeserver never holds a domain connection or blocks a duplicate. It
@@ -328,7 +346,17 @@ pub async fn execute_with_edge(
     }
 
     let now = state.clock.now();
-    let outcome = dispatch(state, &mut tx, actor, &command, &prefetched, &fence, now).await;
+    let outcome = dispatch(
+        state,
+        &mut tx,
+        actor,
+        &command,
+        &prefetched,
+        &fence,
+        &shipping,
+        now,
+    )
+    .await;
     match outcome {
         Ok(Ok(success)) => {
             let body = success_body(&command, &success);
@@ -666,6 +694,7 @@ fn command_kind(payload: &CommandPayload) -> CommandKind {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch(
     state: &AppState,
     tx: &mut Transaction<'_, Postgres>,
@@ -673,6 +702,7 @@ async fn dispatch(
     command: &Command,
     prefetched: &crate::handlers::register_listing::RegisterRecordPrefetch,
     fence: &crate::region_fence::FencePlan,
+    shipping: &crate::shipping::ShippingPlan,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     match &command.payload {
@@ -723,6 +753,7 @@ async fn dispatch(
                     digital: state.digital.as_deref(),
                     require_encrypted_delivery: state.config.require_encrypted_delivery_address,
                     fence,
+                    shipping,
                 },
                 now,
             )
@@ -735,6 +766,7 @@ async fn dispatch(
                 command,
                 payload,
                 state.homeserver.as_deref(),
+                shipping,
                 now,
             )
             .await
@@ -757,6 +789,7 @@ async fn dispatch(
                 command,
                 payload,
                 state.homeserver.as_deref(),
+                shipping,
                 now,
             )
             .await
@@ -786,7 +819,7 @@ async fn dispatch(
             crate::handlers::offers::withdraw(tx, actor, command, payload, now).await
         }
         CommandPayload::PlaceBid(payload) => {
-            crate::handlers::auction::place_bid(tx, actor, command, payload, now).await
+            crate::handlers::auction::place_bid(tx, actor, command, payload, shipping, now).await
         }
         CommandPayload::CloseAuction(payload) => {
             crate::handlers::auction::close(tx, actor, command, payload, now).await

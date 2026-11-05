@@ -265,6 +265,13 @@ impl RegionModes {
         }
     }
 
+    /// Whether an order's destination country is blocked. The destination is
+    /// the country the buyer asked the goods be shipped to; it is checked
+    /// beside the declared country because the two can differ.
+    pub fn destination_blocked(&self, destination: Option<&str>) -> bool {
+        destination.is_some_and(|country| self.mode_of(country) == Mode::Blocked)
+    }
+
     /// Whether a buyer is blocked: the declared country is blocked, else the
     /// IP country is blocked, or unknown while unknown origins are blocked.
     /// A buyer cannot dodge a block by declaring another country or by

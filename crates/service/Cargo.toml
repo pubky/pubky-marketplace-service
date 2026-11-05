@@ -8,6 +8,7 @@ description = "Pubky Marketplace Transaction Service (ADR-0019 / ADR-0022)"
 
 [dependencies]
 marketplace-domain.workspace = true
+pubky-market-specs.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 axum.workspace = true

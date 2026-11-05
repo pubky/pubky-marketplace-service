@@ -797,6 +797,7 @@ impl HomeserverListingClient for CommandMirrorHomeserver {
 /// parsing are exercised end to end.
 pub struct FakeHomeserver {
     shops: Arc<Mutex<HashMap<String, Value>>>,
+    profiles: HomeserverProfileMap,
     records: HomeserverRecordMap,
     drop_records: HomeserverRecordMap,
     events: HomeserverEventLog,
@@ -816,6 +817,10 @@ pub struct HomeserverThrottle {
 }
 
 type HomeserverThrottledStreams = Arc<Mutex<HomeserverThrottle>>;
+
+/// The exact bytes of each seller's shipping profile records, by
+/// `(seller, profile_id)`.
+type HomeserverProfileMap = Arc<Mutex<HashMap<(String, String), Vec<u8>>>>;
 
 /// Records whose fetch answers 500, as a failing homeserver would.
 type HomeserverFailingRecords = Arc<Mutex<std::collections::HashSet<(String, String)>>>;
@@ -932,6 +937,35 @@ impl FakeHomeserver {
             .record(user, "PUT", path.to_string());
     }
 
+    /// Publishes a shipping profile record and returns the SHA-256 (lowercase
+    /// hex) of the bytes served, which is what a buyer pins.
+    pub fn put_shipping_profile(
+        &self,
+        seller_pubky: &str,
+        profile_id: &str,
+        record: &Value,
+    ) -> String {
+        let bytes = serde_json::to_vec(record).expect("shipping profile serializes");
+        let sha256 = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&bytes));
+        self.profiles
+            .lock()
+            .expect("fake homeserver profiles lock")
+            .insert((seller_pubky.to_string(), profile_id.to_string()), bytes);
+        sha256
+    }
+
+    pub fn delete_shipping_profile(&self, seller_pubky: &str, profile_id: &str) {
+        self.profiles
+            .lock()
+            .expect("fake homeserver profiles lock")
+            .remove(&(seller_pubky.to_string(), profile_id.to_string()));
+    }
+
+    /// Answers 500 for this profile's fetch until [`Self::heal_record`].
+    pub fn fail_shipping_profile(&self, seller_pubky: &str, profile_id: &str) {
+        self.fail_record(seller_pubky, profile_id);
+    }
+
     /// Publishes the seller's shop record at `shop.json`.
     pub fn put_shop_record(&self, seller_pubky: &str, record: Value) {
         self.shops
@@ -1032,6 +1066,38 @@ async fn serve_homeserver_record(
         .cloned();
     match stored {
         Some(record) => (StatusCode::OK, axum::Json(record)).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn serve_shipping_profile(
+    axum::extract::State(profiles): axum::extract::State<HomeserverProfileMap>,
+    axum::Extension(delay_ms): axum::Extension<Arc<std::sync::atomic::AtomicU64>>,
+    axum::Extension(failing): axum::Extension<HomeserverFailingRecords>,
+    axum::extract::Path(profile_id): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    homeserver_delay(&delay_ms).await;
+    let seller = headers
+        .get("pubky-host")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    if failing
+        .lock()
+        .expect("fake homeserver failing lock")
+        .contains(&(seller.clone(), profile_id.clone()))
+    {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let stored = profiles
+        .lock()
+        .expect("fake homeserver profiles lock")
+        .get(&(seller, profile_id))
+        .cloned();
+    match stored {
+        Some(bytes) => (StatusCode::OK, bytes).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -1170,7 +1236,12 @@ pub async fn spawn_fake_homeserver() -> FakeHomeserver {
     let failing: HomeserverFailingRecords = Arc::default();
     let throttled: HomeserverThrottledStreams = Arc::default();
     let shops: Arc<Mutex<HashMap<String, Value>>> = Arc::default();
+    let profiles: HomeserverProfileMap = Arc::default();
     let router = Router::new()
+        .route(
+            "/pub/pubky.app/marketplace/v1/shipping_profiles/{profile_id}",
+            axum::routing::get(serve_shipping_profile).with_state(profiles.clone()),
+        )
         .route(
             "/pub/pubky.app/marketplace/v1/shop.json",
             axum::routing::get(serve_shop_record).with_state(shops.clone()),
@@ -1207,6 +1278,7 @@ pub async fn spawn_fake_homeserver() -> FakeHomeserver {
     });
     FakeHomeserver {
         shops,
+        profiles,
         records,
         drop_records,
         events,
@@ -1970,7 +2042,7 @@ fn registration_record(command: &Value) -> Option<(String, String, Value)> {
             }
         })
     };
-    let record = json!({
+    let mut record = json!({
         "recordType": "listing",
         "schemaVersion": 1,
         "ownerPubky": seller_pubky,
@@ -1992,6 +2064,18 @@ fn registration_record(command: &Value) -> Option<(String, String, Value)> {
             .unwrap_or_else(|| vec![json!("shipping")]),
         "sale": sale
     });
+    if let Some(profile_id) = payload
+        .get("shipping_profile_id")
+        .filter(|id| !id.is_null())
+    {
+        record["shippingProfileId"] = profile_id.clone();
+    }
+    if let Some(zones) = payload
+        .get("shipping_zones")
+        .filter(|zones| !zones.is_null())
+    {
+        record["shippingZones"] = zones.clone();
+    }
     Some((seller_pubky.to_string(), listing_id.to_string(), record))
 }
 

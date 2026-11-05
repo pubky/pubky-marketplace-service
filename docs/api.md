@@ -338,6 +338,7 @@ request failed, so clients should branch on HTTP status first, and parse
    | `REVISION_CONFLICT`, `IDEMPOTENCY_CONFLICT`, `INSUFFICIENT_INVENTORY`, `INVARIANT_VIOLATION`, `OFFER_EXPIRED`, `INVALID_STATE`, `AUCTION_CLOSED`, `BID_TOO_LOW`, `SELLER_REGISTRATION_REQUIRED` | 409 |
    | `AWARD_EXPIRED`, `AWARD_ALREADY_CONVERTED`, `AWARD_QUANTITY_MISMATCH`, `AWARD_VARIANT_MISMATCH`, `AWARD_LISTING_CHANGED`, `AWARD_HOLD_MISSING` | 409 |
    | `LISTING_MODERATED`, `LISTING_NOT_ACTIVE` | 409 |
+   | `SHIPPING_UNAVAILABLE_TO_COUNTRY`, `SHIPPING_UNAVAILABLE`, `SHIPPING_CHANGED` | 409 |
    | `SELLER_UNAVAILABLE_IN_REGION`, `SELLER_ANNUAL_LIMIT_REACHED`, `DIGITAL_UNAVAILABLE_IN_REGION`, `COMMERCE_UNAVAILABLE_IN_REGION` | 409 |
    | `UPSTREAM_UNAVAILABLE` | 503 (retriable) |
 
@@ -421,8 +422,10 @@ request failed, so clients should branch on HTTP status first, and parse
    blocked), `buyer_ip_blocked` (the request country from the header named by
    `CLIENT_COUNTRY_HEADER` is blocked, whatever the buyer declared) or
    `buyer_region_unknown` (no usable request country while unknown origins are
-   blocked; also the answer to a seller's own request in that case). The
-   message is "Buying and selling aren't available in your region yet." or, for
+   blocked; also the answer to a seller's own request in that case) or
+   `destination_region_blocked` (the `destination_country` the buyer sent on
+   the command, or the order's when payment starts, is blocked; message
+   "Shipping to that country isn't available yet."). The message is "Buying and selling aren't available in your region yet." or, for
    an unknown origin, "We can't tell where you are, so buying and selling are
    paused." In the same mode `SELLER_UNAVAILABLE_IN_REGION` also has `reason`
    `seller_region_blocked` (the seller's shop country is blocked: refused on
@@ -2070,6 +2073,7 @@ Liveness plus a capability summary. Always `200` while the process is up:
 {
   "status": "ok",
   "offer_checkout": true,
+  "shipping_zones": true,
   "pickup_available": true,
   "digital_delivery_available": true,
   "digital_delivery_max_bytes": 1048576,
@@ -2085,6 +2089,11 @@ Liveness plus a capability summary. Always `200` while the process is up:
 (the `GIT_COMMIT` Docker build arg, set by the production image workflow), or
 `"unknown"` when the build did not pass one or the value is not a hex SHA. It is
 the only build detail exposed: no version, build time or host information.
+
+`shipping_zones` is `true` on a deployment that prices a listing's shipping by
+the buyer's destination country (see
+[Zone-priced shipping](../README.md#zone-priced-shipping)); a client reads it
+before sending `destination_country`.
 
 The capability fields reflect how this deployment is configured (for example
 `priv_keys_available` is `true` only when the `/priv` key-encryption key is

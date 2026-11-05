@@ -117,6 +117,13 @@ pub struct ListingRow {
     /// carries the record's `priceOverride`s and read, under the listing row
     /// lock, by the checkout that charges them.
     pub variant_prices: Option<Value>,
+    /// The seller's shipping profile the listing record references
+    /// (migration 0095). The profile record itself is read from the seller's
+    /// homeserver and pinned by SHA-256 when an order is priced.
+    pub shipping_profile_id: Option<String>,
+    /// Zones the record carries itself, priced in the listing's asset
+    /// (migration 0095). Never set together with `shipping_profile_id`.
+    pub shipping_zones: Option<Value>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -282,6 +289,12 @@ impl ListingRow {
         }
         if let Some(prices) = &self.variant_prices {
             projection["variant_prices"] = prices.clone();
+        }
+        if let Some(profile_id) = &self.shipping_profile_id {
+            projection["shipping_profile_id"] = json!(profile_id);
+        }
+        if let Some(zones) = &self.shipping_zones {
+            projection["shipping_zones"] = zones.clone();
         }
         crate::reserve_secrecy::ensure_reserve_free(&projection)
             .map_err(|_| ListingProjectionError)?;
@@ -455,6 +468,13 @@ pub struct OfferRow {
     /// The physical methods the accepted snapshot published; NULL for awards
     /// accepted before 0044, which are shipping-only.
     pub accepted_fulfillment_methods: Option<Vec<String>>,
+    /// The country the offer would ship to and the rate the buyer chose
+    /// (migration 0095); NULL for an offer priced by the flat rate.
+    pub destination_country: Option<String>,
+    pub shipping_choice: Option<Value>,
+    /// The quote of each zone-priced shipping group the accepted award is
+    /// charged, priced at accept for the accepted quantity.
+    pub accepted_shipping_quotes: Option<Value>,
     pub converted_order_id: Option<Uuid>,
     pub converted_at: Option<DateTime<Utc>>,
     pub expiry_reason: Option<String>,
@@ -515,7 +535,7 @@ impl OfferRow {
         let accepted_total = self
             .accepted_total_minor
             .map(|total| money_json(total, award_currency, award_exponent));
-        json!({
+        let mut view = json!({
             "id": self.id,
             "aggregate_id": self.aggregate_id,
             "listing_aggregate_id": self.listing_aggregate_id,
@@ -565,7 +585,16 @@ impl OfferRow {
                 "convert_by": self.award_expires_at.map(format_timestamp),
                 "converted_order_id": self.converted_order_id,
             })).unwrap_or(Value::Null),
-        })
+        });
+        if let Some(award) = view.get_mut("award").and_then(Value::as_object_mut) {
+            if let Some(country) = &self.destination_country {
+                award.insert("destination_country".to_string(), json!(country));
+            }
+            if let Some(quotes) = &self.accepted_shipping_quotes {
+                award.insert("shipping_quotes".to_string(), quotes.clone());
+            }
+        }
+        view
     }
 }
 
@@ -622,6 +651,12 @@ pub struct OrderRow {
     delivery_key_id: Option<String>,
     pub subtotal_minor: i64,
     pub shipping_minor: i64,
+    /// The country the buyer named for the order (clear text beside the
+    /// sealed address). NULL when the buyer named none.
+    pub destination_country: Option<String>,
+    /// The quote of each zone-priced shipping group the order was charged
+    /// (migration 0095). NULL for an order priced by the flat rate.
+    pub shipping_quotes: Option<Value>,
     pub total_minor: i64,
     pub currency: String,
     pub exponent: i32,
@@ -967,6 +1002,8 @@ impl OrderRow {
             delivery_key_id: None,
             subtotal_minor,
             shipping_minor,
+            destination_country: None,
+            shipping_quotes: None,
             total_minor,
             currency,
             exponent,
@@ -1328,6 +1365,12 @@ impl OrderRow {
         });
         view["priced_from"] = json!(self.priced_from);
         view["auction_aggregate_id"] = json!(self.auction_aggregate_id);
+        if let Some(country) = &self.destination_country {
+            view["destination_country"] = json!(country);
+        }
+        if let Some(quotes) = &self.shipping_quotes {
+            view["shipping_quotes"] = quotes.clone();
+        }
         view["shipping_address_required"] = json!(self.needs_delivery_address());
         view["delivery_assume_days"] = json!(self.delivery_assume_days);
         view["auto_complete_days"] = json!(self.auto_complete_days);

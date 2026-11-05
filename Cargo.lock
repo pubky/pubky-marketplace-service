@@ -1931,6 +1931,7 @@ version = "0.1.0"
 dependencies = [
  "base32",
  "chrono",
+ "pubky-market-specs",
  "regex",
  "serde",
  "serde_json",
@@ -1963,6 +1964,7 @@ dependencies = [
  "marketplace-service",
  "pubky",
  "pubky-common",
+ "pubky-market-specs",
  "rand 0.8.7",
  "reqwest 0.12.28",
  "schemars",
@@ -2524,6 +2526,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "pubky-market-specs"
+version = "0.2.0"
+source = "git+https://github.com/pubky/pubky-market-specs?rev=54945149d127dbf0129347fba508795cc2f7e77f#54945149d127dbf0129347fba508795cc2f7e77f"
+dependencies = [
+ "base32",
+ "blake3",
+ "ed25519-dalek 2.2.0",
+ "js-sys",
+ "serde",
+ "serde-wasm-bindgen",
+ "serde_json",
+ "url",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "pubky-timestamp"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3077,6 +3095,17 @@ checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
 dependencies = [
  "serde_core",
  "serde_derive",
+]
+
+[[package]]
+name = "serde-wasm-bindgen"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8302e169f0eddcc139c70f139d19d6467353af16f9fce27e8c30158036a1e16b"
+dependencies = [
+ "js-sys",
+ "serde",
+ "wasm-bindgen",
 ]
 
 [[package]]

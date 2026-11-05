@@ -58,7 +58,7 @@ pub const ORDER_COLUMNS: &str =
        WHERE seller_option.seller_pubky = orders.seller_pubky \
        AND seller_option.enabled)) AS seller_has_rail, revision, \
      state, lines, delivery_address, checkout_command_id, delivery_address_envelope, \
-     delivery_key_id, subtotal_minor, shipping_minor, total_minor, \
+     delivery_key_id, subtotal_minor, shipping_minor, destination_country, shipping_quotes, total_minor, \
      currency, exponent, payment_id, receipt_id, edition, \
      cancellation_reason, stock_held, hold_expires_at, hold_source, \
      shipment, delivery_assumed, delivery_assume_days, auto_complete_days, return_policy, return_request, external_refund, payment_method, fiat_checkout_url, \

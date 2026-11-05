@@ -53,6 +53,17 @@ pub enum ErrorCode {
     /// `buyer_region_unknown`. Only returned while `REGION_MODES` blocks a
     /// region.
     CommerceUnavailableInRegion,
+    /// The seller does not ship to the order's destination country: no zone
+    /// covers it, the profile excludes it, or the shop's ships-to list omits
+    /// it.
+    ShippingUnavailableToCountry,
+    /// The seller's shipping terms cannot be read or applied right now: the
+    /// profile record is missing or unreadable, or it is priced in another
+    /// asset than the listing. `error.reason` names which.
+    ShippingUnavailable,
+    /// The shipping profile changed since the buyer saw its rates, so the
+    /// quote the buyer chose no longer applies. The client re-quotes.
+    ShippingChanged,
 }
 
 impl ErrorCode {
@@ -83,7 +94,10 @@ impl ErrorCode {
             | ErrorCode::SellerUnavailableInRegion
             | ErrorCode::SellerAnnualLimitReached
             | ErrorCode::DigitalUnavailableInRegion
-            | ErrorCode::CommerceUnavailableInRegion => 409,
+            | ErrorCode::CommerceUnavailableInRegion
+            | ErrorCode::ShippingUnavailableToCountry
+            | ErrorCode::ShippingUnavailable
+            | ErrorCode::ShippingChanged => 409,
             ErrorCode::UpstreamUnavailable => 503,
         }
     }

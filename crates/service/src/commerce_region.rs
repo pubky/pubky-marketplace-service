@@ -60,6 +60,8 @@ pub const COMMERCE_UNKNOWN_MESSAGE: &str =
 /// The seller's own request, or the seller's own shop country.
 pub const SELLING_UNAVAILABLE_MESSAGE: &str = "Selling isn't available in your region yet.";
 pub const REASON_BUYER_REGION_BLOCKED: &str = "buyer_region_blocked";
+pub const REASON_DESTINATION_BLOCKED: &str = "destination_region_blocked";
+pub const DESTINATION_UNAVAILABLE_MESSAGE: &str = "Shipping to that country isn't available yet.";
 pub const REASON_BUYER_IP_BLOCKED: &str = "buyer_ip_blocked";
 pub const REASON_BUYER_REGION_UNKNOWN: &str = "buyer_region_unknown";
 pub const REASON_SELLER_IP_BLOCKED: &str = "seller_ip_blocked";
@@ -128,11 +130,13 @@ pub async fn gate(
         | CommandPayload::OfferCheckout(_)
         | CommandPayload::PlaceBid(_) => {
             let country = crate::region_fence::buyer_country_of(&command.payload).flatten();
-            buyer_check(state, country, edge)
+            buyer_check(state, country, edge)?;
+            destination_check(state, destination_of(&command.payload))
         }
         CommandPayload::PrepareLocks(payload) => {
             let order: Option<OrderFacts> = sqlx::query_as(
-                "SELECT o.seller_pubky, o.buyer_country, o.seller_country FROM payments p \
+                "SELECT o.seller_pubky, o.buyer_country, o.seller_country, o.destination_country \
+                 FROM payments p \
                  JOIN orders o ON o.id = p.order_id \
                  WHERE p.id = $1 AND o.buyer_pubky = $2",
             )
@@ -182,7 +186,7 @@ pub async fn gate_bind(
         return Ok(());
     }
     let order: Option<OrderFacts> = sqlx::query_as(
-        "SELECT seller_pubky, buyer_country, seller_country FROM orders \
+        "SELECT seller_pubky, buyer_country, seller_country, destination_country FROM orders \
          WHERE id = $1 AND buyer_pubky = $2 AND payment_method IS NULL",
     )
     .bind(order_id)
@@ -227,6 +231,36 @@ fn buyer_check(
     }
 }
 
+/// A destination in a blocked region is refused the way a blocked buyer is:
+/// no new commerce ships there.
+fn destination_check(state: &AppState, destination: Option<&str>) -> Result<(), CommandFailure> {
+    if state
+        .config
+        .region_policy()
+        .modes()
+        .destination_blocked(destination)
+    {
+        return Err(CommandFailure::refused_with_reason(
+            RefusalKind::InvalidState,
+            ErrorCode::CommerceUnavailableInRegion,
+            DESTINATION_UNAVAILABLE_MESSAGE,
+            REASON_DESTINATION_BLOCKED,
+        ));
+    }
+    Ok(())
+}
+
+/// The destination country a buyer command names, if any.
+fn destination_of(payload: &CommandPayload) -> Option<&str> {
+    match payload {
+        CommandPayload::CreateCheckout(p) => p.destination_country.as_deref(),
+        CommandPayload::CreateOffer(p) => p.destination_country.as_deref(),
+        CommandPayload::OfferCheckout(p) => p.destination_country.as_deref(),
+        CommandPayload::PlaceBid(p) => p.destination_country.as_deref(),
+        _ => None,
+    }
+}
+
 /// What an order says about the two countries, as stored.
 #[derive(sqlx::FromRow)]
 struct OrderFacts {
@@ -237,6 +271,8 @@ struct OrderFacts {
     /// The seller's shop country, frozen at the order's first payment lock
     /// point; none until then.
     seller_country: Option<String>,
+    /// The country the order ships to, when it was priced for one.
+    destination_country: Option<String>,
 }
 
 /// A payment starts from the country the buyer declared at checkout and the
@@ -249,6 +285,7 @@ async fn start_payment_check(
     edge: &EdgeContext,
 ) -> Result<(), CommandFailure> {
     buyer_check(state, order.buyer_country.as_deref(), edge)?;
+    destination_check(state, order.destination_country.as_deref())?;
     let seller_country = match order.seller_country {
         Some(country) => Some(country),
         None => shop_country(state, &order.seller_pubky).await?,
