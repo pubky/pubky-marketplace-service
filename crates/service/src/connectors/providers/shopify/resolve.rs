@@ -302,6 +302,7 @@ impl Resolver {
 
 /// Every address a name resolved to must be public; one private answer among
 /// public ones refuses the lookup, so a split DNS reply cannot slip through.
+/// The refusal is the same error as an empty answer.
 fn ensure_public(addresses: &[SocketAddr], policy: SitePolicy) -> Result<(), ProviderError> {
     if addresses.is_empty() {
         return Err(ProviderError::Unknown("the address did not resolve".into()));
@@ -312,10 +313,11 @@ fn ensure_public(addresses: &[SocketAddr], policy: SitePolicy) -> Result<(), Pro
     Ok(())
 }
 
+/// A private answer is reported exactly like a name that did not resolve, so
+/// a seller cannot tell internal DNS names or address classes from missing
+/// ones.
 fn private_network() -> ProviderError {
-    ProviderError::Invalid(
-        "That address points at a private network, which cannot be connected.".into(),
-    )
+    ProviderError::Unknown("the address did not resolve".into())
 }
 
 struct Fetched {
@@ -388,9 +390,9 @@ mod tests {
             assert!(
                 matches!(
                     ensure_public(&[at("23.227.38.65:443"), at(private)], production),
-                    Err(ProviderError::Invalid(_))
+                    Err(ProviderError::Unknown(message)) if message == "the address did not resolve"
                 ),
-                "{private} slipped through"
+                "{private} slipped through or was told apart from an empty answer"
             );
         }
         assert!(matches!(
