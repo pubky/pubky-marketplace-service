@@ -600,6 +600,34 @@ the named units, and only forget the version:
 DELETE FROM _sqlx_migrations WHERE version = 93;
 ```
 
+## Moderation decisions (0094)
+
+0094 creates `moderation_decisions`, the statement of reasons a moderator
+records for a restricted listing, shop or review
+([moderation-decisions.md](moderation-decisions.md)), with a recipient index
+and the append-only trigger `report_decisions` uses. A new table only: no
+existing table, row or constraint is touched, and nothing is backfilled.
+Directly rerunnable: the table and index are created only if missing and the
+trigger is recreated, so it applies again after its version is forgotten.
+Its checks hold the same rules as the command's validation.
+
+**Deploy mode: rolling.** A binary from before 0094 never reads the table.
+Rows are written only by the `moderation-decision-admin` command, so none
+exist until an operator records one. A `moderation_decision` notification
+delivered while an older binary serves `GET /v1/notifications` is listed
+without its `moderation_decision` field; the next read from a new binary
+carries it.
+
+### Backing out 0094
+
+An image from before it runs on the migrated database and ignores the table.
+Keep the table and its rows (they are the record of decisions already sent);
+only forget the version:
+
+```sql
+DELETE FROM _sqlx_migrations WHERE version = 94;
+```
+
 ## Numbers claimed by open pull requests
 
 `main` has 0001 to 0079 (0068 and 0069 were never used). A new migration must
@@ -617,6 +645,7 @@ assume it is free:
 | 0091 | `0091_seller_confirmed_payment.sql` | `orders.payment_confirmation` and `orders.gateway_payment_seen_at` (seller-confirmed payment) |
 | 0092 | `0092_digital_release.sql` | `orders.digital_release`, `orders.digital_released_at` and the `release_digital` command kind (digital release split from payment), stacked on 0091 |
 | 0093 | `0093_bitcoin_refund_received_sats.sql` | Bitcoin refunds in the sats received, stacked on 0092 |
+| 0094 | `0094_moderation_decisions.sql` | moderation decisions (statements of reasons) and their notification |
 
 This table describes unmerged work and goes stale as pull requests land; trust
 `crates/service/migrations/` on `main` over it. sqlx does not reject two files

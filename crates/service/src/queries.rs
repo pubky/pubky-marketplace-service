@@ -42,6 +42,7 @@ use crate::model::{
     AuctionReserveRow, AuctionState, DropRow, ListingRow, NotificationRow, OfferRow, OrderRow,
     PaymentRow, ReceiptRow, ReviewRow,
 };
+use crate::moderation_decisions;
 use crate::AppState;
 
 pub const DEFAULT_LIMIT: i64 = 50;
@@ -1297,11 +1298,33 @@ pub async fn list_notifications(
     .bind(limit)
     .fetch_all(&state.pool)
     .await;
-    match notifications {
-        Ok(notifications) => {
-            let views: Vec<Value> = notifications.iter().map(NotificationRow::view).collect();
-            (StatusCode::OK, Json(json!({ "notifications": views }))).into_response()
-        }
-        Err(error) => internal_error("notifications", &error),
-    }
+    let notifications = match notifications {
+        Ok(notifications) => notifications,
+        Err(error) => return internal_error("notifications", &error),
+    };
+    let decision_ids: Vec<Uuid> = notifications
+        .iter()
+        .filter(|row| row.notification_type == moderation_decisions::NOTIFICATION_TYPE)
+        .filter_map(|row| moderation_decisions::decision_id(&row.aggregate_id))
+        .collect();
+    let decisions =
+        match moderation_decisions::views_for_recipient(&state.pool, &actor.0, &decision_ids).await
+        {
+            Ok(decisions) => decisions,
+            Err(error) => return internal_error("notifications", &error),
+        };
+    let views: Vec<Value> = notifications
+        .iter()
+        .map(|row| {
+            let mut view = row.view();
+            // The statement of reasons on a `moderation_decision`
+            // notification; null on every other type.
+            view["moderation_decision"] = moderation_decisions::decision_id(&row.aggregate_id)
+                .filter(|_| row.notification_type == moderation_decisions::NOTIFICATION_TYPE)
+                .and_then(|id| decisions.get(&id).cloned())
+                .unwrap_or(Value::Null);
+            view
+        })
+        .collect();
+    (StatusCode::OK, Json(json!({ "notifications": views }))).into_response()
 }

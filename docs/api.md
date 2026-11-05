@@ -713,6 +713,36 @@ participant-scoped application routes, not through this export.
   the aggregate (listing export, order export) for the new state, using
   `revision` to discard stale reads.
 
+## Moderation decisions
+
+When a moderator restricts a listing, a shop or a review, its owner receives a
+`moderation_decision` notification (`actor_pubky` `system`, `aggregate_id`
+`moderation_decision:<id>`) on `GET /v1/notifications`. It carries the
+statement of reasons as `moderation_decision`:
+
+```json
+{
+  "id": "6f1c…",
+  "restriction": "listing_removed",
+  "target_uri": "pubky://<seller>/pub/pubky.app/marketplace/v1/listings/<id>",
+  "territorial_scope": "Every region where Pubky Market is offered",
+  "ends_at": null,
+  "decided_at": "2026-11-04T12:00:00.000Z",
+  "basis": "notice",
+  "facts": "…",
+  "automated_detection": false,
+  "automated_decision": false,
+  "automated_means": null,
+  "ground": "terms",
+  "ground_reference": "Pubky Terms of Service, Prohibited goods",
+  "explanation": "…"
+}
+```
+
+`moderation_decision` is `null` on every other notification. The fields and
+how operators record a decision are in
+[moderation-decisions.md](moderation-decisions.md).
+
 ## Shipping and tracking commands
 
 Both commands go through `POST /v1/commands` (the envelope is described in the
