@@ -510,15 +510,17 @@ pub struct StartConnectRequest {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct ResolveShopQuery {
+pub struct ResolveShopRequest {
     #[serde(default)]
     provider: String,
     #[serde(default)]
     domain: String,
 }
 
-/// `GET /v1/connectors/resolve?provider=shopify&domain=shop.example`: what
-/// store a merchant's address names, before anything is connected.
+/// `POST /v1/connectors/resolve` with `{"provider": "shopify", "domain":
+/// "shop.example"}`: what store a merchant's address names, before anything
+/// is connected. The address travels in the body, so it never appears in a
+/// URL, a proxy log or an error report.
 ///
 /// A Shopify store is often known by its own domain; the connection is keyed
 /// by its `*.myshopify.com` domain. The answer is `{shop, domain}`: the
@@ -531,13 +533,13 @@ pub struct ResolveShopQuery {
 pub async fn resolve_shop(
     State(state): State<AppState>,
     Extension(_actor): Extension<Actor>,
-    Query(query): Query<ResolveShopQuery>,
+    Json(request): Json<ResolveShopRequest>,
 ) -> Response {
     let runtime = match runtime(&state) {
         Ok(runtime) => runtime,
         Err(response) => return response,
     };
-    let Some(kind) = ProviderKind::parse(&query.provider) else {
+    let Some(kind) = ProviderKind::parse(&request.provider) else {
         return error(
             StatusCode::UNPROCESSABLE_ENTITY,
             "invalid_provider",
@@ -547,14 +549,14 @@ pub async fn resolve_shop(
     let Some(provider) = runtime.providers.get(kind) else {
         return provider_unavailable();
     };
-    if query.domain.chars().count() > MAX_FIELD_CHARS {
+    if request.domain.chars().count() > MAX_FIELD_CHARS {
         return error(
             StatusCode::UNPROCESSABLE_ENTITY,
             "invalid_domain",
             "The store address is too long.",
         );
     }
-    match call(runtime, provider.resolve_shop(&query.domain)).await {
+    match call(runtime, provider.resolve_shop(&request.domain)).await {
         Ok(resolved) => respond(
             StatusCode::OK,
             json!({

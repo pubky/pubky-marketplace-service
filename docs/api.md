@@ -149,7 +149,7 @@ and write. "Automation" means the inventory capability plus the
 | POST | `/v0/orders/{id}/bitcoin/resolve` |
 | GET, POST | `/v1/connectors` |
 | GET | `/v1/connectors/alerts` |
-| GET | `/v1/connectors/resolve` |
+| POST | `/v1/connectors/resolve` |
 | POST | `/v1/connectors/alerts/{id}/resolve` |
 | DELETE | `/v1/connectors/{id}` |
 | GET | `/v1/connectors/{id}/catalog` |
@@ -1854,7 +1854,8 @@ on `X-Shopify-Event-Id`.
   without `fulfillment.update_tracking` (and ship-without-tracking) is detected
   from its command vocabulary and keeps the old behaviour: a fulfilment without
   tracking is ignored (`tracking_commands_unavailable`), one with tracking ships.
-- `GET /v1/connectors/resolve?provider=shopify&domain=shop.example` answers
+- `POST /v1/connectors/resolve` with `{"provider": "shopify", "domain":
+  "shop.example"}` (a body, so the address never sits in a URL) answers
   `{shop, domain}` for the address a merchant typed, before anything is
   connected: `shop` is the canonical `*.myshopify.com` domain to send to
   `POST /v1/connectors`, `domain` the custom domain that was looked up (`null`

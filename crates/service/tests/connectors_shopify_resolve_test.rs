@@ -1,6 +1,6 @@
 //! A Shopify store's own domain resolved to its `*.myshopify.com` domain:
 //! the provider lookup against loopback stand-ins for the storefront and for
-//! Shopify's own host, and `GET /v1/connectors/resolve` over HTTP.
+//! Shopify's own host, and `POST /v1/connectors/resolve` over HTTP.
 //!
 //! The storefront and the store host answer `/meta.json` the way Shopify
 //! documents it (`myshopify_domain`, `domain`); the stand-ins are scripted per
@@ -400,12 +400,10 @@ async fn rig(pool: PgPool) -> Rig {
     }
 }
 
-fn resolve_uri(provider: &str, domain: &str) -> String {
-    let query = url::form_urlencoded::Serializer::new(String::new())
-        .append_pair("provider", provider)
-        .append_pair("domain", domain)
-        .finish();
-    format!("/v1/connectors/resolve?{query}")
+const RESOLVE: &str = "/v1/connectors/resolve";
+
+fn resolve_body(provider: &str, domain: &str) -> Value {
+    json!({"provider": provider, "domain": domain})
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
@@ -416,10 +414,10 @@ async fn the_route_answers_the_shop_for_a_custom_domain_and_for_the_canonical_on
 
     let (status, body) = api(
         &r.app,
-        "GET",
-        &resolve_uri("shopify", &storefront.host_port),
+        "POST",
+        RESOLVE,
         Some(&seller.token),
-        &json!(null),
+        &resolve_body("shopify", &storefront.host_port),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -429,10 +427,10 @@ async fn the_route_answers_the_shop_for_a_custom_domain_and_for_the_canonical_on
 
     let (status, body) = api(
         &r.app,
-        "GET",
-        &resolve_uri("shopify", "https://Example-Goods.myshopify.com"),
+        "POST",
+        RESOLVE,
         Some(&seller.token),
-        &json!(null),
+        &resolve_body("shopify", "https://Example-Goods.myshopify.com"),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -461,31 +459,35 @@ async fn the_route_refuses_clearly_and_needs_a_session(pool: PgPool) {
 
     let (status, body) = api(
         &r.app,
-        "GET",
-        &resolve_uri("shopify", "shop.example"),
+        "POST",
+        RESOLVE,
         None,
-        &json!(null),
+        &resolve_body("shopify", "shop.example"),
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
 
     let cases = [
         (
-            resolve_uri("shopify", &blog.host_port),
+            resolve_body("shopify", &blog.host_port),
             "not_a_shopify_store",
         ),
         (
-            resolve_uri("shopify", "user:pass@shop.example"),
+            resolve_body("shopify", "user:pass@shop.example"),
             "invalid_domain",
         ),
-        (resolve_uri("shopify", ""), "invalid_domain"),
-        (resolve_uri("shopify", &"a".repeat(300)), "invalid_domain"),
-        (resolve_uri("magento", "shop.example"), "invalid_provider"),
+        (resolve_body("shopify", ""), "invalid_domain"),
+        (resolve_body("shopify", &"a".repeat(300)), "invalid_domain"),
+        (resolve_body("magento", "shop.example"), "invalid_provider"),
     ];
-    for (uri, code) in cases {
-        let (status, body) = api(&r.app, "GET", &uri, Some(&seller.token), &json!(null)).await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{uri}: {body}");
-        assert_eq!(body["error"]["code"], code, "{uri}: {body}");
+    for (request, code) in cases {
+        let (status, body) = api(&r.app, "POST", RESOLVE, Some(&seller.token), &request).await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{request}: {body}"
+        );
+        assert_eq!(body["error"]["code"], code, "{request}: {body}");
     }
 
     let port = std::net::TcpListener::bind("127.0.0.1:0")
@@ -495,10 +497,10 @@ async fn the_route_refuses_clearly_and_needs_a_session(pool: PgPool) {
         .port();
     let (status, body) = api(
         &r.app,
-        "GET",
-        &resolve_uri("shopify", &format!("127.0.0.1:{port}")),
+        "POST",
+        RESOLVE,
         Some(&seller.token),
-        &json!(null),
+        &resolve_body("shopify", &format!("127.0.0.1:{port}")),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
@@ -506,10 +508,10 @@ async fn the_route_refuses_clearly_and_needs_a_session(pool: PgPool) {
 
     let (status, body) = api(
         &r.app,
-        "GET",
-        "/v1/connectors/resolve?provider=shopify",
+        "POST",
+        RESOLVE,
         Some(&seller.token),
-        &json!(null),
+        &json!({"provider": "shopify"}),
     )
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
@@ -522,10 +524,10 @@ async fn the_route_is_absent_where_connectors_are_off(pool: PgPool) {
     let seller = new_actor(&app).await;
     let (status, body) = api(
         &app,
-        "GET",
-        &resolve_uri("shopify", "shop.example"),
+        "POST",
+        RESOLVE,
         Some(&seller.token),
-        &json!(null),
+        &resolve_body("shopify", "shop.example"),
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");

@@ -97,7 +97,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route(
             "/v1/connectors/resolve",
-            get(crate::connectors::routes::resolve_shop),
+            post(crate::connectors::routes::resolve_shop),
         )
         .route(
             "/v1/connectors/alerts",
