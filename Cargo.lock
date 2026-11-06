@@ -2528,7 +2528,7 @@ dependencies = [
 [[package]]
 name = "pubky-market-specs"
 version = "0.2.0"
-source = "git+https://github.com/pubky/pubky-market-specs?rev=54945149d127dbf0129347fba508795cc2f7e77f#54945149d127dbf0129347fba508795cc2f7e77f"
+source = "git+https://github.com/pubky/pubky-market-specs?tag=v0.2.0#22b394690a8296cdecb9f43bcbe4f831da1220cb"
 dependencies = [
  "base32",
  "blake3",
