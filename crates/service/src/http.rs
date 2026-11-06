@@ -396,6 +396,7 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
     let mut body = json!({
         "status": "ok",
         "offer_checkout": true,
+        "shipping_zones": true,
         "pickup_available": state.pickup_available(),
         "digital_delivery_available": state.digital_delivery_available(),
         "digital_delivery_max_bytes": state.config.digital_delivery_max_bytes,

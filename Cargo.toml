@@ -10,6 +10,9 @@ rust-version = "1.89"
 
 [workspace.dependencies]
 marketplace-domain = { path = "crates/domain" }
+# Pinned by commit while the shipping-profile PR is under review; moves to the
+# release tag when it merges.
+pubky-market-specs = { git = "https://github.com/pubky/pubky-market-specs", rev = "54945149d127dbf0129347fba508795cc2f7e77f" }
 anyhow = "1"
 async-trait = "0.1"
 axum = "0.8"

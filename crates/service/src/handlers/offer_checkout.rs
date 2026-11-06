@@ -239,6 +239,32 @@ pub async fn handle(
         }
     };
 
+    // A shipped award was priced for the destination the offer named, or for
+    // none; the order ships to that country, and a destination the offer
+    // never named is not accepted here, where no shop limit is read.
+    // Pickup ships nowhere.
+    let destination_country = if pickup {
+        None
+    } else {
+        match (&offer.destination_country, &payload.destination_country) {
+            (Some(offered), Some(presented)) if offered == presented => Some(offered.clone()),
+            (Some(_), _) | (None, Some(_)) => {
+                return Ok(Err(CommandFailure::refused_with_reason(
+                    crate::refusal_audit::RefusalKind::InvalidCommand,
+                    ErrorCode::InvalidCommand,
+                    "The destination country must be the one the offer was priced for.",
+                    crate::shipping::REASON_DESTINATION_MISMATCH,
+                )));
+            }
+            (None, None) => None,
+        }
+    };
+    let shipping_quotes = if pickup {
+        None
+    } else {
+        offer.accepted_shipping_quotes.clone()
+    };
+
     let order_id = Uuid::new_v4();
     let payment_id = Uuid::new_v4();
     let subtotal = offer
@@ -311,9 +337,10 @@ pub async fn handle(
          buyer_pubky, seller_pubky, revision, state, lines, delivery_address, subtotal_minor, \
          shipping_minor, total_minor, currency, exponent, payment_id, \
          stock_held, hold_expires_at, fulfillment, created_at, updated_at, \
-         delivery_address_envelope, delivery_key_id, buyer_country) \
+         delivery_address_envelope, delivery_key_id, buyer_country, destination_country, \
+         shipping_quotes) \
          VALUES ($1, $2, $3, 'offer', $4, $5, 1, 'pending_payment', $6, $7, $8, $9, $10, \
-         $11, $12, $13, TRUE, $14, $16, $15, $15, $17, $18, $19)",
+         $11, $12, $13, TRUE, $14, $16, $15, $15, $17, $18, $19, $20, $21)",
     )
     .bind(order_id)
     .bind(command.command_id)
@@ -334,6 +361,8 @@ pub async fn handle(
     .bind(sealed.as_ref().map(|stored| stored.bytes.as_slice()))
     .bind(sealed.as_ref().map(|stored| stored.key_id.as_str()))
     .bind(&payload.buyer_country)
+    .bind(&destination_country)
+    .bind(&shipping_quotes)
     .execute(&mut **tx)
     .await?;
     sqlx::query(
@@ -394,23 +423,30 @@ pub async fn handle(
         lock_now,
     )
     .await?;
+    let mut result = json!({
+        "kind": "order",
+        "order": {
+            "id": order_id,
+            "priced_from": "offer",
+            "offer_award_id": payload.award_id,
+            "lines": lines,
+            "subtotal": {"amount_minor": subtotal, "currency": currency, "exponent": exponent},
+            "shipping": {"amount_minor": shipping, "currency": currency, "exponent": exponent},
+            "total": {"amount_minor": total, "currency": currency, "exponent": exponent},
+            "payment_id": payment_id,
+            "stock_held": true,
+            "hold_expires_at": hold_expires_at,
+        }
+    });
+    if let Some(country) = &destination_country {
+        result["order"]["destination_country"] = json!(country);
+    }
+    if let Some(quotes) = &shipping_quotes {
+        result["order"]["shipping_quotes"] = quotes.clone();
+    }
     Ok(Ok(HandlerSuccess {
         revision: offer.revision + 1,
         event_ids: vec![event_id, order_event_id],
-        result: json!({
-            "kind": "order",
-            "order": {
-                "id": order_id,
-                "priced_from": "offer",
-                "offer_award_id": payload.award_id,
-                "lines": lines,
-                "subtotal": {"amount_minor": subtotal, "currency": currency, "exponent": exponent},
-                "shipping": {"amount_minor": shipping, "currency": currency, "exponent": exponent},
-                "total": {"amount_minor": total, "currency": currency, "exponent": exponent},
-                "payment_id": payment_id,
-                "stock_held": true,
-                "hold_expires_at": hold_expires_at,
-            }
-        }),
+        result,
     }))
 }

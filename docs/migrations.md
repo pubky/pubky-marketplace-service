@@ -628,6 +628,47 @@ only forget the version:
 DELETE FROM _sqlx_migrations WHERE version = 94;
 ```
 
+## Zone-priced shipping (0095)
+
+0095 adds nullable columns and four checks (the listings profile-or-zones
+check and a country-format check on orders, offers and bids), each NOT VALID so
+no table is scanned under the lock; nothing is backfilled and no table is
+rewritten. `listings.shipping_profile_id` and `listings.shipping_zones` hold
+what a listing record references or carries (at most one is set,
+`listings_shipping_profile_or_zones`); `shipping_minor` stays as the flat
+fallback and keeps pricing every listing with neither set.
+`orders.destination_country` and `orders.shipping_quotes` record the country an
+order ships to and the quote of each shipping group it was charged;
+`offers.destination_country`, `offers.shipping_choice` and
+`offers.accepted_shipping_quotes` hold an offer's destination, the buyer's
+rate and the quote priced at acceptance; `bids.destination_country` and
+`bids.shipping_quote` hold a bid's destination and quote. Each destination
+column is an uppercase ISO 3166-1 alpha-2 code or NULL. Directly rerunnable:
+every column is added only if missing and each check is dropped and re-added.
+
+**Deploy mode: rolling.** A binary from before 0095 never reads the columns,
+and every row it writes leaves them NULL, which prices as before. A listing
+registered by a new binary with a profile or zones is priced by the flat
+fallback while an older binary serves it, so deploy this service before the
+Shop publishes a profile reference.
+
+### Backing out 0095
+
+An image from before it runs on the migrated database and ignores the columns.
+Keep them and their rows (they are the record of what each order was charged);
+only forget the version:
+
+```sql
+DELETE FROM _sqlx_migrations WHERE version = 95;
+```
+
+This is safe only while no listing is zone-priced and no zone-priced order,
+offer or auction is open. An older binary ignores the profile, the zones and
+the quotes, and would charge such a listing its flat fallback. Once any exist,
+keep the new image running; to stop zone pricing, set the region mode that
+blocks the affected destinations or remove the profile references from the
+listings first, and let the open orders, offers and auctions settle.
+
 ## Numbers claimed by open pull requests
 
 `main` has 0001 to 0079 (0068 and 0069 were never used). A new migration must
@@ -646,6 +687,7 @@ assume it is free:
 | 0092 | `0092_digital_release.sql` | `orders.digital_release`, `orders.digital_released_at` and the `release_digital` command kind (digital release split from payment), stacked on 0091 |
 | 0093 | `0093_bitcoin_refund_received_sats.sql` | Bitcoin refunds in the sats received, stacked on 0092 |
 | 0094 | `0094_moderation_decisions.sql` | moderation decisions (statements of reasons) and their notification |
+| 0095 | `0095_shipping_zones.sql` | zone-priced shipping: listing profile or zones, destination country and quotes on orders, offers and bids |
 
 This table describes unmerged work and goes stale as pull requests land; trust
 `crates/service/migrations/` on `main` over it. sqlx does not reject two files

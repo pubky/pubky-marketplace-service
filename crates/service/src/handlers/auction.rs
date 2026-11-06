@@ -62,6 +62,7 @@ pub async fn place_bid(
     actor: &str,
     command: &Command,
     payload: &PlaceBidPayload,
+    shipping: &crate::shipping::ShippingPlan,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     let Some(listing) = fetch_live_listing_for_update(tx, &command.aggregate_id).await? else {
@@ -152,6 +153,33 @@ pub async fn place_bid(
         )));
     }
 
+    // The bid carries the bidder's destination and the quote it was placed
+    // under: the winning bid's quote prices the order, so the bidder knows
+    // the shipping before bidding. An auction sells one unit.
+    let line_shipping = match crate::shipping::LineShipping::from_row(&listing) {
+        Ok(line_shipping) => line_shipping,
+        Err(error) => return Ok(Err(error.failure())),
+    };
+    let priced_shipping = match crate::shipping::price_single_line(
+        shipping,
+        &listing.seller_pubky,
+        crate::shipping::PricedLine {
+            listing_aggregate_id: listing.aggregate_id.clone(),
+            quantity: 1,
+            shipping: line_shipping,
+        },
+        crate::shipping::Asset {
+            currency: &listing.unit_price_currency,
+            exponent: listing.unit_price_exponent,
+        },
+        payload.destination_country.as_deref(),
+        payload.shipping_choice.as_ref(),
+    ) {
+        Ok(priced) => priced,
+        Err(error) => return Ok(Err(error.failure())),
+    };
+    let bid_shipping_quote = priced_shipping.quotes.first().map(|quote| quote.to_json());
+
     let bid = BidRow {
         id: command.command_id,
         listing_aggregate_id: listing.aggregate_id.clone(),
@@ -164,8 +192,9 @@ pub async fn place_bid(
     };
     sqlx::query(
         "INSERT INTO bids (id, listing_aggregate_id, bidder_pubky, maximum_amount_minor, \
-         currency, exponent, sequence, created_at, buyer_country) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+         currency, exponent, sequence, created_at, buyer_country, destination_country, \
+         shipping_quote) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
     )
     .bind(bid.id)
     .bind(&bid.listing_aggregate_id)
@@ -176,6 +205,8 @@ pub async fn place_bid(
     .bind(bid.sequence)
     .bind(bid.created_at)
     .bind(&payload.buyer_country)
+    .bind(&payload.destination_country)
+    .bind(&bid_shipping_quote)
     .execute(&mut **tx)
     .await?;
 
@@ -483,7 +514,24 @@ pub async fn close_locked_auction(
         // shipping, nothing else added.
         let final_price = closed_auction.current_price.clone();
         let subtotal_minor = final_price.amount_minor;
-        let shipping_minor = listing.shipping_minor;
+        // The winner's highest bid names the destination and the rate the
+        // order ships under. A bid without a quote (a flat-rate listing, or a
+        // bid placed before the listing was zone-priced) leaves the order on
+        // the listing's flat rate.
+        let winning_bid: Option<(Option<String>, Option<Value>)> = sqlx::query_as(
+            "SELECT destination_country, shipping_quote FROM bids \
+             WHERE listing_aggregate_id = $1 AND bidder_pubky = $2 \
+             ORDER BY maximum_amount_minor DESC, sequence ASC LIMIT 1",
+        )
+        .bind(&listing.aggregate_id)
+        .bind(winner_pubky)
+        .fetch_optional(&mut **tx)
+        .await?;
+        let (destination_country, shipping_quote) = winning_bid.unwrap_or((None, None));
+        let shipping_minor = shipping_quote
+            .as_ref()
+            .and_then(|quote| quote["amount_minor"].as_i64())
+            .unwrap_or(listing.shipping_minor);
         let total_minor = subtotal_minor + shipping_minor;
         let order_id = Uuid::new_v4();
         let payment_id = Uuid::new_v4();
@@ -504,7 +552,7 @@ pub async fn close_locked_auction(
                 "exponent": final_price.exponent,
             },
         }]);
-        let order = OrderRow::new_for_insert(
+        let mut order = OrderRow::new_for_insert(
             order_id,
             Some(listing.aggregate_id.clone()),
             None,
@@ -525,16 +573,19 @@ pub async fn close_locked_auction(
             now,
             "listing".to_string(),
         );
+        order.destination_country = destination_country.clone();
+        order.shipping_quotes = shipping_quote.as_ref().map(|quote| json!([quote]));
         sqlx::query(
             "INSERT INTO orders (id, auction_aggregate_id, buyer_pubky, seller_pubky, revision, \
              state, lines, delivery_address, subtotal_minor, shipping_minor, \
              total_minor, currency, exponent, payment_id, \
-             fulfillment, hold_expires_at, created_at, updated_at, buyer_country) \
+             fulfillment, hold_expires_at, created_at, updated_at, buyer_country, \
+             destination_country, shipping_quotes) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, NULL, $8, $9, $10, $11, $12, $13, 'shipping', \
              $15, $14, $14, \
              (SELECT buyer_country FROM bids WHERE listing_aggregate_id = $2 \
               AND bidder_pubky = $3 AND buyer_country IS NOT NULL \
-              ORDER BY sequence DESC LIMIT 1))",
+              ORDER BY sequence DESC LIMIT 1), $16, $17)",
         )
         .bind(order.id)
         .bind(&listing.aggregate_id)
@@ -551,6 +602,8 @@ pub async fn close_locked_auction(
         .bind(order.payment_id)
         .bind(now)
         .bind(expires_at)
+        .bind(&destination_country)
+        .bind(shipping_quote.as_ref().map(|quote| json!([quote])))
         .execute(&mut **tx)
         .await?;
 

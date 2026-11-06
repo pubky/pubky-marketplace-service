@@ -29,6 +29,9 @@ pub struct CheckoutContext<'a> {
     /// What the EU scope fence read for this command (legal launch plan
     /// C3, C4); off unless `EU_FENCE_ENABLED`.
     pub fence: &'a crate::region_fence::FencePlan,
+    /// What the sellers' shipping profiles and shop records said, read
+    /// before the transaction opened.
+    pub shipping: &'a crate::shipping::ShippingPlan,
 }
 
 pub async fn handle(
@@ -378,10 +381,27 @@ pub async fn handle(
         _ => {}
     }
 
+    // Shipping is priced per shipped group: flat lines per line as before,
+    // zone-priced lines per shipping group under the buyer's rate. A refusal
+    // here writes nothing.
+    let group_shipping = match price_group_shipping(
+        context.shipping,
+        &resolved,
+        &groups,
+        payload,
+        crate::shipping::Asset {
+            currency: &currency,
+            exponent,
+        },
+    ) {
+        Ok(group_shipping) => group_shipping,
+        Err(error) => return Ok(Err(error.failure())),
+    };
+
     // Every amount is computed before the first order is written, so a
     // checkout whose total exceeds MAX_SAFE_INTEGER writes nothing.
     let Some((line_subtotals, order_amounts)) =
-        checkout_amounts(&resolved, &line_unit_prices, &groups)
+        checkout_amounts(&resolved, &line_unit_prices, &groups, &group_shipping)
     else {
         return Ok(Err(CommandFailure::refused(
             crate::refusal_audit::RefusalKind::InvalidCommand,
@@ -397,7 +417,9 @@ pub async fn handle(
     let mut orders: Vec<Value> = Vec::with_capacity(groups.len());
     let mut payments: Vec<Value> = Vec::with_capacity(groups.len());
     let mut event_ids: Vec<Uuid> = Vec::with_capacity(groups.len());
-    for ((seller_pubky, group_method, indices), amounts) in groups.iter().zip(&order_amounts) {
+    for (((seller_pubky, group_method, indices), amounts), order_shipping) in
+        groups.iter().zip(&order_amounts).zip(&group_shipping)
+    {
         // Pickup and digital orders carry no address and no shipping charge.
         let unshipped = *group_method != FulfillmentMethod::Shipping;
         let OrderAmounts {
@@ -520,15 +542,21 @@ pub async fn handle(
         if drop_aggregate_id.is_some() {
             order.hold_source = Some(HOLD_SOURCE_DROP_CLAIM.to_string());
         }
+        if order_shipping.is_some() {
+            order.destination_country = payload.destination_country.clone();
+            order.shipping_quotes = order_shipping
+                .as_ref()
+                .and_then(crate::shipping::OrderShipping::quotes_json);
+        }
         sqlx::query(
             "INSERT INTO orders (id, checkout_command_id, drop_aggregate_id, buyer_pubky, \
              seller_pubky, revision, state, lines, delivery_address, subtotal_minor, \
              shipping_minor, total_minor, currency, exponent, \
              payment_id, stock_held, hold_expires_at, hold_source, \
              fulfillment, created_at, updated_at, delivery_address_envelope, delivery_key_id, \
-             buyer_country) \
+             buyer_country, destination_country, shipping_quotes) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, \
-             $18, $19, $20, $20, $21, $22, $23)",
+             $18, $19, $20, $20, $21, $22, $23, $24, $25)",
         )
         .bind(order.id)
         .bind(command.command_id)
@@ -557,6 +585,8 @@ pub async fn handle(
         .bind(sealed.map(|stored| stored.bytes.as_slice()))
         .bind(sealed.map(|stored| stored.key_id.as_str()))
         .bind(&payload.buyer_country)
+        .bind(&order.destination_country)
+        .bind(&order.shipping_quotes)
         .execute(&mut **tx)
         .await?;
         if let Some(share) = connector_shares.get(seller_pubky).filter(|_| !unshipped) {
@@ -793,6 +823,7 @@ fn checkout_amounts(
     resolved: &[(&CheckoutLine, ListingRow)],
     line_unit_prices: &[i64],
     groups: &[(String, FulfillmentMethod, Vec<usize>)],
+    group_shipping: &[Option<crate::shipping::OrderShipping>],
 ) -> Option<(Vec<i64>, Vec<OrderAmounts>)> {
     let line_subtotals = resolved
         .iter()
@@ -801,22 +832,18 @@ fn checkout_amounts(
         .collect::<Option<Vec<i64>>>()?;
     let order_amounts = groups
         .iter()
-        .map(|(_, method, indices)| {
+        .zip(group_shipping)
+        .map(|((_, _, indices), order_shipping)| {
             let subtotal_minor = checked_sum(indices.iter().map(|&index| line_subtotals[index]))?;
-            // Shipping is the seller-signed flat rate, charged once per order
-            // line (quantity-independent) — and ONLY on shipped orders: a
-            // pickup order's shipping is zero, never charged and refunded
-            // later (§A2). The price the buyer pays is exactly the seller's
-            // listed price plus that shipping — nothing else is added.
-            let shipping_minor = if *method == FulfillmentMethod::Shipping {
-                checked_sum(
-                    indices
-                        .iter()
-                        .map(|&index| resolved[index].1.shipping_minor),
-                )?
-            } else {
-                0
-            };
+            // Shipping is what the seller signed, charged on shipped orders
+            // only: a pickup order's shipping is zero, never charged and
+            // refunded later (§A2). Flat lines pay once per line, regardless
+            // of quantity; zone-priced groups pay the buyer's chosen rate. The
+            // price the buyer pays is exactly the seller's listed price plus
+            // that shipping, nothing else added.
+            let shipping_minor = order_shipping
+                .as_ref()
+                .map_or(0, |priced| priced.shipping_minor);
             let total_minor = safe_amount(subtotal_minor.checked_add(shipping_minor))?;
             Some(OrderAmounts {
                 subtotal_minor,
@@ -826,6 +853,47 @@ fn checkout_amounts(
         })
         .collect::<Option<Vec<OrderAmounts>>>()?;
     Some((line_subtotals, order_amounts))
+}
+
+/// The shipping each group of the checkout is charged, aligned with
+/// `groups`; `None` for a pickup or digital group. Every buyer rate choice
+/// must price a group of this checkout.
+fn price_group_shipping(
+    plan: &crate::shipping::ShippingPlan,
+    resolved: &[(&CheckoutLine, ListingRow)],
+    groups: &[(String, FulfillmentMethod, Vec<usize>)],
+    payload: &CreateCheckoutPayload,
+    asset: crate::shipping::Asset<'_>,
+) -> Result<Vec<Option<crate::shipping::OrderShipping>>, crate::shipping::PricingError> {
+    let mut book = crate::shipping::ChoiceBook::new(&payload.shipping_choices);
+    let mut priced = Vec::with_capacity(groups.len());
+    for (seller_pubky, method, indices) in groups {
+        if *method != FulfillmentMethod::Shipping {
+            priced.push(None);
+            continue;
+        }
+        let lines = indices
+            .iter()
+            .map(|&index| {
+                let (line, listing) = &resolved[index];
+                Ok(crate::shipping::PricedLine {
+                    listing_aggregate_id: listing.aggregate_id.clone(),
+                    quantity: line.quantity,
+                    shipping: crate::shipping::LineShipping::from_row(listing)?,
+                })
+            })
+            .collect::<Result<Vec<_>, crate::shipping::PricingError>>()?;
+        priced.push(Some(crate::shipping::price_shipped_order(
+            plan,
+            seller_pubky,
+            &lines,
+            asset,
+            payload.destination_country.as_deref(),
+            &mut book,
+        )?));
+    }
+    book.finish()?;
+    Ok(priced)
 }
 
 fn checked_sum(mut amounts: impl Iterator<Item = i64>) -> Option<i64> {

@@ -504,6 +504,7 @@ pub(crate) async fn apply_registration(
     });
     let new_revision = current_revision + 1;
     let variant_prices = variant_prices_json(variants);
+    let shipping_zones = shipping_zones_json(payload);
     let fulfillment_methods: Vec<String> = payload
         .fulfillment_methods
         .iter()
@@ -522,8 +523,8 @@ pub(crate) async fn apply_registration(
              available_quantity, reserved_quantity, sold_quantity, unit_price_amount_minor, \
              unit_price_currency, unit_price_exponent, shipping_minor, sale_format, auction, \
              fulfillment_methods, digital_lock_policy_uri, digital_lock_criterion_id, updated_at, \
-             variant_prices) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23) \
+             variant_prices, shipping_profile_id, shipping_zones) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25) \
              ON CONFLICT (aggregate_id) DO NOTHING",
         )
         .bind(aggregate_id)
@@ -549,6 +550,8 @@ pub(crate) async fn apply_registration(
         .bind(payload.digital_lock.as_ref().map(|lock| &lock.criterion_id))
         .bind(now)
         .bind(&variant_prices)
+        .bind(&payload.shipping_profile_id)
+        .bind(&shipping_zones)
         .execute(&mut **tx)
         .await?;
         inserted.rows_affected() == 1
@@ -559,7 +562,7 @@ pub(crate) async fn apply_registration(
              unit_price_amount_minor = $10, unit_price_currency = $11, unit_price_exponent = $12, \
              shipping_minor = $13, sale_format = $14, auction = $15, fulfillment_methods = $16, \
              digital_lock_policy_uri = $17, digital_lock_criterion_id = $18, updated_at = $19, \
-             variant_prices = $20, \
+             variant_prices = $20, shipping_profile_id = $21, shipping_zones = $22, \
              recreated_at = CASE WHEN deleted_at IS NULL THEN recreated_at ELSE $19 END, \
              generation = CASE WHEN deleted_at IS NULL THEN generation ELSE generation + 1 END, \
              deleted_at = NULL, deleted_event_cursor = NULL \
@@ -585,6 +588,8 @@ pub(crate) async fn apply_registration(
         .bind(payload.digital_lock.as_ref().map(|lock| &lock.criterion_id))
         .bind(now)
         .bind(&variant_prices)
+        .bind(&payload.shipping_profile_id)
+        .bind(&shipping_zones)
         .execute(&mut **tx)
         .await?;
         updated.rows_affected() == 1
@@ -640,6 +645,15 @@ pub(crate) async fn apply_registration(
         event_ids: vec![event_id],
         result: json!({ "kind": "listing", "listing": projection }),
     }))
+}
+
+/// The listing's own shipping zones as the JSON the `shipping_zones` column
+/// holds; `None` when the record references a profile or has no zones.
+pub(crate) fn shipping_zones_json(payload: &RegisterListingPayload) -> Option<Value> {
+    payload
+        .shipping_zones
+        .as_ref()
+        .map(|zones| serde_json::to_value(zones).expect("shipping zones serialize"))
 }
 
 /// The enabled variants that sell at their own price, as the listing row

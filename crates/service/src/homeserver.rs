@@ -187,11 +187,23 @@ pub struct AwardListingSnapshot {
     pub title: String,
     pub currency: String,
     pub exponent: i32,
+    /// The flat rate; 0 when the record is priced by zones.
     pub shipping_minor: i64,
+    /// How the record prices shipping: the flat rate, a profile it
+    /// references, or zones it carries.
+    pub shipping: AwardShipping,
     /// The physical methods (`shipping`, `pickup`) the record publishes, in
     /// record order. Award checkout is authorized from these alone.
     pub fulfillment_methods: Vec<String>,
     pub variants: Vec<AwardVariantSnapshot>,
+}
+
+/// How an award snapshot's record prices shipping.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AwardShipping {
+    Flat,
+    Profile(String),
+    Zones(Vec<pubky_market_specs::PubkyMarketShippingZone>),
 }
 
 /// The record's physical fulfillment methods. As in
@@ -396,7 +408,11 @@ pub fn award_terms_from_bytes_for_variant(
         return Err("variant money mismatch");
     }
     let fulfillment_methods = record_physical_fulfillment_methods(object);
+    let shipping = award_shipping_from_record(object)?;
     let shipping_minor = match object.get("shippingOptions") {
+        // A zone-priced record prices from its profile or zones; its legacy
+        // `shippingOptions` entry only serves readers that predate them.
+        _ if shipping != AwardShipping::Flat => 0,
         // A record that does not publish shipping settles only by pickup, so
         // its (empty) shipping options price nothing.
         _ if !fulfillment_methods
@@ -442,9 +458,43 @@ pub fn award_terms_from_bytes_for_variant(
         currency: unit.currency,
         exponent: unit.exponent,
         shipping_minor,
+        shipping,
         fulfillment_methods,
         variants,
     })
+}
+
+/// The profile a record references or the zones it carries. Both, a profile
+/// id outside the commerce identifier charset, or zones that fail the format's
+/// validation reject the record: a half-read shipping term is never priced.
+fn award_shipping_from_record(
+    object: &serde_json::Map<String, Value>,
+) -> Result<AwardShipping, &'static str> {
+    let profile_id = match object.get("shippingProfileId") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_str()
+                .filter(|id| marketplace_domain::commands::is_valid_entity_id(id))
+                .ok_or("invalid shipping profile id")?,
+        ),
+    };
+    let zones = match object.get("shippingZones") {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            let zones: Vec<pubky_market_specs::PubkyMarketShippingZone> =
+                serde_json::from_value(value.clone()).map_err(|_| "invalid shipping zones")?;
+            pubky_market_specs::validate_shipping_zones(&zones)
+                .map_err(|_| "invalid shipping zones")?;
+            Some(zones)
+        }
+    };
+    match (profile_id, zones) {
+        (None, None) => Ok(AwardShipping::Flat),
+        (Some(profile_id), None) => Ok(AwardShipping::Profile(profile_id.to_string())),
+        (None, Some(zones)) => Ok(AwardShipping::Zones(zones)),
+        (Some(_), Some(_)) => Err("shipping profile and zones are exclusive"),
+    }
 }
 
 /// The setup read of a seller's encrypted deliverable: its BLAKE3 and
@@ -498,6 +548,20 @@ pub trait HomeserverListingClient: Send + Sync + 'static {
                 HomeserverFetchOutcome::Unavailable => HomeserverRawFetchOutcome::Unavailable,
             }
         })
+    }
+
+    /// Fetches the exact bytes of the seller's shipping profile at
+    /// [`crate::shipping::PROFILE_PATH`]`{profile_id}`. The bytes are hashed
+    /// and parsed by the caller, so the SHA-256 a buyer pinned is the hash of
+    /// what the seller signed. The default answers `NotFound`, so a client
+    /// that predates profiles reads every profile as missing.
+    fn fetch_shipping_profile_raw<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        profile_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HomeserverRawFetchOutcome> + Send + 'a>> {
+        let _ = (seller_pubky, profile_id);
+        Box::pin(async { HomeserverRawFetchOutcome::NotFound })
     }
 
     /// Fetches the seller-signed drop record at
@@ -686,6 +750,76 @@ impl HttpHomeserverClient {
     }
 }
 
+impl HttpHomeserverClient {
+    /// The exact bytes of a record, capped at [`MAX_AWARD_LISTING_BYTES`] and
+    /// streamed so a body without a `Content-Length` cannot be buffered past
+    /// the cap. The caller hashes and parses what it gets.
+    async fn fetch_raw_path(&self, seller_pubky: &str, path: &str) -> HomeserverRawFetchOutcome {
+        let prefix = pubky_host_prefix(seller_pubky);
+        let mut response = match self
+            .http
+            .get(format!("{}{path}", self.base_url))
+            .header("pubky-host", seller_pubky)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(_) => return HomeserverRawFetchOutcome::Unavailable,
+        };
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            tracing::warn!(
+                path = %path,
+                pubky_host_prefix = %prefix,
+                status = %status,
+                "homeserver record fetch not found"
+            );
+            return HomeserverRawFetchOutcome::NotFound;
+        }
+        if !status.is_success()
+            || response
+                .content_length()
+                .is_some_and(|length| length > MAX_AWARD_LISTING_BYTES as u64)
+        {
+            if !status.is_success() {
+                tracing::warn!(
+                    path = %path,
+                    pubky_host_prefix = %prefix,
+                    status = %status,
+                    "homeserver record fetch rejected"
+                );
+            }
+            return if status.is_success() {
+                HomeserverRawFetchOutcome::TooLarge
+            } else {
+                HomeserverRawFetchOutcome::Unavailable
+            };
+        }
+
+        let mut raw = Vec::with_capacity(
+            response
+                .content_length()
+                .unwrap_or_default()
+                .min(MAX_AWARD_LISTING_BYTES as u64) as usize,
+        );
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) => {
+                    let Some(next_len) = raw.len().checked_add(chunk.len()) else {
+                        return HomeserverRawFetchOutcome::TooLarge;
+                    };
+                    if next_len > MAX_AWARD_LISTING_BYTES {
+                        return HomeserverRawFetchOutcome::TooLarge;
+                    }
+                    raw.extend_from_slice(&chunk);
+                }
+                Ok(None) => return HomeserverRawFetchOutcome::Found(raw),
+                Err(_) => return HomeserverRawFetchOutcome::Unavailable,
+            }
+        }
+    }
+}
+
 /// A grant-session proof document is about 200 bytes; anything far larger is
 /// not one and is read no further.
 const GRANT_SESSION_PROOF_MAX_BYTES: usize = 8 * 1024;
@@ -810,68 +944,18 @@ impl HomeserverListingClient for HttpHomeserverClient {
     ) -> Pin<Box<dyn Future<Output = HomeserverRawFetchOutcome> + Send + 'a>> {
         Box::pin(async move {
             let path = format!("/pub/pubky.app/marketplace/v1/listings/{listing_id}");
-            let prefix = pubky_host_prefix(seller_pubky);
-            let mut response = match self
-                .http
-                .get(format!("{}{path}", self.base_url))
-                .header("pubky-host", seller_pubky)
-                .send()
-                .await
-            {
-                Ok(response) => response,
-                Err(_) => return HomeserverRawFetchOutcome::Unavailable,
-            };
-            let status = response.status();
-            if status == reqwest::StatusCode::NOT_FOUND {
-                tracing::warn!(
-                    path = %path,
-                    pubky_host_prefix = %prefix,
-                    status = %status,
-                    "homeserver record fetch not found"
-                );
-                return HomeserverRawFetchOutcome::NotFound;
-            }
-            if !status.is_success()
-                || response
-                    .content_length()
-                    .is_some_and(|length| length > MAX_AWARD_LISTING_BYTES as u64)
-            {
-                if !status.is_success() {
-                    tracing::warn!(
-                        path = %path,
-                        pubky_host_prefix = %prefix,
-                        status = %status,
-                        "homeserver record fetch rejected"
-                    );
-                }
-                return if status.is_success() {
-                    HomeserverRawFetchOutcome::TooLarge
-                } else {
-                    HomeserverRawFetchOutcome::Unavailable
-                };
-            }
+            self.fetch_raw_path(seller_pubky, &path).await
+        })
+    }
 
-            let mut raw = Vec::with_capacity(
-                response
-                    .content_length()
-                    .unwrap_or_default()
-                    .min(MAX_AWARD_LISTING_BYTES as u64) as usize,
-            );
-            loop {
-                match response.chunk().await {
-                    Ok(Some(chunk)) => {
-                        let Some(next_len) = raw.len().checked_add(chunk.len()) else {
-                            return HomeserverRawFetchOutcome::TooLarge;
-                        };
-                        if next_len > MAX_AWARD_LISTING_BYTES {
-                            return HomeserverRawFetchOutcome::TooLarge;
-                        }
-                        raw.extend_from_slice(&chunk);
-                    }
-                    Ok(None) => return HomeserverRawFetchOutcome::Found(raw),
-                    Err(_) => return HomeserverRawFetchOutcome::Unavailable,
-                }
-            }
+    fn fetch_shipping_profile_raw<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        profile_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HomeserverRawFetchOutcome> + Send + 'a>> {
+        Box::pin(async move {
+            let path = format!("{}{profile_id}", crate::shipping::PROFILE_PATH);
+            self.fetch_raw_path(seller_pubky, &path).await
         })
     }
 
@@ -1210,6 +1294,10 @@ struct ListingRecord {
     fulfillment_methods: Vec<String>,
     #[serde(default)]
     digital_lock: Option<RecordDigitalLock>,
+    #[serde(default)]
+    shipping_profile_id: Option<String>,
+    #[serde(default)]
+    shipping_zones: Option<Vec<pubky_market_specs::PubkyMarketShippingZone>>,
 }
 
 /// The flat shipping the service will charge per order line: the cheapest
@@ -1383,6 +1471,8 @@ pub fn registration_payload_from_record(
         fulfillment_methods,
         digital_lock,
         variants,
+        shipping_profile_id: record.shipping_profile_id,
+        shipping_zones: record.shipping_zones,
     }))
 }
 

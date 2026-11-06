@@ -351,6 +351,17 @@ pub struct RegisterListingPayload {
     /// canonical JSON (the idempotency hash input).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub variants: Vec<VariantStock>,
+    /// The seller's shipping profile the record references
+    /// (`shippingProfileId`). The zones, rates and excluded countries live in
+    /// the profile record, which the service reads and pins by SHA-256 when
+    /// it prices an order. Mutually exclusive with `shipping_zones`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shipping_profile_id: Option<String>,
+    /// Zones the record carries itself (`shippingZones`), the per-listing
+    /// override of a profile. They are priced in the listing's own asset.
+    /// Mutually exclusive with `shipping_profile_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shipping_zones: Option<Vec<pubky_market_specs::PubkyMarketShippingZone>>,
 }
 
 /// One enabled variant of a listing record: the units the seller holds of it
@@ -670,6 +681,136 @@ pub fn validate_delivery_envelope(
     }
 }
 
+/// Most shipping choices one checkout carries: one per seller and shipping
+/// group, and a checkout has at most as many groups as lines.
+pub const MAX_SHIPPING_CHOICES: usize = 50;
+
+/// The buyer's rate for one shipping group of an order: the lines of one
+/// seller that share a shipping profile, or the single listing whose inline
+/// zones price it. Exactly one of `profile_id` and `listing_aggregate_id`
+/// names the group.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShippingChoice {
+    pub seller_pubky: String,
+    /// The profile the group's lines reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    /// The listing whose inline zones price the group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listing_aggregate_id: Option<String>,
+    /// The rate the buyer picked within the zone that serves the destination.
+    pub rate_id: String,
+    /// SHA-256 (lowercase hex) of the profile record's bytes the buyer saw.
+    /// Required with `profile_id`; the order is refused with
+    /// `SHIPPING_CHANGED` when the profile no longer hashes to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_sha256: Option<String>,
+}
+
+impl ShippingChoice {
+    /// The group this choice prices.
+    pub fn group_key(&self) -> Option<ShippingGroupKey> {
+        match (&self.profile_id, &self.listing_aggregate_id) {
+            (Some(profile_id), None) => Some(ShippingGroupKey::Profile(profile_id.clone())),
+            (None, Some(aggregate_id)) => Some(ShippingGroupKey::Inline(aggregate_id.clone())),
+            _ => None,
+        }
+    }
+}
+
+/// What a shipping group is keyed by within one seller's order.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ShippingGroupKey {
+    Profile(String),
+    Inline(String),
+}
+
+fn validate_shipping_choice(
+    path: &str,
+    choice: &ShippingChoice,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    if !is_valid_pubky(&choice.seller_pubky) {
+        issues.push(issue(
+            &format!("{path}.seller_pubky"),
+            "Expected a 52-character z-base-32 Pubky",
+        ));
+    }
+    if !is_valid_entity_id(&choice.rate_id) {
+        issues.push(issue(
+            &format!("{path}.rate_id"),
+            "Expected a path-safe commerce identifier",
+        ));
+    }
+    match (
+        &choice.profile_id,
+        &choice.listing_aggregate_id,
+        &choice.profile_sha256,
+    ) {
+        (Some(profile_id), None, Some(sha256)) => {
+            if !is_valid_entity_id(profile_id) {
+                issues.push(issue(
+                    &format!("{path}.profile_id"),
+                    "Expected a path-safe commerce identifier",
+                ));
+            }
+            if !content_hash_regex().is_match(sha256) {
+                issues.push(issue(
+                    &format!("{path}.profile_sha256"),
+                    "Expected a 64-character lowercase hex hash",
+                ));
+            }
+        }
+        (None, Some(aggregate_id), None) => {
+            if aggregate_id.is_empty() || aggregate_id.len() > 200 {
+                issues.push(issue(
+                    &format!("{path}.listing_aggregate_id"),
+                    "Expected a listing aggregate id",
+                ));
+            }
+        }
+        _ => issues.push(issue(
+            path,
+            "Expected a profile id with its SHA-256, or a listing aggregate id alone",
+        )),
+    }
+}
+
+/// Shape check for the optional `payload.destination_country`.
+fn validate_destination_country(country: &Option<String>, issues: &mut Vec<ValidationIssue>) {
+    if let Some(country) = country {
+        if !country_code_regex().is_match(country) {
+            issues.push(issue(
+                "payload.destination_country",
+                "Expected an ISO 3166-1 alpha-2 country code",
+            ));
+        }
+    }
+}
+
+fn validate_shipping_choices(choices: &[ShippingChoice], issues: &mut Vec<ValidationIssue>) {
+    if choices.len() > MAX_SHIPPING_CHOICES {
+        issues.push(issue(
+            "payload.shipping_choices",
+            "Expected at most 50 shipping choices",
+        ));
+        return;
+    }
+    let mut seen = std::collections::HashSet::new();
+    for (index, choice) in choices.iter().enumerate() {
+        validate_shipping_choice(&format!("payload.shipping_choices.{index}"), choice, issues);
+        if let Some(key) = choice.group_key() {
+            if !seen.insert((choice.seller_pubky.clone(), key)) {
+                issues.push(issue(
+                    &format!("payload.shipping_choices.{index}"),
+                    "Expected one choice per shipping group",
+                ));
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateCheckoutPayload {
@@ -704,6 +845,16 @@ pub struct CreateCheckoutPayload {
     /// `EU_FENCE_ENABLED` is on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub buyer_country: Option<String>,
+    /// The country the order ships to (ISO 3166-1 alpha-2, uppercase), in
+    /// clear text beside the sealed address. The service prices zone-based
+    /// shipping and enforces a seller's ships-to list with it, and checks it
+    /// against the blocked regions. Required when a shipped line is priced by
+    /// zones; absent when no group ships.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_country: Option<String>,
+    /// The buyer's rate for each zone-priced shipping group of the order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shipping_choices: Vec<ShippingChoice>,
     /// Retired field. A client that still sends it must send `1`; it is
     /// accepted for compatibility and otherwise ignored: the service neither
     /// stores nor projects it. Do not read it.
@@ -802,6 +953,14 @@ pub struct OfferTermsPayload {
     /// `EU_FENCE_ENABLED` is on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub buyer_country: Option<String>,
+    /// The country the order would ship to; see
+    /// [`CreateCheckoutPayload::destination_country`]. Required when the
+    /// listing is priced by zones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_country: Option<String>,
+    /// The buyer's rate for the listing's zone-priced shipping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shipping_choice: Option<ShippingChoice>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -851,6 +1010,10 @@ pub struct OfferCheckoutPayload {
     /// `EU_FENCE_ENABLED` is on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub buyer_country: Option<String>,
+    /// The country the award ships to. Must equal the destination the offer
+    /// was priced for; required when the award's shipping is zone-priced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_country: Option<String>,
     /// Legacy field; see [`CreateCheckoutPayload::guarantee_policy_version`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guarantee_policy_version: Option<u32>,
@@ -867,6 +1030,14 @@ pub struct PlaceBidPayload {
     /// `EU_FENCE_ENABLED` is on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub buyer_country: Option<String>,
+    /// The country the won item would ship to; see
+    /// [`CreateCheckoutPayload::destination_country`]. Required when the
+    /// listing is priced by zones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_country: Option<String>,
+    /// The bidder's rate for the listing's zone-priced shipping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shipping_choice: Option<ShippingChoice>,
 }
 
 /// `auction.close` carries an empty payload; unknown fields are rejected.
@@ -1848,6 +2019,25 @@ fn validate_listing_payload(
         ));
     }
 
+    match (&payload.shipping_profile_id, &payload.shipping_zones) {
+        (Some(_), Some(_)) => issues.push(issue(
+            "payload.shipping_zones",
+            "A listing references a shipping profile or carries its own zones, not both",
+        )),
+        (Some(profile_id), None) if !entity_id_regex().is_match(profile_id) => {
+            issues.push(issue(
+                "payload.shipping_profile_id",
+                "Expected a path-safe commerce identifier",
+            ));
+        }
+        (None, Some(zones)) => {
+            if let Err(message) = pubky_market_specs::validate_shipping_zones(zones) {
+                issues.push(issue("payload.shipping_zones", &message));
+            }
+        }
+        _ => {}
+    }
+
     let is_auction = payload.sale_format == SaleFormat::Auction;
     if is_auction != payload.auction_terms.is_some() {
         issues.push(issue(
@@ -2070,6 +2260,22 @@ fn validate_offer_terms(
     validate_trimmed("payload.message", message, 0, 500, issues);
 }
 
+fn validate_offer_shipping(
+    destination_country: &Option<String>,
+    choice: &Option<ShippingChoice>,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    if let Some(choice) = choice {
+        validate_shipping_choice("payload.shipping_choice", choice, issues);
+        if destination_country.is_none() {
+            issues.push(issue(
+                "payload.shipping_choice",
+                "A shipping choice needs a destination country",
+            ));
+        }
+    }
+}
+
 /// Shape check for the optional `payload.buyer_country`.
 fn validate_buyer_country(country: &Option<String>, issues: &mut Vec<ValidationIssue>) {
     if let Some(country) = country {
@@ -2094,6 +2300,12 @@ fn validate_create_offer(
         &mut issues,
     );
     validate_buyer_country(&payload.buyer_country, &mut issues);
+    validate_destination_country(&payload.destination_country, &mut issues);
+    validate_offer_shipping(
+        &payload.destination_country,
+        &payload.shipping_choice,
+        &mut issues,
+    );
     if issues.is_empty() {
         Ok(CommandPayload::CreateOffer(payload))
     } else {
@@ -2202,6 +2414,15 @@ fn validate_offer_checkout(
         ));
     }
     validate_buyer_country(&payload.buyer_country, &mut issues);
+    validate_destination_country(&payload.destination_country, &mut issues);
+    if payload.destination_country.is_some()
+        && payload.fulfillment == Some(FulfillmentMethod::Pickup)
+    {
+        issues.push(issue(
+            "payload.destination_country",
+            "A pickup award must not carry a destination country",
+        ));
+    }
     if issues.is_empty() {
         Ok(CommandPayload::OfferCheckout(payload))
     } else {
@@ -2217,6 +2438,12 @@ fn validate_place_bid(payload: PlaceBidPayload) -> Result<CommandPayload, Vec<Va
         &mut issues,
     );
     validate_buyer_country(&payload.buyer_country, &mut issues);
+    validate_destination_country(&payload.destination_country, &mut issues);
+    validate_offer_shipping(
+        &payload.destination_country,
+        &payload.shipping_choice,
+        &mut issues,
+    );
     if issues.is_empty() {
         Ok(CommandPayload::PlaceBid(payload))
     } else {
@@ -3088,6 +3315,22 @@ fn validate_create_checkout(
         ));
     }
     validate_buyer_country(&payload.buyer_country, &mut issues);
+    validate_destination_country(&payload.destination_country, &mut issues);
+    validate_shipping_choices(&payload.shipping_choices, &mut issues);
+    if !any_shipping
+        && (payload.destination_country.is_some() || !payload.shipping_choices.is_empty())
+    {
+        issues.push(issue(
+            "payload.destination_country",
+            "A checkout with no shipped line must not carry a destination or shipping choices",
+        ));
+    }
+    if payload.destination_country.is_none() && !payload.shipping_choices.is_empty() {
+        issues.push(issue(
+            "payload.shipping_choices",
+            "Shipping choices need a destination country",
+        ));
+    }
 
     if issues.is_empty() {
         Ok(CommandPayload::CreateCheckout(payload))

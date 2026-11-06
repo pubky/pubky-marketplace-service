@@ -96,6 +96,9 @@ pub(crate) fn error_code_name(code: Option<ErrorCode>) -> &'static str {
         Some(ErrorCode::SellerAnnualLimitReached) => "SELLER_ANNUAL_LIMIT_REACHED",
         Some(ErrorCode::DigitalUnavailableInRegion) => "DIGITAL_UNAVAILABLE_IN_REGION",
         Some(ErrorCode::CommerceUnavailableInRegion) => "COMMERCE_UNAVAILABLE_IN_REGION",
+        Some(ErrorCode::ShippingUnavailableToCountry) => "SHIPPING_UNAVAILABLE_TO_COUNTRY",
+        Some(ErrorCode::ShippingUnavailable) => "SHIPPING_UNAVAILABLE",
+        Some(ErrorCode::ShippingChanged) => "SHIPPING_CHANGED",
         None => "",
     }
 }

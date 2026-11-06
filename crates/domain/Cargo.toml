@@ -8,6 +8,7 @@ description = "Canonical domain contracts for the Pubky Marketplace Transaction 
 
 [dependencies]
 base32.workspace = true
+pubky-market-specs.workspace = true
 chrono.workspace = true
 regex.workspace = true
 serde.workspace = true

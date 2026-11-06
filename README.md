@@ -331,6 +331,7 @@ the command's transaction and after a stored replay is answered:
 | `checkout.create`, `offer.create`, `offer.checkout`, `auction.place_bid` | `COMMERCE_UNAVAILABLE_IN_REGION` (409) | `buyer_region_blocked` (declared country), `buyer_ip_blocked`, `buyer_region_unknown`; `buyer_country` is optional (the IP country decides), and required only while a region is `nuanced` |
 | the same four, on a listing whose seller's shop country is blocked | `SELLER_UNAVAILABLE_IN_REGION` (409) | `seller_region_blocked` (the shop record is read, fail closed) |
 | `payment.prepare_locks`, `POST /v0/orders/{id}/payment-method` (the first bind) | as above | the order's declared country, the request's IP and the seller's shop country |
+| the four buyer commands and the first payment start, on any order that carries a `destination_country` | `COMMERCE_UNAVAILABLE_IN_REGION` (409) | `destination_region_blocked`: the order's `destination_country` is blocked, checked when the order is placed and again when its payment starts |
 | `listing.register`, `listing.sync`, `drop.sync`, `PUT /v0/sellers/me/payment-config` | `SELLER_UNAVAILABLE_IN_REGION` (409) | `seller_region_blocked` (shop country), `seller_ip_blocked` (the seller's own request); an unknown origin is `COMMERCE_UNAVAILABLE_IN_REGION` `buyer_region_unknown` |
 
 `listing.sync` is refused only when it would publish or update a live listing;
@@ -1837,6 +1838,80 @@ request, to the buyer on approval — `order_shipped`, `tracking_updated`,
 prototype had no counterpart to copy. With `REVIEW_BLIND_WINDOW_DAYS` above
 0 the review notifications are `review_waiting`, `review_released` and
 `review_received` at release; see [Reviews](docs/api.md#double-blind-reviews).
+
+## Zone-priced shipping
+
+A listing can price its shipping by the buyer's destination country instead of
+one flat rate. The seller's record carries either `shippingProfileId`, which
+names a shipping profile record the seller published at
+`/pub/pubky.app/marketplace/v1/shipping_profiles/{profileId}`, or its own
+`shippingZones`. A profile holds zones (each a set of countries or
+`restOfWorld`) and each zone holds rates: `free`, `flat` (charged once per
+shipping group) or `per_item` (`firstMinor` for the first unit plus
+`additionalMinor` for each further one). A country in `excludedCountries` is
+never shipped to, an explicit country beats `restOfWorld`, and a country no
+zone covers is not shipped to. The quote function is the one in
+[`pubky-market-specs`](https://github.com/pubky/pubky-market-specs), shared with
+the Shop and pinned by its test vectors. `shippingOptions` stays on the record
+as the flat fallback readers that predate zones use; the service prices a
+profile or zones record by the zones only.
+
+What the commands carry:
+
+| Command | Fields |
+|---|---|
+| `listing.register` | `shipping_profile_id` or `shipping_zones`, never both; stored on the listing row (`listings.shipping_profile_id`, `shipping_zones`, migration 0095) and healed by `listing.sync` |
+| `checkout.create` | `destination_country` (ISO 3166-1 alpha-2, clear text beside the sealed address) and `shipping_choices`: one `{seller_pubky, profile_id \| listing_aggregate_id, rate_id, profile_sha256}` per shipping group |
+| `offer.create` | `destination_country` and `shipping_choice` |
+| `offer.checkout` | `destination_country`, which must equal the offer's; an offer priced with none takes none |
+| `auction.place_bid` | `destination_country` and `shipping_choice`; the winning bid's quote prices the order |
+
+Pricing rules:
+
+- A **shipping group** is the lines of one seller that share a profile, or one
+  listing with inline zones. The buyer picks one rate per group. Lines that
+  share a profile are charged once (`flat`) or by their summed units
+  (`per_item`).
+- The service reads the profile record before the command's transaction and
+  hashes its exact bytes. A choice pins that hash (`profile_sha256`); a profile
+  the seller changed since the buyer looked is refused with `SHIPPING_CHANGED`
+  (409) and nothing is written. The order stores each group's quote
+  (`orders.shipping_quotes`: zone, rate, amount, units, delivery estimate,
+  profile and hash) and the destination (`orders.destination_country`).
+- The shop's `shipsToCountries` list is enforced: a destination outside it is
+  `SHIPPING_UNAVAILABLE_TO_COUNTRY` (409), also for a listing priced by the
+  flat rate. A shop that publishes the list needs the buyer to name a
+  destination (`destination_country_required`), so the shop record is read on
+  every checkout, offer and bid. A shop record that cannot be read refuses a
+  command that names a destination (`SHIPPING_UNAVAILABLE`, `shop_unreadable`)
+  rather than shipping anywhere. A command that names none is not stopped by an
+  unreadable shop record, so a homeserver outage does not stop every flat-rate
+  checkout; the destination is the buyer's claim either way.
+- Refusals: `INVALID_COMMAND` (422) with the reason `destination_country_required`,
+  `shipping_choice_required`, `shipping_choice_unexpected`,
+  `unknown_shipping_rate`, `shipping_overflow` or `destination_country_mismatch`;
+  `SHIPPING_UNAVAILABLE` (409) with `shipping_profile_missing`,
+  `shipping_profile_unreadable`, `shipping_asset_mismatch`,
+  `shipping_zones_unreadable`, `shop_unreadable` or `listing_record_unavailable`;
+  `SHIPPING_UNAVAILABLE_TO_COUNTRY` and `SHIPPING_CHANGED` (409).
+- An offer is priced at creation and re-priced at `offer.accept` for the
+  accepted quantity, against the record it pinned (the record the homeserver
+  serves when it can be read, otherwise the registered row). An offer on a
+  listing whose zones only the registered row carries waits for the record
+  (`SHIPPING_UNAVAILABLE`, `listing_record_unavailable`), because nothing the
+  buyer could name pins them; a profile is pinned by its hash; the accepted charge and
+  quotes are stored on the offer (`accepted_shipping_minor`,
+  `accepted_shipping_quotes`) and the order copies them. A profile changed
+  between the offer and its acceptance is `SHIPPING_CHANGED`.
+- An auction order takes the winning bidder's highest bid for the destination
+  and quote.
+- A pickup award or order ships nowhere and carries no destination.
+- The destination is the buyer's claim: the delivery address is sealed and the
+  service cannot read it, so the seller compares the two after payment. A
+  destination in a blocked region is refused (see [Region modes](#region-modes)).
+- A listing that references no profile and carries no zones prices exactly as
+  before. `GET /health` reports `shipping_zones: true` on a deployment that
+  prices zones.
 
 ## Local pickup (Wave 7 safe subset)
 
