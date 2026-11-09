@@ -2310,19 +2310,47 @@ advance a payment (ADR-0019 §7).
   (pinned contract commit `ba49a777`; tests drive the same code path
   through a fake lifecycle client — production only ever constructs the
   HTTP client). Verification is a pure function of what Locks reports:
-  - `completed` → the payment advances `awaiting_entitlement → confirmed`
+  - `completed` with a matching client binding (below) → the payment
+    advances `awaiting_entitlement → confirmed`
     **exactly once**, enforced by the payment-state compare-and-swap plus
     the `events_one_payment_confirmed` unique index rather than
     application logic; the confirmation applies the same effects as the
     sandbox path (order `paid`, receipt issued, inventory converted,
     `payment_confirmed` outbox intent). Duplicate or reordered completions
     are harmless no-ops.
+  - `completed` without a matching client binding → never confirms, never
+    reaches the late-money paths, and polling stops; see "Client binding".
   - `pending` / `in_progress` / not-found / transport or status failure →
     the payment stays untouched and the correlation stays pending (Locks
     v1 leaves transport/status failures pending and exposes no terminal
     payment failure to the viewer).
   - `failed` / `expired` (the Locks task aged out) → recorded as an
     upstream fact and polling stops; the payment is **not** expired by it.
+- **Client binding.** `payment.prepare_locks` mints one `client_reference`
+  per payment (32 random bytes, base64url) and returns it only to the buyer;
+  the service keeps it sealed beside the sealed lock resource and the
+  criterion id of the checkout snapshot. The Shop submits the reference
+  inside the proof bundle, and a Lock Server at v0.1.1-rc2 or later echoes
+  it on the lifecycle as `client_binding: { client_reference,
+  pubky_lock_resource, criterion_ids }`. A `completed` task qualifies the
+  payment only when **all three** fields equal the prepared terms: the
+  reference exactly (constant-time, no case folding or trimming), the lock
+  resource after canonicalization (the Lock Server writes the creator as
+  `pubky<creator>`), and `criterion_ids` equal to the single prepared
+  criterion. An absent binding never matches, and a binding that is present
+  but not the documented shape is retried like any malformed body. The
+  task is write-once, so a refusal is terminal: the correlation moves to
+  `upstream_failed` with `last_observed_status` `binding_mismatch`,
+  `binding_missing` or `binding_unverifiable` (a correlation registered
+  before preparation existed has nothing to compare against), the same
+  label is appended to `payment_locks_observations`, no value from either
+  side is stored or logged beyond which fields differed, and the payment is
+  left to its window like an upstream failure. This closes the replay of a
+  bundle completed for another order, another lock of the same creator, or
+  another application. Rollout: Lock Server at v0.1.1-rc2 or later and a Shop
+  that submits the reference must both be live before this service
+  verifies completions; otherwise every Locks payment completes without a
+  binding and is refused.
 - **Expiry vs late completion.** The `payment_window` task sweeps the
   ORDER's hold window (`LOCKS_PAYMENT_WINDOW_SECONDS`, armed at
   registration — the correlation window IS the hold window): once it

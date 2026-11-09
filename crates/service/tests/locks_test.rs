@@ -19,7 +19,9 @@ use marketplace_service::clock::{AdjustableClock, Clock};
 use marketplace_service::config::Config;
 use marketplace_service::homeserver::{HomeserverFetchOutcome, HomeserverListingClient};
 use marketplace_service::http::build_router;
-use marketplace_service::locks::{LocksLookupOutcome, LocksRuntime, LocksTaskStatus};
+use marketplace_service::locks::{
+    LocksClientBinding, LocksLookupOutcome, LocksRuntime, LocksTaskStatus,
+};
 use marketplace_service::workers::{self, run_once, try_acquire_lease};
 use marketplace_service::AppState;
 use serde_json::{json, Value};
@@ -352,10 +354,8 @@ async fn a_prepared_row_survives_a_worker_pass_untouched(pool: PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "registration: {body}");
-    fake.set_outcome(
-        TEST_BUNDLE_ID,
-        LocksLookupOutcome::Status(LocksTaskStatus::Completed),
-    );
+    fake.complete_matching(&app.pool, TEST_BUNDLE_ID, &payments[1])
+        .await;
 
     // The interleaved pass: the prepared row must not be claimed, and the
     // batch must not fail because of it.
@@ -1313,10 +1313,8 @@ async fn worker_confirms_a_verified_completion_exactly_once(pool: PgPool) {
     let buyer = new_actor(&app).await;
     let order = create_pending_locks_order(&app, &seller, &buyer).await;
     register_locks(&app, &buyer.token, &order, &seller.pubky).await;
-    fake.set_outcome(
-        TEST_BUNDLE_ID,
-        LocksLookupOutcome::Status(LocksTaskStatus::Completed),
-    );
+    fake.complete_matching(&app.pool, TEST_BUNDLE_ID, &order.payment_id)
+        .await;
 
     let summary = run_once(&app.state, holder, app.clock.now())
         .await
@@ -1448,10 +1446,8 @@ async fn a_digital_locks_order_without_an_address_is_confirmed_by_the_worker(poo
     assert_eq!(body["result"]["orders"][0]["fulfillment"], json!("digital"));
 
     register_locks(&app, &buyer.token, &order, &seller.pubky).await;
-    fake.set_outcome(
-        TEST_BUNDLE_ID,
-        LocksLookupOutcome::Status(LocksTaskStatus::Completed),
-    );
+    fake.complete_matching(&app.pool, TEST_BUNDLE_ID, &order.payment_id)
+        .await;
     let summary = run_once(&app.state, holder, app.clock.now())
         .await
         .expect("worker pass runs");
@@ -1650,10 +1646,8 @@ async fn late_completion_after_window_expiry_completes_when_stock_is_free(pool: 
     );
 
     // The completion arrives late with stock free: late_completion pays.
-    fake.set_outcome(
-        TEST_BUNDLE_ID,
-        LocksLookupOutcome::Status(LocksTaskStatus::Completed),
-    );
+    fake.complete_matching(&app.pool, TEST_BUNDLE_ID, &order.payment_id)
+        .await;
     app.clock.advance_seconds(31);
     let summary = run_once(&app.state, holder, app.clock.now())
         .await
@@ -1712,10 +1706,8 @@ async fn completion_that_cannot_confirm_the_order_goes_to_manual_review(pool: Pg
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(order_state(&app.pool, &order.order_id).await, "cancelled");
 
-    fake.set_outcome(
-        TEST_BUNDLE_ID,
-        LocksLookupOutcome::Status(LocksTaskStatus::Completed),
-    );
+    fake.complete_matching(&app.pool, TEST_BUNDLE_ID, &order.payment_id)
+        .await;
     let summary = run_once(&app.state, holder, app.clock.now())
         .await
         .expect("worker pass runs");
@@ -1747,10 +1739,8 @@ async fn locks_verification_respects_worker_leases(pool: PgPool) {
     let buyer = new_actor(&app).await;
     let order = create_pending_locks_order(&app, &seller, &buyer).await;
     register_locks(&app, &buyer.token, &order, &seller.pubky).await;
-    fake.set_outcome(
-        TEST_BUNDLE_ID,
-        LocksLookupOutcome::Status(LocksTaskStatus::Completed),
-    );
+    fake.complete_matching(&app.pool, TEST_BUNDLE_ID, &order.payment_id)
+        .await;
 
     let now = app.clock.now();
     assert!(try_acquire_lease(
@@ -1825,10 +1815,8 @@ async fn terminal_checkout_snapshots_drain_boundedly_under_the_lease(pool: PgPoo
             .to_string(),
     };
     register_locks(&app, &buyer.token, &order, &seller.pubky).await;
-    fake.set_outcome(
-        TEST_BUNDLE_ID,
-        LocksLookupOutcome::Status(LocksTaskStatus::Completed),
-    );
+    fake.complete_matching(&app.pool, TEST_BUNDLE_ID, &order.payment_id)
+        .await;
     let (status, body) = execute(
         &app,
         &buyer.token,
@@ -1955,10 +1943,8 @@ async fn bundle_and_lock_resource_never_leave_the_correlation_store(pool: PgPool
     let order = create_pending_locks_order(&app, &seller, &buyer).await;
     let expected_resource = lock_resource_for(&seller.pubky);
     let registration = register_locks(&app, &buyer.token, &order, &seller.pubky).await;
-    fake.set_outcome(
-        TEST_BUNDLE_ID,
-        LocksLookupOutcome::Status(LocksTaskStatus::Completed),
-    );
+    fake.complete_matching(&app.pool, TEST_BUNDLE_ID, &order.payment_id)
+        .await;
     run_once(&app.state, holder, app.clock.now())
         .await
         .expect("worker pass runs");
@@ -3656,6 +3642,22 @@ async fn registered_digital_locks_order(
     bundle_id: &str,
     n: u64,
 ) -> PendingOrder {
+    registered_digital_locks_order_with_reference(app, seller, buyer, listing_id, bundle_id, n)
+        .await
+        .0
+}
+
+/// [`registered_digital_locks_order`], also returning the `client_reference`
+/// the buyer received in the `payment.prepare_locks` response: the value the
+/// Shop submits to the Lock Server inside the proof bundle.
+async fn registered_digital_locks_order_with_reference(
+    app: &TestApp,
+    seller: &TestActor,
+    buyer: &TestActor,
+    listing_id: &str,
+    bundle_id: &str,
+    n: u64,
+) -> (PendingOrder, String) {
     let mut listing = register_listing_command(&seller.pubky, listing_id, 1, n);
     listing["payload"]["digital_lock"] = json!({
         "policyUri": lock_resource_for(&seller.pubky),
@@ -3689,6 +3691,10 @@ async fn registered_digital_locks_order(
     prepare["payload"] = json!({ "payment_id": order.payment_id });
     let (status, body) = execute(app, &buyer.token, &prepare).await;
     assert_eq!(status, StatusCode::OK, "prepare {listing_id}: {body}");
+    let client_reference = body["result"]["client_reference"]
+        .as_str()
+        .expect("the buyer receives the minted client reference")
+        .to_string();
     let (status, body) = execute(
         app,
         &buyer.token,
@@ -3706,7 +3712,7 @@ async fn registered_digital_locks_order(
         StatusCode::OK,
         "register_locks {listing_id}: {body}"
     );
-    order
+    (order, client_reference)
 }
 
 /// Makes confirming exactly `order_id` fail inside the confirmation
@@ -3746,10 +3752,8 @@ async fn worker_survives_a_digital_locks_confirmation_that_fails(pool: PgPool) {
         registered_digital_locks_order(&app, &seller, &buyer, "boots_01", TEST_BUNDLE_ID, 0x801)
             .await;
     refuse_receipt_for(&app.pool, &order.order_id).await;
-    fake.set_outcome(
-        TEST_BUNDLE_ID,
-        LocksLookupOutcome::Status(LocksTaskStatus::Completed),
-    );
+    fake.complete_matching(&app.pool, TEST_BUNDLE_ID, &order.payment_id)
+        .await;
 
     let summary = run_once(&app.state, Uuid::new_v4(), app.clock.now())
         .await
@@ -3796,11 +3800,11 @@ async fn a_failed_claimed_digital_locks_item_does_not_stall_the_rest_of_the_batc
         registered_digital_locks_order(&app, &seller, &buyer, "boots_02", OTHER_BUNDLE_ID, 0x852)
             .await;
     refuse_receipt_for(&app.pool, &failing.order_id).await;
-    for bundle in [TEST_BUNDLE_ID, OTHER_BUNDLE_ID] {
-        fake.set_outcome(
-            bundle,
-            LocksLookupOutcome::Status(LocksTaskStatus::Completed),
-        );
+    for (bundle, payment_id) in [
+        (TEST_BUNDLE_ID, &failing.payment_id),
+        (OTHER_BUNDLE_ID, &healthy.payment_id),
+    ] {
+        fake.complete_matching(&app.pool, bundle, payment_id).await;
     }
     // Deterministic claim order (last_checked_at ASC): the FAILING correlation
     // is claimed first, well past the poll interval.
@@ -3869,14 +3873,518 @@ async fn a_sellers_bitcoin_confirmation_option_does_not_hold_a_locks_order(pool:
         .execute(&app.pool)
         .await
         .expect("opt the seller in");
-    fake.set_outcome(
-        TEST_BUNDLE_ID,
-        LocksLookupOutcome::Status(LocksTaskStatus::Completed),
-    );
+    fake.complete_matching(&app.pool, TEST_BUNDLE_ID, &order.payment_id)
+        .await;
 
     let summary = run_once(&app.state, Uuid::new_v4(), app.clock.now())
         .await
         .expect("worker pass runs");
     assert_eq!(summary.locks_completions_applied, 1);
     assert_eq!(order_state(&app.pool, &order.order_id).await, "paid");
+}
+
+// ---------------------------------------------------------------------------
+// Client binding: a completed task confirms a payment only when its echoed
+// `client_binding` carries the reference minted for that payment, the lock
+// resource and the criterion the payment was prepared against.
+// ---------------------------------------------------------------------------
+
+/// A 26-character Crockford bundle id distinct per `index` (0 to 31).
+fn bundle_id_with(index: u32) -> String {
+    const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    format!(
+        "{}00G40R40M30E209185GR38E1W",
+        char::from(CROCKFORD[index as usize])
+    )
+}
+
+/// The binding a Lock Server echoes for a bundle the Shop submitted with
+/// `client_reference` for `seller`'s test lock.
+fn echoed_binding(seller: &TestActor, client_reference: &str) -> LocksClientBinding {
+    LocksClientBinding {
+        client_reference: client_reference.to_string(),
+        pubky_lock_resource: format!("pubky{}", lock_resource_for(&seller.pubky)),
+        criterion_ids: vec!["paykit".to_string()],
+    }
+}
+
+async fn correlation_outcome(pool: &PgPool, payment_id: &str) -> (String, Option<String>) {
+    sqlx::query_as(
+        "SELECT verification_state, last_observed_status FROM payment_locks_correlations \
+         WHERE payment_id = $1::uuid",
+    )
+    .bind(payment_id)
+    .fetch_one(pool)
+    .await
+    .expect("correlation row exists")
+}
+
+async fn binding_observations(pool: &PgPool, payment_id: &str) -> Vec<(String, String)> {
+    sqlx::query_as(
+        "SELECT o.observed_status, o.outcome FROM payment_locks_observations o \
+         JOIN payment_locks_correlations c ON c.id = o.correlation_id \
+         WHERE c.payment_id = $1::uuid AND o.outcome LIKE 'binding_%' ORDER BY o.id",
+    )
+    .bind(payment_id)
+    .fetch_all(pool)
+    .await
+    .expect("observations listed")
+}
+
+async fn confirmation_events(pool: &PgPool) -> i64 {
+    count(
+        pool,
+        "SELECT COUNT(*) FROM events WHERE kind = 'payment.confirmed'",
+    )
+    .await
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_completed_task_echoing_the_minted_reference_and_prepared_terms_confirms(pool: PgPool) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let holder = Uuid::new_v4();
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (order, reference) = registered_digital_locks_order_with_reference(
+        &app,
+        &seller,
+        &buyer,
+        "boots_01",
+        TEST_BUNDLE_ID,
+        0xA01,
+    )
+    .await;
+    fake.set_outcome(
+        TEST_BUNDLE_ID,
+        LocksLookupOutcome::Completed(Some(echoed_binding(&seller, &reference))),
+    );
+
+    let summary = run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    assert_eq!(summary.locks_completions_applied, 1);
+    let (state, _, _) = payment_state(&app.pool, &order.payment_id).await;
+    assert_eq!(state, "confirmed");
+    assert_eq!(order_state(&app.pool, &order.order_id).await, "paid");
+    assert_eq!(confirmation_events(&app.pool).await, 1);
+}
+
+// Every way a completed task can fail to carry the prepared terms leaves the
+// payment unconfirmed: the correlation stops polling, records a static
+// reason and nothing else, and the payment window expires the payment on its
+// own schedule.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_completed_task_that_does_not_carry_the_prepared_terms_never_confirms(pool: PgPool) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let holder = Uuid::new_v4();
+    let seller = new_actor(&app).await;
+    let other_creator = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+
+    type Mutate = Box<dyn Fn(&mut LocksClientBinding)>;
+    let cheaper_lock = format!(
+        "pubky{}",
+        lock_resource_for_payment(&seller.pubky, 100, "USD")
+    );
+    let foreign_lock = format!("pubky{}", lock_resource_for(&other_creator.pubky));
+    let cases: Vec<(&str, Option<Mutate>, &str)> = vec![
+        (
+            "a reference minted for another application",
+            Some(Box::new(|b| {
+                b.client_reference = "x9Kq_3-jW0sN8uYv1tB6rZpLmE4cA2dHfG7iOoQwXyU".to_string()
+            })),
+            "binding_mismatch",
+        ),
+        (
+            "the reference with a character changed",
+            Some(Box::new(|b| {
+                let last = b.client_reference.pop().expect("reference is not empty");
+                b.client_reference.push(if last == 'A' { 'B' } else { 'A' });
+            })),
+            "binding_mismatch",
+        ),
+        (
+            "the reference with case folded",
+            Some(Box::new(|b| {
+                b.client_reference = b.client_reference.to_ascii_lowercase();
+            })),
+            "binding_mismatch",
+        ),
+        (
+            "a cheaper lock of the same creator",
+            Some(Box::new(move |b| {
+                b.pubky_lock_resource = cheaper_lock.clone();
+            })),
+            "binding_mismatch",
+        ),
+        (
+            "another creator's lock",
+            Some(Box::new(move |b| {
+                b.pubky_lock_resource = foreign_lock.clone();
+            })),
+            "binding_mismatch",
+        ),
+        (
+            "a different criterion",
+            Some(Box::new(|b| b.criterion_ids = vec!["other".to_string()])),
+            "binding_mismatch",
+        ),
+        (
+            "the criterion twice",
+            Some(Box::new(|b| {
+                b.criterion_ids = vec!["paykit".to_string(), "paykit".to_string()]
+            })),
+            "binding_mismatch",
+        ),
+        (
+            "no criteria",
+            Some(Box::new(|b| b.criterion_ids = vec![])),
+            "binding_mismatch",
+        ),
+        ("no binding at all", None, "binding_missing"),
+    ];
+
+    let mut orders = Vec::new();
+    for (index, (label, mutate, _)) in cases.iter().enumerate() {
+        let digit = index as u32 + 2;
+        let bundle = bundle_id_with(digit);
+        let (order, reference) = registered_digital_locks_order_with_reference(
+            &app,
+            &seller,
+            &buyer,
+            &format!("boots_{digit:02}"),
+            &bundle,
+            0xA10 + u64::from(digit),
+        )
+        .await;
+        let outcome = match mutate {
+            Some(mutate) => {
+                let mut binding = echoed_binding(&seller, &reference);
+                mutate(&mut binding);
+                LocksLookupOutcome::Completed(Some(binding))
+            }
+            None => LocksLookupOutcome::Completed(None),
+        };
+        fake.set_outcome(&bundle, outcome);
+        orders.push((label, order));
+    }
+
+    let summary = run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    assert_eq!(summary.locks_completions_applied, 0);
+    for ((label, order), (_, _, expected)) in orders.iter().zip(&cases) {
+        let (state, _, revision) = payment_state(&app.pool, &order.payment_id).await;
+        assert_eq!(state, "awaiting_entitlement", "{label}: payment untouched");
+        assert_eq!(revision, 3, "{label}: no revision after registration");
+        assert_eq!(
+            order_state(&app.pool, &order.order_id).await,
+            "pending_payment",
+            "{label}"
+        );
+        let (verification_state, observed) =
+            correlation_outcome(&app.pool, &order.payment_id).await;
+        assert_eq!(verification_state, "upstream_failed", "{label}");
+        assert_eq!(observed.as_deref(), Some(*expected), "{label}");
+        assert_eq!(
+            binding_observations(&app.pool, &order.payment_id).await,
+            vec![("completed".to_string(), expected.to_string())],
+            "{label}: one static observation"
+        );
+    }
+    assert_eq!(confirmation_events(&app.pool).await, 0);
+    assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM receipts").await, 0);
+
+    // Refused tasks are terminal for polling: nothing is looked up again.
+    let lookups = fake.lookup_count();
+    assert_eq!(lookups, cases.len());
+    app.clock.advance_seconds(60);
+    run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    assert_eq!(fake.lookup_count(), lookups);
+
+    // The payment window expires every one of them on its own clock.
+    app.clock.advance_seconds(3_600);
+    let summary = run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    assert_eq!(summary.payment_windows_expired, cases.len() as u64);
+    for (label, order) in &orders {
+        let (state, _, _) = payment_state(&app.pool, &order.payment_id).await;
+        assert_eq!(state, "expired", "{label}");
+    }
+}
+
+// The attack the binding exists for, with the resource and criterion
+// identical across both orders so that only the reference tells the payments
+// apart: the buyer holds two orders for one lock and registers each order's
+// bundle, but each bundle's task carries the OTHER order's reference (a task
+// completed for one order replayed against the other). Two verification
+// passes run at once over the batch together with a legitimately bound
+// order and an unbound one. Exactly the legitimate order confirms; each
+// refusal is recorded once; no row is looked up twice.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn concurrent_passes_confirm_only_the_order_whose_reference_the_task_carries(pool: PgPool) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let locks = app.state.locks.clone().expect("locks runtime");
+
+    let bundles = [
+        bundle_id_with(2),
+        bundle_id_with(3),
+        bundle_id_with(4),
+        bundle_id_with(5),
+    ];
+    let mut orders = Vec::new();
+    for (index, bundle) in bundles.iter().enumerate() {
+        orders.push(
+            registered_digital_locks_order_with_reference(
+                &app,
+                &seller,
+                &buyer,
+                &format!("boots_{:02}", index + 2),
+                bundle,
+                0xB01 + index as u64,
+            )
+            .await,
+        );
+    }
+    let mut orders = orders.into_iter();
+    let (first, first_ref) = orders.next().expect("first order");
+    let (second, second_ref) = orders.next().expect("second order");
+    let (legit, legit_ref) = orders.next().expect("legitimate order");
+    let (unbound, _) = orders.next().expect("unbound order");
+    fake.set_outcome(
+        &bundles[0],
+        LocksLookupOutcome::Completed(Some(echoed_binding(&seller, &second_ref))),
+    );
+    fake.set_outcome(
+        &bundles[1],
+        LocksLookupOutcome::Completed(Some(echoed_binding(&seller, &first_ref))),
+    );
+    fake.set_outcome(
+        &bundles[2],
+        LocksLookupOutcome::Completed(Some(echoed_binding(&seller, &legit_ref))),
+    );
+    fake.set_outcome(&bundles[3], LocksLookupOutcome::Completed(None));
+
+    let now = app.clock.now();
+    let (left, right) = tokio::join!(
+        workers::verify_due_locks_lifecycles(&app.state, &locks, now),
+        workers::verify_due_locks_lifecycles(&app.state, &locks, now),
+    );
+    assert_eq!(
+        left.expect("first pass") + right.expect("second pass"),
+        1,
+        "exactly the legitimately bound order confirms"
+    );
+    let mut looked_up: Vec<String> = fake
+        .lookups()
+        .into_iter()
+        .map(|(_, bundle)| bundle)
+        .collect();
+    looked_up.sort();
+    let mut expected_lookups = bundles.to_vec();
+    expected_lookups.sort();
+    assert_eq!(
+        looked_up, expected_lookups,
+        "no correlation is claimed twice"
+    );
+
+    let (state, _, _) = payment_state(&app.pool, &legit.payment_id).await;
+    assert_eq!(state, "confirmed");
+    assert_eq!(order_state(&app.pool, &legit.order_id).await, "paid");
+    assert_eq!(confirmation_events(&app.pool).await, 1);
+    for (order, outcome) in [
+        (&first, "binding_mismatch"),
+        (&second, "binding_mismatch"),
+        (&unbound, "binding_missing"),
+    ] {
+        let (state, _, _) = payment_state(&app.pool, &order.payment_id).await;
+        assert_eq!(state, "awaiting_entitlement");
+        assert_eq!(
+            order_state(&app.pool, &order.order_id).await,
+            "pending_payment"
+        );
+        assert_eq!(
+            binding_observations(&app.pool, &order.payment_id).await,
+            vec![("completed".to_string(), outcome.to_string())]
+        );
+    }
+}
+
+// A Lock Server response in flight while the payment window lapses. The
+// first pass claims the correlation and parks inside the lookup; the clock
+// passes the window, a second pass re-claims the now-due row, the window
+// sweep expires the payment and the parked response is released last. A task
+// that carries another order's reference must neither pay the expired order
+// (the late-money path) nor be recorded twice.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_foreign_task_arriving_after_the_window_never_reaches_late_money(pool: PgPool) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (order, _reference) = registered_digital_locks_order_with_reference(
+        &app,
+        &seller,
+        &buyer,
+        "boots_01",
+        TEST_BUNDLE_ID,
+        0xC01,
+    )
+    .await;
+    fake.set_outcome(
+        TEST_BUNDLE_ID,
+        LocksLookupOutcome::Completed(Some(echoed_binding(
+            &seller,
+            "x9Kq_3-jW0sN8uYv1tB6rZpLmE4cA2dHfG7iOoQwXyU",
+        ))),
+    );
+
+    let release = fake.park_next_lookup();
+    let in_flight = tokio::spawn({
+        let state = app.state.clone();
+        let locks = state.locks.clone().expect("locks runtime");
+        let now = app.clock.now();
+        async move { workers::verify_due_locks_lifecycles(&state, &locks, now).await }
+    });
+    while fake.lookup_count() < 1 {
+        tokio::task::yield_now().await;
+    }
+
+    app.clock.advance_seconds(3_601);
+    let now = app.clock.now();
+    let locks = app.state.locks.clone().expect("locks runtime");
+    let second = workers::verify_due_locks_lifecycles(&app.state, &locks, now)
+        .await
+        .expect("second pass");
+    assert_eq!(second, 0);
+    let expired = workers::expire_due_payment_windows(&app.state, now)
+        .await
+        .expect("window sweep");
+    assert_eq!(expired, 1);
+    release.notify_one();
+    let first = in_flight.await.expect("pass joins").expect("first pass");
+    assert_eq!(first, 0);
+
+    assert_eq!(fake.lookup_count(), 2);
+    let (state, _, _) = payment_state(&app.pool, &order.payment_id).await;
+    assert_eq!(state, "expired", "the foreign task never moved the payment");
+    assert_eq!(order_state(&app.pool, &order.order_id).await, "cancelled");
+    assert_eq!(confirmation_events(&app.pool).await, 0);
+    assert_eq!(
+        count(
+            &app.pool,
+            "SELECT COUNT(*) FROM events WHERE kind = 'payment.manual_review'"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        binding_observations(&app.pool, &order.payment_id).await,
+        vec![("completed".to_string(), "binding_mismatch".to_string())],
+        "the refusal raced by two passes is recorded once"
+    );
+    let (verification_state, _) = correlation_outcome(&app.pool, &order.payment_id).await;
+    assert_eq!(verification_state, "upstream_failed");
+}
+
+// The same interleaving with the task that does carry the prepared terms:
+// the second pass pays the order through the late path and the parked first
+// response, released afterwards, is a harmless duplicate. This is what makes
+// the previous test's refusal evidence of the binding rather than of the gate.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_bound_task_arriving_after_the_window_pays_once_even_when_two_passes_raced(pool: PgPool) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (order, reference) = registered_digital_locks_order_with_reference(
+        &app,
+        &seller,
+        &buyer,
+        "boots_01",
+        TEST_BUNDLE_ID,
+        0xC11,
+    )
+    .await;
+    fake.set_outcome(
+        TEST_BUNDLE_ID,
+        LocksLookupOutcome::Completed(Some(echoed_binding(&seller, &reference))),
+    );
+
+    let release = fake.park_next_lookup();
+    let in_flight = tokio::spawn({
+        let state = app.state.clone();
+        let locks = state.locks.clone().expect("locks runtime");
+        let now = app.clock.now();
+        async move { workers::verify_due_locks_lifecycles(&state, &locks, now).await }
+    });
+    while fake.lookup_count() < 1 {
+        tokio::task::yield_now().await;
+    }
+
+    app.clock.advance_seconds(3_601);
+    let now = app.clock.now();
+    let locks = app.state.locks.clone().expect("locks runtime");
+    workers::expire_due_payment_windows(&app.state, now)
+        .await
+        .expect("window sweep");
+    let second = workers::verify_due_locks_lifecycles(&app.state, &locks, now)
+        .await
+        .expect("second pass");
+    assert_eq!(second, 1);
+    release.notify_one();
+    let first = in_flight.await.expect("pass joins").expect("first pass");
+    assert_eq!(first, 0, "the released duplicate has no further effect");
+
+    let (state, _, _) = payment_state(&app.pool, &order.payment_id).await;
+    assert_eq!(state, "confirmed");
+    assert_eq!(order_state(&app.pool, &order.order_id).await, "paid");
+    assert_eq!(confirmation_events(&app.pool).await, 1);
+    assert!(binding_observations(&app.pool, &order.payment_id)
+        .await
+        .is_empty());
+}
+
+// A correlation that predates preparation has no sealed facts to compare a
+// task against, so no completion can qualify it.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_correlation_without_sealed_binding_facts_never_confirms(pool: PgPool) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (order, reference) = registered_digital_locks_order_with_reference(
+        &app,
+        &seller,
+        &buyer,
+        "boots_01",
+        TEST_BUNDLE_ID,
+        0xD01,
+    )
+    .await;
+    sqlx::query(
+        "UPDATE payment_locks_correlations SET client_reference_ciphertext = NULL, \
+         expected_resource_ciphertext = NULL, criterion_id = NULL WHERE payment_id = $1::uuid",
+    )
+    .bind(&order.payment_id)
+    .execute(&app.pool)
+    .await
+    .expect("model a pre-preparation correlation");
+    fake.set_outcome(
+        TEST_BUNDLE_ID,
+        LocksLookupOutcome::Completed(Some(echoed_binding(&seller, &reference))),
+    );
+
+    let summary = run_once(&app.state, Uuid::new_v4(), app.clock.now())
+        .await
+        .expect("worker pass runs");
+    assert_eq!(summary.locks_completions_applied, 0);
+    let (state, _, _) = payment_state(&app.pool, &order.payment_id).await;
+    assert_eq!(state, "awaiting_entitlement");
+    assert_eq!(
+        binding_observations(&app.pool, &order.payment_id).await,
+        vec![("completed".to_string(), "binding_unverifiable".to_string())]
+    );
 }

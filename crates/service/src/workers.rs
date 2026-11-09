@@ -57,7 +57,9 @@ use crate::handlers::auction::{close_locked_auction, parse_auction};
 use crate::handlers::payment::confirm_order;
 use crate::handlers::{fetch_order_for_update, insert_notification_intent, LISTING_COLUMNS};
 use crate::homeserver::HomeserverListingClient;
-use crate::locks::{LocksLookupOutcome, LocksRuntime, LocksTaskStatus};
+use crate::locks::{
+    BindingRefusal, LocksClientBinding, LocksLookupOutcome, LocksRuntime, LocksTaskStatus,
+};
 use crate::model::{ListingRow, PaymentRow};
 use crate::payment_attempt::{AcceptedAsset, OfferedAssets, PaymentAsset, PaymentTerms};
 use crate::payments::{
@@ -1620,6 +1622,11 @@ struct ClaimedCorrelation {
     creator_pubky: String,
     bundle_id_ciphertext: Vec<u8>,
     last_observed_status: Option<String>,
+    /// The facts sealed at preparation that a completed task must echo.
+    /// Absent only on correlations registered before preparation existed.
+    client_reference_ciphertext: Option<Vec<u8>>,
+    expected_resource_ciphertext: Option<Vec<u8>>,
+    criterion_id: Option<String>,
 }
 
 /// Claims a batch of pending correlations due for a lifecycle lookup by
@@ -1643,7 +1650,8 @@ async fn claim_due_correlations(
              AND bundle_id_ciphertext IS NOT NULL \
              AND (last_checked_at IS NULL OR last_checked_at <= $2) \
              ORDER BY last_checked_at ASC NULLS FIRST LIMIT $3 FOR UPDATE SKIP LOCKED\
-         ) RETURNING id, payment_id, creator_pubky, bundle_id_ciphertext, last_observed_status",
+         ) RETURNING id, payment_id, creator_pubky, bundle_id_ciphertext, last_observed_status, \
+         client_reference_ciphertext, expected_resource_ciphertext, criterion_id",
     )
     .bind(now)
     .bind(now - chrono::Duration::seconds(poll_seconds))
@@ -1725,6 +1733,36 @@ async fn record_upstream_terminal(
     .await?;
     if flipped.rows_affected() == 1 {
         insert_observation(&mut tx, row.id, observed_status, "none", now).await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Stops polling a correlation whose completed task does not qualify its
+/// payment, and records why. The payment is deliberately untouched, exactly
+/// like an upstream failure: the task is write-once, so a refused binding can
+/// never become a match, and the payment window moves the payment to
+/// `expired` on its own schedule. `outcome` is one of the static
+/// `binding_*` labels; no value from either side of the comparison is stored.
+async fn record_binding_refusal(
+    pool: &PgPool,
+    row: &ClaimedCorrelation,
+    outcome: &str,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await?;
+    let flipped = sqlx::query(
+        "UPDATE payment_locks_correlations SET verification_state = 'upstream_failed', \
+         last_observed_status = $2, updated_at = $3 \
+         WHERE id = $1 AND verification_state = 'pending'",
+    )
+    .bind(row.id)
+    .bind(outcome)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+    if flipped.rows_affected() == 1 {
+        insert_observation(&mut tx, row.id, "completed", outcome, now).await?;
     }
     tx.commit().await?;
     Ok(())
@@ -1964,8 +2002,55 @@ async fn apply_locks_lookup_outcome(
         .map_err(|error| anyhow::anyhow!("correlation {} cannot be decrypted: {error}", row.id))?;
     let outcome = locks.client.lookup(&row.creator_pubky, &bundle_id).await;
     match outcome {
-        LocksLookupOutcome::Status(LocksTaskStatus::Completed) => {
-            apply_completed_lifecycle(&state.pool, row, state.confirm_keys(), now).await
+        LocksLookupOutcome::Completed(binding) => {
+            let (Some(reference), Some(resource), Some(criterion_id)) = (
+                row.client_reference_ciphertext.as_deref(),
+                row.expected_resource_ciphertext.as_deref(),
+                row.criterion_id.as_deref(),
+            ) else {
+                // A correlation registered before preparation existed has
+                // nothing to compare the task against, so it cannot qualify.
+                tracing::warn!(
+                    correlation_id = %row.id,
+                    "completed locks task refused: the correlation has no sealed binding facts"
+                );
+                record_binding_refusal(&state.pool, row, "binding_unverifiable", now).await?;
+                return Ok(false);
+            };
+            let expected = locks
+                .keys
+                .open_expected_binding(row.payment_id, reference, resource, criterion_id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("correlation {} binding facts cannot be opened", row.id)
+                })?;
+            match LocksClientBinding::verify(binding.as_ref(), &expected) {
+                Ok(()) => {
+                    apply_completed_lifecycle(&state.pool, row, state.confirm_keys(), now).await
+                }
+                Err(refusal) => {
+                    match refusal {
+                        BindingRefusal::Missing => tracing::warn!(
+                            correlation_id = %row.id,
+                            payment_id = %row.payment_id,
+                            "completed locks task refused: the Lock Server echoed no client binding"
+                        ),
+                        BindingRefusal::Mismatch {
+                            client_reference,
+                            lock_resource,
+                            criterion_ids,
+                        } => tracing::warn!(
+                            correlation_id = %row.id,
+                            payment_id = %row.payment_id,
+                            client_reference,
+                            lock_resource,
+                            criterion_ids,
+                            "completed locks task refused: the client binding differs from the prepared payment"
+                        ),
+                    }
+                    record_binding_refusal(&state.pool, row, refusal.outcome(), now).await?;
+                    Ok(false)
+                }
+            }
         }
         LocksLookupOutcome::Status(LocksTaskStatus::Failed) => {
             record_upstream_terminal(&state.pool, row, "failed", "upstream_failed", now).await?;
