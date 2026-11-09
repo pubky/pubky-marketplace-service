@@ -20,7 +20,8 @@ use common::connector_provider::{
 use common::shopify_fake::{FakeShopify, Fault, GOOD_CODE};
 use common::{execute, new_actor, register_command, register_listing_command, TestActor, TestApp};
 use hmac::{Hmac, Mac};
-use marketplace_service::connectors::provider::ProviderRegistry;
+use marketplace_service::connectors::product_sync;
+use marketplace_service::connectors::provider::{CatalogProduct, ProviderRegistry};
 use marketplace_service::connectors::providers::shopify::client::Origin;
 use marketplace_service::connectors::providers::shopify::ShopifyProvider;
 use marketplace_service::connectors::{worker, ConnectorRuntime};
@@ -344,6 +345,16 @@ async fn applying_moves_the_base_and_a_dismissed_value_is_not_raised_again(pool:
     let changes = r.changes().await;
     let again = only(&changes, "price");
     assert_ne!(again["id"], dismissed["id"]);
+    let kept: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM connector_product_changes \
+         WHERE connection_id = $1 AND provider_product_id = $2 AND field_group = 'price'",
+    )
+    .bind(r.connection)
+    .bind(BOOTS)
+    .fetch_one(&r.app.pool)
+    .await
+    .expect("count");
+    assert_eq!(kept, 2, "the pending change and the latest resolution only");
     assert_eq!(
         again["base"]["variants"], price["proposed"]["variants"],
         "dismissing kept the base"
@@ -678,17 +689,182 @@ async fn a_resolve_racing_a_newer_store_value_never_loses_it(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn an_unlinked_product_drops_its_pending_changes(pool: PgPool) {
+async fn unlinking_forgets_the_product_its_changes_and_its_listings_overrides(pool: PgPool) {
     let r = rig(pool).await;
     r.poll().await;
+    let (status, _) = r
+        .call(
+            "PUT",
+            "/sync/listings/boots_01",
+            &json!({ "groups": { "price": "off" } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
     r.edit(BOOTS, json!({ "title": "Trail Boots II" }));
     r.poll().await;
-    assert_eq!(r.changes().await.len(), 1);
+    let changes = r.changes().await;
+    let old = only(&changes, "content").clone();
+
     let (status, body) = r.call("PUT", "/mappings", &json!({ "mappings": [] })).await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(r.changes().await, Vec::<Value>::new());
+    let (status, body) = r.resolve(&old, "applied").await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the change went with the link: {body}"
+    );
+    let (_, view) = r.call("GET", "/sync", &json!(null)).await;
+    assert_eq!(
+        view["overrides"],
+        json!([]),
+        "the listing links nothing any more"
+    );
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM connector_product_snapshots WHERE connection_id = $1) \
+              + (SELECT COUNT(*) FROM connector_product_changes WHERE connection_id = $1)",
+    )
+    .bind(r.connection)
+    .fetch_one(&r.app.pool)
+    .await
+    .expect("count");
+    assert_eq!(rows, 0);
+
+    map_listing(
+        &r.app,
+        &r.seller,
+        r.connection,
+        "boots_01",
+        BOOTS,
+        BOOTS_VARIANT,
+    )
+    .await;
     assert_eq!(
         r.changes().await,
         Vec::<Value>::new(),
-        "nothing to apply it to"
+        "no stale proposal comes back"
     );
+    r.poll().await;
+    assert_eq!(
+        r.changes().await,
+        Vec::<Value>::new(),
+        "relinked, the product is based afresh"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_read_older_than_the_products_last_read_is_dropped(pool: PgPool) {
+    let r = rig(pool).await;
+    let slow_read_started = marketplace_service::clock::Clock::now(&*r.app.clock);
+    r.app.clock.advance_seconds(10);
+    r.poll().await;
+    // A read that started before that poll finishes after it, carrying
+    // values that differ from the store's in every group.
+    let stale = CatalogProduct {
+        provider_product_id: BOOTS.into(),
+        handle: None,
+        title: "Old Boots".into(),
+        description: None,
+        url: None,
+        options: vec![],
+        image_urls: vec![],
+        variants: vec![],
+        categories: vec![],
+        attributes: vec![],
+    };
+    let observed = product_sync::observe(&r.app.pool, slow_read_started, r.connection, &stale)
+        .await
+        .expect("observe");
+    assert!(observed.stale, "{observed:?}");
+    assert_eq!(r.changes().await, Vec::<Value>::new());
+    let fresh = product_sync::observe(
+        &r.app.pool,
+        marketplace_service::clock::Clock::now(&*r.app.clock),
+        r.connection,
+        &stale,
+    )
+    .await
+    .expect("observe");
+    assert!(!fresh.stale);
+    assert_eq!(
+        fresh.queued, 3,
+        "the same values from a current read are changes"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_late_delete_delivery_does_not_override_a_newer_read(pool: PgPool) {
+    let r = rig(pool).await;
+    r.poll().await;
+    r.app.clock.advance_seconds(5);
+    r.webhook("evt-late-delete", "products/delete", &json!({ "id": 9001 }))
+        .await;
+    r.app.clock.advance_seconds(5);
+    // The store sells the product again (the delivery is older than this read).
+    r.poll().await;
+    r.pass().await;
+    assert_eq!(r.changes().await, Vec::<Value>::new());
+
+    // Delivered and applied before any newer read, it is queued.
+    r.app.clock.advance_seconds(5);
+    r.fake.lock().products_gone.insert(BOOTS.into(), None);
+    r.webhook("evt-delete", "products/delete", &json!({ "id": 9001 }))
+        .await;
+    r.pass().await;
+    let changes = r.changes().await;
+    assert_eq!(
+        only(&changes, "status")["proposed"],
+        json!({ "available": false })
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_direction_change_waits_for_a_first_read_in_flight_and_drops_its_base(pool: PgPool) {
+    let r = rig(pool).await;
+    // A first observation of the boots, its snapshot inserted but not yet
+    // committed.
+    let mut first_read = r.app.pool.begin().await.expect("begin");
+    sqlx::query(
+        "INSERT INTO connector_product_snapshots \
+         (connection_id, provider_product_id, content, price, variants, status, checked_at, \
+          created_at) \
+         VALUES ($1, $2, '{\"title\":\"Trail Boots\"}', '{}', '{}', \
+                 '{\"available\":true}', now(), now())",
+    )
+    .bind(r.connection)
+    .bind(BOOTS)
+    .execute(&mut *first_read)
+    .await
+    .expect("insert");
+    let router = r.app.router.clone();
+    let token = r.seller.token.clone();
+    let connection = r.connection;
+    let turning_off = tokio::spawn(async move {
+        common::send(
+            router,
+            "PUT",
+            &format!("/v1/connectors/{connection}/sync"),
+            Some(&token),
+            &json!({ "groups": { "content": "off" } }),
+        )
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !turning_off.is_finished(),
+        "the direction change waits for the first read's snapshot"
+    );
+    first_read.commit().await.expect("commit");
+    let (status, body) = turning_off.await.expect("task");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let content: Option<Value> = sqlx::query_scalar(
+        "SELECT content FROM connector_product_snapshots \
+         WHERE connection_id = $1 AND provider_product_id = $2",
+    )
+    .bind(r.connection)
+    .bind(BOOTS)
+    .fetch_one(&r.app.pool)
+    .await
+    .expect("snapshot");
+    assert_eq!(content, None, "the base the first read wrote was dropped");
 }

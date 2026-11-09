@@ -758,6 +758,7 @@ async fn poll_connection_stock(
     let linked = product_sync::linked_products(&state.pool, connection.id).await?;
     let mut seen = std::collections::BTreeSet::new();
     let mut complete = false;
+    let walk_started = state.clock.now();
     let mut page: Option<String> = None;
     for _ in 0..MAX_CATALOG_PAGES_PER_POLL {
         let read_at = state.clock.now();
@@ -821,11 +822,12 @@ async fn poll_connection_stock(
         }
     }
     // The catalog lists only what the store sells, so a linked product that a
-    // whole walk did not meet was deleted, archived or made a draft. A walk
-    // cut short (an error, the page cap) proves nothing.
+    // whole walk did not meet was deleted, archived or made a draft, as known
+    // when the walk started. A walk cut short (an error, the page cap) proves
+    // nothing.
     if complete {
         for product in linked.difference(&seen) {
-            product_sync::observe_removed(&state.pool, state.clock.now(), connection.id, product)
+            product_sync::observe_removed(&state.pool, walk_started, connection.id, product)
                 .await?;
         }
     }

@@ -754,7 +754,7 @@ mod tests {
             InboundEvent::AppUninstalled
         );
         assert!(matches!(
-            parse(&webhook("products/update"), b"{}"),
+            parse(&webhook("products/create"), b"{}"),
             Ok(InboundEvent::Ignored { .. })
         ));
         assert!(parse(&webhook("orders/cancelled"), b"not json").is_err());

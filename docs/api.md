@@ -2048,8 +2048,9 @@ product's last observation is skipped) and on every stock poll, which reads
 the whole catalog anyway. A difference in a group that some linked listing
 follows becomes one pending change per product and group, and a newer store
 value replaces the proposal of a change still pending. A store value back at
-the base, or equal to a proposal the seller dismissed, withdraws the pending
-change. A product the store no longer sells (`products/delete`, `product`
+the base, or equal to a proposal the seller dismissed, withdraws (deletes) the
+pending change. Each read records when it started, and a read older than the
+product's last one is dropped, so a slow read never replaces a newer one. A product the store no longer sells (`products/delete`, `product`
 null or not `ACTIVE`, or missing from a catalog walk that reached the last
 page) is always queued as a `status` change, `{"available": false}`, whatever
 the directions: a paid order for it could not reach the store.
@@ -2063,10 +2064,13 @@ it stands, applies or dismisses it, and calls
 `POST /v1/connectors/{id}/changes/{change_id}/resolve` with
 `{"resolution": "applied" | "dismissed", "proposed_hash": "..."}`. `applied`
 moves the base to the proposal. A change no longer pending, or whose proposal
-was replaced since the Shop read it, answers `409 change_stale`; an unknown
-one `404 change_not_found`. Changing a direction cancels the group's pending
-changes for the listings it affects and drops their base, so the next
-observation takes the store as it then stands.
+was replaced since the Shop read it, answers `409 change_stale`; an unknown or
+withdrawn one `404 change_not_found` (read the changes again). Changing a
+direction withdraws the group's pending changes for the listings it affects
+and drops their base, so the next observation takes the store as it then
+stands. Unlinking a product (a mapping save without it, split mode, a
+disconnect) forgets its base and changes, and the overrides of listings that
+no longer link anything.
 
 ### Mirror leases and the refund difference
 

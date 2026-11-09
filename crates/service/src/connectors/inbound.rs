@@ -421,9 +421,11 @@ async fn handle(
             if !is_linked(&state.pool, connection.id, &provider_product_id).await? {
                 return Ok(Handled::Ignored("unlinked_product".to_string()));
             }
+            // Known as of the delivery: a read of the product made after it
+            // arrived (a product made active again) wins.
             let observed = product_sync::observe_removed(
                 &state.pool,
-                now,
+                due.received_at,
                 connection.id,
                 &provider_product_id,
             )

@@ -558,7 +558,7 @@ fn sorted_migration_catalog(mut numbers: Vec<u32>) -> Vec<u32> {
 }
 
 #[test]
-fn migration_catalog_is_gapless_through_0061_then_0070_to_0095() {
+fn migration_catalog_is_gapless_through_0061_then_0070_to_0096() {
     let numbers: Vec<u32> = std::fs::read_dir(MIGRATIONS_DIR)
         .expect("migrations dir")
         .filter_map(|entry| {

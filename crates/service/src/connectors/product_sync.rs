@@ -15,8 +15,10 @@
 //! the base. A difference becomes one **pending change** per product and
 //! group; a newer store value replaces the proposal of a change still pending,
 //! so the Shop only ever sees the latest. A store value that returns to the
-//! base supersedes the pending change, and one the seller already dismissed
-//! is not raised again.
+//! base withdraws the pending change, and one the seller already dismissed is
+//! not raised again. Each observation carries the time its read started; one
+//! older than the product's last read is dropped, so a slow read can never
+//! replace what a newer one found.
 //!
 //! The service never writes a listing: listing records live on the seller's
 //! homeserver and only the seller's Shop signs them. The Shop reads the
@@ -26,13 +28,20 @@
 //! moves the base to that proposal; a proposal replaced in the meantime is
 //! refused as stale.
 //!
-//! Changing a direction (for the connection or a listing) cancels the pending
-//! changes of that group for the affected products and drops their base, so
-//! the next observation takes the store as it then stands: nothing reviewed
-//! under the old direction can be applied under the new one, and nothing that
-//! changed while a group was off is replayed when it is turned back on.
+//! Changing a direction (for the connection or a listing) withdraws the
+//! pending changes of that group for the affected products and drops their
+//! base, so the next observation takes the store as it then stands: nothing
+//! reviewed under the old direction can be applied under the new one, and
+//! nothing that changed while a group was off is replayed when it is turned
+//! back on. Unlinking a product forgets it: its base, its changes and the
+//! overrides of listings that no longer link anything go with the mapping.
 //!
-//! Lock order, everywhere: the product's snapshot row, then its change rows.
+//! Only what is still needed is kept: a withdrawn change is deleted, and a
+//! product and group keep at most their pending change and their latest
+//! resolution (the dismissal a later observation is compared with).
+//!
+//! Lock order, everywhere: snapshot rows (several in product-id order), then
+//! change rows.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -205,12 +214,14 @@ pub fn value_hash(value: &Value) -> Vec<u8> {
 /// What one observation did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Observed {
+    /// The read started before the product's last read: nothing was done.
+    pub stale: bool,
     /// Groups taken as the base (first sight, or after a rebase).
     pub based: u32,
     /// Changes queued or whose proposal was replaced.
     pub queued: u32,
     /// Pending changes withdrawn because the store returned to the base or
-    /// to a value the seller dismissed, or the product is no longer linked.
+    /// to a value the seller dismissed.
     pub withdrawn: u32,
 }
 
@@ -360,6 +371,7 @@ pub async fn checked_since(
 
 #[derive(sqlx::FromRow)]
 struct SnapshotRow {
+    checked_at: DateTime<Utc>,
     content: Option<Value>,
     price: Option<Value>,
     variants: Option<Value>,
@@ -377,27 +389,51 @@ impl SnapshotRow {
     }
 }
 
-/// Locks the product's snapshot row, creating it empty (every group to be
-/// based) when the product has none yet.
+/// Ensures each product has a snapshot row (an empty one, never read, for a
+/// product without one) and locks the rows in product-id order. The insert
+/// waits for a concurrent first insert of the same row to commit, so the lock
+/// is always taken on the row that transaction wrote.
+async fn lock_snapshots(
+    tx: &mut Transaction<'_, Postgres>,
+    now: DateTime<Utc>,
+    connection_id: Uuid,
+    products: &[String],
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO connector_product_snapshots \
+         (connection_id, provider_product_id, checked_at, created_at) \
+         SELECT $1, product, 'epoch'::timestamptz, $3 \
+         FROM unnest($2::text[]) AS product ORDER BY product \
+         ON CONFLICT (connection_id, provider_product_id) DO NOTHING",
+    )
+    .bind(connection_id)
+    .bind(products)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "SELECT provider_product_id FROM connector_product_snapshots \
+         WHERE connection_id = $1 AND provider_product_id = ANY($2) \
+         ORDER BY provider_product_id FOR UPDATE",
+    )
+    .bind(connection_id)
+    .bind(products)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Locks one product's snapshot row (see [`lock_snapshots`]) and reads it.
 async fn lock_snapshot(
     tx: &mut Transaction<'_, Postgres>,
     now: DateTime<Utc>,
     connection_id: Uuid,
     provider_product_id: &str,
 ) -> Result<SnapshotRow, sqlx::Error> {
-    sqlx::query(
-        "INSERT INTO connector_product_snapshots \
-         (connection_id, provider_product_id, checked_at, created_at) \
-         VALUES ($1, $2, $3, $3) ON CONFLICT (connection_id, provider_product_id) DO NOTHING",
-    )
-    .bind(connection_id)
-    .bind(provider_product_id)
-    .bind(now)
-    .execute(&mut **tx)
-    .await?;
+    lock_snapshots(tx, now, connection_id, &[provider_product_id.to_string()]).await?;
     sqlx::query_as(
-        "SELECT content, price, variants, status FROM connector_product_snapshots \
-         WHERE connection_id = $1 AND provider_product_id = $2 FOR UPDATE",
+        "SELECT checked_at, content, price, variants, status FROM connector_product_snapshots \
+         WHERE connection_id = $1 AND provider_product_id = $2",
     )
     .bind(connection_id)
     .bind(provider_product_id)
@@ -425,29 +461,25 @@ async fn set_base(
     Ok(())
 }
 
-/// Ends the product's pending changes (all groups when `group` is `None`)
-/// with `state`. Returns how many.
-async fn end_pending(
+/// Withdraws the product's pending change for the group. Returns how many
+/// were withdrawn (0 or 1).
+async fn withdraw(
     tx: &mut Transaction<'_, Postgres>,
-    now: DateTime<Utc>,
     connection_id: Uuid,
     provider_product_id: &str,
-    group: Option<FieldGroup>,
-    state: &str,
+    group: FieldGroup,
 ) -> Result<u32, sqlx::Error> {
-    let ended = sqlx::query(
-        "UPDATE connector_product_changes SET state = $5, resolved_at = $3, updated_at = $3 \
-         WHERE connection_id = $1 AND provider_product_id = $2 AND state = 'pending' \
-           AND ($4::text IS NULL OR field_group = $4)",
+    let withdrawn = sqlx::query(
+        "DELETE FROM connector_product_changes \
+         WHERE connection_id = $1 AND provider_product_id = $2 AND field_group = $3 \
+           AND state = 'pending'",
     )
     .bind(connection_id)
     .bind(provider_product_id)
-    .bind(now)
-    .bind(group.map(FieldGroup::as_str))
-    .bind(state)
+    .bind(group.as_str())
     .execute(&mut **tx)
     .await?;
-    Ok(u32::try_from(ended.rows_affected()).unwrap_or(u32::MAX))
+    Ok(u32::try_from(withdrawn.rows_affected()).unwrap_or(u32::MAX))
 }
 
 /// The proposal hash the seller last dismissed for the group, when the
@@ -533,8 +565,9 @@ async fn queue(
 }
 
 /// Compares the store's current values with the product's base and queues
-/// the differences. `now` is when the store was read: it is recorded as the
-/// product's `checked_at`, which [`checked_since`] compares deliveries with.
+/// the differences. `now` is when the store was read: an observation older
+/// than the product's last read is dropped, and a newer one becomes its
+/// `checked_at`, which [`checked_since`] compares deliveries with.
 async fn compare(
     pool: &PgPool,
     now: DateTime<Utc>,
@@ -545,18 +578,15 @@ async fn compare(
     let mut observed = Observed::default();
     let mut tx = pool.begin().await?;
     let snapshot = lock_snapshot(&mut tx, now, connection_id, provider_product_id).await?;
+    if snapshot.checked_at > now {
+        observed.stale = true;
+        tx.rollback().await?;
+        return Ok(observed);
+    }
     let listings = linked_listings(&mut tx, connection_id, provider_product_id).await?;
     if listings.is_empty() {
-        observed.withdrawn += end_pending(
-            &mut tx,
-            now,
-            connection_id,
-            provider_product_id,
-            None,
-            "cancelled",
-        )
-        .await?;
-        tx.commit().await?;
+        // Unlinked since the read was planned; the unlink forgot the product.
+        tx.rollback().await?;
         return Ok(observed);
     }
     let follows = load_config(&mut tx, connection_id)
@@ -610,15 +640,8 @@ async fn compare(
             || dismissed_hash(&mut tx, connection_id, provider_product_id, group).await?
                 == Some(hash.clone())
         {
-            observed.withdrawn += end_pending(
-                &mut tx,
-                now,
-                connection_id,
-                provider_product_id,
-                Some(group),
-                "superseded",
-            )
-            .await?;
+            observed.withdrawn +=
+                withdraw(&mut tx, connection_id, provider_product_id, group).await?;
             continue;
         }
         if queue(
@@ -649,7 +672,7 @@ async fn compare(
     Ok(observed)
 }
 
-/// Compares a product the store sells, read at `read_at`, with its base.
+/// Compares a product the store sells, read at `now`, with its base.
 pub async fn observe(
     pool: &PgPool,
     now: DateTime<Utc>,
@@ -676,8 +699,9 @@ pub async fn observe(
     .await
 }
 
-/// Records that the store no longer sells a product. Only its status is
-/// compared; the other groups keep their base.
+/// Records that the store no longer sells a product, as known at `now`: when
+/// the delivery saying so arrived, or when the catalog walk that missed it
+/// started. Only its status is compared; the other groups keep their base.
 pub async fn observe_removed(
     pool: &PgPool,
     now: DateTime<Utc>,
@@ -722,7 +746,7 @@ pub async fn list_pending(
            AND EXISTS (SELECT 1 FROM connector_variant_map m \
                        WHERE m.connection_id = c.connection_id \
                          AND m.provider_product_id = c.provider_product_id) \
-         ORDER BY c.detected_at, c.id LIMIT $2",
+         ORDER BY c.detected_at, c.seq LIMIT $2",
     )
     .bind(connection_id)
     .bind(limit)
@@ -779,7 +803,7 @@ pub async fn resolve(
         return Ok(ResolveOutcome::NotFound);
     };
     let mut tx = pool.begin().await?;
-    lock_snapshot(&mut tx, now, connection_id, &product).await?;
+    lock_snapshots(&mut tx, now, connection_id, std::slice::from_ref(&product)).await?;
     let change: Option<(String, String, Value, Vec<u8>)> = sqlx::query_as(
         "SELECT state, field_group, proposed, proposed_hash FROM connector_product_changes \
          WHERE id = $1 FOR UPDATE",
@@ -811,12 +835,25 @@ pub async fn resolve(
     .bind(now)
     .execute(&mut *tx)
     .await?;
+    // Only the latest resolution is ever read again.
+    sqlx::query(
+        "DELETE FROM connector_product_changes \
+         WHERE connection_id = $1 AND provider_product_id = $2 AND field_group = $3 \
+           AND state IN ('applied', 'dismissed') AND id <> $4",
+    )
+    .bind(connection_id)
+    .bind(&product)
+    .bind(group.as_str())
+    .bind(change_id)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(ResolveOutcome::Resolved)
 }
 
-/// Cancels the group's pending changes and drops its base for each product,
-/// so the next observation takes the store as it then stands.
+/// Withdraws the group's pending changes and drops its base for every
+/// product given, so the next observation takes the store as it then stands.
+/// A fixed number of statements, however many products.
 async fn rebase(
     tx: &mut Transaction<'_, Postgres>,
     now: DateTime<Utc>,
@@ -824,20 +861,80 @@ async fn rebase(
     group: FieldGroup,
     products: &BTreeSet<String>,
 ) -> Result<(), sqlx::Error> {
-    for product in products {
-        let locked: Option<(String,)> = sqlx::query_as(
-            "SELECT provider_product_id FROM connector_product_snapshots \
-             WHERE connection_id = $1 AND provider_product_id = $2 FOR UPDATE",
-        )
-        .bind(connection_id)
-        .bind(product)
-        .fetch_optional(&mut **tx)
-        .await?;
-        end_pending(tx, now, connection_id, product, Some(group), "cancelled").await?;
-        if locked.is_some() {
-            set_base(tx, connection_id, product, group, None).await?;
-        }
+    if products.is_empty() {
+        return Ok(());
     }
+    let products: Vec<String> = products.iter().cloned().collect();
+    lock_snapshots(tx, now, connection_id, &products).await?;
+    sqlx::query(
+        "DELETE FROM connector_product_changes \
+         WHERE connection_id = $1 AND field_group = $2 AND state = 'pending' \
+           AND provider_product_id = ANY($3)",
+    )
+    .bind(connection_id)
+    .bind(group.as_str())
+    .bind(&products)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(&format!(
+        "UPDATE connector_product_snapshots SET {} = NULL \
+         WHERE connection_id = $1 AND provider_product_id = ANY($2)",
+        group.column()
+    ))
+    .bind(connection_id)
+    .bind(&products)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Forgets what the connection no longer links, in the transaction that
+/// changed its mappings: the snapshots and changes of products no listing
+/// links any more, and the overrides of listings that link nothing. A
+/// product linked again later is based afresh; a listing linked again follows
+/// the connection's directions.
+pub async fn forget_unlinked(
+    tx: &mut Transaction<'_, Postgres>,
+    connection_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    let orphans: Vec<String> = sqlx::query_scalar(
+        "SELECT s.provider_product_id FROM connector_product_snapshots s \
+         WHERE s.connection_id = $1 AND NOT EXISTS ( \
+             SELECT 1 FROM connector_variant_map m \
+             WHERE m.connection_id = s.connection_id \
+               AND m.provider_product_id = s.provider_product_id) \
+         ORDER BY s.provider_product_id FOR UPDATE",
+    )
+    .bind(connection_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    sqlx::query(
+        "DELETE FROM connector_product_changes c \
+         WHERE c.connection_id = $1 AND NOT EXISTS ( \
+             SELECT 1 FROM connector_variant_map m \
+             WHERE m.connection_id = c.connection_id \
+               AND m.provider_product_id = c.provider_product_id)",
+    )
+    .bind(connection_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "DELETE FROM connector_product_snapshots \
+         WHERE connection_id = $1 AND provider_product_id = ANY($2)",
+    )
+    .bind(connection_id)
+    .bind(&orphans)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "DELETE FROM connector_sync_overrides o \
+         WHERE o.connection_id = $1 AND NOT EXISTS ( \
+             SELECT 1 FROM connector_variant_map m \
+             WHERE m.connection_id = o.connection_id AND m.listing_id = o.listing_id)",
+    )
+    .bind(connection_id)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 

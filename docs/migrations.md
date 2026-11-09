@@ -669,6 +669,33 @@ keep the new image running; to stop zone pricing, set the region mode that
 blocks the affected destinations or remove the profile references from the
 listings first, and let the open orders, offers and auctions settle.
 
+## Connector product sync (0096)
+
+0096 creates four tables and changes no existing one:
+`connector_sync_settings` and `connector_sync_overrides` (the direction of
+each field group per connection and per linked listing),
+`connector_product_snapshots` (the base of each linked store product per field
+group) and `connector_product_changes` (pending store changes for the
+seller's Shop, plus the latest resolution per product and group). Every
+foreign key cascades from `connector_connections`. Directly rerunnable: each
+table and index is created only if missing.
+
+**Deploy mode: rolling.** A binary from before 0096 never reads the tables and
+queues nothing; the new binary bases every linked product at its first read,
+so the order of the service and worker deploys does not matter.
+
+### Backing out 0096
+
+An image from before it ignores the tables. Drop them, or keep them and only
+forget the version:
+
+```sql
+DELETE FROM _sqlx_migrations WHERE version = 96;
+```
+
+Nothing else depends on them: pending changes are only a queue for the Shop,
+and listings are never written by the service.
+
 ## Numbers claimed by open pull requests
 
 `main` has 0001 to 0079 (0068 and 0069 were never used). A new migration must
@@ -688,6 +715,7 @@ assume it is free:
 | 0093 | `0093_bitcoin_refund_received_sats.sql` | Bitcoin refunds in the sats received, stacked on 0092 |
 | 0094 | `0094_moderation_decisions.sql` | moderation decisions (statements of reasons) and their notification |
 | 0095 | `0095_shipping_zones.sql` | zone-priced shipping: listing profile or zones, destination country and quotes on orders, offers and bids |
+| 0096 | `0096_connector_product_sync.sql` | connector product sync: sync directions, product snapshots and the change queue for the Shop |
 
 This table describes unmerged work and goes stale as pull requests land; trust
 `crates/service/migrations/` on `main` over it. sqlx does not reject two files

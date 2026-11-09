@@ -11,8 +11,10 @@
 --                              is) at the next observation.
 --   connector_product_changes  a field group whose store value differs from
 --                              its base. At most one pending row per product
---                              and group: a newer store value replaces the
---                              proposal of the pending row.
+--                              and group (a newer store value replaces its
+--                              proposal) and the latest resolution, which a
+--                              later observation is compared with. Withdrawn
+--                              changes are deleted.
 --
 -- The service only queues. Listing records live on the seller's homeserver
 -- and only the seller's Shop writes them; it reads the pending changes,
@@ -69,7 +71,7 @@ CREATE TABLE IF NOT EXISTS connector_product_changes (
         CONSTRAINT connector_product_changes_hash_len CHECK (octet_length(proposed_hash) = 32),
     state TEXT NOT NULL
         CONSTRAINT connector_product_changes_state
-            CHECK (state IN ('pending', 'applied', 'dismissed', 'superseded', 'cancelled')),
+            CHECK (state IN ('pending', 'applied', 'dismissed')),
     detected_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL,
     resolved_at TIMESTAMPTZ,
