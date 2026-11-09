@@ -1691,17 +1691,6 @@ pub async fn put_listing_sync(
             "The listing is not linked to this store.",
         );
     }
-    match store::mapping_count_for_listing(&state.pool, row.id, &listing_id).await {
-        Ok(0) => {
-            return error(
-                StatusCode::NOT_FOUND,
-                "listing_not_linked",
-                "The listing is not linked to this store.",
-            )
-        }
-        Ok(_) => {}
-        Err(cause) => return internal("listing sync", &cause),
-    }
     let mut changes = Vec::with_capacity(request.groups.len());
     for (group, direction) in &request.groups {
         let group = match sync_group(group) {
@@ -1714,7 +1703,7 @@ pub async fn put_listing_sync(
         };
         changes.push((group, direction));
     }
-    if let Err(cause) = product_sync::put_override(
+    match product_sync::put_override(
         &state.pool,
         state.clock.now(),
         row.id,
@@ -1723,9 +1712,14 @@ pub async fn put_listing_sync(
     )
     .await
     {
-        return internal("listing sync", &cause);
+        Ok(true) => sync_response(&state, row.id).await,
+        Ok(false) => error(
+            StatusCode::NOT_FOUND,
+            "listing_not_linked",
+            "The listing is not linked to this store.",
+        ),
+        Err(cause) => internal("listing sync", &cause),
     }
-    sync_response(&state, row.id).await
 }
 
 #[derive(Debug, Deserialize)]

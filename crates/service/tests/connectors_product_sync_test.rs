@@ -17,11 +17,13 @@ use common::connector_provider::{
     api, as_json, map_listing, query_param, raw, rebuild, save_credentials, start_connect,
     test_keys, test_settings,
 };
-use common::shopify_fake::{FakeShopify, Fault, GOOD_CODE};
+use common::shopify_fake::{FakeShopify, Fault, ACCESS_TOKEN, GOOD_CODE};
 use common::{execute, new_actor, register_command, register_listing_command, TestActor, TestApp};
 use hmac::{Hmac, Mac};
 use marketplace_service::connectors::product_sync;
-use marketplace_service::connectors::provider::{CatalogProduct, ProviderRegistry};
+use marketplace_service::connectors::provider::{
+    CatalogProduct, ConnectionContext, ConnectorProvider, CredentialSecret, ProviderRegistry,
+};
 use marketplace_service::connectors::providers::shopify::client::Origin;
 use marketplace_service::connectors::providers::shopify::ShopifyProvider;
 use marketplace_service::connectors::{worker, ConnectorRuntime};
@@ -144,6 +146,24 @@ impl Rig {
             )
             .await;
         assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// The product as the store has it now, read the way the worker reads it.
+    async fn store_product(&self, product: &str) -> CatalogProduct {
+        let provider = ShopifyProvider::with_origin(Origin::Fixed(self.fake.base_url.clone()));
+        let context = ConnectionContext {
+            connection_id: self.connection,
+            seller_pubky: self.seller.pubky.clone(),
+            shop: SHOP.into(),
+            scopes: Vec::new(),
+            credentials: CredentialSecret::new(ACCESS_TOKEN.as_bytes().to_vec()),
+            app: None,
+        };
+        provider
+            .fetch_product(&context, product)
+            .await
+            .expect("read")
+            .expect("on sale")
     }
 
     async fn poll(&self) {
@@ -867,4 +887,77 @@ async fn a_direction_change_waits_for_a_first_read_in_flight_and_drops_its_base(
     .await
     .expect("snapshot");
     assert_eq!(content, None, "the base the first read wrote was dropped");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_read_that_started_before_a_direction_change_cannot_base_the_dropped_group(pool: PgPool) {
+    let r = rig(pool).await;
+    r.poll().await;
+    r.sync(json!({ "content": "off" })).await;
+    r.app.clock.advance_seconds(5);
+    // A read starts while content is off and is delayed.
+    let slow_read_started = marketplace_service::clock::Clock::now(&*r.app.clock);
+    let old = r.store_product(BOOTS).await;
+    r.app.clock.advance_seconds(5);
+    // Meanwhile the store changes and content is turned back on.
+    r.edit(BOOTS, json!({ "title": "Trail Boots II" }));
+    r.sync(json!({ "content": "from_store" })).await;
+    let late = product_sync::observe(&r.app.pool, slow_read_started, r.connection, &old)
+        .await
+        .expect("observe");
+    assert!(
+        !late.stale,
+        "newer than the last read, so not dropped as a whole"
+    );
+    assert_eq!(
+        late.based, 0,
+        "but it may not base the group the change dropped"
+    );
+    r.app.clock.advance_seconds(5);
+    r.poll().await;
+    assert_eq!(
+        r.changes().await,
+        Vec::<Value>::new(),
+        "the store as it stood after the change is the base, not a change"
+    );
+    r.edit(BOOTS, json!({ "title": "Trail Boots III" }));
+    r.app.clock.advance_seconds(5);
+    r.poll().await;
+    let changes = r.changes().await;
+    assert_eq!(only(&changes, "content")["base"]["title"], "Trail Boots II");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_override_change_racing_an_unlink_never_deadlocks(pool: PgPool) {
+    let r = rig(pool).await;
+    r.poll().await;
+    let mappings = json!({ "mappings": [
+        { "listing_id": "boots_01", "provider_product_id": BOOTS,
+          "provider_variant_id": BOOTS_VARIANT },
+    ] });
+    for round in 0..12 {
+        let (status, body) = r.call("PUT", "/mappings", &mappings).await;
+        assert_eq!(status, StatusCode::OK, "relink {round}: {body}");
+        r.poll().await;
+        let direction = if round % 2 == 0 { "off" } else { "from_store" };
+        let override_body = json!({ "groups": { "price": direction } });
+        let unlink_body = json!({ "mappings": [] });
+        let (overridden, unlinked) = tokio::join!(
+            r.call("PUT", "/sync/listings/boots_01", &override_body),
+            r.call("PUT", "/mappings", &unlink_body),
+        );
+        assert_eq!(unlinked.0, StatusCode::OK, "round {round}: {}", unlinked.1);
+        assert!(
+            matches!(overridden.0, StatusCode::OK | StatusCode::NOT_FOUND),
+            "round {round}: either side may go first, neither may fail: {} {}",
+            overridden.0,
+            overridden.1
+        );
+        let (_, view) = r.call("GET", "/sync", &json!(null)).await;
+        assert_eq!(
+            view["overrides"],
+            json!([]),
+            "round {round}: an override left behind by the race went with the unlink"
+        );
+    }
 }

@@ -8,7 +8,8 @@
 --   connector_product_snapshots the base of each linked store product: per
 --                              field group, the store's value as last applied
 --                              or first seen. A NULL group is rebased (taken as
---                              is) at the next observation.
+--                              is) at the next read that started after
+--                              `rebased_at`.
 --   connector_product_changes  a field group whose store value differs from
 --                              its base. At most one pending row per product
 --                              and group (a newer store value replaces its
@@ -51,18 +52,21 @@ CREATE TABLE IF NOT EXISTS connector_product_snapshots (
     variants JSONB,
     status JSONB,
     checked_at TIMESTAMPTZ NOT NULL,
+    rebased_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (connection_id, provider_product_id)
 );
 
+-- A change belongs to its product's snapshot, not directly to the
+-- connection: queueing one while the snapshot is locked must never wait on
+-- the connection row, which a mapping save holds while it locks snapshots.
 CREATE TABLE IF NOT EXISTS connector_product_changes (
     id UUID PRIMARY KEY,
     -- Creation order. A product and group has at most one live change at a
     -- time, so this is also the order of their resolutions.
     seq BIGINT GENERATED ALWAYS AS IDENTITY,
-    connection_id UUID NOT NULL REFERENCES connector_connections (id) ON DELETE CASCADE,
-    provider_product_id TEXT NOT NULL
-        CONSTRAINT connector_product_changes_product_len CHECK (char_length(provider_product_id) BETWEEN 1 AND 256),
+    connection_id UUID NOT NULL,
+    provider_product_id TEXT NOT NULL,
     field_group TEXT NOT NULL
         CONSTRAINT connector_product_changes_group CHECK (field_group IN ('content', 'price', 'variants', 'status')),
     base JSONB,
@@ -76,7 +80,11 @@ CREATE TABLE IF NOT EXISTS connector_product_changes (
     updated_at TIMESTAMPTZ NOT NULL,
     resolved_at TIMESTAMPTZ,
     CONSTRAINT connector_product_changes_resolved
-        CHECK ((state = 'pending') = (resolved_at IS NULL))
+        CHECK ((state = 'pending') = (resolved_at IS NULL)),
+    CONSTRAINT connector_product_changes_snapshot
+        FOREIGN KEY (connection_id, provider_product_id)
+        REFERENCES connector_product_snapshots (connection_id, provider_product_id)
+        ON DELETE CASCADE
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS connector_product_changes_one_pending

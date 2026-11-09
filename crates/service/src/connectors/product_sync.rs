@@ -40,8 +40,10 @@
 //! product and group keep at most their pending change and their latest
 //! resolution (the dismissal a later observation is compared with).
 //!
-//! Lock order, everywhere: snapshot rows (several in product-id order), then
-//! change rows.
+//! Lock order, everywhere: the connection row, then the connection's sync
+//! lock (direction changes and unlinking), then snapshot rows (several in
+//! product-id order), then change and override rows. A change's foreign key
+//! is its snapshot, so queueing one never touches the connection row.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -372,6 +374,7 @@ pub async fn checked_since(
 #[derive(sqlx::FromRow)]
 struct SnapshotRow {
     checked_at: DateTime<Utc>,
+    rebased_at: Option<DateTime<Utc>>,
     content: Option<Value>,
     price: Option<Value>,
     variants: Option<Value>,
@@ -432,7 +435,8 @@ async fn lock_snapshot(
 ) -> Result<SnapshotRow, sqlx::Error> {
     lock_snapshots(tx, now, connection_id, &[provider_product_id.to_string()]).await?;
     sqlx::query_as(
-        "SELECT checked_at, content, price, variants, status FROM connector_product_snapshots \
+        "SELECT checked_at, rebased_at, content, price, variants, status \
+         FROM connector_product_snapshots \
          WHERE connection_id = $1 AND provider_product_id = $2",
     )
     .bind(connection_id)
@@ -595,6 +599,12 @@ async fn compare(
     for (group, value) in current {
         let group = *group;
         let Some(base) = snapshot.get(group) else {
+            // A group dropped by a direction change is based only by a read
+            // that started after it: an older read may carry a value from
+            // before the change.
+            if snapshot.rebased_at.is_some_and(|rebased| now < rebased) {
+                continue;
+            }
             // A linked product the service has not seen yet was on sale when
             // it was linked: its removal is a change, not a base.
             if group == FieldGroup::Status && *value != available(true) {
@@ -877,12 +887,13 @@ async fn rebase(
     .execute(&mut **tx)
     .await?;
     sqlx::query(&format!(
-        "UPDATE connector_product_snapshots SET {} = NULL \
+        "UPDATE connector_product_snapshots SET {} = NULL, rebased_at = $3 \
          WHERE connection_id = $1 AND provider_product_id = ANY($2)",
         group.column()
     ))
     .bind(connection_id)
     .bind(&products)
+    .bind(now)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -897,6 +908,9 @@ pub async fn forget_unlinked(
     tx: &mut Transaction<'_, Postgres>,
     connection_id: Uuid,
 ) -> Result<(), sqlx::Error> {
+    // The same lock as the direction changes, taken before any snapshot or
+    // override row: both touch overrides and snapshots, in opposite orders.
+    lock_config(tx, connection_id).await?;
     let orphans: Vec<String> = sqlx::query_scalar(
         "SELECT s.provider_product_id FROM connector_product_snapshots s \
          WHERE s.connection_id = $1 AND NOT EXISTS ( \
@@ -957,11 +971,18 @@ async fn products_of_listings(
     Ok(rows.into_iter().map(|(product,)| product).collect())
 }
 
-/// Serialises direction changes per connection.
+/// Serialises direction changes and unlinking per connection. The
+/// connection row comes first, in the mode the rows written next take through
+/// their foreign keys anyway: a mapping save locks that row before this lock,
+/// so taking them in the other order could deadlock with it.
 async fn lock_config(
     tx: &mut Transaction<'_, Postgres>,
     connection_id: Uuid,
 ) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT 1 FROM connector_connections WHERE id = $1 FOR KEY SHARE")
+        .bind(connection_id)
+        .execute(&mut **tx)
+        .await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('connector-sync|' || $1::text, 0))")
         .bind(connection_id)
         .execute(&mut **tx)
@@ -1013,20 +1034,28 @@ pub async fn put_settings(
     tx.commit().await
 }
 
-/// Sets (or, with `None`, removes) a listing's own direction for each group
-/// given. A group whose effective direction changes is rebased for the
-/// listing's products.
+/// Sets (or, with `None`, removes) a linked listing's own direction for each
+/// group given. A group whose effective direction changes is rebased for the
+/// listing's products. Returns `false`, changing nothing, when the listing is
+/// not linked: checked under the lock an unlink takes, so an override can
+/// never outlive its listing's link.
 pub async fn put_override(
     pool: &PgPool,
     now: DateTime<Utc>,
     connection_id: Uuid,
     listing_id: &str,
     changes: &[(FieldGroup, Option<Direction>)],
-) -> Result<(), sqlx::Error> {
+) -> Result<bool, sqlx::Error> {
     let mut tx = pool.begin().await?;
     lock_config(&mut tx, connection_id).await?;
-    let config = load_config(&mut tx, connection_id).await?;
     let listing: BTreeSet<String> = [listing_id.to_string()].into_iter().collect();
+    if products_of_listings(&mut tx, connection_id, &listing)
+        .await?
+        .is_empty()
+    {
+        return Ok(false);
+    }
+    let config = load_config(&mut tx, connection_id).await?;
     for (group, direction) in changes {
         let before = config.listing_direction(listing_id, *group);
         match direction {
@@ -1064,7 +1093,8 @@ pub async fn put_override(
             rebase(&mut tx, now, connection_id, *group, &products).await?;
         }
     }
-    tx.commit().await
+    tx.commit().await?;
+    Ok(true)
 }
 
 #[cfg(test)]
