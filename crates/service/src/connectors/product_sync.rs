@@ -1,0 +1,1070 @@
+//! Store product changes, queued for the seller's Shop.
+//!
+//! A listing linked to a store product (`connector_variant_map`) can follow
+//! the store for three field groups: **content** (title, description,
+//! images), **price** (each variant's price) and **variants** (options and
+//! the variant set). Each group has a sync direction per connection, which a
+//! listing may override: `from_store` (the default) or `off`. A fourth group,
+//! **status**, is not configurable: a product the store no longer sells is
+//! always queued, because a paid order for it could not reach the store.
+//!
+//! For every linked product the service keeps a **base** per group: the
+//! store's value as last applied by the Shop, or as first seen. Whenever the
+//! product is observed (a product webhook, or the periodic stock poll that
+//! reads the whole catalog anyway) the store's current value is compared with
+//! the base. A difference becomes one **pending change** per product and
+//! group; a newer store value replaces the proposal of a change still pending,
+//! so the Shop only ever sees the latest. A store value that returns to the
+//! base supersedes the pending change, and one the seller already dismissed
+//! is not raised again.
+//!
+//! The service never writes a listing: listing records live on the seller's
+//! homeserver and only the seller's Shop signs them. The Shop reads the
+//! pending changes, compares each with the listing as it stands (a field the
+//! seller edited since the base is a conflict there), applies or dismisses
+//! it, and resolves it here with the hash of the proposal it saw. Applying
+//! moves the base to that proposal; a proposal replaced in the meantime is
+//! refused as stale.
+//!
+//! Changing a direction (for the connection or a listing) cancels the pending
+//! changes of that group for the affected products and drops their base, so
+//! the next observation takes the store as it then stands: nothing reviewed
+//! under the old direction can be applied under the new one, and nothing that
+//! changed while a group was off is replayed when it is turned back on.
+//!
+//! Lock order, everywhere: the product's snapshot row, then its change rows.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use chrono::{DateTime, Utc};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use sqlx::{PgConnection, PgPool, Postgres, Transaction};
+use uuid::Uuid;
+
+use super::provider::CatalogProduct;
+
+/// A part of a listing that can follow the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum FieldGroup {
+    Content,
+    Price,
+    Variants,
+    Status,
+}
+
+impl FieldGroup {
+    /// The groups with a sync direction.
+    pub const SYNCED: [FieldGroup; 3] =
+        [FieldGroup::Content, FieldGroup::Price, FieldGroup::Variants];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FieldGroup::Content => "content",
+            FieldGroup::Price => "price",
+            FieldGroup::Variants => "variants",
+            FieldGroup::Status => "status",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "content" => Some(FieldGroup::Content),
+            "price" => Some(FieldGroup::Price),
+            "variants" => Some(FieldGroup::Variants),
+            "status" => Some(FieldGroup::Status),
+            _ => None,
+        }
+    }
+
+    /// The group's snapshot column; the names are fixed, never user input.
+    fn column(self) -> &'static str {
+        self.as_str()
+    }
+}
+
+/// Where a field group's truth lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// The store is the truth: its changes are queued for the Shop.
+    FromStore,
+    /// Not synced.
+    Off,
+}
+
+impl Direction {
+    pub const DEFAULT: Direction = Direction::FromStore;
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Direction::FromStore => "from_store",
+            Direction::Off => "off",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "from_store" => Some(Direction::FromStore),
+            "off" => Some(Direction::Off),
+            _ => None,
+        }
+    }
+}
+
+/// A product's value for each field group, in a stable shape: lists are
+/// sorted where the store's order carries no meaning, so a reordering alone is
+/// never a change.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProductValues {
+    pub content: Value,
+    pub price: Value,
+    pub variants: Value,
+    pub status: Value,
+}
+
+impl ProductValues {
+    fn get(&self, group: FieldGroup) -> &Value {
+        match group {
+            FieldGroup::Content => &self.content,
+            FieldGroup::Price => &self.price,
+            FieldGroup::Variants => &self.variants,
+            FieldGroup::Status => &self.status,
+        }
+    }
+}
+
+pub fn values_of(product: &CatalogProduct) -> ProductValues {
+    let mut prices: Vec<Value> = product
+        .variants
+        .iter()
+        .map(|variant| {
+            json!({
+                "provider_variant_id": variant.provider_variant_id,
+                "amount_minor": variant.price.amount_minor,
+                "currency": variant.price.currency,
+                "exponent": variant.price.exponent,
+            })
+        })
+        .collect();
+    prices.sort_by(|a, b| {
+        a["provider_variant_id"]
+            .as_str()
+            .cmp(&b["provider_variant_id"].as_str())
+    });
+    let mut variants: Vec<Value> = product
+        .variants
+        .iter()
+        .map(|variant| {
+            json!({
+                "provider_variant_id": variant.provider_variant_id,
+                "title": variant.title,
+                "sku": variant.sku,
+                "option_values": variant
+                    .option_values
+                    .iter()
+                    .map(|value| json!({ "name": value.name, "value": value.value }))
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    variants.sort_by(|a, b| {
+        a["provider_variant_id"]
+            .as_str()
+            .cmp(&b["provider_variant_id"].as_str())
+    });
+    ProductValues {
+        content: json!({
+            "title": product.title,
+            "description": product.description,
+            "image_urls": product.image_urls,
+        }),
+        price: json!({ "variants": prices }),
+        variants: json!({
+            "options": product
+                .options
+                .iter()
+                .map(|option| json!({ "name": option.name, "values": option.values }))
+                .collect::<Vec<_>>(),
+            "variants": variants,
+        }),
+        status: available(true),
+    }
+}
+
+fn available(on_sale: bool) -> Value {
+    json!({ "available": on_sale })
+}
+
+/// SHA-256 of the RFC 8785 canonical form, so equal values hash equally
+/// whatever their key order.
+pub fn value_hash(value: &Value) -> Vec<u8> {
+    let canonical = serde_json_canonicalizer::to_vec(value).expect("JSON values canonicalize");
+    Sha256::digest(canonical).to_vec()
+}
+
+/// What one observation did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Observed {
+    /// Groups taken as the base (first sight, or after a rebase).
+    pub based: u32,
+    /// Changes queued or whose proposal was replaced.
+    pub queued: u32,
+    /// Pending changes withdrawn because the store returned to the base or
+    /// to a value the seller dismissed, or the product is no longer linked.
+    pub withdrawn: u32,
+}
+
+/// Per field group with a direction: does any listing linked to the product
+/// follow the store?
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Follows {
+    content: bool,
+    price: bool,
+    variants: bool,
+}
+
+impl Follows {
+    fn group(&self, group: FieldGroup) -> bool {
+        match group {
+            FieldGroup::Content => self.content,
+            FieldGroup::Price => self.price,
+            FieldGroup::Variants => self.variants,
+            FieldGroup::Status => true,
+        }
+    }
+}
+
+/// The connection's directions, the listing overrides and the listings
+/// linked to each product.
+#[derive(Debug, Default)]
+pub struct SyncConfig {
+    pub settings: BTreeMap<FieldGroup, Direction>,
+    pub overrides: BTreeMap<(String, FieldGroup), Direction>,
+}
+
+impl SyncConfig {
+    pub fn connection_direction(&self, group: FieldGroup) -> Direction {
+        self.settings
+            .get(&group)
+            .copied()
+            .unwrap_or(Direction::DEFAULT)
+    }
+
+    pub fn listing_direction(&self, listing_id: &str, group: FieldGroup) -> Direction {
+        self.overrides
+            .get(&(listing_id.to_string(), group))
+            .copied()
+            .unwrap_or_else(|| self.connection_direction(group))
+    }
+
+    fn follows(&self, listings: &BTreeSet<String>) -> Follows {
+        let any = |group| {
+            listings
+                .iter()
+                .any(|listing| self.listing_direction(listing, group) == Direction::FromStore)
+        };
+        Follows {
+            content: any(FieldGroup::Content),
+            price: any(FieldGroup::Price),
+            variants: any(FieldGroup::Variants),
+        }
+    }
+}
+
+pub async fn load_config(
+    conn: &mut PgConnection,
+    connection_id: Uuid,
+) -> Result<SyncConfig, sqlx::Error> {
+    let settings: Vec<(String, String)> = sqlx::query_as(
+        "SELECT field_group, direction FROM connector_sync_settings WHERE connection_id = $1",
+    )
+    .bind(connection_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    let overrides: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT listing_id, field_group, direction FROM connector_sync_overrides \
+         WHERE connection_id = $1",
+    )
+    .bind(connection_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut config = SyncConfig::default();
+    for (group, direction) in settings {
+        if let (Some(group), Some(direction)) =
+            (FieldGroup::parse(&group), Direction::parse(&direction))
+        {
+            config.settings.insert(group, direction);
+        }
+    }
+    for (listing, group, direction) in overrides {
+        if let (Some(group), Some(direction)) =
+            (FieldGroup::parse(&group), Direction::parse(&direction))
+        {
+            config.overrides.insert((listing, group), direction);
+        }
+    }
+    Ok(config)
+}
+
+/// The listings linked to a store product on a connection.
+async fn linked_listings(
+    tx: &mut Transaction<'_, Postgres>,
+    connection_id: Uuid,
+    provider_product_id: &str,
+) -> Result<BTreeSet<String>, sqlx::Error> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT listing_id FROM connector_variant_map \
+         WHERE connection_id = $1 AND provider_product_id = $2",
+    )
+    .bind(connection_id)
+    .bind(provider_product_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    Ok(rows.into_iter().map(|(listing,)| listing).collect())
+}
+
+/// Every store product linked to a listing on the connection.
+pub async fn linked_products(
+    pool: &PgPool,
+    connection_id: Uuid,
+) -> Result<BTreeSet<String>, sqlx::Error> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT provider_product_id FROM connector_variant_map WHERE connection_id = $1",
+    )
+    .bind(connection_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(product,)| product).collect())
+}
+
+/// Whether a read of the product started after `at`: a webhook received
+/// before that adds nothing, because that read already saw the store as it
+/// was then, or later. A read that started at the same instant may have
+/// preceded the delivery, so it does not count.
+pub async fn checked_since(
+    pool: &PgPool,
+    connection_id: Uuid,
+    provider_product_id: &str,
+    at: DateTime<Utc>,
+) -> Result<bool, sqlx::Error> {
+    let checked: Option<DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT checked_at FROM connector_product_snapshots \
+         WHERE connection_id = $1 AND provider_product_id = $2",
+    )
+    .bind(connection_id)
+    .bind(provider_product_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(checked.is_some_and(|checked| checked > at))
+}
+
+#[derive(sqlx::FromRow)]
+struct SnapshotRow {
+    content: Option<Value>,
+    price: Option<Value>,
+    variants: Option<Value>,
+    status: Option<Value>,
+}
+
+impl SnapshotRow {
+    fn get(&self, group: FieldGroup) -> Option<&Value> {
+        match group {
+            FieldGroup::Content => self.content.as_ref(),
+            FieldGroup::Price => self.price.as_ref(),
+            FieldGroup::Variants => self.variants.as_ref(),
+            FieldGroup::Status => self.status.as_ref(),
+        }
+    }
+}
+
+/// Locks the product's snapshot row, creating it empty (every group to be
+/// based) when the product has none yet.
+async fn lock_snapshot(
+    tx: &mut Transaction<'_, Postgres>,
+    now: DateTime<Utc>,
+    connection_id: Uuid,
+    provider_product_id: &str,
+) -> Result<SnapshotRow, sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO connector_product_snapshots \
+         (connection_id, provider_product_id, checked_at, created_at) \
+         VALUES ($1, $2, $3, $3) ON CONFLICT (connection_id, provider_product_id) DO NOTHING",
+    )
+    .bind(connection_id)
+    .bind(provider_product_id)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query_as(
+        "SELECT content, price, variants, status FROM connector_product_snapshots \
+         WHERE connection_id = $1 AND provider_product_id = $2 FOR UPDATE",
+    )
+    .bind(connection_id)
+    .bind(provider_product_id)
+    .fetch_one(&mut **tx)
+    .await
+}
+
+async fn set_base(
+    tx: &mut Transaction<'_, Postgres>,
+    connection_id: Uuid,
+    provider_product_id: &str,
+    group: FieldGroup,
+    value: Option<&Value>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(&format!(
+        "UPDATE connector_product_snapshots SET {} = $3 \
+         WHERE connection_id = $1 AND provider_product_id = $2",
+        group.column()
+    ))
+    .bind(connection_id)
+    .bind(provider_product_id)
+    .bind(value)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Ends the product's pending changes (all groups when `group` is `None`)
+/// with `state`. Returns how many.
+async fn end_pending(
+    tx: &mut Transaction<'_, Postgres>,
+    now: DateTime<Utc>,
+    connection_id: Uuid,
+    provider_product_id: &str,
+    group: Option<FieldGroup>,
+    state: &str,
+) -> Result<u32, sqlx::Error> {
+    let ended = sqlx::query(
+        "UPDATE connector_product_changes SET state = $5, resolved_at = $3, updated_at = $3 \
+         WHERE connection_id = $1 AND provider_product_id = $2 AND state = 'pending' \
+           AND ($4::text IS NULL OR field_group = $4)",
+    )
+    .bind(connection_id)
+    .bind(provider_product_id)
+    .bind(now)
+    .bind(group.map(FieldGroup::as_str))
+    .bind(state)
+    .execute(&mut **tx)
+    .await?;
+    Ok(u32::try_from(ended.rows_affected()).unwrap_or(u32::MAX))
+}
+
+/// The proposal hash the seller last dismissed for the group, when the
+/// latest resolution was a dismissal.
+async fn dismissed_hash(
+    tx: &mut Transaction<'_, Postgres>,
+    connection_id: Uuid,
+    provider_product_id: &str,
+    group: FieldGroup,
+) -> Result<Option<Vec<u8>>, sqlx::Error> {
+    let latest: Option<(String, Vec<u8>)> = sqlx::query_as(
+        "SELECT state, proposed_hash FROM connector_product_changes \
+         WHERE connection_id = $1 AND provider_product_id = $2 AND field_group = $3 \
+           AND state IN ('applied', 'dismissed') \
+         ORDER BY seq DESC LIMIT 1",
+    )
+    .bind(connection_id)
+    .bind(provider_product_id)
+    .bind(group.as_str())
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(latest.and_then(|(state, hash)| (state == "dismissed").then_some(hash)))
+}
+
+/// Queues `proposed` for the group, or replaces the proposal of the change
+/// already pending. Returns whether anything was written.
+#[allow(clippy::too_many_arguments)]
+async fn queue(
+    tx: &mut Transaction<'_, Postgres>,
+    now: DateTime<Utc>,
+    connection_id: Uuid,
+    provider_product_id: &str,
+    group: FieldGroup,
+    base: &Value,
+    proposed: &Value,
+    hash: &[u8],
+) -> Result<bool, sqlx::Error> {
+    let pending: Option<(Uuid, Vec<u8>)> = sqlx::query_as(
+        "SELECT id, proposed_hash FROM connector_product_changes \
+         WHERE connection_id = $1 AND provider_product_id = $2 AND field_group = $3 \
+           AND state = 'pending' FOR UPDATE",
+    )
+    .bind(connection_id)
+    .bind(provider_product_id)
+    .bind(group.as_str())
+    .fetch_optional(&mut **tx)
+    .await?;
+    match pending {
+        Some((_, current)) if current == hash => Ok(false),
+        Some((id, _)) => {
+            sqlx::query(
+                "UPDATE connector_product_changes \
+                 SET proposed = $2, proposed_hash = $3, updated_at = $4 WHERE id = $1",
+            )
+            .bind(id)
+            .bind(proposed)
+            .bind(hash)
+            .bind(now)
+            .execute(&mut **tx)
+            .await?;
+            Ok(true)
+        }
+        None => {
+            sqlx::query(
+                "INSERT INTO connector_product_changes \
+                 (id, connection_id, provider_product_id, field_group, base, proposed, \
+                  proposed_hash, state, detected_at, updated_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $8)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(connection_id)
+            .bind(provider_product_id)
+            .bind(group.as_str())
+            .bind(base)
+            .bind(proposed)
+            .bind(hash)
+            .bind(now)
+            .execute(&mut **tx)
+            .await?;
+            Ok(true)
+        }
+    }
+}
+
+/// Compares the store's current values with the product's base and queues
+/// the differences. `now` is when the store was read: it is recorded as the
+/// product's `checked_at`, which [`checked_since`] compares deliveries with.
+async fn compare(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+    connection_id: Uuid,
+    provider_product_id: &str,
+    current: &[(FieldGroup, Value)],
+) -> Result<Observed, sqlx::Error> {
+    let mut observed = Observed::default();
+    let mut tx = pool.begin().await?;
+    let snapshot = lock_snapshot(&mut tx, now, connection_id, provider_product_id).await?;
+    let listings = linked_listings(&mut tx, connection_id, provider_product_id).await?;
+    if listings.is_empty() {
+        observed.withdrawn += end_pending(
+            &mut tx,
+            now,
+            connection_id,
+            provider_product_id,
+            None,
+            "cancelled",
+        )
+        .await?;
+        tx.commit().await?;
+        return Ok(observed);
+    }
+    let follows = load_config(&mut tx, connection_id)
+        .await?
+        .follows(&listings);
+    for (group, value) in current {
+        let group = *group;
+        let Some(base) = snapshot.get(group) else {
+            // A linked product the service has not seen yet was on sale when
+            // it was linked: its removal is a change, not a base.
+            if group == FieldGroup::Status && *value != available(true) {
+                let base = available(true);
+                set_base(
+                    &mut tx,
+                    connection_id,
+                    provider_product_id,
+                    group,
+                    Some(&base),
+                )
+                .await?;
+                queue(
+                    &mut tx,
+                    now,
+                    connection_id,
+                    provider_product_id,
+                    group,
+                    &base,
+                    value,
+                    &value_hash(value),
+                )
+                .await?;
+                observed.queued += 1;
+            } else {
+                set_base(
+                    &mut tx,
+                    connection_id,
+                    provider_product_id,
+                    group,
+                    Some(value),
+                )
+                .await?;
+                observed.based += 1;
+            }
+            continue;
+        };
+        if !follows.group(group) {
+            continue;
+        }
+        let hash = value_hash(value);
+        if hash == value_hash(base)
+            || dismissed_hash(&mut tx, connection_id, provider_product_id, group).await?
+                == Some(hash.clone())
+        {
+            observed.withdrawn += end_pending(
+                &mut tx,
+                now,
+                connection_id,
+                provider_product_id,
+                Some(group),
+                "superseded",
+            )
+            .await?;
+            continue;
+        }
+        if queue(
+            &mut tx,
+            now,
+            connection_id,
+            provider_product_id,
+            group,
+            base,
+            value,
+            &hash,
+        )
+        .await?
+        {
+            observed.queued += 1;
+        }
+    }
+    sqlx::query(
+        "UPDATE connector_product_snapshots SET checked_at = $3 \
+         WHERE connection_id = $1 AND provider_product_id = $2",
+    )
+    .bind(connection_id)
+    .bind(provider_product_id)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(observed)
+}
+
+/// Compares a product the store sells, read at `read_at`, with its base.
+pub async fn observe(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+    connection_id: Uuid,
+    product: &CatalogProduct,
+) -> Result<Observed, sqlx::Error> {
+    let values = values_of(product);
+    let current: Vec<(FieldGroup, Value)> = [
+        FieldGroup::Content,
+        FieldGroup::Price,
+        FieldGroup::Variants,
+        FieldGroup::Status,
+    ]
+    .into_iter()
+    .map(|group| (group, values.get(group).clone()))
+    .collect();
+    compare(
+        pool,
+        now,
+        connection_id,
+        &product.provider_product_id,
+        &current,
+    )
+    .await
+}
+
+/// Records that the store no longer sells a product. Only its status is
+/// compared; the other groups keep their base.
+pub async fn observe_removed(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+    connection_id: Uuid,
+    provider_product_id: &str,
+) -> Result<Observed, sqlx::Error> {
+    compare(
+        pool,
+        now,
+        connection_id,
+        provider_product_id,
+        &[(FieldGroup::Status, available(false))],
+    )
+    .await
+}
+
+// === The seller's routes ======================================================
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ChangeRow {
+    pub id: Uuid,
+    pub provider_product_id: String,
+    pub field_group: String,
+    pub base: Option<Value>,
+    pub proposed: Value,
+    pub proposed_hash: Vec<u8>,
+    pub detected_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// The pending changes of the connection's linked products, oldest first.
+pub async fn list_pending(
+    pool: &PgPool,
+    connection_id: Uuid,
+    limit: i64,
+) -> Result<Vec<ChangeRow>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT c.id, c.provider_product_id, c.field_group, c.base, c.proposed, \
+                c.proposed_hash, c.detected_at, c.updated_at \
+         FROM connector_product_changes c \
+         WHERE c.connection_id = $1 AND c.state = 'pending' \
+           AND EXISTS (SELECT 1 FROM connector_variant_map m \
+                       WHERE m.connection_id = c.connection_id \
+                         AND m.provider_product_id = c.provider_product_id) \
+         ORDER BY c.detected_at, c.id LIMIT $2",
+    )
+    .bind(connection_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resolution {
+    /// The Shop wrote the proposal to the listing.
+    Applied,
+    /// The seller kept the listing as it is.
+    Dismissed,
+}
+
+impl Resolution {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "applied" => Some(Resolution::Applied),
+            "dismissed" => Some(Resolution::Dismissed),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ResolveOutcome {
+    Resolved,
+    NotFound,
+    /// The change is no longer pending, or its proposal is not the one the
+    /// Shop saw.
+    Stale,
+}
+
+/// Resolves a pending change with the hash of the proposal the Shop acted
+/// on. Applying moves the group's base to that proposal.
+pub async fn resolve(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+    connection_id: Uuid,
+    change_id: Uuid,
+    resolution: Resolution,
+    seen_hash: &[u8],
+) -> Result<ResolveOutcome, sqlx::Error> {
+    let product: Option<String> = sqlx::query_scalar(
+        "SELECT provider_product_id FROM connector_product_changes \
+         WHERE id = $1 AND connection_id = $2",
+    )
+    .bind(change_id)
+    .bind(connection_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(product) = product else {
+        return Ok(ResolveOutcome::NotFound);
+    };
+    let mut tx = pool.begin().await?;
+    lock_snapshot(&mut tx, now, connection_id, &product).await?;
+    let change: Option<(String, String, Value, Vec<u8>)> = sqlx::query_as(
+        "SELECT state, field_group, proposed, proposed_hash FROM connector_product_changes \
+         WHERE id = $1 FOR UPDATE",
+    )
+    .bind(change_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((state, group, proposed, hash)) = change else {
+        return Ok(ResolveOutcome::NotFound);
+    };
+    if state != "pending" || hash != seen_hash {
+        return Ok(ResolveOutcome::Stale);
+    }
+    let group = FieldGroup::parse(&group)
+        .ok_or_else(|| sqlx::Error::Decode(format!("unknown field group {group}").into()))?;
+    let final_state = match resolution {
+        Resolution::Applied => {
+            set_base(&mut tx, connection_id, &product, group, Some(&proposed)).await?;
+            "applied"
+        }
+        Resolution::Dismissed => "dismissed",
+    };
+    sqlx::query(
+        "UPDATE connector_product_changes SET state = $2, resolved_at = $3, updated_at = $3 \
+         WHERE id = $1",
+    )
+    .bind(change_id)
+    .bind(final_state)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(ResolveOutcome::Resolved)
+}
+
+/// Cancels the group's pending changes and drops its base for each product,
+/// so the next observation takes the store as it then stands.
+async fn rebase(
+    tx: &mut Transaction<'_, Postgres>,
+    now: DateTime<Utc>,
+    connection_id: Uuid,
+    group: FieldGroup,
+    products: &BTreeSet<String>,
+) -> Result<(), sqlx::Error> {
+    for product in products {
+        let locked: Option<(String,)> = sqlx::query_as(
+            "SELECT provider_product_id FROM connector_product_snapshots \
+             WHERE connection_id = $1 AND provider_product_id = $2 FOR UPDATE",
+        )
+        .bind(connection_id)
+        .bind(product)
+        .fetch_optional(&mut **tx)
+        .await?;
+        end_pending(tx, now, connection_id, product, Some(group), "cancelled").await?;
+        if locked.is_some() {
+            set_base(tx, connection_id, product, group, None).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Products linked to any of `listings`, in name order (the lock order of
+/// [`rebase`]).
+async fn products_of_listings(
+    tx: &mut Transaction<'_, Postgres>,
+    connection_id: Uuid,
+    listings: &BTreeSet<String>,
+) -> Result<BTreeSet<String>, sqlx::Error> {
+    let listings: Vec<String> = listings.iter().cloned().collect();
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT provider_product_id FROM connector_variant_map \
+         WHERE connection_id = $1 AND listing_id = ANY($2)",
+    )
+    .bind(connection_id)
+    .bind(&listings)
+    .fetch_all(&mut **tx)
+    .await?;
+    Ok(rows.into_iter().map(|(product,)| product).collect())
+}
+
+/// Serialises direction changes per connection.
+async fn lock_config(
+    tx: &mut Transaction<'_, Postgres>,
+    connection_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('connector-sync|' || $1::text, 0))")
+        .bind(connection_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// Sets the connection's direction for each group given. A group whose
+/// direction changes is rebased for every product of a listing that follows
+/// the connection's setting for it (no override).
+pub async fn put_settings(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+    connection_id: Uuid,
+    changes: &[(FieldGroup, Direction)],
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    lock_config(&mut tx, connection_id).await?;
+    let config = load_config(&mut tx, connection_id).await?;
+    let all_listings: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT listing_id FROM connector_variant_map WHERE connection_id = $1",
+    )
+    .bind(connection_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    for (group, direction) in changes {
+        if config.connection_direction(*group) == *direction {
+            continue;
+        }
+        sqlx::query(
+            "INSERT INTO connector_sync_settings (connection_id, field_group, direction, updated_at) \
+             VALUES ($1, $2, $3, $4) ON CONFLICT (connection_id, field_group) \
+             DO UPDATE SET direction = EXCLUDED.direction, updated_at = EXCLUDED.updated_at",
+        )
+        .bind(connection_id)
+        .bind(group.as_str())
+        .bind(direction.as_str())
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        let following: BTreeSet<String> = all_listings
+            .iter()
+            .map(|(listing,)| listing.clone())
+            .filter(|listing| !config.overrides.contains_key(&(listing.clone(), *group)))
+            .collect();
+        let products = products_of_listings(&mut tx, connection_id, &following).await?;
+        rebase(&mut tx, now, connection_id, *group, &products).await?;
+    }
+    tx.commit().await
+}
+
+/// Sets (or, with `None`, removes) a listing's own direction for each group
+/// given. A group whose effective direction changes is rebased for the
+/// listing's products.
+pub async fn put_override(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+    connection_id: Uuid,
+    listing_id: &str,
+    changes: &[(FieldGroup, Option<Direction>)],
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    lock_config(&mut tx, connection_id).await?;
+    let config = load_config(&mut tx, connection_id).await?;
+    let listing: BTreeSet<String> = [listing_id.to_string()].into_iter().collect();
+    for (group, direction) in changes {
+        let before = config.listing_direction(listing_id, *group);
+        match direction {
+            Some(direction) => {
+                sqlx::query(
+                    "INSERT INTO connector_sync_overrides \
+                     (connection_id, listing_id, field_group, direction, updated_at) \
+                     VALUES ($1, $2, $3, $4, $5) \
+                     ON CONFLICT (connection_id, listing_id, field_group) \
+                     DO UPDATE SET direction = EXCLUDED.direction, updated_at = EXCLUDED.updated_at",
+                )
+                .bind(connection_id)
+                .bind(listing_id)
+                .bind(group.as_str())
+                .bind(direction.as_str())
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+            }
+            None => {
+                sqlx::query(
+                    "DELETE FROM connector_sync_overrides \
+                     WHERE connection_id = $1 AND listing_id = $2 AND field_group = $3",
+                )
+                .bind(connection_id)
+                .bind(listing_id)
+                .bind(group.as_str())
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+        let after = direction.unwrap_or_else(|| config.connection_direction(*group));
+        if before != after {
+            let products = products_of_listings(&mut tx, connection_id, &listing).await?;
+            rebase(&mut tx, now, connection_id, *group, &products).await?;
+        }
+    }
+    tx.commit().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::connectors::provider::{CatalogOption, CatalogOptionValue, CatalogVariant, Price};
+
+    fn product() -> CatalogProduct {
+        CatalogProduct {
+            provider_product_id: "gid://shopify/Product/1".into(),
+            handle: None,
+            title: "Hat".into(),
+            description: Some("Wool".into()),
+            url: None,
+            options: vec![CatalogOption {
+                name: "Size".into(),
+                values: vec!["S".into(), "M".into()],
+            }],
+            image_urls: vec!["https://cdn.example/hat.png".into()],
+            variants: [
+                "gid://shopify/ProductVariant/2",
+                "gid://shopify/ProductVariant/1",
+            ]
+            .iter()
+            .enumerate()
+            .map(|(index, id)| CatalogVariant {
+                provider_variant_id: (*id).into(),
+                sku: None,
+                title: Some(if index == 0 { "M" } else { "S" }.into()),
+                option_values: vec![CatalogOptionValue {
+                    name: "Size".into(),
+                    value: if index == 0 { "M" } else { "S" }.into(),
+                }],
+                price: Price {
+                    amount_minor: 2100,
+                    currency: "USD".into(),
+                    exponent: 2,
+                },
+                stock: Some(3),
+                made_to_order: false,
+                image_url: None,
+            })
+            .collect(),
+            categories: vec![],
+            attributes: vec![],
+        }
+    }
+
+    #[test]
+    fn stock_and_variant_order_are_not_part_of_any_group() {
+        let mut moved = product();
+        moved.variants.reverse();
+        for variant in &mut moved.variants {
+            variant.stock = Some(99);
+        }
+        assert_eq!(values_of(&product()), values_of(&moved));
+        let mut repriced = product();
+        repriced.variants[1].price.amount_minor = 2500;
+        let (before, after) = (values_of(&product()), values_of(&repriced));
+        assert_ne!(before.price, after.price);
+        assert_eq!(before.content, after.content);
+        assert_eq!(before.variants, after.variants);
+    }
+
+    #[test]
+    fn the_hash_ignores_key_order() {
+        let a = json!({ "title": "Hat", "description": null });
+        let b: Value = serde_json::from_str(r#"{"description":null,"title":"Hat"}"#).expect("json");
+        assert_eq!(value_hash(&a), value_hash(&b));
+        assert_ne!(
+            value_hash(&a),
+            value_hash(&json!({ "title": "Cap", "description": null }))
+        );
+    }
+
+    #[test]
+    fn a_listing_override_wins_over_the_connection() {
+        let mut config = SyncConfig::default();
+        assert_eq!(
+            config.listing_direction("l", FieldGroup::Price),
+            Direction::FromStore
+        );
+        config.settings.insert(FieldGroup::Price, Direction::Off);
+        assert_eq!(
+            config.listing_direction("l", FieldGroup::Price),
+            Direction::Off
+        );
+        config
+            .overrides
+            .insert(("l".into(), FieldGroup::Price), Direction::FromStore);
+        assert_eq!(
+            config.listing_direction("l", FieldGroup::Price),
+            Direction::FromStore
+        );
+        let listings: BTreeSet<String> = ["l".to_string(), "m".to_string()].into_iter().collect();
+        let follows = config.follows(&listings);
+        assert!(follows.price, "one following listing is enough");
+        assert!(follows.content && follows.variants);
+    }
+}

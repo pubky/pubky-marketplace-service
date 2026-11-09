@@ -1,5 +1,6 @@
 //! The connector worker's passes: consume events, drive pushes and order
-//! actions through the provider, apply inbound webhooks, poll stock.
+//! actions through the provider, apply inbound webhooks, poll stock (and, on
+//! the same catalog walk, compare linked products with their base).
 //!
 //! Each pass is a plain async function over an [`AppState`] so tests drive
 //! it one step at a time; [`run_forever`] is the loop the `connector-worker`
@@ -22,6 +23,7 @@ use super::inbound;
 use super::ledger::{self, reason, ClaimedPush};
 use super::order_push::{self, Withheld};
 use super::outbox;
+use super::product_sync;
 use super::provider::{
     CancelOrder, ConnectionContext, ConnectorProvider, ExternalOrder, OrderPush, ProviderError,
     RefundRecord,
@@ -704,9 +706,10 @@ async fn run_action(
     }
 }
 
-/// Reads each mapped connection's catalog and applies the stock it reports.
-/// The webhook path is the fast one; this closes the gaps a missed webhook
-/// leaves. Returns how many listings changed.
+/// Reads each mapped connection's catalog and applies the stock it reports,
+/// and compares each linked product with its base (`product_sync`). The
+/// webhook path is the fast one; this closes the gaps a missed webhook leaves.
+/// Returns how many listings' stock changed.
 pub async fn poll_stock(state: &AppState) -> Result<u64, sqlx::Error> {
     let Some(runtime) = runtime_of(state) else {
         return Ok(0);
@@ -752,8 +755,12 @@ async fn poll_connection_stock(
         Err(_) => return Ok(0),
     };
     let mut applied = 0;
+    let linked = product_sync::linked_products(&state.pool, connection.id).await?;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut complete = false;
     let mut page: Option<String> = None;
     for _ in 0..MAX_CATALOG_PAGES_PER_POLL {
+        let read_at = state.clock.now();
         let catalog = match with_timeout(
             runtime.settings.provider_timeout,
             provider.list_catalog(&context, page.as_deref()),
@@ -775,6 +782,10 @@ async fn poll_connection_stock(
             }
         };
         for product in &catalog.products {
+            if linked.contains(&product.provider_product_id) {
+                seen.insert(product.provider_product_id.clone());
+                product_sync::observe(&state.pool, read_at, connection.id, product).await?;
+            }
             for variant in &product.variants {
                 if !variant.made_to_order && variant.stock.is_none() {
                     continue;
@@ -805,7 +816,17 @@ async fn poll_connection_stock(
         }
         page = catalog.next_page;
         if page.is_none() {
+            complete = true;
             break;
+        }
+    }
+    // The catalog lists only what the store sells, so a linked product that a
+    // whole walk did not meet was deleted, archived or made a draft. A walk
+    // cut short (an error, the page cap) proves nothing.
+    if complete {
+        for product in linked.difference(&seen) {
+            product_sync::observe_removed(&state.pool, state.clock.now(), connection.id, product)
+                .await?;
         }
     }
     Ok(applied)

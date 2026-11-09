@@ -156,6 +156,10 @@ and write. "Automation" means the inventory capability plus the
 | PUT | `/v1/connectors/{id}/credentials` |
 | GET, PUT | `/v1/connectors/{id}/mappings` |
 | GET, PUT | `/v1/connectors/{id}/selection` |
+| GET, PUT | `/v1/connectors/{id}/sync` |
+| PUT | `/v1/connectors/{id}/sync/listings/{listing_id}` |
+| GET | `/v1/connectors/{id}/changes` |
+| POST | `/v1/connectors/{id}/changes/{change_id}/resolve` |
 | PUT | `/v1/connectors/{id}/settings` |
 | PUT | `/v1/connectors/{id}/woocommerce/keys` |
 | GET | `/v1/connectors/{id}/pushes` |
@@ -1712,16 +1716,17 @@ against Shopify's published schema.
   They are signed with the same app secret and are acknowledged (the service
   keeps no store customer data); `shop/redact` ends the 30-day secret retention.
   The merchant guide must say this, because nothing else configures them. The
-  seven operational topics need no merchant step.
+  nine operational topics need no merchant step.
 
 **What the service does.** After a verified launch it redirects to Shopify's
 authorize page; after a verified callback it exchanges the code for an offline
 access token (sealed per connection) and then subscribes `inventory_levels/update`,
 `inventory_items/update`, `fulfillments/create`, `fulfillments/update`,
-`orders/cancelled`, `refunds/create` and `app/uninstalled` to the connection's
-webhooks URL through `webhookSubscriptionCreate`. A connection installed before
-`inventory_items/update` was added gets it on its next install; until then the
-stock poll catches tracking changes. A repeat
+`orders/cancelled`, `refunds/create`, `app/uninstalled`, `products/update` and
+`products/delete` to the connection's webhooks URL through
+`webhookSubscriptionCreate`. A connection installed before
+`inventory_items/update` or the product topics were added gets them on its
+next install; until then the stock poll catches tracking and product changes. A repeat
 install reads the subscription list page by page, subscribes nothing twice (a
 create that loses a race to a concurrent install is confirmed by re-reading the
 list, not by interpreting the message) and removes stale subscriptions this
@@ -2021,6 +2026,47 @@ per-variant inventory (`inventory.adjust` with `variant`), and skipped
 (`multi_variant_listing`) on a build without it. The 15-minute poll
 (`CONNECTOR_STOCK_POLL_SECONDS`) reads the catalog for mapped products because
 WordPress cron is unreliable.
+
+### Product changes
+
+A listing linked to a store product can follow the store for three field
+groups: `content` (title, description, images), `price` (each variant's price)
+and `variants` (options and the variant set). Stock is not one of them: it
+already follows the store through `inventory.adjust`. Each group has a
+direction, `from_store` (the default) or `off`, per connection
+(`GET`/`PUT /v1/connectors/{id}/sync`, body `{"groups": {"price": "off"}}`),
+which a linked listing may override
+(`PUT /v1/connectors/{id}/sync/listings/{listing_id}`, `null` returns a group
+to the connection's setting; a listing that is not linked answers
+`404 listing_not_linked`).
+
+The service keeps a base per linked product and group: the store's value as
+last applied, or as first seen. It compares the store with it on every
+`products/update` (the product is read again with the `Product` query, so a
+late delivery never queues an older version; a delivery received before the
+product's last observation is skipped) and on every stock poll, which reads
+the whole catalog anyway. A difference in a group that some linked listing
+follows becomes one pending change per product and group, and a newer store
+value replaces the proposal of a change still pending. A store value back at
+the base, or equal to a proposal the seller dismissed, withdraws the pending
+change. A product the store no longer sells (`products/delete`, `product`
+null or not `ACTIVE`, or missing from a catalog walk that reached the last
+page) is always queued as a `status` change, `{"available": false}`, whatever
+the directions: a paid order for it could not reach the store.
+
+`GET /v1/connectors/{id}/changes` lists the pending changes, oldest first,
+each with `field_group`, `base`, `proposed`, `proposed_hash` (hex SHA-256 of
+the canonical proposal) and the linked `listings` with their direction for
+the group (`always` for `status`) and their variant links. The service never
+writes a listing: the seller's Shop compares each change with the listing as
+it stands, applies or dismisses it, and calls
+`POST /v1/connectors/{id}/changes/{change_id}/resolve` with
+`{"resolution": "applied" | "dismissed", "proposed_hash": "..."}`. `applied`
+moves the base to the proposal. A change no longer pending, or whose proposal
+was replaced since the Shop read it, answers `409 change_stale`; an unknown
+one `404 change_not_found`. Changing a direction cancels the group's pending
+changes for the listings it affects and drops their base, so the next
+observation takes the store as it then stands.
 
 ### Mirror leases and the refund difference
 

@@ -221,7 +221,7 @@ async fn a_merchant_installs_their_own_custom_app_and_the_store_is_wired_up(pool
         assert!(!rendered.contains(secret), "{secret} left the service");
     }
 
-    // The six operational topics were subscribed to this connection's own
+    // The operational topics were subscribed to this connection's own
     // webhooks URL.
     let url = format!("https://service.test/v1/connectors/shopify/c/{id}/webhooks");
     let mut topics: Vec<String> = r
@@ -242,6 +242,8 @@ async fn a_merchant_installs_their_own_custom_app_and_the_store_is_wired_up(pool
             "INVENTORY_ITEMS_UPDATE",
             "INVENTORY_LEVELS_UPDATE",
             "ORDERS_CANCELLED",
+            "PRODUCTS_DELETE",
+            "PRODUCTS_UPDATE",
             "REFUNDS_CREATE"
         ]
     );

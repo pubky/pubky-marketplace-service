@@ -586,6 +586,13 @@ pub enum InboundEvent {
         amounts: Vec<RefundAmount>,
         mark: Option<PubkyRefundMark>,
     },
+    /// A store product changed. The framework reads it again
+    /// ([`ConnectorProvider::fetch_product`]) and, when it is linked to a
+    /// listing, queues what changed for the seller's Shop.
+    ProductChanged { provider_product_id: String },
+    /// The store deleted a product. A linked listing gets a pending status
+    /// change, whatever its sync settings.
+    ProductRemoved { provider_product_id: String },
     /// The merchant removed the app. The credential is deleted.
     AppUninstalled,
     /// One of the provider's mandatory privacy topics.
@@ -722,6 +729,21 @@ pub trait ConnectorProvider: Send + Sync + 'static {
         _inventory_item_id: &str,
     ) -> Result<Option<ResolvedStock>, ProviderError> {
         Ok(None)
+    }
+
+    /// One product as [`ConnectorProvider::list_catalog`] would list it, read
+    /// when a product webhook arrives (see [`InboundEvent::ProductChanged`]).
+    /// `Ok(None)` when the store no longer sells it: deleted, archived or a
+    /// draft. Providers without a single-product read keep the default; their
+    /// products are still compared on every stock poll.
+    async fn fetch_product(
+        &self,
+        _connection: &ConnectionContext,
+        _provider_product_id: &str,
+    ) -> Result<Option<CatalogProduct>, ProviderError> {
+        Err(ProviderError::Invalid(
+            "this provider has no single-product read".into(),
+        ))
     }
 
     /// A live look at the connection for the Shop's status page: the store's

@@ -1,6 +1,6 @@
 //! Webhook subscriptions and the meaning of Shopify's webhook payloads.
 //!
-//! The service subscribes the store to seven topics through the Admin API
+//! The service subscribes the store to nine topics through the Admin API
 //! (`webhookSubscriptionCreate`), all pointing at the connection's own webhooks
 //! URL. Shopify's three mandatory privacy topics (`customers/data_request`,
 //! `customers/redact`, `shop/redact`) are **not** in `WebhookSubscriptionTopic`
@@ -32,7 +32,7 @@ pub const HEADER_WEBHOOK_ID: &str = "x-shopify-webhook-id";
 
 /// The webhook topic as it appears in `X-Shopify-Topic` and the matching
 /// `WebhookSubscriptionTopic` value.
-pub const SUBSCRIBED_TOPICS: [(&str, &str); 7] = [
+pub const SUBSCRIBED_TOPICS: [(&str, &str); 9] = [
     ("inventory_levels/update", "INVENTORY_LEVELS_UPDATE"),
     // Tracking switched on or off for an item: the variant moves between
     // counted and made-to-order stock without any level changing.
@@ -42,6 +42,11 @@ pub const SUBSCRIBED_TOPICS: [(&str, &str); 7] = [
     ("orders/cancelled", "ORDERS_CANCELLED"),
     ("refunds/create", "REFUNDS_CREATE"),
     ("app/uninstalled", "APP_UNINSTALLED"),
+    // A linked product's content, prices or variants changed, or it left the
+    // store. `products/create` is not needed: a new product is linked to no
+    // listing, and the Shop offers it from the catalog.
+    ("products/update", "PRODUCTS_UPDATE"),
+    ("products/delete", "PRODUCTS_DELETE"),
 ];
 
 /// The topics configured in the app's configuration rather than through the
@@ -406,6 +411,17 @@ pub fn parse(webhook: &VerifiedWebhook, body: &[u8]) -> Result<InboundEvent, Pro
             })
         }
         "app/uninstalled" => Ok(InboundEvent::AppUninstalled),
+        // The body is not used beyond the product id: the product is read
+        // again through the API, so a late delivery can never queue an older
+        // version than the store now has.
+        "products/update" => Ok(InboundEvent::ProductChanged {
+            provider_product_id: gid("Product", &payload, "id")
+                .ok_or_else(|| missing("product"))?,
+        }),
+        "products/delete" => Ok(InboundEvent::ProductRemoved {
+            provider_product_id: gid("Product", &payload, "id")
+                .ok_or_else(|| missing("product"))?,
+        }),
         "customers/data_request" => Ok(InboundEvent::Compliance {
             topic: ComplianceTopic::CustomerDataRequest,
         }),
@@ -488,6 +504,37 @@ mod tests {
             b"{}"
         )
         .is_err());
+    }
+
+    #[test]
+    fn product_webhooks_name_the_product_to_re_read_or_remove() {
+        let updated = parse(
+            &webhook("products/update"),
+            br#"{"id":9001,"title":"Trail Boots","status":"active",
+                 "admin_graphql_api_id":"gid://shopify/Product/9001"}"#,
+        )
+        .expect("event");
+        assert_eq!(
+            updated,
+            InboundEvent::ProductChanged {
+                provider_product_id: "gid://shopify/Product/9001".into()
+            }
+        );
+        // `products/delete` carries only the numeric id.
+        let deleted = parse(&webhook("products/delete"), br#"{"id":9002}"#).expect("event");
+        assert_eq!(
+            deleted,
+            InboundEvent::ProductRemoved {
+                provider_product_id: "gid://shopify/Product/9002".into()
+            }
+        );
+        assert!(parse(&webhook("products/update"), br#"{"title":"no id"}"#).is_err());
+        assert!(SUBSCRIBED_TOPICS
+            .iter()
+            .any(|(topic, _)| *topic == "products/update"));
+        assert!(SUBSCRIBED_TOPICS
+            .iter()
+            .any(|(topic, _)| *topic == "products/delete"));
     }
 
     #[test]
