@@ -10,8 +10,9 @@
 //!   HMAC-SHA256(lookup key, creator ‖ bundle id) — the raw value is never
 //!   stored, indexed, logged, or placed in a URL.
 //! - **Independent verification.** [`LocksLifecycleClient`] is the lifecycle
-//!   lookup (`POST /verification-task-lookups` on the Lock Server, pinned
-//!   contract commit `ba49a777`). The production implementation
+//!   lookup (`POST /verification-task-lookups` on the Lock Server: statuses as
+//!   of contract commit `ba49a777`, plus the `client_binding` echo added in
+//!   Locks v0.1.1-rc2). The production implementation
 //!   ([`HttpLocksClient`]) performs a real HTTP call; the trait exists so
 //!   tests can exercise every lifecycle outcome without a live Lock Server,
 //!   and no configuration path substitutes a fake in production
@@ -803,7 +804,12 @@ mod tests {
     fn each_binding_field_is_checked_on_its_own() {
         let creator = "y".repeat(52);
         let expected = expected_binding(&creator);
-        let cases: [(&str, fn(&mut LocksClientBinding), (bool, bool, bool)); 6] = [
+        type Case = (
+            &'static str,
+            fn(&mut LocksClientBinding),
+            (bool, bool, bool),
+        );
+        let cases: [Case; 6] = [
             (
                 "reference",
                 |b| b.client_reference.push('x'),

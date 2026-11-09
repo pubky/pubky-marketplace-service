@@ -4388,3 +4388,78 @@ async fn a_correlation_without_sealed_binding_facts_never_confirms(pool: PgPool)
         vec![("completed".to_string(), "binding_unverifiable".to_string())]
     );
 }
+
+// A pass that read a non-terminal status keeps working while another pass
+// refuses the same correlation. Its late write must not turn the refused
+// correlation back into a pending observation or add a history row: the
+// refusal is the terminal record.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_late_pending_observation_never_overwrites_a_binding_refusal(pool: PgPool) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (order, _reference) = registered_digital_locks_order_with_reference(
+        &app,
+        &seller,
+        &buyer,
+        "boots_01",
+        TEST_BUNDLE_ID,
+        0xE01,
+    )
+    .await;
+    let locks = app.state.locks.clone().expect("locks runtime");
+
+    fake.set_outcome(
+        TEST_BUNDLE_ID,
+        LocksLookupOutcome::Status(LocksTaskStatus::Pending),
+    );
+    let release = fake.park_next_lookup();
+    let in_flight = tokio::spawn({
+        let state = app.state.clone();
+        let locks = locks.clone();
+        let now = app.clock.now();
+        async move { workers::verify_due_locks_lifecycles(&state, &locks, now).await }
+    });
+    while fake.lookup_count() < 1 {
+        tokio::task::yield_now().await;
+    }
+
+    fake.set_outcome(TEST_BUNDLE_ID, LocksLookupOutcome::Completed(None));
+    app.clock.advance_seconds(60);
+    let second = workers::verify_due_locks_lifecycles(&app.state, &locks, app.clock.now())
+        .await
+        .expect("second pass");
+    assert_eq!(second, 0);
+    assert_eq!(
+        binding_observations(&app.pool, &order.payment_id).await,
+        vec![("completed".to_string(), "binding_missing".to_string())]
+    );
+
+    fake.set_outcome(
+        TEST_BUNDLE_ID,
+        LocksLookupOutcome::Status(LocksTaskStatus::Pending),
+    );
+    release.notify_one();
+    in_flight
+        .await
+        .expect("pass joins")
+        .expect("first pass completes");
+
+    let (verification_state, observed) = correlation_outcome(&app.pool, &order.payment_id).await;
+    assert_eq!(verification_state, "upstream_failed");
+    assert_eq!(observed.as_deref(), Some("binding_missing"));
+    let history: Vec<(String, String)> = sqlx::query_as(
+        "SELECT o.observed_status, o.outcome FROM payment_locks_observations o \
+         JOIN payment_locks_correlations c ON c.id = o.correlation_id \
+         WHERE c.payment_id = $1::uuid ORDER BY o.id",
+    )
+    .bind(&order.payment_id)
+    .fetch_all(&app.pool)
+    .await
+    .expect("observations listed");
+    assert_eq!(
+        history,
+        vec![("completed".to_string(), "binding_missing".to_string())],
+        "the late pending observation left no row"
+    );
+}

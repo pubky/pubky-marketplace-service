@@ -1694,16 +1694,20 @@ async fn record_status_observation(
         return Ok(());
     }
     let mut tx = pool.begin().await?;
-    sqlx::query(
+    // A pass that read a non-terminal status before another pass refused or
+    // ended the correlation must not overwrite that terminal record.
+    let observed = sqlx::query(
         "UPDATE payment_locks_correlations SET last_observed_status = $2, updated_at = $3 \
-         WHERE id = $1",
+         WHERE id = $1 AND verification_state = 'pending'",
     )
     .bind(row.id)
     .bind(observed_status)
     .bind(now)
     .execute(&mut *tx)
     .await?;
-    insert_observation(&mut tx, row.id, observed_status, "none", now).await?;
+    if observed.rows_affected() == 1 {
+        insert_observation(&mut tx, row.id, observed_status, "none", now).await?;
+    }
     tx.commit().await?;
     Ok(())
 }

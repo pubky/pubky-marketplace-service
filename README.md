@@ -2307,9 +2307,10 @@ advance a payment (ADR-0019 §7).
   pending correlations (bounded batches, one lookup per correlation per
   `LOCKS_POLL_SECONDS`), decrypts the bundle id, and performs a real
   `POST /verification-task-lookups` against the configured Lock Server
-  (pinned contract commit `ba49a777`; tests drive the same code path
-  through a fake lifecycle client — production only ever constructs the
-  HTTP client). Verification is a pure function of what Locks reports:
+  (lifecycle statuses as of contract commit `ba49a777`, plus the
+  `client_binding` echo that Locks v0.1.1-rc2 added; tests drive the same
+  code path through a fake lifecycle client — production only ever
+  constructs the HTTP client). Verification is a pure function of what Locks reports:
   - `completed` with a matching client binding (below) → the payment
     advances `awaiting_entitlement → confirmed`
     **exactly once**, enforced by the payment-state compare-and-swap plus
