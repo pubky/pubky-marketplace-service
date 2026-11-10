@@ -2416,6 +2416,34 @@ async fn prepare_seals_the_checkout_snapshot_not_a_post_checkout_lock_mutation(p
     )
     .await;
     assert_eq!(status, StatusCode::OK, "prepare: {body}");
+    // The buyer is told the terms the payment was prepared against, so a
+    // client holding the healed listing (B) can refuse before any task exists.
+    assert_eq!(
+        body["result"]["lock_resource_hash"],
+        json!(blake3::hash(lock_a.as_bytes()).to_hex().to_string()),
+        "the prepare result names the checkout-time lock A"
+    );
+    assert_ne!(
+        body["result"]["lock_resource_hash"],
+        json!(blake3::hash(lock_b.as_bytes()).to_hex().to_string()),
+    );
+    assert_eq!(body["result"]["criterion_id"], json!("paykit"));
+    assert!(
+        !body.to_string().contains(&lock_a),
+        "the resource itself is never returned"
+    );
+    let (status, replay) = execute(
+        &app,
+        &buyer.token,
+        &common::prepare_locks_command(&payment_id, 512),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "prepare replay: {replay}");
+    assert_eq!(
+        replay["result"]["lock_resource_hash"], body["result"]["lock_resource_hash"],
+        "a repeated prepare names the same terms"
+    );
+    assert_eq!(replay["result"]["criterion_id"], json!("paykit"));
     let (hash, ciphertext): (String, Vec<u8>) = sqlx::query_as(
         "SELECT expected_resource_hash, expected_resource_ciphertext \
          FROM payment_locks_correlations WHERE payment_id = $1::uuid",

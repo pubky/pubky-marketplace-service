@@ -2330,7 +2330,12 @@ advance a payment (ADR-0019 §7).
 - **Client binding.** `payment.prepare_locks` mints one `client_reference`
   per payment (32 random bytes, base64url) and returns it only to the buyer;
   the service keeps it sealed beside the sealed lock resource and the
-  criterion id of the checkout snapshot. The Shop submits the reference
+  criterion id of the checkout snapshot. The same result names the prepared
+  terms without the resource: `lock_resource_hash` (BLAKE3 hex of the
+  checkout-time lock resource, the value already on the correlation) and
+  `criterion_id`, so a client holding a listing the seller edited after checkout
+  can tell it is no longer the lock this payment was prepared against and
+  refuse before it submits a bundle. The Shop submits the reference
   inside the proof bundle, and a Lock Server at v0.1.1-rc2 or later echoes
   it on the lifecycle as `client_binding: { client_reference,
   pubky_lock_resource, criterion_ids }`. A `completed` task qualifies the
