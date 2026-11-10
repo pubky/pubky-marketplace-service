@@ -12,7 +12,8 @@
 //!   [`REQUIRED_SCOPES`] puts the connection in `needs_attention`.
 //! * **Webhooks.** After an install the five operational topics are
 //!   subscribed through the API ([`webhooks::SUBSCRIBED_TOPICS`]); the three
-//!   privacy topics are configured in the app ([`webhooks::PRIVACY_TOPICS`]).
+//!   privacy topics are optional for a merchant's own app and can only be
+//!   configured in a deployed app configuration ([`webhooks::PRIVACY_TOPICS`]).
 //!   Deliveries are verified with the connection's app secret.
 //! * **Catalog, orders, refunds** are documented in [`catalog`] and
 //!   [`orders`]. Every query and mutation is a `.graphql` file under
@@ -25,6 +26,7 @@ pub mod client;
 pub mod documents;
 pub mod money;
 pub mod orders;
+pub mod resolve;
 pub mod webhooks;
 
 use async_trait::async_trait;
@@ -35,8 +37,8 @@ use crate::connectors::provider::{
     AppContext, AppKind, AuthorizeRequest, CallbackParams, CancelOrder, CatalogPage,
     CompleteRequest, ConnectCompleted, ConnectRequest, ConnectStart, ConnectionCheck,
     ConnectionContext, ConnectorProvider, CredentialSecret, ExternalOrder, InboundEvent, OrderPush,
-    ProviderError, ProviderKind, RefundRecord, ResolvedStock, StoreRefundTotals, VerifiedWebhook,
-    WebhookContext, WebhookHeaders,
+    ProviderError, ProviderKind, RefundRecord, ResolvedShop, ResolvedStock, StoreRefundTotals,
+    VerifiedWebhook, WebhookContext, WebhookHeaders,
 };
 use client::{Client, Origin};
 
@@ -51,6 +53,8 @@ pub const REQUIRED_SCOPES: [&str; 5] = [
 
 pub struct ShopifyProvider {
     client: Client,
+    origin: Origin,
+    resolver: resolve::Resolver,
 }
 
 impl ShopifyProvider {
@@ -62,8 +66,17 @@ impl ShopifyProvider {
     /// [`Origin::Shopify`].
     pub fn with_origin(origin: Origin) -> Self {
         Self {
-            client: Client::new(origin),
+            client: Client::new(origin.clone()),
+            origin,
+            resolver: resolve::Resolver::default(),
         }
+    }
+
+    /// For tests only: lets the custom-domain lookup reach a loopback
+    /// stand-in over plain HTTP.
+    pub fn with_local_resolver(mut self) -> Self {
+        self.resolver = resolve::Resolver::local_testing();
+        self
     }
 }
 
@@ -125,6 +138,10 @@ impl ConnectorProvider for ShopifyProvider {
         auth::normalize_shop(raw)
     }
 
+    async fn resolve_shop(&self, raw: &str) -> Result<ResolvedShop, ProviderError> {
+        self.resolver.resolve(&self.origin, raw).await
+    }
+
     fn app_kind(&self) -> AppKind {
         AppKind::Custom
     }
@@ -142,7 +159,7 @@ impl ConnectorProvider for ShopifyProvider {
             "where": "In the Shopify Dev Dashboard, open your app and install it from the Installs card (an app created in the store's own organization), or choose Custom distribution, enter the store's myshopify.com domain, click Generate link and open that link as the store owner.",
             "app_url": app_url,
             "redirect_url": redirect_url,
-            "note": "Set the app's App URL and redirect URL to the two values above before installing. Shopify opens the App URL after the install, which sends you to approve the connection. The service gives no authorize link of its own: Shopify's documentation describes the authorize URL as the step that obtains a token for an app, not as one that installs an app the store does not have yet.",
+            "note": "Set the app's App URL and redirect URL to the two values above and leave Use legacy install flow at its default before installing. Shopify opens the App URL during the install, which sends you to approve the connection. The service gives no authorize link of its own: Shopify's documentation describes the authorize URL as the step that obtains a token for an app, not as one that installs an app the store does not have yet.",
         }))
     }
 

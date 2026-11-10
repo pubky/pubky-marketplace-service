@@ -96,6 +96,10 @@ pub fn build_router(state: AppState) -> Router {
                 .post(crate::connectors::routes::start_connect),
         )
         .route(
+            "/v1/connectors/resolve",
+            post(crate::connectors::routes::resolve_shop),
+        )
+        .route(
             "/v1/connectors/alerts",
             get(crate::connectors::routes::list_alerts),
         )

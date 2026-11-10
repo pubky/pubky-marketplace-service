@@ -50,7 +50,7 @@ pub enum Origin {
 }
 
 impl Origin {
-    fn base(&self, shop: &str) -> String {
+    pub(crate) fn base(&self, shop: &str) -> String {
         match self {
             Origin::Shopify => format!("https://{shop}"),
             Origin::Fixed(base) => base.trim_end_matches('/').to_string(),

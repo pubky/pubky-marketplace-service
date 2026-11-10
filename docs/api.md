@@ -149,6 +149,7 @@ and write. "Automation" means the inventory capability plus the
 | POST | `/v0/orders/{id}/bitcoin/resolve` |
 | GET, POST | `/v1/connectors` |
 | GET | `/v1/connectors/alerts` |
+| POST | `/v1/connectors/resolve` |
 | POST | `/v1/connectors/alerts/{id}/resolve` |
 | DELETE | `/v1/connectors/{id}` |
 | GET | `/v1/connectors/{id}/catalog` |
@@ -1853,6 +1854,26 @@ on `X-Shopify-Event-Id`.
   without `fulfillment.update_tracking` (and ship-without-tracking) is detected
   from its command vocabulary and keeps the old behaviour: a fulfilment without
   tracking is ignored (`tracking_commands_unavailable`), one with tracking ships.
+- `POST /v1/connectors/resolve` with `{"provider": "shopify", "domain":
+  "shop.example"}` (a body, so the address never sits in a URL) answers
+  `{shop, domain}` for the address a merchant typed, before anything is
+  connected: `shop` is the canonical `*.myshopify.com` domain to send to
+  `POST /v1/connectors`, `domain` the custom domain that was looked up (`null`
+  when the input already was a `*.myshopify.com` address or an
+  `admin.shopify.com/store/{handle}` URL, which need no lookup). The service
+  reads the storefront's `/meta.json` and accepts the answer only when
+  Shopify's own `https://{shop}/meta.json` names the same shop and lists the
+  typed host (`www.` ignored) as its main domain. Outbound rules: HTTPS and the
+  standard port only, a public DNS name (no IP address, `localhost` or
+  single-label name), every resolved address public and the request pinned to
+  them, at most three redirects that keep scheme and port, 8 s per request and
+  20 s in all, a 128 KiB body cap, and eight lookups at a time (`429
+  provider_rate_limited` beyond that). A pasted page address keeps its host and
+  loses its path, query and fragment. Refusals are `422`: `invalid_domain` (not
+  a usable address), `not_a_shopify_store` (no Shopify answer, or Shopify does
+  not confirm the claim) and `not_primary_domain` (a Shopify store, but the
+  typed host is not its main domain; the message names the main domain); an
+  unreachable host is `502 provider_unavailable`. Nothing is stored.
 - `GET /v1/connectors/{id}/check` reads the store live: its name, the scopes the
   token holds, the number of active locations and whether a catalog read works.
 
