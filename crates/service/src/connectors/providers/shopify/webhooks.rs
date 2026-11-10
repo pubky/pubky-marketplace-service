@@ -5,9 +5,11 @@
 //! URL. Shopify's three mandatory privacy topics (`customers/data_request`,
 //! `customers/redact`, `shop/redact`) are **not** in `WebhookSubscriptionTopic`
 //! and cannot be subscribed through the API: they are configured in the app's
-//! configuration (`shopify.app.toml` `[webhooks.privacy_compliance]`, or the
-//! Dev Dashboard's app version) with the same connection webhooks URL. They are
-//! signed with the same app secret and are parsed here once they arrive.
+//! configuration (`shopify.app.toml` `compliance_topics`, deployed with Shopify
+//! CLI; the Dev Dashboard version form has no field for them). Shopify requires
+//! them only of apps listed in its App Store, so a merchant's own app works
+//! without them. If they are deployed with the connection's webhooks URL, they
+//! are signed with the same app secret and are parsed here once they arrive.
 
 use std::collections::BTreeMap;
 

@@ -167,6 +167,16 @@ pub struct ConnectionContext {
     pub app: Option<AppContext>,
 }
 
+/// Answer of [`ConnectorProvider::resolve_shop`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedShop {
+    /// The canonical shop, as [`ConnectorProvider::normalize_shop`] returns it.
+    pub shop: String,
+    /// The custom domain the merchant typed when it was looked up; `None`
+    /// when the input already was the canonical shop.
+    pub domain: Option<String>,
+}
+
 /// Input of [`ConnectorProvider::connect`].
 #[derive(Debug)]
 pub struct ConnectRequest {
@@ -632,6 +642,19 @@ pub trait ConnectorProvider: Send + Sync + 'static {
     /// URL) and returns the canonical form used as the connection key and in
     /// the credential's associated data. Must never contain `|`.
     fn normalize_shop(&self, raw: &str) -> Result<String, ProviderError>;
+
+    /// Turns what the merchant typed into the canonical shop
+    /// [`Self::normalize_shop`] returns. A provider whose stores are reached
+    /// through a custom domain (Shopify) looks the address up on the
+    /// network; the default accepts exactly what `normalize_shop` accepts.
+    /// Nothing is stored, and nothing is sent to any host but the one the
+    /// merchant named and the provider's own.
+    async fn resolve_shop(&self, raw: &str) -> Result<ResolvedShop, ProviderError> {
+        Ok(ResolvedShop {
+            shop: self.normalize_shop(raw)?,
+            domain: None,
+        })
+    }
 
     /// Whether a connection of this provider is installed through an app the
     /// merchant owns ([`AppKind::Custom`]) or none ([`AppKind::None`]).
