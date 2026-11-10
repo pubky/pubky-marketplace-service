@@ -448,6 +448,14 @@ async fn the_route_answers_the_shop_for_a_custom_domain_and_for_the_canonical_on
     .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
     assert_eq!(body["connection"]["domain"], SHOP);
+    let note = body["connection"]["install"]["note"]
+        .as_str()
+        .expect("the install note");
+    assert!(
+        note.contains("leave Use legacy install flow at its default"),
+        "{note}"
+    );
+    assert!(!note.contains("turn on"), "{note}");
     assert!(r.store.hits() >= 1);
 }
 

@@ -159,7 +159,7 @@ impl ConnectorProvider for ShopifyProvider {
             "where": "In the Shopify Dev Dashboard, open your app and install it from the Installs card (an app created in the store's own organization), or choose Custom distribution, enter the store's myshopify.com domain, click Generate link and open that link as the store owner.",
             "app_url": app_url,
             "redirect_url": redirect_url,
-            "note": "Set the app's App URL and redirect URL to the two values above and turn on Use legacy install flow before installing. With it on, Shopify opens the App URL when you install, which sends you to approve the connection. The service gives no authorize link of its own: Shopify's documentation describes the authorize URL as the step that obtains a token for an app, not as one that installs an app the store does not have yet.",
+            "note": "Set the app's App URL and redirect URL to the two values above and leave Use legacy install flow at its default before installing. Shopify opens the App URL during the install, which sends you to approve the connection. The service gives no authorize link of its own: Shopify's documentation describes the authorize URL as the step that obtains a token for an app, not as one that installs an app the store does not have yet.",
         }))
     }
 
