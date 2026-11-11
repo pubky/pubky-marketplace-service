@@ -183,11 +183,33 @@ test('preserves invalid mint while attempting failed bearer revocation and proof
     assert.equal(error.cause, error.errors[0]);
     assert.deepEqual(error.errors.map((cause) => cause.message), [
       'invalid fixture marketplace session', 'fixture session cleanup failed', 'fixture grant proof cleanup failed',
+      'fixture session cleanup failed',
     ]);
     assert.doesNotMatch(inspect(error), /sensitive-(?:proof|bearer)-token/);
     return true;
   });
-  assert.deepEqual(f.events.map(([event]) => event), ['POST', 'put', 'POST', 'DELETE', 'delete-proof']);
+  assert.deepEqual(f.events.map(([event]) => event), ['POST', 'put', 'POST', 'DELETE', 'delete-proof', 'DELETE']);
+});
+
+test('proof cleanup retires a rejected bearer after its first revocation fails', async () => {
+  const f = fixture({ mint: { capabilities: '/:rw' }, deleteFails: true });
+  const originalFetch = f.args.fetchImpl;
+  let revocations = 0;
+  f.args.fetchImpl = async (url, options) => {
+    if (options.method === 'DELETE' && ++revocations === 1) {
+      f.events.push(['DELETE', url, options]);
+      return new Response(null, { status: 503 });
+    }
+    return originalFetch(url, options);
+  };
+  await assert.rejects(mintFixtureBearer(f.args), (error) => {
+    assert.equal(error.message, 'invalid fixture marketplace session');
+    assert.equal(error.cause, error.errors[0]);
+    assert.doesNotMatch(inspect(error), /sensitive-(?:proof|bearer)-token/);
+    return true;
+  });
+  assert.equal(revocations, 2);
+  assert.deepEqual(f.events.map(([event]) => event), ['POST', 'put', 'POST', 'DELETE', 'delete-proof', 'DELETE']);
 });
 
 test('preserves proof cleanup failure when revoking an otherwise valid bearer also fails', async () => {

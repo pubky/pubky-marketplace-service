@@ -86,8 +86,7 @@ export async function mintFixtureBearer({ session, pubky, service, fetchImpl = f
   } catch (error) {
     failures.push(error);
   }
-  const rejected = failures.length > 0;
-  if (rejected) {
+  if (failures.length > 0) {
     try {
       await revokeRejectedMint();
     } catch (error) {
@@ -98,13 +97,11 @@ export async function mintFixtureBearer({ session, pubky, service, fetchImpl = f
     await session.storage.delete(path);
   } catch {
     failures.push(new Error('fixture grant proof cleanup failed'));
-    if (!rejected) {
-      // Do not lose track of a bearer when proof cleanup prevents returning it.
-      try {
-        await revokeRejectedMint();
-      } catch (error) {
-        failures.push(error);
-      }
+    // A failed earlier revocation leaves minted set for this existing cleanup attempt.
+    try {
+      await revokeRejectedMint();
+    } catch (error) {
+      failures.push(error);
     }
   }
   throwFailures(failures);
