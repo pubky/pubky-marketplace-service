@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { inspect } from 'node:util';
 import test from 'node:test';
 import { mintFixtureBearer, withFixtureGrant } from './fixture-grant-session.mjs';
 
@@ -11,7 +12,7 @@ const path = `/pub/pubky.app/marketplace/v1/session-proofs/${challengeId}`;
 const capabilities = '/priv/pubky.app/:rw,/pub/pubky.app/marketplace-service/v1/:rw';
 const response = (body, status = 201) => new Response(JSON.stringify(body), { status });
 
-function fixture({ mint = {}, status = 201, writeFails = false, deleteFails = false } = {}) {
+function fixture({ mint = {}, status = 201, writeFails = false, deleteFails = false, revokeFails = false } = {}) {
   const events = [];
   const signed = [];
   const issued = {
@@ -28,14 +29,17 @@ function fixture({ mint = {}, status = 201, writeFails = false, deleteFails = fa
       },
       delete: async (target) => {
         events.push(['delete-proof', target]);
-        if (deleteFails) throw new Error('delete unavailable');
+        if (deleteFails) throw new Error('delete unavailable: sensitive-proof-token');
       },
     },
     signout: async () => { events.push(['signout']); },
   };
   const fetchImpl = async (url, options) => {
     events.push([options.method, url, options]);
-    if (options.method === 'DELETE') return new Response(null, { status: 204 });
+    if (options.method === 'DELETE') {
+      if (revokeFails) throw new Error('revoke unavailable: sensitive-bearer-token');
+      return new Response(null, { status: 204 });
+    }
     assert.deepEqual(JSON.parse(options.body), { grant: 'signed-grant', pop: 'signed-pop' });
     if (url.endsWith('/grant-session-challenges')) {
       return response({ challenge_id: challengeId, expires_at: new Date(Date.now() + 120_000).toISOString() });
@@ -117,6 +121,88 @@ test('owned grant is signed out on success and on action failure', async () => {
   await assert.rejects(withFixtureGrant(options, async () => { throw new Error('action failed'); }), /action failed/);
   assert.deepEqual(f.events, [['signout'], ['signout']]);
   await assert.rejects(withFixtureGrant({ ...options, clientId: '' }, async () => {}), /HOLD_SMOKE_GRANT_CLIENT_ID/);
+});
+
+test('owned grant preserves action failure when signout also fails', async () => {
+  const primary = new Error('fixture publish failed');
+  let signouts = 0;
+  const client = { signer: () => ({ signin: async () => ({ signout: async () => {
+    signouts++;
+    throw new Error('sensitive-signout-token');
+  } }) }) };
+  await assert.rejects(withFixtureGrant({ client, seat: {}, clientId: 'fixture.example' }, async () => {
+    throw primary;
+  }), (error) => {
+    assert.ok(error instanceof AggregateError);
+    assert.equal(error.message, primary.message);
+    assert.equal(error.cause, primary);
+    assert.equal(error.errors[0], primary);
+    assert.equal(error.errors[1].message, 'fixture homeserver grant sign-out failed');
+    assert.doesNotMatch(inspect(error), /sensitive-signout-token/);
+    return true;
+  });
+  assert.equal(signouts, 1);
+});
+
+test('owned grant still fails when only signout fails', async () => {
+  const client = { signer: () => ({ signin: async () => ({ signout: async () => {
+    throw new Error('sensitive-signout-token');
+  } }) }) };
+  await assert.rejects(withFixtureGrant({ client, seat: {}, clientId: 'fixture.example' }, async () => 7), (error) => {
+    assert.equal(error.message, 'fixture homeserver grant sign-out failed');
+    assert.doesNotMatch(inspect(error), /sensitive-signout-token/);
+    return true;
+  });
+});
+
+for (const [name, options, primaryMessage] of [
+  ['proof write', { writeFails: true }, 'fixture grant proof write failed'],
+  ['mint request', { status: 403 }, 'fixture grant request failed (403)'],
+]) {
+  test(`preserves ${name} failure when proof deletion also fails`, async () => {
+    const f = fixture({ ...options, deleteFails: true });
+    await assert.rejects(mintFixtureBearer(f.args), (error) => {
+      assert.ok(error instanceof AggregateError);
+      assert.equal(error.message, primaryMessage);
+      assert.equal(error.cause, error.errors[0]);
+      assert.deepEqual(error.errors.map((cause) => cause.message), [
+        primaryMessage, 'fixture grant proof cleanup failed',
+      ]);
+      assert.doesNotMatch(inspect(error), /sensitive-proof-token/);
+      return true;
+    });
+    assert.equal(f.events.at(-1)[0], 'delete-proof');
+  });
+}
+
+test('preserves invalid mint while attempting failed bearer revocation and proof deletion', async () => {
+  const f = fixture({ mint: { capabilities: '/:rw' }, revokeFails: true, deleteFails: true });
+  await assert.rejects(mintFixtureBearer(f.args), (error) => {
+    assert.ok(error instanceof AggregateError);
+    assert.equal(error.message, 'invalid fixture marketplace session');
+    assert.equal(error.cause, error.errors[0]);
+    assert.deepEqual(error.errors.map((cause) => cause.message), [
+      'invalid fixture marketplace session', 'fixture session cleanup failed', 'fixture grant proof cleanup failed',
+    ]);
+    assert.doesNotMatch(inspect(error), /sensitive-(?:proof|bearer)-token/);
+    return true;
+  });
+  assert.deepEqual(f.events.map(([event]) => event), ['POST', 'put', 'POST', 'DELETE', 'delete-proof']);
+});
+
+test('preserves proof cleanup failure when revoking an otherwise valid bearer also fails', async () => {
+  const f = fixture({ deleteFails: true, revokeFails: true });
+  await assert.rejects(mintFixtureBearer(f.args), (error) => {
+    assert.ok(error instanceof AggregateError);
+    assert.equal(error.message, 'fixture grant proof cleanup failed');
+    assert.equal(error.cause, error.errors[0]);
+    assert.deepEqual(error.errors.map((cause) => cause.message), [
+      'fixture grant proof cleanup failed', 'fixture session cleanup failed',
+    ]);
+    assert.doesNotMatch(inspect(error), /sensitive-(?:proof|bearer)-token/);
+    return true;
+  });
+  assert.deepEqual(f.events.map(([event]) => event), ['POST', 'put', 'POST', 'delete-proof', 'DELETE']);
 });
 
 test('hold smoke runner contains no deprecated cookie SDK calls', () => {

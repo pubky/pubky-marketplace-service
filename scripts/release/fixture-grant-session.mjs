@@ -6,17 +6,36 @@ const PRIVATE = '/priv/pubky.app/:rw';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const TOKEN = /^[A-Za-z0-9_-]{43}$/;
 
+function throwFailures(failures) {
+  if (failures.length > 1) {
+    const primary = failures[0];
+    throw new AggregateError(failures, primary instanceof Error ? primary.message : 'Operation failed before cleanup', {
+      cause: primary,
+    });
+  }
+  if (failures.length) throw failures[0];
+}
+
 export async function withFixtureGrant({ client, seat, clientId }, action) {
   if (!clientId) throw new Error('set HOLD_SMOKE_GRANT_CLIENT_ID to a service-allowed grant client id');
   // Return the minted grant before background PKDNS publication can fail.
   const session = await client.signer(seat).signin(clientId)
     .catch(() => { throw new Error('fixture homeserver grant sign-in failed'); });
+  const failures = [];
+  let result;
   try {
-    return await action(session);
-  } finally {
-    // free() only drops the JS handle; signout retires this owned grant.
-    await session.signout().catch(() => { throw new Error('fixture homeserver grant sign-out failed'); });
+    result = await action(session);
+  } catch (error) {
+    failures.push(error);
   }
+  // free() only drops the JS handle; signout retires this owned grant.
+  try {
+    await session.signout();
+  } catch {
+    failures.push(new Error('fixture homeserver grant sign-out failed'));
+  }
+  throwFailures(failures);
+  return result;
 }
 
 /** Borrowed session: the caller keeps responsibility for retiring its grant. */
@@ -45,6 +64,7 @@ export async function mintFixtureBearer({ session, pubky, service, fetchImpl = f
   }
   const path = `${PROOF_PATH}${challenge.challenge_id}`;
   let minted;
+  const failures = [];
   try {
     await session.storage.putJson(path, {
       aud: audience,
@@ -63,19 +83,32 @@ export async function mintFixtureBearer({ session, pubky, service, fetchImpl = f
       || !Number.isFinite(Date.parse(minted?.expires_at)) || Date.parse(minted.expires_at) <= Date.now()) {
       throw new Error('invalid fixture marketplace session');
     }
-    return minted;
   } catch (error) {
-    await revokeRejectedMint();
-    throw error;
-  } finally {
+    failures.push(error);
+  }
+  const rejected = failures.length > 0;
+  if (rejected) {
     try {
-      await session.storage.delete(path);
-    } catch {
-      // Do not lose track of a bearer when proof cleanup prevents returning it.
       await revokeRejectedMint();
-      throw new Error('fixture grant proof cleanup failed');
+    } catch (error) {
+      failures.push(error);
     }
   }
+  try {
+    await session.storage.delete(path);
+  } catch {
+    failures.push(new Error('fixture grant proof cleanup failed'));
+    if (!rejected) {
+      // Do not lose track of a bearer when proof cleanup prevents returning it.
+      try {
+        await revokeRejectedMint();
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+  }
+  throwFailures(failures);
+  return minted;
 
   async function revokeRejectedMint() {
     if (!TOKEN.test(minted?.token) || !UUID.test(minted?.session_id)) return;
