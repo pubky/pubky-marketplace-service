@@ -794,7 +794,7 @@ pub async fn disconnect(
     if let Some((_, seller_pubky)) = &found {
         crate::variant_stock::end_unlinked_made_to_order(&mut tx, seller_pubky, now).await?;
     }
-    super::product_sync::forget_unlinked(&mut tx, id).await?;
+    super::product_sync::forget_unlinked(&mut tx, now, id).await?;
     tx.commit().await?;
     Ok(changed > 0)
 }
@@ -897,7 +897,7 @@ pub async fn set_variant_mode(
     if !unmapped.is_empty() {
         crate::variant_stock::end_unlinked_made_to_order(&mut tx, &connection.seller_pubky, now)
             .await?;
-        super::product_sync::forget_unlinked(&mut tx, connection.id).await?;
+        super::product_sync::forget_unlinked(&mut tx, now, connection.id).await?;
         let names = unmapped
             .iter()
             .map(|listing| {
@@ -1076,7 +1076,7 @@ pub async fn replace_mappings(
         .await?;
     crate::variant_stock::end_unlinked_made_to_order(&mut tx, &connection.seller_pubky, now)
         .await?;
-    super::product_sync::forget_unlinked(&mut tx, connection.id).await?;
+    super::product_sync::forget_unlinked(&mut tx, now, connection.id).await?;
     tx.commit().await?;
     Ok(())
 }

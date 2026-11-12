@@ -741,14 +741,16 @@ async fn unlinking_forgets_the_product_its_changes_and_its_listings_overrides(po
         "the listing links nothing any more"
     );
     let rows: i64 = sqlx::query_scalar(
-        "SELECT (SELECT COUNT(*) FROM connector_product_snapshots WHERE connection_id = $1) \
+        "SELECT (SELECT COUNT(*) FROM connector_product_snapshots WHERE connection_id = $1 \
+                   AND (content IS NOT NULL OR price IS NOT NULL OR variants IS NOT NULL \
+                        OR status IS NOT NULL OR unlinked_at IS NULL)) \
               + (SELECT COUNT(*) FROM connector_product_changes WHERE connection_id = $1)",
     )
     .bind(r.connection)
     .fetch_one(&r.app.pool)
     .await
     .expect("count");
-    assert_eq!(rows, 0);
+    assert_eq!(rows, 0, "no base and no change; only the unlink's fence");
 
     map_listing(
         &r.app,
@@ -1069,4 +1071,147 @@ async fn turning_the_connection_off_keeps_the_change_a_listing_override_follows(
         Vec::<Value>::new(),
         "no listing of the product follows the content now"
     );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_read_from_before_an_unlink_is_dropped_after_the_product_is_linked_again(pool: PgPool) {
+    let r = rig(pool).await;
+    r.poll().await;
+    r.app.clock.advance_seconds(5);
+    // A read starts while the boots are linked and is delayed.
+    let slow_read_started = r.now();
+    let old = r.store_product(BOOTS).await;
+    r.app.clock.advance_seconds(5);
+    r.edit(BOOTS, json!({ "title": "Trail Boots II" }));
+    let (status, body) = r.call("PUT", "/mappings", &json!({ "mappings": [] })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    map_listing(
+        &r.app,
+        &r.seller,
+        r.connection,
+        "boots_01",
+        BOOTS,
+        BOOTS_VARIANT,
+    )
+    .await;
+
+    let late = product_sync::observe(&r.app.pool, slow_read_started, r.connection, &old)
+        .await
+        .expect("observe");
+    assert!(late.stale, "a read of the previous link: {late:?}");
+    let late_removal =
+        product_sync::observe_removed(&r.app.pool, slow_read_started, r.connection, BOOTS)
+            .await
+            .expect("observe");
+    assert!(late_removal.stale, "{late_removal:?}");
+    assert_eq!(r.changes().await, Vec::<Value>::new());
+
+    r.app.clock.advance_seconds(5);
+    r.poll().await;
+    assert_eq!(
+        r.changes().await,
+        Vec::<Value>::new(),
+        "the store as it stands after the relink is the base"
+    );
+    r.edit(BOOTS, json!({ "title": "Trail Boots III" }));
+    r.app.clock.advance_seconds(5);
+    r.poll().await;
+    let changes = r.changes().await;
+    assert_eq!(only(&changes, "content")["base"]["title"], "Trail Boots II");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_direction_change_in_one_group_leaves_a_read_valid_for_another(pool: PgPool) {
+    let r = rig(pool).await;
+    r.poll().await;
+    r.sync(json!({ "content": "off" })).await;
+    r.app.clock.advance_seconds(5);
+    r.sync(json!({ "content": "from_store" })).await;
+    r.app.clock.advance_seconds(5);
+    // A read starts after content was turned back on and is delayed.
+    let read_started = r.now();
+    let product = r.store_product(BOOTS).await;
+    r.app.clock.advance_seconds(5);
+    r.sync(json!({ "price": "off" })).await;
+
+    let late = product_sync::observe(&r.app.pool, read_started, r.connection, &product)
+        .await
+        .expect("observe");
+    assert!(!late.stale, "{late:?}");
+    assert_eq!(
+        late.based, 1,
+        "content is based by a read that started after its own change; price is not"
+    );
+    r.edit(BOOTS, json!({ "title": "Trail Boots II" }));
+    r.app.clock.advance_seconds(5);
+    r.poll().await;
+    let changes = r.changes().await;
+    let content = only(&changes, "content");
+    assert_eq!(content["base"]["title"], "Trail Boots");
+    assert_eq!(content["proposed"]["title"], "Trail Boots II");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_removal_is_queued_although_a_direction_changed_after_it_was_seen(pool: PgPool) {
+    let r = rig(pool).await;
+    r.fake.lock().products_gone.insert(BOOTS.into(), None);
+    // The delivery saying the product is gone arrives first ...
+    let delivered = r.now();
+    r.app.clock.advance_seconds(5);
+    // ... then a direction change, before the worker applies it.
+    r.sync(json!({ "content": "off" })).await;
+    let observed = product_sync::observe_removed(&r.app.pool, delivered, r.connection, BOOTS)
+        .await
+        .expect("observe");
+    assert_eq!(observed.queued, 1, "{observed:?}");
+    let changes = r.changes().await;
+    assert_eq!(
+        only(&changes, "status")["proposed"],
+        json!({ "available": false })
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn migration_0097_gives_each_group_the_shared_rebase_instant_and_reruns(pool: PgPool) {
+    const MIGRATION_0097: &str =
+        include_str!("../migrations/0097_connector_product_sync_fences.sql");
+    let r = rig(pool).await;
+    r.poll().await;
+    let shared = r.now() + chrono::Duration::seconds(30);
+    let own = r.now() + chrono::Duration::seconds(60);
+    sqlx::query(
+        "UPDATE connector_product_snapshots \
+         SET rebased_at = $3, content_rebased_at = NULL, price_rebased_at = $4, \
+             variants_rebased_at = NULL \
+         WHERE connection_id = $1 AND provider_product_id = $2",
+    )
+    .bind(r.connection)
+    .bind(BOOTS)
+    .bind(shared)
+    .bind(own)
+    .execute(&r.app.pool)
+    .await
+    .expect("a row from before 0097");
+    for _ in 0..2 {
+        sqlx::raw_sql(MIGRATION_0097)
+            .execute(&r.app.pool)
+            .await
+            .expect("0097 runs");
+    }
+    type Instants = (
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<chrono::DateTime<chrono::Utc>>,
+    );
+    let instants: Instants = sqlx::query_as(
+        "SELECT content_rebased_at, price_rebased_at, variants_rebased_at, unlinked_at \
+         FROM connector_product_snapshots WHERE connection_id = $1 AND provider_product_id = $2",
+    )
+    .bind(r.connection)
+    .bind(BOOTS)
+    .fetch_one(&r.app.pool)
+    .await
+    .expect("snapshot");
+    assert_eq!(instants, (Some(shared), Some(own), Some(shared), None));
 }

@@ -696,6 +696,31 @@ DELETE FROM _sqlx_migrations WHERE version = 96;
 Nothing else depends on them: pending changes are only a queue for the Shop,
 and listings are never written by the service.
 
+## Connector product sync read fences (0097)
+
+0097 adds four nullable columns to `connector_product_snapshots`:
+`content_rebased_at`, `price_rebased_at` and `variants_rebased_at` (when the
+group's direction last changed for the product; only a read that started
+after it may take the group's new base) and `unlinked_at` (when the product
+was last found linked to no listing; a read that started before it was made
+for a previous link and is dropped). An unlinked product's snapshot row now
+stays, emptied of its bases, to carry that fence. `rebased_at` from 0096 is
+copied into each group's column and is no longer read or written. Directly
+rerunnable.
+
+**Deploy mode: rolling, together with 0096.** A binary from before 0097 keeps
+reading `rebased_at` and deleting unlinked snapshots, which only loses the
+fences.
+
+### Backing out 0097
+
+An image from before it ignores the columns. Keep them and only forget the
+version:
+
+```sql
+DELETE FROM _sqlx_migrations WHERE version = 97;
+```
+
 ## Numbers claimed by open pull requests
 
 `main` has 0001 to 0079 (0068 and 0069 were never used). A new migration must
@@ -716,6 +741,7 @@ assume it is free:
 | 0094 | `0094_moderation_decisions.sql` | moderation decisions (statements of reasons) and their notification |
 | 0095 | `0095_shipping_zones.sql` | zone-priced shipping: listing profile or zones, destination country and quotes on orders, offers and bids |
 | 0096 | `0096_connector_product_sync.sql` | connector product sync: sync directions, product snapshots and the change queue for the Shop |
+| 0097 | `0097_connector_product_sync_fences.sql` | connector product sync: per-group rebase instants and the unlink fence on product snapshots |
 
 This table describes unmerged work and goes stale as pull requests land; trust
 `crates/service/migrations/` on `main` over it. sqlx does not reject two files

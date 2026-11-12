@@ -36,12 +36,20 @@
 //! then stands: nothing reviewed under the old direction can be applied under
 //! the new one, and nothing that changed while a group was off is replayed
 //! when it is turned back on. A product another listing keeps following
-//! keeps its base and pending change. Unlinking a product forgets it: its base, its changes and the
-//! overrides of listings that no longer link anything go with the mapping.
+//! keeps its base and pending change. Each group's base is dropped at its own
+//! instant: only a read that started after it may take the group's new base,
+//! and a change to one group never voids a read for another.
 //!
-//! Only what is still needed is kept: a withdrawn change is deleted, and a
+//! Unlinking a product forgets it: its base, its changes and the overrides of
+//! listings that no longer link anything go with the mapping. Its snapshot
+//! row stays, emptied, as the instant of the unlink: a read that started
+//! before it was made for the previous link and is dropped, also when the
+//! product is linked again before the read completes.
+//!
+//! Only what is still needed is kept: a withdrawn change is deleted, a
 //! product and group keep at most their pending change and their latest
-//! resolution (the dismissal a later observation is compared with).
+//! resolution (the dismissal a later observation is compared with), and an
+//! unlinked product keeps only its read fences.
 //!
 //! Lock order, everywhere: the connection row, then the connection's sync
 //! lock (direction changes and unlinking), then snapshot rows (several in
@@ -94,6 +102,17 @@ impl FieldGroup {
     /// The group's snapshot column; the names are fixed, never user input.
     fn column(self) -> &'static str {
         self.as_str()
+    }
+
+    /// The snapshot column of the group's last direction change; status has
+    /// no direction.
+    fn rebased_column(self) -> Option<&'static str> {
+        match self {
+            FieldGroup::Content => Some("content_rebased_at"),
+            FieldGroup::Price => Some("price_rebased_at"),
+            FieldGroup::Variants => Some("variants_rebased_at"),
+            FieldGroup::Status => None,
+        }
     }
 }
 
@@ -219,7 +238,8 @@ pub fn value_hash(value: &Value) -> Vec<u8> {
 /// What one observation did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Observed {
-    /// The read started before the product's last read: nothing was done.
+    /// The read started before the product's last read, or before it was
+    /// last unlinked: nothing was done.
     pub stale: bool,
     /// Groups taken as the base (first sight, or after a rebase).
     pub based: u32,
@@ -377,7 +397,10 @@ pub async fn checked_since(
 #[derive(sqlx::FromRow)]
 struct SnapshotRow {
     checked_at: DateTime<Utc>,
-    rebased_at: Option<DateTime<Utc>>,
+    unlinked_at: Option<DateTime<Utc>>,
+    content_rebased_at: Option<DateTime<Utc>>,
+    price_rebased_at: Option<DateTime<Utc>>,
+    variants_rebased_at: Option<DateTime<Utc>>,
     content: Option<Value>,
     price: Option<Value>,
     variants: Option<Value>,
@@ -392,6 +415,21 @@ impl SnapshotRow {
             FieldGroup::Variants => self.variants.as_ref(),
             FieldGroup::Status => self.status.as_ref(),
         }
+    }
+
+    fn rebased_at(&self, group: FieldGroup) -> Option<DateTime<Utc>> {
+        match group {
+            FieldGroup::Content => self.content_rebased_at,
+            FieldGroup::Price => self.price_rebased_at,
+            FieldGroup::Variants => self.variants_rebased_at,
+            FieldGroup::Status => None,
+        }
+    }
+
+    /// Whether a read that started at `read_at` is older than the product's
+    /// last read, or than its last unlink (a read made for a previous link).
+    fn is_stale(&self, read_at: DateTime<Utc>) -> bool {
+        self.checked_at > read_at || self.unlinked_at.is_some_and(|unlinked| read_at < unlinked)
     }
 }
 
@@ -438,7 +476,8 @@ async fn lock_snapshot(
 ) -> Result<SnapshotRow, sqlx::Error> {
     lock_snapshots(tx, now, connection_id, &[provider_product_id.to_string()]).await?;
     sqlx::query_as(
-        "SELECT checked_at, rebased_at, content, price, variants, status \
+        "SELECT checked_at, unlinked_at, content_rebased_at, price_rebased_at, \
+                variants_rebased_at, content, price, variants, status \
          FROM connector_product_snapshots \
          WHERE connection_id = $1 AND provider_product_id = $2",
     )
@@ -585,7 +624,7 @@ async fn compare(
     let mut observed = Observed::default();
     let mut tx = pool.begin().await?;
     let snapshot = lock_snapshot(&mut tx, now, connection_id, provider_product_id).await?;
-    if snapshot.checked_at > now {
+    if snapshot.is_stale(now) {
         observed.stale = true;
         tx.rollback().await?;
         return Ok(observed);
@@ -602,10 +641,13 @@ async fn compare(
     for (group, value) in current {
         let group = *group;
         let Some(base) = snapshot.get(group) else {
-            // A group dropped by a direction change is based only by a read
-            // that started after it: an older read may carry a value from
-            // before the change.
-            if snapshot.rebased_at.is_some_and(|rebased| now < rebased) {
+            // A group dropped by a change of its own direction is based only
+            // by a read that started after it: an older read may carry a
+            // value from before the change.
+            if snapshot
+                .rebased_at(group)
+                .is_some_and(|rebased| now < rebased)
+            {
                 continue;
             }
             // A linked product the service has not seen yet was on sale when
@@ -874,6 +916,9 @@ async fn rebase(
     group: FieldGroup,
     products: &BTreeSet<String>,
 ) -> Result<(), sqlx::Error> {
+    let Some(rebased_column) = group.rebased_column() else {
+        return Ok(());
+    };
     if products.is_empty() {
         return Ok(());
     }
@@ -890,7 +935,7 @@ async fn rebase(
     .execute(&mut **tx)
     .await?;
     sqlx::query(&format!(
-        "UPDATE connector_product_snapshots SET {} = NULL, rebased_at = $3 \
+        "UPDATE connector_product_snapshots SET {} = NULL, {rebased_column} = $3 \
          WHERE connection_id = $1 AND provider_product_id = ANY($2)",
         group.column()
     ))
@@ -903,12 +948,19 @@ async fn rebase(
 }
 
 /// Forgets what the connection no longer links, in the transaction that
-/// changed its mappings: the snapshots and changes of products no listing
-/// links any more, and the overrides of listings that link nothing. A
+/// changed its mappings, at `now`: the bases and changes of products no
+/// listing links any more, and the overrides of listings that link nothing. A
 /// product linked again later is based afresh; a listing linked again follows
 /// the connection's directions.
+///
+/// An unlinked product's snapshot row stays, emptied, with `unlinked_at` set
+/// to `now`: a read that started before it was made for the previous link,
+/// and is dropped even when it completes after the product is linked again.
+/// Every call moves the fence of every product still unlinked, which only
+/// drops reads that started while nothing linked the product.
 pub async fn forget_unlinked(
     tx: &mut Transaction<'_, Postgres>,
+    now: DateTime<Utc>,
     connection_id: Uuid,
 ) -> Result<(), sqlx::Error> {
     // The same lock as the direction changes, taken before any snapshot or
@@ -936,11 +988,14 @@ pub async fn forget_unlinked(
     .execute(&mut **tx)
     .await?;
     sqlx::query(
-        "DELETE FROM connector_product_snapshots \
+        "UPDATE connector_product_snapshots \
+         SET content = NULL, price = NULL, variants = NULL, status = NULL, \
+             unlinked_at = GREATEST(unlinked_at, $3) \
          WHERE connection_id = $1 AND provider_product_id = ANY($2)",
     )
     .bind(connection_id)
     .bind(&orphans)
+    .bind(now)
     .execute(&mut **tx)
     .await?;
     sqlx::query(
