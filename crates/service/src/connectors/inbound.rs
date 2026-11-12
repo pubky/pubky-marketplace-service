@@ -1,7 +1,7 @@
 //! Provider webhooks: dedupe on receipt, apply on the worker.
 //!
 //! The ingress route verifies the signature, normalises the event and writes
-//! it to `connector_inbound_events`, unique on the provider's own event id
+//! it to `connector_inbound_events`, unique on the provider's own delivery id
 //! per connection, then answers. The worker applies it later, so a slow
 //! `inventory.adjust` never makes the store's delivery time out and a
 //! redelivery changes nothing. Only the normalised event is stored, never the
@@ -50,7 +50,9 @@ pub enum Recorded {
     Duplicate,
 }
 
-/// Records a verified webhook once per `(connection, provider event id)`.
+/// Records a verified webhook once per `(connection, provider delivery id)`.
+/// A delivery recorded under its shared event id (with its topic) is the same
+/// delivery: its retries now carry their delivery id as the key.
 pub async fn record(
     pool: &PgPool,
     now: DateTime<Utc>,
@@ -58,6 +60,20 @@ pub async fn record(
     webhook: &VerifiedWebhook,
     event: &InboundEvent,
 ) -> Result<Recorded, sqlx::Error> {
+    if let Some(shared) = &webhook.shared_event_id {
+        let recorded: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM connector_inbound_events \
+             WHERE connection_id = $1 AND provider_event_id = $2 AND topic = $3)",
+        )
+        .bind(connection.id)
+        .bind(shared)
+        .bind(&webhook.topic)
+        .fetch_one(pool)
+        .await?;
+        if recorded {
+            return Ok(Recorded::Duplicate);
+        }
+    }
     let id = Uuid::new_v4();
     let inserted: Option<Uuid> = sqlx::query_scalar(
         "INSERT INTO connector_inbound_events \

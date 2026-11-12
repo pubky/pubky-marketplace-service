@@ -226,13 +226,24 @@ pub fn verify(
         .get(HEADER_TOPIC)
         .ok_or_else(|| ProviderError::Invalid("webhook names no topic".into()))?
         .to_ascii_lowercase();
-    let event_id = headers
-        .get(HEADER_EVENT_ID)
-        .or_else(|| headers.get(HEADER_WEBHOOK_ID))
-        .filter(|id| !id.is_empty())
-        .ok_or_else(|| ProviderError::Invalid("webhook carries no event id".into()))?
-        .to_string();
-    Ok(VerifiedWebhook { event_id, topic })
+    // `X-Shopify-Webhook-Id` names the delivery and is kept by its retries;
+    // `X-Shopify-Event-Id` is shared by the deliveries one store action makes
+    // on different topics (a sale's `products/update` and
+    // `inventory_levels/update`), so keying on it would drop all but one.
+    let non_empty = |name| headers.get(name).filter(|id: &&str| !id.is_empty());
+    let shared = non_empty(HEADER_EVENT_ID).map(str::to_string);
+    let (event_id, shared_event_id) = match non_empty(HEADER_WEBHOOK_ID) {
+        Some(delivery) => (delivery.to_string(), shared),
+        None => (
+            shared.ok_or_else(|| ProviderError::Invalid("webhook carries no event id".into()))?,
+            None,
+        ),
+    };
+    Ok(VerifiedWebhook {
+        event_id,
+        topic,
+        shared_event_id,
+    })
 }
 
 fn gid(kind: &str, payload: &Value, numeric: &str) -> Option<String> {
@@ -472,6 +483,7 @@ mod tests {
         VerifiedWebhook {
             event_id: "e".into(),
             topic: topic.into(),
+            shared_event_id: None,
         }
     }
 
@@ -486,6 +498,25 @@ mod tests {
         assert!(verify(None, body, &headers).is_err());
         let unsigned = WebhookHeaders::from_pairs([("X-Shopify-Topic", "orders/cancelled")]);
         assert!(verify(Some(&app()), body, &unsigned).is_err());
+    }
+
+    #[test]
+    fn a_delivery_is_keyed_by_its_delivery_id_not_the_shared_event_id() {
+        let body = br#"{"id":1}"#;
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        let signed = signed_headers(body, "inventory_levels/update");
+        for name in [HEADER_HMAC, HEADER_TOPIC, HEADER_EVENT_ID, HEADER_SHOP] {
+            pairs.push((name.into(), signed.get(name).expect(name).into()));
+        }
+        pairs.push(("X-Shopify-Webhook-Id".into(), "dlv-1".into()));
+        let verified =
+            verify(Some(&app()), body, &WebhookHeaders::from_pairs(pairs)).expect("verified");
+        assert_eq!(verified.event_id, "dlv-1");
+        assert_eq!(verified.shared_event_id.as_deref(), Some("evt-1"));
+
+        let only_event = verify(Some(&app()), body, &signed).expect("verified");
+        assert_eq!(only_event.event_id, "evt-1");
+        assert_eq!(only_event.shared_event_id, None);
     }
 
     #[test]

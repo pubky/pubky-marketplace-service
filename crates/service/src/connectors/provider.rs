@@ -284,10 +284,17 @@ pub struct WebhookContext {
 /// A webhook whose signature the provider verified.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedWebhook {
-    /// The provider's own delivery or event id. The inbound table is unique
-    /// on it per connection, which is the webhook dedupe.
+    /// The provider's own id of this delivery, kept by its retries. The
+    /// inbound table is unique on it per connection, which is the webhook
+    /// dedupe.
     pub event_id: String,
     pub topic: String,
+    /// The id of the store event the delivery belongs to, when the provider
+    /// sends one apart from the delivery id. Deliveries on other topics share
+    /// it, so it is no dedupe key; a delivery recorded under it before
+    /// deliveries were keyed by their own id is still found by it and the
+    /// topic.
+    pub shared_event_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

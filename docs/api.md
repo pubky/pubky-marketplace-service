@@ -1733,7 +1733,12 @@ create that loses a race to a concurrent install is confirmed by re-reading the
 list, not by interpreting the message) and removes stale subscriptions this
 service made for another address. Webhooks are verified with the base64 HMAC-SHA256 of the raw
 body under the connection's app secret (`X-Shopify-Hmac-Sha256`), and deduplicated
-on `X-Shopify-Event-Id`.
+on the delivery id `X-Shopify-Webhook-Id`, which Shopify keeps across retries.
+`X-Shopify-Event-Id` is shared by the deliveries one store action makes on
+different topics (a sale's `products/update` and `inventory_levels/update`), so
+it is the key only of a delivery that carries no delivery id. A delivery whose
+event id and topic match a delivery recorded under its event id is a retry of
+it, and a duplicate.
 
 - **Catalog.** Active products, a few per page, with every variant (more than 25
   variants are read through the product's variant connection). A variant's stock

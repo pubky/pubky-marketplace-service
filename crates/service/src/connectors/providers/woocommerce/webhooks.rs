@@ -239,6 +239,7 @@ pub fn verify(
             return Ok(VerifiedWebhook {
                 event_id: "ping".into(),
                 topic: "ping".into(),
+                shared_event_id: None,
             });
         }
         return Err(invalid("the webhook is not signed"));
@@ -267,7 +268,11 @@ pub fn verify(
         .ok_or_else(|| invalid("the webhook has no topic"))?
         .to_string();
     let event_id = event_id(&topic, body);
-    Ok(VerifiedWebhook { event_id, topic })
+    Ok(VerifiedWebhook {
+        event_id,
+        topic,
+        shared_event_id: None,
+    })
 }
 
 fn body_hash(topic: &str, body: &[u8]) -> String {
@@ -609,6 +614,7 @@ mod tests {
         let webhook = VerifiedWebhook {
             event_id: "e".into(),
             topic: "order.updated".into(),
+            shared_event_id: None,
         };
         parse(&webhook, &serde_json::to_vec(order).unwrap()).unwrap()
     }
@@ -784,6 +790,7 @@ mod tests {
         let webhook = VerifiedWebhook {
             event_id: "e".into(),
             topic: "order.deleted".into(),
+            shared_event_id: None,
         };
         match parse(&webhook, br#"{"id":727}"#).unwrap() {
             InboundEvent::OrderCancelled { order, .. } => {
@@ -800,6 +807,7 @@ mod tests {
         let webhook = VerifiedWebhook {
             event_id: "e".into(),
             topic: "product.updated".into(),
+            shared_event_id: None,
         };
         let simple = serde_json::to_vec(
             &json!({"id": 39, "type": "simple", "manage_stock": true, "stock_quantity": 6}),
@@ -845,6 +853,7 @@ mod tests {
         let ping = VerifiedWebhook {
             event_id: "ping".into(),
             topic: "ping".into(),
+            shared_event_id: None,
         };
         assert!(
             matches!(parse(&ping, b"webhook_id=1").unwrap(), InboundEvent::Ignored { reason } if reason == "ping")
@@ -852,6 +861,7 @@ mod tests {
         let other = VerifiedWebhook {
             event_id: "e".into(),
             topic: "coupon.created".into(),
+            shared_event_id: None,
         };
         assert!(matches!(
             parse(&other, b"{}").unwrap(),
