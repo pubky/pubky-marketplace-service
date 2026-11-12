@@ -961,3 +961,112 @@ async fn an_override_change_racing_an_unlink_never_deadlocks(pool: PgPool) {
         );
     }
 }
+
+impl Rig {
+    /// Links the mug listing to the boots' second variant, so both listings
+    /// share one store product.
+    async fn link_mug_to_boots(&self) {
+        let (status, body) = self
+            .call(
+                "PUT",
+                "/mappings",
+                &json!({ "mappings": [
+                    { "listing_id": "boots_01", "provider_product_id": BOOTS,
+                      "provider_variant_id": BOOTS_VARIANT },
+                    { "listing_id": "mug_01", "provider_product_id": BOOTS,
+                      "provider_variant_id": BOOTS_SECOND_VARIANT },
+                ] }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    async fn override_groups(&self, listing: &str, groups: Value) {
+        let (status, body) = self
+            .call(
+                "PUT",
+                &format!("/sync/listings/{listing}"),
+                &json!({ "groups": groups }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        marketplace_service::clock::Clock::now(&*self.app.clock)
+    }
+}
+
+const BOOTS_SECOND_VARIANT: &str = "gid://shopify/ProductVariant/50002";
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn turning_one_listing_off_keeps_the_change_another_listing_of_the_product_follows(
+    pool: PgPool,
+) {
+    let r = rig(pool).await;
+    r.link_mug_to_boots().await;
+    r.poll().await;
+    r.edit(BOOTS, json!({ "title": "Trail Boots II" }));
+    r.poll().await;
+    let changes = r.changes().await;
+    let pending = only(&changes, "content").clone();
+
+    r.override_groups("boots_01", json!({ "content": "off" }))
+        .await;
+    let changes = r.changes().await;
+    assert_eq!(
+        only(&changes, "content")["id"],
+        pending["id"],
+        "the mug still follows the store's content"
+    );
+    r.app.clock.advance_seconds(5);
+    r.poll().await;
+    let changes = r.changes().await;
+    let kept = only(&changes, "content");
+    assert_eq!(kept["id"], pending["id"]);
+    assert_eq!(kept["base"]["title"], "Trail Boots", "the base was kept");
+
+    // Back on for the boots: the product was followed throughout.
+    r.override_groups("boots_01", json!({ "content": null }))
+        .await;
+    assert_eq!(only(&r.changes().await, "content")["id"], pending["id"]);
+
+    // Off for both: nothing follows the content any more.
+    r.override_groups("boots_01", json!({ "content": "off" }))
+        .await;
+    r.override_groups("mug_01", json!({ "content": "off" }))
+        .await;
+    assert_eq!(r.changes().await, Vec::<Value>::new());
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn turning_the_connection_off_keeps_the_change_a_listing_override_follows(pool: PgPool) {
+    let r = rig(pool).await;
+    r.link_mug_to_boots().await;
+    r.override_groups("mug_01", json!({ "content": "from_store" }))
+        .await;
+    r.poll().await;
+    r.edit(BOOTS, json!({ "title": "Trail Boots II" }));
+    r.poll().await;
+    let changes = r.changes().await;
+    let pending = only(&changes, "content").clone();
+
+    r.sync(json!({ "content": "off" })).await;
+    r.app.clock.advance_seconds(5);
+    r.poll().await;
+    let changes = r.changes().await;
+    let kept = only(&changes, "content");
+    assert_eq!(
+        kept["id"], pending["id"],
+        "the mug's own direction still follows the store"
+    );
+    assert_eq!(kept["base"]["title"], "Trail Boots");
+
+    r.override_groups("mug_01", json!({ "content": null }))
+        .await;
+    assert_eq!(
+        r.changes().await,
+        Vec::<Value>::new(),
+        "no listing of the product follows the content now"
+    );
+}

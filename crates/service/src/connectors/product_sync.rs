@@ -28,12 +28,15 @@
 //! moves the base to that proposal; a proposal replaced in the meantime is
 //! refused as stale.
 //!
-//! Changing a direction (for the connection or a listing) withdraws the
-//! pending changes of that group for the affected products and drops their
-//! base, so the next observation takes the store as it then stands: nothing
-//! reviewed under the old direction can be applied under the new one, and
-//! nothing that changed while a group was off is replayed when it is turned
-//! back on. Unlinking a product forgets it: its base, its changes and the
+//! A product follows a group while any listing linked to it does; its base
+//! and pending change for the group are shared by those listings. Changing a
+//! direction (for the connection or a listing) so that a product starts or
+//! stops following a group withdraws the product's pending change for that
+//! group and drops its base, so the next observation takes the store as it
+//! then stands: nothing reviewed under the old direction can be applied under
+//! the new one, and nothing that changed while a group was off is replayed
+//! when it is turned back on. A product another listing keeps following
+//! keeps its base and pending change. Unlinking a product forgets it: its base, its changes and the
 //! overrides of listings that no longer link anything go with the mapping.
 //!
 //! Only what is still needed is kept: a withdrawn change is deleted, and a
@@ -249,7 +252,7 @@ impl Follows {
 
 /// The connection's directions, the listing overrides and the listings
 /// linked to each product.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct SyncConfig {
     pub settings: BTreeMap<FieldGroup, Direction>,
     pub overrides: BTreeMap<(String, FieldGroup), Direction>,
@@ -952,6 +955,46 @@ pub async fn forget_unlinked(
     Ok(())
 }
 
+/// Rebases the group for those of `products` whose base it changes: a
+/// product is followed while any listing linked to it follows the group, and
+/// its base and pending change are shared by those listings. A product still
+/// followed (or still not) under `after` keeps both, so a listing whose own
+/// direction did not change keeps the change it has not applied yet.
+async fn rebase_where_following_changes(
+    tx: &mut Transaction<'_, Postgres>,
+    now: DateTime<Utc>,
+    connection_id: Uuid,
+    group: FieldGroup,
+    before: &SyncConfig,
+    after: &SyncConfig,
+    products: &BTreeSet<String>,
+) -> Result<(), sqlx::Error> {
+    if products.is_empty() {
+        return Ok(());
+    }
+    let candidates: Vec<String> = products.iter().cloned().collect();
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT DISTINCT provider_product_id, listing_id FROM connector_variant_map \
+         WHERE connection_id = $1 AND provider_product_id = ANY($2)",
+    )
+    .bind(connection_id)
+    .bind(&candidates)
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut listings: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (product, listing) in rows {
+        listings.entry(product).or_default().insert(listing);
+    }
+    let changed: BTreeSet<String> = listings
+        .into_iter()
+        .filter(|(_, listings)| {
+            before.follows(listings).group(group) != after.follows(listings).group(group)
+        })
+        .map(|(product, _)| product)
+        .collect();
+    rebase(tx, now, connection_id, group, &changed).await
+}
+
 /// Products linked to any of `listings`, in name order (the lock order of
 /// [`rebase`]).
 async fn products_of_listings(
@@ -992,7 +1035,8 @@ async fn lock_config(
 
 /// Sets the connection's direction for each group given. A group whose
 /// direction changes is rebased for every product of a listing that follows
-/// the connection's setting for it (no override).
+/// the connection's setting for it (no override), unless another listing of
+/// the product keeps it followed or unfollowed.
 pub async fn put_settings(
     pool: &PgPool,
     now: DateTime<Utc>,
@@ -1029,7 +1073,18 @@ pub async fn put_settings(
             .filter(|listing| !config.overrides.contains_key(&(listing.clone(), *group)))
             .collect();
         let products = products_of_listings(&mut tx, connection_id, &following).await?;
-        rebase(&mut tx, now, connection_id, *group, &products).await?;
+        let mut after = config.clone();
+        after.settings.insert(*group, *direction);
+        rebase_where_following_changes(
+            &mut tx,
+            now,
+            connection_id,
+            *group,
+            &config,
+            &after,
+            &products,
+        )
+        .await?;
     }
     tx.commit().await
 }
@@ -1087,10 +1142,24 @@ pub async fn put_override(
                 .await?;
             }
         }
-        let after = direction.unwrap_or_else(|| config.connection_direction(*group));
-        if before != after {
+        let mut after = config.clone();
+        let key = (listing_id.to_string(), *group);
+        match direction {
+            Some(direction) => after.overrides.insert(key, *direction),
+            None => after.overrides.remove(&key),
+        };
+        if before != after.listing_direction(listing_id, *group) {
             let products = products_of_listings(&mut tx, connection_id, &listing).await?;
-            rebase(&mut tx, now, connection_id, *group, &products).await?;
+            rebase_where_following_changes(
+                &mut tx,
+                now,
+                connection_id,
+                *group,
+                &config,
+                &after,
+                &products,
+            )
+            .await?;
         }
     }
     tx.commit().await?;
