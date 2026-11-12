@@ -134,6 +134,17 @@ The release-proof helpers in [`scripts/release/`](scripts/release/) take every
 target from environment variables and carry no default host; see the header of
 each script.
 
+`hold-smoke-fixtures.mjs` uses SDK 0.16.2 grant sign-in for its temporary
+homeserver session and the [grant-session challenge/proof API](docs/api.md#grant-sessions)
+for its marketplace bearer. Set `HOLD_SMOKE_GRANT_CLIENT_ID` to an ID listed in
+the target service's `MARKETPLACE_GRANT_SESSION_CLIENT_IDS`, enable
+`MARKETPLACE_GRANT_SESSION_ENABLED`, and configure `PUBLIC_SERVICE_ORIGIN`
+and `HOMESERVER_URL` for that target and fixture seller. These are prerequisites
+for publishing, not a cookie fallback. Sweeping needs a grant client ID but
+does not mint a marketplace bearer. The runner deletes its proof document,
+signs out its temporary grant, and revokes each minted marketplace session.
+Existing staging-only target and dedicated-seller guards still apply.
+
 ## Configuration
 
 Configuration is environment-based. Window keys and their defaults also live in
@@ -1466,6 +1477,17 @@ contention. CI runs the toolchain 1.89.0 against PostgreSQL 16; the
 `docker-compose.yml` database is PostgreSQL 17. The pre-push hook
 (`scripts/prepush.sh`) runs the fast gate for the packages a change touches;
 `PREPUSH_FULL=1` runs everything.
+
+The release fixture auth tests are offline and need only Node 24:
+
+```sh
+node --test scripts/release/fixture-grant-session.test.mjs
+node scripts/release/hold-smoke-fixtures.mjs check
+```
+
+They check grant request shape, identity/capability validation, cleanup on
+failure and the existing fixture guards. They do not publish fixtures or prove
+deployed signer/homeserver compatibility.
 
 ## Command envelope (ADR-0019 §3)
 

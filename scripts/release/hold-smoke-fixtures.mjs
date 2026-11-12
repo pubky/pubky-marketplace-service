@@ -31,14 +31,15 @@
 //                           fixture seller (keep it mode 600, outside the repo)
 //   HOLD_SMOKE_FIXTURE_STATE  JSON file the listing ids are kept in (mode 600)
 //   PUBKY_SDK_DIR           directory whose node_modules holds
-//                           @synonymdev/pubky (0.11 API: startCookieAuthFlow,
-//                           signinCookie) and @noble/hashes
+//                           @synonymdev/pubky 0.16.2 (grant sessions) and @noble/hashes
+//   HOLD_SMOKE_GRANT_CLIENT_ID  grant client id allowed by MARKETPLACE_GRANT_SESSION_CLIENT_IDS; required
+//                           for publish/sweep. The service must enable MARKETPLACE_GRANT_SESSION_ENABLED
+//                           and read this seller from its configured HOMESERVER_URL
 //   MARKETPLACE_URL         the staging service under test (required; no default)
 //   HOLD_SMOKE_ALLOWED_URL  the one service URL this run may touch; MARKETPLACE_URL must equal it (required)
 //   HOLD_SMOKE_PRODUCTION_HOSTS  comma list of host substrings that mark production; a MARKETPLACE_URL containing
 //                           any of them is refused (required, non-empty)
 //   NEXUS_URL               the staging Nexus the fixtures are indexed by (required; no default)
-//   HTTP_RELAY              default https://httprelay.pubky.app/inbox
 //   HOLD_SMOKE_FIXTURE_SELLER  optional for publish and status (the seat must match it when set); required
 //                           for sweep and guard
 //   HOLD_SMOKE_GUARD_NEXUS  comma list of every Nexus that must not list a fixture, production and staging alike
@@ -50,8 +51,8 @@ import { createRequire } from 'node:module';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { crc32, deflateSync } from 'node:zlib';
+import { mintFixtureBearer, withFixtureGrant } from './fixture-grant-session.mjs';
 
-const RELAY = process.env.HTTP_RELAY ?? 'https://httprelay.pubky.app/inbox';
 const csv = (value) => (value ?? '').split(',').map((item) => item.trim()).filter(Boolean);
 const LISTINGS = '/pub/pubky.app/marketplace/v1/listings';
 const MEDIA = '/pub/pubky.app/marketplace/v1/media';
@@ -211,7 +212,7 @@ async function main(mode) {
   const SERVICE = serviceTarget().service;
   const NEXUS = requireEnv('NEXUS_URL');
   const require = createRequire(join(requireEnv('PUBKY_SDK_DIR'), 'package.json'));
-  const { AuthFlowKind, Keypair, Pubky } = require('@synonymdev/pubky');
+  const { Keypair, Pubky } = require('@synonymdev/pubky');
   const { blake3 } = require('@noble/hashes/blake3.js');
   const { bytesToHex } = require('@noble/hashes/utils.js');
 
@@ -220,6 +221,9 @@ async function main(mode) {
   if (!secretLine) throw new Error('the seat file has no PROOF_SEAT_SECRET_HEX');
   const seat = Keypair.fromSecret(new Uint8Array(Buffer.from(secretLine.slice('PROOF_SEAT_SECRET_HEX='.length).trim(), 'hex')));
   const pk = seat.publicKey.z32();
+  const withGrant = (action) => withFixtureGrant({
+    client: new Pubky(), seat, clientId: process.env.HOLD_SMOKE_GRANT_CLIENT_ID,
+  }, action);
   if (process.env.HOLD_SMOKE_FIXTURE_SELLER && process.env.HOLD_SMOKE_FIXTURE_SELLER !== pk) throw new Error('the seat is not HOLD_SMOKE_FIXTURE_SELLER');
   const readState = () => (existsSync(statePath) ? JSON.parse(readFileSync(statePath, 'utf8')) : {});
   const writeState = (value) => {
@@ -259,16 +263,13 @@ async function main(mode) {
   // each deleted listing is gone from the homeserver, every guarded Nexus and the service. The seat is dedicated
   // to fixtures (sweep requires HOLD_SMOKE_FIXTURE_SELLER), so nothing under these paths is anyone else's.
   async function sweep() {
-    const session = await new Pubky().signer(seat).signinCookie();
     const ids = await names(LISTINGS);
-    try {
+    await withGrant(async (session) => {
       for (const id of ids) await session.storage.delete(`${LISTINGS}/${id}`);
       for (const path of [MEDIA, DELIVERABLES]) {
         for (const name of await names(path)) await session.storage.delete(`${path}/${name}`);
       }
-    } finally {
-      session.free?.();
-    }
+    });
     writeState({});
     const failures = [];
     for (const id of ids) {
@@ -287,14 +288,8 @@ async function main(mode) {
   }
 
   const sessions = [];
-  async function bearer() {
-    const client = new Pubky();
-    const flow = client.startCookieAuthFlow('/pub/pubky.app/:rw', AuthFlowKind.signin(), RELAY);
-    const tokenPromise = flow.awaitToken();
-    await client.signer(seat).approveAuthRequest(flow.authorizationUrl);
-    const response = await fetch(`${SERVICE}/v1/auth/sessions`, { method: 'POST', headers: { 'content-type': 'application/octet-stream' }, body: (await tokenPromise).toBytes() });
-    if (!response.ok) throw new Error(`session mint ${response.status}`);
-    const body = await response.json();
+  async function bearer(session) {
+    const body = await mintFixtureBearer({ session, pubky: pk, service: SERVICE });
     sessions.push(body);
     return body.token;
   }
@@ -308,8 +303,7 @@ async function main(mode) {
     if (mode === 'publish') {
       const user = await waitFor(`/v0/user/${pk}`, 200);
       if (user.timedOut) throw new Error(`the index has no user for the seat (status ${user.status}); publish its profile first`);
-      const session = await new Pubky().signer(seat).signinCookie();
-      try {
+      await withGrant(async (session) => {
         const state = readState();
         for (const kind of Object.keys(KINDS)) {
           if (state[kind] && (await onHomeserver(state[kind])) === true) {
@@ -334,7 +328,7 @@ async function main(mode) {
             throw error;
           }
           const reg = await fetch(`${SERVICE}/v1/commands`, {
-            method: 'POST', headers: { authorization: `Bearer ${await bearer()}`, 'content-type': 'application/json' },
+            method: 'POST', headers: { authorization: `Bearer ${await bearer(session)}`, 'content-type': 'application/json' },
             body: JSON.stringify(registerCommand(kind, record)),
           });
           if (reg.status !== 200) throw new Error(`${kind}: register ${reg.status}`);
@@ -342,9 +336,7 @@ async function main(mode) {
           log(`${kind}: ${listingId} index ${indexed.status} after ${indexed.ms} ms`);
           if (indexed.timedOut) throw new Error(`${kind}: the index did not show ${listingId}`);
         }
-      } finally {
-        session.free?.();
-      }
+      });
     }
     const state = readState();
     const out = {};
@@ -359,7 +351,11 @@ async function main(mode) {
     process.exitCode = Object.values(out).every((f) => f && f.homeserver === true && f.index === 200 && f.service === 200) ? 0 : 1;
   } finally {
     for (const { token, session_id: id } of sessions.splice(0)) {
-      await fetch(`${SERVICE}/v1/auth/sessions/${id}`, { method: 'DELETE', headers: { authorization: `Bearer ${token}` } }).catch(() => {});
+      const response = await fetch(`${SERVICE}/v1/auth/sessions/${id}`, { method: 'DELETE', headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(30_000) }).catch(() => null);
+      if (!response?.ok) {
+        log('fixture marketplace session revocation failed');
+        process.exitCode = 1;
+      }
     }
   }
 }
