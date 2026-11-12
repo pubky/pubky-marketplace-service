@@ -52,6 +52,7 @@ use super::config::{
 };
 use super::inbound::{self, Recorded};
 use super::ledger::{self, reason_is_informational, PushView, RetryOutcome};
+use super::product_sync::{self, Direction, FieldGroup, Resolution, ResolveOutcome};
 use super::provider::{
     AppKind, AuthorizeRequest, CallbackParams, CompleteRequest, ConnectRequest, ConnectorProvider,
     PendingConnection, ProviderError, ProviderKind, WebhookContext, WebhookHeaders,
@@ -1596,6 +1597,368 @@ pub async fn resolve_alert(
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => missing(),
         Err(cause) => internal("alert resolve", &cause),
+    }
+}
+
+// === Seller: product sync ====================================================
+
+const MAX_LISTING_ID_CHARS: usize = 128;
+
+fn sync_json(connection_id: Uuid, config: &product_sync::SyncConfig) -> Value {
+    json!({
+        "schema_version": 1,
+        "kind": "connector_sync",
+        "connection_id": connection_id,
+        "groups": FieldGroup::SYNCED
+            .iter()
+            .map(|group| json!({
+                "field_group": group.as_str(),
+                "direction": config.connection_direction(*group).as_str(),
+                "default": Direction::DEFAULT.as_str(),
+            }))
+            .collect::<Vec<_>>(),
+        "overrides": config
+            .overrides
+            .iter()
+            .map(|((listing_id, group), direction)| json!({
+                "listing_id": listing_id,
+                "field_group": group.as_str(),
+                "direction": direction.as_str(),
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+async fn sync_response(state: &AppState, connection_id: Uuid) -> Response {
+    let mut conn = match state.pool.acquire().await {
+        Ok(conn) => conn,
+        Err(cause) => return internal("sync settings", &cause),
+    };
+    match product_sync::load_config(&mut conn, connection_id).await {
+        Ok(config) => respond(StatusCode::OK, sync_json(connection_id, &config)),
+        Err(cause) => internal("sync settings", &cause),
+    }
+}
+
+/// `GET /v1/connectors/{id}/sync`: the connection's sync direction per field
+/// group and the listings' own overrides.
+pub async fn get_sync(
+    State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(response) = runtime(&state) {
+        return response;
+    }
+    let row = match owned(&state, &actor, &id).await {
+        Ok(row) => row,
+        Err(response) => return response,
+    };
+    sync_response(&state, row.id).await
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PutSyncRequest {
+    groups: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PutListingSyncRequest {
+    groups: BTreeMap<String, Option<String>>,
+}
+
+fn sync_group(name: &str) -> Result<FieldGroup, Response> {
+    FieldGroup::parse(name)
+        .filter(|group| FieldGroup::SYNCED.contains(group))
+        .ok_or_else(|| {
+            error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_field_group",
+                "field_group must be content, price or variants.",
+            )
+        })
+}
+
+fn sync_direction(name: &str) -> Result<Direction, Response> {
+    Direction::parse(name).ok_or_else(|| {
+        error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_direction",
+            "direction must be from_store or off.",
+        )
+    })
+}
+
+fn not_disconnected(row: &ConnectionRow) -> Result<(), Response> {
+    if row.status == "disconnected" {
+        return Err(error(
+            StatusCode::CONFLICT,
+            "connection_not_available",
+            "The connection was disconnected.",
+        ));
+    }
+    Ok(())
+}
+
+/// `PUT /v1/connectors/{id}/sync`: sets the connection's direction for the
+/// field groups given (others keep theirs). A group whose direction changes
+/// drops its pending changes and its base for the listings that follow the
+/// connection's setting.
+pub async fn put_sync(
+    State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<String>,
+    Json(request): Json<PutSyncRequest>,
+) -> Response {
+    if let Err(response) = runtime(&state) {
+        return response;
+    }
+    let row = match owned(&state, &actor, &id).await {
+        Ok(row) => row,
+        Err(response) => return response,
+    };
+    if let Err(response) = not_disconnected(&row) {
+        return response;
+    }
+    let mut changes = Vec::with_capacity(request.groups.len());
+    for (group, direction) in &request.groups {
+        match (sync_group(group), sync_direction(direction)) {
+            (Ok(group), Ok(direction)) => changes.push((group, direction)),
+            (Err(response), _) | (_, Err(response)) => return response,
+        }
+    }
+    if let Err(cause) =
+        product_sync::put_settings(&state.pool, state.clock.now(), row.id, &changes).await
+    {
+        return internal("sync settings", &cause);
+    }
+    sync_response(&state, row.id).await
+}
+
+/// `PUT /v1/connectors/{id}/sync/listings/{listing_id}`: sets a linked
+/// listing's own direction for the field groups given; `null` returns the
+/// group to the connection's setting.
+pub async fn put_listing_sync(
+    State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
+    Path((id, listing_id)): Path<(String, String)>,
+    Json(request): Json<PutListingSyncRequest>,
+) -> Response {
+    if let Err(response) = runtime(&state) {
+        return response;
+    }
+    let row = match owned(&state, &actor, &id).await {
+        Ok(row) => row,
+        Err(response) => return response,
+    };
+    if let Err(response) = not_disconnected(&row) {
+        return response;
+    }
+    if !clean_id(&listing_id, MAX_LISTING_ID_CHARS) {
+        return error(
+            StatusCode::NOT_FOUND,
+            "listing_not_linked",
+            "The listing is not linked to this store.",
+        );
+    }
+    let mut changes = Vec::with_capacity(request.groups.len());
+    for (group, direction) in &request.groups {
+        let group = match sync_group(group) {
+            Ok(group) => group,
+            Err(response) => return response,
+        };
+        let direction = match direction.as_deref().map(sync_direction).transpose() {
+            Ok(direction) => direction,
+            Err(response) => return response,
+        };
+        changes.push((group, direction));
+    }
+    match product_sync::put_override(
+        &state.pool,
+        state.clock.now(),
+        row.id,
+        &listing_id,
+        &changes,
+    )
+    .await
+    {
+        Ok(true) => sync_response(&state, row.id).await,
+        Ok(false) => error(
+            StatusCode::NOT_FOUND,
+            "listing_not_linked",
+            "The listing is not linked to this store.",
+        ),
+        Err(cause) => internal("listing sync", &cause),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChangesQuery {
+    limit: Option<i64>,
+}
+
+/// `GET /v1/connectors/{id}/changes`: the store changes waiting for the
+/// seller's Shop, oldest first, each with the listings it concerns, their
+/// direction for its group and their variant links.
+pub async fn list_changes(
+    State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<String>,
+    Query(query): Query<ChangesQuery>,
+) -> Response {
+    if let Err(response) = runtime(&state) {
+        return response;
+    }
+    let row = match owned(&state, &actor, &id).await {
+        Ok(row) => row,
+        Err(response) => return response,
+    };
+    let limit = query.limit.unwrap_or(DEFAULT_PAGE);
+    if !(1..=MAX_PAGE).contains(&limit) {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_limit",
+            "The page limit is invalid.",
+        );
+    }
+    let changes = match product_sync::list_pending(&state.pool, row.id, limit).await {
+        Ok(changes) => changes,
+        Err(cause) => return internal("change list", &cause),
+    };
+    let mappings = match store::list_mappings(&state.pool, row.id).await {
+        Ok(mappings) => mappings,
+        Err(cause) => return internal("change list", &cause),
+    };
+    let mut conn = match state.pool.acquire().await {
+        Ok(conn) => conn,
+        Err(cause) => return internal("change list", &cause),
+    };
+    let config = match product_sync::load_config(&mut conn, row.id).await {
+        Ok(config) => config,
+        Err(cause) => return internal("change list", &cause),
+    };
+    let body: Vec<Value> = changes
+        .iter()
+        .map(|change| {
+            let group = FieldGroup::parse(&change.field_group);
+            let mut listings: BTreeMap<&str, Vec<Value>> = BTreeMap::new();
+            for mapping in mappings
+                .iter()
+                .filter(|mapping| mapping.provider_product_id == change.provider_product_id)
+            {
+                listings
+                    .entry(&mapping.listing_id)
+                    .or_default()
+                    .push(json!({
+                        "variant_id": mapping.variant_id,
+                        "provider_variant_id": mapping.provider_variant_id,
+                    }));
+            }
+            json!({
+                "id": change.id,
+                "provider_product_id": change.provider_product_id,
+                "field_group": change.field_group,
+                "base": change.base,
+                "proposed": change.proposed,
+                "proposed_hash": hex::encode(&change.proposed_hash),
+                "detected_at": format_timestamp(change.detected_at),
+                "updated_at": format_timestamp(change.updated_at),
+                "listings": listings
+                    .into_iter()
+                    .map(|(listing_id, variants)| json!({
+                        "listing_id": listing_id,
+                        "direction": match group {
+                            Some(FieldGroup::Status) | None => "always",
+                            Some(group) => config.listing_direction(listing_id, group).as_str(),
+                        },
+                        "variants": variants,
+                    }))
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    respond(
+        StatusCode::OK,
+        json!({
+            "schema_version": 1,
+            "kind": "connector_product_changes",
+            "connection_id": row.id,
+            "changes": body,
+        }),
+    )
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveChangeRequest {
+    resolution: String,
+    proposed_hash: String,
+}
+
+/// `POST /v1/connectors/{id}/changes/{change_id}/resolve`: the Shop applied
+/// the proposal it read (`applied`, which moves the base to it) or the seller
+/// kept the listing as it is (`dismissed`). `proposed_hash` is the hash the
+/// Shop read; a proposal replaced since then answers `409 change_stale`.
+pub async fn resolve_change(
+    State(state): State<AppState>,
+    Extension(actor): Extension<Actor>,
+    Path((id, change_id)): Path<(String, String)>,
+    Json(request): Json<ResolveChangeRequest>,
+) -> Response {
+    if let Err(response) = runtime(&state) {
+        return response;
+    }
+    let row = match owned(&state, &actor, &id).await {
+        Ok(row) => row,
+        Err(response) => return response,
+    };
+    let missing = || {
+        error(
+            StatusCode::NOT_FOUND,
+            "change_not_found",
+            "The change was not found.",
+        )
+    };
+    let Ok(change_id) = Uuid::parse_str(&change_id) else {
+        return missing();
+    };
+    let Some(resolution) = Resolution::parse(&request.resolution) else {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_resolution",
+            "resolution must be applied or dismissed.",
+        );
+    };
+    let hash = match hex::decode(&request.proposed_hash) {
+        Ok(hash) if hash.len() == 32 => hash,
+        _ => {
+            return error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_proposed_hash",
+                "proposed_hash must be the change's 64-character hex hash.",
+            )
+        }
+    };
+    match product_sync::resolve(
+        &state.pool,
+        state.clock.now(),
+        row.id,
+        change_id,
+        resolution,
+        &hash,
+    )
+    .await
+    {
+        Ok(ResolveOutcome::Resolved) => StatusCode::NO_CONTENT.into_response(),
+        Ok(ResolveOutcome::NotFound) => missing(),
+        Ok(ResolveOutcome::Stale) => error(
+            StatusCode::CONFLICT,
+            "change_stale",
+            "The change was resolved or replaced since it was read; read the changes again.",
+        ),
+        Err(cause) => internal("change resolve", &cause),
     }
 }
 

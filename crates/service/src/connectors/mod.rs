@@ -29,6 +29,7 @@ pub mod keys;
 pub mod ledger;
 pub mod order_push;
 pub mod outbox;
+pub mod product_sync;
 pub mod provider;
 pub mod providers;
 pub mod recipient;

@@ -75,7 +75,7 @@ type Location {
 type LocationConnection {
   nodes: [Location!]!
 }
-enum LocationSortKeys { ID NAME RELEVANCE }
+enum LocationSortKeys { CREATED_AT ID NAME RELEVANCE }
 input MailingAddressInput {
   address1: String
   address2: String
@@ -344,6 +344,7 @@ type Product {
   onlineStoreUrl: URL
   options(first: Int): [ProductOption!]!
   productType: String!
+  status: ProductStatus!
   title: String!
   variants(first: Int, after: String, last: Int, before: String, reverse: Boolean, sortKey: ProductVariantSortKeys): ProductVariantConnection!
   vendor: String!
@@ -358,6 +359,7 @@ type ProductOption {
   values: [String!]!
 }
 enum ProductSortKeys { CREATED_AT ID INVENTORY_TOTAL PRODUCT_TYPE PUBLISHED_AT RELEVANCE TITLE UPDATED_AT VENDOR }
+enum ProductStatus { ACTIVE ARCHIVED DRAFT UNLISTED }
 type ProductVariant {
   id: ID!
   image: Image
@@ -375,7 +377,7 @@ type ProductVariantConnection {
   pageInfo: PageInfo!
 }
 enum ProductVariantInventoryPolicy { DENY CONTINUE }
-enum ProductVariantSortKeys { FULL_TITLE ID INVENTORY_LEVELS_AVAILABLE INVENTORY_MANAGEMENT INVENTORY_POLICY INVENTORY_QUANTITY NAME POPULAR POSITION RELEVANCE SKU TITLE }
+enum ProductVariantSortKeys { CREATED_AT FULL_TITLE ID INVENTORY_LEVELS_AVAILABLE INVENTORY_MANAGEMENT INVENTORY_POLICY INVENTORY_QUANTITY NAME POPULAR POSITION RELEVANCE SKU TITLE }
 type QueryRoot {
   currentAppInstallation: AppInstallation!
   inventoryItem(id: ID!): InventoryItem

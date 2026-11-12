@@ -570,6 +570,7 @@ impl ConnectorProvider for TestProvider {
                 .ok_or_else(|| ProviderError::Invalid("no event id".into()))?
                 .to_string(),
             topic: headers.get("x-test-topic").unwrap_or("unknown").to_string(),
+            shared_event_id: None,
         })
     }
 

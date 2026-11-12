@@ -10,7 +10,7 @@
 //!   way and the authorization code is exchanged for an offline access token,
 //!   which the framework seals. A grant missing any of
 //!   [`REQUIRED_SCOPES`] puts the connection in `needs_attention`.
-//! * **Webhooks.** After an install the five operational topics are
+//! * **Webhooks.** After an install the operational topics are
 //!   subscribed through the API ([`webhooks::SUBSCRIBED_TOPICS`]); the three
 //!   privacy topics are optional for a merchant's own app and can only be
 //!   configured in a deployed app configuration ([`webhooks::PRIVACY_TOPICS`]).
@@ -35,10 +35,10 @@ use uuid::Uuid;
 
 use crate::connectors::provider::{
     AppContext, AppKind, AuthorizeRequest, CallbackParams, CancelOrder, CatalogPage,
-    CompleteRequest, ConnectCompleted, ConnectRequest, ConnectStart, ConnectionCheck,
-    ConnectionContext, ConnectorProvider, CredentialSecret, ExternalOrder, InboundEvent, OrderPush,
-    ProviderError, ProviderKind, RefundRecord, ResolvedShop, ResolvedStock, StoreRefundTotals,
-    VerifiedWebhook, WebhookContext, WebhookHeaders,
+    CatalogProduct, CompleteRequest, ConnectCompleted, ConnectRequest, ConnectStart,
+    ConnectionCheck, ConnectionContext, ConnectorProvider, CredentialSecret, ExternalOrder,
+    InboundEvent, OrderPush, ProviderError, ProviderKind, RefundRecord, ResolvedShop,
+    ResolvedStock, StoreRefundTotals, VerifiedWebhook, WebhookContext, WebhookHeaders,
 };
 use client::{Client, Origin};
 
@@ -304,6 +304,20 @@ impl ConnectorProvider for ShopifyProvider {
         page: Option<&str>,
     ) -> Result<CatalogPage, ProviderError> {
         catalog::page(&self.client, &connection.shop, token(connection)?, page).await
+    }
+
+    async fn fetch_product(
+        &self,
+        connection: &ConnectionContext,
+        provider_product_id: &str,
+    ) -> Result<Option<CatalogProduct>, ProviderError> {
+        catalog::one(
+            &self.client,
+            &connection.shop,
+            token(connection)?,
+            provider_product_id,
+        )
+        .await
     }
 
     async fn resolve_inventory(

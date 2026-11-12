@@ -154,21 +154,40 @@ impl Rig {
         body: &Value,
         secret: &str,
     ) -> (StatusCode, Value) {
+        self.delivery(connection, event_id, None, topic, body, secret)
+            .await
+    }
+
+    /// A delivery with Shopify's delivery id (`X-Shopify-Webhook-Id`) as
+    /// well as the id of the event it belongs to.
+    async fn delivery(
+        &self,
+        connection: Uuid,
+        event_id: &str,
+        webhook_id: Option<&str>,
+        topic: &str,
+        body: &Value,
+        secret: &str,
+    ) -> (StatusCode, Value) {
         let bytes = serde_json::to_vec(body).expect("body");
         let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("key");
         mac.update(&bytes);
         let signature = STANDARD.encode(mac.finalize().into_bytes());
+        let mut headers = vec![
+            ("content-type", "application/json"),
+            ("x-shopify-hmac-sha256", signature.as_str()),
+            ("x-shopify-topic", topic),
+            ("x-shopify-event-id", event_id),
+            ("x-shopify-shop-domain", SHOP),
+        ];
+        if let Some(webhook_id) = webhook_id {
+            headers.push(("x-shopify-webhook-id", webhook_id));
+        }
         let (status, _, response) = raw(
             self.app.router.clone(),
             "POST",
             &format!("/v1/connectors/shopify/c/{connection}/webhooks"),
-            &[
-                ("content-type", "application/json"),
-                ("x-shopify-hmac-sha256", &signature),
-                ("x-shopify-topic", topic),
-                ("x-shopify-event-id", event_id),
-                ("x-shopify-shop-domain", SHOP),
-            ],
+            &headers,
             bytes,
         )
         .await;
@@ -221,7 +240,7 @@ async fn a_merchant_installs_their_own_custom_app_and_the_store_is_wired_up(pool
         assert!(!rendered.contains(secret), "{secret} left the service");
     }
 
-    // The six operational topics were subscribed to this connection's own
+    // The operational topics were subscribed to this connection's own
     // webhooks URL.
     let url = format!("https://service.test/v1/connectors/shopify/c/{id}/webhooks");
     let mut topics: Vec<String> = r
@@ -242,6 +261,8 @@ async fn a_merchant_installs_their_own_custom_app_and_the_store_is_wired_up(pool
             "INVENTORY_ITEMS_UPDATE",
             "INVENTORY_LEVELS_UPDATE",
             "ORDERS_CANCELLED",
+            "PRODUCTS_DELETE",
+            "PRODUCTS_UPDATE",
             "REFUNDS_CREATE"
         ]
     );
@@ -660,6 +681,125 @@ async fn an_inventory_webhook_resolves_its_variant_and_sets_the_listings_stock(p
         .expect("listing");
     assert_eq!(available, 3);
     r.fake.assert_clean();
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn deliveries_of_one_store_event_are_told_apart_by_their_delivery_id(pool: PgPool) {
+    let r = rig(pool).await;
+    let seller = new_actor(&r.app).await;
+    let connection = r.install(&seller).await;
+    let buyer = new_actor(&r.app).await;
+    create_paid_order(&r.app, &seller, &buyer).await;
+    map_listing(
+        &r.app,
+        &seller,
+        connection,
+        "boots_01",
+        PRODUCT,
+        "gid://shopify/ProductVariant/50003",
+    )
+    .await;
+    let rows = |id: &'static str| {
+        let pool = r.app.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM connector_inbound_events WHERE provider_event_id = $1",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("count")
+        }
+    };
+
+    // A sale in the store: one event, delivered once per subscribed topic,
+    // the product delivery first.
+    for (webhook_id, topic, body) in [
+        (
+            "dlv-product",
+            "products/update",
+            json!({ "id": 9001, "admin_graphql_api_id": PRODUCT }),
+        ),
+        (
+            "dlv-level",
+            "inventory_levels/update",
+            json!({ "inventory_item_id": 4242, "location_id": 1001, "available": 1 }),
+        ),
+    ] {
+        let (status, body) = r
+            .delivery(
+                connection,
+                "evt-sale",
+                Some(webhook_id),
+                topic,
+                &body,
+                APP_SECRET,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    worker::drive_inbound(&r.app.state, 10)
+        .await
+        .expect("drive");
+    let available: i64 = sqlx::query_scalar(list_available_sql())
+        .bind(&seller.pubky)
+        .fetch_one(&r.app.pool)
+        .await
+        .expect("listing");
+    assert_eq!(available, 3, "the stock delivery was applied, not dropped");
+    assert_eq!((rows("dlv-product").await, rows("dlv-level").await), (1, 1));
+
+    // Shopify's retry of a delivery keeps its delivery id.
+    let (status, _) = r
+        .delivery(
+            connection,
+            "evt-sale",
+            Some("dlv-level"),
+            "inventory_levels/update",
+            &json!({ "inventory_item_id": 4242, "location_id": 1001, "available": 1 }),
+            APP_SECRET,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(rows("dlv-level").await, 1);
+
+    // A delivery recorded under its event id is still recognised when
+    // retried with a delivery id; another topic of that event is not.
+    sqlx::query(
+        "INSERT INTO connector_inbound_events \
+         (id, connection_id, provider, provider_event_id, topic, event, state, attempts, \
+          next_attempt_at, received_at, processed_at) \
+         VALUES ($1, $2, 'shopify', 'evt-earlier', 'inventory_levels/update', '{}', 'applied', \
+                 1, now(), now(), now())",
+    )
+    .bind(Uuid::new_v4())
+    .bind(connection)
+    .execute(&r.app.pool)
+    .await
+    .expect("earlier row");
+    for (webhook_id, topic) in [
+        ("dlv-earlier-retry", "inventory_levels/update"),
+        ("dlv-earlier-product", "products/update"),
+    ] {
+        let (status, _) = r
+            .delivery(
+                connection,
+                "evt-earlier",
+                Some(webhook_id),
+                topic,
+                &json!({ "id": 9001, "inventory_item_id": 4242, "available": 1 }),
+                APP_SECRET,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    assert_eq!(
+        (
+            rows("dlv-earlier-retry").await,
+            rows("dlv-earlier-product").await
+        ),
+        (0, 1)
+    );
 }
 
 async fn listing_stock(r: &Rig, seller: &str) -> (i64, i64, i64, String, bool) {
