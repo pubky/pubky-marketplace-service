@@ -843,7 +843,7 @@ async fn a_late_delete_delivery_does_not_override_a_newer_read(pool: PgPool) {
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_direction_change_waits_for_a_first_read_in_flight_and_drops_its_base(pool: PgPool) {
     let r = rig(pool).await;
-    // A first observation of the boots, its snapshot inserted but not yet
+    // A first observation of the boots, its bases written but not yet
     // committed.
     let mut first_read = r.app.pool.begin().await.expect("begin");
     sqlx::query(
@@ -851,7 +851,11 @@ async fn a_direction_change_waits_for_a_first_read_in_flight_and_drops_its_base(
          (connection_id, provider_product_id, content, price, variants, status, checked_at, \
           created_at) \
          VALUES ($1, $2, '{\"title\":\"Trail Boots\"}', '{}', '{}', \
-                 '{\"available\":true}', now(), now())",
+                 '{\"available\":true}', now(), now()) \
+         ON CONFLICT (connection_id, provider_product_id) DO UPDATE SET \
+             content = EXCLUDED.content, price = EXCLUDED.price, \
+             variants = EXCLUDED.variants, status = EXCLUDED.status, \
+             checked_at = EXCLUDED.checked_at",
     )
     .bind(r.connection)
     .bind(BOOTS)
@@ -1176,7 +1180,18 @@ async fn migration_0097_gives_each_group_the_shared_rebase_instant_and_reruns(po
     const MIGRATION_0097: &str =
         include_str!("../migrations/0097_connector_product_sync_fences.sql");
     let r = rig(pool).await;
+    r.link_mug().await;
     r.poll().await;
+    // A product linked before 0097 may have no snapshot yet.
+    sqlx::query(
+        "DELETE FROM connector_product_snapshots \
+         WHERE connection_id = $1 AND provider_product_id = $2",
+    )
+    .bind(r.connection)
+    .bind(MUG)
+    .execute(&r.app.pool)
+    .await
+    .expect("no mug snapshot");
     let shared = r.now() + chrono::Duration::seconds(30);
     let own = r.now() + chrono::Duration::seconds(60);
     sqlx::query(
@@ -1214,4 +1229,61 @@ async fn migration_0097_gives_each_group_the_shared_rebase_instant_and_reruns(po
     .await
     .expect("snapshot");
     assert_eq!(instants, (Some(shared), Some(own), Some(shared), None));
+    let mug_based: Option<bool> = sqlx::query_scalar(
+        "SELECT content IS NOT NULL OR price IS NOT NULL OR variants IS NOT NULL \
+                OR status IS NOT NULL \
+         FROM connector_product_snapshots WHERE connection_id = $1 AND provider_product_id = $2",
+    )
+    .bind(r.connection)
+    .bind(MUG)
+    .fetch_optional(&r.app.pool)
+    .await
+    .expect("mug snapshot");
+    assert_eq!(
+        mug_based,
+        Some(false),
+        "a linked product gets an empty snapshot row"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_first_read_from_before_an_unlink_is_dropped_after_the_product_is_linked_again(
+    pool: PgPool,
+) {
+    let r = rig(pool).await;
+    // The boots' first read starts before the service has seen them and is
+    // delayed past an unlink and a relink.
+    let slow_read_started = r.now();
+    let old = r.store_product(BOOTS).await;
+    r.app.clock.advance_seconds(5);
+    r.edit(BOOTS, json!({ "title": "Trail Boots II" }));
+    let (status, body) = r.call("PUT", "/mappings", &json!({ "mappings": [] })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    map_listing(
+        &r.app,
+        &r.seller,
+        r.connection,
+        "boots_01",
+        BOOTS,
+        BOOTS_VARIANT,
+    )
+    .await;
+    let late_removal =
+        product_sync::observe_removed(&r.app.pool, slow_read_started, r.connection, BOOTS)
+            .await
+            .expect("observe");
+    assert!(late_removal.stale, "{late_removal:?}");
+    let late = product_sync::observe(&r.app.pool, slow_read_started, r.connection, &old)
+        .await
+        .expect("observe");
+    assert!(late.stale, "a read of the previous link: {late:?}");
+    assert_eq!(r.changes().await, Vec::<Value>::new());
+
+    r.app.clock.advance_seconds(5);
+    r.poll().await;
+    r.edit(BOOTS, json!({ "title": "Trail Boots III" }));
+    r.app.clock.advance_seconds(5);
+    r.poll().await;
+    let changes = r.changes().await;
+    assert_eq!(only(&changes, "content")["base"]["title"], "Trail Boots II");
 }

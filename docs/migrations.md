@@ -703,10 +703,11 @@ and listings are never written by the service.
 group's direction last changed for the product; only a read that started
 after it may take the group's new base) and `unlinked_at` (when the product
 was last found linked to no listing; a read that started before it was made
-for a previous link and is dropped). An unlinked product's snapshot row now
-stays, emptied of its bases, to carry that fence. `rebased_at` from 0096 is
-copied into each group's column and is no longer read or written. Directly
-rerunnable.
+for a previous link and is dropped). A linked product has a snapshot row from
+its link on, and an unlinked product's row stays, emptied of its bases, to
+carry that fence; 0097 inserts an empty row for every linked product that has
+none. `rebased_at` from 0096 is copied into each group's column and is no
+longer read or written. Directly rerunnable.
 
 **Deploy mode: rolling, together with 0096.** A binary from before 0097 keeps
 reading `rebased_at` and deleting unlinked snapshots, which only loses the

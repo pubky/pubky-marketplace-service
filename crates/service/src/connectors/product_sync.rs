@@ -957,7 +957,9 @@ async fn rebase(
 /// to `now`: a read that started before it was made for the previous link,
 /// and is dropped even when it completes after the product is linked again.
 /// Every call moves the fence of every product still unlinked, which only
-/// drops reads that started while nothing linked the product.
+/// drops reads that started while nothing linked the product. Every linked
+/// product is given a snapshot row here, so that one whose first read is
+/// still in flight has a row for its unlink to fence.
 pub async fn forget_unlinked(
     tx: &mut Transaction<'_, Postgres>,
     now: DateTime<Utc>,
@@ -966,6 +968,25 @@ pub async fn forget_unlinked(
     // The same lock as the direction changes, taken before any snapshot or
     // override row: both touch overrides and snapshots, in opposite orders.
     lock_config(tx, connection_id).await?;
+    let linked: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT provider_product_id FROM connector_variant_map \
+         WHERE connection_id = $1 ORDER BY provider_product_id",
+    )
+    .bind(connection_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO connector_product_snapshots \
+         (connection_id, provider_product_id, checked_at, created_at) \
+         SELECT $1, product, 'epoch'::timestamptz, $3 \
+         FROM unnest($2::text[]) AS product ORDER BY product \
+         ON CONFLICT (connection_id, provider_product_id) DO NOTHING",
+    )
+    .bind(connection_id)
+    .bind(&linked)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
     let orphans: Vec<String> = sqlx::query_scalar(
         "SELECT s.provider_product_id FROM connector_product_snapshots s \
          WHERE s.connection_id = $1 AND NOT EXISTS ( \
