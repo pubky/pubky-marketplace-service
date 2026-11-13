@@ -4958,6 +4958,40 @@ async fn concurrent_passes_record_the_first_sighting_of_a_malformed_binding_once
         TEST_BUNDLE_ID,
         LocksLookupOutcome::CompletedMalformedBinding,
     );
+    let (first, second) =
+        two_passes_meeting_on_the_held_correlation(&app, &fake, &order.payment_id).await;
+    assert_eq!((first, second), (0, 0), "nothing is applied while retrying");
+    assert_eq!(
+        observation_history(&app.pool, &order.payment_id).await,
+        vec![(
+            "completed".to_string(),
+            "retry_binding_malformed".to_string()
+        )],
+        "the first sighting is recorded once"
+    );
+    assert_eq!(
+        correlation_outcome(&app.pool, &order.payment_id).await,
+        (
+            "pending".to_string(),
+            Some("retry_binding_malformed".to_string())
+        )
+    );
+    assert_eq!(
+        payment_state(&app.pool, &order.payment_id).await.0,
+        "awaiting_entitlement"
+    );
+}
+
+/// Runs two worker passes over the same correlation (the second re-claims it
+/// after the poll interval while the first one's lookup is in flight) and
+/// lets both reach their writes at the same instant: the test holds the
+/// correlation row until both passes wait on a lock, then releases it.
+/// Returns what each pass applied.
+async fn two_passes_meeting_on_the_held_correlation(
+    app: &TestApp,
+    fake: &FakeLocksClient,
+    payment_id: &str,
+) -> (u64, u64) {
     let locks = app.state.locks.clone().expect("locks runtime");
     let spawn_pass = |now| {
         let state = app.state.clone();
@@ -4979,7 +5013,7 @@ async fn concurrent_passes_record_the_first_sighting_of_a_malformed_binding_once
 
     let mut holder = app.pool.begin().await.expect("holder transaction");
     sqlx::query("SELECT id FROM payment_locks_correlations WHERE payment_id = $1::uuid FOR UPDATE")
-        .bind(&order.payment_id)
+        .bind(payment_id)
         .execute(&mut *holder)
         .await
         .expect("correlation row held");
@@ -5002,24 +5036,35 @@ async fn concurrent_passes_record_the_first_sighting_of_a_malformed_binding_once
         .await
         .expect("second pass joins")
         .expect("second pass");
-    assert_eq!((first, second), (0, 0), "nothing is applied while retrying");
-    assert_eq!(
-        observation_history(&app.pool, &order.payment_id).await,
-        vec![(
-            "completed".to_string(),
-            "retry_binding_malformed".to_string()
-        )],
-        "the first sighting is recorded once"
+    (first, second)
+}
+
+// Two passes that both saw the task `in_progress` record that status once:
+// the observation is written only if the stored status still differs.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn concurrent_passes_record_a_nonterminal_status_once(pool: PgPool) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order =
+        registered_digital_locks_order(&app, &seller, &buyer, "boots_01", TEST_BUNDLE_ID, 0xF41)
+            .await;
+    fake.set_outcome(
+        TEST_BUNDLE_ID,
+        LocksLookupOutcome::Status(LocksTaskStatus::InProgress),
     );
+
+    let (first, second) =
+        two_passes_meeting_on_the_held_correlation(&app, &fake, &order.payment_id).await;
+    assert_eq!((first, second), (0, 0));
+    let in_progress = observation_history(&app.pool, &order.payment_id)
+        .await
+        .into_iter()
+        .filter(|(status, _)| status == "in_progress")
+        .count();
+    assert_eq!(in_progress, 1, "the status is recorded once");
     assert_eq!(
         correlation_outcome(&app.pool, &order.payment_id).await,
-        (
-            "pending".to_string(),
-            Some("retry_binding_malformed".to_string())
-        )
-    );
-    assert_eq!(
-        payment_state(&app.pool, &order.payment_id).await.0,
-        "awaiting_entitlement"
+        ("pending".to_string(), Some("in_progress".to_string()))
     );
 }
