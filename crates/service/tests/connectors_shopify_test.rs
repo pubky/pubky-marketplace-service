@@ -802,6 +802,79 @@ async fn deliveries_of_one_store_event_are_told_apart_by_their_delivery_id(pool:
     );
 }
 
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn deliveries_of_one_topic_for_one_store_event_are_each_recorded_and_applied(pool: PgPool) {
+    let r = rig(pool).await;
+    let seller = new_actor(&r.app).await;
+    let connection = r.install(&seller).await;
+    let buyer = new_actor(&r.app).await;
+    create_paid_order(&r.app, &seller, &buyer).await;
+    map_listing(
+        &r.app,
+        &seller,
+        connection,
+        "boots_01",
+        PRODUCT,
+        "gid://shopify/ProductVariant/50003",
+    )
+    .await;
+
+    // One order drawn from two locations: one event, one inventory delivery
+    // per location, each with its own delivery id.
+    for (webhook_id, location) in [("dlv-location-1", 1001), ("dlv-location-2", 1002)] {
+        let (status, body) = r
+            .delivery(
+                connection,
+                "evt-two-locations",
+                Some(webhook_id),
+                "inventory_levels/update",
+                &json!({ "inventory_item_id": 4242, "location_id": location, "available": 1 }),
+                APP_SECRET,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    worker::drive_inbound(&r.app.state, 10)
+        .await
+        .expect("drive");
+    let recorded: Vec<(String, String, String, bool)> = sqlx::query_as(
+        "SELECT provider_event_id, state, outcome, processed_at IS NOT NULL \
+         FROM connector_inbound_events \
+         WHERE connection_id = $1 AND topic = 'inventory_levels/update' \
+         ORDER BY provider_event_id",
+    )
+    .bind(connection)
+    .fetch_all(&r.app.pool)
+    .await
+    .expect("inbound rows");
+    assert_eq!(
+        recorded
+            .iter()
+            .map(|(delivery, _, _, processed)| (delivery.as_str(), *processed))
+            .collect::<Vec<_>>(),
+        vec![("dlv-location-1", true), ("dlv-location-2", true)],
+        "both deliveries are recorded and processed: {recorded:?}"
+    );
+    // The worker takes them in either order: the first sets the store's
+    // stock, the second reads the same stock and finds nothing to change.
+    let mut outcomes: Vec<(&str, &str)> = recorded
+        .iter()
+        .map(|(_, state, outcome, _)| (state.as_str(), outcome.as_str()))
+        .collect();
+    outcomes.sort();
+    assert_eq!(
+        outcomes,
+        vec![("applied", "delta 3"), ("ignored", "unchanged")],
+        "{recorded:?}"
+    );
+    let available: i64 = sqlx::query_scalar(list_available_sql())
+        .bind(&seller.pubky)
+        .fetch_one(&r.app.pool)
+        .await
+        .expect("listing");
+    assert_eq!(available, 3);
+}
+
 async fn listing_stock(r: &Rig, seller: &str) -> (i64, i64, i64, String, bool) {
     sqlx::query_as(
         "SELECT available_quantity, sold_quantity, total_quantity, state, made_to_order \
