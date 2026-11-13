@@ -2329,22 +2329,89 @@ advance a payment (ADR-0019 §7).
   pending correlations (bounded batches, one lookup per correlation per
   `LOCKS_POLL_SECONDS`), decrypts the bundle id, and performs a real
   `POST /verification-task-lookups` against the configured Lock Server
-  (pinned contract commit `ba49a777`; tests drive the same code path
-  through a fake lifecycle client — production only ever constructs the
-  HTTP client). Verification is a pure function of what Locks reports:
-  - `completed` → the payment advances `awaiting_entitlement → confirmed`
+  (lifecycle statuses as of contract commit `ba49a777`, plus the
+  `client_binding` echo that Locks v0.1.1-rc2 added; tests drive the same
+  code path through a fake lifecycle client — production only ever
+  constructs the HTTP client). Verification is a pure function of what Locks reports:
+  - `completed` with a matching client binding (below) → the payment
+    advances `awaiting_entitlement → confirmed`
     **exactly once**, enforced by the payment-state compare-and-swap plus
     the `events_one_payment_confirmed` unique index rather than
     application logic; the confirmation applies the same effects as the
     sandbox path (order `paid`, receipt issued, inventory converted,
     `payment_confirmed` outbox intent). Duplicate or reordered completions
     are harmless no-ops.
+  - `completed` without a matching client binding → never confirms, never
+    reaches the late-money paths, and polling stops (a malformed binding or
+    unopenable sealed facts after a bounded retry); a binding for other terms
+    leaves the payment to its window, anything else parks it in
+    `manual_review`; see "Client binding".
   - `pending` / `in_progress` / not-found / transport or status failure →
     the payment stays untouched and the correlation stays pending (Locks
     v1 leaves transport/status failures pending and exposes no terminal
     payment failure to the viewer).
   - `failed` / `expired` (the Locks task aged out) → recorded as an
     upstream fact and polling stops; the payment is **not** expired by it.
+- **Client binding.** `payment.prepare_locks` mints one `client_reference`
+  per payment (32 random bytes, base64url) and returns it only to the buyer;
+  the service keeps it sealed beside the sealed lock resource and the
+  criterion id of the checkout snapshot. The same result names the prepared
+  terms without the resource: `lock_resource_hash` (BLAKE3 hex of the
+  checkout-time lock resource, the value already on the correlation) and
+  `criterion_id`, so a client holding a listing the seller edited after checkout
+  can tell it is no longer the lock this payment was prepared against and
+  refuse before it submits a bundle. The Shop submits the reference
+  inside the proof bundle, and a Lock Server at v0.1.1-rc2 or later echoes
+  it on the lifecycle as `client_binding: { client_reference,
+  pubky_lock_resource, criterion_ids }`. A `completed` task qualifies the
+  payment only when **all three** fields equal the prepared terms: the
+  reference exactly (constant-time, no case folding or trimming), the lock
+  resource after canonicalization (the Lock Server writes the creator as
+  `pubky<creator>`), and `criterion_ids` equal to the single prepared
+  criterion. The task is write-once, so every outcome below ends polling
+  (the last two after a bounded retry): the correlation moves to
+  `upstream_failed`, its
+  `last_observed_status` and one `payment_locks_observations` row carry a
+  static label, and no value from either side is stored or logged beyond
+  which fields differed.
+  - `binding_mismatch` (a binding for other terms): the payment is left to
+    its window like an upstream failure; the window expires it, cancels the
+    order and returns the unit. This closes the replay of a bundle completed
+    for another order, another lock of the same creator, or another
+    application.
+  - `binding_missing` (no binding: a bundle submitted without the reference,
+    for example from a Shop tab loaded before the reference existed) and
+    `binding_unverifiable` (a correlation registered before preparation
+    existed, with nothing to compare against): the buyer may have paid, so
+    the fact is kept for an operator. An `awaiting_entitlement` or `expired`
+    payment moves to `manual_review` (one `payment.manual_review` event,
+    `review_reason` unset) and never confirms. The window still cancels the
+    order and returns the unit, because nothing ties that money to this
+    order; the payment stays in `manual_review`.
+  - `binding_malformed` (a binding present but not the documented shape) and
+    `binding_unopenable` (the sealed facts do not open under the configured
+    key): the row stays pending and is retried, since a Lock Server fault or a
+    key configuration can be repaired, for one day
+    (`workers::LOCKS_UNVERIFIED_RETRY_SECONDS`) from the first sighting,
+    which is recorded once as `retry_binding_malformed` /
+    `retry_binding_unopenable`. Then the payment is parked exactly like
+    `binding_missing`.
+
+  Parking takes the payment row lock, then a compare-and-swap on the pending
+  correlation, so two passes, a window sweep and a redelivered lookup park a
+  payment at most once. Paykit's manual-review watchers (SLA alert, seven-day
+  abandonment) and the seller's resolve endpoint select Paykit payments only:
+  a parked Locks payment gets no alert, no automatic outcome and no refund
+  request. Buyer and seller both see the payment `manual_review` and the
+  order `pending_payment`, then `cancelled` once the window ends; no receipt,
+  confirmation or notification is produced. Recovery is an operator decision
+  outside the service (there is no Locks resolver): the correlation label,
+  the observation rows and the events say what happened.
+
+  Rollout: Lock Server at v0.1.1-rc2 or later and a Shop that submits the
+  reference must both be live before this service verifies completions;
+  otherwise every Locks completion arrives without a binding and is parked
+  in `manual_review` instead of confirming.
 - **Expiry vs late completion.** The `payment_window` task sweeps the
   ORDER's hold window (`LOCKS_PAYMENT_WINDOW_SECONDS`, armed at
   registration — the correlation window IS the hold window): once it

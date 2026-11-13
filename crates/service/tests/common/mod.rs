@@ -39,7 +39,7 @@ use marketplace_service::grant::test_support::GrantTestAuthority;
 use marketplace_service::homeserver::{HomeserverListingClient, HttpHomeserverClient};
 use marketplace_service::http::build_router;
 use marketplace_service::locks::{
-    LocksKeys, LocksLifecycleClient, LocksLookupOutcome, LocksRuntime,
+    LocksClientBinding, LocksKeys, LocksLifecycleClient, LocksLookupOutcome, LocksRuntime,
 };
 use marketplace_service::payments::{
     paykit_signature_preimage, PaykitApi, PaykitClient, PaykitStatusOutcome, PaykitStatusSource,
@@ -515,6 +515,7 @@ pub async fn confirm_via_paypal(
 pub struct FakeLocksClient {
     outcomes: Mutex<HashMap<String, LocksLookupOutcome>>,
     lookups: Mutex<Vec<(String, String)>>,
+    parked: Mutex<Option<Arc<tokio::sync::Notify>>>,
 }
 
 impl FakeLocksClient {
@@ -523,6 +524,44 @@ impl FakeLocksClient {
             .lock()
             .expect("fake outcomes lock")
             .insert(bundle_id.to_string(), outcome);
+    }
+
+    /// Scripts a completed task whose echoed `client_binding` equals the
+    /// terms the service prepared for `payment_id`, in the Lock Server's own
+    /// form (`pubky<creator>/pub/...`). Tests that are not about the binding
+    /// use it to model a Lock Server holding the bundle the Shop submitted;
+    /// tests of the binding script `LocksClientBinding` values directly.
+    pub async fn complete_matching(&self, pool: &PgPool, bundle_id: &str, payment_id: &str) {
+        let payment_uuid: uuid::Uuid = payment_id.parse().expect("payment id is a uuid");
+        let (reference, resource, criterion): (Vec<u8>, Vec<u8>, String) = sqlx::query_as(
+            "SELECT client_reference_ciphertext, expected_resource_ciphertext, criterion_id \
+             FROM payment_locks_correlations WHERE payment_id = $1",
+        )
+        .bind(payment_uuid)
+        .fetch_one(pool)
+        .await
+        .expect("the payment has a prepared correlation");
+        let expected = test_locks_keys()
+            .open_expected_binding(payment_uuid, &reference, &resource, &criterion)
+            .expect("the prepared binding opens under the test keys");
+        self.set_outcome(
+            bundle_id,
+            LocksLookupOutcome::Completed(Some(LocksClientBinding {
+                client_reference: expected.client_reference,
+                pubky_lock_resource: format!("pubky{}", expected.lock_resource),
+                criterion_ids: vec![expected.criterion_id],
+            })),
+        );
+    }
+
+    /// Parks the next lookup after it is recorded and before it answers, until
+    /// the returned handle is notified: the Lock Server response is then in
+    /// flight while the test advances the clock, sweeps windows or runs a
+    /// second pass. Later lookups answer immediately.
+    pub fn park_next_lookup(&self) -> Arc<tokio::sync::Notify> {
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.parked.lock().expect("fake park lock") = Some(release.clone());
+        release
     }
 
     pub fn lookup_count(&self) -> usize {
@@ -546,12 +585,16 @@ impl LocksLifecycleClient for FakeLocksClient {
                 .lock()
                 .expect("fake lookups lock")
                 .push((creator.to_string(), bundle_id.to_string()));
-            *self
-                .outcomes
+            let parked = self.parked.lock().expect("fake park lock").take();
+            if let Some(release) = parked {
+                release.notified().await;
+            }
+            self.outcomes
                 .lock()
                 .expect("fake outcomes lock")
                 .get(bundle_id)
-                .unwrap_or(&LocksLookupOutcome::NotFound)
+                .cloned()
+                .unwrap_or(LocksLookupOutcome::NotFound)
         })
     }
 }

@@ -609,12 +609,9 @@ async fn resolve_refuses_a_locks_manual_review(pool: PgPool) {
         .await
         .expect("payment marked expired without releasing the hold");
     let after_window = app.clock.now() + chrono::Duration::seconds(60);
-    locks.set_outcome(
-        TEST_BUNDLE_ID,
-        marketplace_service::locks::LocksLookupOutcome::Status(
-            marketplace_service::locks::LocksTaskStatus::Completed,
-        ),
-    );
+    locks
+        .complete_matching(&app.pool, TEST_BUNDLE_ID, &order.payment_id)
+        .await;
     let applied = verify_due_locks_lifecycles(
         &app.state,
         app.state.locks.as_ref().expect("locks runtime"),

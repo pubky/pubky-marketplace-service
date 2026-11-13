@@ -10,15 +10,18 @@
 //!   HMAC-SHA256(lookup key, creator ‖ bundle id) — the raw value is never
 //!   stored, indexed, logged, or placed in a URL.
 //! - **Independent verification.** [`LocksLifecycleClient`] is the lifecycle
-//!   lookup (`POST /verification-task-lookups` on the Lock Server, pinned
-//!   contract commit `ba49a777`). The production implementation
+//!   lookup (`POST /verification-task-lookups` on the Lock Server: statuses as
+//!   of contract commit `ba49a777`, plus the `client_binding` echo added in
+//!   Locks v0.1.1-rc2). The production implementation
 //!   ([`HttpLocksClient`]) performs a real HTTP call; the trait exists so
 //!   tests can exercise every lifecycle outcome without a live Lock Server,
 //!   and no configuration path substitutes a fake in production
 //!   ([`runtime_from_env`] only ever constructs the HTTP client).
 //!
 //! Verification is a pure function of what Locks reports: nothing in this
-//! module accepts a client-supplied status.
+//! module accepts a client-supplied status. A `completed` task qualifies a
+//! payment only when its echoed `client_binding` equals the facts the
+//! service sealed at preparation ([`LocksClientBinding::verify`]).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -27,9 +30,11 @@ use std::time::Duration;
 
 use base64::Engine;
 use hmac::{Hmac, Mac};
+use marketplace_domain::commands::canonical_lock_resource;
 use rand::RngCore;
 use serde::Deserialize;
 use sha2::Sha256;
+use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 #[cfg(test)]
@@ -134,6 +139,31 @@ impl LocksKeys {
         String::from_utf8(plaintext).ok()
     }
 
+    /// Opens the facts sealed at preparation that a completed task must echo.
+    /// `None` when either ciphertext does not authenticate for this payment
+    /// (tampering or a key rotation) or the sealed resource is not a lock
+    /// resource: the caller must not confirm on a binding it cannot rebuild.
+    pub fn open_expected_binding(
+        &self,
+        payment_id: Uuid,
+        client_reference_ciphertext: &[u8],
+        resource_ciphertext: &[u8],
+        criterion_id: &str,
+    ) -> Option<ExpectedLocksBinding> {
+        let client_reference = self.open_prepared_value(
+            payment_id,
+            b"locks-client-reference:",
+            client_reference_ciphertext,
+        )?;
+        let resource =
+            self.open_prepared_value(payment_id, b"locks-resource:", resource_ciphertext)?;
+        Some(ExpectedLocksBinding {
+            client_reference,
+            lock_resource: canonical_lock_resource(&resource)?,
+            criterion_id: criterion_id.to_string(),
+        })
+    }
+
     /// Seals the minted client reference for the durable prepare command
     /// result: the same domain separation as the sealed correlation column,
     /// additionally bound to the buyer so the stored result can only be
@@ -223,7 +253,6 @@ pub async fn purge_terminal_locks_checkout_snapshots(
 pub enum LocksTaskStatus {
     Pending,
     InProgress,
-    Completed,
     Failed,
     Expired,
 }
@@ -233,11 +262,147 @@ impl LocksTaskStatus {
         match self {
             LocksTaskStatus::Pending => "pending",
             LocksTaskStatus::InProgress => "in_progress",
-            LocksTaskStatus::Completed => "completed",
             LocksTaskStatus::Failed => "failed",
             LocksTaskStatus::Expired => "expired",
         }
     }
+}
+
+/// The `client_binding` a Lock Server echoes on a lifecycle response when
+/// the submitted bundle carried a `client_reference` (Locks `docs/API.md`,
+/// `POST /verification-task-lookups`, since v0.1.1-rc2): the reference as
+/// submitted, the lock resource the task verifies and the submitted proofs'
+/// criterion ids in submission order. The task is write-once, so these
+/// values never change after admission.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+pub struct LocksClientBinding {
+    pub client_reference: String,
+    pub pubky_lock_resource: String,
+    pub criterion_ids: Vec<String>,
+}
+
+/// The reference and the lock resource never appear in logs.
+impl std::fmt::Debug for LocksClientBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocksClientBinding")
+            .field("client_reference", &"<redacted>")
+            .field("pubky_lock_resource", &"<redacted>")
+            .field("criterion_ids", &self.criterion_ids)
+            .finish()
+    }
+}
+
+/// The facts the service holds for one prepared payment, opened from the
+/// correlation row: what a completed task must echo to qualify it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ExpectedLocksBinding {
+    pub client_reference: String,
+    pub lock_resource: String,
+    pub criterion_id: String,
+}
+
+/// The reference and the lock resource never appear in logs.
+impl std::fmt::Debug for ExpectedLocksBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExpectedLocksBinding")
+            .field("client_reference", &"<redacted>")
+            .field("lock_resource", &"<redacted>")
+            .field("criterion_id", &self.criterion_id)
+            .finish()
+    }
+}
+
+/// Static labels for a completed task the service cannot verify against the
+/// prepared payment. Each parks the payment in `manual_review`; none
+/// confirms. Written to `payment_locks_correlations.last_observed_status`
+/// and `payment_locks_observations.outcome`.
+pub mod unverified {
+    /// The Lock Server echoed no `client_binding`.
+    pub const MISSING: &str = "binding_missing";
+    /// The correlation predates preparation and holds no sealed facts.
+    pub const UNVERIFIABLE: &str = "binding_unverifiable";
+    /// The echoed `client_binding` is not the documented shape.
+    pub const MALFORMED: &str = "binding_malformed";
+    /// The sealed facts do not open under the configured key.
+    pub const UNOPENABLE: &str = "binding_unopenable";
+    /// Every label above, for queries that select parked payments.
+    pub const ALL: [&str; 4] = [MISSING, UNVERIFIABLE, MALFORMED, UNOPENABLE];
+}
+
+/// Why a completed task does not qualify its payment. Each variant is a
+/// terminal fact about an immutable task, never a transient condition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingRefusal {
+    /// The Lock Server returned no `client_binding`: the bundle was
+    /// submitted without the reference the service minted. The payment is
+    /// parked for review rather than dropped: the buyer may have paid
+    /// through a client that predates the reference.
+    Missing,
+    /// At least one of the three fields differs from the expected value.
+    Mismatch {
+        client_reference: bool,
+        lock_resource: bool,
+        criterion_ids: bool,
+    },
+}
+
+impl BindingRefusal {
+    /// The static vocabulary written to `payment_locks_observations.outcome`
+    /// and `payment_locks_correlations.last_observed_status`.
+    pub fn outcome(self) -> &'static str {
+        match self {
+            BindingRefusal::Missing => unverified::MISSING,
+            BindingRefusal::Mismatch { .. } => "binding_mismatch",
+        }
+    }
+}
+
+impl LocksClientBinding {
+    /// Accepts a completed task for this payment only when all three
+    /// fields equal the expected terms. An absent binding never matches.
+    /// All three comparisons always run, so the verdict names every field
+    /// that differs and the time taken does not depend on which one does.
+    pub fn verify(
+        binding: Option<&LocksClientBinding>,
+        expected: &ExpectedLocksBinding,
+    ) -> Result<(), BindingRefusal> {
+        let Some(binding) = binding else {
+            return Err(BindingRefusal::Missing);
+        };
+        let client_reference = bool::from(
+            binding
+                .client_reference
+                .as_bytes()
+                .ct_eq(expected.client_reference.as_bytes()),
+        );
+        let lock_resource = lock_resource_from_locks_form(&binding.pubky_lock_resource)
+            .is_some_and(|resource| resource == expected.lock_resource);
+        let criterion_ids =
+            binding.criterion_ids.len() == 1 && binding.criterion_ids[0] == expected.criterion_id;
+        if client_reference && lock_resource && criterion_ids {
+            Ok(())
+        } else {
+            Err(BindingRefusal::Mismatch {
+                client_reference: !client_reference,
+                lock_resource: !lock_resource,
+                criterion_ids: !criterion_ids,
+            })
+        }
+    }
+}
+
+/// Converts the Lock Server's `pubky_lock_resource` (`pubky<creator>/pub/...`,
+/// the creator carrying the `pubky` prefix) to the service's canonical bare
+/// form. Only the 57-character prefixed creator is stripped: a bare creator
+/// can itself begin with `pubky`.
+fn lock_resource_from_locks_form(resource: &str) -> Option<String> {
+    const PREFIXED_CREATOR_LEN: usize = "pubky".len() + 52;
+    let (creator, rest) = resource.split_once('/')?;
+    let bare_creator = match (creator.len(), creator.strip_prefix("pubky")) {
+        (PREFIXED_CREATOR_LEN, Some(bare)) => bare,
+        _ => creator,
+    };
+    canonical_lock_resource(&format!("{bare_creator}/{rest}"))
 }
 
 /// One lifecycle lookup result. Transport failures, non-2xx responses other
@@ -245,13 +410,37 @@ impl LocksTaskStatus {
 /// correlation stays pending and is retried on the next worker pass,
 /// matching Locks v1 semantics where transport/status failures remain
 /// pending rather than terminal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum LocksLookupOutcome {
     Status(LocksTaskStatus),
+    /// The task completed. It qualifies a payment only through its echoed
+    /// binding, `None` when the Lock Server echoed none.
+    Completed(Option<LocksClientBinding>),
+    /// The task completed but its `client_binding` is not the documented
+    /// shape. Never read as an absent binding and never confirms.
+    CompletedMalformedBinding,
     /// `404 verification_task_not_found`: the buyer has not (yet) submitted
     /// this bundle to the Lock Server.
     NotFound,
     Unavailable,
+}
+
+/// Delegates to the redacted [`LocksClientBinding`] form, so no outcome
+/// prints the reference or the lock resource.
+impl std::fmt::Debug for LocksLookupOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LocksLookupOutcome::Status(status) => f.debug_tuple("Status").field(status).finish(),
+            LocksLookupOutcome::Completed(binding) => {
+                f.debug_tuple("Completed").field(binding).finish()
+            }
+            LocksLookupOutcome::CompletedMalformedBinding => {
+                f.write_str("CompletedMalformedBinding")
+            }
+            LocksLookupOutcome::NotFound => f.write_str("NotFound"),
+            LocksLookupOutcome::Unavailable => f.write_str("Unavailable"),
+        }
+    }
 }
 
 /// The Lock Server lifecycle lookup. Implementations must treat the bundle
@@ -276,6 +465,8 @@ pub struct HttpLocksClient {
 #[derive(Deserialize)]
 struct LifecycleBody {
     status: String,
+    #[serde(default)]
+    client_binding: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -328,21 +519,38 @@ impl HttpLocksClient {
             return LocksLookupOutcome::Unavailable;
         }
         match response.json::<LifecycleBody>().await {
-            Ok(body) => match body.status.as_str() {
-                "pending" => LocksLookupOutcome::Status(LocksTaskStatus::Pending),
-                "in_progress" => LocksLookupOutcome::Status(LocksTaskStatus::InProgress),
-                "completed" => LocksLookupOutcome::Status(LocksTaskStatus::Completed),
-                "failed" => LocksLookupOutcome::Status(LocksTaskStatus::Failed),
-                "expired" => LocksLookupOutcome::Status(LocksTaskStatus::Expired),
-                _ => {
-                    tracing::warn!("locks lifecycle lookup returned an unknown status");
-                    LocksLookupOutcome::Unavailable
-                }
-            },
+            Ok(body) => outcome_from_lifecycle(body),
             Err(_) => {
                 tracing::warn!("locks lifecycle lookup returned a malformed body");
                 LocksLookupOutcome::Unavailable
             }
+        }
+    }
+}
+
+/// Maps one lifecycle body to its outcome. The binding is read only for a
+/// `completed` task, and a binding that is present but not the documented
+/// shape is its own outcome (retried for a bounded time, never confirmed)
+/// rather than being read as an absent one.
+fn outcome_from_lifecycle(body: LifecycleBody) -> LocksLookupOutcome {
+    match body.status.as_str() {
+        "pending" => LocksLookupOutcome::Status(LocksTaskStatus::Pending),
+        "in_progress" => LocksLookupOutcome::Status(LocksTaskStatus::InProgress),
+        "failed" => LocksLookupOutcome::Status(LocksTaskStatus::Failed),
+        "expired" => LocksLookupOutcome::Status(LocksTaskStatus::Expired),
+        "completed" => match body.client_binding {
+            None | Some(serde_json::Value::Null) => LocksLookupOutcome::Completed(None),
+            Some(value) => match serde_json::from_value::<LocksClientBinding>(value) {
+                Ok(binding) => LocksLookupOutcome::Completed(Some(binding)),
+                Err(_) => {
+                    tracing::warn!("locks lifecycle lookup returned a malformed client binding");
+                    LocksLookupOutcome::CompletedMalformedBinding
+                }
+            },
+        },
+        _ => {
+            tracing::warn!("locks lifecycle lookup returned an unknown status");
+            LocksLookupOutcome::Unavailable
         }
     }
 }
@@ -611,5 +819,311 @@ mod tests {
             crate::content_lock::validate_content_lock_value(&wrong_creator, &resource),
             Err(crate::content_lock::ContentLockIdentityRejection::CreatorMismatch)
         );
+    }
+
+    const BINDING_LOCK_ID: &str = "000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG";
+    const BINDING_REFERENCE: &str = "x9Kq_3-jW0sN8uYv1tB6rZpLmE4cA2dHfG7iOoQwXyU";
+
+    fn expected_binding(creator: &str) -> ExpectedLocksBinding {
+        ExpectedLocksBinding {
+            client_reference: BINDING_REFERENCE.to_string(),
+            lock_resource: format!("{creator}/pub/app.locks/{BINDING_LOCK_ID}.json"),
+            criterion_id: "criterion-1".to_string(),
+        }
+    }
+
+    fn echoed_binding(creator: &str) -> LocksClientBinding {
+        LocksClientBinding {
+            client_reference: BINDING_REFERENCE.to_string(),
+            pubky_lock_resource: format!("pubky{creator}/pub/app.locks/{BINDING_LOCK_ID}.json"),
+            criterion_ids: vec!["criterion-1".to_string()],
+        }
+    }
+
+    #[test]
+    fn the_binding_the_lock_server_echoes_for_the_prepared_terms_verifies() {
+        let creator = "y".repeat(52);
+        assert_eq!(
+            LocksClientBinding::verify(
+                Some(&echoed_binding(&creator)),
+                &expected_binding(&creator)
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_missing_binding_never_verifies() {
+        let creator = "y".repeat(52);
+        assert_eq!(
+            LocksClientBinding::verify(None, &expected_binding(&creator)),
+            Err(BindingRefusal::Missing)
+        );
+        assert_eq!(BindingRefusal::Missing.outcome(), "binding_missing");
+    }
+
+    #[test]
+    fn each_binding_field_is_checked_on_its_own() {
+        let creator = "y".repeat(52);
+        let expected = expected_binding(&creator);
+        type Case = (
+            &'static str,
+            fn(&mut LocksClientBinding),
+            (bool, bool, bool),
+        );
+        let cases: [Case; 6] = [
+            (
+                "reference",
+                |b| b.client_reference.push('x'),
+                (true, false, false),
+            ),
+            (
+                "resource",
+                |b| b.pubky_lock_resource = b.pubky_lock_resource.replace("app.locks", "locks.app"),
+                (false, true, false),
+            ),
+            (
+                "criterion",
+                |b| b.criterion_ids = vec!["criterion-2".to_string()],
+                (false, false, true),
+            ),
+            (
+                "criterion list longer",
+                |b| b.criterion_ids.push("criterion-1".to_string()),
+                (false, false, true),
+            ),
+            (
+                "criterion list empty",
+                |b| b.criterion_ids.clear(),
+                (false, false, true),
+            ),
+            (
+                "everything",
+                |b| {
+                    b.client_reference = "other".to_string();
+                    b.pubky_lock_resource = "not a resource".to_string();
+                    b.criterion_ids.clear();
+                },
+                (true, true, true),
+            ),
+        ];
+        for (label, mutate, (reference, resource, criteria)) in cases {
+            let mut binding = echoed_binding(&creator);
+            mutate(&mut binding);
+            assert_eq!(
+                LocksClientBinding::verify(Some(&binding), &expected),
+                Err(BindingRefusal::Mismatch {
+                    client_reference: reference,
+                    lock_resource: resource,
+                    criterion_ids: criteria,
+                }),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reference_that_differs_only_in_case_or_whitespace_does_not_verify() {
+        let creator = "y".repeat(52);
+        let expected = expected_binding(&creator);
+        for changed in [
+            BINDING_REFERENCE.to_ascii_lowercase(),
+            format!("{BINDING_REFERENCE} "),
+            format!(" {BINDING_REFERENCE}"),
+            String::new(),
+        ] {
+            let mut binding = echoed_binding(&creator);
+            binding.client_reference = changed.clone();
+            assert!(
+                LocksClientBinding::verify(Some(&binding), &expected).is_err(),
+                "{changed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_lock_resource_compares_in_canonical_form() {
+        let creator = "y".repeat(52);
+        let expected = expected_binding(&creator);
+        let mut binding = echoed_binding(&creator);
+        binding.pubky_lock_resource = binding
+            .pubky_lock_resource
+            .replace(BINDING_LOCK_ID, &BINDING_LOCK_ID.to_ascii_lowercase());
+        assert_eq!(
+            LocksClientBinding::verify(Some(&binding), &expected),
+            Ok(())
+        );
+
+        let mut other_creator = echoed_binding(&creator);
+        other_creator.pubky_lock_resource = format!(
+            "pubky{}/pub/app.locks/{BINDING_LOCK_ID}.json",
+            "o".repeat(52)
+        );
+        assert!(LocksClientBinding::verify(Some(&other_creator), &expected).is_err());
+    }
+
+    #[test]
+    fn only_the_prefixed_creator_form_loses_its_pubky_prefix() {
+        // A bare z-base-32 creator can itself begin with `pubky`.
+        let creator = format!("pubky{}", "y".repeat(47));
+        assert_eq!(creator.len(), 52);
+        let expected = expected_binding(&creator);
+        assert_eq!(
+            LocksClientBinding::verify(Some(&echoed_binding(&creator)), &expected),
+            Ok(())
+        );
+        let mut bare = echoed_binding(&creator);
+        bare.pubky_lock_resource = format!("{creator}/pub/app.locks/{BINDING_LOCK_ID}.json");
+        assert_eq!(LocksClientBinding::verify(Some(&bare), &expected), Ok(()));
+    }
+
+    #[test]
+    fn open_expected_binding_needs_the_sealed_facts_of_this_payment() {
+        let keys = keys();
+        let payment_id = Uuid::new_v4();
+        let creator = "y".repeat(52);
+        let resource = format!("pubky://{creator}/pub/app.locks/{BINDING_LOCK_ID}.json");
+        let reference =
+            keys.encrypt_prepared_value(payment_id, b"locks-client-reference:", BINDING_REFERENCE);
+        let sealed_resource =
+            keys.encrypt_prepared_value(payment_id, b"locks-resource:", &resource);
+        assert_eq!(
+            keys.open_expected_binding(payment_id, &reference, &sealed_resource, "criterion-1"),
+            Some(expected_binding(&creator))
+        );
+        assert_eq!(
+            keys.open_expected_binding(Uuid::new_v4(), &reference, &sealed_resource, "criterion-1"),
+            None,
+            "sealed to another payment"
+        );
+        assert_eq!(
+            keys.open_expected_binding(
+                payment_id,
+                &sealed_resource,
+                &sealed_resource,
+                "criterion-1"
+            ),
+            None,
+            "the domains are separate"
+        );
+        let not_a_lock = keys.encrypt_prepared_value(payment_id, b"locks-resource:", "nonsense");
+        assert_eq!(
+            keys.open_expected_binding(payment_id, &reference, &not_a_lock, "criterion-1"),
+            None
+        );
+    }
+
+    fn lifecycle(value: serde_json::Value) -> LocksLookupOutcome {
+        outcome_from_lifecycle(serde_json::from_value(value).expect("lifecycle body shape"))
+    }
+
+    #[test]
+    fn a_completed_lifecycle_carries_the_echoed_binding() {
+        let creator = "y".repeat(52);
+        let outcome = lifecycle(serde_json::json!({
+            "creator": format!("pubky{creator}"),
+            "bundle_id": "000G40R40M30E209185GR38E1W",
+            "status": "completed",
+            "submitted_at": "2026-11-09T09:00:00Z",
+            "started_at": "2026-11-09T09:00:01Z",
+            "completed_at": "2026-11-09T09:00:30Z",
+            "failure_message": null,
+            "client_binding": {
+                "client_reference": BINDING_REFERENCE,
+                "pubky_lock_resource": format!("pubky{creator}/pub/app.locks/{BINDING_LOCK_ID}.json"),
+                "criterion_ids": ["criterion-1"]
+            }
+        }));
+        assert_eq!(
+            outcome,
+            LocksLookupOutcome::Completed(Some(echoed_binding(&creator)))
+        );
+    }
+
+    #[test]
+    fn a_completed_lifecycle_without_a_binding_is_completed_without_one() {
+        for body in [
+            serde_json::json!({"status": "completed"}),
+            serde_json::json!({"status": "completed", "client_binding": null}),
+        ] {
+            assert_eq!(lifecycle(body), LocksLookupOutcome::Completed(None));
+        }
+    }
+
+    #[test]
+    fn a_malformed_binding_on_a_completed_lifecycle_is_its_own_outcome_not_read_as_absent() {
+        for binding in [
+            serde_json::json!({}),
+            serde_json::json!("text"),
+            serde_json::json!({"client_reference": 1, "pubky_lock_resource": "x", "criterion_ids": []}),
+            serde_json::json!({"client_reference": "r", "pubky_lock_resource": "x"}),
+            serde_json::json!({"client_reference": "r", "pubky_lock_resource": "x", "criterion_ids": "c"}),
+        ] {
+            assert_eq!(
+                lifecycle(serde_json::json!({"status": "completed", "client_binding": binding})),
+                LocksLookupOutcome::CompletedMalformedBinding
+            );
+        }
+    }
+
+    #[test]
+    fn debug_output_never_carries_the_reference_or_the_lock_resource() {
+        let creator = "y".repeat(52);
+        let echoed = echoed_binding(&creator);
+        let expected = expected_binding(&creator);
+        let outputs = [
+            format!("{echoed:?}"),
+            format!("{echoed:#?}"),
+            format!("{expected:?}"),
+            format!("{expected:#?}"),
+            format!("{:?}", LocksLookupOutcome::Completed(Some(echoed.clone()))),
+            format!("{:#?}", LocksLookupOutcome::Completed(Some(echoed.clone()))),
+        ];
+        for output in &outputs {
+            assert!(!output.contains(BINDING_REFERENCE), "{output}");
+            assert!(!output.contains(BINDING_LOCK_ID), "{output}");
+            assert!(!output.contains(&creator), "{output}");
+            assert!(output.contains("<redacted>"), "{output}");
+        }
+        assert!(outputs[0].contains("criterion-1"));
+        assert!(outputs[2].contains("criterion-1"));
+        assert_eq!(
+            format!("{:?}", LocksLookupOutcome::Completed(None)),
+            "Completed(None)"
+        );
+        assert_eq!(
+            format!("{:?}", LocksLookupOutcome::CompletedMalformedBinding),
+            "CompletedMalformedBinding"
+        );
+    }
+
+    #[test]
+    fn the_binding_is_read_only_for_completed_lifecycles() {
+        let binding = serde_json::json!({"client_reference": 1});
+        for (status, expected) in [
+            (
+                "pending",
+                LocksLookupOutcome::Status(LocksTaskStatus::Pending),
+            ),
+            (
+                "in_progress",
+                LocksLookupOutcome::Status(LocksTaskStatus::InProgress),
+            ),
+            (
+                "failed",
+                LocksLookupOutcome::Status(LocksTaskStatus::Failed),
+            ),
+            (
+                "expired",
+                LocksLookupOutcome::Status(LocksTaskStatus::Expired),
+            ),
+            ("unknown", LocksLookupOutcome::Unavailable),
+        ] {
+            assert_eq!(
+                lifecycle(serde_json::json!({"status": status, "client_binding": binding})),
+                expected,
+                "{status}"
+            );
+        }
     }
 }
