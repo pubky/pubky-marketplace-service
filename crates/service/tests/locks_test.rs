@@ -4941,3 +4941,85 @@ async fn sealed_binding_facts_that_cannot_be_opened_are_retried_then_parked(pool
     assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM receipts").await, 0);
     assert_eq!(stock(&app.pool, &seller, "boots_01").await, (1, 0));
 }
+
+// Two passes that both looked up a malformed binding (the second re-claimed
+// the row after the poll interval) reach the first-sighting record at the
+// same time: the test holds the correlation row until both wait on it. The
+// sighting is recorded once, so the retry bound has one starting point.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn concurrent_passes_record_the_first_sighting_of_a_malformed_binding_once(pool: PgPool) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order =
+        registered_digital_locks_order(&app, &seller, &buyer, "boots_01", TEST_BUNDLE_ID, 0xF31)
+            .await;
+    fake.set_outcome(
+        TEST_BUNDLE_ID,
+        LocksLookupOutcome::CompletedMalformedBinding,
+    );
+    let locks = app.state.locks.clone().expect("locks runtime");
+    let spawn_pass = |now| {
+        let state = app.state.clone();
+        let locks = locks.clone();
+        tokio::spawn(async move { workers::verify_due_locks_lifecycles(&state, &locks, now).await })
+    };
+
+    let release_first = fake.park_next_lookup();
+    let first = spawn_pass(app.clock.now());
+    while fake.lookup_count() < 1 {
+        tokio::task::yield_now().await;
+    }
+    app.clock.advance_seconds(61);
+    let release_second = fake.park_next_lookup();
+    let second = spawn_pass(app.clock.now());
+    while fake.lookup_count() < 2 {
+        tokio::task::yield_now().await;
+    }
+
+    let mut holder = app.pool.begin().await.expect("holder transaction");
+    sqlx::query("SELECT id FROM payment_locks_correlations WHERE payment_id = $1::uuid FOR UPDATE")
+        .bind(&order.payment_id)
+        .execute(&mut *holder)
+        .await
+        .expect("correlation row held");
+    release_first.notify_one();
+    release_second.notify_one();
+    while count(
+        &app.pool,
+        "SELECT COUNT(*) FROM pg_stat_activity \
+         WHERE datname = current_database() AND wait_event_type = 'Lock'",
+    )
+    .await
+        < 2
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    holder.commit().await.expect("correlation row released");
+
+    let first = first.await.expect("first pass joins").expect("first pass");
+    let second = second
+        .await
+        .expect("second pass joins")
+        .expect("second pass");
+    assert_eq!((first, second), (0, 0), "nothing is applied while retrying");
+    assert_eq!(
+        observation_history(&app.pool, &order.payment_id).await,
+        vec![(
+            "completed".to_string(),
+            "retry_binding_malformed".to_string()
+        )],
+        "the first sighting is recorded once"
+    );
+    assert_eq!(
+        correlation_outcome(&app.pool, &order.payment_id).await,
+        (
+            "pending".to_string(),
+            Some("retry_binding_malformed".to_string())
+        )
+    );
+    assert_eq!(
+        payment_state(&app.pool, &order.payment_id).await.0,
+        "awaiting_entitlement"
+    );
+}

@@ -1868,7 +1868,12 @@ async fn park_unverified_completion(
 /// the configured key). The first sighting is recorded once; the row stays
 /// `pending` and is retried until [`LOCKS_UNVERIFIED_RETRY_SECONDS`] after
 /// that sighting, then the payment is parked under `label`. Returns
-/// `Some(parked)` once the bound is reached, `None` while still retrying.
+/// `Some(parked)` once the bound is reached or another pass already settled
+/// the correlation, `None` while still retrying.
+///
+/// The first sighting is read and recorded under the correlation row lock,
+/// so two passes over the same row record it once; the lock is released
+/// before parking, which takes the payment row first.
 async fn bound_unverified_retry(
     pool: &PgPool,
     row: &ClaimedCorrelation,
@@ -1876,31 +1881,41 @@ async fn bound_unverified_retry(
     now: DateTime<Utc>,
 ) -> anyhow::Result<Option<bool>> {
     let retry_outcome = unverified_retry_outcome(label);
+    let mut tx = pool.begin().await?;
+    let pending: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM payment_locks_correlations \
+         WHERE id = $1 AND verification_state = 'pending' FOR UPDATE",
+    )
+    .bind(row.id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if pending.is_none() {
+        tx.rollback().await?;
+        return Ok(Some(false));
+    }
     let first_seen: Option<DateTime<Utc>> = sqlx::query_scalar(
         "SELECT min(observed_at) FROM payment_locks_observations \
          WHERE correlation_id = $1 AND observed_status = 'completed' AND outcome = $2",
     )
     .bind(row.id)
     .bind(&retry_outcome)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
     let Some(first_seen) = first_seen else {
-        let mut tx = pool.begin().await?;
-        let recorded = sqlx::query(
+        sqlx::query(
             "UPDATE payment_locks_correlations SET last_observed_status = $2, updated_at = $3 \
-             WHERE id = $1 AND verification_state = 'pending'",
+             WHERE id = $1",
         )
         .bind(row.id)
         .bind(&retry_outcome)
         .bind(now)
         .execute(&mut *tx)
         .await?;
-        if recorded.rows_affected() == 1 {
-            insert_observation(&mut tx, row.id, "completed", &retry_outcome, now).await?;
-        }
+        insert_observation(&mut tx, row.id, "completed", &retry_outcome, now).await?;
         tx.commit().await?;
         return Ok(None);
     };
+    tx.rollback().await?;
     if now - first_seen < chrono::Duration::seconds(LOCKS_UNVERIFIED_RETRY_SECONDS) {
         return Ok(None);
     }
@@ -4398,7 +4413,10 @@ pub async fn expire_due_payment_windows(
 /// reservation sweep already released the stock, so the expiry effects here
 /// skip the release; a paid order, an order awaiting seller confirmation,
 /// and a payment under manual review never match (their reservation is
-/// preserved or converted, never `expired`).
+/// preserved or converted, never `expired`), except a Locks payment parked
+/// because its completion could not be verified ([`SWEEPABLE_PAYMENT`]),
+/// whose order is cancelled like an unpaid one while the payment stays in
+/// `manual_review`.
 async fn expire_lapsed_auction_orders(state: &AppState, now: DateTime<Utc>) -> anyhow::Result<u64> {
     let mut tx = state.pool.begin().await?;
     let due: Vec<(Uuid, Uuid, String, String)> = sqlx::query_as(&format!(
