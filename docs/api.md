@@ -2093,16 +2093,17 @@ moves the base to the proposal. A change no longer pending, or whose proposal
 was replaced since the Shop read it, answers `409 change_stale`; an unknown or
 withdrawn one `404 change_not_found` (read the changes again). A product's
 base and pending change for a group are shared by its linked listings, and a
-product follows a group while any of them does. Changing a direction so that
-a product starts or stops following a group withdraws its pending change for
-the group and drops its base, so the next observation that started after the
-change takes the store as it then stands; a product another listing keeps
-following keeps both. Each group's base is dropped at its own instant, so a
-direction change in one group never voids a read for another. Unlinking a
-product (a mapping save without it, split mode, a disconnect) forgets its
-base and changes, and the overrides of listings that no longer link anything;
-a read that started before the unlink is dropped, also when the product is
-linked again before it completes.
+product follows a group while any of them does. Changing a direction, or the
+listings linked to a product (a mapping save, split mode), so that a product
+starts or stops following a group withdraws its pending change for the group
+and drops its base, so the next observation that started after the change
+takes the store as it then stands; a product another listing keeps following
+keeps both. Each group's base is dropped at its own instant, so a change in
+one group never voids a read for another. Linking or unlinking a product (a
+mapping save, split mode, a disconnect) starts it afresh: its base and
+changes go, and so do the overrides of listings that no longer link anything.
+A read that started before the link or unlink is dropped, also when the
+product is linked again before it completes.
 
 ### Mirror leases and the refund difference
 
