@@ -267,8 +267,8 @@ pub fn value_hash(value: &Value) -> Vec<u8> {
 /// What one observation did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Observed {
-    /// The read started before the product's last read, or before it was
-    /// last unlinked: nothing was done.
+    /// The read started before the product's last read, or before its link
+    /// fence (its last link or unlink): nothing was done.
     pub stale: bool,
     /// Groups taken as the base (first sight, or after a rebase).
     pub based: u32,
@@ -1016,6 +1016,11 @@ pub struct Links {
 /// already holds the connection row), reads the links as they stand, and
 /// then reads the clock, so the change's instant is later than any read
 /// planned under these links could have started before the lock was held.
+/// A read that starts between this instant and the commit is kept: it read
+/// the store after this instant, and its [`compare`] either commits before
+/// [`apply_links`] locks the product's snapshot row, whose reset then
+/// replaces what it wrote, or waits for this commit and is judged by the
+/// links and followers committed here.
 /// Pass the result to [`apply_links`] in the same transaction once the
 /// mappings are written.
 pub async fn lock_links(
@@ -1231,7 +1236,7 @@ async fn products_of_listings(
     Ok(rows.into_iter().map(|(product,)| product).collect())
 }
 
-/// Serialises direction changes and unlinking per connection. The
+/// Serialises direction changes and mapping changes per connection. The
 /// connection row comes first, in the mode the rows written next take through
 /// their foreign keys anyway: a mapping save locks that row before this lock,
 /// so taking them in the other order could deadlock with it.
