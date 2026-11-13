@@ -1148,7 +1148,10 @@ pub const PUBKY_RESOURCE_SCHEME: &str = "pubky://";
 /// [`PUBKY_RESOURCE_SCHEME`], requires the remainder to name a valid pubky
 /// creator and a 52-character Crockford lock id that decodes to exactly 32
 /// bytes, and renders the id in canonical UPPERCASE Crockford (a lowercase
-/// id is accepted and uppercased). Anything else returns `None`.
+/// id is accepted and uppercased). 52 characters carry 260 bits and the id
+/// is 256, so the last character's four low bits are padding: an id whose
+/// padding is not zero re-encodes to a different id and is refused, so each
+/// lock has exactly one spelling up to case. Anything else returns `None`.
 pub fn canonical_lock_resource(resource: &str) -> Option<String> {
     let resource = resource
         .strip_prefix(PUBKY_RESOURCE_SCHEME)
@@ -1160,10 +1163,11 @@ pub fn canonical_lock_resource(resource: &str) -> Option<String> {
     }
     let decoded = base32::decode(base32::Alphabet::Crockford, &lock_id)
         .filter(|decoded| decoded.len() == 32)?;
-    Some(format!(
-        "{creator}{prefix}{}.json",
-        base32::encode(base32::Alphabet::Crockford, &decoded)
-    ))
+    let canonical_id = base32::encode(base32::Alphabet::Crockford, &decoded);
+    if canonical_id != lock_id {
+        return None;
+    }
+    Some(format!("{creator}{prefix}{canonical_id}.json"))
 }
 
 /// Payload shared by the order commands that carry only the order id
@@ -5198,6 +5202,30 @@ mod tests {
             canonical_lock_resource(&lowercase).as_deref(),
             Some(bare.as_str())
         );
+    }
+
+    #[test]
+    fn a_lock_id_is_accepted_only_in_its_canonical_spelling_up_to_case() {
+        const CROCKFORD: &str = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+        let bare = bare_lock_resource();
+        assert!(LOCK_ID.ends_with('0'));
+        for (value, last) in CROCKFORD.chars().enumerate() {
+            let id = format!("{}{last}", &LOCK_ID[..51]);
+            let canonical = value % 16 == 0;
+            for spelling in [id.clone(), id.to_ascii_lowercase()] {
+                let resource = bare.replace(LOCK_ID, &spelling);
+                let parsed = canonical_lock_resource(&resource);
+                if canonical {
+                    assert_eq!(
+                        parsed,
+                        Some(bare.replace(LOCK_ID, &id)),
+                        "{spelling} is canonical"
+                    );
+                } else {
+                    assert_eq!(parsed, None, "{spelling} pads with non-zero bits");
+                }
+            }
+        }
     }
 
     #[test]

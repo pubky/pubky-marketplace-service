@@ -17,7 +17,11 @@
 //! inventory hold, and pins the payment adapter to `locks` — atomically.
 //! The minted reference exists in plaintext only in the authenticated
 //! buyer's response; its durable command-result copy is sealed to the
-//! payment and buyer.
+//! payment and buyer. The result also names the prepared terms without the
+//! resource: the BLAKE3 hex of the prepared lock resource (`lock_resource_hash`,
+//! the value already kept on the correlation) and the `criterion_id`, so the
+//! buyer's client can tell whether the listing's current lock is the one this
+//! payment was prepared against.
 //!
 //! REGISTRATION only attaches the buyer-generated bundle id to that
 //! prepared row: it accepts no resource, criterion, economics, or reference
@@ -270,6 +274,16 @@ pub async fn register(
     }))
 }
 
+/// `preparation_state`, sealed client reference, window end, resource hash and
+/// criterion id of a payment's existing correlation row.
+type PreparedRow = (
+    String,
+    Option<Vec<u8>>,
+    DateTime<Utc>,
+    Option<String>,
+    Option<String>,
+);
+
 /// The immutable checkout-time Locks authority snapshot (migration 0029),
 /// loaded whole: prepare compares every field to the locked payment/order
 /// rows before any authority row is created, then populates the
@@ -341,15 +355,22 @@ pub async fn prepare(
     // observes the winner's revision bump — recovers the same live
     // reference rather than conflicting (DESIGN §3.2). An elapsed
     // preparation is never replayed.
-    let existing: Option<(String, Option<Vec<u8>>, DateTime<Utc>)> = sqlx::query_as(
-        "SELECT preparation_state, client_reference_ciphertext, window_expires_at \
+    let existing: Option<PreparedRow> = sqlx::query_as(
+        "SELECT preparation_state, client_reference_ciphertext, window_expires_at, \
+         expected_resource_hash, criterion_id \
          FROM payment_locks_correlations WHERE payment_id = $1 FOR UPDATE",
     )
     .bind(payment.id)
     .fetch_optional(&mut **tx)
     .await?;
     match existing.as_ref() {
-        Some((state, Some(sealed_reference), expires_at)) if state == "prepared" => {
+        Some((
+            state,
+            Some(sealed_reference),
+            expires_at,
+            Some(resource_hash),
+            Some(criterion_id),
+        )) if state == "prepared" => {
             if now >= *expires_at {
                 return Ok(Err(CommandFailure::refused(
                     crate::refusal_audit::RefusalKind::InvalidState,
@@ -368,7 +389,13 @@ pub async fn prepare(
                 return Ok(Ok(HandlerSuccess {
                     revision: payment.revision,
                     event_ids: vec![],
-                    result: json!({"kind": "payment", "client_reference": client_reference, "window_expires_at": format_timestamp(*expires_at)}),
+                    result: json!({
+                        "kind": "payment",
+                        "client_reference": client_reference,
+                        "lock_resource_hash": resource_hash,
+                        "criterion_id": criterion_id,
+                        "window_expires_at": format_timestamp(*expires_at),
+                    }),
                 }));
             }
             // A prepared row whose sealed reference cannot be opened fails
@@ -646,7 +673,13 @@ pub async fn prepare(
     Ok(Ok(HandlerSuccess {
         revision: updated_payment.revision,
         event_ids: vec![],
-        result: json!({"kind": "payment", "client_reference": client_reference, "window_expires_at": format_timestamp(window_expires_at)}),
+        result: json!({
+            "kind": "payment",
+            "client_reference": client_reference,
+            "lock_resource_hash": snapshot.expected_resource_hash,
+            "criterion_id": snapshot.criterion_id,
+            "window_expires_at": format_timestamp(window_expires_at),
+        }),
     }))
 }
 

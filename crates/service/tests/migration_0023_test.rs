@@ -661,6 +661,9 @@ fn every_manual_review_writer_stamps_the_entry_time() {
     // upstream lifecycle inconsistency, seller-window reaper, money confirmed
     // on both rails of one request — late settlement now goes through
     // apply_late_money),
+    // the Locks worker parking a completed task that cannot be verified against
+    // the prepared payment (1: `park_unverified_completion`: binding missing,
+    // unverifiable, malformed or unopenable),
     // the fiat apply_fiat_paid confirm-failure (1; expired uses apply_late_money),
     // the sandbox transition (1), and a released Paykit attempt settling with a
     // different amount (1 in paykit_attempts). Any NEW writer fails here until it is
@@ -676,7 +679,7 @@ fn every_manual_review_writer_stamps_the_entry_time() {
             ("payment.rs".to_string(), 1),
             ("paykit_attempts.rs".to_string(), 1),
             ("payment_methods.rs".to_string(), 1),
-            ("workers.rs".to_string(), 6),
+            ("workers.rs".to_string(), 7),
         ]),
         "the manual_review writer set drifted; stamp and enumerate the new writer"
     );
