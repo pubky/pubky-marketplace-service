@@ -30,31 +30,39 @@
 //!
 //! A product follows a group while any listing linked to it does; its base
 //! and pending change for the group are shared by those listings. Changing a
-//! direction (for the connection or a listing) so that a product starts or
-//! stops following a group withdraws the product's pending change for that
-//! group and drops its base, so the next observation takes the store as it
-//! then stands: nothing reviewed under the old direction can be applied under
-//! the new one, and nothing that changed while a group was off is replayed
-//! when it is turned back on. A product another listing keeps following
-//! keeps its base and pending change. Each group's base is dropped at its own
-//! instant: only a read that started after it may take the group's new base,
-//! and a change to one group never voids a read for another.
+//! direction (for the connection or a listing), or the listings linked to the
+//! product (a mapping save, a switch to split variants), so that a product
+//! starts or stops following a group withdraws the product's pending change
+//! for that group and drops its base, so the next observation takes the store
+//! as it then stands: nothing reviewed under the old followers can be applied
+//! under the new ones, and nothing that changed while nobody followed a group
+//! is replayed when a listing follows it again. A product another listing
+//! keeps following keeps its base and pending change. Each group's base is
+//! dropped at its own instant: only a read that started after it may take the
+//! group's new base, and a change to one group never voids a read for
+//! another.
 //!
-//! Unlinking a product forgets it: its base, its changes and the overrides of
-//! listings that no longer link anything go with the mapping. Its snapshot
-//! row stays, emptied, as the instant of the unlink: a read that started
-//! before it was made for the previous link and is dropped, also when the
-//! product is linked again before the read completes.
+//! Linking or unlinking a product starts afresh: its base, its changes and the
+//! overrides of listings that no longer link anything go, and its snapshot
+//! row records the instant in `unlinked_at`, the product's link fence. A read
+//! that started before it was planned for the previous link (or for none) and
+//! is dropped, also when the product is linked again before the read
+//! completes. The instant is read from the clock once the mapping change holds
+//! its locks, so a read planned under the old link cannot carry a later one.
 //!
 //! Only what is still needed is kept: a withdrawn change is deleted, a
 //! product and group keep at most their pending change and their latest
 //! resolution (the dismissal a later observation is compared with), and an
-//! unlinked product keeps only its read fences.
+//! unlinked product keeps only its emptied snapshot row, which the stock poll
+//! deletes after [`ORPHAN_SNAPSHOT_RETENTION`]. A read of a product that is
+//! not linked does nothing, and linking it again sets a new fence, so the row
+//! is not needed for the fence once the product is unlinked.
 //!
 //! Lock order, everywhere: the connection row, then the connection's sync
-//! lock (direction changes and unlinking), then snapshot rows (several in
-//! product-id order), then change and override rows. A change's foreign key
-//! is its snapshot, so queueing one never touches the connection row.
+//! lock (direction changes and mapping changes), then snapshot rows (several
+//! in product-id order), then change and override rows. A change's foreign
+//! key is its snapshot, so queueing one never touches the connection row. The
+//! orphan delete skips rows that are locked, so it never waits.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -64,7 +72,28 @@ use sha2::{Digest, Sha256};
 use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
+use super::config::{MAX_CATALOG_PAGES_PER_POLL, MAX_PROVIDER_TIMEOUT_SECONDS};
 use super::provider::CatalogProduct;
+use crate::clock::Clock;
+
+/// The longest a catalog walk can spend reading the store: every page it
+/// may read ([`MAX_CATALOG_PAGES_PER_POLL`]) at the longest provider timeout
+/// the configuration accepts ([`MAX_PROVIDER_TIMEOUT_SECONDS`]). A single
+/// product read is bounded by one provider timeout, so this covers it too.
+const LONGEST_CATALOG_WALK_SECONDS: i64 =
+    MAX_CATALOG_PAGES_PER_POLL as i64 * MAX_PROVIDER_TIMEOUT_SECONDS as i64;
+
+/// How long an unlinked product's emptied snapshot row is kept: twice the
+/// longest catalog walk, so a read in flight when the product was unlinked
+/// has normally finished long before its row goes. Correctness does not rest
+/// on it: a read of an unlinked product does nothing, and a read that
+/// outlives the row (a removal is dated by its delivery, which can wait in
+/// the inbound queue) is dropped by the fence the next link sets.
+pub const ORPHAN_SNAPSHOT_RETENTION: chrono::Duration =
+    chrono::Duration::seconds(2 * LONGEST_CATALOG_WALK_SECONDS);
+
+/// How many orphan rows one delete statement removes.
+const ORPHAN_DELETE_BATCH: i64 = 500;
 
 /// A part of a listing that can follow the store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -427,7 +456,8 @@ impl SnapshotRow {
     }
 
     /// Whether a read that started at `read_at` is older than the product's
-    /// last read, or than its last unlink (a read made for a previous link).
+    /// last read, or than its link fence (a read planned for a previous
+    /// link, or while the product was not linked).
     fn is_stale(&self, read_at: DateTime<Utc>) -> bool {
         self.checked_at > read_at || self.unlinked_at.is_some_and(|unlinked| read_at < unlinked)
     }
@@ -468,12 +498,14 @@ async fn lock_snapshots(
 }
 
 /// Locks one product's snapshot row (see [`lock_snapshots`]) and reads it.
+/// `None` when the orphan delete removed the row between the insert and the
+/// lock: the product was not linked when it did.
 async fn lock_snapshot(
     tx: &mut Transaction<'_, Postgres>,
     now: DateTime<Utc>,
     connection_id: Uuid,
     provider_product_id: &str,
-) -> Result<SnapshotRow, sqlx::Error> {
+) -> Result<Option<SnapshotRow>, sqlx::Error> {
     lock_snapshots(tx, now, connection_id, &[provider_product_id.to_string()]).await?;
     sqlx::query_as(
         "SELECT checked_at, unlinked_at, content_rebased_at, price_rebased_at, \
@@ -483,7 +515,7 @@ async fn lock_snapshot(
     )
     .bind(connection_id)
     .bind(provider_product_id)
-    .fetch_one(&mut **tx)
+    .fetch_optional(&mut **tx)
     .await
 }
 
@@ -623,7 +655,11 @@ async fn compare(
 ) -> Result<Observed, sqlx::Error> {
     let mut observed = Observed::default();
     let mut tx = pool.begin().await?;
-    let snapshot = lock_snapshot(&mut tx, now, connection_id, provider_product_id).await?;
+    let Some(snapshot) = lock_snapshot(&mut tx, now, connection_id, provider_product_id).await?
+    else {
+        tx.rollback().await?;
+        return Ok(observed);
+    };
     if snapshot.is_stale(now) {
         observed.stale = true;
         tx.rollback().await?;
@@ -947,78 +983,134 @@ async fn rebase(
     Ok(())
 }
 
-/// Forgets what the connection no longer links, in the transaction that
-/// changed its mappings, at `now`: the bases and changes of products no
-/// listing links any more, and the overrides of listings that link nothing. A
-/// product linked again later is based afresh; a listing linked again follows
-/// the connection's directions.
-///
-/// An unlinked product's snapshot row stays, emptied, with `unlinked_at` set
-/// to `now`: a read that started before it was made for the previous link,
-/// and is dropped even when it completes after the product is linked again.
-/// Every call moves the fence of every product still unlinked, which only
-/// drops reads that started while nothing linked the product. Every linked
-/// product is given a snapshot row here, so that one whose first read is
-/// still in flight has a row for its unlink to fence.
-pub async fn forget_unlinked(
+/// The listings linked to each store product of a connection.
+type LinkSet = BTreeMap<String, BTreeSet<String>>;
+
+async fn load_links(
     tx: &mut Transaction<'_, Postgres>,
-    now: DateTime<Utc>,
     connection_id: Uuid,
-) -> Result<(), sqlx::Error> {
+) -> Result<LinkSet, sqlx::Error> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT DISTINCT provider_product_id, listing_id FROM connector_variant_map \
+         WHERE connection_id = $1",
+    )
+    .bind(connection_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut links = LinkSet::new();
+    for (product, listing) in rows {
+        links.entry(product).or_default().insert(listing);
+    }
+    Ok(links)
+}
+
+/// A connection's links as they stood before a mapping change, and the
+/// instant the change takes effect.
+#[derive(Debug)]
+pub struct Links {
+    at: DateTime<Utc>,
+    products: LinkSet,
+}
+
+/// Starts a mapping change: takes the connection's sync lock (the caller
+/// already holds the connection row), reads the links as they stand, and
+/// then reads the clock, so the change's instant is later than any read
+/// planned under these links could have started before the lock was held.
+/// Pass the result to [`apply_links`] in the same transaction once the
+/// mappings are written.
+pub async fn lock_links(
+    tx: &mut Transaction<'_, Postgres>,
+    clock: &dyn Clock,
+    connection_id: Uuid,
+) -> Result<Links, sqlx::Error> {
     // The same lock as the direction changes, taken before any snapshot or
     // override row: both touch overrides and snapshots, in opposite orders.
     lock_config(tx, connection_id).await?;
-    let linked: Vec<String> = sqlx::query_scalar(
-        "SELECT DISTINCT provider_product_id FROM connector_variant_map \
-         WHERE connection_id = $1 ORDER BY provider_product_id",
-    )
-    .bind(connection_id)
-    .fetch_all(&mut **tx)
-    .await?;
+    let products = load_links(tx, connection_id).await?;
+    Ok(Links {
+        at: clock.now(),
+        products,
+    })
+}
+
+/// Finishes a mapping change started with [`lock_links`], at its instant:
+///
+/// * a product linked or unlinked by it (no listing linked it before, or
+///   none does after) starts afresh: its bases and changes go, and its
+///   snapshot row (created if missing) takes the instant as its link fence,
+///   so a read that started before it is dropped;
+/// * a product still linked whose followers of a group change from none to
+///   some, or the reverse, is rebased for that group, as a direction change
+///   would;
+/// * the overrides of listings that link nothing go; a listing linked again
+///   follows the connection's directions.
+///
+/// Only the products the change touches are written.
+pub async fn apply_links(
+    tx: &mut Transaction<'_, Postgres>,
+    connection_id: Uuid,
+    before: &Links,
+) -> Result<(), sqlx::Error> {
+    let now = before.at;
+    let after = load_links(tx, connection_id).await?;
+    let config = load_config(tx, connection_id).await?;
+    let relinked: Vec<String> = before
+        .products
+        .keys()
+        .filter(|product| !after.contains_key(*product))
+        .chain(
+            after
+                .keys()
+                .filter(|product| !before.products.contains_key(*product)),
+        )
+        .cloned()
+        .collect::<BTreeSet<String>>()
+        .into_iter()
+        .collect();
+    let flipped: Vec<(FieldGroup, BTreeSet<String>)> = FieldGroup::SYNCED
+        .into_iter()
+        .map(|group| {
+            (
+                group,
+                following_flips(group, (&config, &before.products), (&config, &after)),
+            )
+        })
+        .filter(|(_, products)| !products.is_empty())
+        .collect();
+    let mut touched: BTreeSet<String> = relinked.iter().cloned().collect();
+    for (_, products) in &flipped {
+        touched.extend(products.iter().cloned());
+    }
+    let touched: Vec<String> = touched.into_iter().collect();
+    lock_snapshots(tx, now, connection_id, &touched).await?;
     sqlx::query(
-        "INSERT INTO connector_product_snapshots \
-         (connection_id, provider_product_id, checked_at, created_at) \
-         SELECT $1, product, 'epoch'::timestamptz, $3 \
-         FROM unnest($2::text[]) AS product ORDER BY product \
-         ON CONFLICT (connection_id, provider_product_id) DO NOTHING",
-    )
-    .bind(connection_id)
-    .bind(&linked)
-    .bind(now)
-    .execute(&mut **tx)
-    .await?;
-    let orphans: Vec<String> = sqlx::query_scalar(
-        "SELECT s.provider_product_id FROM connector_product_snapshots s \
-         WHERE s.connection_id = $1 AND NOT EXISTS ( \
-             SELECT 1 FROM connector_variant_map m \
-             WHERE m.connection_id = s.connection_id \
-               AND m.provider_product_id = s.provider_product_id) \
-         ORDER BY s.provider_product_id FOR UPDATE",
-    )
-    .bind(connection_id)
-    .fetch_all(&mut **tx)
-    .await?;
-    sqlx::query(
-        "DELETE FROM connector_product_changes c \
-         WHERE c.connection_id = $1 AND NOT EXISTS ( \
-             SELECT 1 FROM connector_variant_map m \
-             WHERE m.connection_id = c.connection_id \
-               AND m.provider_product_id = c.provider_product_id)",
-    )
-    .bind(connection_id)
-    .execute(&mut **tx)
-    .await?;
-    sqlx::query(
-        "UPDATE connector_product_snapshots \
-         SET content = NULL, price = NULL, variants = NULL, status = NULL, \
-             unlinked_at = GREATEST(unlinked_at, $3) \
+        "DELETE FROM connector_product_changes \
          WHERE connection_id = $1 AND provider_product_id = ANY($2)",
     )
     .bind(connection_id)
-    .bind(&orphans)
+    .bind(&relinked)
+    .execute(&mut **tx)
+    .await?;
+    // An upsert, so a row the orphan delete removed after the lock above
+    // missed it is written again with the fence.
+    sqlx::query(
+        "INSERT INTO connector_product_snapshots \
+         (connection_id, provider_product_id, checked_at, created_at, unlinked_at) \
+         SELECT $1, product, 'epoch'::timestamptz, $3, $3 \
+         FROM unnest($2::text[]) AS product ORDER BY product \
+         ON CONFLICT (connection_id, provider_product_id) DO UPDATE SET \
+             content = NULL, price = NULL, variants = NULL, status = NULL, \
+             unlinked_at = GREATEST(connector_product_snapshots.unlinked_at, \
+                                    EXCLUDED.unlinked_at)",
+    )
+    .bind(connection_id)
+    .bind(&relinked)
     .bind(now)
     .execute(&mut **tx)
     .await?;
+    for (group, products) in &flipped {
+        rebase(tx, now, connection_id, *group, products).await?;
+    }
     sqlx::query(
         "DELETE FROM connector_sync_overrides o \
          WHERE o.connection_id = $1 AND NOT EXISTS ( \
@@ -1031,10 +1123,65 @@ pub async fn forget_unlinked(
     Ok(())
 }
 
-/// Rebases the group for those of `products` whose base it changes: a
+/// Deletes the snapshot rows of products no listing links whose link fence
+/// is older than [`ORPHAN_SNAPSHOT_RETENTION`], on every connection, in
+/// batches. Rows another transaction holds (a mapping change linking the
+/// product again, a read) are skipped and taken by a later pass; a link that
+/// commits after a row was deleted writes the row again with a newer fence.
+/// Returns how many rows were deleted.
+pub async fn delete_old_orphans(pool: &PgPool, now: DateTime<Utc>) -> Result<u64, sqlx::Error> {
+    let cutoff = now - ORPHAN_SNAPSHOT_RETENTION;
+    let mut deleted = 0;
+    loop {
+        let batch = sqlx::query(
+            "DELETE FROM connector_product_snapshots s USING ( \
+                 SELECT o.connection_id, o.provider_product_id \
+                 FROM connector_product_snapshots o \
+                 WHERE o.unlinked_at < $1 AND NOT EXISTS ( \
+                     SELECT 1 FROM connector_variant_map m \
+                     WHERE m.connection_id = o.connection_id \
+                       AND m.provider_product_id = o.provider_product_id) \
+                 ORDER BY o.connection_id, o.provider_product_id \
+                 LIMIT $2 FOR UPDATE SKIP LOCKED) old \
+             WHERE s.connection_id = old.connection_id \
+               AND s.provider_product_id = old.provider_product_id",
+        )
+        .bind(cutoff)
+        .bind(ORPHAN_DELETE_BATCH)
+        .execute(pool)
+        .await?
+        .rows_affected();
+        deleted += batch;
+        if batch < ORPHAN_DELETE_BATCH as u64 {
+            return Ok(deleted);
+        }
+    }
+}
+
+/// The products whose following of `group` changes from `before` to `after`
+/// (each a configuration and the listings linked to every product): a
 /// product is followed while any listing linked to it follows the group, and
-/// its base and pending change are shared by those listings. A product still
-/// followed (or still not) under `after` keeps both, so a listing whose own
+/// its base and pending change are shared by those listings. A product linked
+/// on one side only is not included: linking and unlinking start afresh.
+fn following_flips(
+    group: FieldGroup,
+    before: (&SyncConfig, &LinkSet),
+    after: (&SyncConfig, &LinkSet),
+) -> BTreeSet<String> {
+    after
+        .1
+        .iter()
+        .filter_map(|(product, listings)| {
+            let old = before.1.get(product)?;
+            (before.0.follows(old).group(group) != after.0.follows(listings).group(group))
+                .then(|| product.clone())
+        })
+        .collect()
+}
+
+/// Rebases the group for those of `products` whose base it changes (see
+/// [`following_flips`]). A product still followed (or still not) under
+/// `after` keeps its base and pending change, so a listing whose own
 /// direction did not change keeps the change it has not applied yet.
 async fn rebase_where_following_changes(
     tx: &mut Transaction<'_, Postgres>,
@@ -1057,17 +1204,11 @@ async fn rebase_where_following_changes(
     .bind(&candidates)
     .fetch_all(&mut **tx)
     .await?;
-    let mut listings: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut listings = LinkSet::new();
     for (product, listing) in rows {
         listings.entry(product).or_default().insert(listing);
     }
-    let changed: BTreeSet<String> = listings
-        .into_iter()
-        .filter(|(_, listings)| {
-            before.follows(listings).group(group) != after.follows(listings).group(group)
-        })
-        .map(|(product, _)| product)
-        .collect();
+    let changed = following_flips(group, (before, &listings), (after, &listings));
     rebase(tx, now, connection_id, group, &changed).await
 }
 

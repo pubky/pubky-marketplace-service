@@ -1197,7 +1197,7 @@ async fn migration_0097_gives_each_group_the_shared_rebase_instant_and_reruns(po
     sqlx::query(
         "UPDATE connector_product_snapshots \
          SET rebased_at = $3, content_rebased_at = NULL, price_rebased_at = $4, \
-             variants_rebased_at = NULL \
+             variants_rebased_at = NULL, unlinked_at = NULL \
          WHERE connection_id = $1 AND provider_product_id = $2",
     )
     .bind(r.connection)
@@ -1286,4 +1286,268 @@ async fn a_first_read_from_before_an_unlink_is_dropped_after_the_product_is_link
     r.poll().await;
     let changes = r.changes().await;
     assert_eq!(only(&changes, "content")["base"]["title"], "Trail Boots II");
+}
+
+const OTHER: &str = "gid://shopify/Product/9099";
+const OTHER_VARIANT: &str = "gid://shopify/ProductVariant/59099";
+
+impl Rig {
+    async fn save_mappings(&self, mappings: Value) {
+        let (status, body) = self
+            .call("PUT", "/mappings", &json!({ "mappings": mappings }))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// The products of the connection that have a snapshot row.
+    async fn snapshot_rows(&self) -> Vec<String> {
+        sqlx::query_scalar(
+            "SELECT provider_product_id FROM connector_product_snapshots \
+             WHERE connection_id = $1 ORDER BY provider_product_id",
+        )
+        .bind(self.connection)
+        .fetch_all(&self.app.pool)
+        .await
+        .expect("snapshots")
+    }
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_mapping_change_that_removes_a_products_last_follower_withdraws_its_change(pool: PgPool) {
+    let r = rig(pool).await;
+    r.link_mug_to_boots().await;
+    r.override_groups("boots_01", json!({ "content": "off" }))
+        .await;
+    r.poll().await;
+    r.edit(BOOTS, json!({ "title": "Trail Boots II" }));
+    r.app.clock.advance_seconds(5);
+    r.poll().await;
+    only(&r.changes().await, "content");
+
+    // The mug, the only listing that follows the boots' content, is unlinked;
+    // the boots listing stays linked with content off.
+    r.app.clock.advance_seconds(5);
+    r.save_mappings(json!([
+        { "listing_id": "boots_01", "provider_product_id": BOOTS,
+          "provider_variant_id": BOOTS_VARIANT },
+    ]))
+    .await;
+    assert_eq!(
+        r.changes().await,
+        Vec::<Value>::new(),
+        "nothing follows the boots' content any more"
+    );
+    let content: Option<Value> = sqlx::query_scalar(
+        "SELECT content FROM connector_product_snapshots \
+         WHERE connection_id = $1 AND provider_product_id = $2",
+    )
+    .bind(r.connection)
+    .bind(BOOTS)
+    .fetch_one(&r.app.pool)
+    .await
+    .expect("snapshot");
+    assert_eq!(content, None, "the group's base was dropped");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn linking_a_listing_that_follows_a_group_nobody_followed_takes_the_store_as_it_is(
+    pool: PgPool,
+) {
+    let r = rig(pool).await;
+    r.override_groups("boots_01", json!({ "content": "off" }))
+        .await;
+    r.poll().await;
+    // The store's title changes while no listing follows the content.
+    r.edit(BOOTS, json!({ "title": "Trail Boots II" }));
+    r.app.clock.advance_seconds(5);
+    r.poll().await;
+    assert_eq!(r.changes().await, Vec::<Value>::new());
+
+    // The mug, which follows the content, is linked to the boots.
+    r.app.clock.advance_seconds(5);
+    r.link_mug_to_boots().await;
+    r.app.clock.advance_seconds(5);
+    r.poll().await;
+    assert_eq!(
+        r.changes().await,
+        Vec::<Value>::new(),
+        "an edit made while nobody followed the content is not replayed"
+    );
+    r.edit(BOOTS, json!({ "title": "Trail Boots III" }));
+    r.app.clock.advance_seconds(5);
+    r.poll().await;
+    let changes = r.changes().await;
+    let content = only(&changes, "content");
+    assert_eq!(content["base"]["title"], "Trail Boots II");
+    assert_eq!(content["proposed"]["title"], "Trail Boots III");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_split_switch_that_unmaps_a_products_last_follower_withdraws_its_change(pool: PgPool) {
+    let r = rig(pool).await;
+    // The mug listing combines the boots' second variant and the mug, so a
+    // switch to split variants unmaps it.
+    r.save_mappings(json!([
+        { "listing_id": "boots_01", "provider_product_id": BOOTS,
+          "provider_variant_id": BOOTS_VARIANT },
+        { "listing_id": "mug_01", "variant_id": "a", "provider_product_id": BOOTS,
+          "provider_variant_id": BOOTS_SECOND_VARIANT },
+        { "listing_id": "mug_01", "variant_id": "b", "provider_product_id": MUG,
+          "provider_variant_id": MUG_VARIANT },
+    ]))
+    .await;
+    r.override_groups("boots_01", json!({ "content": "off" }))
+        .await;
+    r.poll().await;
+    r.edit(BOOTS, json!({ "title": "Trail Boots II" }));
+    r.app.clock.advance_seconds(5);
+    r.poll().await;
+    only(&r.changes().await, "content");
+
+    r.app.clock.advance_seconds(5);
+    let (status, body) = r
+        .call("PUT", "/settings", &json!({ "variant_mode": "split" }))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["unmapped_listings"],
+        json!([{ "listing_id": "mug_01", "mappings_removed": 2 }])
+    );
+    assert_eq!(
+        r.changes().await,
+        Vec::<Value>::new(),
+        "the boots listing left linked does not follow the content"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_read_planned_under_the_old_link_but_started_after_the_unlink_is_dropped_after_a_relink(
+    pool: PgPool,
+) {
+    let r = rig(pool).await;
+    r.poll().await;
+    r.app.clock.advance_seconds(5);
+    r.save_mappings(json!([])).await;
+    // A read planned while the boots were linked starts after the unlink's
+    // instant (the unlink was still waiting for its locks) and is delayed.
+    r.app.clock.advance_seconds(2);
+    let read_started = r.now();
+    let old = r.store_product(BOOTS).await;
+    r.app.clock.advance_seconds(3);
+    r.edit(BOOTS, json!({ "title": "Trail Boots II" }));
+    r.fake.lock().products_gone.insert(BOOTS.into(), None);
+    map_listing(
+        &r.app,
+        &r.seller,
+        r.connection,
+        "boots_01",
+        BOOTS,
+        BOOTS_VARIANT,
+    )
+    .await;
+
+    let late = product_sync::observe(&r.app.pool, read_started, r.connection, &old)
+        .await
+        .expect("observe");
+    assert!(late.stale, "a read planned for the previous link: {late:?}");
+    let late_removal =
+        product_sync::observe_removed(&r.app.pool, read_started, r.connection, BOOTS)
+            .await
+            .expect("observe");
+    assert!(late_removal.stale, "{late_removal:?}");
+    assert_eq!(r.changes().await, Vec::<Value>::new());
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn the_stock_poll_deletes_old_orphan_snapshots_only(pool: PgPool) {
+    let r = rig(pool).await;
+    let retention = product_sync::ORPHAN_SNAPSHOT_RETENTION.num_seconds();
+    r.link_mug().await;
+    r.poll().await;
+    // Both unlinked; the mug is linked again after the retention, the boots
+    // are not.
+    r.app.clock.advance_seconds(5);
+    r.save_mappings(json!([])).await;
+    r.app.clock.advance_seconds(retention + 1);
+    r.save_mappings(json!([
+        { "listing_id": "mug_01", "provider_product_id": MUG,
+          "provider_variant_id": MUG_VARIANT },
+        { "listing_id": "boots_01", "provider_product_id": OTHER,
+          "provider_variant_id": OTHER_VARIANT },
+    ]))
+    .await;
+    // A product unlinked a moment ago.
+    r.app.clock.advance_seconds(1);
+    r.save_mappings(json!([
+        { "listing_id": "mug_01", "provider_product_id": MUG,
+          "provider_variant_id": MUG_VARIANT },
+    ]))
+    .await;
+    assert_eq!(
+        r.snapshot_rows().await,
+        vec![BOOTS.to_string(), MUG.to_string(), OTHER.to_string()]
+    );
+    r.poll().await;
+    assert_eq!(
+        r.snapshot_rows().await,
+        vec![MUG.to_string(), OTHER.to_string()],
+        "only the boots' row is an orphan older than the retention"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_read_from_before_an_unlink_completing_after_its_row_was_deleted_changes_nothing(
+    pool: PgPool,
+) {
+    let r = rig(pool).await;
+    let retention = product_sync::ORPHAN_SNAPSHOT_RETENTION.num_seconds();
+    r.poll().await;
+    r.app.clock.advance_seconds(5);
+    // A read starts while the boots are linked and is delayed past the
+    // unlink, the retention and the deletion of their row.
+    let slow_read_started = r.now();
+    let old = r.store_product(BOOTS).await;
+    r.app.clock.advance_seconds(5);
+    r.save_mappings(json!([])).await;
+    r.app.clock.advance_seconds(retention + 1);
+    r.poll().await;
+    assert_eq!(r.snapshot_rows().await, Vec::<String>::new());
+
+    let late = product_sync::observe(&r.app.pool, slow_read_started, r.connection, &old)
+        .await
+        .expect("observe");
+    let late_removal =
+        product_sync::observe_removed(&r.app.pool, slow_read_started, r.connection, BOOTS)
+            .await
+            .expect("observe");
+    assert_eq!((late.based, late.queued), (0, 0), "{late:?}");
+    assert_eq!(late_removal.queued, 0, "{late_removal:?}");
+    assert_eq!(
+        r.snapshot_rows().await,
+        Vec::<String>::new(),
+        "a read of an unlinked product writes nothing"
+    );
+
+    // Linked again, the same late read is older than the new link.
+    r.edit(BOOTS, json!({ "title": "Trail Boots II" }));
+    r.fake.lock().products_gone.insert(BOOTS.into(), None);
+    map_listing(
+        &r.app,
+        &r.seller,
+        r.connection,
+        "boots_01",
+        BOOTS,
+        BOOTS_VARIANT,
+    )
+    .await;
+    let late = product_sync::observe(&r.app.pool, slow_read_started, r.connection, &old)
+        .await
+        .expect("observe");
+    assert!(late.stale, "{late:?}");
+    let late_removal =
+        product_sync::observe_removed(&r.app.pool, slow_read_started, r.connection, BOOTS)
+            .await
+            .expect("observe");
+    assert!(late_removal.stale, "{late_removal:?}");
+    assert_eq!(r.changes().await, Vec::<Value>::new());
 }

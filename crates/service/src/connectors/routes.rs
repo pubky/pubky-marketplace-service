@@ -712,7 +712,7 @@ pub async fn start_connect(
     };
     let (row, unmapped) = match variant_mode {
         Some(split) => {
-            match store::set_variant_mode(&state.pool, &row, split, state.clock.now()).await {
+            match store::set_variant_mode(&state.pool, &row, split, &*state.clock).await {
                 Ok(switch) => (switch.connection, switch.unmapped),
                 Err(cause) => return internal("variant mode", &cause),
             }
@@ -909,7 +909,7 @@ pub async fn disconnect(
     };
     let now = state.clock.now();
     let retain_until = now + chrono::Duration::seconds(APP_SECRET_RETENTION_SECONDS);
-    if let Err(cause) = store::disconnect(&state.pool, row.id, now, retain_until).await {
+    if let Err(cause) = store::disconnect(&state.pool, row.id, &*state.clock, retain_until).await {
         return internal("disconnect", &cause);
     }
     if let (Some(provider), Some(context)) = (provider, context) {
@@ -1138,7 +1138,7 @@ pub async fn put_mappings(
             )
         }
     };
-    match store::replace_mappings(&state.pool, &row, &mappings, state.clock.now()).await {
+    match store::replace_mappings(&state.pool, &row, &mappings, &*state.clock).await {
         Ok(()) => respond(
             StatusCode::OK,
             json!({
@@ -1229,7 +1229,7 @@ pub async fn put_settings(
             "The connection was disconnected.",
         );
     }
-    match store::set_variant_mode(&state.pool, &row, split, state.clock.now()).await {
+    match store::set_variant_mode(&state.pool, &row, split, &*state.clock).await {
         Ok(switch) => match connection_view(&state, runtime, &switch.connection).await {
             Ok(view) => respond(
                 StatusCode::OK,
