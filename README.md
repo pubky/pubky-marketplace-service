@@ -2342,7 +2342,10 @@ advance a payment (ADR-0019 §7).
     `payment_confirmed` outbox intent). Duplicate or reordered completions
     are harmless no-ops.
   - `completed` without a matching client binding → never confirms, never
-    reaches the late-money paths, and polling stops; see "Client binding".
+    reaches the late-money paths, and polling stops (a malformed binding or
+    unopenable sealed facts after a bounded retry); a binding for other terms
+    leaves the payment to its window, anything else parks it in
+    `manual_review`; see "Client binding".
   - `pending` / `in_progress` / not-found / transport or status failure →
     the payment stays untouched and the correlation stays pending (Locks
     v1 leaves transport/status failures pending and exposes no terminal
@@ -2365,20 +2368,49 @@ advance a payment (ADR-0019 §7).
   reference exactly (constant-time, no case folding or trimming), the lock
   resource after canonicalization (the Lock Server writes the creator as
   `pubky<creator>`), and `criterion_ids` equal to the single prepared
-  criterion. An absent binding never matches, and a binding that is present
-  but not the documented shape is retried like any malformed body. The
-  task is write-once, so a refusal is terminal: the correlation moves to
-  `upstream_failed` with `last_observed_status` `binding_mismatch`,
-  `binding_missing` or `binding_unverifiable` (a correlation registered
-  before preparation existed has nothing to compare against), the same
-  label is appended to `payment_locks_observations`, no value from either
-  side is stored or logged beyond which fields differed, and the payment is
-  left to its window like an upstream failure. This closes the replay of a
-  bundle completed for another order, another lock of the same creator, or
-  another application. Rollout: Lock Server at v0.1.1-rc2 or later and a Shop
-  that submits the reference must both be live before this service
-  verifies completions; otherwise every Locks payment completes without a
-  binding and is refused.
+  criterion. The task is write-once, so every outcome below is terminal for
+  polling: the correlation moves to `upstream_failed`, its
+  `last_observed_status` and one `payment_locks_observations` row carry a
+  static label, and no value from either side is stored or logged beyond
+  which fields differed.
+  - `binding_mismatch` (a binding for other terms): the payment is left to
+    its window like an upstream failure; the window expires it, cancels the
+    order and returns the unit. This closes the replay of a bundle completed
+    for another order, another lock of the same creator, or another
+    application.
+  - `binding_missing` (no binding: a bundle submitted without the reference,
+    for example from a Shop tab loaded before the reference existed) and
+    `binding_unverifiable` (a correlation registered before preparation
+    existed, with nothing to compare against): the buyer may have paid, so
+    the fact is kept for an operator. An `awaiting_entitlement` or `expired`
+    payment moves to `manual_review` (one `payment.manual_review` event,
+    `review_reason` unset) and never confirms. The window still cancels the
+    order and returns the unit, because nothing ties that money to this
+    order; the payment stays in `manual_review`.
+  - `binding_malformed` (a binding present but not the documented shape) and
+    `binding_unopenable` (the sealed facts do not open under the configured
+    key): the row stays pending and is retried, since a Lock Server fault or a
+    key configuration can be repaired, for one day
+    (`workers::LOCKS_UNVERIFIED_RETRY_SECONDS`) from the first sighting,
+    which is recorded once as `retry_binding_malformed` /
+    `retry_binding_unopenable`. Then the payment is parked exactly like
+    `binding_missing`.
+
+  Parking takes the payment row lock, then a compare-and-swap on the pending
+  correlation, so two passes, a window sweep and a redelivered lookup park a
+  payment at most once. Paykit's manual-review watchers (SLA alert, seven-day
+  abandonment) and the seller's resolve endpoint select Paykit payments only:
+  a parked Locks payment gets no alert, no automatic outcome and no refund
+  request. Buyer and seller both see the payment `manual_review` and the
+  order `pending_payment`, then `cancelled` once the window ends; no receipt,
+  confirmation or notification is produced. Recovery is an operator decision
+  outside the service (there is no Locks resolver): the correlation label,
+  the observation rows and the events say what happened.
+
+  Rollout: Lock Server at v0.1.1-rc2 or later and a Shop that submits the
+  reference must both be live before this service verifies completions;
+  otherwise every Locks completion arrives without a binding and is parked
+  in `manual_review` instead of confirming.
 - **Expiry vs late completion.** The `payment_window` task sweeps the
   ORDER's hold window (`LOCKS_PAYMENT_WINDOW_SECONDS`, armed at
   registration — the correlation window IS the hold window): once it

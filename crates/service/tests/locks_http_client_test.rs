@@ -106,7 +106,7 @@ async fn a_completed_task_from_a_server_without_binding_support_has_none() {
 }
 
 #[tokio::test]
-async fn a_malformed_binding_on_a_completed_task_is_unavailable() {
+async fn a_malformed_binding_on_a_completed_task_is_reported_as_malformed() {
     let (client, _) = serve(
         StatusCode::OK,
         lifecycle("completed", Some(json!({"client_reference": REFERENCE}))),
@@ -114,7 +114,7 @@ async fn a_malformed_binding_on_a_completed_task_is_unavailable() {
     .await;
     assert_eq!(
         client.lookup(CREATOR, BUNDLE).await,
-        LocksLookupOutcome::Unavailable
+        LocksLookupOutcome::CompletedMalformedBinding
     );
 }
 

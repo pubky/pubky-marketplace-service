@@ -290,12 +290,31 @@ pub struct ExpectedLocksBinding {
     pub criterion_id: String,
 }
 
+/// Static labels for a completed task the service cannot verify against the
+/// prepared payment. Each parks the payment in `manual_review`; none
+/// confirms. Written to `payment_locks_correlations.last_observed_status`
+/// and `payment_locks_observations.outcome`.
+pub mod unverified {
+    /// The Lock Server echoed no `client_binding`.
+    pub const MISSING: &str = "binding_missing";
+    /// The correlation predates preparation and holds no sealed facts.
+    pub const UNVERIFIABLE: &str = "binding_unverifiable";
+    /// The echoed `client_binding` is not the documented shape.
+    pub const MALFORMED: &str = "binding_malformed";
+    /// The sealed facts do not open under the configured key.
+    pub const UNOPENABLE: &str = "binding_unopenable";
+    /// Every label above, for queries that select parked payments.
+    pub const ALL: [&str; 4] = [MISSING, UNVERIFIABLE, MALFORMED, UNOPENABLE];
+}
+
 /// Why a completed task does not qualify its payment. Each variant is a
 /// terminal fact about an immutable task, never a transient condition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BindingRefusal {
     /// The Lock Server returned no `client_binding`: the bundle was
-    /// submitted without the reference the service minted.
+    /// submitted without the reference the service minted. The payment is
+    /// parked for review rather than dropped: the buyer may have paid
+    /// through a client that predates the reference.
     Missing,
     /// At least one of the three fields differs from the expected value.
     Mismatch {
@@ -310,7 +329,7 @@ impl BindingRefusal {
     /// and `payment_locks_correlations.last_observed_status`.
     pub fn outcome(self) -> &'static str {
         match self {
-            BindingRefusal::Missing => "binding_missing",
+            BindingRefusal::Missing => unverified::MISSING,
             BindingRefusal::Mismatch { .. } => "binding_mismatch",
         }
     }
@@ -375,6 +394,9 @@ pub enum LocksLookupOutcome {
     /// The task completed. It qualifies a payment only through its echoed
     /// binding, `None` when the Lock Server echoed none.
     Completed(Option<LocksClientBinding>),
+    /// The task completed but its `client_binding` is not the documented
+    /// shape. Never read as an absent binding and never confirms.
+    CompletedMalformedBinding,
     /// `404 verification_task_not_found`: the buyer has not (yet) submitted
     /// this bundle to the Lock Server.
     NotFound,
@@ -468,8 +490,8 @@ impl HttpLocksClient {
 
 /// Maps one lifecycle body to its outcome. The binding is read only for a
 /// `completed` task, and a binding that is present but not the documented
-/// shape leaves the task unavailable (retried, never confirmed) rather than
-/// being read as an absent one.
+/// shape is its own outcome (retried for a bounded time, never confirmed)
+/// rather than being read as an absent one.
 fn outcome_from_lifecycle(body: LifecycleBody) -> LocksLookupOutcome {
     match body.status.as_str() {
         "pending" => LocksLookupOutcome::Status(LocksTaskStatus::Pending),
@@ -482,7 +504,7 @@ fn outcome_from_lifecycle(body: LifecycleBody) -> LocksLookupOutcome {
                 Ok(binding) => LocksLookupOutcome::Completed(Some(binding)),
                 Err(_) => {
                     tracing::warn!("locks lifecycle lookup returned a malformed client binding");
-                    LocksLookupOutcome::Unavailable
+                    LocksLookupOutcome::CompletedMalformedBinding
                 }
             },
         },
@@ -989,7 +1011,7 @@ mod tests {
     }
 
     #[test]
-    fn a_malformed_binding_on_a_completed_lifecycle_is_retried_not_read_as_absent() {
+    fn a_malformed_binding_on_a_completed_lifecycle_is_its_own_outcome_not_read_as_absent() {
         for binding in [
             serde_json::json!({}),
             serde_json::json!("text"),
@@ -999,7 +1021,7 @@ mod tests {
         ] {
             assert_eq!(
                 lifecycle(serde_json::json!({"status": "completed", "client_binding": binding})),
-                LocksLookupOutcome::Unavailable
+                LocksLookupOutcome::CompletedMalformedBinding
             );
         }
     }

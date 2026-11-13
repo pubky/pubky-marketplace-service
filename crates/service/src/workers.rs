@@ -1742,12 +1742,12 @@ async fn record_upstream_terminal(
     Ok(())
 }
 
-/// Stops polling a correlation whose completed task does not qualify its
-/// payment, and records why. The payment is deliberately untouched, exactly
-/// like an upstream failure: the task is write-once, so a refused binding can
-/// never become a match, and the payment window moves the payment to
-/// `expired` on its own schedule. `outcome` is one of the static
-/// `binding_*` labels; no value from either side of the comparison is stored.
+/// Stops polling a correlation whose completed task carries a binding for
+/// different terms (`binding_mismatch`), and records why. The payment is
+/// deliberately untouched, exactly like an upstream failure: the task is
+/// write-once, so a refused binding can never become a match, and the
+/// payment window moves the payment to `expired` on its own schedule. No
+/// value from either side of the comparison is stored.
 async fn record_binding_refusal(
     pool: &PgPool,
     row: &ClaimedCorrelation,
@@ -1770,6 +1770,143 @@ async fn record_binding_refusal(
     }
     tx.commit().await?;
     Ok(())
+}
+
+/// How long a completed task whose binding is malformed, or whose sealed
+/// facts do not open, is retried before its payment is parked. Measured from
+/// the first such sighting (an append-only observation row), never from the
+/// payment state: a late completion legitimately polls an expired payment.
+pub const LOCKS_UNVERIFIED_RETRY_SECONDS: i64 = 86_400;
+
+/// The observation outcome marking the first sighting of `label` while it
+/// is still being retried.
+fn unverified_retry_outcome(label: &str) -> String {
+    format!("retry_{label}")
+}
+
+/// Parks the payment of a completed task that cannot be verified against the
+/// prepared payment (`label` is one of [`crate::locks::unverified`]). The
+/// task never confirms anything: the correlation stops polling with the
+/// static label and one observation row, and an `awaiting_entitlement` or
+/// `expired` payment moves to `manual_review` so the fact is retained for an
+/// operator instead of being dropped. The held-window sweep still releases
+/// the order's stock at the end of the payment window
+/// ([`SWEEPABLE_PAYMENT`]).
+///
+/// Lock order is payment, then correlation, as in every confirmation path.
+/// The correlation compare-and-swap is the exactly-once gate: a second pass
+/// or a redelivered observation finds it no longer `pending` and changes
+/// nothing. Returns whether this call parked the payment.
+async fn park_unverified_completion(
+    pool: &PgPool,
+    row: &ClaimedCorrelation,
+    label: &str,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    let mut tx = pool.begin().await?;
+    let payment_state: Option<(String,)> =
+        sqlx::query_as("SELECT state FROM payments WHERE id = $1 FOR UPDATE")
+            .bind(row.payment_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some((payment_state,)) = payment_state else {
+        anyhow::bail!("correlation {} references a missing payment", row.id);
+    };
+    let flipped = sqlx::query(
+        "UPDATE payment_locks_correlations SET verification_state = 'upstream_failed', \
+         last_observed_status = $2, updated_at = $3 \
+         WHERE id = $1 AND verification_state = 'pending'",
+    )
+    .bind(row.id)
+    .bind(label)
+    .bind(now)
+    .execute(&mut *tx)
+    .await?;
+    if flipped.rows_affected() != 1 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    insert_observation(&mut tx, row.id, "completed", label, now).await?;
+    let parked = if matches!(payment_state.as_str(), "awaiting_entitlement" | "expired") {
+        let (revision, buyer_pubky): (i64, String) = sqlx::query_as(
+            "UPDATE payments SET state = 'manual_review', revision = revision + 1, \
+             manual_review_entered_at = $3, updated_at = $3 \
+             WHERE id = $1 AND state = $2 RETURNING revision, buyer_pubky",
+        )
+        .bind(row.payment_id)
+        .bind(&payment_state)
+        .bind(now)
+        .fetch_one(&mut *tx)
+        .await?;
+        crate::executor::insert_event(
+            &mut tx,
+            row.id,
+            &ids::payment_aggregate_id(row.payment_id),
+            revision,
+            &buyer_pubky,
+            "payment.manual_review",
+            now,
+        )
+        .await?;
+        true
+    } else {
+        false
+    };
+    tx.commit().await?;
+    tracing::warn!(
+        correlation_id = %row.id,
+        payment_id = %row.payment_id,
+        outcome = label,
+        parked,
+        "completed locks task cannot be verified against the prepared payment; it confirms nothing"
+    );
+    Ok(parked)
+}
+
+/// A completed task that cannot be verified yet for a reason that may be
+/// operational (a malformed binding body, sealed facts that do not open under
+/// the configured key). The first sighting is recorded once; the row stays
+/// `pending` and is retried until [`LOCKS_UNVERIFIED_RETRY_SECONDS`] after
+/// that sighting, then the payment is parked under `label`. Returns
+/// `Some(parked)` once the bound is reached, `None` while still retrying.
+async fn bound_unverified_retry(
+    pool: &PgPool,
+    row: &ClaimedCorrelation,
+    label: &str,
+    now: DateTime<Utc>,
+) -> anyhow::Result<Option<bool>> {
+    let retry_outcome = unverified_retry_outcome(label);
+    let first_seen: Option<DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT min(observed_at) FROM payment_locks_observations \
+         WHERE correlation_id = $1 AND observed_status = 'completed' AND outcome = $2",
+    )
+    .bind(row.id)
+    .bind(&retry_outcome)
+    .fetch_one(pool)
+    .await?;
+    let Some(first_seen) = first_seen else {
+        let mut tx = pool.begin().await?;
+        let recorded = sqlx::query(
+            "UPDATE payment_locks_correlations SET last_observed_status = $2, updated_at = $3 \
+             WHERE id = $1 AND verification_state = 'pending'",
+        )
+        .bind(row.id)
+        .bind(&retry_outcome)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        if recorded.rows_affected() == 1 {
+            insert_observation(&mut tx, row.id, "completed", &retry_outcome, now).await?;
+        }
+        tx.commit().await?;
+        return Ok(None);
+    };
+    if now - first_seen < chrono::Duration::seconds(LOCKS_UNVERIFIED_RETRY_SECONDS) {
+        return Ok(None);
+    }
+    park_unverified_completion(pool, row, label, now)
+        .await
+        .map(Some)
 }
 
 /// Marks the correlation completed inside the caller's effect transaction.
@@ -2013,48 +2150,75 @@ async fn apply_locks_lookup_outcome(
                 row.criterion_id.as_deref(),
             ) else {
                 // A correlation registered before preparation existed has
-                // nothing to compare the task against, so it cannot qualify.
-                tracing::warn!(
-                    correlation_id = %row.id,
-                    "completed locks task refused: the correlation has no sealed binding facts"
-                );
-                record_binding_refusal(&state.pool, row, "binding_unverifiable", now).await?;
-                return Ok(false);
+                // nothing to compare the task against, so it cannot qualify;
+                // the buyer may still have paid, so the fact is parked.
+                return park_unverified_completion(
+                    &state.pool,
+                    row,
+                    crate::locks::unverified::UNVERIFIABLE,
+                    now,
+                )
+                .await;
             };
-            let expected = locks
-                .keys
-                .open_expected_binding(row.payment_id, reference, resource, criterion_id)
-                .ok_or_else(|| {
-                    anyhow::anyhow!("correlation {} binding facts cannot be opened", row.id)
-                })?;
+            let Some(expected) =
+                locks
+                    .keys
+                    .open_expected_binding(row.payment_id, reference, resource, criterion_id)
+            else {
+                return match bound_unverified_retry(
+                    &state.pool,
+                    row,
+                    crate::locks::unverified::UNOPENABLE,
+                    now,
+                )
+                .await?
+                {
+                    Some(parked) => Ok(parked),
+                    None => Err(anyhow::anyhow!(
+                        "correlation {} binding facts cannot be opened",
+                        row.id
+                    )),
+                };
+            };
             match LocksClientBinding::verify(binding.as_ref(), &expected) {
                 Ok(()) => {
                     apply_completed_lifecycle(&state.pool, row, state.confirm_keys(), now).await
                 }
-                Err(refusal) => {
-                    match refusal {
-                        BindingRefusal::Missing => tracing::warn!(
-                            correlation_id = %row.id,
-                            payment_id = %row.payment_id,
-                            "completed locks task refused: the Lock Server echoed no client binding"
-                        ),
-                        BindingRefusal::Mismatch {
-                            client_reference,
-                            lock_resource,
-                            criterion_ids,
-                        } => tracing::warn!(
-                            correlation_id = %row.id,
-                            payment_id = %row.payment_id,
-                            client_reference,
-                            lock_resource,
-                            criterion_ids,
-                            "completed locks task refused: the client binding differs from the prepared payment"
-                        ),
-                    }
+                Err(BindingRefusal::Missing) => {
+                    park_unverified_completion(
+                        &state.pool,
+                        row,
+                        BindingRefusal::Missing.outcome(),
+                        now,
+                    )
+                    .await
+                }
+                Err(
+                    refusal @ BindingRefusal::Mismatch {
+                        client_reference,
+                        lock_resource,
+                        criterion_ids,
+                    },
+                ) => {
+                    tracing::warn!(
+                        correlation_id = %row.id,
+                        payment_id = %row.payment_id,
+                        client_reference,
+                        lock_resource,
+                        criterion_ids,
+                        "completed locks task refused: the client binding differs from the prepared payment"
+                    );
                     record_binding_refusal(&state.pool, row, refusal.outcome(), now).await?;
                     Ok(false)
                 }
             }
+        }
+        LocksLookupOutcome::CompletedMalformedBinding => {
+            Ok(
+                bound_unverified_retry(&state.pool, row, crate::locks::unverified::MALFORMED, now)
+                    .await?
+                    .unwrap_or(false),
+            )
         }
         LocksLookupOutcome::Status(LocksTaskStatus::Failed) => {
             record_upstream_terminal(&state.pool, row, "failed", "upstream_failed", now).await?;
@@ -4140,7 +4304,11 @@ pub async fn verify_due_paykit_payments(
 /// ageing), so a completion verified later still surfaces as
 /// `manual_review`. Payments already under `manual_review` are deliberately
 /// NOT swept: a human decides those — their money may be real, so their
-/// hold is never auto-released. A sandbox payment the buyer drove to
+/// hold is never auto-released. The one exception is a Locks payment parked
+/// because its completed task could not be verified against the prepared
+/// payment ([`SWEEPABLE_PAYMENT`]): nothing ties that money to this order,
+/// so its order is cancelled and its stock released at the window, while
+/// the payment stays in `manual_review`. A sandbox payment the buyer drove to
 /// `detected` has no `detected → expired` edge; its lapsed order still
 /// cancels and restocks, and the payment record stays untouched exactly as
 /// buyer cancellation leaves it. Confirmed orders are `paid` and never
@@ -4164,8 +4332,7 @@ pub async fn expire_due_payment_windows(
     let due: Vec<(Uuid, Uuid, String, String)> = sqlx::query_as(&format!(
         "SELECT o.id, p.id, p.state, o.buyer_pubky \
          FROM orders o JOIN payments p ON p.order_id = o.id \
-         WHERE {HELD_DUE_ORDER} \
-         AND p.state IN ('awaiting_entitlement', 'detected', 'expired') \
+         WHERE {HELD_DUE_ORDER} AND {SWEEPABLE_PAYMENT} \
          ORDER BY o.hold_expires_at NULLS FIRST FOR UPDATE OF p SKIP LOCKED"
     ))
     .bind(now)
@@ -4237,8 +4404,7 @@ async fn expire_lapsed_auction_orders(state: &AppState, now: DateTime<Utc>) -> a
     let due: Vec<(Uuid, Uuid, String, String)> = sqlx::query_as(&format!(
         "SELECT o.id, p.id, p.state, o.buyer_pubky \
          FROM orders o JOIN payments p ON p.order_id = o.id \
-         WHERE {LAPSED_AUCTION_ORDER} \
-         AND p.state IN ('awaiting_entitlement', 'detected', 'expired') \
+         WHERE {LAPSED_AUCTION_ORDER} AND {SWEEPABLE_PAYMENT} \
          ORDER BY o.created_at FOR UPDATE OF p SKIP LOCKED"
     ))
     .bind(now)
@@ -4430,6 +4596,19 @@ const MARK_PAYKIT_DETECTED: &str = "UPDATE orders SET paykit_request_state = 'de
          ELSE hold_expires_at END, \
      updated_at = $2 \
      WHERE id = $1 AND paykit_request_state = 'pending'";
+
+/// The payment half of the window sweeps: a payment the window may still
+/// expire, or a Locks payment parked by [`park_unverified_completion`]. A
+/// parked payment's money is not verified for this order, so its hold ends
+/// with the window exactly as a refused one does; the payment itself stays
+/// in `manual_review` (`expire_held_order` moves only `awaiting_entitlement`).
+/// Every other `manual_review` payment keeps its hold for a human.
+const SWEEPABLE_PAYMENT: &str = "(p.state IN ('awaiting_entitlement', 'detected', 'expired') \
+     OR (p.state = 'manual_review' AND p.adapter = 'locks' AND EXISTS ( \
+         SELECT 1 FROM payment_locks_correlations c WHERE c.payment_id = p.id \
+         AND c.verification_state = 'upstream_failed' \
+         AND c.last_observed_status IN ('binding_missing', 'binding_unverifiable', \
+             'binding_malformed', 'binding_unopenable'))))";
 
 /// The order half of the held-window expiry predicate; `$1` is `now`.
 const HELD_DUE_ORDER: &str = "o.state = 'pending_payment' AND o.stock_held \
@@ -6206,4 +6385,20 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_window_sweeps_release_every_parked_unverified_completion() {
+        for label in crate::locks::unverified::ALL {
+            assert!(
+                SWEEPABLE_PAYMENT.contains(&format!("'{label}'")),
+                "{label} is missing from the sweep predicate"
+            );
+        }
+        assert!(!SWEEPABLE_PAYMENT.contains("binding_mismatch"));
+    }
 }
