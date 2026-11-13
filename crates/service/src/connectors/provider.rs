@@ -167,6 +167,16 @@ pub struct ConnectionContext {
     pub app: Option<AppContext>,
 }
 
+/// Answer of [`ConnectorProvider::resolve_shop`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedShop {
+    /// The canonical shop, as [`ConnectorProvider::normalize_shop`] returns it.
+    pub shop: String,
+    /// The custom domain the merchant typed when it was looked up; `None`
+    /// when the input already was the canonical shop.
+    pub domain: Option<String>,
+}
+
 /// Input of [`ConnectorProvider::connect`].
 #[derive(Debug)]
 pub struct ConnectRequest {
@@ -274,10 +284,17 @@ pub struct WebhookContext {
 /// A webhook whose signature the provider verified.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedWebhook {
-    /// The provider's own delivery or event id. The inbound table is unique
-    /// on it per connection, which is the webhook dedupe.
+    /// The provider's own id of this delivery, kept by its retries. The
+    /// inbound table is unique on it per connection, which is the webhook
+    /// dedupe.
     pub event_id: String,
     pub topic: String,
+    /// The id of the store event the delivery belongs to, when the provider
+    /// sends one apart from the delivery id. Deliveries on other topics share
+    /// it, so it is no dedupe key; a delivery recorded under it before
+    /// deliveries were keyed by their own id is still found by it and the
+    /// topic.
+    pub shared_event_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -586,6 +603,13 @@ pub enum InboundEvent {
         amounts: Vec<RefundAmount>,
         mark: Option<PubkyRefundMark>,
     },
+    /// A store product changed. The framework reads it again
+    /// ([`ConnectorProvider::fetch_product`]) and, when it is linked to a
+    /// listing, queues what changed for the seller's Shop.
+    ProductChanged { provider_product_id: String },
+    /// The store deleted a product. A linked listing gets a pending status
+    /// change, whatever its sync settings.
+    ProductRemoved { provider_product_id: String },
     /// The merchant removed the app. The credential is deleted.
     AppUninstalled,
     /// One of the provider's mandatory privacy topics.
@@ -625,6 +649,19 @@ pub trait ConnectorProvider: Send + Sync + 'static {
     /// URL) and returns the canonical form used as the connection key and in
     /// the credential's associated data. Must never contain `|`.
     fn normalize_shop(&self, raw: &str) -> Result<String, ProviderError>;
+
+    /// Turns what the merchant typed into the canonical shop
+    /// [`Self::normalize_shop`] returns. A provider whose stores are reached
+    /// through a custom domain (Shopify) looks the address up on the
+    /// network; the default accepts exactly what `normalize_shop` accepts.
+    /// Nothing is stored, and nothing is sent to any host but the one the
+    /// merchant named and the provider's own.
+    async fn resolve_shop(&self, raw: &str) -> Result<ResolvedShop, ProviderError> {
+        Ok(ResolvedShop {
+            shop: self.normalize_shop(raw)?,
+            domain: None,
+        })
+    }
 
     /// Whether a connection of this provider is installed through an app the
     /// merchant owns ([`AppKind::Custom`]) or none ([`AppKind::None`]).
@@ -722,6 +759,21 @@ pub trait ConnectorProvider: Send + Sync + 'static {
         _inventory_item_id: &str,
     ) -> Result<Option<ResolvedStock>, ProviderError> {
         Ok(None)
+    }
+
+    /// One product as [`ConnectorProvider::list_catalog`] would list it, read
+    /// when a product webhook arrives (see [`InboundEvent::ProductChanged`]).
+    /// `Ok(None)` when the store no longer sells it: deleted, archived or a
+    /// draft. Providers without a single-product read keep the default; their
+    /// products are still compared on every stock poll.
+    async fn fetch_product(
+        &self,
+        _connection: &ConnectionContext,
+        _provider_product_id: &str,
+    ) -> Result<Option<CatalogProduct>, ProviderError> {
+        Err(ProviderError::Invalid(
+            "this provider has no single-product read".into(),
+        ))
     }
 
     /// A live look at the connection for the Shop's status page: the store's

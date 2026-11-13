@@ -67,50 +67,7 @@ pub async fn page(
         .ok_or_else(|| malformed("products page"))?;
     let mut products = Vec::with_capacity(nodes.len());
     for node in nodes {
-        let mut variants: Vec<Value> = node
-            .pointer("/variants/nodes")
-            .and_then(Value::as_array)
-            .cloned()
-            .ok_or_else(|| malformed("variants page"))?;
-        let product_id = text(node, "id").ok_or_else(|| malformed("product id"))?;
-        let mut more = node
-            .pointer("/variants/pageInfo")
-            .map(cursor_of)
-            .unwrap_or_default();
-        let mut pages = 0;
-        while let Some(cursor) = more {
-            pages += 1;
-            if pages > MAX_VARIANT_PAGES {
-                return Err(ProviderError::Rejected {
-                    code: "too_many_variants".into(),
-                    message: format!("product {product_id} has more variants than can be read"),
-                });
-            }
-            let rest = client
-                .execute(
-                    shop,
-                    token,
-                    documents::PRODUCT_VARIANTS_PAGE,
-                    json!({ "id": product_id, "after": cursor }),
-                )
-                .await?;
-            let connection = rest
-                .pointer("/product/variants")
-                .ok_or_else(|| malformed("variants page"))?;
-            variants.extend(
-                connection
-                    .get("nodes")
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| malformed("variants page"))?
-                    .iter()
-                    .cloned(),
-            );
-            more = connection
-                .get("pageInfo")
-                .map(cursor_of)
-                .unwrap_or_default();
-        }
-        products.push(product(node, &variants, &currency)?);
+        products.push(whole_product(client, shop, token, node, &currency).await?);
     }
     Ok(CatalogPage {
         products,
@@ -119,6 +76,91 @@ pub async fn page(
             .map(cursor_of)
             .unwrap_or_default(),
     })
+}
+
+/// One product, read when its webhook arrives. `None` when the store no longer
+/// sells it: deleted (`product` is null), or any status but `ACTIVE`, the only
+/// products [`page`] lists.
+pub async fn one(
+    client: &Client,
+    shop: &str,
+    token: &str,
+    product_id: &str,
+) -> Result<Option<CatalogProduct>, ProviderError> {
+    let data = client
+        .execute(shop, token, documents::PRODUCT, json!({ "id": product_id }))
+        .await?;
+    let currency = data
+        .pointer("/shop/currencyCode")
+        .and_then(Value::as_str)
+        .ok_or_else(|| malformed("shop currency"))?
+        .to_string();
+    let node = match data.get("product") {
+        None => return Err(malformed("product")),
+        Some(Value::Null) => return Ok(None),
+        Some(node) => node,
+    };
+    if node.get("status").and_then(Value::as_str) != Some("ACTIVE") {
+        return Ok(None);
+    }
+    whole_product(client, shop, token, node, &currency)
+        .await
+        .map(Some)
+}
+
+/// A product node with every variant: the ones beyond the first page are read
+/// through the product's own variant connection.
+async fn whole_product(
+    client: &Client,
+    shop: &str,
+    token: &str,
+    node: &Value,
+    currency: &str,
+) -> Result<CatalogProduct, ProviderError> {
+    let mut variants: Vec<Value> = node
+        .pointer("/variants/nodes")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| malformed("variants page"))?;
+    let product_id = text(node, "id").ok_or_else(|| malformed("product id"))?;
+    let mut more = node
+        .pointer("/variants/pageInfo")
+        .map(cursor_of)
+        .unwrap_or_default();
+    let mut pages = 0;
+    while let Some(cursor) = more {
+        pages += 1;
+        if pages > MAX_VARIANT_PAGES {
+            return Err(ProviderError::Rejected {
+                code: "too_many_variants".into(),
+                message: format!("product {product_id} has more variants than can be read"),
+            });
+        }
+        let rest = client
+            .execute(
+                shop,
+                token,
+                documents::PRODUCT_VARIANTS_PAGE,
+                json!({ "id": product_id, "after": cursor }),
+            )
+            .await?;
+        let connection = rest
+            .pointer("/product/variants")
+            .ok_or_else(|| malformed("variants page"))?;
+        variants.extend(
+            connection
+                .get("nodes")
+                .and_then(Value::as_array)
+                .ok_or_else(|| malformed("variants page"))?
+                .iter()
+                .cloned(),
+        );
+        more = connection
+            .get("pageInfo")
+            .map(cursor_of)
+            .unwrap_or_default();
+    }
+    product(node, &variants, currency)
 }
 
 /// The `endCursor` when `hasNextPage`.

@@ -88,6 +88,52 @@ fn refund(id: &str, amount: i64, recorded_total: i64) -> RefundRecord {
 }
 
 #[tokio::test]
+async fn one_product_reads_as_the_catalog_lists_it_and_a_gone_one_reads_as_none() {
+    let (fake, provider, connection) = setup().await;
+    let listed = provider
+        .list_catalog(&connection, None)
+        .await
+        .expect("page 1")
+        .products
+        .remove(0);
+    let read = provider
+        .fetch_product(&connection, "gid://shopify/Product/9001")
+        .await
+        .expect("read")
+        .expect("on sale");
+    assert_eq!(read, listed, "the same product, every variant included");
+    assert_eq!(read.variants.len(), 3);
+    assert_eq!(
+        fake.calls("Product")[0].variables,
+        json!({ "id": "gid://shopify/Product/9001" })
+    );
+
+    fake.lock()
+        .products_gone
+        .insert("gid://shopify/Product/9001".into(), Some("ARCHIVED"));
+    assert_eq!(
+        provider
+            .fetch_product(&connection, "gid://shopify/Product/9001")
+            .await
+            .expect("read"),
+        None,
+        "an archived product is not sold"
+    );
+    fake.lock()
+        .products_gone
+        .insert("gid://shopify/Product/9001".into(), None);
+    assert_eq!(
+        provider
+            .fetch_product(&connection, "gid://shopify/Product/9001")
+            .await
+            .expect("read"),
+        None,
+        "a deleted product reads as null"
+    );
+    fake.assert_clean();
+}
+
+#[tokio::test]
 async fn the_catalog_is_paged_with_whole_products_and_normalised() {
     let (fake, provider, connection) = setup().await;
     let first = provider
@@ -707,6 +753,8 @@ async fn webhooks_are_subscribed_once_and_stale_service_subscriptions_are_replac
             "INVENTORY_ITEMS_UPDATE",
             "INVENTORY_LEVELS_UPDATE",
             "ORDERS_CANCELLED",
+            "PRODUCTS_DELETE",
+            "PRODUCTS_UPDATE",
             "REFUNDS_CREATE"
         ]
     );
@@ -878,7 +926,7 @@ async fn subscriptions_are_read_page_by_page_and_a_lost_race_is_not_a_failure() 
         .iter()
         .filter(|(_, _, uri)| uri == HOOK)
         .count();
-    assert_eq!(topics, 7, "one subscription per topic, none twice");
+    assert_eq!(topics, 9, "one subscription per topic, none twice");
     fake.assert_clean();
 }
 
@@ -1073,7 +1121,7 @@ fn the_privacy_topics_are_named_for_the_merchant_guide() {
         PRIVACY_TOPICS,
         ["customers/data_request", "customers/redact", "shop/redact"]
     );
-    assert_eq!(SUBSCRIBED_TOPICS.len(), 7);
+    assert_eq!(SUBSCRIBED_TOPICS.len(), 9);
     let _ = Value::Null;
 }
 

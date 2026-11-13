@@ -1,7 +1,7 @@
 //! Provider webhooks: dedupe on receipt, apply on the worker.
 //!
 //! The ingress route verifies the signature, normalises the event and writes
-//! it to `connector_inbound_events`, unique on the provider's own event id
+//! it to `connector_inbound_events`, unique on the provider's own delivery id
 //! per connection, then answers. The worker applies it later, so a slow
 //! `inventory.adjust` never makes the store's delivery time out and a
 //! redelivery changes nothing. Only the normalised event is stored, never the
@@ -14,6 +14,9 @@
 //! * fulfillment: `fulfillment.ship` on the Pubky order the push created;
 //! * order cancelled in the store: a seller alert, never a refund;
 //! * refund in the store: a seller alert, never a refund;
+//! * product changed: read again and, when linked to a listing, compared
+//!   with its base so the seller's Shop gets the change (`product_sync`);
+//! * product deleted: a linked listing gets a pending status change;
 //! * app uninstalled: the credential is deleted and the connection closed;
 //! * privacy topics (`customers/data_request`, `customers/redact`,
 //!   `shop/redact`): the service keeps no store customer data, so the first
@@ -33,6 +36,7 @@ use crate::clock::format_timestamp;
 use crate::AppState;
 
 use super::deterministic_uuid;
+use super::product_sync;
 use super::provider::{
     ComplianceTopic, InboundEvent, OrderRef, PubkyRefundMark, RefundAmount, VerifiedWebhook,
 };
@@ -46,7 +50,9 @@ pub enum Recorded {
     Duplicate,
 }
 
-/// Records a verified webhook once per `(connection, provider event id)`.
+/// Records a verified webhook once per `(connection, provider delivery id)`.
+/// A delivery recorded under its shared event id (with its topic) is the same
+/// delivery: its retries now carry their delivery id as the key.
 pub async fn record(
     pool: &PgPool,
     now: DateTime<Utc>,
@@ -54,6 +60,20 @@ pub async fn record(
     webhook: &VerifiedWebhook,
     event: &InboundEvent,
 ) -> Result<Recorded, sqlx::Error> {
+    if let Some(shared) = &webhook.shared_event_id {
+        let recorded: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM connector_inbound_events \
+             WHERE connection_id = $1 AND provider_event_id = $2 AND topic = $3)",
+        )
+        .bind(connection.id)
+        .bind(shared)
+        .bind(&webhook.topic)
+        .fetch_one(pool)
+        .await?;
+        if recorded {
+            return Ok(Recorded::Duplicate);
+        }
+    }
     let id = Uuid::new_v4();
     let inserted: Option<Uuid> = sqlx::query_scalar(
         "INSERT INTO connector_inbound_events \
@@ -408,6 +428,26 @@ async fn handle(
             .await?;
             Ok(Handled::Applied("connection closed".to_string()))
         }
+        InboundEvent::ProductChanged {
+            provider_product_id,
+        } => product_changed(state, runtime, &connection, due, &provider_product_id).await,
+        InboundEvent::ProductRemoved {
+            provider_product_id,
+        } => {
+            if !is_linked(&state.pool, connection.id, &provider_product_id).await? {
+                return Ok(Handled::Ignored("unlinked_product".to_string()));
+            }
+            // Known as of the delivery: a read of the product made after it
+            // arrived (a product made active again) wins.
+            let observed = product_sync::observe_removed(
+                &state.pool,
+                due.received_at,
+                connection.id,
+                &provider_product_id,
+            )
+            .await?;
+            Ok(Handled::Applied(format!("queued {}", observed.queued)))
+        }
         InboundEvent::Compliance { .. } | InboundEvent::InventoryChanged { .. } => {
             unreachable!("handled above")
         }
@@ -712,6 +752,91 @@ async fn resolve_inventory(
             Err(Handled::Retry("provider_unavailable".to_string()))
         }
     })
+}
+
+async fn is_linked(
+    pool: &PgPool,
+    connection_id: Uuid,
+    provider_product_id: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM connector_variant_map \
+         WHERE connection_id = $1 AND provider_product_id = $2)",
+    )
+    .bind(connection_id)
+    .bind(provider_product_id)
+    .fetch_one(pool)
+    .await
+}
+
+/// Reads a changed product again and compares it with its base. A delivery
+/// received before a read of the product started adds nothing (that read saw
+/// the store as it was then, or later), so a burst of updates costs one read.
+async fn product_changed(
+    state: &AppState,
+    runtime: &ConnectorRuntime,
+    connection: &ConnectionRow,
+    due: &DueEvent,
+    provider_product_id: &str,
+) -> Result<Handled, sqlx::Error> {
+    if !is_linked(&state.pool, connection.id, provider_product_id).await? {
+        return Ok(Handled::Ignored("unlinked_product".to_string()));
+    }
+    if product_sync::checked_since(
+        &state.pool,
+        connection.id,
+        provider_product_id,
+        due.received_at,
+    )
+    .await?
+    {
+        return Ok(Handled::Ignored("already_observed".to_string()));
+    }
+    let Some(provider) = connection
+        .provider_kind()
+        .and_then(|kind| runtime.providers.get(kind))
+    else {
+        return Ok(Handled::Ignored("provider_unavailable".to_string()));
+    };
+    let context = match runtime.open(&state.pool, connection).await {
+        Ok(context) => context,
+        Err(store::OpenError::Database(error)) => return Err(error),
+        Err(_) => return Ok(Handled::Retry("connection_unavailable".to_string())),
+    };
+    let read_at = state.clock.now();
+    let fetched = tokio::time::timeout(
+        runtime.settings.provider_timeout,
+        provider.fetch_product(&context, provider_product_id),
+    )
+    .await;
+    let observed = match fetched {
+        Ok(Ok(Some(product))) if product.provider_product_id == provider_product_id => {
+            product_sync::observe(&state.pool, read_at, connection.id, &product).await?
+        }
+        Ok(Ok(Some(_))) => {
+            return Ok(Handled::Ignored(
+                "provider_returned_other_product".to_string(),
+            ))
+        }
+        Ok(Ok(None)) => {
+            product_sync::observe_removed(&state.pool, read_at, connection.id, provider_product_id)
+                .await?
+        }
+        Ok(Err(super::provider::ProviderError::Unauthorized)) => {
+            return Ok(Handled::Ignored("credentials_rejected".to_string()))
+        }
+        Ok(Err(
+            super::provider::ProviderError::Rejected { .. }
+            | super::provider::ProviderError::Invalid(_),
+        )) => return Ok(Handled::Ignored("provider_rejected".to_string())),
+        Ok(Err(super::provider::ProviderError::RateLimited { .. })) => {
+            return Ok(Handled::Retry("rate_limited".to_string()))
+        }
+        Ok(Err(super::provider::ProviderError::Unknown(_))) | Err(_) => {
+            return Ok(Handled::Retry("provider_unavailable".to_string()))
+        }
+    };
+    Ok(Handled::Applied(format!("queued {}", observed.queued)))
 }
 
 fn retention_end(now: DateTime<Utc>) -> DateTime<Utc> {

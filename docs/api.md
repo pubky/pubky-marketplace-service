@@ -149,6 +149,7 @@ and write. "Automation" means the inventory capability plus the
 | POST | `/v0/orders/{id}/bitcoin/resolve` |
 | GET, POST | `/v1/connectors` |
 | GET | `/v1/connectors/alerts` |
+| POST | `/v1/connectors/resolve` |
 | POST | `/v1/connectors/alerts/{id}/resolve` |
 | DELETE | `/v1/connectors/{id}` |
 | GET | `/v1/connectors/{id}/catalog` |
@@ -156,6 +157,10 @@ and write. "Automation" means the inventory capability plus the
 | PUT | `/v1/connectors/{id}/credentials` |
 | GET, PUT | `/v1/connectors/{id}/mappings` |
 | GET, PUT | `/v1/connectors/{id}/selection` |
+| GET, PUT | `/v1/connectors/{id}/sync` |
+| PUT | `/v1/connectors/{id}/sync/listings/{listing_id}` |
+| GET | `/v1/connectors/{id}/changes` |
+| POST | `/v1/connectors/{id}/changes/{change_id}/resolve` |
 | PUT | `/v1/connectors/{id}/settings` |
 | PUT | `/v1/connectors/{id}/woocommerce/keys` |
 | GET | `/v1/connectors/{id}/pushes` |
@@ -1712,22 +1717,28 @@ against Shopify's published schema.
   They are signed with the same app secret and are acknowledged (the service
   keeps no store customer data); `shop/redact` ends the 30-day secret retention.
   The merchant guide must say this, because nothing else configures them. The
-  seven operational topics need no merchant step.
+  nine operational topics need no merchant step.
 
 **What the service does.** After a verified launch it redirects to Shopify's
 authorize page; after a verified callback it exchanges the code for an offline
 access token (sealed per connection) and then subscribes `inventory_levels/update`,
 `inventory_items/update`, `fulfillments/create`, `fulfillments/update`,
-`orders/cancelled`, `refunds/create` and `app/uninstalled` to the connection's
-webhooks URL through `webhookSubscriptionCreate`. A connection installed before
-`inventory_items/update` was added gets it on its next install; until then the
-stock poll catches tracking changes. A repeat
+`orders/cancelled`, `refunds/create`, `app/uninstalled`, `products/update` and
+`products/delete` to the connection's webhooks URL through
+`webhookSubscriptionCreate`. A connection installed before
+`inventory_items/update` or the product topics were added gets them on its
+next install; until then the stock poll catches tracking and product changes. A repeat
 install reads the subscription list page by page, subscribes nothing twice (a
 create that loses a race to a concurrent install is confirmed by re-reading the
 list, not by interpreting the message) and removes stale subscriptions this
 service made for another address. Webhooks are verified with the base64 HMAC-SHA256 of the raw
 body under the connection's app secret (`X-Shopify-Hmac-Sha256`), and deduplicated
-on `X-Shopify-Event-Id`.
+on the delivery id `X-Shopify-Webhook-Id`, which Shopify keeps across retries.
+`X-Shopify-Event-Id` is shared by the deliveries one store action makes on
+different topics (a sale's `products/update` and `inventory_levels/update`), so
+it is the key only of a delivery that carries no delivery id. A delivery whose
+event id and topic match a delivery recorded under its event id is a retry of
+it, and a duplicate.
 
 - **Catalog.** Active products, a few per page, with every variant (more than 25
   variants are read through the product's variant connection). A variant's stock
@@ -1853,6 +1864,26 @@ on `X-Shopify-Event-Id`.
   without `fulfillment.update_tracking` (and ship-without-tracking) is detected
   from its command vocabulary and keeps the old behaviour: a fulfilment without
   tracking is ignored (`tracking_commands_unavailable`), one with tracking ships.
+- `POST /v1/connectors/resolve` with `{"provider": "shopify", "domain":
+  "shop.example"}` (a body, so the address never sits in a URL) answers
+  `{shop, domain}` for the address a merchant typed, before anything is
+  connected: `shop` is the canonical `*.myshopify.com` domain to send to
+  `POST /v1/connectors`, `domain` the custom domain that was looked up (`null`
+  when the input already was a `*.myshopify.com` address or an
+  `admin.shopify.com/store/{handle}` URL, which need no lookup). The service
+  reads the storefront's `/meta.json` and accepts the answer only when
+  Shopify's own `https://{shop}/meta.json` names the same shop and lists the
+  typed host (`www.` ignored) as its main domain. Outbound rules: HTTPS and the
+  standard port only, a public DNS name (no IP address, `localhost` or
+  single-label name), every resolved address public and the request pinned to
+  them, at most three redirects that keep scheme and port, 8 s per request and
+  20 s in all, a 128 KiB body cap, and eight lookups at a time (`429
+  provider_rate_limited` beyond that). A pasted page address keeps its host and
+  loses its path, query and fragment. Refusals are `422`: `invalid_domain` (not
+  a usable address), `not_a_shopify_store` (no Shopify answer, or Shopify does
+  not confirm the claim) and `not_primary_domain` (a Shopify store, but the
+  typed host is not its main domain; the message names the main domain); an
+  unreachable host is `502 provider_unavailable`. Nothing is stored.
 - `GET /v1/connectors/{id}/check` reads the store live: its name, the scopes the
   token holds, the number of active locations and whether a catalog read works.
 
@@ -2021,6 +2052,57 @@ per-variant inventory (`inventory.adjust` with `variant`), and skipped
 (`multi_variant_listing`) on a build without it. The 15-minute poll
 (`CONNECTOR_STOCK_POLL_SECONDS`) reads the catalog for mapped products because
 WordPress cron is unreliable.
+
+### Product changes
+
+A listing linked to a store product can follow the store for three field
+groups: `content` (title, description, images), `price` (each variant's price)
+and `variants` (options and the variant set). Stock is not one of them: it
+already follows the store through `inventory.adjust`. Each group has a
+direction, `from_store` (the default) or `off`, per connection
+(`GET`/`PUT /v1/connectors/{id}/sync`, body `{"groups": {"price": "off"}}`),
+which a linked listing may override
+(`PUT /v1/connectors/{id}/sync/listings/{listing_id}`, `null` returns a group
+to the connection's setting; a listing that is not linked answers
+`404 listing_not_linked`).
+
+The service keeps a base per linked product and group: the store's value as
+last applied, or as first seen. It compares the store with it on every
+`products/update` (the product is read again with the `Product` query, so a
+late delivery never queues an older version; a delivery received before the
+product's last observation is skipped) and on every stock poll, which reads
+the whole catalog anyway. A difference in a group that some linked listing
+follows becomes one pending change per product and group, and a newer store
+value replaces the proposal of a change still pending. A store value back at
+the base, or equal to a proposal the seller dismissed, withdraws (deletes) the
+pending change. Each read records when it started, and a read older than the
+product's last one is dropped, so a slow read never replaces a newer one. A product the store no longer sells (`products/delete`, `product`
+null or not `ACTIVE`, or missing from a catalog walk that reached the last
+page) is always queued as a `status` change, `{"available": false}`, whatever
+the directions: a paid order for it could not reach the store.
+
+`GET /v1/connectors/{id}/changes` lists the pending changes, oldest first,
+each with `field_group`, `base`, `proposed`, `proposed_hash` (hex SHA-256 of
+the canonical proposal) and the linked `listings` with their direction for
+the group (`always` for `status`) and their variant links. The service never
+writes a listing: the seller's Shop compares each change with the listing as
+it stands, applies or dismisses it, and calls
+`POST /v1/connectors/{id}/changes/{change_id}/resolve` with
+`{"resolution": "applied" | "dismissed", "proposed_hash": "..."}`. `applied`
+moves the base to the proposal. A change no longer pending, or whose proposal
+was replaced since the Shop read it, answers `409 change_stale`; an unknown or
+withdrawn one `404 change_not_found` (read the changes again). A product's
+base and pending change for a group are shared by its linked listings, and a
+product follows a group while any of them does. Changing a direction so that
+a product starts or stops following a group withdraws its pending change for
+the group and drops its base, so the next observation that started after the
+change takes the store as it then stands; a product another listing keeps
+following keeps both. Each group's base is dropped at its own instant, so a
+direction change in one group never voids a read for another. Unlinking a
+product (a mapping save without it, split mode, a disconnect) forgets its
+base and changes, and the overrides of listings that no longer link anything;
+a read that started before the unlink is dropped, also when the product is
+linked again before it completes.
 
 ### Mirror leases and the refund difference
 

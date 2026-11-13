@@ -96,6 +96,10 @@ pub fn build_router(state: AppState) -> Router {
                 .post(crate::connectors::routes::start_connect),
         )
         .route(
+            "/v1/connectors/resolve",
+            post(crate::connectors::routes::resolve_shop),
+        )
+        .route(
             "/v1/connectors/alerts",
             get(crate::connectors::routes::list_alerts),
         )
@@ -132,6 +136,22 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/connectors/{id}/selection",
             get(crate::connectors::routes::get_selection)
                 .put(crate::connectors::routes::put_selection),
+        )
+        .route(
+            "/v1/connectors/{id}/sync",
+            get(crate::connectors::routes::get_sync).put(crate::connectors::routes::put_sync),
+        )
+        .route(
+            "/v1/connectors/{id}/sync/listings/{listing_id}",
+            put(crate::connectors::routes::put_listing_sync),
+        )
+        .route(
+            "/v1/connectors/{id}/changes",
+            get(crate::connectors::routes::list_changes),
+        )
+        .route(
+            "/v1/connectors/{id}/changes/{change_id}/resolve",
+            post(crate::connectors::routes::resolve_change),
         )
         .route(
             "/v1/connectors/{id}/woocommerce/keys",

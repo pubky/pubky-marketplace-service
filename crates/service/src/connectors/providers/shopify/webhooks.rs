@@ -1,13 +1,15 @@
 //! Webhook subscriptions and the meaning of Shopify's webhook payloads.
 //!
-//! The service subscribes the store to seven topics through the Admin API
+//! The service subscribes the store to nine topics through the Admin API
 //! (`webhookSubscriptionCreate`), all pointing at the connection's own webhooks
 //! URL. Shopify's three mandatory privacy topics (`customers/data_request`,
 //! `customers/redact`, `shop/redact`) are **not** in `WebhookSubscriptionTopic`
 //! and cannot be subscribed through the API: they are configured in the app's
-//! configuration (`shopify.app.toml` `[webhooks.privacy_compliance]`, or the
-//! Dev Dashboard's app version) with the same connection webhooks URL. They are
-//! signed with the same app secret and are parsed here once they arrive.
+//! configuration (`shopify.app.toml` `compliance_topics`, deployed with Shopify
+//! CLI; the Dev Dashboard version form has no field for them). Shopify requires
+//! them only of apps listed in its App Store, so a merchant's own app works
+//! without them. If they are deployed with the connection's webhooks URL, they
+//! are signed with the same app secret and are parsed here once they arrive.
 
 use std::collections::BTreeMap;
 
@@ -32,7 +34,7 @@ pub const HEADER_WEBHOOK_ID: &str = "x-shopify-webhook-id";
 
 /// The webhook topic as it appears in `X-Shopify-Topic` and the matching
 /// `WebhookSubscriptionTopic` value.
-pub const SUBSCRIBED_TOPICS: [(&str, &str); 7] = [
+pub const SUBSCRIBED_TOPICS: [(&str, &str); 9] = [
     ("inventory_levels/update", "INVENTORY_LEVELS_UPDATE"),
     // Tracking switched on or off for an item: the variant moves between
     // counted and made-to-order stock without any level changing.
@@ -42,6 +44,11 @@ pub const SUBSCRIBED_TOPICS: [(&str, &str); 7] = [
     ("orders/cancelled", "ORDERS_CANCELLED"),
     ("refunds/create", "REFUNDS_CREATE"),
     ("app/uninstalled", "APP_UNINSTALLED"),
+    // A linked product's content, prices or variants changed, or it left the
+    // store. `products/create` is not needed: a new product is linked to no
+    // listing, and the Shop offers it from the catalog.
+    ("products/update", "PRODUCTS_UPDATE"),
+    ("products/delete", "PRODUCTS_DELETE"),
 ];
 
 /// The topics configured in the app's configuration rather than through the
@@ -219,13 +226,24 @@ pub fn verify(
         .get(HEADER_TOPIC)
         .ok_or_else(|| ProviderError::Invalid("webhook names no topic".into()))?
         .to_ascii_lowercase();
-    let event_id = headers
-        .get(HEADER_EVENT_ID)
-        .or_else(|| headers.get(HEADER_WEBHOOK_ID))
-        .filter(|id| !id.is_empty())
-        .ok_or_else(|| ProviderError::Invalid("webhook carries no event id".into()))?
-        .to_string();
-    Ok(VerifiedWebhook { event_id, topic })
+    // `X-Shopify-Webhook-Id` names the delivery and is kept by its retries;
+    // `X-Shopify-Event-Id` is shared by the deliveries one store action makes
+    // on different topics (a sale's `products/update` and
+    // `inventory_levels/update`), so keying on it would drop all but one.
+    let non_empty = |name| headers.get(name).filter(|id: &&str| !id.is_empty());
+    let shared = non_empty(HEADER_EVENT_ID).map(str::to_string);
+    let (event_id, shared_event_id) = match non_empty(HEADER_WEBHOOK_ID) {
+        Some(delivery) => (delivery.to_string(), shared),
+        None => (
+            shared.ok_or_else(|| ProviderError::Invalid("webhook carries no event id".into()))?,
+            None,
+        ),
+    };
+    Ok(VerifiedWebhook {
+        event_id,
+        topic,
+        shared_event_id,
+    })
 }
 
 fn gid(kind: &str, payload: &Value, numeric: &str) -> Option<String> {
@@ -406,6 +424,17 @@ pub fn parse(webhook: &VerifiedWebhook, body: &[u8]) -> Result<InboundEvent, Pro
             })
         }
         "app/uninstalled" => Ok(InboundEvent::AppUninstalled),
+        // The body is not used beyond the product id: the product is read
+        // again through the API, so a late delivery can never queue an older
+        // version than the store now has.
+        "products/update" => Ok(InboundEvent::ProductChanged {
+            provider_product_id: gid("Product", &payload, "id")
+                .ok_or_else(|| missing("product"))?,
+        }),
+        "products/delete" => Ok(InboundEvent::ProductRemoved {
+            provider_product_id: gid("Product", &payload, "id")
+                .ok_or_else(|| missing("product"))?,
+        }),
         "customers/data_request" => Ok(InboundEvent::Compliance {
             topic: ComplianceTopic::CustomerDataRequest,
         }),
@@ -454,6 +483,7 @@ mod tests {
         VerifiedWebhook {
             event_id: "e".into(),
             topic: topic.into(),
+            shared_event_id: None,
         }
     }
 
@@ -468,6 +498,25 @@ mod tests {
         assert!(verify(None, body, &headers).is_err());
         let unsigned = WebhookHeaders::from_pairs([("X-Shopify-Topic", "orders/cancelled")]);
         assert!(verify(Some(&app()), body, &unsigned).is_err());
+    }
+
+    #[test]
+    fn a_delivery_is_keyed_by_its_delivery_id_not_the_shared_event_id() {
+        let body = br#"{"id":1}"#;
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        let signed = signed_headers(body, "inventory_levels/update");
+        for name in [HEADER_HMAC, HEADER_TOPIC, HEADER_EVENT_ID, HEADER_SHOP] {
+            pairs.push((name.into(), signed.get(name).expect(name).into()));
+        }
+        pairs.push(("X-Shopify-Webhook-Id".into(), "dlv-1".into()));
+        let verified =
+            verify(Some(&app()), body, &WebhookHeaders::from_pairs(pairs)).expect("verified");
+        assert_eq!(verified.event_id, "dlv-1");
+        assert_eq!(verified.shared_event_id.as_deref(), Some("evt-1"));
+
+        let only_event = verify(Some(&app()), body, &signed).expect("verified");
+        assert_eq!(only_event.event_id, "evt-1");
+        assert_eq!(only_event.shared_event_id, None);
     }
 
     #[test]
@@ -488,6 +537,37 @@ mod tests {
             b"{}"
         )
         .is_err());
+    }
+
+    #[test]
+    fn product_webhooks_name_the_product_to_re_read_or_remove() {
+        let updated = parse(
+            &webhook("products/update"),
+            br#"{"id":9001,"title":"Trail Boots","status":"active",
+                 "admin_graphql_api_id":"gid://shopify/Product/9001"}"#,
+        )
+        .expect("event");
+        assert_eq!(
+            updated,
+            InboundEvent::ProductChanged {
+                provider_product_id: "gid://shopify/Product/9001".into()
+            }
+        );
+        // `products/delete` carries only the numeric id.
+        let deleted = parse(&webhook("products/delete"), br#"{"id":9002}"#).expect("event");
+        assert_eq!(
+            deleted,
+            InboundEvent::ProductRemoved {
+                provider_product_id: "gid://shopify/Product/9002".into()
+            }
+        );
+        assert!(parse(&webhook("products/update"), br#"{"title":"no id"}"#).is_err());
+        assert!(SUBSCRIBED_TOPICS
+            .iter()
+            .any(|(topic, _)| *topic == "products/update"));
+        assert!(SUBSCRIBED_TOPICS
+            .iter()
+            .any(|(topic, _)| *topic == "products/delete"));
     }
 
     #[test]
@@ -707,7 +787,7 @@ mod tests {
             InboundEvent::AppUninstalled
         );
         assert!(matches!(
-            parse(&webhook("products/update"), b"{}"),
+            parse(&webhook("products/create"), b"{}"),
             Ok(InboundEvent::Ignored { .. })
         ));
         assert!(parse(&webhook("orders/cancelled"), b"not json").is_err());

@@ -153,6 +153,16 @@ pub struct Inner {
     /// How the store keeps inventory item 4242's stock: `(tracked,
     /// inventoryPolicy)`. Defaults to the fixture's `(true, "DENY")`.
     pub inventory_item_tracking: (bool, &'static str),
+    /// Edits a test made to a fixture product, applied wherever the product
+    /// is served (`ProductsPage`, `Product`): each top-level field replaces
+    /// the fixture's. Keyed by product id.
+    pub product_edits: HashMap<String, Value>,
+    /// Variant prices replacing the fixture's, keyed by variant id.
+    pub variant_prices: HashMap<String, String>,
+    /// Products the store no longer sells, by id: `Some(status)` for an
+    /// archived or draft product (`Product` reports it, `ProductsPage` lists
+    /// only `ACTIVE`), `None` for a deleted one.
+    pub products_gone: HashMap<String, Option<&'static str>>,
     next_id: u64,
 }
 
@@ -208,6 +218,9 @@ impl FakeShopify {
             subscription_page_size: 100,
             cancel_refusal: None,
             forced_tax_bps: 0,
+            product_edits: HashMap::new(),
+            variant_prices: HashMap::new(),
+            products_gone: HashMap::new(),
             next_id: 7000,
         }));
         let router = Router::new()
@@ -527,6 +540,32 @@ fn process(
     Ok(axum::Json(response).into_response())
 }
 
+fn edit_variant(inner: &Inner, variant: &mut Value) {
+    if let Some(price) = variant["id"]
+        .as_str()
+        .and_then(|id| inner.variant_prices.get(id))
+    {
+        variant["price"] = json!(price);
+    }
+}
+
+fn edit_product(inner: &Inner, node: &mut Value) {
+    if let Some(Value::Object(edits)) = node["id"]
+        .as_str()
+        .and_then(|id| inner.product_edits.get(id))
+        .cloned()
+    {
+        for (field, value) in edits {
+            node[field] = value;
+        }
+    }
+    if let Some(variants) = node["variants"]["nodes"].as_array_mut() {
+        for variant in variants {
+            edit_variant(inner, variant);
+        }
+    }
+}
+
 fn gid(kind: &str, number: u64) -> String {
     format!("gid://shopify/{kind}/{number}")
 }
@@ -556,9 +595,52 @@ fn run(inner: &mut Inner, name: &str, document: &str, variables: &Value) -> Resu
             };
             let mut response = fixture(page);
             response["data"]["shop"]["currencyCode"] = json!(inner.shop_currency);
+            if let Some(nodes) = response["data"]["products"]["nodes"].as_array_mut() {
+                nodes.retain(|node| {
+                    !inner
+                        .products_gone
+                        .contains_key(node["id"].as_str().unwrap_or_default())
+                });
+                for node in nodes.iter_mut() {
+                    edit_product(inner, node);
+                }
+            }
             Ok(json!({ "data": response["data"] }))
         }
-        "ProductVariantsPage" => Ok(json!({ "data": fixture("product_variants_page")["data"] })),
+        "ProductVariantsPage" => {
+            let mut response = fixture("product_variants_page");
+            if let Some(nodes) = response["data"]["product"]["variants"]["nodes"].as_array_mut() {
+                for variant in nodes {
+                    edit_variant(inner, variant);
+                }
+            }
+            Ok(json!({ "data": response["data"] }))
+        }
+        "Product" => {
+            let id = variables["id"].as_str().unwrap_or_default();
+            let gone = inner.products_gone.get(id).copied();
+            let node = ["products_page_1", "products_page_2"]
+                .iter()
+                .flat_map(|page| {
+                    fixture(page)["data"]["products"]["nodes"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                })
+                .find(|node| node["id"] == id);
+            let product = match (node, gone) {
+                (None, _) | (_, Some(None)) => Value::Null,
+                (Some(mut node), gone) => {
+                    edit_product(inner, &mut node);
+                    node["status"] = json!(gone.flatten().unwrap_or("ACTIVE"));
+                    node
+                }
+            };
+            Ok(json!({ "data": {
+                "shop": { "currencyCode": inner.shop_currency },
+                "product": product,
+            } }))
+        }
         "InventoryItemVariant" => {
             if variables["id"] == "gid://shopify/InventoryItem/4242" {
                 let mut response = fixture("inventory_item");
