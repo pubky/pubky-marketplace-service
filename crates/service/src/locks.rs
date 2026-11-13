@@ -274,20 +274,42 @@ impl LocksTaskStatus {
 /// submitted, the lock resource the task verifies and the submitted proofs'
 /// criterion ids in submission order. The task is write-once, so these
 /// values never change after admission.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 pub struct LocksClientBinding {
     pub client_reference: String,
     pub pubky_lock_resource: String,
     pub criterion_ids: Vec<String>,
 }
 
+/// The reference and the lock resource never appear in logs.
+impl std::fmt::Debug for LocksClientBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocksClientBinding")
+            .field("client_reference", &"<redacted>")
+            .field("pubky_lock_resource", &"<redacted>")
+            .field("criterion_ids", &self.criterion_ids)
+            .finish()
+    }
+}
+
 /// The facts the service holds for one prepared payment, opened from the
 /// correlation row: what a completed task must echo to qualify it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ExpectedLocksBinding {
     pub client_reference: String,
     pub lock_resource: String,
     pub criterion_id: String,
+}
+
+/// The reference and the lock resource never appear in logs.
+impl std::fmt::Debug for ExpectedLocksBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExpectedLocksBinding")
+            .field("client_reference", &"<redacted>")
+            .field("lock_resource", &"<redacted>")
+            .field("criterion_id", &self.criterion_id)
+            .finish()
+    }
 }
 
 /// Static labels for a completed task the service cannot verify against the
@@ -388,7 +410,7 @@ fn lock_resource_from_locks_form(resource: &str) -> Option<String> {
 /// correlation stays pending and is retried on the next worker pass,
 /// matching Locks v1 semantics where transport/status failures remain
 /// pending rather than terminal.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum LocksLookupOutcome {
     Status(LocksTaskStatus),
     /// The task completed. It qualifies a payment only through its echoed
@@ -401,6 +423,24 @@ pub enum LocksLookupOutcome {
     /// this bundle to the Lock Server.
     NotFound,
     Unavailable,
+}
+
+/// Delegates to the redacted [`LocksClientBinding`] form, so no outcome
+/// prints the reference or the lock resource.
+impl std::fmt::Debug for LocksLookupOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LocksLookupOutcome::Status(status) => f.debug_tuple("Status").field(status).finish(),
+            LocksLookupOutcome::Completed(binding) => {
+                f.debug_tuple("Completed").field(binding).finish()
+            }
+            LocksLookupOutcome::CompletedMalformedBinding => {
+                f.write_str("CompletedMalformedBinding")
+            }
+            LocksLookupOutcome::NotFound => f.write_str("NotFound"),
+            LocksLookupOutcome::Unavailable => f.write_str("Unavailable"),
+        }
+    }
 }
 
 /// The Lock Server lifecycle lookup. Implementations must treat the bundle
@@ -1024,6 +1064,37 @@ mod tests {
                 LocksLookupOutcome::CompletedMalformedBinding
             );
         }
+    }
+
+    #[test]
+    fn debug_output_never_carries_the_reference_or_the_lock_resource() {
+        let creator = "y".repeat(52);
+        let echoed = echoed_binding(&creator);
+        let expected = expected_binding(&creator);
+        let outputs = [
+            format!("{echoed:?}"),
+            format!("{echoed:#?}"),
+            format!("{expected:?}"),
+            format!("{expected:#?}"),
+            format!("{:?}", LocksLookupOutcome::Completed(Some(echoed.clone()))),
+            format!("{:#?}", LocksLookupOutcome::Completed(Some(echoed.clone()))),
+        ];
+        for output in &outputs {
+            assert!(!output.contains(BINDING_REFERENCE), "{output}");
+            assert!(!output.contains(BINDING_LOCK_ID), "{output}");
+            assert!(!output.contains(&creator), "{output}");
+            assert!(output.contains("<redacted>"), "{output}");
+        }
+        assert!(outputs[0].contains("criterion-1"));
+        assert!(outputs[2].contains("criterion-1"));
+        assert_eq!(
+            format!("{:?}", LocksLookupOutcome::Completed(None)),
+            "Completed(None)"
+        );
+        assert_eq!(
+            format!("{:?}", LocksLookupOutcome::CompletedMalformedBinding),
+            "CompletedMalformedBinding"
+        );
     }
 
     #[test]
