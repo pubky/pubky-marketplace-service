@@ -2368,8 +2368,9 @@ advance a payment (ADR-0019 §7).
   reference exactly (constant-time, no case folding or trimming), the lock
   resource after canonicalization (the Lock Server writes the creator as
   `pubky<creator>`), and `criterion_ids` equal to the single prepared
-  criterion. The task is write-once, so every outcome below is terminal for
-  polling: the correlation moves to `upstream_failed`, its
+  criterion. The task is write-once, so every outcome below ends polling
+  (the last two after a bounded retry): the correlation moves to
+  `upstream_failed`, its
   `last_observed_status` and one `payment_locks_observations` row carry a
   static label, and no value from either side is stored or logged beyond
   which fields differed.
