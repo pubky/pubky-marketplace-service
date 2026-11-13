@@ -681,8 +681,8 @@ foreign key cascades from `connector_connections`. Directly rerunnable: each
 table and index is created only if missing.
 
 **Deploy mode: rolling.** A binary from before 0096 never reads the tables and
-queues nothing; the new binary bases every linked product at its first read,
-so the order of the service and worker deploys does not matter.
+queues nothing; the new binary bases every linked product at its first read.
+0097 ships with it and asks for the API to roll before the worker.
 
 ### Backing out 0096
 
@@ -701,17 +701,26 @@ and listings are never written by the service.
 0097 adds four nullable columns to `connector_product_snapshots`:
 `content_rebased_at`, `price_rebased_at` and `variants_rebased_at` (when the
 group's direction last changed for the product; only a read that started
-after it may take the group's new base) and `unlinked_at` (when the product
-was last found linked to no listing; a read that started before it was made
-for a previous link and is dropped). A linked product has a snapshot row from
-its link on, and an unlinked product's row stays, emptied of its bases, to
-carry that fence; 0097 inserts an empty row for every linked product that has
-none. `rebased_at` from 0096 is copied into each group's column and is no
+after it may take the group's new base) and `unlinked_at` (the product's link
+fence: when a mapping change last linked or unlinked it; a read that started
+before it was planned for a previous link, or for none, and is dropped). A
+linked product has a snapshot row from its link on, and an unlinked product's
+row stays, emptied of its bases, until the connector worker's stock poll
+deletes it once its fence is older than `ORPHAN_SNAPSHOT_RETENTION` (twice
+the longest catalog walk, 12,000 seconds); linking the product again writes a
+new row and fence. 0097 inserts an empty row for every linked product that
+has none. `rebased_at` from 0096 is copied into each group's column and is no
 longer read or written. Directly rerunnable.
 
-**Deploy mode: rolling, together with 0096.** A binary from before 0097 keeps
-reading `rebased_at` and deleting unlinked snapshots, which only loses the
-fences.
+**Deploy mode: rolling, together with 0096, the API before the worker.** No
+binary that reads `rebased_at` shipped: 0096 and 0097 reach production in one
+release. The binary running during the roll predates both migrations and has
+no product sync at all, so a mapping change it makes gives a newly linked
+product no snapshot row and an unlinked one no fence. That only matters once
+a new connector worker is reading products: roll the API (which serves the
+mapping routes) before the `connector-worker` and no new read meets a mapping
+change from the old binary. A product the old API linked gets its row at its
+first read.
 
 ### Backing out 0097
 
