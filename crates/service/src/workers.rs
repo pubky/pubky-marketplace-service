@@ -64,7 +64,7 @@ use crate::model::{ListingRow, PaymentRow};
 use crate::payment_attempt::{AcceptedAsset, OfferedAssets, PaymentAsset, PaymentTerms};
 use crate::payments::{
     ActivationTerms, PaykitClient, PaykitCommandError, PaykitLifecycleTarget, PaykitStatusOutcome,
-    PaykitStatusSource, PaykitUsdtObservation,
+    PaykitStatusSource, PaykitUsdtObservation, SellerReceiptOutcome,
 };
 use crate::queries::PAYMENT_COLUMNS;
 use crate::{expiry, fx, AppState};
@@ -3660,9 +3660,144 @@ async fn apply_paykit_status_outcome(
         return apply_settled_status(state, row, &outcome, now).await;
     }
     if row.paykit_request_state == "awaiting_seller_confirmation" {
-        return apply_report_inside_seller_window(&state.pool, row, &outcome, now).await;
+        let changed = apply_report_inside_seller_window(&state.pool, row, &outcome, now).await?;
+        if row.seller_confirms_payment()
+            && confirm_with_seller_wallet_receipt(state, source, row, now).await?
+        {
+            return Ok(true);
+        }
+        return Ok(changed);
     }
     apply_status_outcome(state, row, outcome, now).await
+}
+
+/// Under `PAYMENT_CONFIRMATION=seller`, the Receipt the seller's wallet
+/// issued for the request is the seller's confirmation: it pays an order
+/// inside `awaiting_seller_confirmation` exactly as the seller's tap does,
+/// through the same conditional UPDATE, so the tap, the seller-window reaper
+/// and this path pay the order at most once. Without a Receipt (none yet, a
+/// paykit-server without the route, a failed read) the order keeps waiting
+/// for its seller. The Receipt pays only what the service's own observation
+/// already matched: an observation marked short or gone, or a Receipt whose
+/// amount differs from it, leaves the decision to the seller. Returns
+/// whether the order was paid.
+async fn confirm_with_seller_wallet_receipt(
+    state: &AppState,
+    source: &dyn PaykitStatusSource,
+    row: &ClaimedPaykitOrder,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    let SellerReceiptOutcome::Issued(receipt) = source
+        .seller_receipt(&row.seller_pubky, row.paykit_invoice_id)
+        .await
+    else {
+        return Ok(false);
+    };
+    let mut tx = state.pool.begin().await?;
+    // Canonical lock order: payment, then order.
+    sqlx::query("SELECT id FROM payments WHERE id = $1 FOR UPDATE")
+        .bind(row.payment_id)
+        .execute(&mut *tx)
+        .await?;
+    let Some(order) = fetch_order_for_update(&mut tx, row.id).await? else {
+        anyhow::bail!("paykit order {} is missing", row.id);
+    };
+    if order.paykit_request_state.as_deref() != Some("awaiting_seller_confirmation") {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    let observation = order
+        .paykit_observation
+        .clone()
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !wallet_receipt_matches_observation(&receipt, &observation) {
+        tx.rollback().await?;
+        tracing::warn!(
+            order_id = %row.id,
+            receipt_id = %receipt.receipt_id,
+            "a seller wallet receipt does not match the observed payment; the seller decides"
+        );
+        return Ok(false);
+    }
+    let receipt_doc = serde_json::to_value(&receipt)?;
+    let seller_pubky = order.seller_pubky.clone();
+    match crate::bitcoin_review::confirm_awaiting_payment(
+        &mut tx,
+        &seller_pubky,
+        row.id,
+        order,
+        &observation,
+        None,
+        Some(&receipt_doc),
+        state.confirm_keys(),
+        now,
+    )
+    .await
+    {
+        Ok(_) => {
+            tx.commit().await?;
+            tracing::info!(
+                order_id = %row.id,
+                receipt_id = %receipt.receipt_id,
+                "the seller's wallet receipt confirmed the payment"
+            );
+            Ok(true)
+        }
+        Err(crate::bitcoin_review::SellerConfirmFailure::NotAwaiting) => {
+            tx.rollback().await?;
+            Ok(false)
+        }
+        Err(crate::bitcoin_review::SellerConfirmFailure::Effects(failure)) => {
+            tx.rollback().await?;
+            tracing::warn!(
+                order_id = %row.id,
+                reason = %failure.message(),
+                "a seller wallet receipt could not pay the order; the seller decides"
+            );
+            Ok(false)
+        }
+        Err(crate::bitcoin_review::SellerConfirmFailure::MissingPin) => {
+            tx.rollback().await?;
+            anyhow::bail!("paykit order {} has no resolution pin", row.id)
+        }
+        Err(crate::bitcoin_review::SellerConfirmFailure::Internal(context, error)) => {
+            tx.rollback().await?;
+            anyhow::bail!("seller wallet receipt {context}: {error}")
+        }
+    }
+}
+
+/// Whether a wallet Receipt agrees with the observation the order entered
+/// the seller window on. The window holds only matching, on-time money, so
+/// the Receipt may pay only that: not an observation marked short or gone,
+/// and not a Receipt stating a different amount on the observed rail
+/// (`btc`/`SAT` in satoshis, `usdt` in millionths). A Receipt that states no
+/// amount, or a rail whose observation carries no figure, defers to the
+/// observation's match; an amount in another currency or on the other rail
+/// pays nothing.
+pub(crate) fn wallet_receipt_matches_observation(
+    receipt: &crate::payments::SellerReceipt,
+    observation: &Value,
+) -> bool {
+    if observation["amount_matched"] == Value::Bool(false)
+        || observation["disappeared"] == Value::Bool(true)
+    {
+        return false;
+    }
+    let Some(amount) = &receipt.amount else {
+        return true;
+    };
+    let observed = match amount.currency.to_ascii_lowercase().as_str() {
+        "btc" | "sat" if matches!(observation["asset"].as_str(), None | Some("BTC")) => {
+            &observation["observed_sats"]
+        }
+        "usdt" if observation["asset"].as_str() == Some("USDT") => &observation["observed_units"],
+        _ => return false,
+    };
+    match observed.as_u64() {
+        Some(observed) => amount.value.parse::<u64>().ok() == Some(observed),
+        None => observed.is_null(),
+    }
 }
 
 /// Applies one status to an order whose payment is still open.

@@ -2696,6 +2696,9 @@ struct FakePaykitState {
     status_bodies: HashMap<String, Value>,
     /// Exact Marketplace status bodies by server-issued invoice id.
     marketplace_status_bodies: HashMap<uuid::Uuid, Value>,
+    /// Seller Receipts by invoice for `/marketplace/payment-requests/receipt`;
+    /// `None` is a paykit-server without the route (every call `404`).
+    marketplace_receipts: Option<HashMap<uuid::Uuid, Value>>,
     marketplace_status_failure: Option<(u16, String)>,
     /// Holds the Marketplace status answers for one invoice at a barrier:
     /// the answers are released together once `parties` requests arrived.
@@ -3035,6 +3038,17 @@ impl FakePaykit {
             .expect("fake paykit lock")
             .status_bodies
             .insert(bundle_id.to_string(), body);
+    }
+
+    /// Serves the seller Receipt route; `receipt` is the Receipt object the
+    /// route returns for `invoice_id`, or `Value::Null` for none yet.
+    pub fn set_marketplace_receipt(&self, invoice_id: uuid::Uuid, receipt: Value) {
+        self.state
+            .lock()
+            .expect("fake paykit lock")
+            .marketplace_receipts
+            .get_or_insert_with(HashMap::new)
+            .insert(invoice_id, receipt);
     }
 
     pub fn set_marketplace_status(&self, invoice_id: uuid::Uuid, body: Value) {
@@ -4236,6 +4250,49 @@ async fn serve_paykit_status(
     }
 }
 
+/// paykit-server's seller Receipt route (pubky/paykit-server#139): signed
+/// `{creator, invoice_id}` in, `{invoice_id, receipt}` out; a server without
+/// the route, or an unknown invoice, answers `404`.
+async fn serve_marketplace_receipt(
+    axum::extract::State(state): axum::extract::State<Arc<Mutex<FakePaykitState>>>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    const PATH: &str = "/marketplace/payment-requests/receipt";
+    let host = header_host(&headers);
+    if state
+        .lock()
+        .expect("fake paykit lock")
+        .marketplace_receipts
+        .is_none()
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Some(parsed) = paykit_verify_signed(&state, "POST", PATH, &headers, &body) else {
+        return paykit_unauthorized();
+    };
+    let Some(invoice_id) = parsed["invoice_id"]
+        .as_str()
+        .and_then(|value| value.parse::<uuid::Uuid>().ok())
+    else {
+        return paykit_error(StatusCode::BAD_REQUEST, "invalid_request");
+    };
+    paykit_record_call(&state, "POST", PATH, &host, &parsed);
+    let receipt = state
+        .lock()
+        .expect("fake paykit lock")
+        .marketplace_receipts
+        .as_ref()
+        .and_then(|receipts| receipts.get(&invoice_id).cloned());
+    match receipt {
+        Some(receipt) => {
+            axum::Json(json!({ "invoice_id": invoice_id, "receipt": receipt })).into_response()
+        }
+        None => paykit_error(StatusCode::NOT_FOUND, "invoice_not_found"),
+    }
+}
+
 async fn serve_marketplace_status(
     axum::extract::State(state): axum::extract::State<Arc<Mutex<FakePaykitState>>>,
     headers: axum::http::HeaderMap,
@@ -4312,6 +4369,7 @@ pub async fn spawn_fake_paykit() -> FakePaykit {
         resolutions: HashMap::new(),
         status_bodies: HashMap::new(),
         marketplace_status_bodies: HashMap::new(),
+        marketplace_receipts: None,
         marketplace_status_failure: None,
         marketplace_status_rendezvous: None,
         marketplace_status_arrived: Arc::new(tokio::sync::Notify::new()),
@@ -4382,6 +4440,10 @@ pub async fn spawn_fake_paykit() -> FakePaykit {
             axum::routing::post(serve_marketplace_status),
         )
         .route(
+            "/marketplace/payment-requests/receipt",
+            axum::routing::post(serve_marketplace_receipt),
+        )
+        .route(
             "/transactions/status",
             axum::routing::post(serve_paykit_status),
         )
@@ -4405,6 +4467,7 @@ pub async fn spawn_fake_paykit() -> FakePaykit {
 #[derive(Default)]
 pub struct FakePaykitStatus {
     outcomes: Mutex<HashMap<String, PaykitStatusOutcome>>,
+    receipts: Mutex<HashMap<uuid::Uuid, marketplace_service::payments::SellerReceiptOutcome>>,
 }
 
 /// The validated-facts bundle for a worker-test outcome on an
@@ -4426,9 +4489,39 @@ impl FakePaykitStatus {
             .expect("fake paykit status lock")
             .insert(reference.to_string(), outcome);
     }
+
+    /// What the seller Receipt route answers for `invoice_id`; unset reads as
+    /// a server without the route.
+    pub fn set_receipt(
+        &self,
+        invoice_id: uuid::Uuid,
+        outcome: marketplace_service::payments::SellerReceiptOutcome,
+    ) {
+        self.receipts
+            .lock()
+            .expect("fake paykit receipt lock")
+            .insert(invoice_id, outcome);
+    }
 }
 
 impl PaykitStatusSource for FakePaykitStatus {
+    fn seller_receipt<'a>(
+        &'a self,
+        _seller_pubky: &'a str,
+        invoice_id: uuid::Uuid,
+    ) -> Pin<
+        Box<dyn Future<Output = marketplace_service::payments::SellerReceiptOutcome> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            self.receipts
+                .lock()
+                .expect("fake paykit receipt lock")
+                .get(&invoice_id)
+                .cloned()
+                .unwrap_or(marketplace_service::payments::SellerReceiptOutcome::Unsupported)
+        })
+    }
+
     fn status<'a>(
         &'a self,
         _seller_pubky: &'a str,
