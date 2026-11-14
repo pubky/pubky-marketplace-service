@@ -500,6 +500,31 @@ ALTER TABLE orders DROP COLUMN IF EXISTS payment_confirmation,
 DELETE FROM _sqlx_migrations WHERE version = 91;
 ```
 
+## Seller wallet Receipt confirmation (0098)
+
+0098 widens `paykit_seller_confirmations.confirmation_basis` to
+`seller_attestation` or `seller_wallet_receipt` and adds the nullable
+`wallet_receipt` JSONB column, set exactly when the basis is
+`seller_wallet_receipt` (`paykit_seller_confirmations_wallet_receipt_basis`),
+with `lock_timeout` like 0091.
+
+**Deploy mode: rolling.** A binary from before 0098 writes only
+`seller_attestation` rows with no Receipt, which both constraints accept, and
+never reads the column.
+
+### Backing out 0098
+
+An image from before it runs on the migrated database. Rows a new binary wrote
+with `seller_wallet_receipt` stay valid under the widened constraint, so keep
+it; by hand, after the old image is serving, only if no such row exists:
+
+```sql
+ALTER TABLE paykit_seller_confirmations
+    DROP CONSTRAINT IF EXISTS paykit_seller_confirmations_wallet_receipt_basis,
+    DROP COLUMN IF EXISTS wallet_receipt;
+DELETE FROM _sqlx_migrations WHERE version = 98;
+```
+
 ## Digital release (0092)
 
 0092 adds two nullable `orders` columns with no default and no index
@@ -743,6 +768,7 @@ assume it is free:
 | 0095 | `0095_shipping_zones.sql` | zone-priced shipping: listing profile or zones, destination country and quotes on orders, offers and bids |
 | 0096 | `0096_connector_product_sync.sql` | connector product sync: sync directions, product snapshots and the change queue for the Shop |
 | 0097 | `0097_connector_product_sync_fences.sql` | connector product sync: per-group rebase instants and the unlink fence on product snapshots |
+| 0098 | `0098_seller_wallet_receipt_confirmation.sql` | seller confirmations may rest on the seller's wallet Receipt: the `seller_wallet_receipt` basis and `wallet_receipt` |
 
 This table describes unmerged work and goes stale as pull requests land; trust
 `crates/service/migrations/` on `main` over it. sqlx does not reject two files

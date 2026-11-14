@@ -521,6 +521,19 @@ seller's attestation pays the order:
   expiry cancels the order; a later seller confirmation takes the late-money
   path. A confirmation is refused with `payment_taken_back` while PayPal
   reports the money refunded or reversed.
+- **The seller's wallet Receipt (Paykit, upstream):** while an order waits in
+  `awaiting_seller_confirmation`, each status poll also reads the Receipt the
+  seller's wallet issued for the request (paykit-server's signed
+  `POST /marketplace/payment-requests/receipt`). A Receipt pays the order
+  exactly as the seller's confirmation does, recorded with
+  `confirmation_basis = 'seller_wallet_receipt'` and the Receipt itself
+  (`paykit_seller_confirmations.wallet_receipt`, migration 0098). It pays only
+  what the service's own observation already matched: a Receipt whose amount
+  differs on the observed rail (`btc`/`SAT` in satoshis, `usdt` in
+  millionths), or an observation marked short or gone, leaves the order to the
+  seller. Instant digital lines held for the seller (`DIGITAL_RELEASE=seller`)
+  stay held. No Receipt, a paykit-server without the route (`404`) or a failed
+  read changes nothing: the seller confirms as above.
 - The buyer cannot cancel once money is seen (a Paykit sighting or a PayPal
   notification), and `next_actor` is the seller.
 - Short money and money on both rails keep their review routes. Late Paykit
@@ -1243,7 +1256,10 @@ Three exits, each one CAS with every effect in the same transaction:
   frozen observation from the stored Paykit observation, never the body
   (a disagreeing body-supplied value is rejected with
   `confirmation_observation_mismatch`), with
-  `confirmation_basis = 'seller_attestation'`. Idempotent on the order id.
+  `confirmation_basis = 'seller_attestation'` (`seller_wallet_receipt` when
+  the seller's wallet Receipt confirmed it, see
+  [Seller-confirmed payment](#seller-confirmed-payment)). Idempotent on the
+  order id.
 - **The 24-hour seller-window reaper**: the order's request state becomes
   `confirmed` and the payment `manual_review` with
   `manual_review_entered_at` stamped (the hold is PRESERVED), starting the

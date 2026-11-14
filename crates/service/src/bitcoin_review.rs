@@ -238,6 +238,7 @@ type StoredConfirmation = (
     Option<i64>,
     Option<String>,
     Value,
+    String,
 );
 
 fn order_not_found() -> Response {
@@ -319,7 +320,8 @@ pub async fn confirm_bitcoin_payment(
     // confirmation unchanged and writes nothing.
     let existing: Option<StoredConfirmation> = match sqlx::query_as(
         "SELECT confirmed_at, confirmed_txid, confirmed_amount_sats, confirmed_reason, \
-         paykit_observation FROM paykit_seller_confirmations WHERE order_id = $1",
+         paykit_observation, confirmation_basis FROM paykit_seller_confirmations \
+         WHERE order_id = $1",
     )
     .bind(order_id)
     .fetch_optional(&state.pool)
@@ -328,7 +330,7 @@ pub async fn confirm_bitcoin_payment(
         Ok(existing) => existing,
         Err(error) => return internal("confirmation lookup", &error),
     };
-    if let Some((confirmed_at, txid, amount_sats, reason, observation)) = existing {
+    if let Some((confirmed_at, txid, amount_sats, reason, observation, basis)) = existing {
         return (
             StatusCode::OK,
             Json(json!({
@@ -341,7 +343,7 @@ pub async fn confirm_bitcoin_payment(
                     "confirmed_amount_sats": amount_sats,
                     "confirmed_reason": reason,
                     "confirmation_source": "seller",
-                    "confirmation_basis": "seller_attestation",
+                    "confirmation_basis": basis,
                     "paykit_observation": seller_observation(Some(&observation)),
                 },
             })),
@@ -401,182 +403,33 @@ pub async fn confirm_bitcoin_payment(
     }
 
     let now = state.clock.now();
-    let pool = state.pool.clone();
-    let mut tx = match pool.begin().await {
+    let mut tx = match state.pool.begin().await {
         Ok(tx) => tx,
         Err(error) => return internal("confirmation transaction", &error),
     };
-    // Canonical lock order: payment row before the order row (the 24-hour
-    // reaper and every resolution path take them in this order).
-    let payment: Option<PaymentRow> = match sqlx::query_as(&format!(
-        "SELECT {PAYMENT_COLUMNS} FROM payments WHERE order_id = $1 FOR UPDATE"
-    ))
-    .bind(order_id)
-    .fetch_optional(&mut *tx)
-    .await
-    {
-        Ok(payment) => payment,
-        Err(error) => return internal("payment lock", &error),
-    };
-    let Some(payment) = payment else {
-        return internal("payment lock", &"payment row missing for order");
-    };
-    // (3) The decision: one conditional UPDATE predicated on the state.
-    // Zero rows means the order was never in it or the reaper won — the
-    // same named error either way (A8: first committer wins, the loser
-    // changes nothing).
-    let won = match sqlx::query(
-        "UPDATE orders SET paykit_request_state = 'confirmed', \
-         paykit_seller_confirmation_entered_at = NULL, \
-         paykit_seller_confirmation_deadline = NULL, updated_at = $2 \
-         WHERE id = $1 AND paykit_request_state = 'awaiting_seller_confirmation'",
-    )
-    .bind(order_id)
-    .bind(now)
-    .execute(&mut *tx)
-    .await
-    {
-        Ok(result) => result.rows_affected() == 1,
-        Err(error) => return internal("confirmation decision", &error),
-    };
-    if !won {
-        let _ = tx.rollback().await;
-        return review_error(
-            ErrorCode::InvalidState,
-            review_reason(ReviewReason::OrderNotAwaitingConfirmation),
-            "This order is not awaiting seller confirmation.",
-        );
-    }
-    let payment_cas: Option<(i64,)> = match sqlx::query_as(
-        "UPDATE payments SET state = 'confirmed', revision = revision + 1, updated_at = $2 \
-         WHERE id = $1 AND state = 'awaiting_entitlement' RETURNING revision",
-    )
-    .bind(payment.id)
-    .bind(now)
-    .fetch_optional(&mut *tx)
-    .await
-    {
-        Ok(cas) => cas,
-        Err(error) => return internal("payment confirmation", &error),
-    };
-    let Some((payment_revision,)) = payment_cas else {
-        let _ = tx.rollback().await;
-        return internal(
-            "payment confirmation",
-            &"payment left awaiting_entitlement mid-confirm",
-        );
-    };
-    if let Err(error) = sqlx::query(
-        "UPDATE orders SET paykit_observed_sats = COALESCE(\
-             paykit_observed_sats, (paykit_observation->>'observed_sats')::bigint) \
-         WHERE id = $1 AND paykit_observed_sats IS NULL",
-    )
-    .bind(order_id)
-    .execute(&mut *tx)
-    .await
-    {
-        return internal("freeze observed payment", &error);
-    }
-    // The fulfilment effects: paid, receipt exactly once, hold consumed.
-    let (confirmed_order, _receipt, receipt_event_id) =
-        match crate::handlers::payment::confirm_order(
-            &mut tx,
-            &actor.0,
-            order_id,
-            &payment,
-            order.clone(),
-            state.confirm_keys(),
-            now,
-        )
-        .await
-        {
-            Ok(Ok(confirmed)) => confirmed,
-            Ok(Err(failure)) => {
-                let _ = tx.rollback().await;
-                return review_error(
-                    failure.code(),
-                    review_reason(ReviewReason::ConfirmationEffectsFailed),
-                    failure.message(),
-                );
-            }
-            Err(error) => return internal("confirmation effects", &error),
-        };
-    let payment_event_id = match insert_event(
+    let ConfirmedPayment {
+        order: confirmed_order,
+        txid: confirmed_txid,
+        amount_sats: confirmed_amount_sats,
+    } = match confirm_awaiting_payment(
         &mut tx,
+        &actor.0,
         order_id,
-        &ids::payment_aggregate_id(payment.id),
-        payment_revision,
-        &actor.0,
-        "payment.confirmed",
-        now,
-    )
-    .await
-    {
-        Ok(event_id) => event_id,
-        Err(error) => return internal("payment event", &error),
-    };
-    if let Err(error) = insert_notification_intent(
-        &mut tx,
-        payment_event_id,
-        "payment_confirmed",
-        &confirmed_order.buyer_pubky,
-        &actor.0,
-        &ids::order_aggregate_id(order_id),
+        order.clone(),
+        &observation,
+        body.reason.as_deref(),
         None,
+        state.confirm_keys(),
         now,
     )
     .await
     {
-        return internal("confirmation notification", &error);
-    }
-    // The audit row: observation-derived facts, the constant basis, the
-    // frozen observation. Inserted in the SAME transaction — an
-    // unauthorised or losing call leaves no audit row behind.
-    let confirmed_txid = observation["txid"].as_str().map(str::to_owned);
-    let confirmed_amount_sats = observation["observed_sats"].as_i64();
-    if let Err(error) = sqlx::query(
-        "INSERT INTO paykit_seller_confirmations (order_id, payment_id, confirmed_by_pubky, \
-         confirmed_at, confirmed_txid, confirmed_amount_sats, confirmed_reason, \
-         confirmation_source, confirmation_basis, paykit_observation, event_id, created_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, 'seller', 'seller_attestation', $8, $9, $4)",
-    )
-    .bind(order_id)
-    .bind(payment.id)
-    .bind(&actor.0)
-    .bind(now)
-    .bind(&confirmed_txid)
-    .bind(confirmed_amount_sats)
-    .bind(&body.reason)
-    .bind(&observation)
-    .bind(receipt_event_id)
-    .execute(&mut *tx)
-    .await
-    {
-        return internal("confirmation audit", &error);
-    }
-    // The pinned resolve outbox row: stack identity AND address from the
-    // order's bind-time pin, one-hour delivery deadline.
-    if let Err(error) = enqueue_resolve_row(
-        &mut tx,
-        &order,
-        payment.id,
-        payment_event_id,
-        "paid_manually",
-        now,
-    )
-    .await
-    {
-        let _ = tx.rollback().await;
-        return match error {
-            ResolutionFailure::MissingPin => review_error(
-                ErrorCode::InvalidState,
-                review_reason(ReviewReason::MissingPin),
-                "This order has no pinned paykit stack to resolve against.",
-            ),
-            ResolutionFailure::Internal(context, error) => internal(&context, &error),
-            _ => internal("resolve outbox", &"unexpected resolution failure"),
-        };
-    }
+        Ok(confirmed) => confirmed,
+        Err(failure) => {
+            let _ = tx.rollback().await;
+            return failure.into_response();
+        }
+    };
     let confirmed_order = if body.release_digital == Some(true) {
         match crate::handlers::digital_manual::release_with_confirmation(
             &mut tx,
@@ -618,6 +471,221 @@ pub async fn confirm_bitcoin_payment(
             .into_response(),
         Err(error) => internal("confirmation commit", &error),
     }
+}
+
+/// What a seller confirmation recorded.
+pub(crate) struct ConfirmedPayment {
+    pub order: OrderRow,
+    pub txid: Option<String>,
+    pub amount_sats: Option<i64>,
+}
+
+/// Why a seller confirmation changed nothing.
+pub(crate) enum SellerConfirmFailure {
+    /// The order is not inside `awaiting_seller_confirmation` (never was, or
+    /// the reaper or another confirmation won).
+    NotAwaiting,
+    /// The fulfilment effects refused the payment.
+    Effects(crate::result::CommandFailure),
+    /// The order has no bind-time pin to resolve against.
+    MissingPin,
+    Internal(String, String),
+}
+
+impl SellerConfirmFailure {
+    fn internal(context: &str, error: &dyn std::fmt::Display) -> Self {
+        Self::Internal(context.to_string(), error.to_string())
+    }
+
+    pub(crate) fn into_response(self) -> Response {
+        match self {
+            Self::NotAwaiting => review_error(
+                ErrorCode::InvalidState,
+                review_reason(ReviewReason::OrderNotAwaitingConfirmation),
+                "This order is not awaiting seller confirmation.",
+            ),
+            Self::Effects(failure) => review_error(
+                failure.code(),
+                review_reason(ReviewReason::ConfirmationEffectsFailed),
+                failure.message(),
+            ),
+            Self::MissingPin => review_error(
+                ErrorCode::InvalidState,
+                review_reason(ReviewReason::MissingPin),
+                "This order has no pinned paykit stack to resolve against.",
+            ),
+            Self::Internal(context, error) => internal(&context, &error),
+        }
+    }
+}
+
+/// The seller's confirmation of an order inside
+/// `awaiting_seller_confirmation`, inside the caller's transaction: the
+/// conditional UPDATE out of the state, the fulfilment effects, the audit
+/// record and the pinned `paykit.resolve` outbox row. `wallet_receipt` is
+/// the Receipt the seller's wallet issued when the wallet, not the seller's
+/// tap, confirms; it is recorded on the audit row. On `Err` the caller rolls
+/// back. No network call happens here.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn confirm_awaiting_payment(
+    tx: &mut Transaction<'_, Postgres>,
+    seller_pubky: &str,
+    order_id: Uuid,
+    order: OrderRow,
+    observation: &Value,
+    reason: Option<&str>,
+    wallet_receipt: Option<&Value>,
+    keys: crate::ConfirmKeys<'_>,
+    now: DateTime<Utc>,
+) -> Result<ConfirmedPayment, SellerConfirmFailure> {
+    type Failure = SellerConfirmFailure;
+    // Canonical lock order: payment row before the order row (the 24-hour
+    // reaper and every resolution path take them in this order).
+    let payment: Option<PaymentRow> = sqlx::query_as(&format!(
+        "SELECT {PAYMENT_COLUMNS} FROM payments WHERE order_id = $1 FOR UPDATE"
+    ))
+    .bind(order_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|error| Failure::internal("payment lock", &error))?;
+    let Some(payment) = payment else {
+        return Err(Failure::internal(
+            "payment lock",
+            &"payment row missing for order",
+        ));
+    };
+    // (3) The decision: one conditional UPDATE predicated on the state.
+    // Zero rows means the order was never in it or the reaper won — the
+    // same named error either way (A8: first committer wins, the loser
+    // changes nothing).
+    let won = sqlx::query(
+        "UPDATE orders SET paykit_request_state = 'confirmed', \
+         paykit_seller_confirmation_entered_at = NULL, \
+         paykit_seller_confirmation_deadline = NULL, updated_at = $2 \
+         WHERE id = $1 AND paykit_request_state = 'awaiting_seller_confirmation'",
+    )
+    .bind(order_id)
+    .bind(now)
+    .execute(&mut **tx)
+    .await
+    .map_err(|error| Failure::internal("confirmation decision", &error))?
+    .rows_affected()
+        == 1;
+    if !won {
+        return Err(Failure::NotAwaiting);
+    }
+    let payment_cas: Option<(i64,)> = sqlx::query_as(
+        "UPDATE payments SET state = 'confirmed', revision = revision + 1, updated_at = $2 \
+         WHERE id = $1 AND state = 'awaiting_entitlement' RETURNING revision",
+    )
+    .bind(payment.id)
+    .bind(now)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|error| Failure::internal("payment confirmation", &error))?;
+    let Some((payment_revision,)) = payment_cas else {
+        return Err(Failure::internal(
+            "payment confirmation",
+            &"payment left awaiting_entitlement mid-confirm",
+        ));
+    };
+    sqlx::query(
+        "UPDATE orders SET paykit_observed_sats = COALESCE(\
+             paykit_observed_sats, (paykit_observation->>'observed_sats')::bigint) \
+         WHERE id = $1 AND paykit_observed_sats IS NULL",
+    )
+    .bind(order_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(|error| Failure::internal("freeze observed payment", &error))?;
+    // The fulfilment effects: paid, receipt exactly once, hold consumed.
+    let (confirmed_order, _receipt, receipt_event_id) = crate::handlers::payment::confirm_order(
+        tx,
+        seller_pubky,
+        order_id,
+        &payment,
+        order.clone(),
+        keys,
+        now,
+    )
+    .await
+    .map_err(|error| Failure::internal("confirmation effects", &error))?
+    .map_err(Failure::Effects)?;
+    let payment_event_id = insert_event(
+        tx,
+        order_id,
+        &ids::payment_aggregate_id(payment.id),
+        payment_revision,
+        seller_pubky,
+        "payment.confirmed",
+        now,
+    )
+    .await
+    .map_err(|error| Failure::internal("payment event", &error))?;
+    insert_notification_intent(
+        tx,
+        payment_event_id,
+        "payment_confirmed",
+        &confirmed_order.buyer_pubky,
+        seller_pubky,
+        &ids::order_aggregate_id(order_id),
+        None,
+        now,
+    )
+    .await
+    .map_err(|error| Failure::internal("confirmation notification", &error))?;
+    // The audit row: observation-derived facts, the basis, the frozen
+    // observation and any wallet Receipt. Inserted in the SAME transaction —
+    // an unauthorised or losing call leaves no audit row behind.
+    let txid = observation["txid"].as_str().map(str::to_owned);
+    let amount_sats = observation["observed_sats"].as_i64();
+    let basis = if wallet_receipt.is_some() {
+        "seller_wallet_receipt"
+    } else {
+        "seller_attestation"
+    };
+    sqlx::query(
+        "INSERT INTO paykit_seller_confirmations (order_id, payment_id, confirmed_by_pubky, \
+         confirmed_at, confirmed_txid, confirmed_amount_sats, confirmed_reason, \
+         confirmation_source, confirmation_basis, paykit_observation, event_id, \
+         wallet_receipt, created_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'seller', $8, $9, $10, $11, $4)",
+    )
+    .bind(order_id)
+    .bind(payment.id)
+    .bind(seller_pubky)
+    .bind(now)
+    .bind(&txid)
+    .bind(amount_sats)
+    .bind(reason)
+    .bind(basis)
+    .bind(observation)
+    .bind(receipt_event_id)
+    .bind(wallet_receipt)
+    .execute(&mut **tx)
+    .await
+    .map_err(|error| Failure::internal("confirmation audit", &error))?;
+    // The pinned resolve outbox row: stack identity AND address from the
+    // order's bind-time pin, one-hour delivery deadline.
+    enqueue_resolve_row(
+        tx,
+        &order,
+        payment.id,
+        payment_event_id,
+        "paid_manually",
+        now,
+    )
+    .await
+    .map_err(|error| match error {
+        ResolutionFailure::MissingPin => Failure::MissingPin,
+        ResolutionFailure::Internal(context, error) => Failure::Internal(context, error),
+        _ => Failure::internal("resolve outbox", &"unexpected resolution failure"),
+    })?;
+    Ok(ConfirmedPayment {
+        order: confirmed_order,
+        txid,
+        amount_sats,
+    })
 }
 
 /// Writes the one pinned `paykit.resolve` outbox row for an order, inside
