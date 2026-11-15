@@ -516,7 +516,10 @@ never reads the column.
 
 An image from before it runs on the migrated database. Rows a new binary wrote
 with `seller_wallet_receipt` stay valid under the widened constraint, so keep
-it; by hand, after the old image is serving, only if no such row exists:
+it. The old image replays a Receipt-paid order's confirmation as
+`seller_attestation`, because it does not read the stored basis; the row
+itself keeps `seller_wallet_receipt`. By hand, after the old image is serving,
+only if no such row exists:
 
 ```sql
 ALTER TABLE paykit_seller_confirmations

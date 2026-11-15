@@ -3661,7 +3661,17 @@ async fn apply_paykit_status_outcome(
     }
     if row.paykit_request_state == "awaiting_seller_confirmation" {
         let changed = apply_report_inside_seller_window(&state.pool, row, &outcome, now).await?;
-        if row.seller_confirms_payment()
+        // Only a usable report lets the Receipt pay: paykit-server reporting
+        // the request as broken, gone or unreadable is no payment authority.
+        let usable = matches!(
+            outcome,
+            PaykitStatusOutcome::Confirmed { .. }
+                | PaykitStatusOutcome::AcceptancePending { .. }
+                | PaykitStatusOutcome::Detected { .. }
+                | PaykitStatusOutcome::UsdtObserved { .. }
+        );
+        if usable
+            && row.seller_confirms_payment()
             && confirm_with_seller_wallet_receipt(state, source, row, now).await?
         {
             return Ok(true);
@@ -3773,8 +3783,9 @@ async fn confirm_with_seller_wallet_receipt(
 /// and not a Receipt stating a different amount on the observed rail
 /// (`btc`/`SAT` in satoshis, `usdt` in millionths). A Receipt that states no
 /// amount, or a rail whose observation carries no figure, defers to the
-/// observation's match; an amount in another currency or on the other rail
-/// pays nothing.
+/// observation's match; an amount that is not a whole number, in another
+/// currency or on the other rail pays nothing. A Receipt naming a txid must
+/// name the observed one.
 pub(crate) fn wallet_receipt_matches_observation(
     receipt: &crate::payments::SellerReceipt,
     observation: &Value,
@@ -3783,6 +3794,11 @@ pub(crate) fn wallet_receipt_matches_observation(
         || observation["disappeared"] == Value::Bool(true)
     {
         return false;
+    }
+    if let Some(txid) = receipt.metadata.get("txid").and_then(Value::as_str) {
+        if observation["txid"].as_str() != Some(txid) {
+            return false;
+        }
     }
     let Some(amount) = &receipt.amount else {
         return true;
@@ -3794,8 +3810,11 @@ pub(crate) fn wallet_receipt_matches_observation(
         "usdt" if observation["asset"].as_str() == Some("USDT") => &observation["observed_units"],
         _ => return false,
     };
+    let Ok(value) = amount.value.parse::<u64>() else {
+        return false;
+    };
     match observed.as_u64() {
-        Some(observed) => amount.value.parse::<u64>().ok() == Some(observed),
+        Some(observed) => value == observed,
         None => observed.is_null(),
     }
 }
@@ -6556,5 +6575,170 @@ mod tests {
             );
         }
         assert!(!SWEEPABLE_PAYMENT.contains("binding_mismatch"));
+    }
+
+    fn wallet_receipt(
+        amount: Option<(&str, &str)>,
+        txid: Option<&str>,
+    ) -> crate::payments::SellerReceipt {
+        let mut metadata = serde_json::Map::new();
+        if let Some(txid) = txid {
+            metadata.insert("txid".into(), serde_json::json!(txid));
+        }
+        crate::payments::SellerReceipt {
+            receipt_id: "r".into(),
+            app_id: "bitkit".into(),
+            payment_request_id: "p".into(),
+            payment_reference: "ref".into(),
+            payment_endpoint_identifier: None,
+            amount: amount.map(|(value, currency)| crate::payments::SellerReceiptAmount {
+                value: value.into(),
+                currency: currency.into(),
+            }),
+            metadata,
+            issued_at: "2026-11-14T10:00:00Z".into(),
+            stored_at: "2026-11-14T10:00:05Z".into(),
+        }
+    }
+
+    #[test]
+    fn a_wallet_receipt_pays_only_the_observed_money() {
+        use serde_json::json;
+        let btc =
+            json!({"asset": "BTC", "txid": "aa", "observed_sats": 50_000, "amount_matched": true});
+        let legacy = json!({"txid": "aa", "observed_sats": 50_000});
+        let usdt = json!({"asset": "USDT", "txid": "aa", "observed_units": 12_500_000, "amount_matched": true});
+        let no_figure = json!({"asset": "BTC", "txid": "aa", "observed_sats": null});
+        // (case, Receipt amount and currency, Receipt txid, observation, pays)
+        type Case<'a> = (
+            &'a str,
+            Option<(&'a str, &'a str)>,
+            Option<&'a str>,
+            &'a Value,
+            bool,
+        );
+        let cases: &[Case] = &[
+            ("same sats", Some(("50000", "SAT")), Some("aa"), &btc, true),
+            (
+                "same sats as btc",
+                Some(("50000", "btc")),
+                Some("aa"),
+                &btc,
+                true,
+            ),
+            (
+                "no asset reads as BTC",
+                Some(("50000", "SAT")),
+                None,
+                &legacy,
+                true,
+            ),
+            (
+                "different sats",
+                Some(("49000", "SAT")),
+                Some("aa"),
+                &btc,
+                false,
+            ),
+            ("no amount", None, Some("aa"), &btc, true),
+            (
+                "no txid in the Receipt",
+                Some(("50000", "SAT")),
+                None,
+                &btc,
+                true,
+            ),
+            (
+                "another txid",
+                Some(("50000", "SAT")),
+                Some("bb"),
+                &btc,
+                false,
+            ),
+            (
+                "a txid the observation lacks",
+                Some(("50000", "SAT")),
+                Some("aa"),
+                &json!({"observed_sats": 50_000}),
+                false,
+            ),
+            (
+                "bitcoin as a decimal",
+                Some(("0.0005", "BTC")),
+                Some("aa"),
+                &btc,
+                false,
+            ),
+            (
+                "a decimal with no observed figure",
+                Some(("0.0005", "BTC")),
+                Some("aa"),
+                &no_figure,
+                false,
+            ),
+            (
+                "no observed figure",
+                Some(("50000", "SAT")),
+                Some("aa"),
+                &no_figure,
+                true,
+            ),
+            (
+                "sats against USDT money",
+                Some(("12500000", "SAT")),
+                Some("aa"),
+                &usdt,
+                false,
+            ),
+            (
+                "USDT against bitcoin money",
+                Some(("50000", "usdt")),
+                Some("aa"),
+                &btc,
+                false,
+            ),
+            (
+                "unknown currency",
+                Some(("50000", "EUR")),
+                Some("aa"),
+                &btc,
+                false,
+            ),
+            (
+                "same USDT millionths",
+                Some(("12500000", "usdt")),
+                Some("aa"),
+                &usdt,
+                true,
+            ),
+            (
+                "different USDT millionths",
+                Some(("12500001", "usdt")),
+                Some("aa"),
+                &usdt,
+                false,
+            ),
+            (
+                "amount not matched",
+                Some(("50000", "SAT")),
+                Some("aa"),
+                &json!({"asset": "BTC", "txid": "aa", "observed_sats": 50_000, "amount_matched": false}),
+                false,
+            ),
+            (
+                "disappeared",
+                Some(("50000", "SAT")),
+                Some("aa"),
+                &json!({"asset": "BTC", "txid": "aa", "observed_sats": 50_000, "disappeared": true}),
+                false,
+            ),
+        ];
+        for (name, amount, txid, observation, pays) in cases {
+            assert_eq!(
+                wallet_receipt_matches_observation(&wallet_receipt(*amount, *txid), observation),
+                *pays,
+                "{name}"
+            );
+        }
     }
 }

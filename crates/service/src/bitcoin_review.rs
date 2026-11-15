@@ -14,7 +14,9 @@
 //!   any idempotency lookup — attests the payment. The audit facts
 //!   (`confirmed_txid`, `confirmed_amount_sats`, the frozen observation)
 //!   derive from the stored Paykit observation, never the body;
-//!   `confirmation_basis = 'seller_attestation'` is a constant.
+//!   `confirmation_basis` is `seller_attestation` for a tap and
+//!   `seller_wallet_receipt` when the seller's wallet Receipt confirmed
+//!   (`workers.rs`), never a body field.
 //! - **The 24-hour seller-window reaper**: CAS `awaiting_seller_confirmation
 //!   -> confirmed` on the order plus `manual_review` on the payment, hold
 //!   PRESERVED, starting the two-business-day SLA and the seven-day clock.
@@ -317,38 +319,11 @@ pub async fn confirm_bitcoin_payment(
         return not_order_seller();
     }
     // (2) Idempotency on the order id: the second call returns the recorded
-    // confirmation unchanged and writes nothing.
-    let existing: Option<StoredConfirmation> = match sqlx::query_as(
-        "SELECT confirmed_at, confirmed_txid, confirmed_amount_sats, confirmed_reason, \
-         paykit_observation, confirmation_basis FROM paykit_seller_confirmations \
-         WHERE order_id = $1",
-    )
-    .bind(order_id)
-    .fetch_optional(&state.pool)
-    .await
-    {
-        Ok(existing) => existing,
-        Err(error) => return internal("confirmation lookup", &error),
-    };
-    if let Some((confirmed_at, txid, amount_sats, reason, observation, basis)) = existing {
-        return (
-            StatusCode::OK,
-            Json(json!({
-                "ok": true,
-                "confirmation": {
-                    "order_id": order_id,
-                    "confirmed_by_pubky": actor.0,
-                    "confirmed_at": format_timestamp(confirmed_at),
-                    "confirmed_txid": txid,
-                    "confirmed_amount_sats": amount_sats,
-                    "confirmed_reason": reason,
-                    "confirmation_source": "seller",
-                    "confirmation_basis": basis,
-                    "paykit_observation": seller_observation(Some(&observation)),
-                },
-            })),
-        )
-            .into_response();
+    // confirmation unchanged and writes nothing, except a release the seller
+    // now asks for.
+    let release_digital = body.release_digital == Some(true);
+    if let Some(replay) = replay_confirmation(&state, &actor.0, order_id, release_digital).await {
+        return replay;
     }
 
     // Legacy-field equality: a supplied txid/amount must equal the stored
@@ -427,10 +402,19 @@ pub async fn confirm_bitcoin_payment(
         Ok(confirmed) => confirmed,
         Err(failure) => {
             let _ = tx.rollback().await;
+            // Another confirmation (the seller's wallet Receipt, or a second
+            // tap) may have committed since the lookup above: replay it.
+            if matches!(failure, SellerConfirmFailure::NotAwaiting) {
+                if let Some(replay) =
+                    replay_confirmation(&state, &actor.0, order_id, release_digital).await
+                {
+                    return replay;
+                }
+            }
             return failure.into_response();
         }
     };
-    let confirmed_order = if body.release_digital == Some(true) {
+    let confirmed_order = if release_digital {
         match crate::handlers::digital_manual::release_with_confirmation(
             &mut tx,
             confirmed_order,
@@ -471,6 +455,73 @@ pub async fn confirm_bitcoin_payment(
             .into_response(),
         Err(error) => internal("confirmation commit", &error),
     }
+}
+
+/// The recorded confirmation of an order, if one exists, as the reply to a
+/// repeated confirmation: the record is returned unchanged. When the seller
+/// asks for the release of instant lines still held for them (the wallet
+/// Receipt paid the order without one), the release happens here, in its own
+/// transaction; lines already released stay as they are.
+async fn replay_confirmation(
+    state: &AppState,
+    actor: &str,
+    order_id: Uuid,
+    release_digital: bool,
+) -> Option<Response> {
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(error) => return Some(internal("confirmation lookup", &error)),
+    };
+    let existing: Option<StoredConfirmation> = match sqlx::query_as(
+        "SELECT confirmed_at, confirmed_txid, confirmed_amount_sats, confirmed_reason, \
+         paykit_observation, confirmation_basis FROM paykit_seller_confirmations \
+         WHERE order_id = $1",
+    )
+    .bind(order_id)
+    .fetch_optional(&mut *tx)
+    .await
+    {
+        Ok(existing) => existing,
+        Err(error) => return Some(internal("confirmation lookup", &error)),
+    };
+    let (confirmed_at, txid, amount_sats, reason, observation, basis) = existing?;
+    if release_digital {
+        let order = match fetch_order_for_update(&mut tx, order_id).await {
+            Ok(Some(order)) => order,
+            Ok(None) => return Some(order_not_found()),
+            Err(error) => return Some(internal("digital release", &error)),
+        };
+        let now = state.clock.now();
+        if let Err(error) =
+            crate::handlers::digital_manual::release_with_confirmation(&mut tx, order, actor, now)
+                .await
+        {
+            return Some(internal("digital release", &error));
+        }
+    }
+    if let Err(error) = tx.commit().await {
+        return Some(internal("confirmation commit", &error));
+    }
+    Some(
+        (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "confirmation": {
+                    "order_id": order_id,
+                    "confirmed_by_pubky": actor,
+                    "confirmed_at": format_timestamp(confirmed_at),
+                    "confirmed_txid": txid,
+                    "confirmed_amount_sats": amount_sats,
+                    "confirmed_reason": reason,
+                    "confirmation_source": "seller",
+                    "confirmation_basis": basis,
+                    "paykit_observation": seller_observation(Some(&observation)),
+                },
+            })),
+        )
+            .into_response(),
+    )
 }
 
 /// What a seller confirmation recorded.

@@ -1,7 +1,9 @@
 //! Migration 0098: a seller confirmation may rest on the seller's wallet
 //! Receipt (`confirmation_basis = 'seller_wallet_receipt'`), and then, and
 //! only then, records that Receipt (`wallet_receipt`). The file reruns.
-//! Rows of both kinds are written by `seller_wallet_receipt_test`.
+//! `seller_wallet_receipt_test` writes rows of both kinds and checks the
+//! pair constraint refuses each kind with the other's `wallet_receipt`
+//! (a valid row needs a real order, payment and event).
 
 use sqlx::PgPool;
 
