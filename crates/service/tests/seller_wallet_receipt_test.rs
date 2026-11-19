@@ -360,6 +360,92 @@ async fn the_client_reads_the_receipt_route_and_falls_back_on_404(pool: PgPool) 
     );
 }
 
+/// The poll through `PaykitClient` against the paykit-server double: the
+/// status read keeps the order waiting until the Receipt route answers with
+/// the wallet's Receipt, which then pays it.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn the_receipt_pays_through_the_real_client(pool: PgPool) {
+    let fx = fixture(pool).await;
+    let (order_id, _, invoice_id, _) = waiting_order(&fx).await;
+    let deadline: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT paykit_expires_at FROM orders WHERE id = $1")
+            .bind(Uuid::parse_str(&order_id).expect("order uuid"))
+            .fetch_one(&fx.app.pool)
+            .await
+            .expect("order deadline");
+    let stamp =
+        |at: chrono::DateTime<chrono::Utc>| at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+    fx.paykit.use_upstream_api();
+    fx.paykit.set_marketplace_status(
+        invoice_id,
+        json!({
+            "invoice_id": invoice_id,
+            "state": "active",
+            "proposal_delivery_state": "delivered",
+            "request_state": "accepted",
+            "payment_state": "confirmed",
+            "activated_at": stamp(deadline - chrono::Duration::minutes(30)),
+            "payment_deadline": stamp(deadline),
+            "bitcoin": {
+                "txid": "9f2c".repeat(16),
+                "observed_sats": OBSERVED_SATS,
+                "confirmations": 2,
+                "amount_matched": true,
+                "paid_on_time": true,
+            },
+            "outcome": null,
+            "resolved_at": null,
+        }),
+    );
+    let client = fx
+        .app
+        .state
+        .payments
+        .as_ref()
+        .and_then(|payments| payments.paykit.as_ref())
+        .expect("paykit client");
+    let poll_client = || async {
+        fx.app.clock.advance_seconds(60);
+        verify_due_paykit_payments(&fx.app.state, client, fx.app.clock.now())
+            .await
+            .expect("poll runs");
+    };
+
+    // No Receipt yet: the order keeps waiting for the seller.
+    fx.paykit
+        .set_marketplace_receipt(invoice_id, serde_json::Value::Null);
+    poll_client().await;
+    assert_eq!(
+        request_state(&fx, &order_id).await,
+        "awaiting_seller_confirmation"
+    );
+
+    fx.paykit
+        .set_marketplace_receipt(invoice_id, json!(receipt(OBSERVED_SATS)));
+    poll_client().await;
+    assert_eq!(order_state(&fx, &order_id).await, "paid");
+    assert_eq!(
+        confirmation(&fx, &order_id).await,
+        Some((
+            fx.seller.pubky.clone(),
+            "seller_wallet_receipt".to_string(),
+            Some(receipt(OBSERVED_SATS).receipt_id)
+        ))
+    );
+    // Both polls read the status and the Receipt from the double.
+    let calls = fx.paykit.calls();
+    for path in [
+        "/marketplace/payment-requests/status",
+        "/marketplace/payment-requests/receipt",
+    ] {
+        assert_eq!(
+            calls.iter().filter(|call| call.path == path).count(),
+            2,
+            "{path}"
+        );
+    }
+}
+
 /// Setting `wallet_receipt` to `value` on the order's confirmation row breaks
 /// 0098's pair check, which refuses it.
 async fn assert_pair_check_refuses(fx: &Fixture, order_id: &str, value: &str) {
