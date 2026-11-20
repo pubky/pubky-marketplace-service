@@ -3284,6 +3284,10 @@ async fn refresh_seller_confirmation_facts(
     Ok(true)
 }
 
+/// Whether a seller-window report changed the order, and whether it is usable.
+type SellerWindowReport<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<(bool, bool)>> + Send + 'a>>;
+
 /// Applies one Paykit report to an order inside
 /// `awaiting_seller_confirmation`. Once the seller gate is armed no report
 /// pays the order or routes it to review: not an `exclusive` mode Paykit
@@ -3294,51 +3298,63 @@ async fn refresh_seller_confirmation_facts(
 /// attestation and the seller-window reaper stay the only exits. A report
 /// that finds the order already gone from the state changes nothing, and
 /// the next poll reads the order afresh.
-async fn apply_report_inside_seller_window(
-    pool: &PgPool,
-    row: &ClaimedPaykitOrder,
-    outcome: &PaykitStatusOutcome,
+///
+/// Returns whether the order changed and whether the report is usable: a
+/// detected or confirmed sighting on the order's own rail, the only report
+/// the seller's wallet Receipt may pay on. A USDT report for an order that
+/// entered on Bitcoin is judged, and applied, by its Bitcoin leg.
+fn apply_report_inside_seller_window<'a>(
+    pool: &'a PgPool,
+    row: &'a ClaimedPaykitOrder,
+    outcome: &'a PaykitStatusOutcome,
     now: DateTime<Utc>,
-) -> anyhow::Result<bool> {
-    let (observed_state, amount_matched, facts) = match outcome {
-        PaykitStatusOutcome::Confirmed {
+) -> SellerWindowReport<'a> {
+    Box::pin(async move {
+        let (observed_state, amount_matched, facts) = match outcome {
+            PaykitStatusOutcome::Confirmed {
+                amount_matched,
+                facts,
+            } => ("confirmed", *amount_matched, facts),
+            PaykitStatusOutcome::AcceptancePending { facts } => ("confirmed", true, facts),
+            PaykitStatusOutcome::Detected { facts } => {
+                ("detected", facts.amount_matched.unwrap_or(true), facts)
+            }
+            PaykitStatusOutcome::UsdtObserved { usdt, bitcoin, .. } => {
+                return match refresh_usdt_inside_seller_window(pool, row, usdt, now).await? {
+                    Some(changed) => Ok((changed, true)),
+                    None => apply_report_inside_seller_window(pool, row, bitcoin, now).await,
+                };
+            }
+            PaykitStatusOutcome::ManualReview { .. } => return Ok((false, false)),
+            PaykitStatusOutcome::Undetected | PaykitStatusOutcome::ActiveUndetected { .. } => {
+                return Ok((mark_shared_manual_disappeared(pool, row, now).await?, false))
+            }
+            PaykitStatusOutcome::NotFound | PaykitStatusOutcome::Unavailable => {
+                return Ok((false, false))
+            }
+        };
+        if !matches!(
+            facts.allocation_mode.as_str(),
+            "shared_manual" | "exclusive"
+        ) {
+            tracing::warn!(
+                order_id = %row.id,
+                allocation_mode = %facts.allocation_mode,
+                "paykit status reported an unknown allocation_mode; failing closed"
+            );
+            return Ok((false, false));
+        }
+        refresh_inside_seller_window(
+            pool,
+            row,
+            observed_state,
             amount_matched,
-            facts,
-        } => ("confirmed", *amount_matched, facts),
-        PaykitStatusOutcome::AcceptancePending { facts } => ("confirmed", true, facts),
-        PaykitStatusOutcome::Detected { facts } => {
-            ("detected", facts.amount_matched.unwrap_or(true), facts)
-        }
-        PaykitStatusOutcome::UsdtObserved { usdt, .. } => {
-            return refresh_usdt_inside_seller_window(pool, row, usdt, now).await
-        }
-        PaykitStatusOutcome::ManualReview { .. } => return Ok(false),
-        PaykitStatusOutcome::Undetected | PaykitStatusOutcome::ActiveUndetected { .. } => {
-            return mark_shared_manual_disappeared(pool, row, now).await
-        }
-        PaykitStatusOutcome::NotFound | PaykitStatusOutcome::Unavailable => return Ok(false),
-    };
-    if !matches!(
-        facts.allocation_mode.as_str(),
-        "shared_manual" | "exclusive"
-    ) {
-        tracing::warn!(
-            order_id = %row.id,
-            allocation_mode = %facts.allocation_mode,
-            "paykit status reported an unknown allocation_mode; failing closed"
-        );
-        return Ok(false);
-    }
-    refresh_inside_seller_window(
-        pool,
-        row,
-        observed_state,
-        amount_matched,
-        &facts.observation,
-        now,
-    )
-    .await?;
-    Ok(false)
+            &facts.observation,
+            now,
+        )
+        .await?;
+        Ok((false, true))
+    })
 }
 
 /// Refreshes an order waiting for its seller from one report, under the
@@ -3386,14 +3402,15 @@ async fn refresh_inside_seller_window(
 /// on its USDT transfer refreshes the transfer's facts and finality, under the
 /// canonical payment-then-order lock; a transfer the report no longer shows
 /// in a block is marked `disappeared` and its finality `reverted`. Nothing
-/// advances the order. An order that entered on Bitcoin ignores the USDT leg
-/// here: once paid, the settled poll holds second-rail money for review.
+/// advances the order. An order that entered on Bitcoin gets `None`: its
+/// caller applies the report's Bitcoin leg instead, and once paid the settled
+/// poll holds second-rail money for review.
 async fn refresh_usdt_inside_seller_window(
     pool: &PgPool,
     row: &ClaimedPaykitOrder,
     usdt: &PaykitUsdtObservation,
     now: DateTime<Utc>,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<Option<bool>> {
     let mut tx = pool.begin().await?;
     let payment_state: Option<(String,)> =
         sqlx::query_as("SELECT state FROM payments WHERE id = $1 FOR UPDATE")
@@ -3402,14 +3419,14 @@ async fn refresh_usdt_inside_seller_window(
             .await?;
     if payment_state.as_ref().map(|(state,)| state.as_str()) != Some("awaiting_entitlement") {
         tx.rollback().await?;
-        return Ok(false);
+        return Ok(Some(false));
     }
     let Some(order) = fetch_order_for_update(&mut tx, row.id).await? else {
         anyhow::bail!("paykit order {} is missing", row.id);
     };
     if order.payment_asset.as_deref() != Some("USDT") {
         tx.rollback().await?;
-        return Ok(false);
+        return Ok(None);
     }
     let observation = usdt.as_observation();
     let observation_doc = crate::bitcoin_review::observation_json(
@@ -3422,7 +3439,7 @@ async fn refresh_usdt_inside_seller_window(
     if !refresh_seller_confirmation_facts(&mut tx, row, &observation_doc, &observation, now).await?
     {
         tx.rollback().await?;
-        return Ok(false);
+        return Ok(Some(false));
     }
     let finality = if usdt.included() {
         finality_of(usdt)
@@ -3431,7 +3448,7 @@ async fn refresh_usdt_inside_seller_window(
     };
     set_payment_finality(&mut tx, row.id, finality, now).await?;
     tx.commit().await?;
-    Ok(true)
+    Ok(Some(true))
 }
 
 /// A disappearance/reorg fact for an order awaiting seller confirmation:
@@ -3660,16 +3677,10 @@ async fn apply_paykit_status_outcome(
         return apply_settled_status(state, row, &outcome, now).await;
     }
     if row.paykit_request_state == "awaiting_seller_confirmation" {
-        let changed = apply_report_inside_seller_window(&state.pool, row, &outcome, now).await?;
         // Only a usable report lets the Receipt pay: paykit-server reporting
         // the request as broken, gone or unreadable is no payment authority.
-        let usable = matches!(
-            outcome,
-            PaykitStatusOutcome::Confirmed { .. }
-                | PaykitStatusOutcome::AcceptancePending { .. }
-                | PaykitStatusOutcome::Detected { .. }
-                | PaykitStatusOutcome::UsdtObserved { .. }
-        );
+        let (changed, usable) =
+            apply_report_inside_seller_window(&state.pool, row, &outcome, now).await?;
         if usable
             && row.seller_confirms_payment()
             && confirm_with_seller_wallet_receipt(state, source, row, now).await?
@@ -3785,7 +3796,8 @@ async fn confirm_with_seller_wallet_receipt(
 /// amount, or a rail whose observation carries no figure, defers to the
 /// observation's match; an amount that is not a whole number, in another
 /// currency or on the other rail pays nothing. A Receipt naming a txid must
-/// name the observed one.
+/// name the observed one, compared as hex without regard to case; a `txid`
+/// that is not a string pays nothing.
 pub(crate) fn wallet_receipt_matches_observation(
     receipt: &crate::payments::SellerReceipt,
     observation: &Value,
@@ -3795,10 +3807,13 @@ pub(crate) fn wallet_receipt_matches_observation(
     {
         return false;
     }
-    if let Some(txid) = receipt.metadata.get("txid").and_then(Value::as_str) {
-        if observation["txid"].as_str() != Some(txid) {
-            return false;
-        }
+    match receipt.metadata.get("txid") {
+        None => {}
+        Some(Value::String(txid)) => match observation["txid"].as_str() {
+            Some(observed) if observed.eq_ignore_ascii_case(txid) => {}
+            _ => return false,
+        },
+        Some(_) => return false,
     }
     let Some(amount) = &receipt.amount else {
         return true;
@@ -6656,6 +6671,13 @@ mod tests {
                 false,
             ),
             (
+                "the observed txid in upper case",
+                Some(("50000", "SAT")),
+                Some("AA"),
+                &btc,
+                true,
+            ),
+            (
                 "a txid the observation lacks",
                 Some(("50000", "SAT")),
                 Some("aa"),
@@ -6738,6 +6760,15 @@ mod tests {
                 wallet_receipt_matches_observation(&wallet_receipt(*amount, *txid), observation),
                 *pays,
                 "{name}"
+            );
+        }
+        // A `txid` that is not a string pays nothing.
+        for txid in [json!(null), json!(170), json!({"value": "aa"})] {
+            let mut receipt = wallet_receipt(Some(("50000", "SAT")), None);
+            receipt.metadata.insert("txid".into(), txid.clone());
+            assert!(
+                !wallet_receipt_matches_observation(&receipt, &btc),
+                "txid {txid}"
             );
         }
     }

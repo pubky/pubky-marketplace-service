@@ -19,7 +19,7 @@ use marketplace_service::clock::Clock;
 use marketplace_service::config::{Config, PaymentConfirmation};
 use marketplace_service::payments::{
     parse_seller_receipt, pubky_app_key, PaykitObservation, PaykitStatusFacts, PaykitStatusOutcome,
-    SellerReceipt, SellerReceiptAmount, SellerReceiptOutcome,
+    PaykitUsdtObservation, SellerReceipt, SellerReceiptAmount, SellerReceiptOutcome,
 };
 use marketplace_service::workers::verify_due_paykit_payments;
 use serde_json::json;
@@ -502,6 +502,75 @@ async fn a_receipt_never_pays_when_paykit_reports_the_request_broken(pool: PgPoo
     assert_eq!(order_state(&fx, &order_id).await, "paid");
 }
 
+/// A report carrying a USDT transfer, for an order waiting on its Bitcoin.
+fn usdt_report(bitcoin: PaykitStatusOutcome) -> PaykitStatusOutcome {
+    PaykitStatusOutcome::UsdtObserved {
+        usdt: PaykitUsdtObservation {
+            tx_hash: format!("0x{}", "ab".repeat(32)),
+            observed_units: Some(12_500_000),
+            confirmations: 3,
+            amount_matched: true,
+            paid_on_time: true,
+            finalized: true,
+        },
+        bitcoin: Box::new(bitcoin),
+        payment_deadline: chrono::Utc::now() + chrono::Duration::hours(1),
+        paid_asset: None,
+    }
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_bitcoin_order_is_judged_by_the_bitcoin_leg_of_a_usdt_report(pool: PgPool) {
+    let fx = fixture(pool).await;
+    let (order_id, _, invoice_id, reference) = waiting_order(&fx).await;
+    fx.status.set_receipt(
+        invoice_id,
+        SellerReceiptOutcome::Issued(Box::new(receipt(OBSERVED_SATS))),
+    );
+
+    // paykit-server no longer reports the Bitcoin: the sighting is marked
+    // gone and the Receipt pays nothing.
+    fx.status.set_outcome(
+        &reference,
+        usdt_report(PaykitStatusOutcome::ActiveUndetected {
+            payment_deadline: chrono::Utc::now() + chrono::Duration::hours(1),
+        }),
+    );
+    poll(&fx).await;
+    assert_eq!(
+        request_state(&fx, &order_id).await,
+        "awaiting_seller_confirmation"
+    );
+    assert_eq!(confirmation(&fx, &order_id).await, None);
+    let disappeared: Option<bool> = sqlx::query_scalar(
+        "SELECT (paykit_observation->>'disappeared')::boolean FROM orders WHERE id = $1",
+    )
+    .bind(Uuid::parse_str(&order_id).expect("order uuid"))
+    .fetch_one(&fx.app.pool)
+    .await
+    .expect("observation");
+    assert_eq!(disappeared, Some(true));
+
+    // A broken Bitcoin leg is no payment authority either.
+    fx.status
+        .set_outcome(&reference, usdt_report(manual_review()));
+    poll(&fx).await;
+    assert_eq!(confirmation(&fx, &order_id).await, None);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_usdt_report_with_the_bitcoin_confirmed_lets_the_receipt_pay(pool: PgPool) {
+    let fx = fixture(pool).await;
+    let (order_id, _, invoice_id, reference) = waiting_order(&fx).await;
+    fx.status.set_receipt(
+        invoice_id,
+        SellerReceiptOutcome::Issued(Box::new(receipt(OBSERVED_SATS))),
+    );
+    fx.status.set_outcome(&reference, usdt_report(confirmed()));
+    poll(&fx).await;
+    assert_eq!(order_state(&fx, &order_id).await, "paid");
+}
+
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn an_automatic_order_held_by_the_bitcoin_opt_in_ignores_a_receipt(pool: PgPool) {
     let fx = fixture_in(pool, PaymentConfirmation::Automatic).await;
@@ -655,6 +724,7 @@ async fn the_sellers_tap_after_the_receipt_releases_held_lines(pool: PgPool) {
     let (code, body) = confirm_call(&fx.app, &fx.seller.token, &order_id, &json!({})).await;
     assert_eq!(code, StatusCode::OK, "{body}");
     assert!(!released().await);
+    assert!(body.get("order").is_none(), "{body}");
     let (code, body) = confirm_call(
         &fx.app,
         &fx.seller.token,
@@ -668,4 +738,6 @@ async fn the_sellers_tap_after_the_receipt_releases_held_lines(pool: PgPool) {
         json!("seller_wallet_receipt")
     );
     assert!(released().await);
+    // The releasing replay carries the order, as the first confirmation does.
+    assert!(body["order"]["digital_released_at"].is_string(), "{body}");
 }

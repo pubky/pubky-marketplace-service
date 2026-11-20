@@ -461,7 +461,8 @@ pub async fn confirm_bitcoin_payment(
 /// repeated confirmation: the record is returned unchanged. When the seller
 /// asks for the release of instant lines still held for them (the wallet
 /// Receipt paid the order without one), the release happens here, in its own
-/// transaction; lines already released stay as they are.
+/// transaction; lines already released stay as they are. That reply carries
+/// the order projection, as the first confirmation's does.
 async fn replay_confirmation(
     state: &AppState,
     actor: &str,
@@ -485,6 +486,7 @@ async fn replay_confirmation(
         Err(error) => return Some(internal("confirmation lookup", &error)),
     };
     let (confirmed_at, txid, amount_sats, reason, observation, basis) = existing?;
+    let mut order_json = None;
     if release_digital {
         let order = match fetch_order_for_update(&mut tx, order_id).await {
             Ok(Some(order)) => order,
@@ -492,22 +494,26 @@ async fn replay_confirmation(
             Err(error) => return Some(internal("digital release", &error)),
         };
         let now = state.clock.now();
-        if let Err(error) =
-            crate::handlers::digital_manual::release_with_confirmation(&mut tx, order, actor, now)
-                .await
+        let order = match crate::handlers::digital_manual::release_with_confirmation(
+            &mut tx, order, actor, now,
+        )
+        .await
         {
-            return Some(internal("digital release", &error));
-        }
+            Ok(order) => order,
+            Err(error) => return Some(internal("digital release", &error)),
+        };
+        let reviews = match crate::handlers::fetch_order_reviews(&mut tx, order_id).await {
+            Ok(reviews) => reviews,
+            Err(error) => return Some(internal("order projection", &error)),
+        };
+        order_json = Some(seller_order_json_with_reviews(&order, &reviews, actor));
     }
     if let Err(error) = tx.commit().await {
         return Some(internal("confirmation commit", &error));
     }
-    Some(
-        (
-            StatusCode::OK,
-            Json(json!({
-                "ok": true,
-                "confirmation": {
+    let mut reply = json!({
+        "ok": true,
+        "confirmation": {
                     "order_id": order_id,
                     "confirmed_by_pubky": actor,
                     "confirmed_at": format_timestamp(confirmed_at),
@@ -517,11 +523,12 @@ async fn replay_confirmation(
                     "confirmation_source": "seller",
                     "confirmation_basis": basis,
                     "paykit_observation": seller_observation(Some(&observation)),
-                },
-            })),
-        )
-            .into_response(),
-    )
+        },
+    });
+    if let Some(order) = order_json {
+        reply["order"] = order;
+    }
+    Some((StatusCode::OK, Json(reply)).into_response())
 }
 
 /// What a seller confirmation recorded.
