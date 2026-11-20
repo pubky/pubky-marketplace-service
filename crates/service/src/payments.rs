@@ -292,6 +292,73 @@ pub struct PaykitStatusFacts {
     pub amount_matched: Option<bool>,
 }
 
+/// What the seller's wallet says arrived, as paykit-server reports the
+/// Receipt it read for a Marketplace invoice. Unknown fields are ignored so
+/// the server can add facts without breaking this reader.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
+pub struct SellerReceipt {
+    pub receipt_id: String,
+    pub app_id: String,
+    pub payment_request_id: String,
+    pub payment_reference: String,
+    #[serde(default)]
+    pub payment_endpoint_identifier: Option<String>,
+    #[serde(default)]
+    pub amount: Option<SellerReceiptAmount>,
+    #[serde(default)]
+    pub metadata: serde_json::Map<String, serde_json::Value>,
+    pub issued_at: String,
+    pub stored_at: String,
+}
+
+/// A Receipt's Payment Amount: a decimal string in `currency`'s smallest
+/// unit (`SAT` for Bitcoin).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
+pub struct SellerReceiptAmount {
+    pub value: String,
+    pub currency: String,
+}
+
+/// One read of the seller Receipt route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SellerReceiptOutcome {
+    /// The wallet's Receipt for the invoice.
+    Issued(Box<SellerReceipt>),
+    /// The server has no Receipt for the invoice yet.
+    NotIssued,
+    /// The server has no Receipt route (`404`): an older paykit-server.
+    Unsupported,
+    /// The read failed or answered something this reader does not accept.
+    Unavailable,
+}
+
+#[derive(Deserialize)]
+struct SellerReceiptBody {
+    invoice_id: uuid::Uuid,
+    receipt: Option<SellerReceipt>,
+}
+
+/// Parses one Receipt route answer for `invoice_id`.
+pub fn parse_seller_receipt(
+    status: reqwest::StatusCode,
+    body: &str,
+    invoice_id: uuid::Uuid,
+) -> SellerReceiptOutcome {
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return SellerReceiptOutcome::Unsupported;
+    }
+    if !status.is_success() {
+        return SellerReceiptOutcome::Unavailable;
+    }
+    match serde_json::from_str::<SellerReceiptBody>(body) {
+        Ok(body) if body.invoice_id == invoice_id => match body.receipt {
+            Some(receipt) => SellerReceiptOutcome::Issued(Box::new(receipt)),
+            None => SellerReceiptOutcome::NotIssued,
+        },
+        _ => SellerReceiptOutcome::Unavailable,
+    }
+}
+
 /// Whether the payment request reached the buyer's wallet, normalized from
 /// paykit-server's `paykit_delivery_state`. `cancelled` and
 /// `contract_error` are not delivery facts about a live request and map to
@@ -2012,6 +2079,43 @@ impl PaykitClient {
         Ok(body["stack_id"].as_str().map(str::to_owned))
     }
 
+    /// Reads the Receipt the seller's wallet issued for one Marketplace
+    /// invoice (paykit-server `POST /marketplace/payment-requests/receipt`).
+    /// A server without the route, an unknown invoice and any failure all
+    /// read as no Receipt: the order keeps waiting for its seller.
+    pub async fn marketplace_seller_receipt(
+        &self,
+        seller_pubky: &str,
+        invoice_id: uuid::Uuid,
+    ) -> SellerReceiptOutcome {
+        let response = self
+            .post_signed_to(
+                PaykitApi::Upstream,
+                &self.base_url,
+                "/marketplace/payment-requests/receipt",
+                serde_json::json!({
+                    "creator": pubky_app_key(seller_pubky),
+                    "invoice_id": invoice_id,
+                }),
+            )
+            .await;
+        let Ok(response) = response else {
+            tracing::warn!(%invoice_id, "the seller receipt read failed to reach paykit-server");
+            return SellerReceiptOutcome::Unavailable;
+        };
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        let outcome = parse_seller_receipt(status, &body, invoice_id);
+        if outcome == SellerReceiptOutcome::Unavailable {
+            tracing::warn!(
+                %invoice_id,
+                status = status.as_u16(),
+                "paykit-server answered the seller receipt read with something unusable"
+            );
+        }
+        outcome
+    }
+
     /// Reads one Marketplace invoice through the dedicated signed status
     /// endpoint. Producer fixture: paykit-server
     /// `34620d4dd612818152f3039e2ea34b214a2725ce`, tree
@@ -2560,6 +2664,17 @@ pub trait PaykitStatusSource: Send + Sync + 'static {
         Box::pin(async move { (self.status(seller_pubky, reference).await, None) })
     }
 
+    /// The Receipt the seller's wallet issued for an upstream Marketplace
+    /// invoice. Sources without the route report it unsupported.
+    fn seller_receipt<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        invoice_id: uuid::Uuid,
+    ) -> Pin<Box<dyn Future<Output = SellerReceiptOutcome> + Send + 'a>> {
+        let _ = (seller_pubky, invoice_id);
+        Box::pin(async { SellerReceiptOutcome::Unsupported })
+    }
+
     /// Polls using identity persisted with one invoice. Implementations that
     /// only support the fork keep using the reference route.
     fn status_for<'a>(
@@ -2577,6 +2692,14 @@ pub trait PaykitStatusSource: Send + Sync + 'static {
 }
 
 impl PaykitStatusSource for PaykitClient {
+    fn seller_receipt<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        invoice_id: uuid::Uuid,
+    ) -> Pin<Box<dyn Future<Output = SellerReceiptOutcome> + Send + 'a>> {
+        Box::pin(self.marketplace_seller_receipt(seller_pubky, invoice_id))
+    }
+
     fn status<'a>(
         &'a self,
         seller_pubky: &'a str,
