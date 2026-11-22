@@ -791,6 +791,57 @@ Keep both and only forget the version:
 DELETE FROM _sqlx_migrations WHERE version = 99;
 ```
 
+## Homeserver-scoped deletion cursors (0100)
+
+0100 adds three nullable `TEXT` columns, each with a `NOT VALID` check that
+it is NULL or a 52-character z-base-32 pubky:
+`listing_deletion_cursors.homeserver` (the homeserver the follower's
+`event_cursor` counts on), `listings.deleted_event_homeserver` (the
+homeserver of a tombstone's `deleted_event_cursor`) and
+`listings.revived_from_homeserver` (the homeserver of the revival marker
+`revived_from_cursor`). NULL is the homeserver `HOMESERVER_URL` names, which
+every existing row and every `fixed` deployment's write keeps. It replaces
+the two guard functions of 0050 and 0051 and recreates
+`listings_deletion_guard` to also fire on `revived_from_homeserver`: cursors
+compare only on one homeserver, a cursor write that changes `homeserver`
+may set any cursor, a revival moves the superseded delete's homeserver into
+the marker, and the marker's homeserver changes only with a revival
+([listing deletion follower](listing-deletion-follower.md)). No default, no
+rewrite, no backfill, no index; it sets `lock_timeout` like 0050. Directly
+rerunnable: each column is added only if missing, each check is dropped and
+re-added, and the functions and trigger are replaced.
+
+**Deploy mode: rolling.** A binary from before 0100 never reads the columns;
+its cursor writes leave `homeserver` as it is and stay monotonic, and its
+tombstones leave `deleted_event_homeserver` NULL, as `fixed` writes it. The
+revival trigger clears `deleted_event_homeserver` with the cursor it moves.
+
+### Backing out 0100
+
+An image from before it runs on the migrated database, with the replaced
+guards, which behave as 0051's while every homeserver column is NULL. Under
+`HOMESERVER_RESOLUTION=fixed` they all are; an image from before 0100 cannot
+run `pkarr`. After a `pkarr` deployment, first restart every cursor that
+names a homeserver on the configured one, which the older image would
+otherwise read from a position on another homeserver. The cursor guard
+accepts the write under the current follower lease, which it share-locks:
+
+```sql
+BEGIN;
+SELECT set_config('marketplace.listing_deletion_authority',
+    (SELECT 'follower:' || holder || ':' || fence
+     FROM worker_leases WHERE task = 'listing_deletions'), true);
+UPDATE listing_deletion_cursors SET event_cursor = NULL, homeserver = NULL
+    WHERE homeserver IS NOT NULL;
+COMMIT;
+```
+
+Then forget the version:
+
+```sql
+DELETE FROM _sqlx_migrations WHERE version = 100;
+```
+
 ## Numbers claimed by open pull requests
 
 `main` has 0001 to 0079 (0068 and 0069 were never used). A new migration must
@@ -814,6 +865,7 @@ assume it is free:
 | 0097 | `0097_connector_product_sync_fences.sql` | connector product sync: per-group rebase instants and the unlink fence on product snapshots |
 | 0098 | `0098_seller_wallet_receipt_confirmation.sql` | seller confirmations may rest on the seller's wallet Receipt: the `seller_wallet_receipt` basis and `wallet_receipt` |
 | 0099 | `0099_inventory_actor_rate_limits.sql` | per-seller inventory rate buckets and the `session.create` automation class |
+| 0100 | `0100_homeserver_scoped_deletion_cursors.sql` | homeserver-scoped listing deletion cursors and revival markers (`HOMESERVER_RESOLUTION=pkarr`) |
 
 This table describes unmerged work and goes stale as pull requests land; trust
 `crates/service/migrations/` on `main` over it. sqlx does not reject two files

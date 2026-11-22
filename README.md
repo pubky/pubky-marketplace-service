@@ -285,7 +285,12 @@ Resolved records are cached in memory per process: at most 10,000 records
 (users' and their homeservers'), each used for 5 minutes whatever TTL its
 publisher set, then resolved again. A pubky that moves to another
 homeserver is read from the new one within 5 minutes of republishing its
-record; until then reads still go to the old homeserver.
+record; until then reads still go to the old homeserver. A deletion proof
+does not wait: it reads the seller's record from the network first. Event
+cursors count on one homeserver, so the deletion follower keeps each
+seller's cursor with the homeserver it was read from and, once the seller is
+read from another one, follows the new homeserver's stream from its start
+([deletion follower](docs/listing-deletion-follower.md)).
 
 ### Listing moderation
 
