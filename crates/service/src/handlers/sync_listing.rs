@@ -29,7 +29,7 @@ use crate::homeserver::{
     MalformedDigitalLock,
 };
 use crate::listing_deletion::{
-    latest_event_is_delete, observe_live, tombstone, DeletionAuthority, DeletionCheck,
+    confirm_missing_record_deleted, observe_live, tombstone, DeletionAuthority, DeletionCheck,
 };
 use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
 
@@ -447,8 +447,11 @@ async fn settle_missing_record(
     let Some(observed) = observe_live(&mut **tx, &command.aggregate_id).await? else {
         return Ok(Err(not_found()));
     };
-    let DeletionCheck::Deleted { cursor } =
-        latest_event_is_delete(homeserver, &payload.seller_pubky, &payload.listing_id).await
+    let DeletionCheck::Deleted {
+        cursor,
+        homeserver: event_homeserver,
+    } = confirm_missing_record_deleted(homeserver, &payload.seller_pubky, &payload.listing_id)
+        .await
     else {
         return Ok(Err(not_found()));
     };
@@ -457,6 +460,7 @@ async fn settle_missing_record(
         DeletionAuthority::Command,
         &command.aggregate_id,
         &cursor,
+        event_homeserver.as_deref(),
         observed.record_epoch,
         actor,
         command.command_id,

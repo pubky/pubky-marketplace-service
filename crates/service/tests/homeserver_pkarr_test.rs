@@ -326,7 +326,7 @@ async fn assert_reads_everything(client: &HttpHomeserverClient, published: &Publ
         HomeserverFetchOutcome::NotFound,
         "a missing record on the pubky's own homeserver is NotFound"
     );
-    let HomeserverEventsOutcome::Events(events) = client
+    let HomeserverEventsOutcome::Events { events, .. } = client
         .listing_events(pubky, LISTINGS_PATH, None, false, 10)
         .await
     else {
