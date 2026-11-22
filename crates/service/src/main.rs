@@ -8,8 +8,15 @@ use marketplace_service::clock::SystemClock;
 use marketplace_service::config::Config;
 use marketplace_service::{http, workers, AppState};
 
-fn env_filter() -> EnvFilter {
-    EnvFilter::try_from_default_env()
+/// Whether `HOMESERVER_RESOLUTION` selects `pkarr`. A bad value is refused
+/// when the homeserver client is built.
+fn resolves_through_pkarr() -> bool {
+    std::env::var(marketplace_service::homeserver::ENV_HOMESERVER_RESOLUTION)
+        .is_ok_and(|value| value.trim() == "pkarr")
+}
+
+fn env_filter(pkarr: bool) -> EnvFilter {
+    let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,marketplace_service=info"))
         .add_directive("sqlx=warn".parse().expect("valid sqlx log directive"))
         .add_directive("hyper=warn".parse().expect("valid hyper log directive"))
@@ -19,9 +26,14 @@ fn env_filter() -> EnvFilter {
                 .expect("valid tower_http log directive"),
         )
         .add_directive("h2=warn".parse().expect("valid h2 log directive"))
-        .add_directive("rustls=warn".parse().expect("valid rustls log directive"))
-        // The SDK's info and warn logs and pkarr's warnings (Pkarr lookups,
-        // transport fallbacks, DHT and relay failures) carry full pubkys.
+        .add_directive("rustls=warn".parse().expect("valid rustls log directive"));
+    if !pkarr {
+        return filter;
+    }
+    // Under `pkarr` every read resolves a seller, and the SDK's info and warn
+    // logs and pkarr's warnings (Pkarr lookups, transport fallbacks, DHT and
+    // relay failures) carry full pubkys.
+    filter
         .add_directive("pubky=error".parse().expect("valid pubky log directive"))
         .add_directive("pkarr=error".parse().expect("valid pkarr log directive"))
 }
@@ -30,7 +42,7 @@ fn env_filter() -> EnvFilter {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .json()
-        .with_env_filter(env_filter())
+        .with_env_filter(env_filter(resolves_through_pkarr()))
         .init();
 
     let config = Config::from_env()?;
@@ -332,17 +344,35 @@ mod tests {
 
     #[test]
     fn dependency_directives_remain_at_warn() {
-        let filter = env_filter().to_string();
-        for directive in [
-            "sqlx=warn",
-            "hyper=warn",
-            "tower_http=warn",
-            "h2=warn",
-            "rustls=warn",
-        ] {
+        for pkarr in [false, true] {
+            let filter = env_filter(pkarr).to_string();
+            for directive in [
+                "sqlx=warn",
+                "hyper=warn",
+                "tower_http=warn",
+                "h2=warn",
+                "rustls=warn",
+            ] {
+                assert!(
+                    filter.contains(directive),
+                    "{directive} missing from {filter}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sdk_and_pkarr_logs_are_limited_to_errors_only_under_pkarr() {
+        let fixed = env_filter(false).to_string();
+        assert!(
+            !fixed.contains("pubky=") && !fixed.contains("pkarr="),
+            "fixed mode keeps the SDK and pkarr levels: {fixed}"
+        );
+        let pkarr = env_filter(true).to_string();
+        for directive in ["pubky=error", "pkarr=error"] {
             assert!(
-                filter.contains(directive),
-                "{directive} missing from {filter}"
+                pkarr.contains(directive),
+                "{directive} missing from {pkarr}"
             );
         }
     }
