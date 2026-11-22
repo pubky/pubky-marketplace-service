@@ -2280,9 +2280,10 @@ be exactly the fields above, with `aud` equal to the origin of
 `client_id` to be listed in `MARKETPLACE_GRANT_SESSION_CLIENT_IDS`; and the
 grant to cover `/pub/pubky.app/marketplace-service/v1/` with read and write.
 A mint further requires the challenge to have been issued to the grant's
-pubky, unused and unexpired, and the proof document, read through
-`HOMESERVER_URL` with `pubky-host` set to the grant's issuer (body capped at
-8 KB), to equal the expected body. The challenge is then burned and the
+pubky, unused and unexpired, and the proof document, read from the grant
+issuer's homeserver (body capped at 8 KB; see
+[Homeserver reads](../README.md#homeserver-reads)), to equal the expected
+body. The challenge is then burned and the
 session inserted in one transaction.
 
 Because the challenge exists only from step 1, a document cannot be staged
@@ -2290,9 +2291,11 @@ while the grant is live and used after it is revoked, beyond one challenge
 lifetime. Only a live homeserver session can write the document, so a revoked
 grant cannot mint by itself. Two limits remain: a document written by another
 live session of the same user also passes, and revoking a grant does not
-revoke sessions already minted from it; they live until they expire. Sellers
-whose homeserver is not `HOMESERVER_URL` cannot pass the document read and
-keep the approval flow.
+revoke sessions already minted from it; they live until they expire. Under
+`HOMESERVER_RESOLUTION=fixed`, sellers whose homeserver is not
+`HOMESERVER_URL` cannot pass the document read and keep the approval flow;
+under `pkarr` the document is read from whichever homeserver the issuer's
+Pkarr record names.
 
 The session's capabilities are the grant's narrowed to the marketplace scopes:
 `/pub/pubky.app/marketplace-service/v1/:rw`, plus `/priv/pubky.app/:rw` when the

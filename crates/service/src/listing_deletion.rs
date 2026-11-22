@@ -1,6 +1,8 @@
 //! Listing tombstones: the service follows a seller's homeserver delete.
 //!
-//! A listing is deleted when BOTH hold on the configured homeserver:
+//! A listing is deleted when BOTH hold on the seller's homeserver (the one
+//! `HOMESERVER_URL` names, or the one the seller's Pkarr record names under
+//! `HOMESERVER_RESOLUTION=pkarr`):
 //!
 //! 1. the record fetch at `/pub/pubky.app/marketplace/v1/listings/{id}`
 //!    answers 404, and
@@ -10,7 +12,9 @@
 //! The homeserver answers the record fetch with 404 for users it does not
 //! host, so (1) alone would let any caller tombstone a listing whose seller
 //! lives elsewhere. The event stream answers 404 for an unhosted user and
-//! only ever records a `DEL` the seller wrote, so (2) is the proof.
+//! only ever records a `DEL` the seller wrote, so (2) is the proof. A seller
+//! whose homeserver cannot be resolved is an unanswered read, never an
+//! unhosted one.
 //!
 //! Two paths reach the tombstone: `listing.sync` (any actor, including
 //! `POST /v1/listings/sync-many`) when its fetch finds the record gone, and

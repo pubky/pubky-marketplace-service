@@ -33,6 +33,11 @@ the `listing_deletions` lease.
   sellers inside their backoff are left out of the pass, so they take none
   of its seller slots, and the rest are served least recently attempted
   first. A successful poll clears the backoff.
+- **An unresolvable seller is not unhosted.** Under
+  `HOMESERVER_RESOLUTION=pkarr` each seller is read from the homeserver
+  their Pkarr record names. A seller with no record, a lookup that fails or
+  times out, or a homeserver that does not answer is a rejected read as
+  above, never the 404 of a seller the homeserver does not host.
 - **A record accepted after a confirmation wins.** A delete that the
   service accepted a record for after confirming it is settled again on a
   later pass; the seller's cursor stops before it.

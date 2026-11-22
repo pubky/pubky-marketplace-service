@@ -67,8 +67,10 @@ cargo run -p marketplace-service
 `DATABASE_URL` alone is not enough: the service refuses to start unless it
 also has
 
-- `HOMESERVER_URL` — the homeserver the `listing.sync` command reads
-  seller-signed listing records from (an http(s) URL);
+- `HOMESERVER_URL` — the homeserver the `listing.sync` command and every
+  other homeserver read go to (an http(s) URL), unless
+  `HOMESERVER_RESOLUTION=pkarr` resolves each pubky's own homeserver instead
+  (see [Homeserver reads](#homeserver-reads));
 - `NEXUS_URL` — the marketplace index the moderation gate reads (an http(s)
   URL; see [Listing moderation](#listing-moderation));
 - `REFUSAL_AUDIT_DATABASE_URL` and `REFUSAL_AUDIT_RETENTION_DATABASE_URL` —
@@ -153,7 +155,8 @@ Configuration is environment-based. Window keys and their defaults also live in
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `DATABASE_URL` | required | Postgres connection string |
-| `HOMESERVER_URL` | required | homeserver base URL (http(s)) the `listing.sync` command fetches seller-signed records from; the service refuses to boot without it |
+| `HOMESERVER_RESOLUTION` | `fixed` | where homeserver reads go: `fixed` sends every read to `HOMESERVER_URL`; `pkarr` reads each pubky from the homeserver its Pkarr record names. Any other value refuses to boot. See [Homeserver reads](#homeserver-reads) |
+| `HOMESERVER_URL` | required with `fixed` | homeserver base URL (http(s)) the `listing.sync` command and every other homeserver read fetch seller-signed records from; the service refuses to boot without it under `fixed`, and refuses to boot with it set under `pkarr` |
 | `NEXUS_URL` | required | base URL (http(s)) of the marketplace index (Nexus) the service asks whether a listing is moderated before it accepts a checkout, a bid or an offer on it; the service refuses to boot without it. See [Listing moderation](#listing-moderation) |
 | `REFUSAL_AUDIT_*` | required | refusal-audit logins, HMAC key pair and attestations; see [Run](#run) |
 | `BIND_ADDR` | `127.0.0.1:8080` | HTTP listen address |
@@ -242,6 +245,46 @@ Configuration is environment-based. Window keys and their defaults also live in
 | `CONNECTOR_CREDENTIAL_ENCRYPTION_KEY_PREVIOUS` | unset | optional previous connector key for the dual-key read window during rotation; the worker re-seals every value to the current key |
 | `SHOPIFY_PUBLIC_APP_CLIENT_ID`, `SHOPIFY_PUBLIC_APP_CLIENT_SECRET` | unset | reserved for Pubky's own public Shopify app, the only Shopify values that will ever live in the environment; not read yet. A merchant's own custom app brings its client id and secret through `PUT /v1/connectors/{id}/credentials`, sealed per connection, never in the environment |
 | `PICKUP_DISPUTE_RETENTION_DAYS` | `30` | days a cancelled-after-payment order's pinned pickup snapshot is retained as the dispute exhibit when no refund evidence ever lands, before the ordinary terminal-order purge takes it (≥ 1) |
+
+### Homeserver reads
+
+The service reads seller-signed data from homeservers: listing records
+(`listing.sync`, the lifecycle gate, auction award snapshots, the deletion
+follower's record checks), shipping profiles, drop and shop records,
+grant-session proof documents, Locks content locks, digital deliverables
+(hashed, up to `DIGITAL_DELIVERY_MAX_BYTES`) and the per-user
+`/events-stream` the [deletion follower](docs/listing-deletion-follower.md)
+follows. `HOMESERVER_RESOLUTION` decides where those reads go:
+
+- **`fixed`** (the default). Every read goes to `HOMESERVER_URL`, a record
+  read with a `pubky-host` header naming its owner. A pubky that homeserver
+  does not host reads as missing (404), and its event stream as an unhosted
+  user. This is the behaviour of every release before the setting existed.
+- **`pkarr`**. Each read goes to the homeserver the pubky's own Pkarr record
+  names, found with the `pubky` SDK on the public Pkarr network (mainline
+  DHT and the SDK's default relays) and reached over the SDK's transport.
+  `HOMESERVER_URL` is not read and must be unset: the service refuses to
+  boot with it set, so a deployment never believes it is pinned to a
+  homeserver it is not using. Finding the pubky's homeserver and the
+  homeserver's own address is bounded by 5 s; the request then keeps the
+  same timeouts as `fixed`.
+
+Both modes give each read the same outcomes, body caps and timeouts. A
+record is found, missing (the pubky's homeserver answered 404) or
+unavailable. Under `pkarr` a pubky with no Pkarr record, a malformed pubky,
+a failed or timed-out lookup and a homeserver that does not answer are all
+unavailable, never missing: `listing.sync` answers `UPSTREAM_UNAVAILABLE`,
+the lifecycle gate and shop reads fail closed, and the deletion follower
+backs off the seller instead of treating it as unhosted or a record as
+deleted. Logs name a pubky by its first eight characters only; the
+service's log filter keeps the SDK's and Pkarr's own logs, which carry full
+keys, to errors.
+
+Resolved records are cached in memory per process: at most 10,000 records
+(users' and their homeservers'), each used for 5 minutes whatever TTL its
+publisher set, then resolved again. A pubky that moves to another
+homeserver is read from the new one within 5 minutes of republishing its
+record; until then reads still go to the old homeserver.
 
 ### Listing moderation
 
@@ -441,7 +484,7 @@ With the flag on:
   payment starts from the new date.
 - A seller's shop record is read before the command's transaction, like the
   lifecycle gate, and fails closed: an unreadable record is
-  `UPSTREAM_UNAVAILABLE` (`HOMESERVER_URL` is already required to boot).
+  `UPSTREAM_UNAVAILABLE` (a homeserver source is already required to boot).
 
 The Shop reads `GET /v1/sellers/{seller_pubky}/annual-limit` (see
 `docs/api.md`) for the seller's counters.
@@ -576,8 +619,8 @@ is paid. After 24 hours without it the payment goes to manual review.
 A seller pauses, ends or removes a listing by rewriting `state` in its record
 at `/pub/pubky.app/marketplace/v1/listings/{listing_id}` on their homeserver;
 the listing aggregate tracks stock only. Before the service accepts a command
-that sells a listing it reads the record of every listing involved, from
-`HOMESERVER_URL`, and refuses with `LISTING_NOT_ACTIVE` (HTTP 409, audited as
+that sells a listing it reads the record of every listing involved, from the
+seller's homeserver (see [Homeserver reads](#homeserver-reads)), and refuses with `LISTING_NOT_ACTIVE` (HTTP 409, audited as
 `invalid_state`) and `reason` `listing_paused`, `listing_ended`,
 `listing_removed` or `listing_not_active`. A record the homeserver answers
 404 for is `listing_removed`; a record with no `state` field predates the
