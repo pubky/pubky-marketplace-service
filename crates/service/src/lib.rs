@@ -125,8 +125,9 @@ pub struct AppState {
     /// (`ARBITRUM_RPC_URL`); `None` records it unchecked.
     pub refund_chain: Option<Arc<dyn refund_chain::RefundChain>>,
     /// The homeserver listing-record fetch backing `listing.sync`. Required
-    /// in production (`HOMESERVER_URL`); `None` only in tests that do not
-    /// exercise sync, where the command is refused (fail closed).
+    /// in production (`HOMESERVER_URL`, or `HOMESERVER_RESOLUTION=pkarr`);
+    /// `None` only in tests that do not exercise sync, where the command is
+    /// refused (fail closed).
     pub homeserver: Option<Arc<dyn HomeserverListingClient>>,
     /// Single flight for commands that read the homeserver before their
     /// executor transaction (`listing.register` with a public record).

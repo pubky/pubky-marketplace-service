@@ -40,6 +40,9 @@ url.workspace = true
 uuid.workspace = true
 hkdf = "0.12"
 pubky = { version = "=0.16.1", features = ["json"] }
+# The response type of `pubky`'s HTTP client, which `HOMESERVER_RESOLUTION=pkarr`
+# reads go through. The service's own HTTP client stays on reqwest 0.12.
+pubky-reqwest = { package = "reqwest", version = "0.13", default-features = false }
 # RFC 9180 HPKE (DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305),
 # the suite the Shop seals delivery envelopes with. The connector worker opens
 # the opt-in connector address envelope with it; the same crate pubky-core's

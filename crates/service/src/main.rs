@@ -20,6 +20,10 @@ fn env_filter() -> EnvFilter {
         )
         .add_directive("h2=warn".parse().expect("valid h2 log directive"))
         .add_directive("rustls=warn".parse().expect("valid rustls log directive"))
+        // The SDK's info and warn logs and pkarr's warnings (Pkarr lookups,
+        // transport fallbacks, DHT and relay failures) carry full pubkys.
+        .add_directive("pubky=error".parse().expect("valid pubky log directive"))
+        .add_directive("pkarr=error".parse().expect("valid pkarr log directive"))
 }
 
 #[tokio::main]
@@ -143,9 +147,10 @@ async fn main() -> anyhow::Result<()> {
         },
         "store connectors mode resolved"
     );
-    // HOMESERVER_URL is required: `listing.sync` fetches canonical
-    // seller-signed records from it, and running without the sync path would
-    // silently re-open the unregistered-listing dead-end it exists to fix.
+    // A homeserver source is required (HOMESERVER_URL, or
+    // HOMESERVER_RESOLUTION=pkarr): `listing.sync` fetches canonical
+    // seller-signed records through it, and running without the sync path
+    // would silently re-open the unregistered-listing dead-end it exists to fix.
     let homeserver = Arc::new(marketplace_service::homeserver::client_from_env()?);
     tracing::info!("homeserver listing sync enabled");
     // NEXUS_URL is required: checkout, bids and offers on a moderated listing
