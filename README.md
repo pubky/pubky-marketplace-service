@@ -276,9 +276,10 @@ a failed or timed-out lookup and a homeserver that does not answer are all
 unavailable, never missing: `listing.sync` answers `UPSTREAM_UNAVAILABLE`,
 the lifecycle gate and shop reads fail closed, and the deletion follower
 backs off the seller instead of treating it as unhosted or a record as
-deleted. Logs name a pubky by its first eight characters only; the
-service's log filter keeps the SDK's and Pkarr's own logs, which carry full
-keys, to errors.
+deleted. The service's own logs name a pubky by its first eight characters
+only. Under `pkarr` every read resolves a pubky, and the SDK's and Pkarr's
+own logs carry full keys, so the service's log filter keeps them
+(`pubky`, `pkarr`) to errors; under `fixed` their levels are unchanged.
 
 Resolved records are cached in memory per process: at most 10,000 records
 (users' and their homeservers'), each used for 5 minutes whatever TTL its
