@@ -1804,11 +1804,13 @@ async fn a_lapsed_window_releases_once_the_locks_task_ends(pool: PgPool) {
     assert_eq!(listing_quantities(&app.pool).await, (1, 0, 0));
 }
 
-// A Lock Server that stops answering after reporting the task live cannot
-// pin the unit forever: past the bound the window sweep runs, and a
-// completion verified later still takes the late-money fork.
+// Paykit dates a Locks invoice from its creation, up to 600 s after proof
+// submission, and a payment it sees before the deadline still confirms
+// later. A task that completes one second past the old fixed 24 h bound is
+// inside the default `LOCKS_LIVE_TASK_HOLD_SECONDS`, so the unit is still
+// held and the order confirms.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn a_silent_lock_server_holds_a_live_task_only_up_to_the_bound(pool: PgPool) {
+async fn a_live_locks_task_completing_past_paykits_default_window_confirms(pool: PgPool) {
     let (app, fake) = test_app_with_locks(pool).await;
     let holder = Uuid::new_v4();
     let seller = new_actor(&app).await;
@@ -1822,10 +1824,57 @@ async fn a_silent_lock_server_holds_a_live_task_only_up_to_the_bound(pool: PgPoo
     run_once(&app.state, holder, app.clock.now())
         .await
         .expect("worker pass runs");
+
+    app.clock.advance_seconds(3_600 + 86_400 + 1);
+    let summary = run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    assert_eq!(summary.payment_windows_expired, 0);
+    assert_eq!(listing_quantities(&app.pool).await, (0, 1, 0));
+
+    fake.complete_matching(&app.pool, TEST_BUNDLE_ID, &order.payment_id)
+        .await;
+    app.clock.advance_seconds(31);
+    let summary = run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    assert_eq!(summary.locks_completions_applied, 1);
+    let (state, _, _) = payment_state(&app.pool, &order.payment_id).await;
+    assert_eq!(state, "confirmed");
+    assert_eq!(order_state(&app.pool, &order.order_id).await, "paid");
+    assert_eq!(listing_quantities(&app.pool).await, (0, 0, 1));
+    assert_eq!(
+        count(
+            &app.pool,
+            "SELECT COUNT(*) FROM events WHERE kind IN ('payment.expired', 'order.cancelled')"
+        )
+        .await,
+        0
+    );
+}
+
+// A Lock Server that stops answering after reporting the task live cannot
+// pin the unit forever: one second past the configured bound the window
+// sweep runs, and a completion verified later takes the late-money fork.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_silent_lock_server_holds_a_live_task_only_up_to_the_bound(pool: PgPool) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let holder = Uuid::new_v4();
+    let bound = app.state.config.locks_live_task_hold_seconds;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
+    register_locks(&app, &buyer.token, &order, &seller.pubky).await;
+    fake.set_outcome(
+        TEST_BUNDLE_ID,
+        LocksLookupOutcome::Status(LocksTaskStatus::Pending),
+    );
+    run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
     fake.set_outcome(TEST_BUNDLE_ID, LocksLookupOutcome::Unavailable);
 
-    app.clock
-        .advance_seconds(3_600 + workers::LOCKS_LIVE_TASK_HOLD_SECONDS - 1);
+    app.clock.advance_seconds(3_600 + bound - 1);
     let summary = run_once(&app.state, holder, app.clock.now())
         .await
         .expect("worker pass runs");
@@ -1855,6 +1904,46 @@ async fn a_silent_lock_server_holds_a_live_task_only_up_to_the_bound(pool: PgPoo
         "paid",
         "the late-money fork completes it while the unit is free"
     );
+}
+
+// A registered task the service has never looked up successfully (every
+// lookup unavailable, status NULL) may already carry a Paykit invoice: the
+// bundle id it registered exists only after proof submission. It keeps its
+// unit past the window like a live task, up to the same bound.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_never_observed_locks_task_is_held_up_to_the_bound(pool: PgPool) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let holder = Uuid::new_v4();
+    let bound = app.state.config.locks_live_task_hold_seconds;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
+    fake.set_outcome(TEST_BUNDLE_ID, LocksLookupOutcome::Unavailable);
+    register_locks(&app, &buyer.token, &order, &seller.pubky).await;
+    run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    let (status,): (Option<String>,) =
+        sqlx::query_as("SELECT last_observed_status FROM payment_locks_correlations")
+            .fetch_one(&app.pool)
+            .await
+            .expect("correlation row exists");
+    assert_eq!(status, None, "no lookup has succeeded");
+
+    app.clock.advance_seconds(3_601);
+    let summary = run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    assert_eq!(summary.payment_windows_expired, 0);
+    assert_eq!(listing_quantities(&app.pool).await, (0, 1, 0));
+
+    app.clock.advance_seconds(bound - 1);
+    let summary = run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    assert_eq!(summary.payment_windows_expired, 1);
+    assert_eq!(order_state(&app.pool, &order.order_id).await, "cancelled");
+    assert_eq!(listing_quantities(&app.pool).await, (1, 0, 0));
 }
 
 // A verified completion whose order can no longer be confirmed (the buyer
@@ -2414,6 +2503,111 @@ async fn prepare_refuses_a_lock_document_with_changed_bytes(pool: PgPool) {
         0,
         "a path mismatch never creates a correlation"
     );
+}
+
+// Locks v0.1 locks carry `payment_in` (whole hours) in the paykit params, and
+// paykit-server v0.1.1 requires it on every Locks invoice. Such a lock,
+// served at its own content-addressed path, prepares and registers; a
+// non-positive `payment_in` is refused at prepare like any other invalid
+// paykit param.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn prepare_accepts_a_lock_carrying_payment_in(pool: PgPool) {
+    for (payment_in, accepted) in [(json!(0), false), (json!(24), true)] {
+        let seller_key = common::random_keypair();
+        let seller_pubky = seller_key.1.clone();
+        let mut document = lock_document_for(&seller_pubky, 13_700, "USD");
+        document["criteria"][0]["params"]["payment_in"] = payment_in.clone();
+        let typed: marketplace_service::content_lock::ContentLock =
+            serde_json::from_value(document.clone()).expect("document decodes");
+        let lock_id = typed.lock_id().expect("typed lock id");
+        let resource = format!("{seller_pubky}/pub/locks.app/{lock_id}.json");
+        let path = format!("/pub/locks.app/{lock_id}.json");
+        let app = test_app_with_lock_documents(
+            pool.clone(),
+            HashMap::from([((seller_pubky.clone(), path), document)]),
+        )
+        .await;
+        let seller = TestActor {
+            token: common::authenticate(&app, &seller_key.0).await,
+            keypair: seller_key.0,
+            pubky: seller_pubky,
+        };
+        let buyer = new_actor(&app).await;
+        let mut listing = register_command(&seller.pubky, 1);
+        listing["payload"]["digital_lock"] = json!({
+            "policyUri": resource,
+            "criterionId": "paykit",
+        });
+        as_digital_locks_listing(&mut listing);
+        let (status, body) = execute(&app, &seller.token, &listing).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "payment_in {payment_in} listing: {body}"
+        );
+        let (status, body) = execute(
+            &app,
+            &buyer.token,
+            &as_digital_checkout(checkout_command_with_id(
+                &seller.pubky,
+                "00000000-0000-4000-8000-000000003100",
+            )),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "payment_in {payment_in} checkout: {body}"
+        );
+        let payment_id = body["result"]["payments"][0]["id"]
+            .as_str()
+            .expect("payment id")
+            .to_string();
+        let (status, body) = execute(
+            &app,
+            &buyer.token,
+            &common::prepare_locks_command(&payment_id, 74),
+        )
+        .await;
+        if !accepted {
+            assert_eq!(
+                status,
+                StatusCode::CONFLICT,
+                "payment_in {payment_in}: {body}"
+            );
+            assert_eq!(
+                body["error"]["message"],
+                json!("The seller's Locks document does not match the payment.")
+            );
+            assert_eq!(
+                count(&app.pool, "SELECT COUNT(*) FROM payment_locks_correlations").await,
+                0
+            );
+            continue;
+        }
+        assert_eq!(status, StatusCode::OK, "payment_in {payment_in}: {body}");
+        assert_eq!(
+            body["result"]["lock_resource_hash"],
+            json!(blake3::hash(resource.as_bytes()).to_hex().to_string())
+        );
+        let (status, body) = execute(
+            &app,
+            &buyer.token,
+            &register_locks_command(&payment_id, 2, TEST_BUNDLE_ID, &resource, 75),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "payment_in {payment_in} registration: {body}"
+        );
+        let (preparation_state,): (String,) =
+            sqlx::query_as("SELECT preparation_state FROM payment_locks_correlations")
+                .fetch_one(&app.pool)
+                .await
+                .expect("correlation row exists");
+        assert_eq!(preparation_state, "registered");
+    }
 }
 
 // Paykit v1 policy refusals through the handler: a document carrying an
@@ -4857,7 +5051,8 @@ async fn a_completion_without_a_binding_is_parked_and_its_unit_returns_with_the_
 /// second pass re-claims the due row, and the window sweep runs before
 /// (`sweep_first`) or after the second pass. The parked response is released
 /// last. Either way the payment is parked exactly once, the order is
-/// cancelled, the unit returns and nothing confirms.
+/// cancelled, the unit returns and nothing confirms. An earlier lookup found
+/// no task, so the window sweep does not wait on it as a live one.
 async fn race_an_unbound_completion_against_the_window(pool: PgPool, sweep_first: bool) {
     let (app, fake) = test_app_with_locks(pool).await;
     let seller = new_actor(&app).await;
@@ -4865,22 +5060,27 @@ async fn race_an_unbound_completion_against_the_window(pool: PgPool, sweep_first
     let order =
         registered_digital_locks_order(&app, &seller, &buyer, "boots_01", TEST_BUNDLE_ID, 0xF11)
             .await;
+    let locks = app.state.locks.clone().expect("locks runtime");
+    fake.set_outcome(TEST_BUNDLE_ID, LocksLookupOutcome::NotFound);
+    workers::verify_due_locks_lifecycles(&app.state, &locks, app.clock.now())
+        .await
+        .expect("first lookup");
     fake.set_outcome(TEST_BUNDLE_ID, LocksLookupOutcome::Completed(None));
+    app.clock.advance_seconds(61);
 
     let release = fake.park_next_lookup();
     let in_flight = tokio::spawn({
         let state = app.state.clone();
-        let locks = state.locks.clone().expect("locks runtime");
+        let locks = locks.clone();
         let now = app.clock.now();
         async move { workers::verify_due_locks_lifecycles(&state, &locks, now).await }
     });
-    while fake.lookup_count() < 1 {
+    while fake.lookup_count() < 2 {
         tokio::task::yield_now().await;
     }
 
-    app.clock.advance_seconds(3_601);
+    app.clock.advance_seconds(3_601 - 61);
     let now = app.clock.now();
-    let locks = app.state.locks.clone().expect("locks runtime");
     let (second, expired) = if sweep_first {
         let expired = workers::expire_due_payment_windows(&app.state, now)
             .await
@@ -4908,7 +5108,7 @@ async fn race_an_unbound_completion_against_the_window(pool: PgPool, sweep_first
     let first = in_flight.await.expect("pass joins").expect("first pass");
     assert_eq!(first, 0, "the released duplicate has no effect");
 
-    assert_eq!(fake.lookup_count(), 2);
+    assert_eq!(fake.lookup_count(), 3);
     let (state, _, revision) = payment_state(&app.pool, &order.payment_id).await;
     assert_eq!(state, "manual_review");
     assert_eq!(
