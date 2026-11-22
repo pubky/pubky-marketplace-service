@@ -708,3 +708,178 @@ fn sync_and_the_follower_tombstone_deletes_but_not_unreachable_sellers() {
         assert!(!deleted_at_is_set(&app.pool, &stranded.pubky, "boots_02").await);
     });
 }
+
+/// The follower's saved position for `seller`: its cursor and the
+/// homeserver it counts on.
+async fn follower_position(pool: &PgPool, seller: &str) -> (Option<String>, Option<String>) {
+    sqlx::query_as(
+        "SELECT event_cursor, homeserver FROM listing_deletion_cursors WHERE seller_pubky = $1",
+    )
+    .bind(seller)
+    .fetch_one(pool)
+    .await
+    .expect("deletion cursor")
+}
+
+fn cursor_number(cursor: &str) -> u64 {
+    cursor
+        .parse()
+        .expect("a homeserver event cursor is a number")
+}
+
+#[test]
+fn the_follower_restarts_a_seller_who_moved_and_tombstones_a_delete_below_the_old_cursor() {
+    on_testnet_with_service_database(|pool| async move {
+        let mut testnet = testnet().await;
+        let old = testnet
+            .create_random_homeserver()
+            .await
+            .expect("old homeserver")
+            .public_key();
+        let new = testnet
+            .create_random_homeserver()
+            .await
+            .expect("new homeserver")
+            .public_key();
+        let ttl = Duration::from_secs(20);
+        let client = Arc::new(pkarr_client(&testnet, ttl));
+        let app = test_app_with_homeserver_client(pool, client.clone()).await;
+        let seller = new_actor(&app).await;
+        let kept_id = "boots_02";
+        // The service's client caches the seller's record no earlier than this.
+        let first_resolution = Instant::now();
+
+        // Two listings registered from the old homeserver, whose stream then
+        // runs well past anything the new homeserver will hold.
+        let old_session = account(&testnet, &seller.keypair, &old).await;
+        for (number, listing_id) in [LISTING_ID, kept_id].into_iter().enumerate() {
+            let record = listing_record(&seller.pubky, listing_id, "Winter boots");
+            put(
+                &old_session,
+                &listing_path(listing_id),
+                &serde_json::to_vec(&record).expect("record"),
+            )
+            .await;
+            let (status, body) = execute(
+                &app,
+                &seller.token,
+                &sync_command(&seller.pubky, listing_id, number as u64 + 1),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "sync registers {listing_id}: {body}"
+            );
+        }
+        let kept = serde_json::to_vec(&listing_record(&seller.pubky, kept_id, "Winter boots"))
+            .expect("record");
+        for _ in 0..20 {
+            put(&old_session, &listing_path(kept_id), &kept).await;
+        }
+
+        let holder = Uuid::new_v4();
+        let summary = marketplace_service::workers::run_once(&app.state, holder, app.clock.now())
+            .await
+            .expect("worker pass on the old homeserver");
+        assert_eq!(summary.listings_tombstoned, 0);
+        let (old_cursor, old_homeserver) = follower_position(&app.pool, &seller.pubky).await;
+        let old_cursor = old_cursor.expect("the follower read the old homeserver");
+        assert_eq!(old_homeserver, Some(old.z32()));
+
+        // The seller moves, re-publishes both listings on the new homeserver
+        // and deletes one there. `boots_02` is deleted and re-created, so its
+        // DEL is not the latest event for it.
+        let moved_at = Instant::now();
+        let new_session = account(&testnet, &seller.keypair, &new).await;
+        put(
+            &new_session,
+            &listing_path(LISTING_ID),
+            &serde_json::to_vec(&listing_record(&seller.pubky, LISTING_ID, "Winter boots"))
+                .expect("record"),
+        )
+        .await;
+        put(&new_session, &listing_path(kept_id), &kept).await;
+        new_session
+            .storage()
+            .delete(listing_path(LISTING_ID))
+            .await
+            .expect("delete the listing record on the new homeserver");
+        new_session
+            .storage()
+            .delete(listing_path(kept_id))
+            .await
+            .expect("delete the kept record");
+        put(&new_session, &listing_path(kept_id), &kept).await;
+
+        // Read through a client with no cached record: the new homeserver's
+        // DEL is numbered below the position saved on the old one.
+        let HomeserverEventsOutcome::Events {
+            homeserver: answered,
+            events,
+        } = pkarr_client(&testnet, ttl)
+            .listing_events(&seller.pubky, LISTINGS_PATH, None, false, 100)
+            .await
+        else {
+            panic!("the new homeserver's event stream answers");
+        };
+        assert_eq!(answered, Some(new.z32()));
+        let deleted_uri = format!("pubky://{}{}", seller.pubky, listing_path(LISTING_ID));
+        let delete = events
+            .iter()
+            .find(|event| event.kind == HomeserverEventKind::Del && event.uri == deleted_uri)
+            .expect("the DEL on the new homeserver");
+        assert!(
+            cursor_number(&delete.cursor) < cursor_number(&old_cursor),
+            "the DEL at {} must sit below the old position {old_cursor}",
+            delete.cursor
+        );
+        let last_new_cursor = events.last().expect("events").cursor.clone();
+
+        // A pass while the cached record still names the old homeserver
+        // reads nothing new there and keeps the old position.
+        app.clock.advance_seconds(61);
+        let summary = marketplace_service::workers::run_once(&app.state, holder, app.clock.now())
+            .await
+            .expect("worker pass with the cached record");
+        assert!(
+            first_resolution.elapsed() < ttl,
+            "the pass ran inside the cache TTL"
+        );
+        assert_eq!(summary.listings_tombstoned, 0);
+        assert_eq!(
+            follower_position(&app.pool, &seller.pubky).await,
+            (Some(old_cursor.clone()), Some(old.z32()))
+        );
+
+        // Once the record expires, the follower reads the new homeserver,
+        // restarts there and tombstones the delete it would have skipped.
+        tokio::time::sleep_until((moved_at + ttl + Duration::from_secs(2)).into()).await;
+        app.clock.advance_seconds(61);
+        let summary = marketplace_service::workers::run_once(&app.state, holder, app.clock.now())
+            .await
+            .expect("worker pass on the new homeserver");
+        assert_eq!(summary.listings_tombstoned, 1);
+        let tombstone: (bool, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT deleted_at IS NOT NULL, deleted_event_cursor, deleted_event_homeserver \
+             FROM listings WHERE aggregate_id = $1",
+        )
+        .bind(format!("listing:{}_{LISTING_ID}", seller.pubky))
+        .fetch_one(&app.pool)
+        .await
+        .expect("listing row");
+        assert_eq!(
+            tombstone,
+            (true, Some(delete.cursor.clone()), Some(new.z32()))
+        );
+        assert!(
+            !deleted_at_is_set(&app.pool, &seller.pubky, kept_id).await,
+            "a listing re-created on the new homeserver stays live"
+        );
+        assert_eq!(
+            follower_position(&app.pool, &seller.pubky).await,
+            (Some(last_new_cursor), Some(new.z32())),
+            "the position now counts on the new homeserver"
+        );
+    });
+}
