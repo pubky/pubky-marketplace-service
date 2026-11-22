@@ -322,6 +322,7 @@ pub enum PaykitPaymentParamsRejection {
     InvalidRecipientPubky,
     InvalidAmount,
     InvalidAsset,
+    InvalidPaymentIn,
 }
 
 /// Mirrors
@@ -337,15 +338,25 @@ pub enum PaykitPaymentPolicyRejection {
 
 /// Mirrors
 /// `pubky/locks@ba49a777:locks-core/src/lock_policy.rs:380-425`
-/// (`validate_paykit_payment_params`): exactly the three known fields,
-/// recipient a valid Pubky key, amount a positive decimal integer string,
-/// asset a non-empty string.
+/// (`validate_paykit_payment_params`): only the known fields, recipient a
+/// valid Pubky key, amount a positive decimal integer string, asset a
+/// non-empty string.
+///
+/// `payment_in` (whole hours, a positive JSON integer) is required by Locks
+/// v0.1.0 and later (`pubky/locks@v0.1.1-rc5:locks-core/src/lock_policy.rs`)
+/// and absent from locks written by earlier Lock Servers, so it is validated
+/// when present and not required. It sets no deadline: paykit-server only
+/// checks it equals the lock's value and dates the invoice from its own
+/// `payment_window`, so the marketplace hold does not derive from it.
 fn validate_paykit_payment_params(params: &Value) -> Result<(), PaykitPaymentParamsRejection> {
     let object = params
         .as_object()
         .ok_or(PaykitPaymentParamsRejection::NotObject)?;
     for key in object.keys() {
-        if !matches!(key.as_str(), "recipient_pubky" | "amount" | "asset") {
+        if !matches!(
+            key.as_str(),
+            "recipient_pubky" | "amount" | "asset" | "payment_in"
+        ) {
             return Err(PaykitPaymentParamsRejection::UnknownField(key.clone()));
         }
     }
@@ -376,6 +387,12 @@ fn validate_paykit_payment_params(params: &Value) -> Result<(), PaykitPaymentPar
         .ok_or(PaykitPaymentParamsRejection::InvalidAsset)?;
     if asset.is_empty() {
         return Err(PaykitPaymentParamsRejection::InvalidAsset);
+    }
+    if object
+        .get("payment_in")
+        .is_some_and(|payment_in| payment_in.as_u64().is_none_or(|hours| hours == 0))
+    {
+        return Err(PaykitPaymentParamsRejection::InvalidPaymentIn);
     }
     Ok(())
 }
@@ -460,6 +477,7 @@ pub fn validate_content_lock_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     const CREATOR: &str = "7jfgaa9nutjyixzikb7tgmsf9gkwq7iqz498zr1nd5ig1fng4esy";
     /// The typed-derived lock id of the pinned positive upstream vector
@@ -657,5 +675,35 @@ mod tests {
             ),
             Err(ContentLockIdentityRejection::CreatorMismatch),
         );
+    }
+
+    // Locks v0.1.0+ writes `payment_in` on every paykit-payment lock
+    // (`pubky/locks@v0.1.1-rc5:locks-core/src/lock_policy.rs`): a positive
+    // whole-hour JSON u64. Earlier locks omit it.
+    #[test]
+    fn a_locks_v0_1_payment_window_is_accepted_and_validated() {
+        let document = fixture("typed-reserialisation.json");
+        let mut lock = validate_content_lock_value(&document, &resource(POSITIVE_LOCK_ID))
+            .expect("the positive vector is identity-valid");
+        assert_eq!(lock.validate_paykit_payment_v1_policy(), Ok(()));
+        lock.criteria[0].params["payment_in"] = json!(24);
+        assert_eq!(lock.validate_paykit_payment_v1_policy(), Ok(()));
+        for invalid in [
+            json!(0),
+            json!("24"),
+            json!(-1),
+            json!(1.5),
+            json!(null),
+            Value::from(f64::from(u32::MAX) * f64::from(u32::MAX) * 2.0),
+        ] {
+            lock.criteria[0].params["payment_in"] = invalid.clone();
+            assert_eq!(
+                lock.validate_paykit_payment_v1_policy(),
+                Err(PaykitPaymentPolicyRejection::InvalidParams(
+                    PaykitPaymentParamsRejection::InvalidPaymentIn
+                )),
+                "payment_in {invalid} is refused"
+            );
+        }
     }
 }
