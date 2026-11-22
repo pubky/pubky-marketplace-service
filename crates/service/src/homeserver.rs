@@ -44,6 +44,9 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// then, separately, the homeserver's transport and storage addressing. The
 /// HTTP exchange that follows keeps its own timeout.
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bound on a network-only Pkarr lookup, which asks every DHT node near the
+/// key for its most recent record instead of stopping at the first answer.
+const REFRESH_TIMEOUT: Duration = Duration::from_secs(10);
 /// A deliverable is up to `DIGITAL_DELIVERY_MAX_BYTES` of ciphertext, read
 /// once at `digital_delivery.set`; the record timeout would cut it short.
 const DELIVERABLE_FETCH_TIMEOUT: Duration = Duration::from_secs(120);
@@ -99,7 +102,14 @@ pub struct HomeserverEvent {
 /// unhosted seller is told apart from a deleted record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HomeserverEventsOutcome {
-    Events(Vec<HomeserverEvent>),
+    /// `homeserver` is the pubky of the homeserver that answered under
+    /// `HOMESERVER_RESOLUTION=pkarr`, `None` for the one configured homeserver
+    /// under `fixed`. Event cursors count in that homeserver's own sequence
+    /// and compare only with cursors from the same homeserver.
+    Events {
+        homeserver: Option<String>,
+        events: Vec<HomeserverEvent>,
+    },
     UnknownUser,
     /// The homeserver answered with a status other than success or 404 (a
     /// `429` rate limit, a `5xx`). `retry_after` is its `Retry-After`, when
@@ -650,6 +660,29 @@ pub trait HomeserverListingClient: Send + Sync + 'static {
         let _ = (seller_pubky, path, after_cursor, reverse, limit);
         Box::pin(async { HomeserverEventsOutcome::Unavailable })
     }
+
+    /// Looks `pubky`'s homeserver up again on the network, past any cached
+    /// record, so the reads that follow go to the homeserver its record names
+    /// now. A deletion proof runs this first: a cached record may still name
+    /// a homeserver the pubky has moved away from.
+    fn refresh_homeserver<'a>(
+        &'a self,
+        pubky: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HomeserverRefresh> + Send + 'a>> {
+        let _ = pubky;
+        Box::pin(async { HomeserverRefresh::Fixed })
+    }
+}
+
+/// What [`HomeserverListingClient::refresh_homeserver`] came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HomeserverRefresh {
+    /// One configured homeserver holds every pubky: nothing to look up.
+    Fixed,
+    /// The pubky's record was read from the network just now.
+    Refreshed,
+    /// No record was found, or the lookup failed or timed out.
+    Unavailable,
 }
 
 /// How the service finds the homeserver that holds a pubky's records
@@ -748,42 +781,54 @@ struct Unreached;
 /// `http` 1, so status codes and headers are the same types.
 enum Response {
     Fixed(reqwest::Response),
-    Pkarr(pubky_reqwest::Response),
+    /// `homeserver` is the pubky of the homeserver that answered.
+    Pkarr {
+        response: pubky_reqwest::Response,
+        homeserver: String,
+    },
 }
 
 impl Response {
     fn status(&self) -> reqwest::StatusCode {
         match self {
             Self::Fixed(response) => response.status(),
-            Self::Pkarr(response) => response.status(),
+            Self::Pkarr { response, .. } => response.status(),
         }
     }
 
     fn headers(&self) -> &reqwest::header::HeaderMap {
         match self {
             Self::Fixed(response) => response.headers(),
-            Self::Pkarr(response) => response.headers(),
+            Self::Pkarr { response, .. } => response.headers(),
         }
     }
 
     fn content_length(&self) -> Option<u64> {
         match self {
             Self::Fixed(response) => response.content_length(),
-            Self::Pkarr(response) => response.content_length(),
+            Self::Pkarr { response, .. } => response.content_length(),
         }
     }
 
     async fn chunk(&mut self) -> Result<Option<impl AsRef<[u8]>>, Unreached> {
         match self {
             Self::Fixed(response) => response.chunk().await.map_err(|_| Unreached),
-            Self::Pkarr(response) => response.chunk().await.map_err(|_| Unreached),
+            Self::Pkarr { response, .. } => response.chunk().await.map_err(|_| Unreached),
+        }
+    }
+
+    /// The homeserver that answered: `None` for the configured one.
+    fn homeserver(&self) -> Option<String> {
+        match self {
+            Self::Fixed(_) => None,
+            Self::Pkarr { homeserver, .. } => Some(homeserver.clone()),
         }
     }
 
     async fn bytes(self) -> Result<impl AsRef<[u8]>, Unreached> {
         match self {
             Self::Fixed(response) => response.bytes().await.map_err(|_| Unreached),
-            Self::Pkarr(response) => response.bytes().await.map_err(|_| Unreached),
+            Self::Pkarr { response, .. } => response.bytes().await.map_err(|_| Unreached),
         }
     }
 }
@@ -904,7 +949,10 @@ impl HttpHomeserverClient {
                     .timeout(timeout)
                     .send()
                     .await
-                    .map(Response::Pkarr)
+                    .map(|response| Response::Pkarr {
+                        response,
+                        homeserver: homeserver.z32(),
+                    })
                     .map_err(|_| Unreached)
             }
         }
@@ -1162,6 +1210,33 @@ async fn resolve_homeserver(
     Err(Unreached)
 }
 
+/// Reads `pubky`'s Pkarr record from the network, past the cache, which the
+/// answer then refreshes, so [`resolve_homeserver`] names the homeserver the
+/// record names now.
+async fn refresh_record(sdk: &pubky::Pubky, pubky: &str) -> HomeserverRefresh {
+    let prefix = pubky_host_prefix(pubky);
+    let Ok(user) = pubky::PublicKey::try_from_z32(pubky) else {
+        tracing::warn!(pubky_host_prefix = %prefix, "homeserver refresh refused a malformed pubky");
+        return HomeserverRefresh::Unavailable;
+    };
+    let lookup = sdk
+        .client()
+        .pkarr()
+        .resolve(&user, pubky::pkarr::ResolvePolicy::NetworkOnly);
+    let failure = match tokio::time::timeout(REFRESH_TIMEOUT, lookup).await {
+        Ok(Ok(_)) => return HomeserverRefresh::Refreshed,
+        Ok(Err(pubky::pkarr::errors::ResolveError::NotFound)) => "no record",
+        Ok(Err(_)) => "lookup failed",
+        Err(_) => "lookup timed out",
+    };
+    tracing::warn!(
+        pubky_host_prefix = %prefix,
+        failure,
+        "homeserver refresh failed"
+    );
+    HomeserverRefresh::Unavailable
+}
+
 impl HomeserverListingClient for HttpHomeserverClient {
     fn fetch_grant_session_proof<'a>(
         &'a self,
@@ -1368,6 +1443,7 @@ impl HomeserverListingClient for HttpHomeserverClient {
                 );
                 return HomeserverEventsOutcome::Rejected { retry_after };
             }
+            let homeserver = response.homeserver();
             let mut body = Vec::new();
             loop {
                 match response.chunk().await {
@@ -1384,7 +1460,7 @@ impl HomeserverListingClient for HttpHomeserverClient {
             }
             let parsed = std::str::from_utf8(&body).ok().and_then(parse_event_stream);
             match parsed {
-                Some(events) => HomeserverEventsOutcome::Events(events),
+                Some(events) => HomeserverEventsOutcome::Events { homeserver, events },
                 None => {
                     tracing::warn!(
                         pubky_host_prefix = %prefix,
@@ -1392,6 +1468,18 @@ impl HomeserverListingClient for HttpHomeserverClient {
                     );
                     HomeserverEventsOutcome::Unavailable
                 }
+            }
+        })
+    }
+
+    fn refresh_homeserver<'a>(
+        &'a self,
+        pubky: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HomeserverRefresh> + Send + 'a>> {
+        Box::pin(async move {
+            match &self.transport {
+                Transport::Fixed { .. } => HomeserverRefresh::Fixed,
+                Transport::Pkarr(sdk) => refresh_record(sdk, pubky).await,
             }
         })
     }

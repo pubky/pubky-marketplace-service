@@ -406,6 +406,7 @@ async fn a_deleted_auction_takes_no_bids_and_closes_unsold(pool: PgPool) {
         marketplace_service::listing_deletion::DeletionAuthority::Command,
         &aggregate_id,
         "7",
+        None,
         epoch,
         "system",
         Uuid::new_v4(),
@@ -953,6 +954,7 @@ async fn late_settlement(
                 marketplace_service::listing_deletion::DeletionAuthority::Command,
                 &aggregate_id,
                 "9",
+                None,
                 epoch,
                 "system",
                 Uuid::new_v4(),
@@ -1021,6 +1023,7 @@ async fn a_held_manual_review_on_a_deleted_listing_still_resolves_paid(pool: PgP
         marketplace_service::listing_deletion::DeletionAuthority::Command,
         &listing_aggregate(&seller.pubky),
         "9",
+        None,
         epoch,
         "system",
         Uuid::new_v4(),
@@ -1080,6 +1083,7 @@ async fn a_deleted_auctions_bid_history_is_kept_for_its_parties_only(pool: PgPoo
         marketplace_service::listing_deletion::DeletionAuthority::Command,
         &aggregate_id,
         "9",
+        None,
         epoch,
         "system",
         Uuid::new_v4(),
@@ -1170,6 +1174,7 @@ async fn a_tombstone_takes_drop_and_listing_locks_in_the_sell_out_confirm_order(
             marketplace_service::listing_deletion::DeletionAuthority::Command,
             &tombstone_id,
             "9",
+            None,
             epoch,
             "system",
             Uuid::new_v4(),
@@ -1300,6 +1305,7 @@ async fn tombstone_now(pool: &PgPool, aggregate_id: &str, now: chrono::DateTime<
         marketplace_service::listing_deletion::DeletionAuthority::Command,
         aggregate_id,
         "9",
+        None,
         epoch,
         "system",
         Uuid::new_v4(),
@@ -2343,6 +2349,7 @@ async fn a_delete_confirmed_before_a_revival_cannot_hide_the_revived_listing(poo
                 DeletionAuthority::Command,
                 &aggregate_id,
                 cursor,
+                None,
                 observed_epoch,
                 "system",
                 Uuid::new_v4(),
@@ -3025,7 +3032,8 @@ async fn a_record_registered_after_the_delete_was_confirmed_is_never_retired(poo
     assert_eq!(
         confirm_deleted(client, &seller.pubky, LISTING_ID).await,
         DeletionCheck::Deleted {
-            cursor: "2".to_string()
+            cursor: "2".to_string(),
+            homeserver: None,
         }
     );
 
@@ -3047,6 +3055,7 @@ async fn a_record_registered_after_the_delete_was_confirmed_is_never_retired(poo
         DeletionAuthority::Command,
         &aggregate_id,
         "2",
+        None,
         observed.record_epoch,
         "system",
         Uuid::new_v4(),
@@ -3224,7 +3233,8 @@ async fn an_unchanged_record_synced_after_the_delete_was_confirmed_is_never_reti
     assert_eq!(
         confirm_deleted(client, &seller.pubky, LISTING_ID).await,
         DeletionCheck::Deleted {
-            cursor: "2".to_string()
+            cursor: "2".to_string(),
+            homeserver: None,
         }
     );
 
@@ -3240,6 +3250,7 @@ async fn an_unchanged_record_synced_after_the_delete_was_confirmed_is_never_reti
         DeletionAuthority::Command,
         &aggregate_id,
         "2",
+        None,
         observed.record_epoch,
         "system",
         Uuid::new_v4(),

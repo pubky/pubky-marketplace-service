@@ -33,8 +33,15 @@
 //! The follower runs under a fenced lease (`worker_leases.fence`, 0050).
 //! Each of its database units is one transaction whose statements the
 //! server cancels at the lease deadline, and each write first share-locks
-//! the lease row and proceeds only while it still names this pass. The
-//! cursor it writes never moves backwards.
+//! the lease row and proceeds only while it still names this pass.
+//!
+//! Event cursors are positions in one homeserver's stream. The follower
+//! keeps each seller's cursor with the homeserver it was read from
+//! (`listing_deletion_cursors.homeserver`, 0099; `NULL` is the configured
+//! homeserver). On that homeserver the cursor never moves backwards; a
+//! seller read from another homeserver (under `pkarr`, after a move) is
+//! followed from the start of the new homeserver's stream, so a delete
+//! there below the old cursor is not skipped.
 
 use std::time::Duration;
 
@@ -46,7 +53,7 @@ use crate::executor::insert_event;
 use crate::handlers::LISTING_COLUMNS;
 use crate::homeserver::{
     HomeserverEventKind, HomeserverEventsOutcome, HomeserverFetchOutcome, HomeserverListingClient,
-    LISTINGS_PATH,
+    HomeserverRefresh, LISTINGS_PATH,
 };
 use crate::model::ListingRow;
 
@@ -102,8 +109,12 @@ pub fn listing_record_uri(seller_pubky: &str, listing_id: &str) -> String {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeletionCheck {
-    /// The latest event for the record is this `DEL`.
-    Deleted { cursor: String },
+    /// The latest event for the record is this `DEL`, at `cursor` on
+    /// `homeserver` (`None`: the configured homeserver).
+    Deleted {
+        cursor: String,
+        homeserver: Option<String>,
+    },
     /// The record was re-created, never existed on this homeserver, or the
     /// seller is not hosted there.
     NotDeleted,
@@ -124,10 +135,11 @@ pub async fn latest_event_is_delete(
         .listing_events(seller_pubky, &path, None, true, CONFIRM_WINDOW)
         .await
     {
-        HomeserverEventsOutcome::Events(events) => {
+        HomeserverEventsOutcome::Events { homeserver, events } => {
             match events.into_iter().find(|event| event.uri == uri) {
                 Some(event) if event.kind == HomeserverEventKind::Del => DeletionCheck::Deleted {
                     cursor: event.cursor,
+                    homeserver,
                 },
                 _ => DeletionCheck::NotDeleted,
             }
@@ -141,8 +153,42 @@ pub async fn latest_event_is_delete(
 }
 
 /// Both steps of the deletion proof, for callers that have not fetched the
-/// record.
+/// record. Under `HOMESERVER_RESOLUTION=pkarr` the seller's homeserver is
+/// looked up again first, so the proof is read from the homeserver the
+/// seller's record names now, never one a cached record still names after
+/// the seller moved.
 pub async fn confirm_deleted(
+    homeserver: &dyn HomeserverListingClient,
+    seller_pubky: &str,
+    listing_id: &str,
+) -> DeletionCheck {
+    if homeserver.refresh_homeserver(seller_pubky).await == HomeserverRefresh::Unavailable {
+        return DeletionCheck::Unavailable { retry_after: None };
+    }
+    record_then_latest_event(homeserver, seller_pubky, listing_id).await
+}
+
+/// The deletion proof for a caller whose record fetch already answered 404.
+/// With one configured homeserver that fetch is step (1). Under `pkarr` it
+/// may have gone to a homeserver a cached record still named, so after the
+/// fresh lookup the record is read again.
+pub async fn confirm_missing_record_deleted(
+    homeserver: &dyn HomeserverListingClient,
+    seller_pubky: &str,
+    listing_id: &str,
+) -> DeletionCheck {
+    match homeserver.refresh_homeserver(seller_pubky).await {
+        HomeserverRefresh::Fixed => {
+            latest_event_is_delete(homeserver, seller_pubky, listing_id).await
+        }
+        HomeserverRefresh::Refreshed => {
+            record_then_latest_event(homeserver, seller_pubky, listing_id).await
+        }
+        HomeserverRefresh::Unavailable => DeletionCheck::Unavailable { retry_after: None },
+    }
+}
+
+async fn record_then_latest_event(
     homeserver: &dyn HomeserverListingClient,
     seller_pubky: &str,
     listing_id: &str,
@@ -217,27 +263,35 @@ pub async fn observe_live<'e>(
 /// for it since `$3` was observed, and no revival superseded a newer
 /// delete. The delete a revival superseded qualifies: confirmed after the
 /// revival (the revival advanced the epoch), it is still the record's
-/// latest event, so nothing backs the revival.
+/// latest event, so nothing backs the revival. Cursors compare only on one
+/// homeserver (`$4`): a delete on another homeserver than the superseded
+/// one was confirmed after the revival on the homeserver the seller's record
+/// names, which the epoch fence alone proves.
 const TOMBSTONE_FENCE: &str = "record_epoch = $3 \
-     AND (revived_from_cursor IS NULL OR $2::numeric >= revived_from_cursor::numeric)";
+     AND (revived_from_cursor IS NULL \
+          OR revived_from_homeserver IS DISTINCT FROM $4 \
+          OR $2::numeric >= revived_from_cursor::numeric)";
 
 /// Tombstones a live listing inside the caller's transaction and records
 /// `listing.deleted` at the bumped revision. Stock columns are left as they
 /// are: holds and paid orders still settle against them.
 ///
 /// `observed_epoch` is the listing's `record_epoch` from [`observe_live`],
-/// read before the caller confirmed the delete at `event_cursor`. Returns
-/// `None`, having written nothing, when the listing is missing or already
+/// read before the caller confirmed the delete at `event_cursor` on
+/// `event_homeserver` (`None`: the configured homeserver). Returns `None`,
+/// having written nothing, when the listing is missing or already
 /// tombstoned, when a register, sync or revival changed its record since
 /// that read, or when `event_cursor` is older than the delete a revival
-/// superseded. The fence is evaluated on the row the tombstone locks.
-// Eight positional facts of one write; both callers must supply all of them.
+/// superseded on the same homeserver. The fence is evaluated on the row the
+/// tombstone locks.
+// Nine positional facts of one write; both callers must supply all of them.
 #[allow(clippy::too_many_arguments)]
 pub async fn tombstone(
     tx: &mut Transaction<'_, Postgres>,
     authority: DeletionAuthority,
     aggregate_id: &str,
     event_cursor: &str,
+    event_homeserver: Option<&str>,
     observed_epoch: i64,
     actor: &str,
     command_id: Uuid,
@@ -255,6 +309,7 @@ pub async fn tombstone(
     .bind(aggregate_id)
     .bind(event_cursor)
     .bind(observed_epoch)
+    .bind(event_homeserver)
     .fetch_optional(&mut **tx)
     .await?;
     let Some((seller_pubky, listing_id)) = live else {
@@ -278,14 +333,16 @@ pub async fn tombstone(
     .execute(&mut *write)
     .await?;
     let deleted: Option<ListingRow> = sqlx::query_as(&format!(
-        "UPDATE listings SET deleted_at = $4, deleted_event_cursor = $2, \
-         server_revision = server_revision + 1, updated_at = $4 \
+        "UPDATE listings SET deleted_at = $5, deleted_event_cursor = $2, \
+         deleted_event_homeserver = $4, \
+         server_revision = server_revision + 1, updated_at = $5 \
          WHERE aggregate_id = $1 AND deleted_at IS NULL AND {TOMBSTONE_FENCE} \
          RETURNING {LISTING_COLUMNS}"
     ))
     .bind(aggregate_id)
     .bind(event_cursor)
     .bind(observed_epoch)
+    .bind(event_homeserver)
     .bind(now)
     .fetch_optional(&mut *write)
     .await?;
@@ -510,11 +567,11 @@ impl FollowerPass<'_> {
         let not_deleted = SettleOutcome::NotDeleted {
             observed: Some(observed.generation),
         };
-        let cursor = match self
+        let (cursor, event_homeserver) = match self
             .bounded(confirm_deleted(self.homeserver, seller_pubky, listing_id))
             .await
         {
-            Some(DeletionCheck::Deleted { cursor }) => cursor,
+            Some(DeletionCheck::Deleted { cursor, homeserver }) => (cursor, homeserver),
             Some(DeletionCheck::NotDeleted) => return Ok(Ok(not_deleted)),
             Some(DeletionCheck::Unavailable { retry_after }) => {
                 return Ok(Ok(SettleOutcome::HomeserverUnavailable { retry_after }))
@@ -534,6 +591,7 @@ impl FollowerPass<'_> {
                     self.authority(),
                     &aggregate_id,
                     &cursor,
+                    event_homeserver.as_deref(),
                     observed.record_epoch,
                     crate::workers::SYSTEM_ACTOR,
                     Uuid::new_v4(),
@@ -557,8 +615,11 @@ impl FollowerPass<'_> {
         Ok(written.unwrap_or(Err(Halt::OutOfTime)))
     }
 
-    /// Records a poll while the pass holds its lease. The cursor only
-    /// moves forward: one older than the stored cursor keeps the stored one.
+    /// Records a poll while the pass holds its lease. A read that reached
+    /// the seller's events gives its `position`: on the stored homeserver
+    /// the cursor only moves forward (one older than the stored cursor keeps
+    /// the stored one); on another homeserver the position replaces the
+    /// stored one, cursor and all. A poll with no position keeps both.
     ///
     /// A [`Poll::Succeeded`] poll stamps `polled_at` and clears the seller's
     /// backoff. A [`Poll::Failed`] one leaves `polled_at` as the last
@@ -568,9 +629,12 @@ impl FollowerPass<'_> {
     async fn record_poll(
         &self,
         seller_pubky: &str,
-        cursor: Option<&str>,
+        position: Option<Position<'_>>,
         poll: Poll,
     ) -> Result<Result<(), Halt>, sqlx::Error> {
+        let (homeserver, cursor) = position
+            .map(|position| (position.homeserver, position.cursor))
+            .unwrap_or_default();
         let attempted_at = self.clock.now();
         let (polled_at, failures, retry_not_before) = match poll {
             Poll::Succeeded { polled_at } => (Some(polled_at), 0, None),
@@ -595,10 +659,16 @@ impl FollowerPass<'_> {
                 sqlx::query(
                     "INSERT INTO listing_deletion_cursors \
                          (seller_pubky, event_cursor, polled_at, attempted_at, failures, \
-                          retry_not_before) \
-                     VALUES ($1, $2, $3, $4, $5, $6) \
+                          retry_not_before, homeserver) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7) \
                      ON CONFLICT (seller_pubky) DO UPDATE SET \
+                         homeserver = CASE WHEN $8 THEN EXCLUDED.homeserver \
+                             ELSE listing_deletion_cursors.homeserver END, \
                          event_cursor = CASE \
+                             WHEN NOT $8 THEN listing_deletion_cursors.event_cursor \
+                             WHEN EXCLUDED.homeserver \
+                                 IS DISTINCT FROM listing_deletion_cursors.homeserver \
+                             THEN EXCLUDED.event_cursor \
                              WHEN listing_deletion_cursors.event_cursor IS NULL \
                                  OR EXCLUDED.event_cursor::numeric \
                                      > listing_deletion_cursors.event_cursor::numeric \
@@ -616,6 +686,8 @@ impl FollowerPass<'_> {
                 .bind(attempted_at)
                 .bind(failures)
                 .bind(retry_not_before)
+                .bind(homeserver)
+                .bind(position.is_some())
                 .execute(&mut *tx)
                 .await?;
                 tx.commit().await?;
@@ -664,6 +736,23 @@ impl FollowerPass<'_> {
         Ok(written.unwrap_or(Err(Halt::OutOfTime)))
     }
 
+    /// One forward batch of the seller's listing events after `after`,
+    /// within what is left of the pass.
+    async fn read_events(
+        &self,
+        seller_pubky: &str,
+        after: Option<&str>,
+    ) -> Option<HomeserverEventsOutcome> {
+        self.bounded(self.homeserver.listing_events(
+            seller_pubky,
+            LISTINGS_PATH,
+            after,
+            false,
+            FOLLOW_PAGE,
+        ))
+        .await
+    }
+
     /// Ends this pass's lease, unless a later acquisition already owns it.
     pub async fn release_lease(&self) -> Result<(), sqlx::Error> {
         self.within_lease(async {
@@ -684,6 +773,14 @@ impl FollowerPass<'_> {
         .await?;
         Ok(())
     }
+}
+
+/// Where a read of a seller's events left them: the homeserver that
+/// answered (`None`: the configured one) and the last event settled on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Position<'a> {
+    homeserver: Option<&'a str>,
+    cursor: Option<&'a str>,
 }
 
 /// What one seller's poll came to.
@@ -743,8 +840,8 @@ pub async fn follow_homeserver_deletions(pass: &FollowerPass<'_>) -> anyhow::Res
             let Some(mut tx) = pass.begin().await? else {
                 return Ok(None);
             };
-            let due: Vec<(String, Option<String>, i32)> = sqlx::query_as(
-                "SELECT s.seller_pubky, c.event_cursor, COALESCE(c.failures, 0) \
+            let due: Vec<(String, Option<String>, Option<String>, i32)> = sqlx::query_as(
+                "SELECT s.seller_pubky, c.event_cursor, c.homeserver, COALESCE(c.failures, 0) \
                  FROM (SELECT DISTINCT seller_pubky FROM listings WHERE deleted_at IS NULL) s \
                  LEFT JOIN listing_deletion_cursors c ON c.seller_pubky = s.seller_pubky \
                  WHERE (c.polled_at IS NULL OR c.polled_at <= $1) \
@@ -767,21 +864,28 @@ pub async fn follow_homeserver_deletions(pass: &FollowerPass<'_>) -> anyhow::Res
 
     let mut settles = 0usize;
     let mut unhosted = 0usize;
-    for (seller_pubky, cursor, failures) in due {
+    for (seller_pubky, cursor, stored_homeserver, failures) in due {
         if pass.expired() || settles >= FOLLOW_SETTLES_PER_PASS {
             break;
         }
-        let events = match pass
-            .bounded(pass.homeserver.listing_events(
-                &seller_pubky,
-                LISTINGS_PATH,
-                cursor.as_deref(),
-                false,
-                FOLLOW_PAGE,
-            ))
-            .await
-        {
-            Some(HomeserverEventsOutcome::Events(events)) => events,
+        let mut read = pass.read_events(&seller_pubky, cursor.as_deref()).await;
+        // A cursor counts on the homeserver it was read from. A seller read
+        // from another homeserver (they moved, or the deployment switched
+        // `HOMESERVER_RESOLUTION`) starts again at the beginning of that
+        // homeserver's stream, so no delete there is skipped; each delete is
+        // still proven before anything is tombstoned.
+        if let Some(HomeserverEventsOutcome::Events { homeserver, .. }) = &read {
+            if cursor.is_some() && *homeserver != stored_homeserver {
+                tracing::info!(
+                    seller_pubky_prefix = %seller_pubky.get(..8).unwrap_or_default(),
+                    "listing deletion follower: the seller is read from another homeserver; \
+                     following it from the start"
+                );
+                read = pass.read_events(&seller_pubky, None).await;
+            }
+        }
+        let (answered, events) = match read {
+            Some(HomeserverEventsOutcome::Events { homeserver, events }) => (homeserver, events),
             Some(HomeserverEventsOutcome::UnknownUser) => {
                 unhosted += 1;
                 let polled = Poll::Succeeded {
@@ -860,8 +964,12 @@ pub async fn follow_homeserver_deletions(pass: &FollowerPass<'_>) -> anyhow::Res
                 },
             },
         };
+        let position = Position {
+            homeserver: answered.as_deref(),
+            cursor: settled_through,
+        };
         if let Err(halt) = pass
-            .record_poll(&seller_pubky, settled_through, poll)
+            .record_poll(&seller_pubky, Some(position), poll)
             .await?
         {
             return Ok(halted(tombstoned, halt));
