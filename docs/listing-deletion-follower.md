@@ -14,7 +14,23 @@ the `listing_deletions` lease.
   follower write share-locks its lease row and proceeds only while the row
   names the pass's holder and fence and has not expired; a takeover waits
   for a write in flight.
-- **Monotonic cursor.** The cursor for a seller never moves backwards.
+- **A cursor counts on one homeserver.** A homeserver numbers its events
+  in a sequence of its own, so each seller's cursor names the homeserver it
+  was read from (`listing_deletion_cursors.homeserver`, migration 0099;
+  `NULL` is the homeserver `HOMESERVER_URL` names). On that homeserver the
+  cursor never moves backwards. When the seller is read from another
+  homeserver (under `HOMESERVER_RESOLUTION=pkarr`, after the seller moved
+  and the cached record expired; or once after a deployment switches
+  modes), the same pass reads that homeserver's stream from the start and
+  the cursor restarts there, so a `DEL` on the new homeserver numbered
+  below the old cursor is not skipped. Replaying the new stream removes
+  nothing on its own: every `DEL` is still proven before a tombstone.
+- **A delete is proven where the seller lives now.** Under `pkarr` every
+  deletion proof (the follower's and `listing.sync`'s) first reads the
+  seller's Pkarr record from the network, past the cache, and reads the
+  record and the event stream from the homeserver it names. A cached
+  record that still names a homeserver the seller left never proves a
+  delete there; a record that cannot be read leaves the listing as it is.
 - **Revivals are confirmed.** Each pass first confirms up to five revived
   listings not yet confirmed at their current generation
   (`listing_revival_checks`, 0051), least recently tried first, within the
@@ -62,11 +78,14 @@ locked row still has that epoch. So a register or sync that lands between
 the confirmation and the tombstone, including a re-publish after a delete,
 is never retired by the delete confirmed before it.
 
-A revival records the `DEL` it superseded in `revived_from_cursor`. A later
-tombstone needs that `DEL` or a newer one, confirmed at the current epoch.
-The revival advanced the epoch, so the superseded `DEL` retires the row
-only when it was confirmed after the revival and was then still the
-record's latest event: nothing backs the revival.
+A revival records the `DEL` it superseded in `revived_from_cursor`, and
+its homeserver in `revived_from_homeserver` (0099). A later tombstone on
+that homeserver needs that `DEL` or a newer one, confirmed at the current
+epoch. The revival advanced the epoch, so the superseded `DEL` retires the
+row only when it was confirmed after the revival and was then still the
+record's latest event: nothing backs the revival. A `DEL` on another
+homeserver is not compared with the marker: it was confirmed after the
+revival, at the current epoch, on the homeserver the seller's record names.
 
 ## Database guards (migration 0050)
 
@@ -77,10 +96,10 @@ for every writer:
 |---|---|
 | Tombstone (`deleted_at` NULL to set) | the transaction declares no `marketplace.listing_deletion_authority`, or declares `follower:<holder>:<fence>` that is not the current lease row |
 | Tombstone | the transaction does not declare the row's current `record_epoch` in `marketplace.listing_deletion_observed_epoch` (0051); a binary before 0051 declares none |
-| Tombstone | its `DEL` cursor is older than the delete a revival of the listing superseded (`revived_from_cursor`) |
+| Tombstone | its `DEL` cursor is older than the delete a revival of the listing superseded (`revived_from_cursor`), on the same homeserver (`deleted_event_homeserver`, `revived_from_homeserver`; 0099) |
 | `record_epoch` | set by a statement to anything but one more: the trigger keeps it unless a revival or a record field changes |
-| Revival marker | it would move backwards |
-| Follower cursor insert or update | no current follower authority, or the cursor would move backwards |
+| Revival marker | it would move backwards on its homeserver, or its homeserver changes other than by a revival (0099) |
+| Follower cursor insert or update | no current follower authority, or the cursor would move backwards on the same homeserver (0099: a write that changes `homeserver` may set any cursor) |
 | Follower cursor delete | always |
 
 The service declares `command` for a `listing.sync` that confirmed the
@@ -125,3 +144,16 @@ an old replica declares no record epoch, so its tombstones are refused with
 fail and release the lease, and a `listing.sync` it serves for a deleted
 record fails with an internal error and changes nothing. The new replica
 tombstones those listings. Rollback is fix-forward.
+
+## Deploying 0099
+
+**Deploy mode: rolling.** 0099 adds three nullable columns
+(`listing_deletion_cursors.homeserver`, `listings.deleted_event_homeserver`,
+`listings.revived_from_homeserver`) and replaces both guard functions; every
+existing row keeps `NULL`, the configured homeserver, so a `fixed`
+deployment compares cursors exactly as before. An old replica in the overlap
+writes no homeserver: its cursor writes stay monotonic on the stored
+homeserver and its tombstones name the configured one, which is what
+`fixed` writes. `pkarr` cannot run beside an image from before 0099, which
+needs `HOMESERVER_URL`. Backing out is in
+[migrations.md](migrations.md#homeserver-scoped-deletion-cursors-0099).
