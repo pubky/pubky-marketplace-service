@@ -11,6 +11,10 @@
 //! The record is parsed leniently (camelCase, unknown and null fields
 //! tolerated): the record contract belongs to the client, and this service
 //! extracts only the handful of fields registration needs.
+//!
+//! Which homeserver holds a pubky's records is [`HomeserverResolution`]:
+//! one configured `HOMESERVER_URL` for every pubky (`fixed`), or the
+//! homeserver each pubky's own Pkarr record names (`pkarr`).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -27,11 +31,19 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 /// Environment variable naming the homeserver base URL used to fetch
-/// canonical seller-signed listing records. Required: the service refuses to
-/// start without it.
+/// canonical seller-signed listing records. Required with
+/// `HOMESERVER_RESOLUTION=fixed` (the default): the service refuses to start
+/// without it. Refused with `HOMESERVER_RESOLUTION=pkarr`, which reads no URL.
 pub const ENV_HOMESERVER_URL: &str = "HOMESERVER_URL";
+/// Environment variable selecting the [`HomeserverResolution`]: `fixed`
+/// (the default) or `pkarr`.
+pub const ENV_HOMESERVER_RESOLUTION: &str = "HOMESERVER_RESOLUTION";
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound on finding a pubky's homeserver in `pkarr` mode: the Pkarr lookup,
+/// then, separately, the homeserver's transport and storage addressing. The
+/// HTTP exchange that follows keeps its own timeout.
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 /// A deliverable is up to `DIGITAL_DELIVERY_MAX_BYTES` of ciphertext, read
 /// once at `digital_delivery.set`; the record timeout would cut it short.
 const DELIVERABLE_FETCH_TIMEOUT: Duration = Duration::from_secs(120);
@@ -640,12 +652,140 @@ pub trait HomeserverListingClient: Send + Sync + 'static {
     }
 }
 
-/// The production client: a real
+/// How the service finds the homeserver that holds a pubky's records
+/// ([`ENV_HOMESERVER_RESOLUTION`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HomeserverResolution {
+    /// Every pubky is read from `base_url` ([`ENV_HOMESERVER_URL`]) with a
+    /// `pubky-host` header naming it. A pubky hosted elsewhere reads as
+    /// missing there.
+    Fixed { base_url: String },
+    /// Each pubky is read from the homeserver its Pkarr record names, found
+    /// through the `pubky` SDK on the public Pkarr network (mainline DHT and
+    /// the SDK's default relays).
+    Pkarr,
+}
+
+impl HomeserverResolution {
+    /// Reads the resolution from a variable lookup. `fixed` (or no value)
+    /// needs `HOMESERVER_URL`; `pkarr` refuses one, so a deployment cannot
+    /// believe it reads a URL the service ignores.
+    pub fn from_lookup(get: &dyn Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
+        let base_url = get(ENV_HOMESERVER_URL);
+        match get(ENV_HOMESERVER_RESOLUTION).as_deref().map(str::trim) {
+            None | Some("fixed") => base_url
+                .map(|base_url| Self::Fixed { base_url })
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "{ENV_HOMESERVER_URL} must be set unless \
+                         {ENV_HOMESERVER_RESOLUTION} is `pkarr`"
+                    )
+                }),
+            Some("pkarr") => {
+                if base_url.is_some_and(|url| !url.trim().is_empty()) {
+                    anyhow::bail!(
+                        "{ENV_HOMESERVER_URL} is not read when {ENV_HOMESERVER_RESOLUTION} \
+                         is `pkarr`; unset it"
+                    );
+                }
+                Ok(Self::Pkarr)
+            }
+            Some(_) => anyhow::bail!("{ENV_HOMESERVER_RESOLUTION} must be `fixed` or `pkarr`"),
+        }
+    }
+}
+
+/// The Pkarr record cache of a `pkarr` client. It holds users' records and
+/// their homeservers' records alike.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PkarrResolutionCache {
+    /// Most records held; the least recently used is evicted first.
+    pub capacity: usize,
+    /// How long a resolved record is used before it is resolved again,
+    /// whatever TTL its publisher set. A pubky that moves to another
+    /// homeserver is read from the new one at most this long after it
+    /// republishes its record.
+    pub ttl: Duration,
+}
+
+impl Default for PkarrResolutionCache {
+    fn default() -> Self {
+        Self {
+            capacity: 10_000,
+            ttl: Duration::from_secs(300),
+        }
+    }
+}
+
+/// The production client. With a fixed base URL, a real
 /// `GET {base}/pub/pubky.app/marketplace/v1/listings/{listing_id}` with a
-/// `pubky-host: {seller_pubky}` header.
+/// `pubky-host: {seller_pubky}` header. With Pkarr resolution, the same
+/// record read from the seller's own homeserver.
 pub struct HttpHomeserverClient {
-    base_url: String,
-    http: reqwest::Client,
+    transport: Transport,
+}
+
+enum Transport {
+    Fixed {
+        base_url: String,
+        http: reqwest::Client,
+    },
+    Pkarr(pubky::Pubky),
+}
+
+/// What [`HttpHomeserverClient::get`] asks a pubky's homeserver for.
+enum Target<'a> {
+    /// A record under the pubky's storage, at an absolute `/pub/…` path.
+    Record(&'a str),
+    /// A batch of the homeserver's `/events-stream`.
+    Events(&'a [(&'a str, &'a str)]),
+}
+
+/// The pubky's homeserver was not found or not reached: no response to map.
+struct Unreached;
+
+/// A homeserver response from either transport. Both reqwest majors build on
+/// `http` 1, so status codes and headers are the same types.
+enum Response {
+    Fixed(reqwest::Response),
+    Pkarr(pubky_reqwest::Response),
+}
+
+impl Response {
+    fn status(&self) -> reqwest::StatusCode {
+        match self {
+            Self::Fixed(response) => response.status(),
+            Self::Pkarr(response) => response.status(),
+        }
+    }
+
+    fn headers(&self) -> &reqwest::header::HeaderMap {
+        match self {
+            Self::Fixed(response) => response.headers(),
+            Self::Pkarr(response) => response.headers(),
+        }
+    }
+
+    fn content_length(&self) -> Option<u64> {
+        match self {
+            Self::Fixed(response) => response.content_length(),
+            Self::Pkarr(response) => response.content_length(),
+        }
+    }
+
+    async fn chunk(&mut self) -> Result<Option<impl AsRef<[u8]>>, Unreached> {
+        match self {
+            Self::Fixed(response) => response.chunk().await.map_err(|_| Unreached),
+            Self::Pkarr(response) => response.chunk().await.map_err(|_| Unreached),
+        }
+    }
+
+    async fn bytes(self) -> Result<impl AsRef<[u8]>, Unreached> {
+        match self {
+            Self::Fixed(response) => response.bytes().await.map_err(|_| Unreached),
+            Self::Pkarr(response) => response.bytes().await.map_err(|_| Unreached),
+        }
+    }
 }
 
 /// Controls whether a fetched record's public path is safe to include in logs.
@@ -663,7 +803,118 @@ impl HttpHomeserverClient {
         }
         tracing::info!(base_url = %base_url, "homeserver client configured");
         let http = reqwest::Client::builder().timeout(FETCH_TIMEOUT).build()?;
-        Ok(Self { base_url, http })
+        Ok(Self {
+            transport: Transport::Fixed { base_url, http },
+        })
+    }
+
+    /// A client that reads each pubky from the homeserver its Pkarr record
+    /// names. `builder` carries the Pkarr network (the SDK default in
+    /// production, a local testnet in tests); the cache bounds are applied
+    /// to it here.
+    pub fn pkarr(
+        mut builder: pubky::PubkyHttpClientBuilder,
+        cache: PkarrResolutionCache,
+    ) -> anyhow::Result<Self> {
+        let ttl_seconds = u32::try_from(cache.ttl.as_secs()).unwrap_or(u32::MAX);
+        builder
+            .pkarr(|pkarr| {
+                pkarr
+                    .cache_size(cache.capacity)
+                    .minimum_ttl(ttl_seconds)
+                    .maximum_ttl(ttl_seconds)
+            })
+            .request_timeout(FETCH_TIMEOUT);
+        let client = builder
+            .build()
+            .map_err(|error| anyhow::anyhow!("homeserver Pkarr client: {error}"))?;
+        tracing::info!(
+            cache_capacity = cache.capacity,
+            cache_ttl_seconds = cache.ttl.as_secs(),
+            "homeserver client configured to resolve each pubky through Pkarr"
+        );
+        Ok(Self {
+            transport: Transport::Pkarr(pubky::Pubky::with_client(client)),
+        })
+    }
+
+    /// One `GET` of `target` on `pubky`'s homeserver, bounded by `timeout`
+    /// from the request's start to the end of its body. `Err` when the
+    /// homeserver was not found (logged here) or the request failed before a
+    /// status arrived (logged by the caller, as in `fixed` mode).
+    async fn get(
+        &self,
+        pubky: &str,
+        target: Target<'_>,
+        timeout: Duration,
+    ) -> Result<Response, Unreached> {
+        match &self.transport {
+            Transport::Fixed { base_url, http } => {
+                let request = match target {
+                    Target::Record(path) => http
+                        .get(format!("{base_url}{path}"))
+                        .header("pubky-host", pubky),
+                    Target::Events(query) => {
+                        http.get(format!("{base_url}/events-stream")).query(query)
+                    }
+                };
+                request
+                    .timeout(timeout)
+                    .send()
+                    .await
+                    .map(Response::Fixed)
+                    .map_err(|_| Unreached)
+            }
+            Transport::Pkarr(sdk) => {
+                let homeserver = resolve_homeserver(sdk, pubky).await?;
+                // The owner rides in the path; the SDK rewrites it to the
+                // legacy `pubky-host` form for homeservers that predate
+                // path-addressed storage.
+                let url = match target {
+                    Target::Record(path) => url::Url::parse(&format!(
+                        "https://{}/storage/{pubky}{path}",
+                        homeserver.z32()
+                    )),
+                    Target::Events(query) => {
+                        url::Url::parse(&format!("https://{}/events-stream", homeserver.z32())).map(
+                            |mut url| {
+                                url.query_pairs_mut().extend_pairs(query);
+                                url
+                            },
+                        )
+                    }
+                };
+                let Ok(url) = url else {
+                    tracing::warn!(
+                        pubky_host_prefix = %pubky_host_prefix(pubky),
+                        "homeserver request path is not a URL path"
+                    );
+                    return Err(Unreached);
+                };
+                let request = match tokio::time::timeout(
+                    RESOLVE_TIMEOUT,
+                    sdk.client().request_async(pubky::Method::GET, url),
+                )
+                .await
+                {
+                    Ok(Ok(request)) => request,
+                    Ok(Err(_)) | Err(_) => {
+                        tracing::warn!(
+                            pubky_host_prefix = %pubky_host_prefix(pubky),
+                            homeserver_prefix = %pubky_host_prefix(&homeserver.z32()),
+                            "homeserver transport could not be resolved"
+                        );
+                        return Err(Unreached);
+                    }
+                };
+                request
+                    .timeout(timeout)
+                    .send()
+                    .await
+                    .map(Response::Pkarr)
+                    .map_err(|_| Unreached)
+            }
+        }
     }
 
     async fn fetch_inner(
@@ -673,16 +924,12 @@ impl HttpHomeserverClient {
         record_kind: FetchRecordKind,
     ) -> HomeserverFetchOutcome {
         let prefix = pubky_host_prefix(seller_pubky);
-        let url = format!("{}{path}", self.base_url);
         let response = self
-            .http
-            .get(url)
-            .header("pubky-host", seller_pubky)
-            .send()
+            .get(seller_pubky, Target::Record(path), FETCH_TIMEOUT)
             .await;
         let response = match response {
             Ok(response) => response,
-            Err(_) => {
+            Err(Unreached) => {
                 match record_kind {
                     FetchRecordKind::Public => {
                         tracing::warn!("homeserver record fetch transport failure");
@@ -741,9 +988,14 @@ impl HttpHomeserverClient {
             }
             return HomeserverFetchOutcome::Unavailable;
         }
-        match response.json::<Value>().await {
-            Ok(record) => HomeserverFetchOutcome::Found(record),
-            Err(_) => {
+        let record = response
+            .bytes()
+            .await
+            .ok()
+            .and_then(|body| serde_json::from_slice::<Value>(body.as_ref()).ok());
+        match record {
+            Some(record) => HomeserverFetchOutcome::Found(record),
+            None => {
                 match record_kind {
                     FetchRecordKind::Public => {
                         tracing::warn!("homeserver record fetch returned a non-JSON body");
@@ -766,14 +1018,11 @@ impl HttpHomeserverClient {
         const MAX_RECORD_BYTES: usize = 1024 * 1024;
         let prefix = pubky_host_prefix(seller_pubky);
         let response = match self
-            .http
-            .get(format!("{}{path}", self.base_url))
-            .header("pubky-host", seller_pubky)
-            .send()
+            .get(seller_pubky, Target::Record(path), FETCH_TIMEOUT)
             .await
         {
             Ok(response) => response,
-            Err(_) => return HomeserverFetchOutcome::Unavailable,
+            Err(Unreached) => return HomeserverFetchOutcome::Unavailable,
         };
         let status = response.status();
         if status == reqwest::StatusCode::NOT_FOUND {
@@ -801,9 +1050,11 @@ impl HttpHomeserverClient {
             return HomeserverFetchOutcome::Unavailable;
         }
         match response.bytes().await {
-            Ok(bytes) if bytes.len() <= MAX_RECORD_BYTES => serde_json::from_slice(&bytes)
-                .map(HomeserverFetchOutcome::Found)
-                .unwrap_or(HomeserverFetchOutcome::Unavailable),
+            Ok(bytes) if bytes.as_ref().len() <= MAX_RECORD_BYTES => {
+                serde_json::from_slice(bytes.as_ref())
+                    .map(HomeserverFetchOutcome::Found)
+                    .unwrap_or(HomeserverFetchOutcome::Unavailable)
+            }
             _ => HomeserverFetchOutcome::Unavailable,
         }
     }
@@ -816,14 +1067,11 @@ impl HttpHomeserverClient {
     async fn fetch_raw_path(&self, seller_pubky: &str, path: &str) -> HomeserverRawFetchOutcome {
         let prefix = pubky_host_prefix(seller_pubky);
         let mut response = match self
-            .http
-            .get(format!("{}{path}", self.base_url))
-            .header("pubky-host", seller_pubky)
-            .send()
+            .get(seller_pubky, Target::Record(path), FETCH_TIMEOUT)
             .await
         {
             Ok(response) => response,
-            Err(_) => return HomeserverRawFetchOutcome::Unavailable,
+            Err(Unreached) => return HomeserverRawFetchOutcome::Unavailable,
         };
         let status = response.status();
         if status == reqwest::StatusCode::NOT_FOUND {
@@ -864,16 +1112,17 @@ impl HttpHomeserverClient {
         loop {
             match response.chunk().await {
                 Ok(Some(chunk)) => {
+                    let chunk = chunk.as_ref();
                     let Some(next_len) = raw.len().checked_add(chunk.len()) else {
                         return HomeserverRawFetchOutcome::TooLarge;
                     };
                     if next_len > MAX_AWARD_LISTING_BYTES {
                         return HomeserverRawFetchOutcome::TooLarge;
                     }
-                    raw.extend_from_slice(&chunk);
+                    raw.extend_from_slice(chunk);
                 }
                 Ok(None) => return HomeserverRawFetchOutcome::Found(raw),
-                Err(_) => return HomeserverRawFetchOutcome::Unavailable,
+                Err(Unreached) => return HomeserverRawFetchOutcome::Unavailable,
             }
         }
     }
@@ -894,13 +1143,7 @@ impl HttpHomeserverClient {
         path: &str,
         max_bytes: usize,
     ) -> HomeserverFetchOutcome {
-        let Ok(mut response) = self
-            .http
-            .get(format!("{}{path}", self.base_url))
-            .header("pubky-host", pubky)
-            .send()
-            .await
-        else {
+        let Ok(mut response) = self.get(pubky, Target::Record(path), FETCH_TIMEOUT).await else {
             return HomeserverFetchOutcome::Unavailable;
         };
         if response.status() == reqwest::StatusCode::NOT_FOUND {
@@ -917,13 +1160,14 @@ impl HttpHomeserverClient {
         loop {
             match response.chunk().await {
                 Ok(Some(chunk)) => {
+                    let chunk = chunk.as_ref();
                     if body.len() + chunk.len() > max_bytes {
                         return HomeserverFetchOutcome::Unavailable;
                     }
-                    body.extend_from_slice(&chunk);
+                    body.extend_from_slice(chunk);
                 }
                 Ok(None) => break,
-                Err(_) => return HomeserverFetchOutcome::Unavailable,
+                Err(Unreached) => return HomeserverFetchOutcome::Unavailable,
             }
         }
         serde_json::from_slice(&body)
@@ -947,6 +1191,34 @@ fn retry_after_from(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
 
 fn pubky_host_prefix(seller_pubky: &str) -> &str {
     seller_pubky.get(..8).unwrap_or(seller_pubky)
+}
+
+/// The homeserver `pubky`'s Pkarr record names, through the SDK's bounded
+/// record cache. A pubky with no record, a record naming no homeserver, a
+/// failed or slow lookup are all `Unreached`, which every read maps to
+/// `Unavailable`: an identity that cannot be resolved right now is never
+/// read as one whose records are gone.
+async fn resolve_homeserver(
+    sdk: &pubky::Pubky,
+    pubky: &str,
+) -> Result<pubky::PublicKey, Unreached> {
+    let prefix = pubky_host_prefix(pubky);
+    let Ok(user) = pubky::PublicKey::try_from_z32(pubky) else {
+        tracing::warn!(pubky_host_prefix = %prefix, "homeserver resolution refused a malformed pubky");
+        return Err(Unreached);
+    };
+    let failure = match tokio::time::timeout(RESOLVE_TIMEOUT, sdk.get_homeserver_of(&user)).await {
+        Ok(Ok(Some(homeserver))) => return Ok(homeserver),
+        Ok(Ok(None)) => "no homeserver record",
+        Ok(Err(_)) => "lookup failed",
+        Err(_) => "lookup timed out",
+    };
+    tracing::warn!(
+        pubky_host_prefix = %prefix,
+        failure,
+        "homeserver resolution failed"
+    );
+    Err(Unreached)
 }
 
 impl HomeserverListingClient for HttpHomeserverClient {
@@ -1065,15 +1337,15 @@ impl HomeserverListingClient for HttpHomeserverClient {
         Box::pin(async move {
             let path = format!("{DELIVERABLES_PATH}{deliverable_id}/{version}");
             let response = match self
-                .http
-                .get(format!("{}{path}", self.base_url))
-                .header("pubky-host", seller_pubky)
-                .timeout(DELIVERABLE_FETCH_TIMEOUT)
-                .send()
+                .get(
+                    seller_pubky,
+                    Target::Record(&path),
+                    DELIVERABLE_FETCH_TIMEOUT,
+                )
                 .await
             {
                 Ok(response) => response,
-                Err(_) => {
+                Err(Unreached) => {
                     tracing::warn!("homeserver deliverable fetch transport failure");
                     return DeliverableFetchOutcome::Unavailable;
                 }
@@ -1102,14 +1374,15 @@ impl HomeserverListingClient for HttpHomeserverClient {
             loop {
                 match response.chunk().await {
                     Ok(Some(chunk)) => {
+                        let chunk = chunk.as_ref();
                         len += chunk.len() as u64;
                         if len > max_len {
                             return DeliverableFetchOutcome::TooLarge;
                         }
-                        hasher.update(&chunk);
+                        hasher.update(chunk);
                     }
                     Ok(None) => break,
-                    Err(_) => return DeliverableFetchOutcome::Unavailable,
+                    Err(Unreached) => return DeliverableFetchOutcome::Unavailable,
                 }
             }
             DeliverableFetchOutcome::Found {
@@ -1139,14 +1412,11 @@ impl HomeserverListingClient for HttpHomeserverClient {
                 query.push(("reverse", "true"));
             }
             let mut response = match self
-                .http
-                .get(format!("{}/events-stream", self.base_url))
-                .query(&query)
-                .send()
+                .get(seller_pubky, Target::Events(&query), FETCH_TIMEOUT)
                 .await
             {
                 Ok(response) => response,
-                Err(_) => {
+                Err(Unreached) => {
                     tracing::warn!("homeserver event stream transport failure");
                     return HomeserverEventsOutcome::Unavailable;
                 }
@@ -1169,13 +1439,14 @@ impl HomeserverListingClient for HttpHomeserverClient {
             loop {
                 match response.chunk().await {
                     Ok(Some(chunk)) => {
+                        let chunk = chunk.as_ref();
                         if body.len() + chunk.len() > MAX_EVENT_STREAM_BYTES {
                             return HomeserverEventsOutcome::Unavailable;
                         }
-                        body.extend_from_slice(&chunk);
+                        body.extend_from_slice(chunk);
                     }
                     Ok(None) => break,
-                    Err(_) => return HomeserverEventsOutcome::Unavailable,
+                    Err(Unreached) => return HomeserverEventsOutcome::Unavailable,
                 }
             }
             let parsed = std::str::from_utf8(&body).ok().and_then(parse_event_stream);
@@ -1710,13 +1981,18 @@ pub fn validated_drop_record(
     }
 }
 
-/// Builds the production client from the environment. `HOMESERVER_URL` is
-/// required: `listing.sync` cannot work without it, and running without the
-/// sync path would silently re-open the dead-end this command exists to fix.
+/// Builds the production client from the environment. A homeserver source is
+/// required (`HOMESERVER_URL`, or `HOMESERVER_RESOLUTION=pkarr`):
+/// `listing.sync` cannot work without one, and running without the sync path
+/// would silently re-open the dead-end this command exists to fix.
 pub fn client_from_env() -> anyhow::Result<HttpHomeserverClient> {
-    let url = std::env::var(ENV_HOMESERVER_URL)
-        .map_err(|_| anyhow::anyhow!("{ENV_HOMESERVER_URL} must be set"))?;
-    HttpHomeserverClient::new(&url)
+    match HomeserverResolution::from_lookup(&|name| std::env::var(name).ok())? {
+        HomeserverResolution::Fixed { base_url } => HttpHomeserverClient::new(&base_url),
+        HomeserverResolution::Pkarr => HttpHomeserverClient::pkarr(
+            pubky::PubkyHttpClient::builder(),
+            PkarrResolutionCache::default(),
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -2181,6 +2457,85 @@ mod tests {
     fn http_client_requires_an_http_base_url() {
         assert!(HttpHomeserverClient::new("ftp://homeserver.example").is_err());
         assert!(HttpHomeserverClient::new("https://homeserver.example/").is_ok());
+    }
+
+    fn resolution(vars: &[(&str, &str)]) -> anyhow::Result<HomeserverResolution> {
+        let vars: Vec<(String, String)> = vars
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        HomeserverResolution::from_lookup(&move |name| {
+            vars.iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        })
+    }
+
+    #[test]
+    fn resolution_defaults_to_the_fixed_homeserver_url() {
+        let fixed = HomeserverResolution::Fixed {
+            base_url: "https://homeserver.example".to_string(),
+        };
+        assert_eq!(
+            resolution(&[(ENV_HOMESERVER_URL, "https://homeserver.example")]).unwrap(),
+            fixed
+        );
+        assert_eq!(
+            resolution(&[
+                (ENV_HOMESERVER_RESOLUTION, " fixed "),
+                (ENV_HOMESERVER_URL, "https://homeserver.example"),
+            ])
+            .unwrap(),
+            fixed
+        );
+        for vars in [&[][..], &[(ENV_HOMESERVER_RESOLUTION, "fixed")][..]] {
+            let error = resolution(vars).expect_err("fixed needs a URL").to_string();
+            assert!(error.contains(ENV_HOMESERVER_URL), "{error}");
+        }
+    }
+
+    #[test]
+    fn pkarr_resolution_reads_no_homeserver_url() {
+        assert_eq!(
+            resolution(&[(ENV_HOMESERVER_RESOLUTION, "pkarr")]).unwrap(),
+            HomeserverResolution::Pkarr
+        );
+        assert_eq!(
+            resolution(&[
+                (ENV_HOMESERVER_RESOLUTION, " pkarr"),
+                (ENV_HOMESERVER_URL, "  "),
+            ])
+            .unwrap(),
+            HomeserverResolution::Pkarr,
+            "a blank URL is no URL"
+        );
+        let error = resolution(&[
+            (ENV_HOMESERVER_RESOLUTION, "pkarr"),
+            (ENV_HOMESERVER_URL, "https://homeserver.example"),
+        ])
+        .expect_err("a URL pkarr mode would ignore is refused")
+        .to_string();
+        assert!(error.contains("unset it"), "{error}");
+    }
+
+    #[test]
+    fn unknown_resolutions_are_refused() {
+        for value in ["", "PKARR", "dht", "fixed,pkarr"] {
+            let error = resolution(&[
+                (ENV_HOMESERVER_RESOLUTION, value),
+                (ENV_HOMESERVER_URL, "https://homeserver.example"),
+            ])
+            .expect_err("unknown resolution")
+            .to_string();
+            assert!(error.contains("`fixed` or `pkarr`"), "{value:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn the_default_pkarr_cache_is_bounded_and_expires() {
+        let cache = PkarrResolutionCache::default();
+        assert_eq!(cache.capacity, 10_000);
+        assert_eq!(cache.ttl, Duration::from_secs(300));
     }
 
     #[tokio::test]
