@@ -1589,9 +1589,9 @@ async fn upstream_failure_is_separate_from_marketplace_expiry(pool: PgPool) {
     );
 }
 
-// The marketplace payment window expires a still-pending payment; a
-// completion verified after that expiry with stock free completes the
-// order. History is retained — never dropped.
+// The marketplace payment window expires a payment whose task the Lock
+// Server has not reported; a completion verified after that expiry with
+// stock free completes the order. History is retained — never dropped.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn late_completion_after_window_expiry_completes_when_stock_is_free(pool: PgPool) {
     let (app, fake) = test_app_with_locks(pool).await;
@@ -1600,15 +1600,11 @@ async fn late_completion_after_window_expiry_completes_when_stock_is_free(pool: 
     let buyer = new_actor(&app).await;
     let order = create_pending_locks_order(&app, &seller, &buyer).await;
     register_locks(&app, &buyer.token, &order, &seller.pubky).await;
-    fake.set_outcome(
-        TEST_BUNDLE_ID,
-        LocksLookupOutcome::Status(LocksTaskStatus::Pending),
-    );
     run_once(&app.state, holder, app.clock.now())
         .await
         .expect("worker pass runs");
 
-    // The window (3600 s) elapses while the lifecycle is still pending: the
+    // The window (3600 s) elapses before the Lock Server has the task: the
     // hold releases back to the listing, the payment expires, and the ORDER
     // is cancelled with the stored server reason — the buyer simply checks
     // out again.
@@ -1670,7 +1666,7 @@ async fn late_completion_after_window_expiry_completes_when_stock_is_free(pool: 
     assert_eq!(
         history,
         vec![
-            ("pending".to_string(), "none".to_string()),
+            ("not_found".to_string(), "none".to_string()),
             ("window_elapsed".to_string(), "payment_expired".to_string()),
             ("completed".to_string(), "payment_confirmed".to_string()),
         ],
@@ -1681,6 +1677,184 @@ async fn late_completion_after_window_expiry_completes_when_stock_is_free(pool: 
         .execute(&app.pool)
         .await
         .expect_err("observations are append-only");
+}
+
+/// The listing's `(available, reserved, sold)` quantities.
+async fn listing_quantities(pool: &PgPool) -> (i64, i64, i64) {
+    sqlx::query_as("SELECT available_quantity, reserved_quantity, sold_quantity FROM listings")
+        .fetch_one(pool)
+        .await
+        .expect("listing row exists")
+}
+
+// The interleaving the Locks hold must survive: paykit-server dates a Locks
+// invoice from its own `payment_window` (24 h by default), not from
+// `LOCKS_PAYMENT_WINDOW_SECONDS` (1 h), so a buyer can pay after the
+// marketplace window and the Lock Server still grants access. Releasing the
+// unit at the window would let another buyer take it, and the first buyer's
+// completion would then find it gone: a cancelled `refund_required` order
+// whose buyer already holds the content. While the Lock Server reports the
+// task live the order keeps its unit, and the completion confirms it.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_live_locks_task_keeps_its_unit_past_the_window_and_confirms(pool: PgPool) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let holder = Uuid::new_v4();
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let rival = new_actor(&app).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
+    register_locks(&app, &buyer.token, &order, &seller.pubky).await;
+    fake.set_outcome(
+        TEST_BUNDLE_ID,
+        LocksLookupOutcome::Status(LocksTaskStatus::Pending),
+    );
+    run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+
+    app.clock.advance_seconds(3_601);
+    let summary = run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    assert_eq!(
+        summary.payment_windows_expired, 0,
+        "a live Locks task is not swept at the window"
+    );
+    let (state, _, _) = payment_state(&app.pool, &order.payment_id).await;
+    assert_eq!(state, "awaiting_entitlement");
+    assert_eq!(
+        order_state(&app.pool, &order.order_id).await,
+        "pending_payment"
+    );
+    assert_eq!(listing_quantities(&app.pool).await, (0, 1, 0));
+
+    let (status, body) = execute(
+        &app,
+        &rival.token,
+        &checkout_at_listing_revision(&seller.pubky, "00000000-0000-4000-8000-000000004100", 2),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        body["error"]["message"],
+        json!(
+            "Another buyer's payment is holding this item. If it isn't completed in time, the item restocks."
+        )
+    );
+
+    // The buyer pays an hour after the marketplace window, inside Paykit's.
+    app.clock.advance_seconds(3_600);
+    fake.complete_matching(&app.pool, TEST_BUNDLE_ID, &order.payment_id)
+        .await;
+    let summary = run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    assert_eq!(summary.locks_completions_applied, 1);
+    let (state, _, _) = payment_state(&app.pool, &order.payment_id).await;
+    assert_eq!(state, "confirmed");
+    assert_eq!(order_state(&app.pool, &order.order_id).await, "paid");
+    assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM receipts").await, 1);
+    assert_eq!(listing_quantities(&app.pool).await, (0, 0, 1));
+    assert_eq!(
+        count(
+            &app.pool,
+            "SELECT COUNT(*) FROM events WHERE kind IN ('payment.expired', 'order.cancelled')"
+        )
+        .await,
+        0
+    );
+}
+
+// Once the Lock Server ends the task (the buyer let the Paykit proposal or
+// payment deadline pass), nothing can grant access any more and the lapsed
+// window releases the unit on the next pass.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_lapsed_window_releases_once_the_locks_task_ends(pool: PgPool) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let holder = Uuid::new_v4();
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
+    register_locks(&app, &buyer.token, &order, &seller.pubky).await;
+    fake.set_outcome(
+        TEST_BUNDLE_ID,
+        LocksLookupOutcome::Status(LocksTaskStatus::InProgress),
+    );
+    run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    app.clock.advance_seconds(3_601);
+    let summary = run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    assert_eq!(summary.payment_windows_expired, 0);
+
+    fake.set_outcome(
+        TEST_BUNDLE_ID,
+        LocksLookupOutcome::Status(LocksTaskStatus::Expired),
+    );
+    app.clock.advance_seconds(31);
+    let summary = run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    assert_eq!(summary.payment_windows_expired, 1);
+    let (state, _, _) = payment_state(&app.pool, &order.payment_id).await;
+    assert_eq!(state, "expired");
+    assert_eq!(order_state(&app.pool, &order.order_id).await, "cancelled");
+    assert_eq!(listing_quantities(&app.pool).await, (1, 0, 0));
+}
+
+// A Lock Server that stops answering after reporting the task live cannot
+// pin the unit forever: past the bound the window sweep runs, and a
+// completion verified later still takes the late-money fork.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_silent_lock_server_holds_a_live_task_only_up_to_the_bound(pool: PgPool) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let holder = Uuid::new_v4();
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
+    register_locks(&app, &buyer.token, &order, &seller.pubky).await;
+    fake.set_outcome(
+        TEST_BUNDLE_ID,
+        LocksLookupOutcome::Status(LocksTaskStatus::Pending),
+    );
+    run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    fake.set_outcome(TEST_BUNDLE_ID, LocksLookupOutcome::Unavailable);
+
+    app.clock
+        .advance_seconds(3_600 + workers::LOCKS_LIVE_TASK_HOLD_SECONDS - 1);
+    let summary = run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    assert_eq!(summary.payment_windows_expired, 0);
+    assert_eq!(
+        order_state(&app.pool, &order.order_id).await,
+        "pending_payment"
+    );
+
+    app.clock.advance_seconds(2);
+    let summary = run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    assert_eq!(summary.payment_windows_expired, 1);
+    assert_eq!(order_state(&app.pool, &order.order_id).await, "cancelled");
+    assert_eq!(listing_quantities(&app.pool).await, (1, 0, 0));
+
+    fake.complete_matching(&app.pool, TEST_BUNDLE_ID, &order.payment_id)
+        .await;
+    app.clock.advance_seconds(31);
+    let summary = run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    assert_eq!(summary.locks_completions_applied, 1);
+    assert_eq!(
+        order_state(&app.pool, &order.order_id).await,
+        "paid",
+        "the late-money fork completes it while the unit is free"
+    );
 }
 
 // A verified completion whose order can no longer be confirmed (the buyer

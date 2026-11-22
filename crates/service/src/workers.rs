@@ -27,10 +27,12 @@
 //! bounded, abortable, and resumable across restarts. Marketplace
 //! payment-window expiry is a separate server-time transition over the
 //! ORDER's armed inventory-hold window ("only a payment locks an item"):
-//! a lapsed hold restocks, the payment expires, and the order cancels.
-//! Locks v1 leaves transport/status failures pending, so upstream trouble
-//! never expires a payment by itself — and a completion verified after the
-//! window goes to `manual_review`, never silently discarded.
+//! a lapsed hold restocks, the payment expires, and the order cancels —
+//! except while the Lock Server reports the order's Locks task live, since
+//! that task can still grant access. Locks v1 leaves transport/status
+//! failures pending, so upstream trouble never expires a payment by itself —
+//! and a completion verified after the window takes the late-money fork,
+//! never silently discarded.
 //!
 //! Delivery autocomplete semantics (ADR-0019): there is NO carrier
 //! tracking feed, so post-purchase liveness is server time. A `shipped`
@@ -4317,10 +4319,14 @@ pub async fn verify_due_paykit_payments(
 /// the buyer simply checks out again. A held order with `hold_expires_at`
 /// NULL (pre-#50 rows the 0012 backfill missed) is already elapsed.
 ///
-/// This is a marketplace policy transition, independent of upstream state; a
-/// Locks correlation keeps polling (bounded by the Lock Server's own task
-/// ageing), so a completion verified later still surfaces as
-/// `manual_review`. Payments already under `manual_review` are deliberately
+/// This is a marketplace policy transition: an upstream failure never expires
+/// a payment by itself. The one upstream fact it waits on is a Locks task the
+/// Lock Server last reported live ([`LIVE_LOCKS_TASK`]): that task can still
+/// grant the buyer access, so its order stays held until the task completes,
+/// fails or expires, or [`LOCKS_LIVE_TASK_HOLD_SECONDS`] past the window. A
+/// Locks correlation keeps polling after the window (bounded by the Lock
+/// Server's own task ageing), so a completion verified later still takes the
+/// late-money fork. Payments already under `manual_review` are deliberately
 /// NOT swept: a human decides those — their money may be real, so their
 /// hold is never auto-released. The one exception is a Locks payment parked
 /// because its completed task could not be verified against the prepared
@@ -4350,10 +4356,11 @@ pub async fn expire_due_payment_windows(
     let due: Vec<(Uuid, Uuid, String, String)> = sqlx::query_as(&format!(
         "SELECT o.id, p.id, p.state, o.buyer_pubky \
          FROM orders o JOIN payments p ON p.order_id = o.id \
-         WHERE {HELD_DUE_ORDER} AND {SWEEPABLE_PAYMENT} \
+         WHERE {HELD_DUE_ORDER} AND {SWEEPABLE_PAYMENT} AND NOT {LIVE_LOCKS_TASK} \
          ORDER BY o.hold_expires_at NULLS FIRST FOR UPDATE OF p SKIP LOCKED"
     ))
     .bind(now)
+    .bind(LOCKS_LIVE_TASK_HOLD_SECONDS)
     .fetch_all(&mut *tx)
     .await?;
 
@@ -4630,6 +4637,28 @@ const SWEEPABLE_PAYMENT: &str = "(p.state IN ('awaiting_entitlement', 'detected'
          AND c.verification_state = 'upstream_failed' \
          AND c.last_observed_status IN ('binding_missing', 'binding_unverifiable', \
              'binding_malformed', 'binding_unopenable'))))";
+
+/// How long past its hold window a Locks order is kept while the Lock
+/// Server still reports its task live: paykit-server's default
+/// `payment_window`, from which it dates every Locks invoice. Past it the
+/// window sweep runs, and a completion verified later takes the late-money
+/// fork.
+pub const LOCKS_LIVE_TASK_HOLD_SECONDS: i64 = 86_400;
+
+/// A Locks payment whose registered task the Lock Server last reported live
+/// (`pending`/`in_progress`). Until Locks ends that task (it ages it out at
+/// the Paykit proposal and payment deadlines, which paykit-server sets from
+/// its own config, not from `LOCKS_PAYMENT_WINDOW_SECONDS`) a payment can
+/// still grant the buyer access, so the window sweep must not cancel the
+/// order and release its unit under it. Bounded by
+/// [`LOCKS_LIVE_TASK_HOLD_SECONDS`] so a silent Lock Server cannot pin stock
+/// forever. `$1` is `now`, `$2` the bound.
+const LIVE_LOCKS_TASK: &str = "(p.adapter = 'locks' AND p.state = 'awaiting_entitlement' \
+     AND o.hold_expires_at IS NOT NULL \
+     AND o.hold_expires_at > $1 - make_interval(secs => $2) \
+     AND EXISTS (SELECT 1 FROM payment_locks_correlations c WHERE c.payment_id = p.id \
+         AND c.preparation_state = 'registered' AND c.verification_state = 'pending' \
+         AND c.last_observed_status IN ('pending', 'in_progress')))";
 
 /// The order half of the held-window expiry predicate; `$1` is `now`.
 const HELD_DUE_ORDER: &str = "o.state = 'pending_payment' AND o.stock_held \
