@@ -434,8 +434,11 @@ the `v1_command` surface under its own command kind, a route on the
 still issued to any identity, so buyers sign in as before. Public reads
 (`/v0` projections, `/health`) are not filtered; they only show what the
 guarded writes let in. The mode is meant for a database that has only ever
-served the store seller; another seller's existing records are not removed,
-and every route and command for them is refused.
+served the store seller, and the service refuses to start in it, after
+migrations, while the database holds a listing, an order or a stock hold of
+another seller. The message counts them and names up to three of those
+sellers by the first eight characters of their pubky. Nothing is removed:
+start the store on its own database, or unset `STORE_SELLER_PUBKY`.
 
 `LISTING_MODERATION=off` is allowed only in this mode. The moderation gate is
 then not built, `NEXUS_URL` is not read and must be unset, and the boot log

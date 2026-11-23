@@ -9,6 +9,8 @@
 //! route from the route's entry in [`ROUTES`]. Both refuse with
 //! `SELLER_NOT_SERVED` (HTTP 409) and write a `seller_not_served` refusal
 //! audit row. Sessions are still issued to any identity: buyers need them.
+//! At boot, [`refuse_other_sellers`] refuses a database that already holds
+//! another seller's listings, orders or holds.
 //!
 //! With `STORE_SELLER_PUBKY` unset the service is a marketplace and nothing
 //! here runs.
@@ -128,6 +130,80 @@ pub fn moderation_from_lookup(
         }
         Some(_) => anyhow::bail!("{ENV_LISTING_MODERATION} must be `on` or `off`"),
     }
+}
+
+/// What the database holds for sellers other than the store seller.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OtherSellerRows {
+    pub listings: i64,
+    pub orders: i64,
+    /// Stock holds (`reservations`) on those sellers' listings.
+    pub holds: i64,
+    /// Up to three of those sellers, by the first eight characters of their
+    /// pubky.
+    pub sellers: Vec<String>,
+}
+
+impl OtherSellerRows {
+    pub fn is_empty(&self) -> bool {
+        self.listings == 0 && self.orders == 0 && self.holds == 0
+    }
+}
+
+/// Counts the listings, orders and holds that belong to a seller other than
+/// `store`.
+pub async fn other_seller_rows(pool: &PgPool, store: &str) -> Result<OtherSellerRows, sqlx::Error> {
+    let (listings, orders, holds): (i64, i64, i64) = sqlx::query_as(
+        "SELECT \
+             (SELECT COUNT(*) FROM listings WHERE seller_pubky <> $1), \
+             (SELECT COUNT(*) FROM orders WHERE seller_pubky <> $1), \
+             (SELECT COUNT(*) FROM reservations r \
+                  JOIN listings l ON l.aggregate_id = r.listing_aggregate_id \
+              WHERE l.seller_pubky <> $1)",
+    )
+    .bind(store)
+    .fetch_one(pool)
+    .await?;
+    let sellers: Vec<String> = sqlx::query_scalar(
+        "SELECT seller_pubky FROM ( \
+             SELECT seller_pubky FROM listings WHERE seller_pubky <> $1 \
+             UNION SELECT seller_pubky FROM orders WHERE seller_pubky <> $1 \
+         ) other ORDER BY seller_pubky LIMIT 3",
+    )
+    .bind(store)
+    .fetch_all(pool)
+    .await?;
+    Ok(OtherSellerRows {
+        listings,
+        orders,
+        holds,
+        sellers: sellers
+            .iter()
+            .map(|seller| format!("{}…", crate::logging::actor_prefix(seller)))
+            .collect(),
+    })
+}
+
+/// Refuses to start single-seller mode on a database that holds a listing,
+/// order or hold of another seller: the mode would refuse every route and
+/// command for them, leaving their buyers' orders and holds unserved.
+pub async fn refuse_other_sellers(pool: &PgPool, mode: &StoreMode) -> anyhow::Result<()> {
+    let Some(store) = mode.store_seller() else {
+        return Ok(());
+    };
+    let rows = other_seller_rows(pool, store).await?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "{ENV_STORE_SELLER_PUBKY} is set, but the database holds {} listings, {} orders and \
+         {} holds of other sellers ({}); single-seller mode needs a database that only its \
+         store seller has used; refusing to start",
+        rows.listings,
+        rows.orders,
+        rows.holds,
+        rows.sellers.join(", ")
+    )
 }
 
 /// Something a command or route acts on, named by the seller it belongs to.

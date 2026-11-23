@@ -216,6 +216,7 @@ async fn main() -> anyhow::Result<()> {
     wait_for_database(&pool, BOOT_DATABASE_WAIT).await?;
     marketplace_service::migrations::run(&pool).await?;
     tracing::info!("database migrations applied");
+    marketplace_service::store_seller::refuse_other_sellers(&pool, &config.store_mode).await?;
     let audit_writer_options: PgConnectOptions = config.refusal_audit_database_url.parse()?;
     let audit_writer_pool = PgPoolOptions::new()
         .max_connections(marketplace_service::refusal_audit::WRITER_POOL_MAX_CONNECTIONS)
