@@ -184,13 +184,13 @@ impl Records {
         {
             return Ok(packet.clone());
         }
-        self.from_network(key, cached).await
+        self.network_record(key, cached).await
     }
 
     /// `key`'s most recent record on the network, read past the cache.
     async fn latest(&self, key: &pkarr::PublicKey) -> Result<SignedPacket, ResolveError> {
         let cached = self.cache.get(&CacheKey::from(key));
-        self.from_network(key, cached).await
+        self.network_record(key, cached).await
     }
 
     /// The network's answer, or `cached` when that is more recent still: the
@@ -198,7 +198,7 @@ impl Records {
     /// returns the older one, and an expired cached record would otherwise
     /// lose to it on every read. A cached record the network has nothing
     /// newer than is marked as just seen, so it is fresh again.
-    async fn from_network(
+    async fn network_record(
         &self,
         key: &pkarr::PublicKey,
         cached: Option<SignedPacket>,
