@@ -376,7 +376,9 @@ request failed, so clients should branch on HTTP status first, and parse
    transaction and without writing anything. Signed-in routes that act for a
    seller, or name another seller's record in their path, answer it too, in
    this command envelope (`{"ok":false,"error":{"code":"SELLER_NOT_SERVED",...}}`,
-   HTTP 409) whatever envelope the route uses otherwise. A marketplace
+   HTTP 409) whatever envelope the route uses otherwise. So does any route
+   missing from the deployment's scope table, signed in or not, and a method
+   a path does not serve, which a marketplace answers with 405. A marketplace
    deployment never returns it (see
    [Single-seller mode](../README.md#single-seller-mode)).
 

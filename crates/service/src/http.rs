@@ -14,21 +14,12 @@ use crate::auth::{self, Actor};
 use crate::{executor, logging, queries, AppState};
 
 pub fn build_router(state: AppState) -> Router {
-    let cors = CorsLayer::new()
-        .allow_origin(state.config.allowed_origins.clone())
-        .allow_methods([
-            Method::GET,
-            Method::POST,
-            Method::PUT,
-            Method::PATCH,
-            Method::DELETE,
-        ])
-        .allow_headers([
-            header::CONTENT_TYPE,
-            header::AUTHORIZATION,
-            header::HeaderName::from_static("idempotency-key"),
-        ]);
+    serve(routes(&state), state)
+}
 
+/// Every route the service serves, before the layers [`serve`] applies to
+/// all of them.
+pub fn routes(state: &AppState) -> Router<AppState> {
     let inventory = Router::new()
         .route(
             "/v1/inventory/adjust",
@@ -405,6 +396,32 @@ pub fn build_router(state: AppState) -> Router {
         .merge(automation)
         .merge(connectors)
         .merge(connector_ingress)
+}
+
+/// The layers every route shares, applied once all of them are mounted,
+/// however they were (routed in place, merged or nested): the single-seller
+/// guard against routes missing from `store_seller::ROUTES`, CORS and
+/// request logging.
+pub fn serve(routes: Router<AppState>, state: AppState) -> Router {
+    let cors = CorsLayer::new()
+        .allow_origin(state.config.allowed_origins.clone())
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+        ])
+        .allow_headers([
+            header::CONTENT_TYPE,
+            header::AUTHORIZATION,
+            header::HeaderName::from_static("idempotency-key"),
+        ]);
+    routes
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::store_seller::refuse_unlisted_routes,
+        ))
         .layer(cors)
         .layer(middleware::map_response(expose_retry_after))
         .layer(middleware::from_fn(log_request))

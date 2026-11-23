@@ -6,9 +6,11 @@
 //! each to its seller and admits the request only when every one is the
 //! store seller. The executor runs it for each command before any other gate
 //! ([`command_refusal`]); [`require_store_seller`] runs it for each signed-in
-//! route from the route's entry in [`ROUTES`]. Both refuse with
+//! route from the route's entry in [`ROUTES`], and [`refuse_unlisted_routes`]
+//! refuses any route missing from it wherever it is mounted. All refuse with
 //! `SELLER_NOT_SERVED` (HTTP 409) and write a `seller_not_served` refusal
-//! audit row. Sessions are still issued to any identity: buyers need them.
+//! audit row for an authenticated actor. Sessions are still issued to any
+//! identity: buyers need them.
 //! At boot, [`refuse_other_sellers`] refuses a database that already holds
 //! another seller's listings, orders, holds, store connections, payment
 //! configurations, webhook endpoints or seller settings.
@@ -494,9 +496,10 @@ const PROVIDER: &str = "authenticated by the provider for a connection only the 
                         can create";
 const STORED: &str = "answers only from what the guarded writes stored";
 
-/// Every route the router serves, and what it acts on. A signed-in route
-/// missing here is refused in single-seller mode; `tests/store_seller_test.rs`
-/// fails when this table and `http.rs` disagree.
+/// Every route the router serves, and what it acts on. In single-seller
+/// mode a route missing here is refused wherever it is mounted
+/// ([`refuse_unlisted_routes`]); `tests/store_seller_test.rs` fails when this
+/// table and `http.rs` disagree.
 pub const ROUTES: &[RouteRule] = &[
     rule("GET", "/health", Public("deployment health")),
     rule("GET", "/ready", Public("deployment readiness")),
@@ -796,13 +799,45 @@ pub async fn require_store_seller(
     if admitted {
         return next.run(Request::from_parts(parts, body)).await;
     }
+    route_refusal(&state, &actor)
+}
+
+/// The whole-router guard, layered once by [`crate::http::serve`] over every
+/// route however it was mounted. In single-seller mode it refuses a route
+/// with no entry in [`ROUTES`], so a route the table misses fails closed
+/// even on a router without [`require_store_seller`]. It runs before any
+/// session check, so the refusal-audit row, which tags an authenticated
+/// actor, is written only when the request carries an active session.
+pub async fn refuse_unlisted_routes(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if state.config.store_mode.store_seller().is_none() {
+        return next.run(request).await;
+    }
+    let listed = request
+        .extensions()
+        .get::<MatchedPath>()
+        .and_then(|path| route_scope(request.method().as_str(), path.as_str()))
+        .is_some();
+    if listed {
+        return next.run(request).await;
+    }
+    let actor = crate::auth::session_actor(&state, request.headers())
+        .await
+        .unwrap_or_default();
+    route_refusal(&state, &actor)
+}
+
+fn route_refusal(state: &AppState, actor: &str) -> Response {
     if let Some(audit) = &state.refusal_audit {
         if let Ok(envelope) = audit.envelope(
             state.clock.now(),
             crate::refusal_audit::SurfaceKind::SellerRoute,
             crate::refusal_audit::CommandKind::SellerRoute,
             crate::refusal_audit::RefusalKind::SellerNotServed,
-            &actor,
+            actor,
             None,
         ) {
             audit.try_send(envelope);

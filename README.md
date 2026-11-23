@@ -425,12 +425,19 @@ whether a request concerns the store seller, and refuses anything else:
   Routes that name a listing, drop, seller, order, payment or receipt in
   their path are served only when that record belongs to the store seller.
   The caller's own sessions, offers, orders, notifications and private-key
-  envelopes stay open, and a route with no scope is refused. A refusal
-  answers `SELLER_NOT_SERVED` (HTTP 409).
+  envelopes stay open. A refusal answers `SELLER_NOT_SERVED` (HTTP 409).
+- **Unlisted routes.** One last layer over the whole router refuses any
+  route missing from `store_seller::ROUTES`, however it was mounted (routed
+  in place, merged or nested, guarded router or not), before the session
+  check. The table is keyed by method and path, so a method a path does not
+  serve is refused the same way rather than answered with 405; a path no
+  route matches is still a 404.
 
 Every refusal writes a refusal-audit row (`seller_not_served`): a command on
 the `v1_command` surface under its own command kind, a route on the
-`seller_route` surface under the `seller_route` command kind. Sessions are
+`seller_route` surface under the `seller_route` command kind. The row tags
+an authenticated actor, so an unlisted route refused without an active
+session writes none. Sessions are
 still issued to any identity, so buyers sign in as before. Public reads
 (`/v0` projections, `/health`) are not filtered; they only show what the
 guarded writes let in. The mode is meant for a database that has only ever
