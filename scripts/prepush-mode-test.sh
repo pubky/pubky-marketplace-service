@@ -23,6 +23,11 @@ mkdir -p "$WORK/bin"
 cat > "$WORK/bin/cargo" <<'EOF'
 #!/usr/bin/env bash
 if [ "${1:-}" = metadata ]; then
+  if [ "${FAKE_METADATA_NO_DEPS_FAIL:-0}" = 1 ]; then
+    for arg in "$@"; do
+      [ "$arg" != --no-deps ] || exit 101
+    done
+  fi
   exec "$REAL_CARGO" "$@"
 fi
 printf '%s\n' "$*" >> "$FAKE_LOG/cargo"
@@ -181,7 +186,7 @@ gate() {
   mkdir -p "$WORK/log"
   local st=0
   FAKE_LOG="$WORK/log" PATH="$WORK/bin:$PATH" PREPUSH_BASE="$BASE" \
-    PREPUSH_CARGO_TARGET="$WORK/target" HEAVY_LOCK_DIR="$WORK/locks" \
+    PREPUSH_CARGO_TARGET="${PREPUSH_CARGO_TARGET:-$WORK/target}" HEAVY_LOCK_DIR="$WORK/locks" \
     HEAVY_DISK_VOLUMES="" bash scripts/prepush.sh </dev/null >"$WORK/out" 2>&1 || st=$?
   printf '%s\n' "$st"
 }
@@ -196,6 +201,56 @@ commit_change() {
   printf '// %s %s\n' "$RANDOM" "$(date +%s)" >> "$1"
   git commit -qam "change $1"
 }
+expected_member_clean() {
+  local expected=clean member
+  while IFS= read -r member; do
+    [ -n "$member" ] && expected="$expected -p $member"
+  done < <("$REAL_CARGO" metadata --no-deps --format-version 1 --locked | jq -r '
+    .workspace_members as $members
+    | .packages[]
+    | select(.id as $id | $members | index($id))
+    | .name
+  ')
+  printf '%s\n' "$expected"
+}
+
+echo "test: gate: a seeded target cleans every workspace member before the gate"
+commit_change crates/domain/src/lib.rs
+mkdir -p "$WORK/shared-target"
+printf 'registry artifact\n' > "$WORK/shared-target/artifact"
+st="$(CARGO_TARGET_DIR="$WORK/shared-target" PREPUSH_CARGO_TARGET="$WORK/seeded-target" gate)"
+expect_ok "$st" "seeded target" fast
+[ -f "$WORK/seeded-target/artifact" ] || fail "seeded target: shared artifact was not copied"
+expected_clean="$(expected_member_clean)"
+cargo_log | grep -Fqx "$expected_clean" || fail "seeded target: expected $expected_clean: $(cargo_log)"
+[ "$(cargo_log | sed -n '1p')" = "$expected_clean" ] \
+  || fail "seeded target: member clean did not precede fmt/clippy/test: $(cargo_log)"
+[ -f "$WORK/seeded-target/.prepush-members-clean" ] || fail "seeded target: no clean marker"
+
+echo "test: gate: an unmarked target is cleaned once"
+mkdir -p "$WORK/legacy-target"
+commit_change crates/domain/src/lib.rs
+st="$(PREPUSH_CARGO_TARGET="$WORK/legacy-target" gate)"
+expect_ok "$st" "unmarked target" fast
+[ "$(cargo_log | grep -Fxc "$expected_clean" || true)" = 1 ] \
+  || fail "unmarked target: expected one member clean: $(cargo_log)"
+[ -f "$WORK/legacy-target/.prepush-members-clean" ] || fail "unmarked target: no clean marker"
+commit_change crates/service/src/lib.rs
+st="$(PREPUSH_CARGO_TARGET="$WORK/legacy-target" gate)"
+expect_ok "$st" "marked target" fast
+if cargo_log | grep -q '^clean '; then
+  fail "marked target cleaned again: $(cargo_log)"
+fi
+
+echo "test: gate: a member metadata failure falls back to an empty target"
+commit_change docs/readme.md
+st="$(CARGO_TARGET_DIR="$WORK/shared-target" PREPUSH_CARGO_TARGET="$WORK/failed-target" \
+  FAKE_METADATA_NO_DEPS_FAIL=1 gate)"
+expect_ok "$st" "metadata failure" fast
+[ ! -e "$WORK/failed-target/artifact" ] || fail "metadata failure retained the seeded artifact"
+[ -f "$WORK/failed-target/.prepush-members-clean" ] || fail "metadata failure: no empty-target marker"
+grep -q '^prepush: could not clean workspace members; using an empty target$' "$WORK/out" \
+  || fail "metadata failure: no fallback explanation: $(cat "$WORK/out")"
 
 echo "test: gate: fast widens a domain change to the service and its integration binaries"
 commit_change crates/domain/src/lib.rs

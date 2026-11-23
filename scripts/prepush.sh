@@ -88,17 +88,48 @@ else
   echo "prepush: packages ${packages[*]}"
 fi
 
+prepush_clean_workspace_members() {
+  local target="$1" metadata names member
+  local members=() clean_args=()
+  metadata="$(CARGO_TARGET_DIR="$target" cargo metadata --no-deps --format-version 1 --locked 2>/dev/null)" || return 1
+  names="$(printf '%s' "$metadata" | jq -r '
+    .workspace_members as $members
+    | .packages[]
+    | select(.id as $id | $members | index($id))
+    | .name
+  ')" || return 1
+  while IFS= read -r member; do
+    [ -n "$member" ] && members+=("$member")
+  done <<< "$names"
+  [ "${#members[@]}" -gt 0 ] || return 1
+  for member in "${members[@]}"; do
+    clean_args+=(-p "$member")
+  done
+  CARGO_TARGET_DIR="$target" cargo clean "${clean_args[@]}" >/dev/null 2>&1 || return 1
+  : > "$target/.prepush-members-clean" || return 1
+  echo "prepush: cleaned ${#members[@]} workspace members from the seeded target"
+}
+
 # Sibling worktrees share one Cargo target unless this gate overrides it.
-# A shared target can run another tree's test binary. This checkout gets its own;
+# Workspace artifacts copied from a shared target name another tree's sources,
+# so only dependency artifacts are reused. Clean every workspace member in a
+# seeded or unmarked target, and mark empty targets to avoid a later clean.
 # PREPUSH_CARGO_TARGET names a different one.
 shared_target="${CARGO_TARGET_DIR:-}"
 private_target="${PREPUSH_CARGO_TARGET:-/Volumes/t7/vibes-dev/.cargo-target/marketplace-service/$(basename "$ROOT")}"
+new_empty=0
+seeded=0
+if [ ! -d "$private_target" ]; then
+  new_empty=1
+fi
 if [ ! -d "$private_target" ] && [ -n "$shared_target" ] && [ -d "$shared_target" ] && [ "$shared_target" != "$private_target" ]; then
   seed="${private_target}.partial"
   rm -rf "$seed"
   mkdir -p "$(dirname "$private_target")"
   if cp -cR "$shared_target" "$seed" 2>/dev/null || cp -R "$shared_target" "$seed"; then
     mv "$seed" "$private_target"
+    new_empty=0
+    seeded=1
   else
     rm -rf "$seed"
     mkdir -p "$private_target"
@@ -106,6 +137,17 @@ if [ ! -d "$private_target" ] && [ -n "$shared_target" ] && [ -d "$shared_target
 fi
 mkdir -p "$private_target"
 export CARGO_TARGET_DIR="$private_target"
+marker="$private_target/.prepush-members-clean"
+if [ "$new_empty" = 1 ]; then
+  : > "$marker"
+elif [ "$seeded" = 1 ] || [ ! -f "$marker" ]; then
+  if ! prepush_clean_workspace_members "$private_target"; then
+    rm -rf "$private_target"
+    mkdir -p "$private_target"
+    : > "$marker"
+    echo "prepush: could not clean workspace members; using an empty target"
+  fi
+fi
 
 echo "prepush: cargo fmt"
 cargo fmt --check
