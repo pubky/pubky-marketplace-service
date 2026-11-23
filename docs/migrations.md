@@ -767,6 +767,35 @@ UPDATE listing_deletion_cursors SET event_cursor = NULL, homeserver = NULL
 COMMIT;
 ```
 
+Then clear the listing markers that name a homeserver. The older image's
+tombstone fence compares a delete's cursor with `revived_from_cursor`
+whatever homeserver either counts on, so a marker from another homeserver
+could refuse a valid delete and leave the listing live. A tombstone's
+cursor from another homeserver becomes such a marker when the listing is
+revived. The guard refuses both changes outside a revival, so this runs in
+one maintenance transaction with `listings_deletion_guard` disabled; other
+writers to `listings` wait on the table lock until it commits, and never
+see the guard off. A tombstone keeps `'0'` as its cursor, which every
+delete on the configured homeserver follows; the previous values are kept
+in `listing_homeserver_markers_0099`:
+
+```sql
+BEGIN;
+SET LOCAL lock_timeout = '10s';
+CREATE TABLE listing_homeserver_markers_0099 AS
+    SELECT aggregate_id, deleted_event_cursor, deleted_event_homeserver,
+           revived_from_cursor, revived_from_homeserver
+    FROM listings
+    WHERE deleted_event_homeserver IS NOT NULL OR revived_from_homeserver IS NOT NULL;
+ALTER TABLE listings DISABLE TRIGGER listings_deletion_guard;
+UPDATE listings SET deleted_event_cursor = '0', deleted_event_homeserver = NULL
+    WHERE deleted_event_homeserver IS NOT NULL;
+UPDATE listings SET revived_from_cursor = NULL, revived_from_homeserver = NULL
+    WHERE revived_from_homeserver IS NOT NULL;
+ALTER TABLE listings ENABLE TRIGGER listings_deletion_guard;
+COMMIT;
+```
+
 Then forget the version:
 
 ```sql
