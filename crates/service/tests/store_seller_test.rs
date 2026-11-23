@@ -854,7 +854,7 @@ async fn single_seller_mode_refuses_to_start_on_another_sellers_rows(pool: PgPoo
     assert!(
         error
             .to_string()
-            .contains("holds 1 listings, 0 orders and 0 holds of other sellers"),
+            .contains("holds 1 listings, 0 orders, 0 holds, 0 store connections"),
         "{error}"
     );
     let (status, body) = execute(&app, &other_buyer.token, &checkout_command(&bob.pubky)).await;
@@ -874,6 +874,7 @@ async fn single_seller_mode_refuses_to_start_on_another_sellers_rows(pool: PgPoo
             orders: 1,
             holds: 1,
             sellers: vec![format!("{}…", &bob.pubky[..8])],
+            ..OtherSellerRows::default()
         }
     );
     let error = refuse_other_sellers(&pool, &single)
@@ -883,9 +884,10 @@ async fn single_seller_mode_refuses_to_start_on_another_sellers_rows(pool: PgPoo
     assert_eq!(
         error,
         format!(
-            "STORE_SELLER_PUBKY is set, but the database holds 1 listings, 1 orders and 1 holds \
-             of other sellers ({}…); single-seller mode needs a database that only its store \
-             seller has used; refusing to start",
+            "STORE_SELLER_PUBKY is set, but the database holds 1 listings, 1 orders, 1 holds, \
+             0 store connections, 0 payment configurations, 0 webhook endpoints and 0 seller \
+             settings of other sellers ({}…); single-seller mode needs a database that only its \
+             store seller has used; refusing to start",
             &bob.pubky[..8]
         )
     );
@@ -895,6 +897,137 @@ async fn single_seller_mode_refuses_to_start_on_another_sellers_rows(pool: PgPoo
     refuse_other_sellers(&pool, &StoreMode::Marketplace)
         .await
         .expect("marketplace mode");
+}
+
+/// One seller-keyed record the boot check counts besides listings, orders
+/// and holds: its table, an insert binding `$1` (seller) and `$2` (time),
+/// and the count it adds.
+struct Category {
+    table: &'static str,
+    insert: &'static str,
+    counted: fn(&mut OtherSellerRows) -> &mut i64,
+}
+
+const CATEGORIES: &[Category] = &[
+    Category {
+        table: "connector_connections",
+        insert: "INSERT INTO connector_connections \
+                     (id, seller_pubky, provider, shop, status, created_at, updated_at) \
+                 VALUES (gen_random_uuid(), $1, 'shopify', left($1, 20) || '.myshopify.com', \
+                         'disconnected', $2, $2)",
+        counted: |rows| &mut rows.connector_connections,
+    },
+    Category {
+        table: "seller_payment_configs",
+        insert: "INSERT INTO seller_payment_configs \
+                     (seller_pubky, bitcoin_enabled, created_at, updated_at) \
+                 VALUES ($1, TRUE, $2, $2)",
+        counted: |rows| &mut rows.payment_configs,
+    },
+    Category {
+        table: "seller_accepted_payment_options",
+        insert: "INSERT INTO seller_accepted_payment_options \
+                     (seller_pubky, option_id, enabled, updated_at) \
+                 VALUES ($1, 'paykit.usdt.arbitrum-one', FALSE, $2)",
+        counted: |rows| &mut rows.payment_configs,
+    },
+    Category {
+        table: "webhook_endpoints",
+        insert: "INSERT INTO webhook_endpoints \
+                     (id, seller_pubky, endpoint_url, key_id, signing_key, created_at, \
+                      updated_at, deleted_at) \
+                 VALUES (gen_random_uuid(), $1, 'https://hooks.example/' || $1, \
+                         gen_random_uuid(), decode(repeat('ab', 32), 'hex'), $2, $2, $2)",
+        counted: |rows| &mut rows.webhook_endpoints,
+    },
+    Category {
+        table: "attestation_band_consents",
+        insert: "INSERT INTO attestation_band_consents \
+                     (seller_pubky, allows_amount_band, revision, updated_at) \
+                 VALUES ($1, FALSE, 1, $2)",
+        counted: |rows| &mut rows.seller_settings,
+    },
+];
+
+/// A seller with no listing, order or hold still keeps single-seller mode
+/// from starting through a store connection, a payment configuration or
+/// accepted option, a webhook endpoint or seller settings. Each counts on
+/// its own, whatever its state (a disconnected connection, a disabled
+/// option and a deleted endpoint are seeded).
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn single_seller_mode_refuses_to_start_on_another_sellers_settings_and_integrations(
+    pool: PgPool,
+) {
+    let store = marketplace_domain::pubky::encode_pubky(&[11; 32]);
+    let carol = marketplace_domain::pubky::encode_pubky(&[12; 32]);
+    let single = StoreMode::SingleSeller(store.clone());
+    let at = chrono::Utc::now();
+    let seed = |category: &Category, seller: &str| {
+        sqlx::query(category.insert)
+            .bind(seller.to_string())
+            .bind(at)
+            .execute(&pool)
+    };
+
+    for category in CATEGORIES {
+        seed(category, &store).await.expect(category.table);
+    }
+    assert_eq!(
+        other_seller_rows(&pool, &store).await.expect("rows"),
+        OtherSellerRows::default()
+    );
+    refuse_other_sellers(&pool, &single)
+        .await
+        .expect("only the store seller's rows");
+
+    for category in CATEGORIES {
+        seed(category, &carol).await.expect(category.table);
+        let mut expected = OtherSellerRows {
+            sellers: vec![format!("{}…", &carol[..8])],
+            ..OtherSellerRows::default()
+        };
+        *(category.counted)(&mut expected) = 1;
+        assert_eq!(
+            other_seller_rows(&pool, &store).await.expect("rows"),
+            expected,
+            "{}",
+            category.table
+        );
+        refuse_other_sellers(&pool, &single)
+            .await
+            .expect_err(category.table);
+        sqlx::query(&format!(
+            "DELETE FROM {} WHERE seller_pubky = $1",
+            category.table
+        ))
+        .bind(&carol)
+        .execute(&pool)
+        .await
+        .expect("removed");
+        refuse_other_sellers(&pool, &single)
+            .await
+            .unwrap_or_else(|error| panic!("{} removed: {error}", category.table));
+    }
+
+    for category in CATEGORIES {
+        seed(category, &carol).await.expect(category.table);
+    }
+    let error = refuse_other_sellers(&pool, &single)
+        .await
+        .expect_err("all of them")
+        .to_string();
+    assert_eq!(
+        error,
+        format!(
+            "STORE_SELLER_PUBKY is set, but the database holds 0 listings, 0 orders, 0 holds, \
+             1 store connections, 1 payment configurations, 1 webhook endpoints and 1 seller \
+             settings of other sellers ({}…); single-seller mode needs a database that only its \
+             store seller has used; refusing to start",
+            &carol[..8]
+        ),
+        "a configuration and an accepted option of one seller are one payment configuration"
+    );
+    assert!(!error.contains(&carol), "{error}");
 }
 
 const STORE_SECRET: &str = "0505050505050505050505050505050505050505050505050505050505050505";

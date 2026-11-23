@@ -10,7 +10,8 @@
 //! `SELLER_NOT_SERVED` (HTTP 409) and write a `seller_not_served` refusal
 //! audit row. Sessions are still issued to any identity: buyers need them.
 //! At boot, [`refuse_other_sellers`] refuses a database that already holds
-//! another seller's listings, orders or holds.
+//! another seller's listings, orders, holds, store connections, payment
+//! configurations, webhook endpoints or seller settings.
 //!
 //! With `STORE_SELLER_PUBKY` unset the service is a marketplace and nothing
 //! here runs.
@@ -134,13 +135,25 @@ pub fn moderation_from_lookup(
     }
 }
 
-/// What the database holds for sellers other than the store seller.
+/// What the database holds for sellers other than the store seller. Rows
+/// are counted whatever their state: soft-deleted listings and webhook
+/// endpoints and disconnected store connections included.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OtherSellerRows {
     pub listings: i64,
     pub orders: i64,
     /// Stock holds (`reservations`) on those sellers' listings.
     pub holds: i64,
+    /// Store connections (`connector_connections`), pending ones included.
+    pub connector_connections: i64,
+    /// Sellers with a payment configuration (`seller_payment_configs`) or
+    /// an accepted payment option (`seller_accepted_payment_options`).
+    pub payment_configs: i64,
+    /// Automation webhook endpoints (`webhook_endpoints`).
+    pub webhook_endpoints: i64,
+    /// Seller settings: the band consent (`attestation_band_consents`) a
+    /// `seller_settings:` aggregate writes.
+    pub seller_settings: i64,
     /// Up to three of those sellers, by the first eight characters of their
     /// pubky.
     pub sellers: Vec<String>,
@@ -148,20 +161,44 @@ pub struct OtherSellerRows {
 
 impl OtherSellerRows {
     pub fn is_empty(&self) -> bool {
-        self.listings == 0 && self.orders == 0 && self.holds == 0
+        self.listings == 0
+            && self.orders == 0
+            && self.holds == 0
+            && self.connector_connections == 0
+            && self.payment_configs == 0
+            && self.webhook_endpoints == 0
+            && self.seller_settings == 0
     }
 }
 
-/// Counts the listings, orders and holds that belong to a seller other than
-/// `store`.
+/// Counts what the database holds for a seller other than `store`: their
+/// listings, orders, holds, store connections, payment configurations,
+/// webhook endpoints and seller settings.
 pub async fn other_seller_rows(pool: &PgPool, store: &str) -> Result<OtherSellerRows, sqlx::Error> {
-    let (listings, orders, holds): (i64, i64, i64) = sqlx::query_as(
+    type Counts = (i64, i64, i64, i64, i64, i64, i64);
+    let (
+        listings,
+        orders,
+        holds,
+        connector_connections,
+        payment_configs,
+        webhook_endpoints,
+        seller_settings,
+    ): Counts = sqlx::query_as(
         "SELECT \
              (SELECT COUNT(*) FROM listings WHERE seller_pubky <> $1), \
              (SELECT COUNT(*) FROM orders WHERE seller_pubky <> $1), \
              (SELECT COUNT(*) FROM reservations r \
                   JOIN listings l ON l.aggregate_id = r.listing_aggregate_id \
-              WHERE l.seller_pubky <> $1)",
+              WHERE l.seller_pubky <> $1), \
+             (SELECT COUNT(*) FROM connector_connections WHERE seller_pubky <> $1), \
+             (SELECT COUNT(*) FROM ( \
+                  SELECT seller_pubky FROM seller_payment_configs WHERE seller_pubky <> $1 \
+                  UNION SELECT seller_pubky FROM seller_accepted_payment_options \
+                        WHERE seller_pubky <> $1 \
+              ) configured), \
+             (SELECT COUNT(*) FROM webhook_endpoints WHERE seller_pubky <> $1), \
+             (SELECT COUNT(*) FROM attestation_band_consents WHERE seller_pubky <> $1)",
     )
     .bind(store)
     .fetch_one(pool)
@@ -170,6 +207,12 @@ pub async fn other_seller_rows(pool: &PgPool, store: &str) -> Result<OtherSeller
         "SELECT seller_pubky FROM ( \
              SELECT seller_pubky FROM listings WHERE seller_pubky <> $1 \
              UNION SELECT seller_pubky FROM orders WHERE seller_pubky <> $1 \
+             UNION SELECT seller_pubky FROM connector_connections WHERE seller_pubky <> $1 \
+             UNION SELECT seller_pubky FROM seller_payment_configs WHERE seller_pubky <> $1 \
+             UNION SELECT seller_pubky FROM seller_accepted_payment_options \
+                   WHERE seller_pubky <> $1 \
+             UNION SELECT seller_pubky FROM webhook_endpoints WHERE seller_pubky <> $1 \
+             UNION SELECT seller_pubky FROM attestation_band_consents WHERE seller_pubky <> $1 \
          ) other ORDER BY seller_pubky LIMIT 3",
     )
     .bind(store)
@@ -179,6 +222,10 @@ pub async fn other_seller_rows(pool: &PgPool, store: &str) -> Result<OtherSeller
         listings,
         orders,
         holds,
+        connector_connections,
+        payment_configs,
+        webhook_endpoints,
+        seller_settings,
         sellers: sellers
             .iter()
             .map(|seller| format!("{}…", crate::logging::actor_prefix(seller)))
@@ -186,9 +233,10 @@ pub async fn other_seller_rows(pool: &PgPool, store: &str) -> Result<OtherSeller
     })
 }
 
-/// Refuses to start single-seller mode on a database that holds a listing,
-/// order or hold of another seller: the mode would refuse every route and
-/// command for them, leaving their buyers' orders and holds unserved.
+/// Refuses to start single-seller mode on a database that holds anything of
+/// another seller ([`other_seller_rows`]): the mode would refuse every route
+/// and command for them, leaving their buyers' orders and holds unserved,
+/// while their store connections, payment rails and webhooks stayed live.
 pub async fn refuse_other_sellers(pool: &PgPool, mode: &StoreMode) -> anyhow::Result<()> {
     let Some(store) = mode.store_seller() else {
         return Ok(());
@@ -198,12 +246,17 @@ pub async fn refuse_other_sellers(pool: &PgPool, mode: &StoreMode) -> anyhow::Re
         return Ok(());
     }
     anyhow::bail!(
-        "{ENV_STORE_SELLER_PUBKY} is set, but the database holds {} listings, {} orders and \
-         {} holds of other sellers ({}); single-seller mode needs a database that only its \
-         store seller has used; refusing to start",
+        "{ENV_STORE_SELLER_PUBKY} is set, but the database holds {} listings, {} orders, {} \
+         holds, {} store connections, {} payment configurations, {} webhook endpoints and {} \
+         seller settings of other sellers ({}); single-seller mode needs a database that only \
+         its store seller has used; refusing to start",
         rows.listings,
         rows.orders,
         rows.holds,
+        rows.connector_connections,
+        rows.payment_configs,
+        rows.webhook_endpoints,
+        rows.seller_settings,
         rows.sellers.join(", ")
     )
 }
