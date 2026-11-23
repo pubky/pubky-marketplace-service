@@ -503,8 +503,8 @@ async fn registration_after_window_expiry_before_the_sweep_is_refused(pool: PgPo
     assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
 }
 
-// A buyer-cancelled order no longer holds the prepared window: attachment
-// is refused even though the payment itself is still awaiting entitlement.
+// A buyer-cancelled order's payment has expired: attachment is refused, and
+// the cancel is on the prepared correlation's history.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn registration_after_order_cancellation_is_refused(pool: PgPool) {
     let (app, _fake) = test_app_with_locks(pool).await;
@@ -529,13 +529,15 @@ async fn registration_after_order_cancellation_is_refused(pool: PgPool) {
     let (status, body) = execute(&app, &buyer.token, &cancel).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(order_state(&app.pool, &order.order_id).await, "cancelled");
+    let (state, _, revision) = payment_state(&app.pool, &order.payment_id).await;
+    assert_eq!((state.as_str(), revision), ("expired", 3));
 
     let (status, body) = execute(
         &app,
         &buyer.token,
         &register_locks_command(
             &order.payment_id,
-            2,
+            3,
             TEST_BUNDLE_ID,
             &lock_resource_for(&seller.pubky),
             97,
@@ -546,7 +548,11 @@ async fn registration_after_order_cancellation_is_refused(pool: PgPool) {
     assert_eq!(body["error"]["code"], json!("INVALID_STATE"));
     assert_eq!(
         body["error"]["message"],
-        json!("The order no longer holds the prepared Locks payment window.")
+        json!("Only a payment awaiting entitlement can register a Locks correlation.")
+    );
+    assert_eq!(
+        observation_history(&app.pool, &order.payment_id).await,
+        vec![("buyer_cancelled".to_string(), "payment_expired".to_string())]
     );
     let (preparation_state, bundle): (String, Option<Vec<u8>>) = sqlx::query_as(
         "SELECT preparation_state, bundle_id_ciphertext FROM payment_locks_correlations",
@@ -1687,6 +1693,26 @@ async fn listing_quantities(pool: &PgPool) -> (i64, i64, i64) {
         .expect("listing row exists")
 }
 
+async fn cancel_as_buyer(app: &TestApp, buyer: &TestActor, order: &PendingOrder, command: u64) {
+    let cancel = common::order_command(
+        "order.cancel_request",
+        &order.order_id,
+        1,
+        json!({ "reason": "Changed my mind" }),
+        command,
+    );
+    let (status, body) = execute(app, &buyer.token, &cancel).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// `(available, reserved)` of the single listing in the test.
+async fn listing_stock(pool: &PgPool) -> (i64, i64) {
+    sqlx::query_as("SELECT available_quantity, reserved_quantity FROM listings")
+        .fetch_one(pool)
+        .await
+        .expect("listing row exists")
+}
+
 // The interleaving the Locks hold must survive: paykit-server dates a Locks
 // invoice from its own `payment_window` (24 h by default), not from
 // `LOCKS_PAYMENT_WINDOW_SECONDS` (1 h), so a buyer can pay after the
@@ -1946,28 +1972,84 @@ async fn a_never_observed_locks_task_is_held_up_to_the_bound(pool: PgPool) {
     assert_eq!(listing_quantities(&app.pool).await, (1, 0, 0));
 }
 
-// A verified completion whose order can no longer be confirmed (the buyer
-// cancelled while the lifecycle was pending) is retained under manual
-// review instead of confirming a dead order — and instead of vanishing.
+/// `(payment state, review reason)` of `payment_id`.
+async fn review_facts(pool: &PgPool, payment_id: &str) -> (String, Option<String>) {
+    sqlx::query_as("SELECT state, review_reason FROM payments WHERE id = $1::uuid")
+        .bind(payment_id)
+        .fetch_one(pool)
+        .await
+        .expect("payment row exists")
+}
+
+/// The refund-required outcome of a completion for a buyer-cancelled order:
+/// review reason stamped, both parties told, order still cancelled, nothing
+/// confirmed, no receipt.
+async fn assert_refund_required_after_cancel(app: &TestApp, order: &PendingOrder) {
+    assert_eq!(
+        review_facts(&app.pool, &order.payment_id).await,
+        (
+            "manual_review".to_string(),
+            Some("refund_required".to_string())
+        )
+    );
+    assert_eq!(order_state(&app.pool, &order.order_id).await, "cancelled");
+    assert_eq!(confirmation_events(&app.pool).await, 0);
+    assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM receipts").await, 0);
+    assert_eq!(
+        count(
+            &app.pool,
+            "SELECT COUNT(*) FROM outbox WHERE kind = 'notification.payment_refund_required'"
+        )
+        .await,
+        2,
+        "buyer and seller are told the money goes back"
+    );
+    assert_eq!(
+        correlation_outcome(&app.pool, &order.payment_id).await,
+        ("completed".to_string(), Some("completed".to_string()))
+    );
+}
+
+// The buyer cancels while the registered task is still pending: the payment
+// expires and the cancel is recorded on the correlation, which keeps polling.
+// The task completes later with the released unit still free. The buyer paid
+// and then withdrew, so the money is refund-required: the cancelled order is
+// neither confirmed nor revived, and the unit stays on the listing.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn completion_that_cannot_confirm_the_order_goes_to_manual_review(pool: PgPool) {
+async fn a_completion_after_the_buyer_cancelled_is_refund_required(pool: PgPool) {
     let (app, fake) = test_app_with_locks(pool).await;
     let holder = Uuid::new_v4();
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
     let order = create_pending_locks_order(&app, &seller, &buyer).await;
     register_locks(&app, &buyer.token, &order, &seller.pubky).await;
+    assert_eq!(listing_stock(&app.pool).await, (0, 1));
 
-    let cancel = common::order_command(
-        "order.cancel_request",
-        &order.order_id,
-        1,
-        json!({ "reason": "Changed my mind" }),
-        50,
-    );
-    let (status, body) = execute(&app, &buyer.token, &cancel).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
+    cancel_as_buyer(&app, &buyer, &order, 50).await;
     assert_eq!(order_state(&app.pool, &order.order_id).await, "cancelled");
+    let (state, adapter, _) = payment_state(&app.pool, &order.payment_id).await;
+    assert_eq!((state.as_str(), adapter.as_str()), ("expired", "locks"));
+    assert_eq!(
+        count(
+            &app.pool,
+            "SELECT COUNT(*) FROM events WHERE kind = 'payment.expired'"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        projected_states(&app, &buyer, &seller, &order).await,
+        vec![
+            ("expired".to_string(), "cancelled".to_string()),
+            ("expired".to_string(), "cancelled".to_string()),
+        ]
+    );
+    assert_eq!(listing_stock(&app.pool).await, (1, 0), "the hold released");
+    assert_eq!(
+        correlation_outcome(&app.pool, &order.payment_id).await.0,
+        "pending",
+        "the correlation keeps polling so a completion still surfaces"
+    );
 
     fake.complete_matching(&app.pool, TEST_BUNDLE_ID, &order.payment_id)
         .await;
@@ -1975,18 +2057,203 @@ async fn completion_that_cannot_confirm_the_order_goes_to_manual_review(pool: Pg
         .await
         .expect("worker pass runs");
     assert_eq!(summary.locks_completions_applied, 1);
-    let (state, _, _) = payment_state(&app.pool, &order.payment_id).await;
-    assert_eq!(state, "manual_review");
-    assert_eq!(order_state(&app.pool, &order.order_id).await, "cancelled");
-    assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM receipts").await, 0);
+    assert_refund_required_after_cancel(&app, &order).await;
     assert_eq!(
-        count(
-            &app.pool,
-            "SELECT COUNT(*) FROM events WHERE kind = 'payment.confirmed'"
-        )
-        .await,
-        0,
-        "a dead order is never confirmed"
+        listing_stock(&app.pool).await,
+        (1, 0),
+        "the refund never re-takes the unit"
+    );
+    assert_eq!(
+        observation_history(&app.pool, &order.payment_id).await,
+        vec![
+            ("buyer_cancelled".to_string(), "payment_expired".to_string()),
+            ("completed".to_string(), "manual_review".to_string()),
+        ]
+    );
+
+    // The correlation is terminal: later passes change nothing.
+    let summary = next_poll(&app, holder).await;
+    assert_eq!(summary.locks_completions_applied, 0);
+    assert_eq!(fake.lookup_count(), 1);
+    assert_eq!(manual_review_events(&app.pool).await, 1);
+}
+
+// The same cancel, but another buyer holds the released unit by the time the
+// task completes: still refund-required, and the other buyer's hold is
+// untouched.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_completion_after_the_buyer_cancelled_leaves_the_next_buyers_hold_alone(pool: PgPool) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let holder = Uuid::new_v4();
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
+    register_locks(&app, &buyer.token, &order, &seller.pubky).await;
+    cancel_as_buyer(&app, &buyer, &order, 50).await;
+
+    let second = new_actor(&app).await;
+    let (status, body) = execute(
+        &app,
+        &second.token,
+        &as_digital_checkout(checkout_at_listing_revision(
+            &seller.pubky,
+            "00000000-0000-4000-8000-000000000151",
+            3,
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "second buyer's checkout: {body}");
+    let next = PendingOrder {
+        order_id: body["result"]["orders"][0]["id"]
+            .as_str()
+            .expect("order id")
+            .to_string(),
+        payment_id: body["result"]["payments"][0]["id"]
+            .as_str()
+            .expect("payment id")
+            .to_string(),
+    };
+    let mut prepare = payment_command(&next.payment_id, 1, "prepare_locks", 0, 90);
+    prepare["kind"] = json!("payment.prepare_locks");
+    prepare["payload"] = json!({ "payment_id": next.payment_id });
+    let (status, body) = execute(&app, &second.token, &prepare).await;
+    assert_eq!(status, StatusCode::OK, "second buyer's preparation: {body}");
+    assert_eq!(listing_stock(&app.pool).await, (0, 1));
+
+    fake.complete_matching(&app.pool, TEST_BUNDLE_ID, &order.payment_id)
+        .await;
+    let summary = run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    assert_eq!(summary.locks_completions_applied, 1);
+    assert_refund_required_after_cancel(&app, &order).await;
+    assert_eq!(listing_stock(&app.pool).await, (0, 1));
+    assert_eq!(
+        order_state(&app.pool, &next.order_id).await,
+        "pending_payment"
+    );
+    assert_eq!(
+        payment_state(&app.pool, &next.payment_id).await.0,
+        "awaiting_entitlement"
+    );
+}
+
+// The race itself: the worker has already read the completed task from the
+// Lock Server when the buyer's cancel commits. The worker then applies the
+// result under the payment lock, sees the cancel, and refunds.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_completion_in_flight_when_the_buyer_cancels_is_refund_required(pool: PgPool) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
+    register_locks(&app, &buyer.token, &order, &seller.pubky).await;
+    fake.complete_matching(&app.pool, TEST_BUNDLE_ID, &order.payment_id)
+        .await;
+
+    let release = fake.park_next_lookup();
+    let in_flight = tokio::spawn({
+        let state = app.state.clone();
+        let locks = state.locks.clone().expect("locks runtime");
+        let now = app.clock.now();
+        async move { workers::verify_due_locks_lifecycles(&state, &locks, now).await }
+    });
+    while fake.lookup_count() < 1 {
+        tokio::task::yield_now().await;
+    }
+    cancel_as_buyer(&app, &buyer, &order, 50).await;
+    assert_eq!(
+        payment_state(&app.pool, &order.payment_id).await.0,
+        "expired"
+    );
+    release.notify_one();
+    let applied = in_flight.await.expect("pass joins").expect("pass runs");
+    assert_eq!(applied, 1);
+
+    assert_refund_required_after_cancel(&app, &order).await;
+    assert_eq!(listing_stock(&app.pool).await, (1, 0));
+}
+
+// The other side of the race: the completion confirms first, so the order is
+// paid and the buyer's cancel becomes an ordinary request awaiting the
+// seller. Nothing is refund-required and the payment stays confirmed.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_cancel_after_the_completion_confirmed_awaits_the_seller(pool: PgPool) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let holder = Uuid::new_v4();
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
+    register_locks(&app, &buyer.token, &order, &seller.pubky).await;
+    fake.complete_matching(&app.pool, TEST_BUNDLE_ID, &order.payment_id)
+        .await;
+    let summary = run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    assert_eq!(summary.locks_completions_applied, 1);
+    assert_eq!(order_state(&app.pool, &order.order_id).await, "paid");
+
+    let cancel = common::order_command(
+        "order.cancel_request",
+        &order.order_id,
+        2,
+        json!({ "reason": "Changed my mind" }),
+        50,
+    );
+    let (status, body) = execute(&app, &buyer.token, &cancel).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        order_state(&app.pool, &order.order_id).await,
+        "cancel_requested"
+    );
+    assert_eq!(
+        review_facts(&app.pool, &order.payment_id).await,
+        ("confirmed".to_string(), None)
+    );
+    assert_eq!(confirmation_events(&app.pool).await, 1);
+    assert_eq!(
+        observation_history(&app.pool, &order.payment_id).await,
+        vec![("completed".to_string(), "payment_confirmed".to_string())]
+    );
+}
+
+// An order the buyer cancelled before the cancel expired Locks payments still
+// carries an `awaiting_entitlement` payment on a cancelled order and has no
+// `buyer_cancelled` record. Its completion is refund-required as well.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_completion_for_an_order_cancelled_without_expiring_its_payment_is_refund_required(
+    pool: PgPool,
+) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let holder = Uuid::new_v4();
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
+    register_locks(&app, &buyer.token, &order, &seller.pubky).await;
+    sqlx::query(
+        "UPDATE orders SET state = 'cancelled', revision = revision + 1, \
+         cancellation_reason = 'Changed my mind', stock_held = false, hold_expires_at = NULL \
+         WHERE id = $1::uuid",
+    )
+    .bind(&order.order_id)
+    .execute(&app.pool)
+    .await
+    .expect("order cancelled as the earlier handler left it");
+    assert_eq!(
+        payment_state(&app.pool, &order.payment_id).await.0,
+        "awaiting_entitlement"
+    );
+
+    fake.complete_matching(&app.pool, TEST_BUNDLE_ID, &order.payment_id)
+        .await;
+    let summary = run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    assert_eq!(summary.locks_completions_applied, 1);
+    assert_refund_required_after_cancel(&app, &order).await;
+    assert_eq!(
+        observation_history(&app.pool, &order.payment_id).await,
+        vec![("completed".to_string(), "manual_review".to_string())]
     );
 }
 

@@ -1217,6 +1217,21 @@ cannot retract a published request, and `resolve(abandoned)` would stop
 paykit observing it. Once money is observed (`detected`,
 `awaiting_seller_confirmation`, `confirmed`) the buyer's cancel is refused.
 
+**Buyer cancel of a Locks order.** `order.cancel_request` on an unpaid
+Locks order expires its payment (`awaiting_entitlement → expired`) in the
+cancel transaction and appends `buyer_cancelled` (outcome
+`payment_expired`) to the correlation's observation history; the
+correlation keeps polling. Registration is refused once the order left
+`pending_payment`, so a task that completes afterwards was registered
+before the cancel: the buyer paid, then withdrew. Its verified completion
+takes the refund-required shape (payment `manual_review` with
+`review_reason=refund_required`, buyer and seller notified, no receipt)
+and the order stays `cancelled`, even when the released unit is still
+free. An order cancelled before the cancel expired Locks payments (a
+cancelled order whose payment is still `awaiting_entitlement`) is treated
+the same way. A window expiry is different: its late completion takes the
+late-money fork and completes the order when the unit is free.
+
 ### `shared_manual` checkout and manual-review resolution (W1.15)
 
 A seller whose Paykit creator is `shared_manual` confirms Bitcoin payments
@@ -1722,8 +1737,9 @@ and refund branches):
   the sold quantities to available under the same quantity-balance
   constraint (see the divergence table for the resulting listing
   `sold → available` transition). Cancellation never touches a confirmed
-  payment: it stays confirmed with its receipt intact (an unpaid Paykit
-  payment expires; see "Buyer cancel of a Bitcoin order"), and
+  payment: it stays confirmed with its receipt intact (an unpaid Paykit or
+  Locks payment expires; see "Buyer cancel of a Bitcoin order" and "Buyer
+  cancel of a Locks order"), and
   the only money path out of a cancelled order is the externally evidenced
   `refund.record_external` — the service never claims to move funds. An
   auction winner's cancel releases the winning hold through the reservation

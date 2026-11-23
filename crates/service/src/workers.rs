@@ -54,7 +54,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use uuid::Uuid;
 
-use crate::bitcoin_review::{apply_late_money, LateMoneyOutcome};
+use crate::bitcoin_review::{apply_late_money, refund_required, LateMoneyOutcome};
 use crate::handlers::auction::{close_locked_auction, parse_auction};
 use crate::handlers::payment::confirm_order;
 use crate::handlers::{fetch_order_for_update, insert_notification_intent, LISTING_COLUMNS};
@@ -62,7 +62,7 @@ use crate::homeserver::HomeserverListingClient;
 use crate::locks::{
     BindingRefusal, LocksClientBinding, LocksLookupOutcome, LocksRuntime, LocksTaskStatus,
 };
-use crate::model::{ListingRow, PaymentRow};
+use crate::model::{ListingRow, OrderRow, PaymentRow};
 use crate::payment_attempt::{AcceptedAsset, OfferedAssets, PaymentAsset, PaymentTerms};
 use crate::payments::{
     ActivationTerms, PaykitClient, PaykitCommandError, PaykitLifecycleTarget, PaykitStatusOutcome,
@@ -1998,12 +1998,83 @@ async fn apply_manual_review(
     Ok(applied)
 }
 
+/// Whether the buyer cancelled the order before its Locks task completed.
+/// The cancel expires the payment and appends
+/// [`crate::locks::BUYER_CANCELLED`] to the correlation's history, which
+/// tells it apart from a window expiry. A cancel that predates that record
+/// left the payment `awaiting_entitlement` on the cancelled order, a pair
+/// no other path produces: the window sweep expires the payment, and the
+/// refund and resolution paths cancel only from `manual_review`.
+async fn cancelled_by_buyer(
+    tx: &mut Transaction<'_, Postgres>,
+    correlation_id: Uuid,
+    payment: &PaymentRow,
+    order: &OrderRow,
+) -> Result<bool, sqlx::Error> {
+    if order.state != "cancelled" {
+        return Ok(false);
+    }
+    if payment.state == "awaiting_entitlement" {
+        return Ok(true);
+    }
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM payment_locks_observations \
+         WHERE correlation_id = $1 AND observed_status = $2)",
+    )
+    .bind(correlation_id)
+    .bind(crate::locks::BUYER_CANCELLED)
+    .fetch_one(&mut **tx)
+    .await
+}
+
+/// A verified completion for an order the buyer cancelled first. The buyer
+/// paid and then withdrew, so the money goes back: the payment takes the
+/// refund-required shape (`manual_review`, `review_reason =
+/// refund_required`, both parties notified, no receipt) and the order stays
+/// cancelled even when its released unit is still free. Runs in the
+/// caller's transaction, which holds the payment and order locks.
+async fn refund_after_buyer_cancel(
+    mut tx: Transaction<'_, Postgres>,
+    row: &ClaimedCorrelation,
+    payment: &PaymentRow,
+    order: &OrderRow,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    if let Err(failure) = refund_required(
+        &mut tx,
+        payment,
+        order,
+        "cancelled by the buyer before payment completed",
+        row.id,
+        &payment.buyer_pubky,
+        now,
+    )
+    .await
+    {
+        tx.rollback().await?;
+        anyhow::bail!(
+            "refund of locks completion {} after buyer cancel failed: {:?}",
+            row.id,
+            std::mem::discriminant(&failure)
+        );
+    }
+    mark_correlation_completed(&mut tx, row.id, "manual_review", now).await?;
+    tx.commit().await?;
+    tracing::warn!(
+        payment_id = %payment.id,
+        correlation_id = %row.id,
+        "verified locks completion for a buyer-cancelled order; refund required"
+    );
+    Ok(true)
+}
+
 /// Applies one independently verified completed Locks result. Advances
 /// `awaiting_entitlement → confirmed` exactly once (payment CAS + the
 /// `events_one_payment_confirmed` unique index); routes a completion that
 /// arrives after marketplace expiry — or one whose order can no longer be
-/// confirmed — to `manual_review`; treats an already-advanced payment as a
-/// harmless duplicate.
+/// confirmed — to `manual_review`; makes a completion for an order the
+/// buyer cancelled first refund-required; treats an already-advanced
+/// payment as a harmless duplicate.
 async fn apply_completed_lifecycle(
     pool: &PgPool,
     row: &ClaimedCorrelation,
@@ -2026,6 +2097,9 @@ async fn apply_completed_lifecycle(
             let Some(order) = fetch_order_for_update(&mut tx, payment.order_id).await? else {
                 anyhow::bail!("correlation {} references a missing order", row.id);
             };
+            if cancelled_by_buyer(&mut tx, row.id, &payment, &order).await? {
+                return refund_after_buyer_cancel(tx, row, &payment, &order, now).await;
+            }
             match confirm_order(
                 &mut tx,
                 &payment.buyer_pubky,
@@ -2096,6 +2170,9 @@ async fn apply_completed_lifecycle(
             let Some(order) = fetch_order_for_update(&mut tx, payment.order_id).await? else {
                 anyhow::bail!("correlation {} references a missing order", row.id);
             };
+            if cancelled_by_buyer(&mut tx, row.id, &payment, &order).await? {
+                return refund_after_buyer_cancel(tx, row, &payment, &order, now).await;
+            }
             match apply_late_money(
                 &mut tx,
                 keys,
