@@ -371,7 +371,7 @@ pub async fn execute_with_edge(
                     ));
                 }
                 let failure = CommandFailure::refused(
-                    RefusalKind::UpstreamUnavailable,
+                    crate::refusal_audit::RefusalKind::UpstreamUnavailable,
                     ErrorCode::UpstreamUnavailable,
                     crate::homeserver::TRANSACTION_READS_BUSY,
                 );
