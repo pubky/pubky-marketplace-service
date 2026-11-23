@@ -462,6 +462,17 @@ counted. The message counts each kind and names up to three of those
 sellers by the first eight characters of their pubky. Nothing is removed:
 start the store on its own database, or unset `STORE_SELLER_PUBKY`.
 
+Set `STORE_SELLER_PUBKY` on every replica of the service and the
+`connector-worker` at once, on a database no other seller uses. A replica
+started without it serves every seller, and a row it writes for another
+seller refuses the next start of every replica that has it.
+
+A refusal does not hide whether another seller's record exists: an
+existing order, payment, receipt or offer of another seller answers 409
+`SELLER_NOT_SERVED`, while an unknown id reaches the handler and answers
+its 404. The boot check keeps such records out of a single-seller
+database, so there is nothing to find.
+
 `LISTING_MODERATION=off` is allowed only in this mode. The moderation gate is
 then not built, `NEXUS_URL` is not read and must be unset, and the boot log
 says so. In marketplace mode `off` refuses to boot.
