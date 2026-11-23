@@ -714,6 +714,7 @@ fn refusal_audit_command_failure_formation_is_compile_closed() {
         include_str!("../src/handlers/returns.rs"),
         include_str!("../src/handlers/reviews.rs"),
         include_str!("../src/handlers/sync_listing.rs"),
+        include_str!("../src/store_seller.rs"),
     ]
     .join("\n");
     for forbidden in [
@@ -2779,6 +2780,17 @@ async fn refusal_audit_real_fixture_is_invariant_across_writer_states(pool: PgPo
         Uuid::parse_str(&stock_id).expect("stock order"),
         Some(Uuid::new_v4()),
         serde_json::json!({"outcome":"paid"}),
+    ));
+
+    let single_seller = common::reconfigured(&base, |config| {
+        config.store_mode =
+            marketplace_service::store_seller::StoreMode::SingleSeller(other.pubky.clone());
+    });
+    cases.push(command_case(
+        RefusalKind::SellerNotServed,
+        &single_seller,
+        &buyer,
+        common::reserve_command(&seller.pubky, 96, 1, 1),
     ));
 
     assert_eq!(

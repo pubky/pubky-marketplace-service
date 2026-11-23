@@ -68,6 +68,38 @@ pub async fn execute_with_edge(
     };
     let request_hash = command.request_hash();
 
+    // In single-seller mode a command for any other seller is refused before
+    // any other gate. A command id that already has a stored result is a
+    // replay and is answered from it.
+    if let Some(failure) = crate::store_seller::command_refusal(state, &command).await? {
+        if stored_command_result(&state.pool, actor, command.command_id)
+            .await?
+            .is_none()
+        {
+            log_command(
+                actor,
+                command.kind(),
+                &command.command_id.to_string(),
+                &command.aggregate_id,
+                "refused",
+                Some(failure.code()),
+                Some(failure.message()),
+                command.expected_revision,
+                started.elapsed().as_millis() as u64,
+            );
+            enqueue_refusal(
+                state,
+                actor,
+                state.clock.now(),
+                SurfaceKind::V1Command,
+                command_kind(&command.payload),
+                failure.refusal_kind(),
+                Some(command.command_id),
+            );
+            return Ok(failure_response(&failure));
+        }
+    }
+
     // A command that sells a listing is refused when the index says the
     // listing, or its seller, is moderated, and when the seller's current
     // record says it is not for sale (any non-active state for a new
@@ -686,7 +718,8 @@ fn enqueue_refusal(
     }
 }
 
-fn command_kind(payload: &CommandPayload) -> CommandKind {
+/// The refusal-audit kind a command is recorded under.
+pub fn command_kind(payload: &CommandPayload) -> CommandKind {
     match payload {
         CommandPayload::RegisterListing(_) => CommandKind::RegisterListing,
         CommandPayload::SyncListing(_) => CommandKind::SyncListing,

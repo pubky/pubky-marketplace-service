@@ -544,6 +544,13 @@ pub enum DeliverableFetchOutcome {
 /// integration tests can stand in a local listener; production only ever
 /// constructs [`HttpHomeserverClient`].
 pub trait HomeserverListingClient: Send + Sync + 'static {
+    /// How this client finds a pubky's homeserver (`fixed` or `pkarr`),
+    /// reported by `/health`. `None` for a client that reads no homeserver
+    /// (test doubles).
+    fn resolution(&self) -> Option<&'static str> {
+        None
+    }
+
     fn fetch_listing<'a>(
         &'a self,
         seller_pubky: &'a str,
@@ -1263,6 +1270,13 @@ fn pubky_host_prefix(seller_pubky: &str) -> &str {
 }
 
 impl HomeserverListingClient for HttpHomeserverClient {
+    fn resolution(&self) -> Option<&'static str> {
+        Some(match self.transport {
+            Transport::Fixed { .. } => "fixed",
+            Transport::Pkarr(_) => "pkarr",
+        })
+    }
+
     fn fetch_grant_session_proof<'a>(
         &'a self,
         pubky: &'a str,

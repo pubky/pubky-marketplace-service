@@ -6,6 +6,7 @@ use tracing_subscriber::EnvFilter;
 
 use marketplace_service::clock::SystemClock;
 use marketplace_service::config::Config;
+use marketplace_service::store_seller::ListingModeration;
 use marketplace_service::{http, workers, AppState};
 
 /// Whether `HOMESERVER_RESOLUTION` selects `pkarr`. A bad value is refused
@@ -170,15 +171,40 @@ async fn main() -> anyhow::Result<()> {
             std::env::var(marketplace_service::homeserver::ENV_HOMESERVER_URL).unwrap_or_default(),
         );
     }
-    // NEXUS_URL is required: checkout, bids and offers on a moderated listing
-    // are refused from the index's moderation state, and running without it
-    // would sell moderated listings by omission.
-    let listing_moderation = Arc::new(
-        marketplace_service::listing_moderation::ListingModerationGate::new(Arc::new(
-            marketplace_service::listing_moderation::client_from_env()?,
-        )),
-    );
-    tracing::info!("listing moderation gate enabled");
+    match config.store_mode.store_seller() {
+        Some(seller) => tracing::info!(
+            store_mode = config.store_mode.as_str(),
+            store_seller = seller,
+            "single-seller mode: commands and routes for any other seller are refused"
+        ),
+        None => tracing::info!(
+            store_mode = config.store_mode.as_str(),
+            "marketplace mode: any seller is served"
+        ),
+    }
+    // NEXUS_URL is required while moderation is on: checkout, bids and offers
+    // on a moderated listing are refused from the index's moderation state,
+    // and running without it would sell moderated listings by omission. Only
+    // a single-seller deployment may turn moderation off, explicitly.
+    let listing_moderation = match marketplace_service::store_seller::moderation_from_lookup(
+        &|name| std::env::var(name).ok(),
+        &config.store_mode,
+    )? {
+        ListingModeration::On => {
+            let gate = marketplace_service::listing_moderation::ListingModerationGate::new(
+                Arc::new(marketplace_service::listing_moderation::client_from_env()?),
+            );
+            tracing::info!("listing moderation gate enabled");
+            Some(Arc::new(gate))
+        }
+        ListingModeration::Off => {
+            tracing::info!(
+                "listing moderation off (LISTING_MODERATION=off in single-seller mode): \
+                 NEXUS_URL is not read and no listing is checked against the index"
+            );
+            None
+        }
+    };
     match &attestor {
         Some(attestor) => tracing::info!(
             attestor_pubky = attestor.pubky(),
@@ -264,7 +290,7 @@ async fn main() -> anyhow::Result<()> {
         .with_attestor_publisher(attestor_publisher)
         .with_homeserver(Some(homeserver))
         .with_refund_chain(refund_chain)
-        .with_listing_moderation(Some(listing_moderation))
+        .with_listing_moderation(listing_moderation)
         .with_payments(payments)
         .with_pickup(pickup)
         .with_digital(digital)
