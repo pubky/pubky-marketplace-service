@@ -660,6 +660,17 @@ pub trait HomeserverListingClient: Send + Sync + 'static {
         Box::pin(async { HomeserverEventsOutcome::Unavailable })
     }
 
+    /// [`Self::fetch_listing`], also naming the homeserver that answered
+    /// (`None`: the configured one). A deletion proof takes its 404 and its
+    /// `DEL` from the same homeserver. The default names the configured one.
+    fn fetch_listing_from<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        listing_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = (HomeserverFetchOutcome, Option<String>)> + Send + 'a>> {
+        Box::pin(async move { (self.fetch_listing(seller_pubky, listing_id).await, None) })
+    }
+
     /// Looks `pubky`'s homeserver up again on the network, past any cached
     /// record, so the reads that follow go to the homeserver its record names
     /// now. A deletion proof runs this first: a cached record may still name
@@ -925,6 +936,16 @@ impl HttpHomeserverClient {
     }
 
     async fn fetch_inner(&self, seller_pubky: &str, path: &str) -> HomeserverFetchOutcome {
+        self.fetch_inner_from(seller_pubky, path).await.0
+    }
+
+    /// [`Self::fetch_inner`], also naming the homeserver that answered
+    /// (`None`: the configured one, or no answer).
+    async fn fetch_inner_from(
+        &self,
+        seller_pubky: &str,
+        path: &str,
+    ) -> (HomeserverFetchOutcome, Option<String>) {
         let prefix = pubky_host_prefix(seller_pubky);
         let response = self
             .get(seller_pubky, Target::Record(path), FETCH_TIMEOUT)
@@ -933,9 +954,10 @@ impl HttpHomeserverClient {
             Ok(response) => response,
             Err(Unreached) => {
                 tracing::warn!("homeserver record fetch transport failure");
-                return HomeserverFetchOutcome::Unavailable;
+                return (HomeserverFetchOutcome::Unavailable, None);
             }
         };
+        let homeserver = response.homeserver();
         let status = response.status();
         if status == reqwest::StatusCode::NOT_FOUND {
             tracing::warn!(
@@ -944,7 +966,7 @@ impl HttpHomeserverClient {
                 status = %status,
                 "homeserver record fetch not found"
             );
-            return HomeserverFetchOutcome::NotFound;
+            return (HomeserverFetchOutcome::NotFound, homeserver);
         }
         if !status.is_success() {
             tracing::warn!(
@@ -953,7 +975,7 @@ impl HttpHomeserverClient {
                 status = %status,
                 "homeserver record fetch rejected"
             );
-            return HomeserverFetchOutcome::Unavailable;
+            return (HomeserverFetchOutcome::Unavailable, homeserver);
         }
         let record = response
             .bytes()
@@ -961,10 +983,10 @@ impl HttpHomeserverClient {
             .ok()
             .and_then(|body| serde_json::from_slice::<Value>(body.as_ref()).ok());
         match record {
-            Some(record) => HomeserverFetchOutcome::Found(record),
+            Some(record) => (HomeserverFetchOutcome::Found(record), homeserver),
             None => {
                 tracing::warn!("homeserver record fetch returned a non-JSON body");
-                HomeserverFetchOutcome::Unavailable
+                (HomeserverFetchOutcome::Unavailable, homeserver)
             }
         }
     }
@@ -1174,6 +1196,20 @@ impl HomeserverListingClient for HttpHomeserverClient {
     ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
         Box::pin(async move {
             self.fetch_inner(
+                seller_pubky,
+                &format!("/pub/pubky.app/marketplace/v1/listings/{listing_id}"),
+            )
+            .await
+        })
+    }
+
+    fn fetch_listing_from<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        listing_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = (HomeserverFetchOutcome, Option<String>)> + Send + 'a>> {
+        Box::pin(async move {
+            self.fetch_inner_from(
                 seller_pubky,
                 &format!("/pub/pubky.app/marketplace/v1/listings/{listing_id}"),
             )
