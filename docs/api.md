@@ -375,14 +375,14 @@ request failed, so clients should branch on HTTP status first, and parse
    refused with `UPSTREAM_UNAVAILABLE` instead (see
    [Listing lifecycle](../README.md#listing-lifecycle)).
 
-   Under `HOMESERVER_RESOLUTION=pkarr`, `offer.create`, `offer.counter`,
-   `offer.accept`, `drop.sync`, `payment.sandbox_advance`,
-   `payment.prepare_locks` and `POST /v0/orders/{id}/payment-method` are also
-   refused with `UPSTREAM_UNAVAILABLE` when the service is already reading as
-   many sellers' homeservers inside database transactions as it allows (see
-   [Homeserver reads](../README.md#homeserver-reads)). Nothing was changed;
-   retry shortly. A replayed command is still answered from its stored
-   result.
+   `offer.counter`, `offer.accept`, `payment.sandbox_advance`,
+   `payment.prepare_locks` and `POST /v0/orders/{id}/payment-method` read
+   the seller's homeserver before their database transaction (see
+   [Homeserver reads](../README.md#homeserver-reads)). One whose offer,
+   order or payment changed in between, so that the transaction needs a
+   record that was not read, is refused with `UPSTREAM_UNAVAILABLE`.
+   Nothing was changed; retry shortly. A replayed command is still answered
+   from its stored result.
 
    `BID_TOO_LOW` refuses an `auction.place_bid` whose maximum is under the
    bidder's minimum next bid. While no bid stands the minimum is the starting

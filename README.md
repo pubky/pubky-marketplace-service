@@ -303,21 +303,27 @@ rather than the SDK's:
   the lookup of the pubky's homeserver to the end of the body: 10 s, or
   120 s for a digital deliverable. A deletion proof first reads the
   seller's record from the network, bounded by 10 s.
-- **Bounded reads inside transactions.** `listing.sync` makes its reads
-  (the record, then, for a missing record, the deletion proof: the network
-  lookup, the record again and the event stream, at most 40 s) and
-  `digital_delivery.set` reads its file back (up to 120 s) before the
-  database transaction, so no database connection waits on a homeserver for
-  them. The other reads stay inside their transaction, as under `fixed` and
-  within the same 10 s budget: offers (the listing record), `drop.sync`,
-  Locks preparation (content locks) and the return policy and seller terms
-  captured when an order is paid (`payment.sandbox_advance`, Locks
-  preparation, payment-method bind). Each of those commands holds one of 4
-  permits per process while its transaction is open, so homeservers that
-  stall can hold at most 4 of the main pool's 20 connections. A command
-  that finds none free is refused at once with `UPSTREAM_UNAVAILABLE` and
-  can be retried; a replay is answered from its stored result. Under
-  `fixed` no permit is taken.
+- **No reads inside transactions.** Every homeserver read is made before
+  the database transaction it serves, in both modes, so no database
+  connection, row lock or Paykit call waits on a homeserver:
+  `listing.sync` (the record, then, for a missing record, the deletion
+  proof: the network lookup, the record again and the event stream, at most
+  40 s), `digital_delivery.set` (the file read back, up to 120 s), offers
+  (the listing record), `drop.sync` (the drop record), Locks preparation
+  (the content lock) and the seller terms and return policy captured when
+  an order's payment starts (`payment.sandbox_advance`, Locks preparation,
+  payment-method bind). Each read is made only for a command that passes
+  the checks its transaction makes before using it: the payment's buyer
+  for the payment commands, an offer's participants, a live listing that is
+  not the actor's own. The transaction makes those checks again under its
+  locks and uses the record read, fenced as before: an offer pins the
+  record's revision and SHA-256, a drop or listing sync compares revisions
+  with the stored row, a Locks preparation requires the document its
+  sealed checkout snapshot names, and the terms are frozen once per order.
+  A command whose order, payment or offer changed between its read and its
+  transaction so that it now needs a record it did not read is refused
+  with `UPSTREAM_UNAVAILABLE` and can be retried; a replay is answered from
+  its stored result.
 
 Both modes give each read the same outcomes and body caps. A
 record is found, missing (the pubky's homeserver answered 404) or
