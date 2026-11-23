@@ -4,7 +4,8 @@
 //! on another; a revival records the superseded delete with its homeserver,
 //! whose marker changes only with a revival; a delete older than the revival
 //! marker is refused only on the marker's homeserver; and the documented
-//! back-out restarts every cursor on the configured homeserver. The follower
+//! back-out restarts every cursor on the configured homeserver and clears the
+//! listing markers that name another one, leaving the guard enabled. The follower
 //! across a real homeserver move is exercised in `homeserver_pkarr_test.rs`.
 
 use sqlx::PgPool;
@@ -322,4 +323,82 @@ async fn migration_0100_scopes_deletion_cursors_to_their_homeserver_and_is_rerun
     .await
     .expect("the documented back-out restart");
     assert_eq!(stored_cursor(&pool).await, (None, None));
+
+    // Then the listing markers that name a homeserver: kept aside, and
+    // cleared with the guard disabled for the one transaction.
+    assert_eq!(
+        markers(&pool).await,
+        (
+            Some("3".to_string()),
+            Some(a.clone()),
+            Some("3".to_string()),
+            Some(a.clone())
+        )
+    );
+    sqlx::raw_sql(
+        "BEGIN; \
+         SET LOCAL lock_timeout = '10s'; \
+         CREATE TABLE listing_homeserver_markers_0100 AS \
+             SELECT aggregate_id, deleted_event_cursor, deleted_event_homeserver, \
+                    revived_from_cursor, revived_from_homeserver \
+             FROM listings \
+             WHERE deleted_event_homeserver IS NOT NULL OR revived_from_homeserver IS NOT NULL; \
+         ALTER TABLE listings DISABLE TRIGGER listings_deletion_guard; \
+         UPDATE listings SET deleted_event_cursor = '0', deleted_event_homeserver = NULL \
+             WHERE deleted_event_homeserver IS NOT NULL; \
+         UPDATE listings SET revived_from_cursor = NULL, revived_from_homeserver = NULL \
+             WHERE revived_from_homeserver IS NOT NULL; \
+         ALTER TABLE listings ENABLE TRIGGER listings_deletion_guard; \
+         COMMIT;",
+    )
+    .execute(&pool)
+    .await
+    .expect("the documented marker back-out");
+    assert_eq!(
+        markers(&pool).await,
+        (Some("0".to_string()), None, None, None)
+    );
+    let kept: (String, String, String, String, String) = sqlx::query_as(
+        "SELECT aggregate_id, deleted_event_cursor, deleted_event_homeserver, \
+         revived_from_cursor, revived_from_homeserver FROM listing_homeserver_markers_0100",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the kept markers");
+    assert_eq!(
+        kept,
+        (
+            AGGREGATE.to_string(),
+            "3".to_string(),
+            a.clone(),
+            "3".to_string(),
+            a.clone()
+        )
+    );
+    let enabled: String = sqlx::query_scalar(
+        "SELECT tgenabled::text FROM pg_trigger WHERE tgname = 'listings_deletion_guard'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("guard trigger");
+    assert_eq!(enabled, "O", "the guard is enabled again");
+
+    // A binary from before 0100 revives and tombstones on the configured
+    // homeserver, its own numbering, unhindered by the other homeserver's.
+    revive(&pool).await;
+    assert_eq!(
+        markers(&pool).await,
+        (None, None, Some("0".to_string()), None)
+    );
+    tombstone(&pool, "1", None)
+        .await
+        .expect("a delete on the configured homeserver after the back-out");
+    let refused =
+        sqlx::query("UPDATE listings SET revived_from_cursor = NULL WHERE aggregate_id = $1")
+            .bind(AGGREGATE)
+            .execute(&pool)
+            .await
+            .expect_err("the guard is back")
+            .to_string();
+    assert!(refused.contains("would move backwards"), "{refused}");
 }
