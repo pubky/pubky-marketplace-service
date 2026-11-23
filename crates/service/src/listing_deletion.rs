@@ -188,14 +188,33 @@ pub async fn confirm_missing_record_deleted(
     }
 }
 
+/// Both steps, each answered by the same homeserver. Each read looks the
+/// seller's homeserver up on its own, so a refresh or a cache eviction
+/// between them could send the `DEL` read elsewhere; a `DEL` from another
+/// homeserver than the 404's proves nothing and is retried.
 async fn record_then_latest_event(
     homeserver: &dyn HomeserverListingClient,
     seller_pubky: &str,
     listing_id: &str,
 ) -> DeletionCheck {
-    match homeserver.fetch_listing(seller_pubky, listing_id).await {
+    let (record, record_homeserver) = homeserver
+        .fetch_listing_from(seller_pubky, listing_id)
+        .await;
+    match record {
         HomeserverFetchOutcome::NotFound => {
-            latest_event_is_delete(homeserver, seller_pubky, listing_id).await
+            match latest_event_is_delete(homeserver, seller_pubky, listing_id).await {
+                DeletionCheck::Deleted {
+                    homeserver: event_homeserver,
+                    ..
+                } if event_homeserver != record_homeserver => {
+                    tracing::warn!(
+                        seller_prefix = %seller_pubky.get(..8).unwrap_or(seller_pubky),
+                        "listing deletion proof read its record and its events from different homeservers"
+                    );
+                    DeletionCheck::Unavailable { retry_after: None }
+                }
+                check => check,
+            }
         }
         HomeserverFetchOutcome::Found(_) => DeletionCheck::NotDeleted,
         HomeserverFetchOutcome::Unavailable => DeletionCheck::Unavailable { retry_after: None },
