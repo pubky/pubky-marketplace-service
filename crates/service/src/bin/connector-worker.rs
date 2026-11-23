@@ -63,6 +63,7 @@ async fn main() -> anyhow::Result<()> {
         .connect(&config.database_url)
         .await?;
     marketplace_service::migrations::run(&pool).await?;
+    marketplace_service::store_seller::refuse_other_sellers(&pool, &config.store_mode).await?;
     connectors::assert_credentials_coherent(&pool, Some(runtime.keys.as_ref())).await?;
     tracing::info!(
         providers = ?runtime.providers.kinds(),

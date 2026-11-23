@@ -1030,6 +1030,136 @@ async fn single_seller_mode_refuses_to_start_on_another_sellers_settings_and_int
     assert!(!error.contains(&carol), "{error}");
 }
 
+/// `connector-worker` on `pool`'s database, connectors on, serving `store`.
+fn connector_worker(pool: &PgPool, store: &str) -> std::process::Command {
+    let mut database = url::Url::parse(&std::env::var("DATABASE_URL").expect("DATABASE_URL"))
+        .expect("database url");
+    database.set_path(&format!(
+        "/{}",
+        pool.connect_options()
+            .get_database()
+            .expect("test database name")
+    ));
+    let root = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [7u8; 32]);
+    let mut worker = std::process::Command::new(env!("CARGO_BIN_EXE_connector-worker"));
+    worker
+        .env_clear()
+        .env("DATABASE_URL", database.as_str())
+        .env(
+            "REFUSAL_AUDIT_DATABASE_URL",
+            "postgres://marketplace_refusal_audit_writer_login@audit.example/refusal",
+        )
+        .env(
+            "REFUSAL_AUDIT_RETENTION_DATABASE_URL",
+            "postgres://marketplace_refusal_audit_retention@audit.example/refusal",
+        )
+        .env("REFUSAL_AUDIT_HMAC_ROOT_B64", root)
+        .env("REFUSAL_AUDIT_HMAC_KEY_EPOCH", "1")
+        .env("REFUSAL_AUDIT_BACKUP_EXPIRY_ATTESTED", "true")
+        .env("REFUSAL_AUDIT_REPLICA_EXPIRY_ATTESTED", "true")
+        .env("REFUSAL_AUDIT_RESIDUAL_RISK_ACCEPTED", "true")
+        .env("CONNECTORS_ENABLED", "true")
+        .env("CONNECTOR_PUBLIC_BASE_URL", "https://market.example")
+        .env("CONNECTOR_RETURN_URL", "https://market.example/connectors")
+        .env("CONNECTOR_CREDENTIAL_ENCRYPTION_KEY", "55".repeat(32))
+        .env("STORE_SELLER_PUBKY", store);
+    worker
+}
+
+/// The connector worker runs the same boot check as the service: it refuses
+/// to start in single-seller mode on another seller's rows, and starts once
+/// they are the store seller's.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn the_connector_worker_refuses_to_start_on_another_sellers_rows(pool: PgPool) {
+    // `TEST_MIGRATOR` wraps the catalog in test-only lock versions that the
+    // worker's migrator does not know; leave the ledger production holds.
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version IN (0, 9000000001)")
+        .execute(&pool)
+        .await
+        .expect("drop test-only ledger rows");
+    let store = marketplace_domain::pubky::encode_pubky(&[11; 32]);
+    let carol = marketplace_domain::pubky::encode_pubky(&[12; 32]);
+    sqlx::query(CATEGORIES[0].insert)
+        .bind(&carol)
+        .bind(chrono::Utc::now())
+        .execute(&pool)
+        .await
+        .expect("carol's store connection");
+
+    match boot(connector_worker(&pool, &store)) {
+        Boot::Started => panic!("the worker started on another seller's store connection"),
+        Boot::Refused(stderr) => assert!(
+            stderr.contains(&format!(
+                "STORE_SELLER_PUBKY is set, but the database holds 0 listings, 0 orders, 0 \
+                 holds, 1 store connections, 0 payment configurations, 0 webhook endpoints and \
+                 0 seller settings of other sellers ({}…)",
+                &carol[..8]
+            )),
+            "{stderr}"
+        ),
+    }
+    match boot(connector_worker(&pool, &carol)) {
+        Boot::Started => {}
+        Boot::Refused(stderr) => panic!("the worker refused its store seller's rows: {stderr}"),
+    }
+}
+
+enum Boot {
+    /// Exited before it started work, with what it wrote to stderr.
+    Refused(String),
+    /// Logged that it is starting; it has been stopped.
+    Started,
+}
+
+/// Runs `worker` until it exits or logs that it is starting, for at most a
+/// minute.
+fn boot(mut worker: std::process::Command) -> Boot {
+    use std::io::{BufRead, Read};
+    let mut child = worker
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the worker runs");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let stderr = std::thread::spawn(move || {
+        let mut text = String::new();
+        stderr.read_to_string(&mut text).expect("stderr is text");
+        text
+    });
+    let stdout = child.stdout.take().expect("stdout");
+    let (lines, logged) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if lines.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = std::time::Instant::now() + StdDuration::from_secs(60);
+    loop {
+        if logged
+            .recv_timeout(StdDuration::from_millis(100))
+            .is_ok_and(|line| line.contains("connector worker starting"))
+        {
+            child.kill().expect("stop the worker");
+            child.wait().expect("the worker stops");
+            return Boot::Started;
+        }
+        if let Some(status) = child.try_wait().expect("worker status") {
+            assert!(!status.success(), "the worker exited cleanly");
+            return Boot::Refused(stderr.join().expect("stderr reader"));
+        }
+        if std::time::Instant::now() > deadline {
+            child.kill().expect("stop the worker");
+            child.wait().expect("the worker stops");
+            panic!("the worker neither started nor exited within a minute");
+        }
+    }
+}
+
 const STORE_SECRET: &str = "0505050505050505050505050505050505050505050505050505050505050505";
 
 fn encode_store() -> String {
