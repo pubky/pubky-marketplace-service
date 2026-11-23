@@ -2257,6 +2257,58 @@ async fn a_completion_for_an_order_cancelled_without_expiring_its_payment_is_ref
     );
 }
 
+// A verified completion whose still-pending order refuses confirmation (its
+// hold is gone) is kept under manual review in the transaction that read the
+// payment, so nothing can move the payment in between. A buyer cancel that
+// follows leaves the parked payment as it is.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn completion_that_cannot_confirm_the_order_goes_to_manual_review(pool: PgPool) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let holder = Uuid::new_v4();
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
+    register_locks(&app, &buyer.token, &order, &seller.pubky).await;
+    sqlx::query("UPDATE orders SET stock_held = false WHERE id = $1::uuid")
+        .bind(&order.order_id)
+        .execute(&app.pool)
+        .await
+        .expect("hold flag cleared");
+
+    fake.complete_matching(&app.pool, TEST_BUNDLE_ID, &order.payment_id)
+        .await;
+    let summary = run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    assert_eq!(summary.locks_completions_applied, 1);
+    assert_eq!(
+        review_facts(&app.pool, &order.payment_id).await,
+        ("manual_review".to_string(), None)
+    );
+    assert_eq!(
+        order_state(&app.pool, &order.order_id).await,
+        "pending_payment"
+    );
+    assert_eq!(confirmation_events(&app.pool).await, 0);
+    assert_eq!(manual_review_events(&app.pool).await, 1);
+    assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM receipts").await, 0);
+    assert_eq!(
+        correlation_outcome(&app.pool, &order.payment_id).await,
+        ("completed".to_string(), Some("completed".to_string()))
+    );
+
+    cancel_as_buyer(&app, &buyer, &order, 50).await;
+    assert_eq!(order_state(&app.pool, &order.order_id).await, "cancelled");
+    assert_eq!(
+        review_facts(&app.pool, &order.payment_id).await,
+        ("manual_review".to_string(), None)
+    );
+    assert_eq!(
+        observation_history(&app.pool, &order.payment_id).await,
+        vec![("completed".to_string(), "manual_review".to_string())]
+    );
+}
+
 // The verification task participates in the lease discipline like every
 // other worker task: an instance that does not hold the lease skips it, and
 // the task is recovered after the lease lapses.

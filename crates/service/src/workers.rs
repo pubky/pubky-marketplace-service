@@ -1951,51 +1951,40 @@ async fn mark_correlation_completed(
     Ok(())
 }
 
-/// Moves the payment to `manual_review` from `from_state` (a completion that
-/// can no longer confirm the order: verified after the marketplace window,
-/// or refused by the confirmation invariants). The compare-and-swap makes a
-/// redelivered completion harmless, and the correlation plus its observation
-/// row retain the history — a late completion is never silently discarded.
+/// Moves the `awaiting_entitlement` payment of a verified completion whose
+/// order cannot be confirmed (refused by the confirmation invariants) to
+/// `manual_review`, in the caller's transaction. The caller still holds the
+/// payment and order locks it read them under, so neither a buyer cancel
+/// nor the window sweep can move the payment first. The correlation plus its
+/// observation row retain the history; the completion is never discarded.
 async fn apply_manual_review(
-    pool: &PgPool,
+    mut tx: Transaction<'_, Postgres>,
     row: &ClaimedCorrelation,
-    from_state: &str,
+    payment: &PaymentRow,
     now: DateTime<Utc>,
 ) -> anyhow::Result<bool> {
-    let mut tx = pool.begin().await?;
-    let updated: Option<(i64, String)> = sqlx::query_as(
+    let (revision,): (i64,) = sqlx::query_as(
         "UPDATE payments SET state = 'manual_review', revision = revision + 1, \
-         manual_review_entered_at = $3, updated_at = $3 \
-         WHERE id = $1 AND state = $2 RETURNING revision, buyer_pubky",
+         manual_review_entered_at = $2, updated_at = $2 \
+         WHERE id = $1 AND state = 'awaiting_entitlement' RETURNING revision",
     )
-    .bind(row.payment_id)
-    .bind(from_state)
+    .bind(payment.id)
     .bind(now)
-    .fetch_optional(&mut *tx)
+    .fetch_one(&mut *tx)
     .await?;
-    let applied = match updated {
-        Some((revision, buyer_pubky)) => {
-            crate::executor::insert_event(
-                &mut tx,
-                row.id,
-                &ids::payment_aggregate_id(row.payment_id),
-                revision,
-                &buyer_pubky,
-                "payment.manual_review",
-                now,
-            )
-            .await?;
-            mark_correlation_completed(&mut tx, row.id, "manual_review", now).await?;
-            true
-        }
-        None => {
-            // The payment moved concurrently; keep the completed fact.
-            mark_correlation_completed(&mut tx, row.id, "none", now).await?;
-            false
-        }
-    };
+    crate::executor::insert_event(
+        &mut tx,
+        row.id,
+        &ids::payment_aggregate_id(payment.id),
+        revision,
+        &payment.buyer_pubky,
+        "payment.manual_review",
+        now,
+    )
+    .await?;
+    mark_correlation_completed(&mut tx, row.id, "manual_review", now).await?;
     tx.commit().await?;
-    Ok(applied)
+    Ok(true)
 }
 
 /// Whether the buyer cancelled the order before its Locks task completed.
@@ -2100,8 +2089,9 @@ async fn apply_completed_lifecycle(
             if cancelled_by_buyer(&mut tx, row.id, &payment, &order).await? {
                 return refund_after_buyer_cancel(tx, row, &payment, &order, now).await;
             }
+            let mut confirmation = sqlx::Acquire::begin(&mut *tx).await?;
             match confirm_order(
-                &mut tx,
+                &mut confirmation,
                 &payment.buyer_pubky,
                 row.id,
                 &payment,
@@ -2112,6 +2102,7 @@ async fn apply_completed_lifecycle(
             .await?
             {
                 Ok((order, _receipt, _receipt_event_id)) => {
+                    confirmation.commit().await?;
                     let (revision,): (i64,) = sqlx::query_as(
                         "UPDATE payments SET state = 'confirmed', revision = revision + 1, \
                          updated_at = $2 WHERE id = $1 RETURNING revision",
@@ -2153,16 +2144,17 @@ async fn apply_completed_lifecycle(
                 Err(failure) => {
                     // The entitlement is real but the order can no longer be
                     // confirmed (e.g. a lapsed auction hold). Roll back the
-                    // partial confirmation effects, then retain the fact
-                    // under manual review.
-                    tx.rollback().await?;
+                    // partial confirmation effects to the savepoint, then
+                    // retain the fact under manual review while the payment
+                    // and order are still locked.
+                    confirmation.rollback().await?;
                     tracing::warn!(
                         payment_id = %payment.id,
                         correlation_id = %row.id,
                         code = ?failure.code(),
                         "verified locks completion could not confirm the order; routing to manual review"
                     );
-                    apply_manual_review(pool, row, "awaiting_entitlement", now).await
+                    apply_manual_review(tx, row, &payment, now).await
                 }
             }
         }
