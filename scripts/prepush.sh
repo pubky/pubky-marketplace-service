@@ -88,10 +88,20 @@ else
   echo "prepush: packages ${packages[*]}"
 fi
 
+if [ "${#packages[@]}" -eq 0 ]; then
+  echo "prepush: cargo fmt"
+  cargo fmt --check
+  echo "prepush: clippy and tests skipped (no package changed)"
+  prepush_stamp "$sha"
+  seconds="$(( $(date +%s) - start ))"
+  echo "PREPUSH OK ${sha} ${seconds} ${PREPUSH_MODE}"
+  exit 0
+fi
+
 prepush_clean_workspace_members() {
   local target="$1" metadata names member
   local members=() clean_args=()
-  metadata="$(CARGO_TARGET_DIR="$target" cargo metadata --no-deps --format-version 1 --locked 2>/dev/null)" || return 1
+  metadata="$(CARGO_TARGET_DIR="$target" cargo metadata --no-deps --format-version 1 --locked)" || return 1
   names="$(printf '%s' "$metadata" | jq -r '
     .workspace_members as $members
     | .packages[]
@@ -105,31 +115,30 @@ prepush_clean_workspace_members() {
   for member in "${members[@]}"; do
     clean_args+=(-p "$member")
   done
-  CARGO_TARGET_DIR="$target" cargo clean "${clean_args[@]}" >/dev/null 2>&1 || return 1
-  : > "$target/.prepush-members-clean" || return 1
-  echo "prepush: cleaned ${#members[@]} workspace members from the seeded target"
+  CARGO_TARGET_DIR="$target" cargo clean "${clean_args[@]}" >/dev/null || return 1
+  printf '%s\n' "$ROOT" > "$target/.prepush-members-clean" || return 1
+  echo "prepush: cleaned ${#members[@]} workspace members from ${target}"
 }
 
 # Sibling worktrees share one Cargo target unless this gate overrides it.
 # Workspace artifacts copied from a shared target name another tree's sources,
 # so only dependency artifacts are reused. Clean every workspace member in a
-# seeded or unmarked target, and mark empty targets to avoid a later clean.
-# PREPUSH_CARGO_TARGET names a different one.
+# seeded, unmarked or differently-owned target, and mark empty targets to avoid
+# a later clean. PREPUSH_CARGO_TARGET overrides the private target location; an
+# existing shared target only seeds it when the paths differ.
 shared_target="${CARGO_TARGET_DIR:-}"
 private_target="${PREPUSH_CARGO_TARGET:-/Volumes/t7/vibes-dev/.cargo-target/marketplace-service/$(basename "$ROOT")}"
-new_empty=0
-seeded=0
+origin=existing
 if [ ! -d "$private_target" ]; then
-  new_empty=1
+  origin=new
 fi
-if [ ! -d "$private_target" ] && [ -n "$shared_target" ] && [ -d "$shared_target" ] && [ "$shared_target" != "$private_target" ]; then
+if [ "$origin" = new ] && [ -n "$shared_target" ] && [ -d "$shared_target" ] && [ "$shared_target" != "$private_target" ]; then
   seed="${private_target}.partial"
   rm -rf "$seed"
   mkdir -p "$(dirname "$private_target")"
   if cp -cR "$shared_target" "$seed" 2>/dev/null || cp -R "$shared_target" "$seed"; then
     mv "$seed" "$private_target"
-    new_empty=0
-    seeded=1
+    origin=seeded
   else
     rm -rf "$seed"
     mkdir -p "$private_target"
@@ -138,27 +147,24 @@ fi
 mkdir -p "$private_target"
 export CARGO_TARGET_DIR="$private_target"
 marker="$private_target/.prepush-members-clean"
-if [ "$new_empty" = 1 ]; then
-  : > "$marker"
-elif [ "$seeded" = 1 ] || [ ! -f "$marker" ]; then
+if [ "$origin" = new ]; then
+  printf '%s\n' "$ROOT" > "$marker"
+elif [ "$origin" = seeded ] || [ ! -f "$marker" ] || [ "$(cat "$marker")" != "$ROOT" ]; then
   if ! prepush_clean_workspace_members "$private_target"; then
-    rm -rf "$private_target"
-    mkdir -p "$private_target"
-    : > "$marker"
-    echo "prepush: could not clean workspace members; using an empty target"
+    if [ "$origin" = seeded ]; then
+      rm -rf "$private_target"
+      mkdir -p "$private_target"
+      printf '%s\n' "$ROOT" > "$marker"
+      echo "prepush: could not clean workspace members; using an empty target"
+    else
+      echo "prepush: cannot clean workspace members in ${private_target}; delete it or set PREPUSH_CARGO_TARGET to a new path" >&2
+      exit 1
+    fi
   fi
 fi
 
 echo "prepush: cargo fmt"
 cargo fmt --check
-
-if [ "${#packages[@]}" -eq 0 ]; then
-  echo "prepush: clippy and tests skipped (no package changed)"
-  prepush_stamp "$sha"
-  seconds="$(( $(date +%s) - start ))"
-  echo "PREPUSH OK ${sha} ${seconds} ${PREPUSH_MODE}"
-  exit 0
-fi
 
 clippy_scope=()
 test_args=()
