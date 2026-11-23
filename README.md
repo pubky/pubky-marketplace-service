@@ -1230,7 +1230,8 @@ and the order stays `cancelled`, even when the released unit is still
 free. An order cancelled before the cancel expired Locks payments (a
 cancelled order whose payment is still `awaiting_entitlement`) is treated
 the same way. The seller returns the money and records it with
-`refund.record_external`; that command closes the refund-required Locks
+`refund.record_external`; when the recorded amount covers the payment (the
+seller's `refund_cap`), that command closes the refund-required Locks
 payment as `refunded` in the same transaction (`confirmed` with
 `resolution_outcome=refunded`, `resolution_basis=seller_attestation`, the
 recorded transaction id as `refund_reference`, one `payment.resolved` event
@@ -1240,8 +1241,11 @@ is different: its late completion takes the late-money fork and completes the
 order when the unit is free. When the seller has already recorded an
 external refund on the cancelled order (`refunded_external`) before the task
 completes, the completion closes the payment as `refunded` against that
-record in the same way: it neither completes the order nor asks for the
-refund again, and nobody is left with an action to take.
+record in the same way when the record covers it: it neither completes the
+order nor asks for the refund again, and nobody is left with an action to
+take. A partial refund closes nothing: money is still owed, so a
+refund-required payment stays in review, and a completion that lands after
+a partial record waits in `manual_review` for an operator.
 
 ### `shared_manual` checkout and manual-review resolution (W1.15)
 
@@ -2494,15 +2498,16 @@ advance a payment (ADR-0019 §7).
     `review_reason=refund_required`, the order stays cancelled.
   - **Buyer cancel**: refund-required whatever the stock (see "Buyer cancel
     of a Locks order").
-  - **Refund already recorded** (`refunded_external`): the payment closes as
-    `refunded` against the seller's record; nothing is paid.
+  - **Refund already recorded** (`refunded_external`): when the record covers
+    the payment, it closes as `refunded` against the seller's record and
+    nothing is paid; a partial record leaves it in `manual_review`.
   - **Any other refusal** (a still-pending order that refuses confirmation,
     for example a lost hold or a lapsed auction hold): `manual_review`
     without a review reason, written in the transaction that read the
     payment.
 
   A refund-required Locks payment closes as `refunded` when the seller
-  records the refund with `refund.record_external`.
+  records a refund that covers it with `refund.record_external`.
 
   **Hold exposure.** No per-buyer or per-listing cap limits open Locks
   holds; the only per-buyer limit in the service is a drop's

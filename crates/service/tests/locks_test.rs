@@ -2330,11 +2330,30 @@ async fn assert_closed_as_refunded(
     );
 }
 
+/// The refund cap the seller's order view offers: a refund of this amount
+/// covers the payment.
+async fn refund_cap(app: &TestApp, seller: &TestActor, order: &PendingOrder) -> i64 {
+    let (status, body) = common::send(
+        app.router.clone(),
+        "GET",
+        &format!("/v1/orders/{}", order.order_id),
+        Some(&seller.token),
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body["refund_cap"]["amount_minor"]
+        .as_i64()
+        .expect("the seller sees the refund cap")
+}
+
 /// The order is cancelled by the buyer (`buyer_cancel`) or by the payment
 /// window, and the seller records an external refund on it before the task
-/// completes. The money came and went back: the completion closes the
-/// payment as refunded against that record, once, and the row stops polling.
-async fn a_completion_after_a_recorded_refund(pool: PgPool, buyer_cancel: bool) {
+/// completes. A refund that covers the payment (`full`) means the money
+/// came and went back: the completion closes the payment as refunded
+/// against that record, once, and the row stops polling. A partial refund
+/// leaves money owed, so the completion waits for an operator instead.
+async fn a_completion_after_a_recorded_refund(pool: PgPool, buyer_cancel: bool, full: bool) {
     let (app, fake) = test_app_with_locks(pool).await;
     let holder = Uuid::new_v4();
     let seller = new_actor(&app).await;
@@ -2362,11 +2381,13 @@ async fn a_completion_after_a_recorded_refund(pool: PgPool, buyer_cancel: bool) 
         "expired"
     );
 
+    let cap = refund_cap(&app, &seller, &order).await;
+    let amount = if full { cap } else { cap - 1 };
     let refund = common::order_command(
         "refund.record_external",
         &order.order_id,
         2,
-        json!({ "amount_minor": 1, "transaction_id": "manual-refund-1" }),
+        json!({ "amount_minor": amount, "transaction_id": "manual-refund-1" }),
         60,
     );
     let (status, body) = execute(&app, &seller.token, &refund).await;
@@ -2380,14 +2401,35 @@ async fn a_completion_after_a_recorded_refund(pool: PgPool, buyer_cancel: bool) 
         .await;
     let summary = next_poll(&app, holder).await;
     assert_eq!(summary.locks_completions_applied, 1);
-    assert_closed_as_refunded(&app, &seller, &order, "manual-refund-1").await;
-    assert_eq!(manual_review_events(&app.pool).await, 0);
+    if full {
+        assert_closed_as_refunded(&app, &seller, &order, "manual-refund-1").await;
+        assert_eq!(manual_review_events(&app.pool).await, 0);
+    } else {
+        assert_eq!(
+            review_facts(&app.pool, &order.payment_id).await,
+            ("manual_review".to_string(), None),
+            "money is still owed: an operator decides"
+        );
+        assert_eq!(manual_review_events(&app.pool).await, 1);
+        assert_eq!(
+            count(
+                &app.pool,
+                "SELECT COUNT(*) FROM events WHERE kind = 'payment.resolved'"
+            )
+            .await,
+            0
+        );
+        assert_eq!(confirmation_events(&app.pool).await, 0);
+    }
     assert_eq!(
         observation_history(&app.pool, &order.payment_id)
             .await
             .last()
             .cloned(),
-        Some(("completed".to_string(), "refunded".to_string()))
+        Some((
+            "completed".to_string(),
+            if full { "refunded" } else { "manual_review" }.to_string()
+        ))
     );
     assert_eq!(
         count(
@@ -2414,22 +2456,27 @@ async fn a_completion_after_a_recorded_refund(pool: PgPool, buyer_cancel: bool) 
 async fn a_completion_after_the_buyer_cancelled_and_the_seller_refunded_closes_as_refunded(
     pool: PgPool,
 ) {
-    a_completion_after_a_recorded_refund(pool, true).await;
+    a_completion_after_a_recorded_refund(pool, true, true).await;
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_completion_after_the_window_lapsed_and_the_seller_refunded_closes_as_refunded(
     pool: PgPool,
 ) {
-    a_completion_after_a_recorded_refund(pool, false).await;
+    a_completion_after_a_recorded_refund(pool, false, true).await;
 }
 
-// The other ordering: the completion lands first and is refund-required,
-// which asks the seller to return the money and record it. Recording that
-// refund closes the payment as refunded, so the seller is not left with a
-// review they have no way to resolve.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn recording_the_refund_closes_a_refund_required_locks_payment(pool: PgPool) {
+async fn a_completion_after_a_partial_refund_waits_for_an_operator(pool: PgPool) {
+    a_completion_after_a_recorded_refund(pool, true, false).await;
+}
+
+/// The other ordering: the completion lands first and is refund-required,
+/// which asks the seller to return the money and record it. A refund that
+/// covers the payment (`full`) closes it as refunded, so the seller is not
+/// left with a review they have no way to resolve; a partial one leaves the
+/// refund-required review open.
+async fn a_refund_recorded_after_a_refund_required_completion(pool: PgPool, full: bool) {
     let (app, fake) = test_app_with_locks(pool).await;
     let holder = Uuid::new_v4();
     let seller = new_actor(&app).await;
@@ -2448,16 +2495,29 @@ async fn recording_the_refund_closes_a_refund_required_locks_payment(pool: PgPoo
         json!("seller")
     );
 
+    let cap = refund_cap(&app, &seller, &order).await;
+    let amount = if full { cap } else { cap - 1 };
     let refund = common::order_command(
         "refund.record_external",
         &order.order_id,
         2,
-        json!({ "amount_minor": 1, "transaction_id": "manual-refund-2" }),
+        json!({ "amount_minor": amount, "transaction_id": "manual-refund-2" }),
         61,
     );
     let (status, body) = execute(&app, &seller.token, &refund).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_closed_as_refunded(&app, &seller, &order, "manual-refund-2").await;
+    if full {
+        assert_closed_as_refunded(&app, &seller, &order, "manual-refund-2").await;
+    } else {
+        assert_eq!(
+            review_facts(&app.pool, &order.payment_id).await,
+            (
+                "manual_review".to_string(),
+                Some("refund_required".to_string())
+            ),
+            "a partial refund leaves money owed"
+        );
+    }
     assert_eq!(
         review_facts(&app.pool, &order.payment_id)
             .await
@@ -2476,8 +2536,18 @@ async fn recording_the_refund_closes_a_refund_required_locks_payment(pool: PgPoo
             "SELECT COUNT(*) FROM events WHERE kind = 'payment.resolved'"
         )
         .await,
-        1
+        i64::from(full)
     );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn recording_the_refund_closes_a_refund_required_locks_payment(pool: PgPool) {
+    a_refund_recorded_after_a_refund_required_completion(pool, true).await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_partial_refund_leaves_a_refund_required_locks_payment_open(pool: PgPool) {
+    a_refund_recorded_after_a_refund_required_completion(pool, false).await;
 }
 
 // A verified completion whose still-pending order refuses confirmation (its

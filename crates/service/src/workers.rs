@@ -2061,11 +2061,12 @@ async fn refund_after_buyer_cancel(
 }
 
 /// A verified completion for an order whose refund the seller has already
-/// recorded (`refunded_external`): the money came and went back, so the
-/// payment closes as `refunded` against that record and nobody is asked to
-/// act. An order without a recorded refund reference cannot be reconciled
-/// and waits in manual review instead. Runs in the caller's transaction,
-/// which holds the payment and order locks.
+/// recorded (`refunded_external`): when the record covers the payment, the
+/// money came and went back, so the payment closes as `refunded` against
+/// that record and nobody is asked to act. A partial record, or one without
+/// a reference, leaves money unaccounted for and waits in manual review for
+/// an operator instead. Runs in the caller's transaction, which holds the
+/// payment and order locks.
 async fn close_completion_for_refunded_order(
     mut tx: Transaction<'_, Postgres>,
     row: &ClaimedCorrelation,
@@ -2073,17 +2074,23 @@ async fn close_completion_for_refunded_order(
     order: &OrderRow,
     now: DateTime<Utc>,
 ) -> anyhow::Result<bool> {
+    let covered = order
+        .external_refund
+        .as_ref()
+        .and_then(|refund| crate::refund_destination::refund_terms(order).covered_by(refund))
+        == Some(true);
     let reference = order
         .external_refund
         .as_ref()
         .and_then(|refund| refund["transaction_id"].as_str())
-        .map(str::to_string);
+        .map(str::to_string)
+        .filter(|_| covered);
     let Some(reference) = reference else {
         tracing::error!(
             payment_id = %payment.id,
             correlation_id = %row.id,
-            "ALERT verified locks completion for a refunded order without a refund reference; \
-             routing to manual review"
+            "ALERT verified locks completion for a refunded order whose recorded refund \
+             does not cover it; routing to manual review"
         );
         return apply_manual_review(tx, row, payment, now).await;
     };
@@ -3147,6 +3154,9 @@ async fn apply_confirmed_paykit_payment(
                 "confirmed paykit payment could not confirm the order; routing to manual review"
             );
             let mut tx = pool.begin().await?;
+            // Payment before order, as `record_external_refund` and every
+            // settlement path lock them.
+            lock_order_payment(&mut tx, row.id).await?;
             record_settlement_rail(&mut tx, row.id, observation, usdt, now).await?;
             let updated: Option<(i64,)> = sqlx::query_as(
                 "UPDATE payments SET state = 'manual_review', revision = revision + 1, \

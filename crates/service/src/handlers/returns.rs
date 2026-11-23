@@ -654,11 +654,14 @@ pub async fn record_external_refund(
     .await?;
 
     // The refund the review asked for is now recorded: the Locks payment has
-    // no other way out of `manual_review`, so it closes as `refunded` here.
+    // no other way out of `manual_review`, so it closes as `refunded` here,
+    // but only when the record covers the payment. A partial refund leaves
+    // money owed and the review open.
     if let Some((payment_id, adapter, state, review_reason)) = &payment {
         if adapter == "locks"
             && state == "manual_review"
             && review_reason.as_deref() == Some("refund_required")
+            && terms.covered_by(&external_refund) == Some(true)
         {
             crate::bitcoin_review::close_refunded_locks_payment(
                 tx,
