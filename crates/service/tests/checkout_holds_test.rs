@@ -6,15 +6,24 @@ mod common;
 use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
 use common::paykit_review::{
-    bound_order, enable_bitcoin, poll_now, resolve_call, status_confirmed,
+    bound_order, create_sat_order, enable_bitcoin, poll_now, resolve_call, status_confirmed,
 };
 use common::*;
 use common::{FakePaykit, TestActor};
 use marketplace_service::clock::Clock;
+use marketplace_service::homeserver::{
+    HomeserverFetchOutcome, HomeserverListingClient, HomeserverRawFetchOutcome,
+    TRANSACTION_READS_BUSY,
+};
+use marketplace_service::http::build_router;
 use marketplace_service::payments::attempt_reference;
 use marketplace_service::workers::{drain_outbox, expire_due_payment_windows};
 use serde_json::{json, Value};
 use sqlx::PgPool;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 const HOLDING_COPY: &str =
@@ -979,4 +988,92 @@ async fn legacy_null_expiry_hold_cancel_completes(pool: PgPool) {
         listing_qty(&app.pool, &seller.pubky).await,
         (1, 0, 0, "available".to_string())
     );
+}
+
+/// Listing records from the command mirror, with `permits` bounding the
+/// reads made inside a transaction, as a `pkarr` client bounds them.
+struct BoundedMirrorHomeserver {
+    permits: Arc<Semaphore>,
+}
+
+impl HomeserverListingClient for BoundedMirrorHomeserver {
+    fn fetch_listing<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        listing_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
+        CommandMirrorHomeserver.fetch_listing(seller_pubky, listing_id)
+    }
+
+    fn fetch_listing_raw<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        listing_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HomeserverRawFetchOutcome> + Send + 'a>> {
+        CommandMirrorHomeserver.fetch_listing_raw(seller_pubky, listing_id)
+    }
+
+    fn fetch_drop<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        drop_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
+        CommandMirrorHomeserver.fetch_drop(seller_pubky, drop_id)
+    }
+
+    fn transaction_reads(&self) -> Option<Arc<Semaphore>> {
+        Some(self.permits.clone())
+    }
+}
+
+async fn bind_attempt(pool: &PgPool, order_id: &str) -> i32 {
+    sqlx::query_scalar("SELECT paykit_bind_attempt FROM orders WHERE id = $1::uuid")
+        .bind(order_id)
+        .fetch_one(pool)
+        .await
+        .expect("order row")
+}
+
+/// A bind captures the seller's terms from their homeserver inside its
+/// transaction. With every permit for such reads taken, it is refused as
+/// retryable before it spends an attempt or opens the transaction.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_bind_is_refused_while_every_homeserver_read_permit_is_taken(pool: PgPool) {
+    let (app, paykit) = test_app_with_payments(pool).await;
+    let permits = Arc::new(Semaphore::new(1));
+    let state = app
+        .state
+        .clone()
+        .with_homeserver(Some(Arc::new(BoundedMirrorHomeserver {
+            permits: permits.clone(),
+        })));
+    let app = TestApp {
+        router: build_router(state.clone()),
+        pool: app.pool,
+        clock: app.clock,
+        state,
+    };
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    enable_bitcoin(&app, &paykit, &seller).await;
+    let order = create_sat_order(&app, &seller, &buyer).await;
+    let attempts = bind_attempt(&app.pool, &order.order_id).await;
+
+    let held = permits.clone().try_acquire_owned().expect("a free permit");
+    let (status, body) = bind_method(&app, &buyer.token, &order.order_id, "bitcoin").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(
+        body["error"]["code"],
+        json!("UPSTREAM_UNAVAILABLE"),
+        "{body}"
+    );
+    assert_eq!(body["error"]["reason"], json!("upstream_unavailable"));
+    assert_eq!(body["error"]["message"], json!(TRANSACTION_READS_BUSY));
+    assert_eq!(bind_attempt(&app.pool, &order.order_id).await, attempts);
+
+    drop(held);
+    let (status, body) = bind_method(&app, &buyer.token, &order.order_id, "bitcoin").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(bind_attempt(&app.pool, &order.order_id).await, attempts + 1);
+    assert_eq!(permits.available_permits(), 1, "the permit is returned");
 }

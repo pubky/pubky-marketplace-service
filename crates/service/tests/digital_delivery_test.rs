@@ -13,18 +13,25 @@ use marketplace_service::digital::{
     self, assert_digital_sealing_coherent, email_aad, pin_aad, reseal_previous_key_batch,
     version_aad, DigitalKeys,
 };
-use marketplace_service::homeserver::registration_payload_from_record;
+use marketplace_service::homeserver::{
+    registration_payload_from_record, DeliverableFetchOutcome, HomeserverFetchOutcome,
+    HomeserverListingClient,
+};
+use marketplace_service::http::build_router;
 use marketplace_service::locks::{LocksKeys, LocksRuntime};
 use marketplace_service::pickup::PickupKeys;
 use serde_json::{json, Value};
 use sqlx::PgPool;
-use std::sync::Arc;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 use common::{
     create_offer_command, execute, indexed_command_id, listing_aggregate, new_actor, offer_action,
-    register_command, send, test_app_with_digital, test_digital_keys, DeliverableServer, TestActor,
-    TestApp, OFFER_COMMAND_ID, TEST_DIGITAL_ENCRYPTION_KEY, TEST_DIGITAL_PREVIOUS_ENCRYPTION_KEY,
+    register_command, send, test_app_with_digital, test_app_with_homeserver_client,
+    test_digital_keys, CommandMirrorHomeserver, DeliverableServer, TestActor, TestApp,
+    OFFER_COMMAND_ID, TEST_DIGITAL_ENCRYPTION_KEY, TEST_DIGITAL_PREVIOUS_ENCRYPTION_KEY,
     TEST_LOCKS_ENCRYPTION_KEY, TEST_LOCKS_HMAC_KEY, TEST_PICKUP_ENCRYPTION_KEY,
     TEST_PICKUP_PREVIOUS_ENCRYPTION_KEY,
 };
@@ -1298,4 +1305,116 @@ async fn digital_evidence_is_append_only(pool: PgPool) {
         .execute(&pool)
         .await
         .expect("the re-seal may rewrite the ciphertext");
+}
+
+/// Listing records from the command mirror. Each deliverable read counts the
+/// transactions open on the service's database, then finds `bytes`: a read
+/// made while the command holds a transaction would hold a pooled
+/// connection across the whole network wait.
+struct TransactionWatchingDeliverables {
+    pool: PgPool,
+    bytes: Vec<u8>,
+    open_transactions: Mutex<Vec<i64>>,
+}
+
+impl HomeserverListingClient for TransactionWatchingDeliverables {
+    fn fetch_listing<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        listing_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
+        CommandMirrorHomeserver.fetch_listing(seller_pubky, listing_id)
+    }
+
+    fn fetch_drop<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        drop_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
+        CommandMirrorHomeserver.fetch_drop(seller_pubky, drop_id)
+    }
+
+    fn fetch_deliverable_digest<'a>(
+        &'a self,
+        _seller_pubky: &'a str,
+        _deliverable_id: &'a str,
+        _version: i64,
+        _max_len: u64,
+    ) -> Pin<Box<dyn Future<Output = DeliverableFetchOutcome> + Send + 'a>> {
+        Box::pin(async move {
+            let open: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pg_stat_activity \
+                 WHERE datname = current_database() AND backend_type = 'client backend' \
+                 AND pid <> pg_backend_pid() AND xact_start IS NOT NULL",
+            )
+            .fetch_one(&self.pool)
+            .await
+            .expect("activity");
+            self.open_transactions.lock().expect("lock").push(open);
+            DeliverableFetchOutcome::Found {
+                blake3: blake3::hash(&self.bytes).to_hex().to_string(),
+                len: self.bytes.len() as u64,
+            }
+        })
+    }
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn set_reads_the_deliverable_with_no_transaction_open(pool: PgPool) {
+    let bytes = ciphertext(2_048);
+    let homeserver = Arc::new(TransactionWatchingDeliverables {
+        pool: pool.clone(),
+        bytes: bytes.clone(),
+        open_transactions: Mutex::new(Vec::new()),
+    });
+    let app = test_app_with_homeserver_client(pool, homeserver.clone()).await;
+    let state = app.state.with_digital(Some(test_digital_keys()));
+    let app = TestApp {
+        router: build_router(state.clone()),
+        pool: app.pool,
+        clock: app.clock,
+        state,
+    };
+    let seller = new_actor(&app).await;
+    let other = new_actor(&app).await;
+    register_digital_listing(&app, &seller, json!(["digital"])).await;
+
+    // Only the listing's seller makes the service read a homeserver path.
+    let (status, body) = execute(
+        &app,
+        &other.token,
+        &set_command(&seller.pubky, 0, file_delivery(1, &bytes), 1),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(homeserver
+        .open_transactions
+        .lock()
+        .expect("lock")
+        .is_empty());
+
+    let (status, body) = execute(
+        &app,
+        &seller.token,
+        &set_command(&seller.pubky, 0, file_delivery(1, &bytes), 2),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["version"], json!(1));
+    assert_eq!(
+        *homeserver.open_transactions.lock().expect("lock"),
+        vec![0],
+        "the deliverable was read once, with no transaction open"
+    );
+
+    // The read is fenced by the version: a set of the same version, read
+    // again before its transaction, finds the version taken.
+    let (status, body) = execute(
+        &app,
+        &seller.token,
+        &set_command(&seller.pubky, 0, file_delivery(1, &bytes), 3),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["current_revision"], json!(1));
 }

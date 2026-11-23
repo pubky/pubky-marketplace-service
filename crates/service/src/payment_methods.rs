@@ -1591,6 +1591,21 @@ pub async fn bind_payment_method(
             );
         }
     }
+    // The bind captures the seller's terms from their homeserver inside its
+    // transaction; under `pkarr` it holds a permit for that read until the
+    // transaction ends, and is refused as retryable, before any attempt is
+    // spent, when none is free.
+    let _transaction_read =
+        match crate::homeserver::try_transaction_read(state.homeserver.as_deref()) {
+            Ok(permit) => permit,
+            Err(crate::homeserver::TransactionReadsBusy) => {
+                return method_error(
+                    ErrorCode::UpstreamUnavailable,
+                    "upstream_unavailable",
+                    crate::homeserver::TRANSACTION_READS_BUSY,
+                );
+            }
+        };
     let now = state.clock.now();
     // A bitcoin bind spends its attempt number in a committed statement of
     // its own, before the bind transaction: a bind that rolls back after
