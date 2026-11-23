@@ -427,8 +427,9 @@ the `v1_command` surface under its own command kind, a route on the
 still issued to any identity, so buyers sign in as before. Public reads
 (`/v0` projections, `/health`) are not filtered; they only show what the
 guarded writes let in. The mode is meant for a database that has only ever
-served the store seller. After migrations, the service refuses to start in
-it while the database holds any of these for another seller, in any state
+served the store seller. After migrations, the service and the
+`connector-worker` both refuse to start in it while the database holds any
+of these for another seller, in any state
 (soft-deleted, disconnected or disabled rows included):
 
 - a listing (`listings`), an order (`orders`) or a stock hold on their
