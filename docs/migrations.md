@@ -837,7 +837,11 @@ directly rerunnable. No table, column or index changes.
 **Deploy mode: rolling.** An image from before 0100 never writes the new ids
 and does not read `STORE_SELLER_PUBKY`; the rows are harmless to it. Set
 `STORE_SELLER_PUBKY` only once every serving binary is from 0100 or later:
-an older one would serve every seller.
+an older one would serve every seller. Then set it on every replica of the
+service and the `connector-worker` at once, on a database no other seller
+uses, never replica by replica: a replica still without it serves every
+seller, and a row it writes for another seller refuses the next start of
+every replica that has it.
 
 ### Backing out 0100
 
