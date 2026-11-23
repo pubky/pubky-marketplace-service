@@ -25,6 +25,7 @@ use marketplace_domain::commands::{
 };
 use marketplace_domain::state_machines::{can_transition, order_machine};
 use marketplace_domain::{ids, Command, ErrorCode};
+use pubky_market_specs::price_decade;
 use serde_json::{json, Value};
 use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
@@ -59,12 +60,15 @@ pub struct OrderListing {
     pub listing_id: String,
     /// The canonical public listing URI the purchase attestation binds.
     pub uri: String,
+    /// The `price_decade` claim of the listing's unit price paid, from its
+    /// first line; `None` when there is no decade to sign.
+    pub price_decade: Option<String>,
 }
 
 /// The order's distinct listings in line order. Every order line carries
-/// `listing_aggregate_id` in the `listing:{seller}_{listing_id}` format,
-/// and the seller is the order's seller by construction (checkout groups
-/// lines per seller).
+/// `listing_aggregate_id` in the `listing:{seller}_{listing_id}` format and
+/// its `unit_price`, and the seller is the order's seller by construction
+/// (checkout groups lines per seller).
 pub fn order_listings(order: &OrderRow) -> Vec<OrderListing> {
     let prefix = format!("listing:{}_", order.seller_pubky);
     let mut listings: Vec<OrderListing> = Vec::new();
@@ -81,6 +85,18 @@ pub fn order_listings(order: &OrderRow) -> Vec<OrderListing> {
         let listing_id = aggregate_id
             .strip_prefix(&prefix)
             .expect("listing aggregate ids follow the listing:{seller}_{id} format");
+        let unit_price = &line["unit_price"];
+        let price_decade = price_decade(
+            unit_price["currency"]
+                .as_str()
+                .expect("order lines always carry a unit price currency"),
+            unit_price["exponent"]
+                .as_i64()
+                .expect("order lines always carry a unit price exponent"),
+            unit_price["amount_minor"]
+                .as_i64()
+                .expect("order lines always carry a unit price amount"),
+        );
         listings.push(OrderListing {
             aggregate_id: aggregate_id.to_string(),
             listing_id: listing_id.to_string(),
@@ -88,6 +104,7 @@ pub fn order_listings(order: &OrderRow) -> Vec<OrderListing> {
                 "pubky://{}/pub/pubky.app/marketplace/v1/listings/{}",
                 order.seller_pubky, listing_id
             ),
+            price_decade,
         });
     }
     listings
@@ -725,6 +742,7 @@ async fn issue_attestation(
         &listing.uri,
         &context.completed_on,
         context.band.clone(),
+        listing.price_decade.clone(),
         now,
     );
     sqlx::query(

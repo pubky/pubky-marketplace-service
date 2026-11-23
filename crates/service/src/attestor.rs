@@ -20,7 +20,10 @@
 //! the salt can link it back to an order. `completed_on` is day-granularity.
 //! The optional `amount_band` log-decade band is emitted only under
 //! both-sides consent (ratified D2): the seller's standing preference AND
-//! the buyer's per-review opt-in.
+//! the buyer's per-review opt-in. `price_decade`, the log decade of the
+//! bound listing's unit price paid, is always emitted (reviews decision
+//! RV1): it discloses only the order of magnitude the public listing price
+//! already shows.
 //!
 //! Key custody (ratified D6): the secret lives in the `ATTESTOR_SECRET_KEY`
 //! environment variable (KMS/env-held, same process as the service), to be
@@ -46,10 +49,9 @@ pub const ENV_ATTESTOR_ORDER_SALT: &str = "ATTESTOR_ORDER_SALT";
 /// Whether the purchase attestations this service issues carry `price_decade`.
 /// The attestor profile states it as `issuancePolicy.priceDecade` (`always`
 /// when true, `never` otherwise), so the profile is truthful about what a
-/// verifier will find. The change that starts signing the claim sets this to
-/// true; `purchase_attestation_claims_follow_the_price_decade_policy` fails
-/// until it does.
-pub const ISSUES_PRICE_DECADE: bool = false;
+/// verifier will find; `purchase_attestation_claims_follow_the_price_decade_policy`
+/// fails when the two disagree.
+pub const ISSUES_PRICE_DECADE: bool = true;
 
 /// JOSE `typ` of a v1 purchase attestation (spec fork: normative reference
 /// in `pubky-app-specs` `marketplace_attestation.rs`).
@@ -243,7 +245,9 @@ impl Attestor {
     /// Issues the durable purchase attestation for one (order, reviewer)
     /// pair. `role` is the record-vocabulary direction
     /// (`buyer_reviewing_seller` / `seller_reviewing_buyer`); `amount_band`
-    /// must already have passed the D2 both-sides consent gate.
+    /// must already have passed the D2 both-sides consent gate;
+    /// `price_decade` is [`pubky_market_specs::price_decade`] of the
+    /// listing's unit price paid.
     #[allow(clippy::too_many_arguments)]
     pub fn issue_purchase_attestation(
         &self,
@@ -254,6 +258,7 @@ impl Attestor {
         listing_uri: &str,
         completed_on: &str,
         amount_band: Option<String>,
+        price_decade: Option<String>,
         now: DateTime<Utc>,
     ) -> IssuedAttestation {
         let order_ref = self.order_ref(order_id);
@@ -271,6 +276,9 @@ impl Attestor {
         });
         if let Some(band) = amount_band {
             claims["amount_band"] = json!(band);
+        }
+        if let Some(decade) = price_decade.filter(|_| ISSUES_PRICE_DECADE) {
+            claims["price_decade"] = json!(decade);
         }
         claims["iat"] = json!(now.timestamp());
         let jws = self.sign_compact(PURCHASE_ATTESTATION_TYP, &claims);
@@ -455,6 +463,7 @@ mod tests {
             "pubky://ppppp/pub/pubky.app/marketplace/v1/listings/x",
             "2026-08-20",
             None,
+            Some("USD:4".to_string()),
             "2026-08-21T12:00:00Z".parse().unwrap(),
         );
         assert_eq!(
@@ -477,7 +486,31 @@ mod tests {
             "pubky://ppppp/pub/pubky.app/marketplace/v1/listings/x",
             "2026-08-20",
             Some("SAT:5".to_string()),
+            Some("SAT:4".to_string()),
             now,
+        );
+        let keys: Vec<&str> = issued
+            .claims
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "v",
+                "iss",
+                "sub",
+                "cpk",
+                "role",
+                "listing",
+                "order_ref",
+                "completed_on",
+                "amount_band",
+                "price_decade",
+                "iat"
+            ]
         );
         let mut parts = issued.jws.split('.');
         let header_b64 = parts.next().unwrap();
@@ -711,6 +744,19 @@ mod tests {
         assert_eq!(amount_band("USD", 1), Some("USD:0".to_string()));
         assert_eq!(amount_band("USD", 99), Some("USD:1".to_string()));
         assert_eq!(amount_band("USD", 0), None);
+    }
+
+    #[test]
+    fn every_registry_currency_is_decaded_at_its_registry_exponent() {
+        use marketplace_domain::currency::{Currency, SUPPORTED_CODES};
+        for code in SUPPORTED_CODES.split(", ") {
+            let currency = Currency::parse(code).expect(code);
+            assert_eq!(
+                pubky_market_specs::price_weight_currency(code).map(|entry| entry.exponent),
+                Some(i64::from(currency.exponent())),
+                "{code}"
+            );
+        }
     }
 
     #[test]

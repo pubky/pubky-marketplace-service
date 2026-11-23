@@ -224,6 +224,7 @@ async fn attested_order(pool: &PgPool, attestor: &Attestor) -> (Uuid, String) {
         &listing,
         "2026-08-19",
         None,
+        None,
         "2026-08-19T22:00:00Z".parse().unwrap(),
     );
     sqlx::query(

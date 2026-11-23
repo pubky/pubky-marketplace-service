@@ -1345,6 +1345,7 @@ attestation per reviewed listing inside the review transaction, all sharing
 the order's `order_ref` (re-fetchable via
 `GET /v1/orders/{id}/review-attestations`, and the first line's via
 `GET /v1/orders/{id}/review-attestation`, participant-scoped, idempotent),
+each carrying the `price_decade` of its listing's unit price paid,
 the D2 amount-band consent gate applies (`attestation.set_band_consent`
 command + `GET /v1/sellers/{pubky}/band-consent` read), external refunds
 append `attestation_annotations` rows keyed by the
@@ -1370,10 +1371,10 @@ announced. The index serves them
   list and successor (`ATTESTOR_KEYS`, `ATTESTOR_SUCCESSOR`) and the issuance
   policy, which the service states from what it does: the edit window, the
   blind window (`REVIEW_BLIND_WINDOW_DAYS`), `amountBand: "both-sides
-  consent"`, `minOrderValue: null` and `priceDecade`. `priceDecade` is `never`
-  while the purchase attestations this service issues carry no price decade
-  (`ISSUES_PRICE_DECADE` in `attestor.rs`, which the change that signs the
-  claim sets to `true`, turning the profile to `always`).
+  consent"`, `minOrderValue: null` and `priceDecade: "always"`. The attestor
+  signs `price_decade` and the profile states it from one switch,
+  `ISSUES_PRICE_DECADE` in `attestor.rs`; turning it off drops the claim and
+  turns the profile to `never`.
 - **One annotation per attested order**,
   `.../attestor/annotations/{order_ref}`: the order's `returned` outcome
   (written when the seller records `return.receive`) and `refunded` outcome
@@ -1582,9 +1583,9 @@ compare it.
 | `return.receive` | CAS 409 vs order `revision` | `returns.rs:171` |
 | `refund.record_external` | CAS 409 vs order `revision` | `returns.rs:251` |
 | `refund.confirm_destination` | CAS 409 vs order `revision` | `refund_destination.rs:27` |
-| `review.create` | CAS 409 vs order `revision` | `reviews.rs:223` |
-| `review.update` | CAS 409 vs order `revision` | `reviews.rs:778` |
-| `review.withdraw` | CAS 409 vs order `revision` | `reviews.rs:896` |
+| `review.create` | CAS 409 vs order `revision` | `reviews.rs:243` |
+| `review.update` | CAS 409 vs order `revision` | `reviews.rs:798` |
+| `review.withdraw` | CAS 409 vs order `revision` | `reviews.rs:916` |
 | `attestation.set_band_consent` | CAS 409 vs stored consent revision (`0` on first write) | `attestation.rs:47` |
 
 Handler paths are under `crates/service/src/handlers/`.
