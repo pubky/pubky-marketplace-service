@@ -2803,6 +2803,12 @@ advance a payment (ADR-0019 §7).
   Server cannot reach Paykit, or the service has had no answer from the
   Lock Server since registration, every registered order is held up to
   the same bound.
+
+  This exposure is accepted: holding the unit is what keeps a payment made
+  inside Paykit's deadline from ending `refund_required`. An operator who
+  prefers shorter free holds can lower `LOCKS_LIVE_TASK_HOLD_SECONDS`; a
+  completion verified past the lower bound then takes the late-money fork
+  above.
 - **History.** Every observed upstream status change and every marketplace
   action on it is appended to `payment_locks_observations` (append-only by
   trigger, statuses only — no bearer material), so late-completion and
