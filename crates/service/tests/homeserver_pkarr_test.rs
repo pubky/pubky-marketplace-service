@@ -48,7 +48,9 @@ use marketplace_service::homeserver::{
     HomeserverListingClient, HomeserverRawFetchOutcome, HttpHomeserverClient, PkarrResolutionCache,
     DELIVERABLES_PATH, LISTINGS_PATH, SHOP_PATH,
 };
-use marketplace_service::listing_deletion::{confirm_deleted, DeletionCheck};
+use marketplace_service::listing_deletion::{
+    confirm_deleted, confirm_missing_record_deleted, DeletionCheck,
+};
 
 const CLIENT_ID: &str = "market.pubky.service-test";
 const LISTING_ID: &str = "boots_01";
@@ -1251,6 +1253,90 @@ fn a_homeserver_reachable_only_over_plain_http_is_refused() {
             plain.plain_http_requests(),
             0,
             "no plain-HTTP request was sent"
+        );
+    });
+}
+
+#[test]
+fn a_stale_cache_naming_the_old_homeserver_cannot_prove_a_delete_there() {
+    on_testnet_with_service_database(|pool| async move {
+        let mut testnet = testnet().await;
+        let old = testnet
+            .create_random_homeserver()
+            .await
+            .expect("old homeserver")
+            .public_key();
+        let new = testnet
+            .create_random_homeserver()
+            .await
+            .expect("new homeserver")
+            .public_key();
+        let ttl = Duration::from_secs(30);
+        let client = Arc::new(pkarr_client(&testnet, ttl));
+        let app = test_app_with_homeserver_client(pool, client.clone()).await;
+        let seller = new_actor(&app).await;
+        // Two more clients that resolve the seller while the record names the
+        // old homeserver, one per proof function.
+        let for_confirm = pkarr_client(&testnet, ttl);
+        let for_missing = pkarr_client(&testnet, ttl);
+
+        let old_session = account(&testnet, &seller.keypair, &old).await;
+        let record = serde_json::to_vec(&listing_record(&seller.pubky, LISTING_ID, "Winter boots"))
+            .expect("record");
+        put(&old_session, &listing_path(LISTING_ID), &record).await;
+        let cached_at = Instant::now();
+        let (status, body) = execute(
+            &app,
+            &seller.token,
+            &sync_command(&seller.pubky, LISTING_ID, 1),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "sync registers the listing: {body}");
+        for warm in [&for_confirm, &for_missing] {
+            assert!(matches!(
+                warm.fetch_listing(&seller.pubky, LISTING_ID).await,
+                HomeserverFetchOutcome::Found(_)
+            ));
+        }
+
+        // The listing is deleted on the old homeserver, and the seller moves to
+        // the new one, where the listing lives on.
+        old_session
+            .storage()
+            .delete(listing_path(LISTING_ID))
+            .await
+            .expect("delete on the old homeserver");
+        let new_session = account(&testnet, &seller.keypair, &new).await;
+        put(&new_session, &listing_path(LISTING_ID), &record).await;
+
+        // The follower reads the old homeserver's DEL through its stale cache,
+        // and its proof, read from where the seller's record names now, holds
+        // no delete.
+        let summary =
+            marketplace_service::workers::run_once(&app.state, Uuid::new_v4(), app.clock.now())
+                .await
+                .expect("worker pass");
+        assert_eq!(summary.listings_tombstoned, 0);
+        assert!(!deleted_at_is_set(&app.pool, &seller.pubky, LISTING_ID).await);
+
+        // Each proof function, from a client whose cache still names the old
+        // homeserver.
+        assert_eq!(
+            for_missing.fetch_listing(&seller.pubky, LISTING_ID).await,
+            HomeserverFetchOutcome::NotFound,
+            "the cached record still names the old homeserver"
+        );
+        assert_eq!(
+            confirm_missing_record_deleted(&for_missing, &seller.pubky, LISTING_ID).await,
+            DeletionCheck::NotDeleted
+        );
+        assert_eq!(
+            confirm_deleted(&for_confirm, &seller.pubky, LISTING_ID).await,
+            DeletionCheck::NotDeleted
+        );
+        assert!(
+            cached_at.elapsed() < ttl,
+            "every read ran while the old homeserver was cached"
         );
     });
 }
