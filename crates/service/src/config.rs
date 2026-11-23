@@ -1531,12 +1531,14 @@ mod tests {
         let config = from_env_with(&[("STORE_SELLER_PUBKY", Some(seller.as_str()))])
             .expect("a pubky parses");
         assert_eq!(config.store_mode, StoreMode::SingleSeller(seller));
-        let error =
-            from_env_with(&[("STORE_SELLER_PUBKY", Some("seller"))]).expect_err("not a pubky");
-        assert!(
-            error.to_string().starts_with("STORE_SELLER_PUBKY must be"),
-            "{error}"
-        );
+        for value in ["seller", "   "] {
+            let error =
+                from_env_with(&[("STORE_SELLER_PUBKY", Some(value))]).expect_err("not a pubky");
+            assert!(
+                error.to_string().starts_with("STORE_SELLER_PUBKY must be"),
+                "{value:?}: {error}"
+            );
+        }
     }
 
     #[test]

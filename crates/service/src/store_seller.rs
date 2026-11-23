@@ -82,9 +82,11 @@ impl ListingModeration {
 }
 
 /// `STORE_SELLER_PUBKY` from a variable lookup: unset or empty is
-/// marketplace mode; set, it must be a 52-character z-base-32 pubky.
+/// marketplace mode; any other value must be a 52-character z-base-32
+/// pubky. Whitespace alone is refused, not read as unset: a template that
+/// renders blanks must not fall back to serving every seller.
 pub fn store_mode_from_lookup(get: &dyn Fn(&str) -> Option<String>) -> anyhow::Result<StoreMode> {
-    match get(ENV_STORE_SELLER_PUBKY).filter(|value| !value.trim().is_empty()) {
+    match get(ENV_STORE_SELLER_PUBKY).filter(|value| !value.is_empty()) {
         None => Ok(StoreMode::Marketplace),
         Some(seller) if marketplace_domain::pubky::is_valid_pubky(&seller) => {
             Ok(StoreMode::SingleSeller(seller))
@@ -850,6 +852,9 @@ mod tests {
             &format!("pubky{store}"),
             &format!(" {store}"),
             &store.to_uppercase(),
+            " ",
+            "\t",
+            " \n ",
         ] {
             let error = modes(&[NEXUS, ("STORE_SELLER_PUBKY", value)]).expect_err("refused");
             assert!(
