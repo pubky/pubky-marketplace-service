@@ -1079,9 +1079,111 @@ fn halted(tombstoned: u64, halt: Halt) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::pin::Pin;
     use std::time::Duration;
 
-    use super::{event_listing_id, follow_backoff};
+    use super::{
+        confirm_deleted, confirm_missing_record_deleted, event_listing_id, follow_backoff,
+        listing_record_uri, DeletionCheck,
+    };
+    use crate::homeserver::{
+        HomeserverEvent, HomeserverEventKind, HomeserverEventsOutcome, HomeserverFetchOutcome,
+        HomeserverListingClient, HomeserverRefresh,
+    };
+
+    const SELLER: &str = "7oboeqnfgtf5d6gohz1wao7rboe1q3ynexkbm5tmq4u49kxzej9y";
+    const LISTING: &str = "w4i_mujp0ovw_a";
+
+    /// A `pkarr` client whose record read answers 404 from `record_from`
+    /// while its event read reports the record's `DEL` from `events_from`,
+    /// as when the seller's homeserver is looked up anew between the reads.
+    struct Homeservers {
+        record_from: &'static str,
+        events_from: &'static str,
+    }
+
+    impl HomeserverListingClient for Homeservers {
+        fn fetch_listing<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+        ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
+            Box::pin(async { HomeserverFetchOutcome::NotFound })
+        }
+
+        fn fetch_drop<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+        ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
+            Box::pin(async { HomeserverFetchOutcome::NotFound })
+        }
+
+        fn fetch_listing_from<'a>(
+            &'a self,
+            _: &'a str,
+            _: &'a str,
+        ) -> Pin<Box<dyn Future<Output = (HomeserverFetchOutcome, Option<String>)> + Send + 'a>>
+        {
+            let homeserver = Some(self.record_from.to_owned());
+            Box::pin(async move { (HomeserverFetchOutcome::NotFound, homeserver) })
+        }
+
+        fn listing_events<'a>(
+            &'a self,
+            seller_pubky: &'a str,
+            _: &'a str,
+            _: Option<&'a str>,
+            _: bool,
+            _: u16,
+        ) -> Pin<Box<dyn Future<Output = HomeserverEventsOutcome> + Send + 'a>> {
+            let outcome = HomeserverEventsOutcome::Events {
+                homeserver: Some(self.events_from.to_owned()),
+                events: vec![HomeserverEvent {
+                    kind: HomeserverEventKind::Del,
+                    uri: listing_record_uri(seller_pubky, LISTING),
+                    cursor: "7".to_owned(),
+                }],
+            };
+            Box::pin(async move { outcome })
+        }
+
+        fn refresh_homeserver<'a>(
+            &'a self,
+            _: &'a str,
+        ) -> Pin<Box<dyn Future<Output = HomeserverRefresh> + Send + 'a>> {
+            Box::pin(async { HomeserverRefresh::Refreshed })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_delete_from_another_homeserver_than_the_404_proves_nothing() {
+        let split = Homeservers {
+            record_from: "homeserver-a",
+            events_from: "homeserver-b",
+        };
+        let unavailable = DeletionCheck::Unavailable { retry_after: None };
+        assert_eq!(confirm_deleted(&split, SELLER, LISTING).await, unavailable);
+        assert_eq!(
+            confirm_missing_record_deleted(&split, SELLER, LISTING).await,
+            unavailable
+        );
+
+        let same = Homeservers {
+            record_from: "homeserver-a",
+            events_from: "homeserver-a",
+        };
+        let deleted = DeletionCheck::Deleted {
+            cursor: "7".to_owned(),
+            homeserver: Some("homeserver-a".to_owned()),
+        };
+        assert_eq!(confirm_deleted(&same, SELLER, LISTING).await, deleted);
+        assert_eq!(
+            confirm_missing_record_deleted(&same, SELLER, LISTING).await,
+            deleted
+        );
+    }
 
     fn seconds(failures: i32, retry_after: Option<u64>) -> i64 {
         follow_backoff(failures, retry_after.map(Duration::from_secs)).num_seconds()
