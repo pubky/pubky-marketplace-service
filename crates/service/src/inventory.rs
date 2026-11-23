@@ -715,8 +715,8 @@ pub async fn adjust_inventory(
 
 /// The adjustment, for an authenticated session or for an in-process caller
 /// acting as the seller (the connector worker). `enforce_rate_limit` is false
-/// only for that caller: the per-session bucket is keyed to a stored bearer
-/// session, which an in-process caller does not have, and the worker is
+/// only for that caller: the per-seller bucket budgets the seller's own
+/// bearer-session requests, which the worker must not spend, and the worker is
 /// already paced by its own queue and backoff. Every other check, the
 /// idempotency table and the revision rule are the same.
 pub async fn adjust_inventory_for(
