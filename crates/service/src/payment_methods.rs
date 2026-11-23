@@ -1109,6 +1109,25 @@ async fn seller_usdt_available(state: &AppState, seller_pubky: &str) -> Result<b
         .await)
 }
 
+/// Whether a bind passes the order and payment checks its transaction makes
+/// before the payment starts.
+async fn bind_starts_payment(
+    pool: &sqlx::PgPool,
+    order_id: Uuid,
+    buyer_pubky: &str,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM orders o JOIN payments p ON p.order_id = o.id \
+         WHERE o.id = $1 AND o.buyer_pubky = $2 AND o.payment_method IS NULL \
+         AND o.state = 'pending_payment' AND p.state = 'awaiting_entitlement' \
+         AND p.adapter <> 'locks')",
+    )
+    .bind(order_id)
+    .bind(buyer_pubky)
+    .fetch_one(pool)
+    .await
+}
+
 async fn fetch_payment_for_order_update(
     tx: &mut Transaction<'_, Postgres>,
     order_id: Uuid,
@@ -1591,21 +1610,26 @@ pub async fn bind_payment_method(
             );
         }
     }
-    // The bind captures the seller's terms from their homeserver inside its
-    // transaction; under `pkarr` it holds a permit for that read until the
-    // transaction ends, and is refused as retryable, before any attempt is
-    // spent, when none is free.
-    let _transaction_read =
-        match crate::homeserver::try_transaction_read(state.homeserver.as_deref()) {
-            Ok(permit) => permit,
-            Err(crate::homeserver::TransactionReadsBusy) => {
-                return method_error(
-                    ErrorCode::UpstreamUnavailable,
-                    "upstream_unavailable",
-                    crate::homeserver::TRANSACTION_READS_BUSY,
-                );
-            }
-        };
+    // The seller's terms the bind freezes are read here, before any attempt
+    // is spent or transaction opened, so a slow homeserver holds neither a
+    // connection nor the Paykit call. Only a bind the transaction would not
+    // refuse first reads them: the order's buyer, with no method bound, on a
+    // pending order whose payment awaits one.
+    let terms = match bind_starts_payment(&state.pool, order_id, &actor.0).await {
+        Ok(true) => match crate::seller_terms::read_for_order(
+            &state.pool,
+            state.homeserver.as_deref(),
+            order_id,
+            &actor.0,
+        )
+        .await
+        {
+            Ok(terms) => terms,
+            Err(error) => return internal("seller terms read", &error),
+        },
+        Ok(false) => crate::seller_terms::TermsRead::not_read(state.homeserver.is_some()),
+        Err(error) => return internal("bind eligibility lookup", &error),
+    };
     let now = state.clock.now();
     // A bitcoin bind spends its attempt number in a committed statement of
     // its own, before the bind transaction: a bind that rolls back after
@@ -2017,16 +2041,24 @@ pub async fn bind_payment_method(
     };
     // The seller's delivery and completion periods freeze on the order at its
     // first payment lock point.
-    if let Err(error) = crate::seller_terms::capture_for_order(
+    match crate::seller_terms::capture_for_order(
         &mut tx,
-        state.homeserver.as_deref(),
+        &terms,
         order.id,
         &order.seller_pubky,
         now,
     )
     .await
     {
-        return internal("seller delivery terms capture", &error);
+        Ok(Ok(())) => {}
+        Ok(Err(crate::seller_terms::TermsNotRead)) => {
+            return method_error(
+                ErrorCode::UpstreamUnavailable,
+                "upstream_unavailable",
+                crate::seller_terms::TERMS_NOT_READ,
+            );
+        }
+        Err(error) => return internal("seller delivery terms capture", &error),
     }
     // Who marks this order paid is frozen with the terms, at the first
     // payment start, so a later change to the deployment never moves it.

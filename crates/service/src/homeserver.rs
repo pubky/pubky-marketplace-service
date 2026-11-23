@@ -18,7 +18,6 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -30,7 +29,6 @@ use marketplace_domain::ValidationIssue;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Environment variable naming the homeserver base URL used to fetch
 /// canonical seller-signed listing records. Required with
@@ -684,51 +682,6 @@ pub trait HomeserverListingClient: Send + Sync + 'static {
         let _ = pubky;
         Box::pin(async { HomeserverRefresh::Fixed })
     }
-
-    /// The permits a command must hold to read this client inside a database
-    /// transaction, or `None` when such reads are not bounded. The default,
-    /// and the `fixed` client, whose one homeserver is the operator's, bound
-    /// none. See [`TRANSACTION_READS`].
-    fn transaction_reads(&self) -> Option<Arc<Semaphore>> {
-        None
-    }
-}
-
-/// How many commands may read a `pkarr` client's homeservers inside a
-/// database transaction at once. Under `pkarr` the seller picks the
-/// homeserver, so one that answers slowly holds the command's main-pool
-/// connection for the read's whole budget (10 s). Four of the pool's 20
-/// connections leave the rest to every other request even when sellers'
-/// homeservers stall all four. The commands that need a permit (offers,
-/// `drop.sync`, sandbox payment advances, Locks preparation and payment
-/// method binds) are interactive and rare, and a homeserver that answers
-/// holds one for well under a second. A command that finds none free is
-/// refused as retryable instead of queued, so a stalled homeserver cannot
-/// build a backlog. The bound is global: keys are free, so a per-seller
-/// bound would bound nothing.
-pub const TRANSACTION_READS: usize = 4;
-
-/// Every [`TRANSACTION_READS`] permit is taken.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TransactionReadsBusy;
-
-/// The message of a command refused with [`TransactionReadsBusy`].
-pub const TRANSACTION_READS_BUSY: &str =
-    "Too many sellers' homeservers are being read right now. Try again shortly.";
-
-/// A permit to read `homeserver` inside a database transaction, to hold until
-/// the transaction ends: `Ok(None)` when its reads are not bounded (no
-/// client, or `fixed`).
-pub fn try_transaction_read(
-    homeserver: Option<&dyn HomeserverListingClient>,
-) -> Result<Option<OwnedSemaphorePermit>, TransactionReadsBusy> {
-    let Some(permits) = homeserver.and_then(HomeserverListingClient::transaction_reads) else {
-        return Ok(None);
-    };
-    permits
-        .try_acquire_owned()
-        .map(Some)
-        .map_err(|_| TransactionReadsBusy)
 }
 
 /// What [`HomeserverListingClient::refresh_homeserver`] came to.
@@ -813,7 +766,6 @@ impl Default for PkarrResolutionCache {
 /// record read from the seller's own homeserver.
 pub struct HttpHomeserverClient {
     transport: Transport,
-    transaction_reads: Option<Arc<Semaphore>>,
 }
 
 enum Transport {
@@ -908,7 +860,6 @@ impl HttpHomeserverClient {
         let http = reqwest::Client::builder().timeout(FETCH_TIMEOUT).build()?;
         Ok(Self {
             transport: Transport::Fixed { base_url, http },
-            transaction_reads: None,
         })
     }
 
@@ -948,7 +899,6 @@ impl HttpHomeserverClient {
         );
         Ok(Self {
             transport: Transport::Pkarr(transport),
-            transaction_reads: Some(Arc::new(Semaphore::new(TRANSACTION_READS))),
         })
     }
 
@@ -1551,10 +1501,6 @@ impl HomeserverListingClient for HttpHomeserverClient {
             }
         })
     }
-
-    fn transaction_reads(&self) -> Option<Arc<Semaphore>> {
-        self.transaction_reads.clone()
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2093,41 +2039,6 @@ mod tests {
     use super::*;
     use axum::Router;
     use serde_json::json;
-
-    #[tokio::test]
-    async fn only_a_pkarr_client_bounds_its_reads_in_transactions() {
-        let fixed = HttpHomeserverClient::new("http://127.0.0.1:9").expect("fixed client");
-        assert!(fixed.transaction_reads().is_none());
-        assert!(matches!(try_transaction_read(Some(&fixed)), Ok(None)));
-        assert!(matches!(try_transaction_read(None), Ok(None)));
-
-        // A relay that is never contacted: building the client reads nothing.
-        let mut builder = pubky::PubkyHttpClient::builder();
-        builder.pkarr(|pkarr| {
-            pkarr
-                .no_dht()
-                .relays(&["https://127.0.0.1:9/"])
-                .expect("relay URL")
-        });
-        let pkarr = HttpHomeserverClient::pkarr(builder, PkarrResolutionCache::default())
-            .expect("pkarr client");
-        let permits = pkarr.transaction_reads().expect("pkarr bounds its reads");
-        assert_eq!(permits.available_permits(), TRANSACTION_READS);
-
-        let held: Vec<_> = (0..TRANSACTION_READS)
-            .map(|_| {
-                try_transaction_read(Some(&pkarr))
-                    .expect("a permit is free")
-                    .expect("pkarr hands out permits")
-            })
-            .collect();
-        assert_eq!(
-            try_transaction_read(Some(&pkarr)).err(),
-            Some(TransactionReadsBusy)
-        );
-        drop(held);
-        assert!(matches!(try_transaction_read(Some(&pkarr)), Ok(Some(_))));
-    }
 
     fn record_json() -> Value {
         json!({

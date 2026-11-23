@@ -20,13 +20,11 @@ use std::time::Duration;
 
 use axum::http::StatusCode;
 use marketplace_service::clock::Clock;
-use marketplace_service::homeserver::{
-    HomeserverFetchOutcome, HomeserverListingClient, TRANSACTION_READS_BUSY,
-};
+use marketplace_service::homeserver::{HomeserverFetchOutcome, HomeserverListingClient};
 use marketplace_service::workers::run_once;
 use serde_json::{json, Value};
 use sqlx::PgPool;
-use tokio::sync::{watch, Semaphore};
+use tokio::sync::watch;
 use uuid::Uuid;
 
 use common::{
@@ -1906,14 +1904,12 @@ async fn a_claim_whose_payment_started_survives_the_claim_window_and_confirms(po
     assert_eq!((available, reserved, sold), (4, 0, 1));
 }
 
-// === Reads inside a transaction are bounded ===
+// === Drop reads hold no transaction ===
 
-/// A homeserver that bounds the reads commands make inside a transaction
-/// with `permits`, as a `pkarr` client does, and whose drop reads wait for
-/// `release`, then serve `record` (`None`: no such drop).
+/// A homeserver whose drop reads wait for `release`, then serve `record`
+/// (`None`: no such drop).
 struct StallingDropHomeserver {
     record: std::sync::Mutex<Option<Value>>,
-    permits: Arc<Semaphore>,
     release: watch::Sender<bool>,
     drop_reads: AtomicUsize,
 }
@@ -1945,10 +1941,6 @@ impl HomeserverListingClient for StallingDropHomeserver {
             }
         })
     }
-
-    fn transaction_reads(&self) -> Option<Arc<Semaphore>> {
-        Some(self.permits.clone())
-    }
 }
 
 async fn open_transactions(pool: &PgPool) -> i64 {
@@ -1962,11 +1954,13 @@ async fn open_transactions(pool: &PgPool) -> i64 {
     .expect("activity")
 }
 
+/// Anyone may sync any drop, so a seller's stalled homeserver must not
+/// hold anything another command needs: the read is made before the
+/// transaction, and nothing bounds how many are made at once.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn homeserver_reads_in_transactions_are_refused_once_the_permits_are_taken(pool: PgPool) {
+async fn stalled_drop_reads_hold_no_transaction_and_refuse_no_one(pool: PgPool) {
     let homeserver = Arc::new(StallingDropHomeserver {
         record: std::sync::Mutex::new(None),
-        permits: Arc::new(Semaphore::new(2)),
         release: watch::channel(false).0,
         drop_reads: AtomicUsize::new(0),
     });
@@ -1977,48 +1971,31 @@ async fn homeserver_reads_in_transactions_are_refused_once_the_permits_are_taken
     assert_eq!(status, StatusCode::OK, "register: {body}");
     let sync = |n: u64| sync_drop_command(&seller.pubky, DROP_ID, n);
 
-    // Two syncs take both permits and wait on the homeserver inside their
-    // transactions.
-    let stalled: Vec<_> = (1..=2)
+    // Every sync reads the homeserver and waits on it, none inside a
+    // transaction.
+    let stalled: Vec<_> = (1..=6)
         .map(|n| {
             let (app, token, command) = (app.clone(), buyer.token.clone(), sync(n));
             tokio::spawn(async move { execute(&app, &token, &command).await })
         })
         .collect();
     tokio::time::timeout(Duration::from_secs(10), async {
-        while homeserver.drop_reads.load(Ordering::SeqCst) < 2 {
+        while homeserver.drop_reads.load(Ordering::SeqCst) < 6 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("both syncs read the homeserver");
-    assert_eq!(open_transactions(&pool).await, 2);
+    .expect("every sync reads the homeserver");
+    assert_eq!(open_transactions(&pool).await, 0);
 
-    // A third is refused at once, as retryable, with no read and no
-    // transaction, rather than waiting for a connection.
-    let (status, body) = tokio::time::timeout(
-        Duration::from_secs(5),
-        execute(&app, &buyer.token, &sync(3)),
-    )
-    .await
-    .expect("refused without waiting");
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    assert_eq!(
-        body["error"]["code"],
-        json!("UPSTREAM_UNAVAILABLE"),
-        "{body}"
-    );
-    assert_eq!(body["error"]["message"], json!(TRANSACTION_READS_BUSY));
-    assert_eq!(homeserver.drop_reads.load(Ordering::SeqCst), 2);
-
-    // Commands that read no homeserver in their transaction still run.
+    // Other commands run meanwhile.
     let (status, body) = execute(
         &app,
         &seller.token,
         &register_listing_command(&seller.pubky, "boots_02", 5, 1),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "register while saturated: {body}");
+    assert_eq!(status, StatusCode::OK, "register while stalled: {body}");
 
     // Released, the stalled syncs finish (the drop has no record yet).
     homeserver.release.send_replace(true);
@@ -2038,23 +2015,13 @@ async fn homeserver_reads_in_transactions_are_refused_once_the_permits_are_taken
         10,
         2,
     ));
-    let (status, synced) = execute(&app, &buyer.token, &sync(4)).await;
-    assert_eq!(status, StatusCode::OK, "sync with a free permit: {synced}");
+    let (status, synced) = execute(&app, &buyer.token, &sync(7)).await;
+    assert_eq!(status, StatusCode::OK, "sync: {synced}");
+    assert_eq!(homeserver.drop_reads.load(Ordering::SeqCst), 7);
 
-    // With every permit taken, a replay is answered from its stored result
-    // and a new sync is refused.
-    let held = homeserver
-        .permits
-        .clone()
-        .try_acquire_many_owned(2)
-        .expect("the permits were returned");
-    let (status, replay) = execute(&app, &buyer.token, &sync(4)).await;
+    // A replay is answered from its stored result without a read.
+    let (status, replay) = execute(&app, &buyer.token, &sync(7)).await;
     assert_eq!(status, StatusCode::OK, "{replay}");
     assert_eq!(replay, synced);
-    let (status, body) = execute(&app, &buyer.token, &sync(5)).await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    drop(held);
-    let (status, body) = execute(&app, &buyer.token, &sync(5)).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(homeserver.drop_reads.load(Ordering::SeqCst), 4);
+    assert_eq!(homeserver.drop_reads.load(Ordering::SeqCst), 7);
 }

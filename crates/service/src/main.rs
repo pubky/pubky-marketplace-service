@@ -298,12 +298,12 @@ const POOL_ACQUIRE_WAIT: Duration = Duration::from_secs(15);
 
 // A request or worker pass waits at most 15 s for a connection, instead of
 // the sqlx default of 30 s. That covers a payment-method bind, which holds
-// its transaction across the 10 s Paykit HTTP timeout. A command
-// transaction can hold a connection across a homeserver read of up to 10 s;
-// under `HOMESERVER_RESOLUTION=pkarr`, where sellers pick the homeserver, at
-// most `homeserver::TRANSACTION_READS` such transactions are open at once.
-// The 120 s deliverable read-back of `digital_delivery.set` is made before
-// its transaction. A request waiting behind a full pool fails with
+// its transaction across the 10 s Paykit HTTP timeout. No transaction holds
+// a connection across a homeserver read: every command and the bind read the
+// seller's homeserver (including the 120 s deliverable read-back of
+// `digital_delivery.set`) before their transaction opens, so under
+// `HOMESERVER_RESOLUTION=pkarr`, where sellers pick the homeserver, a stalled
+// one holds no connection. A request waiting behind a full pool fails with
 // `PoolTimedOut` after 15 s rather than 30 s. The same 15 s also bounds
 // opening a new connection. At boot the service still waits up to
 // `BOOT_DATABASE_WAIT` for the database.

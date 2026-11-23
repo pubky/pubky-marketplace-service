@@ -13,7 +13,6 @@ use common::{FakePaykit, TestActor};
 use marketplace_service::clock::Clock;
 use marketplace_service::homeserver::{
     HomeserverFetchOutcome, HomeserverListingClient, HomeserverRawFetchOutcome,
-    TRANSACTION_READS_BUSY,
 };
 use marketplace_service::http::build_router;
 use marketplace_service::payments::attempt_reference;
@@ -22,8 +21,9 @@ use serde_json::{json, Value};
 use sqlx::PgPool;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Arc;
-use tokio::sync::Semaphore;
+use tokio::sync::watch;
 use uuid::Uuid;
 
 const HOLDING_COPY: &str =
@@ -990,13 +990,44 @@ async fn legacy_null_expiry_hold_cancel_completes(pool: PgPool) {
     );
 }
 
-/// Listing records from the command mirror, with `permits` bounding the
-/// reads made inside a transaction, as a `pkarr` client bounds them.
-struct BoundedMirrorHomeserver {
-    permits: Arc<Semaphore>,
+/// Records from the command mirror, except that the drop records and raw
+/// listing records of the seller named in `stalled_seller` wait for
+/// `release`: the reads `drop.sync` and the offer commands make, which any
+/// signed-in actor can send for any key. Every other read records how many
+/// database transactions were open while it ran.
+struct StallingHomeserver {
+    pool: PgPool,
+    stalled_seller: std::sync::Mutex<String>,
+    release: watch::Sender<bool>,
+    stalled_reads: AtomicUsize,
+    open_during_reads: std::sync::Mutex<Vec<i64>>,
 }
 
-impl HomeserverListingClient for BoundedMirrorHomeserver {
+impl StallingHomeserver {
+    async fn stall_if_named(&self, seller_pubky: &str) -> bool {
+        if *self.stalled_seller.lock().expect("lock") != seller_pubky {
+            let open: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pg_stat_activity \
+                 WHERE datname = current_database() AND backend_type = 'client backend' \
+                 AND pid <> pg_backend_pid() AND xact_start IS NOT NULL",
+            )
+            .fetch_one(&self.pool)
+            .await
+            .expect("activity");
+            self.open_during_reads.lock().expect("lock").push(open);
+            return false;
+        }
+        self.stalled_reads.fetch_add(1, AtomicOrdering::SeqCst);
+        self.release
+            .subscribe()
+            .wait_for(|released| *released)
+            .await
+            .expect("release");
+        true
+    }
+}
+
+impl HomeserverListingClient for StallingHomeserver {
     fn fetch_listing<'a>(
         &'a self,
         seller_pubky: &'a str,
@@ -1010,7 +1041,14 @@ impl HomeserverListingClient for BoundedMirrorHomeserver {
         seller_pubky: &'a str,
         listing_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = HomeserverRawFetchOutcome> + Send + 'a>> {
-        CommandMirrorHomeserver.fetch_listing_raw(seller_pubky, listing_id)
+        Box::pin(async move {
+            if self.stall_if_named(seller_pubky).await {
+                return HomeserverRawFetchOutcome::Unavailable;
+            }
+            CommandMirrorHomeserver
+                .fetch_listing_raw(seller_pubky, listing_id)
+                .await
+        })
     }
 
     fn fetch_drop<'a>(
@@ -1018,11 +1056,24 @@ impl HomeserverListingClient for BoundedMirrorHomeserver {
         seller_pubky: &'a str,
         drop_id: &'a str,
     ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
-        CommandMirrorHomeserver.fetch_drop(seller_pubky, drop_id)
+        Box::pin(async move {
+            if self.stall_if_named(seller_pubky).await {
+                return HomeserverFetchOutcome::Unavailable;
+            }
+            CommandMirrorHomeserver
+                .fetch_drop(seller_pubky, drop_id)
+                .await
+        })
     }
 
-    fn transaction_reads(&self) -> Option<Arc<Semaphore>> {
-        Some(self.permits.clone())
+    fn fetch_shop<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
+        Box::pin(async move {
+            self.stall_if_named(seller_pubky).await;
+            HomeserverFetchOutcome::NotFound
+        })
     }
 }
 
@@ -1034,46 +1085,98 @@ async fn bind_attempt(pool: &PgPool, order_id: &str) -> i32 {
         .expect("order row")
 }
 
-/// A bind captures the seller's terms from their homeserver inside its
-/// transaction. With every permit for such reads taken, it is refused as
-/// retryable before it spends an attempt or opens the transaction.
+/// `drop.sync` and the offer commands read a seller's homeserver for any
+/// signed-in actor, for any key. With more of them stalled on one seller's
+/// homeserver than the database pool has connections, a payment-method
+/// bind on another seller's order still runs to completion: those reads
+/// hold no connection, permit or lock, and the bind reads its own seller's
+/// terms before its transaction, never while Paykit is called.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn a_bind_is_refused_while_every_homeserver_read_permit_is_taken(pool: PgPool) {
-    let (app, paykit) = test_app_with_payments(pool).await;
-    let permits = Arc::new(Semaphore::new(1));
-    let state = app
-        .state
-        .clone()
-        .with_homeserver(Some(Arc::new(BoundedMirrorHomeserver {
-            permits: permits.clone(),
-        })));
-    let app = TestApp {
+async fn stalled_reads_anyone_can_send_never_hold_up_a_bind(pool: PgPool) {
+    let (app, paykit) = test_app_with_payments(pool.clone()).await;
+    let homeserver = Arc::new(StallingHomeserver {
+        pool,
+        stalled_seller: std::sync::Mutex::new(String::new()),
+        release: watch::channel(false).0,
+        stalled_reads: AtomicUsize::new(0),
+        open_during_reads: std::sync::Mutex::new(Vec::new()),
+    });
+    let state = app.state.clone().with_homeserver(Some(homeserver.clone()));
+    let app = Arc::new(TestApp {
         router: build_router(state.clone()),
         pool: app.pool,
         clock: app.clock,
         state,
-    };
+    });
+    let pool_size = app.pool.options().get_max_connections() as usize;
+    let stalled_seller = new_actor(&app).await;
     let seller = new_actor(&app).await;
     let buyer = new_actor(&app).await;
+    let (status, body) = execute(
+        &app,
+        &stalled_seller.token,
+        &register_command(&stalled_seller.pubky, 100),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "register: {body}");
     enable_bitcoin(&app, &paykit, &seller).await;
     let order = create_sat_order(&app, &seller, &buyer).await;
+    *homeserver.stalled_seller.lock().expect("lock") = stalled_seller.pubky.clone();
+
+    // Strangers sync the stalled seller's drop and make offers on its
+    // listing: more stalled reads than the pool has connections.
+    let senders = pool_size + 4;
+    let mut stalled = Vec::new();
+    for n in 0..senders as u64 {
+        let stranger = new_actor(&app).await;
+        let mut offer = create_offer_command(&stalled_seller.pubky, 1);
+        offer["command_id"] = json!(indexed_command_id(0x7100, n));
+        for command in [
+            sync_drop_command(&stalled_seller.pubky, "winter_drop", 0x7200 + n),
+            offer,
+        ] {
+            let (app, token) = (app.clone(), stranger.token.clone());
+            stalled.push(tokio::spawn(async move {
+                execute(&app, &token, &command).await
+            }));
+        }
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while homeserver.stalled_reads.load(AtomicOrdering::SeqCst) < 2 * senders {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("every stalled command reads the homeserver");
+    homeserver.open_during_reads.lock().expect("lock").clear();
+
     let attempts = bind_attempt(&app.pool, &order.order_id).await;
-
-    let held = permits.clone().try_acquire_owned().expect("a free permit");
-    let (status, body) = bind_method(&app, &buyer.token, &order.order_id, "bitcoin").await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    assert_eq!(
-        body["error"]["code"],
-        json!("UPSTREAM_UNAVAILABLE"),
-        "{body}"
-    );
-    assert_eq!(body["error"]["reason"], json!("upstream_unavailable"));
-    assert_eq!(body["error"]["message"], json!(TRANSACTION_READS_BUSY));
-    assert_eq!(bind_attempt(&app.pool, &order.order_id).await, attempts);
-
-    drop(held);
-    let (status, body) = bind_method(&app, &buyer.token, &order.order_id, "bitcoin").await;
+    let (status, body) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        bind_method(&app, &buyer.token, &order.order_id, "bitcoin"),
+    )
+    .await
+    .expect("the bind does not wait on the stalled homeserver");
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(bind_attempt(&app.pool, &order.order_id).await, attempts + 1);
-    assert_eq!(permits.available_permits(), 1, "the permit is returned");
+    let open = homeserver.open_during_reads.lock().expect("lock").clone();
+    assert!(!open.is_empty(), "the bind read its seller's terms");
+    assert!(
+        open.iter().all(|open| *open == 0),
+        "the bind's reads ran with no transaction open: {open:?}"
+    );
+    assert_eq!(
+        homeserver.stalled_reads.load(AtomicOrdering::SeqCst),
+        2 * senders
+    );
+
+    // Released, every stalled command finishes on its own terms.
+    homeserver.release.send_replace(true);
+    for task in stalled {
+        let (status, body) = task.await.expect("stalled command");
+        assert!(
+            status == StatusCode::OK || status == StatusCode::SERVICE_UNAVAILABLE,
+            "{status}: {body}"
+        );
+    }
 }

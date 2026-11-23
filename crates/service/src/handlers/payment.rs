@@ -14,7 +14,7 @@ use marketplace_domain::state_machines::{
 };
 use marketplace_domain::{ids, Command, ErrorCode};
 use serde_json::{json, Value};
-use sqlx::{Postgres, Transaction};
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::clock::format_timestamp;
@@ -27,6 +27,99 @@ use crate::homeserver::HomeserverListingClient;
 use crate::model::{money_json, OrderRow, PaymentRow, ReceiptRow};
 use crate::queries::{ORDER_COLUMNS, PAYMENT_COLUMNS};
 use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
+use crate::seller_terms::{TermsNotRead, TermsRead};
+
+/// The checks [`advance`] makes on the payment row before it touches the
+/// order.
+fn advance_refusal(
+    actor: &str,
+    command: &Command,
+    payload: &AdvanceSandboxPaymentPayload,
+    payment: &PaymentRow,
+) -> Option<CommandFailure> {
+    if payment.buyer_pubky != actor {
+        return Some(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::Unauthorized,
+            ErrorCode::Unauthorized,
+            "Only the buyer may advance a sandbox payment.",
+        ));
+    }
+    // A payment correlated to a Locks lifecycle is advanced exclusively by
+    // server-side verification (ADR-0019 §7): no client claim — including
+    // this explicitly sandbox-only command — may advance it.
+    if payment.adapter != "sandbox" {
+        return Some(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
+            ErrorCode::InvalidState,
+            "A Locks-correlated payment advances only by server-side verification.",
+        ));
+    }
+    if command.aggregate_id != ids::payment_aggregate_id(payment.id) {
+        return Some(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidCommand,
+            ErrorCode::InvalidCommand,
+            "The payment aggregate id is invalid.",
+        ));
+    }
+    if command.expected_revision != payment.revision {
+        return Some(CommandFailure::refused_with_revision(
+            crate::refusal_audit::RefusalKind::RevisionConflict,
+            ErrorCode::RevisionConflict,
+            "The payment revision is stale.",
+            payment.revision,
+        ));
+    }
+    // The prototype's transition table is a strict subset of the payment
+    // machine (the machine also carries the server-driven payment window).
+    let allowed = match payment.state.as_str() {
+        "awaiting_entitlement" => ["detected", "confirmed", "expired", "manual_review"].as_slice(),
+        "detected" => ["confirmed", "manual_review"].as_slice(),
+        _ => [].as_slice(),
+    };
+    if !allowed.contains(&payload.target.as_str()) {
+        return Some(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
+            ErrorCode::InvalidState,
+            "The sandbox payment transition is invalid.",
+        ));
+    }
+    if payload.target == SandboxPaymentTarget::Confirmed && payload.confirmations < 1 {
+        return Some(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidCommand,
+            ErrorCode::InvalidCommand,
+            "Confirmed payment requires at least one confirmation.",
+        ));
+    }
+    None
+}
+
+/// The seller's terms a `payment.sandbox_advance` that starts its payment
+/// freezes, read before its transaction; [`TermsRead::NotRead`] for an
+/// advance that does not start one or that [`advance`] refuses first, so
+/// only the payment's buyer makes the service read the seller's records.
+pub async fn terms_read(
+    pool: &PgPool,
+    homeserver: Option<&dyn HomeserverListingClient>,
+    actor: &str,
+    command: &Command,
+    payload: &AdvanceSandboxPaymentPayload,
+) -> Result<TermsRead, sqlx::Error> {
+    let payment: Option<PaymentRow> = sqlx::query_as(&format!(
+        "SELECT {PAYMENT_COLUMNS} FROM payments WHERE id = $1"
+    ))
+    .bind(payload.payment_id)
+    .fetch_optional(pool)
+    .await?;
+    match payment {
+        Some(payment)
+            if payment.state == "awaiting_entitlement"
+                && advance_refusal(actor, command, payload, &payment).is_none() =>
+        {
+            crate::seller_terms::read_for_order(pool, homeserver, payment.order_id, actor).await
+        }
+        _ => Ok(TermsRead::not_read(homeserver.is_some())),
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 pub async fn advance(
@@ -35,7 +128,7 @@ pub async fn advance(
     command: &Command,
     payload: &AdvanceSandboxPaymentPayload,
     sandbox_payment_window_seconds: i64,
-    homeserver: Option<&dyn HomeserverListingClient>,
+    terms: &TermsRead,
     keys: crate::ConfirmKeys<'_>,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
@@ -52,61 +145,11 @@ pub async fn advance(
             "The sandbox payment was not found.",
         )));
     };
-    if payment.buyer_pubky != actor {
-        return Ok(Err(CommandFailure::refused(
-            crate::refusal_audit::RefusalKind::Unauthorized,
-            ErrorCode::Unauthorized,
-            "Only the buyer may advance a sandbox payment.",
-        )));
-    }
-    // A payment correlated to a Locks lifecycle is advanced exclusively by
-    // server-side verification (ADR-0019 §7): no client claim — including
-    // this explicitly sandbox-only command — may advance it.
-    if payment.adapter != "sandbox" {
-        return Ok(Err(CommandFailure::refused(
-            crate::refusal_audit::RefusalKind::InvalidState,
-            ErrorCode::InvalidState,
-            "A Locks-correlated payment advances only by server-side verification.",
-        )));
-    }
-    if command.aggregate_id != ids::payment_aggregate_id(payment.id) {
-        return Ok(Err(CommandFailure::refused(
-            crate::refusal_audit::RefusalKind::InvalidCommand,
-            ErrorCode::InvalidCommand,
-            "The payment aggregate id is invalid.",
-        )));
-    }
-    if command.expected_revision != payment.revision {
-        return Ok(Err(CommandFailure::refused_with_revision(
-            crate::refusal_audit::RefusalKind::RevisionConflict,
-            ErrorCode::RevisionConflict,
-            "The payment revision is stale.",
-            payment.revision,
-        )));
+    if let Some(failure) = advance_refusal(actor, command, payload, &payment) {
+        return Ok(Err(failure));
     }
     let target = payload.target.as_str();
-    // The prototype's transition table is a strict subset of the payment
-    // machine (the machine also carries the server-driven payment window).
-    let allowed = match payment.state.as_str() {
-        "awaiting_entitlement" => ["detected", "confirmed", "expired", "manual_review"].as_slice(),
-        "detected" => ["confirmed", "manual_review"].as_slice(),
-        _ => [].as_slice(),
-    };
-    if !allowed.contains(&target) {
-        return Ok(Err(CommandFailure::refused(
-            crate::refusal_audit::RefusalKind::InvalidState,
-            ErrorCode::InvalidState,
-            "The sandbox payment transition is invalid.",
-        )));
-    }
     debug_assert!(can_transition(&payment_machine(), &payment.state, target));
-    if payload.target == SandboxPaymentTarget::Confirmed && payload.confirmations < 1 {
-        return Ok(Err(CommandFailure::refused(
-            crate::refusal_audit::RefusalKind::InvalidCommand,
-            ErrorCode::InvalidCommand,
-            "Confirmed payment requires at least one confirmation.",
-        )));
-    }
     let Some(order) = fetch_order_for_update(tx, payment.order_id).await? else {
         return Ok(Err(CommandFailure::refused(
             crate::refusal_audit::RefusalKind::InvariantViolation,
@@ -119,8 +162,16 @@ pub async fn advance(
     // inventory hold (or re-arms a drop claim's window) before anything
     // else moves.
     let order = if payment.state == "awaiting_entitlement" {
-        crate::seller_terms::capture_for_order(tx, homeserver, order.id, &order.seller_pubky, now)
-            .await?;
+        if let Err(TermsNotRead) =
+            crate::seller_terms::capture_for_order(tx, terms, order.id, &order.seller_pubky, now)
+                .await?
+        {
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::UpstreamUnavailable,
+                ErrorCode::UpstreamUnavailable,
+                crate::seller_terms::TERMS_NOT_READ,
+            )));
+        }
         // The annual limit at payment start, before any listing lock so the
         // per-seller counter lock stays first (`docs/lock-order.md`).
         if let (Some(modes), SandboxPaymentTarget::Confirmed) = (keys.fence, payload.target) {

@@ -2,10 +2,11 @@
 //!
 //! A seller publishes `returnPolicy` on each listing record
 //! (`acceptsReturns`, `returnWindowDays`). The service reads it from the
-//! seller-owned listing record on the homeserver when the order's payment
-//! starts, together with the seller's delivery terms
-//! ([`crate::seller_terms::capture_for_order`]), and freezes it on the order,
-//! so a later edit of the listing never changes what the buyer bought under.
+//! seller-owned listing record on the homeserver just before the order's
+//! payment starts, together with the seller's delivery terms
+//! ([`crate::seller_terms::read_for_order`]), and freezes it on the order
+//! when the payment starts, so a later edit of the listing never changes
+//! what the buyer bought under.
 //! `return.request` then refuses a return on a final-sale order and after the
 //! return window.
 //!
@@ -17,7 +18,7 @@
 
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{json, Value};
-use sqlx::{Postgres, Transaction};
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::homeserver::{HomeserverFetchOutcome, HomeserverListingClient};
@@ -91,15 +92,25 @@ impl ReturnPolicy {
     }
 }
 
-/// Reads every line's listing record and freezes the order's policy in
-/// `orders.return_policy`. Called from the payment-start capture, inside the
-/// transaction that holds the order row, and only once per order.
-pub async fn capture_for_order(
-    tx: &mut Transaction<'_, Postgres>,
+/// An order's return policy as its lines' listing records read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyRead {
+    /// Every line's policy, merged; `None` for an order with no listing line.
+    Policy(Option<ReturnPolicy>),
+    /// This line's record could not be read or carries no usable policy.
+    Unusable { listing_id: String },
+}
+
+/// Reads every line's listing record, before the payment-start transaction
+/// ([`crate::seller_terms::read_for_order`]). An order's lines and their
+/// listings never change, so the records read here are the ones the
+/// transaction freezes.
+pub async fn read_for_order(
+    pool: &PgPool,
     homeserver: &dyn HomeserverListingClient,
     order_id: Uuid,
     seller_pubky: &str,
-) -> Result<(), sqlx::Error> {
+) -> Result<PolicyRead, sqlx::Error> {
     let listing_ids: Vec<(String,)> = sqlx::query_as(
         "SELECT l.listing_id FROM orders o \
          CROSS JOIN LATERAL jsonb_array_elements(o.lines) AS line \
@@ -107,26 +118,41 @@ pub async fn capture_for_order(
          WHERE o.id = $1",
     )
     .bind(order_id)
-    .fetch_all(&mut **tx)
+    .fetch_all(pool)
     .await?;
-    let mut frozen: Option<ReturnPolicy> = None;
-    for (listing_id,) in &listing_ids {
-        let policy = match homeserver.fetch_listing(seller_pubky, listing_id).await {
+    let mut merged: Option<ReturnPolicy> = None;
+    for (listing_id,) in listing_ids {
+        let policy = match homeserver.fetch_listing(seller_pubky, &listing_id).await {
             HomeserverFetchOutcome::Found(record) => ReturnPolicy::from_listing_record(&record),
             _ => None,
         };
         let Some(policy) = policy else {
+            return Ok(PolicyRead::Unusable { listing_id });
+        };
+        merged = Some(merged.map_or(policy, |current| current.merge(policy)));
+    }
+    Ok(PolicyRead::Policy(merged))
+}
+
+/// Freezes the order's policy in `orders.return_policy`. Called from the
+/// payment-start capture, inside the transaction that holds the order row,
+/// and only once per order.
+pub async fn freeze(
+    tx: &mut Transaction<'_, Postgres>,
+    order_id: Uuid,
+    read: &PolicyRead,
+) -> Result<(), sqlx::Error> {
+    let policy = match read {
+        PolicyRead::Policy(Some(policy)) => *policy,
+        PolicyRead::Policy(None) => return Ok(()),
+        PolicyRead::Unusable { listing_id } => {
             tracing::warn!(
                 order_id = %order_id,
                 listing_id = %listing_id,
                 "listing return policy unreadable at payment start; order keeps no return policy"
             );
             return Ok(());
-        };
-        frozen = Some(frozen.map_or(policy, |current| current.merge(policy)));
-    }
-    let Some(policy) = frozen else {
-        return Ok(());
+        }
     };
     sqlx::query("UPDATE orders SET return_policy = $2 WHERE id = $1")
         .bind(order_id)
