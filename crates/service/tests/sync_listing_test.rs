@@ -6,8 +6,9 @@
 //! real. Covered: a buyer's happy sync creating a fresh aggregate, the
 //! convergent no-op replays (same record, and an aggregate already ahead of
 //! the record), the definitive 404, the retriable unreachable-homeserver
-//! failure, and the committed-inventory invariant that survives both
-//! registration paths.
+//! failure, the committed-inventory invariant that survives both
+//! registration paths, and the homeserver reads running with no database
+//! transaction open.
 
 mod common;
 
@@ -19,8 +20,13 @@ use common::{
     execute, new_actor, register_command, send, sync_command, test_app_with_homeserver,
     test_app_with_homeserver_client, test_app_without_homeserver, TestApp,
 };
-use marketplace_service::homeserver::HttpHomeserverClient;
-use std::sync::Arc;
+use marketplace_service::homeserver::{
+    HomeserverEvent, HomeserverEventKind, HomeserverEventsOutcome, HomeserverFetchOutcome,
+    HomeserverListingClient, HttpHomeserverClient,
+};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 
 const LISTING_ID: &str = "boots_01";
 
@@ -678,5 +684,117 @@ async fn an_edit_keeps_reserved_while_a_hold_is_open_and_available_above_committ
     assert_eq!(
         state_of(&app, &seller.pubky).await,
         ("available".to_string(), 3, 1, 1)
+    );
+}
+
+/// A homeserver double that, during each read, counts the transactions
+/// open on the service's database: a read made while the command holds a
+/// transaction would hold a pooled connection across the network wait.
+struct TransactionWatchingHomeserver {
+    pool: PgPool,
+    /// `Some`: the record is served; `None`: it is gone, and the latest event
+    /// for it is a `DEL`.
+    record: Mutex<Option<Value>>,
+    open_transactions: Mutex<Vec<i64>>,
+}
+
+impl TransactionWatchingHomeserver {
+    async fn watch(&self) {
+        let open: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_stat_activity \
+             WHERE datname = current_database() AND backend_type = 'client backend' \
+             AND pid <> pg_backend_pid() AND xact_start IS NOT NULL",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .expect("activity");
+        self.open_transactions.lock().expect("lock").push(open);
+    }
+}
+
+impl HomeserverListingClient for TransactionWatchingHomeserver {
+    fn fetch_listing<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        listing_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
+        Box::pin(async move {
+            self.watch().await;
+            match self.record.lock().expect("lock").clone() {
+                Some(mut record) => {
+                    record["ownerPubky"] = json!(seller_pubky);
+                    record["listingId"] = json!(listing_id);
+                    HomeserverFetchOutcome::Found(record)
+                }
+                None => HomeserverFetchOutcome::NotFound,
+            }
+        })
+    }
+
+    fn fetch_drop<'a>(
+        &'a self,
+        _seller_pubky: &'a str,
+        _drop_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
+        Box::pin(async { HomeserverFetchOutcome::NotFound })
+    }
+
+    fn listing_events<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        path: &'a str,
+        _after_cursor: Option<&'a str>,
+        _reverse: bool,
+        _limit: u16,
+    ) -> Pin<Box<dyn Future<Output = HomeserverEventsOutcome> + Send + 'a>> {
+        Box::pin(async move {
+            self.watch().await;
+            HomeserverEventsOutcome::Events {
+                homeserver: None,
+                events: vec![HomeserverEvent {
+                    kind: HomeserverEventKind::Del,
+                    uri: format!("pubky://{seller_pubky}{path}"),
+                    cursor: "7".to_string(),
+                }],
+            }
+        })
+    }
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn sync_reads_the_homeserver_with_no_transaction_open(pool: PgPool) {
+    let homeserver = Arc::new(TransactionWatchingHomeserver {
+        pool: pool.clone(),
+        record: Mutex::new(Some(homeserver_record(1, &[2, 3]))),
+        open_transactions: Mutex::new(Vec::new()),
+    });
+    let app = test_app_with_homeserver_client(pool, homeserver.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &sync_command(&seller.pubky, LISTING_ID, 1),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "registers: {body}");
+
+    // The record is deleted: the missing-record read and the deletion proof.
+    *homeserver.record.lock().expect("lock") = None;
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &sync_command(&seller.pubky, LISTING_ID, 2),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "tombstones: {body}");
+    assert_eq!(body["result"]["kind"], json!("listing_deleted"), "{body}");
+
+    let open = homeserver.open_transactions.lock().expect("lock").clone();
+    assert_eq!(
+        open,
+        vec![0, 0, 0],
+        "record, record, events: no transaction open"
     );
 }

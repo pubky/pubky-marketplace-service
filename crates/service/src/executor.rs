@@ -278,47 +278,53 @@ pub async fn execute_with_edge(
         shipping = crate::shipping::ShippingPlan::read(state, &command).await?;
     }
 
-    // A `listing.register` that needs the seller's public record reads it
-    // here, before the transaction and the command's advisory lock, so a slow
-    // homeserver never holds a domain connection or blocks a duplicate. It
-    // enters the command's flight first, so a concurrent duplicate waits for
-    // this submission instead of reading the record too, and a replay or a
-    // conflicting reuse of the command id is answered from its stored result
-    // without the homeserver. `command_results` rows are never updated or
-    // deleted, so that result is the one the locked lookup below would find.
-    let (prefetched, _flight) = match crate::handlers::register_listing::public_record_request(
-        &state.pool,
-        actor,
-        &command,
-    )
-    .await?
-    {
-        Some(payload) => {
-            let flight = state.command_flights.enter(actor, command.command_id).await;
-            if let Some((stored_hash, stored_result)) =
-                stored_command_result(&state.pool, actor, command.command_id).await?
-            {
-                return Ok(stored_result_response(
-                    state,
-                    actor,
-                    &command,
-                    &request_hash,
-                    &stored_hash,
-                    stored_result,
-                    started,
-                ));
-            }
-            let prefetched = crate::handlers::register_listing::prefetch_public_record(
+    // A `listing.register` that needs the seller's public record, and every
+    // `listing.sync` (the record and, when it is missing, the deletion
+    // proof), read the seller's homeserver here, before the transaction and
+    // the command's advisory lock, so a slow homeserver never holds a domain
+    // connection or blocks a duplicate. The command enters its flight first,
+    // so a concurrent duplicate waits for this submission instead of reading
+    // the homeserver too, and a replay or a conflicting reuse of the command
+    // id is answered from its stored result without the homeserver.
+    // `command_results` rows are never updated or deleted, so that result is
+    // the one the locked lookup below would find.
+    let register_request =
+        crate::handlers::register_listing::public_record_request(&state.pool, actor, &command)
+            .await?;
+    let sync_request =
+        crate::handlers::sync_listing::record_request(&command, state.homeserver.is_some());
+    let mut prefetched = crate::handlers::register_listing::RegisterRecordPrefetch::NotNeeded;
+    let mut synced = crate::handlers::sync_listing::SyncPrefetch::NotNeeded;
+    let _flight = if register_request.is_some() || sync_request.is_some() {
+        let flight = state.command_flights.enter(actor, command.command_id).await;
+        if let Some((stored_hash, stored_result)) =
+            stored_command_result(&state.pool, actor, command.command_id).await?
+        {
+            return Ok(stored_result_response(
+                state,
+                actor,
+                &command,
+                &request_hash,
+                &stored_hash,
+                stored_result,
+                started,
+            ));
+        }
+        if let Some(payload) = register_request {
+            prefetched = crate::handlers::register_listing::prefetch_public_record(
                 state.homeserver.as_deref(),
                 payload,
             )
             .await;
-            (prefetched, Some(flight))
         }
-        None => (
-            crate::handlers::register_listing::RegisterRecordPrefetch::NotNeeded,
-            None,
-        ),
+        if let (Some(payload), Some(homeserver)) = (sync_request, state.homeserver.as_deref()) {
+            synced =
+                crate::handlers::sync_listing::prefetch(&state.pool, homeserver, &command, payload)
+                    .await?;
+        }
+        Some(flight)
+    } else {
+        None
     };
 
     let mut tx = state.pool.begin().await?;
@@ -352,6 +358,7 @@ pub async fn execute_with_edge(
         actor,
         &command,
         &prefetched,
+        &synced,
         &fence,
         &shipping,
         now,
@@ -701,6 +708,7 @@ async fn dispatch(
     actor: &str,
     command: &Command,
     prefetched: &crate::handlers::register_listing::RegisterRecordPrefetch,
+    synced: &crate::handlers::sync_listing::SyncPrefetch,
     fence: &crate::region_fence::FencePlan,
     shipping: &crate::shipping::ShippingPlan,
     now: DateTime<Utc>,
@@ -716,7 +724,8 @@ async fn dispatch(
                 actor,
                 command,
                 payload,
-                state.homeserver.as_deref(),
+                state.homeserver.is_some(),
+                synced,
                 now,
             )
             .await
