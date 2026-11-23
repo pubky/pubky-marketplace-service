@@ -49,6 +49,13 @@ impl LogBuffer {
 }
 
 async fn client(status: &'static str) -> (HttpHomeserverClient, JoinHandle<()>) {
+    client_with_body(status, "").await
+}
+
+async fn client_with_body(
+    status: &'static str,
+    body: &'static str,
+) -> (HttpHomeserverClient, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let address = listener.local_addr().expect("address");
     let server = tokio::spawn(async move {
@@ -69,8 +76,11 @@ async fn client(status: &'static str) -> (HttpHomeserverClient, JoinHandle<()>) 
         );
         stream
             .write_all(
-                format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
-                    .as_bytes(),
+                format!(
+                    "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
             )
             .await
             .expect("write response");
@@ -86,14 +96,20 @@ fn content_lock_path() -> String {
     format!("/pub/locks.app/{LOCK_ID}.json")
 }
 
-fn assert_content_lock_log_is_redacted(logs: &str, message: &str, status: &str) {
+fn assert_content_lock_log_is_redacted(logs: &str, message: &str, status: Option<&str>) {
     assert!(logs.contains(message), "warning is captured: {logs}");
-    assert!(logs.contains(status), "status is retained: {logs}");
+    if let Some(status) = status {
+        assert!(logs.contains(status), "status is retained: {logs}");
+    }
     assert!(
         logs.contains("pubky_host_prefix=8pinxxgq"),
         "creator prefix is retained: {logs}"
     );
     assert!(!logs.contains(LOCK_ID), "lock id is not logged: {logs}");
+    assert!(
+        !logs.contains(&LOCK_ID[..8]),
+        "lock id prefix is not logged: {logs}"
+    );
     assert!(
         !logs.contains(&content_lock_path()),
         "lock document path is not logged: {logs}"
@@ -116,7 +132,7 @@ async fn content_lock_not_found_logs_omit_lock_id_and_path() {
     assert_content_lock_log_is_redacted(
         &logs.text(),
         "homeserver record fetch not found",
-        "status=404 Not Found",
+        Some("status=404 Not Found"),
     );
 }
 
@@ -132,7 +148,41 @@ async fn content_lock_rejection_logs_omit_lock_id_and_path() {
     assert_content_lock_log_is_redacted(
         &logs.text(),
         "homeserver record fetch rejected",
-        "status=500 Internal Server Error",
+        Some("status=500 Internal Server Error"),
+    );
+}
+
+#[tokio::test]
+async fn content_lock_transport_failure_logs_omit_lock_id_and_path() {
+    let (logs, _guard) = LogBuffer::capture();
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("address").port();
+    drop(listener);
+    let client = HttpHomeserverClient::new(&format!("http://127.0.0.1:{port}")).expect("client");
+    let outcome = client
+        .fetch_content_lock(CREATOR, &content_lock_path())
+        .await;
+    assert_eq!(outcome, HomeserverFetchOutcome::Unavailable);
+    assert_content_lock_log_is_redacted(
+        &logs.text(),
+        "homeserver record fetch transport failure",
+        None,
+    );
+}
+
+#[tokio::test]
+async fn content_lock_non_json_logs_omit_lock_id_and_path() {
+    let (logs, _guard) = LogBuffer::capture();
+    let (client, server) = client_with_body("200 OK", "not json").await;
+    let outcome = client
+        .fetch_content_lock(CREATOR, &content_lock_path())
+        .await;
+    server.await.expect("server");
+    assert_eq!(outcome, HomeserverFetchOutcome::Unavailable);
+    assert_content_lock_log_is_redacted(
+        &logs.text(),
+        "homeserver record fetch returned a non-JSON body",
+        Some("status=200 OK"),
     );
 }
 
