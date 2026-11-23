@@ -17,7 +17,7 @@ use std::time::Duration as StdDuration;
 
 use axum::http::StatusCode;
 use marketplace_service::homeserver::HttpHomeserverClient;
-use marketplace_service::http::build_router;
+use marketplace_service::http::{build_router, routes, serve};
 use marketplace_service::listing_moderation::{HttpListingModerationClient, ListingModerationGate};
 use marketplace_service::refusal_audit::{
     AuditKeys, CommandKind, RefusalAuditRuntime, RefusalKind, SurfaceKind,
@@ -1005,6 +1005,100 @@ async fn single_seller_mode_refuses_to_start_on_another_sellers_rows(pool: PgPoo
     refuse_other_sellers(&pool, &StoreMode::Marketplace)
         .await
         .expect("marketplace mode");
+}
+
+async fn unlisted() -> axum::Json<Value> {
+    axum::Json(json!({ "served": true }))
+}
+
+/// One layer over the whole router refuses, in single-seller mode, a route
+/// missing from `store_seller::ROUTES` however it is mounted: nested,
+/// merged, or routed in place, on no guarded router and with no session.
+/// Listed routes on the same router are served, and marketplace mode
+/// serves the unlisted ones too.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_route_missing_from_the_scope_table_is_refused_wherever_it_is_mounted(pool: PgPool) {
+    use axum::routing::{get, post};
+    let base = test_app(pool.clone()).await;
+    let store = new_actor(&base).await;
+    let audit = writer(&pool).await;
+    let single = single_seller(&base, &store.pubky, Some(&audit));
+    let with_unlisted = |state: &AppState| {
+        serve(
+            routes(state)
+                .nest(
+                    "/v1/nested",
+                    axum::Router::new().route("/{id}", get(unlisted)),
+                )
+                .merge(axum::Router::new().route("/v1/merged", post(unlisted)))
+                .route("/v1/inline", get(unlisted)),
+            state.clone(),
+        )
+    };
+    let added = [
+        ("GET", "/v1/nested/{id}", "/v1/nested/7"),
+        ("POST", "/v1/merged", "/v1/merged"),
+        ("GET", "/v1/inline", "/v1/inline"),
+    ];
+    for (method, path, _) in added {
+        assert_eq!(route_scope(method, path), None, "{method} {path} is listed");
+    }
+
+    let marketplace = with_unlisted(&base.state);
+    let router = with_unlisted(&single.state);
+    for (method, path, uri) in added {
+        let (status, body) = send(marketplace.clone(), method, uri, None, &json!({})).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "marketplace {method} {path}: {body}"
+        );
+        assert_eq!(body, json!({ "served": true }));
+        for token in [None, Some(store.token.as_str())] {
+            let (status, body) = send(router.clone(), method, uri, token, &json!({})).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{method} {path}: {body}");
+            assert_eq!(
+                body["error"]["code"],
+                json!("SELLER_NOT_SERVED"),
+                "{method} {path}"
+            );
+        }
+    }
+    let (status, body) = send(router.clone(), "GET", "/health", None, &json!({})).await;
+    assert_eq!(status, StatusCode::OK, "a listed public route: {body}");
+    let (status, body) = send(
+        router.clone(),
+        "GET",
+        "/v1/connectors",
+        Some(&store.token),
+        &json!({}),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::CONFLICT,
+        "a listed seller route: {body}"
+    );
+    // A method the path does not serve is not in the table either: refused
+    // in single-seller mode, the router's 405 in marketplace mode. A path
+    // no route matches stays the router's 404.
+    let (status, _) = send(marketplace.clone(), "PUT", "/health", None, &json!({})).await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    let (status, body) = send(router.clone(), "PUT", "/health", None, &json!({})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    for router in [&marketplace, &router] {
+        let (status, _) = send(router.clone(), "GET", "/v1/nowhere", None, &json!({})).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    // The audit tags an authenticated actor: only the refusals that carried
+    // the store seller's session are written.
+    let refusals = added.len() as u64;
+    settle(&audit, refusals).await;
+    assert_eq!(
+        audited(&pool, SurfaceKind::SellerRoute).await,
+        BTreeMap::from([(CommandKind::SellerRoute as i16, refusals as i64)])
+    );
 }
 
 /// One seller-keyed record the boot check counts besides listings, orders

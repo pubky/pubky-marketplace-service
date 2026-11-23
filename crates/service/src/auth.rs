@@ -200,6 +200,18 @@ async fn resolve_active_session(
     }))
 }
 
+/// The actor of the request's bearer session when it is active, for a
+/// layer that runs before [`require_session`]. Read-only: it does not
+/// record the session's use.
+pub(crate) async fn session_actor(state: &AppState, headers: &HeaderMap) -> Option<String> {
+    let token = bearer_from_headers(headers).ok().flatten()?;
+    resolve_active_session(&state.pool, &token, state.clock.now())
+        .await
+        .ok()
+        .flatten()
+        .map(|session| session.actor.0)
+}
+
 async fn record_session_use(pool: &sqlx::PgPool, token_hash: &[u8], now: DateTime<Utc>) {
     if let Err(error) = sqlx::query(
         "UPDATE auth_sessions SET last_used_at = $2 WHERE token_hash = $1 \
