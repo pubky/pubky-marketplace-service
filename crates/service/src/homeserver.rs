@@ -39,14 +39,13 @@ pub const ENV_HOMESERVER_URL: &str = "HOMESERVER_URL";
 /// (the default) or `pkarr`.
 pub const ENV_HOMESERVER_RESOLUTION: &str = "HOMESERVER_RESOLUTION";
 
+mod pkarr_transport;
+
+use pkarr_transport::{EndpointPolicy, PkarrTransport};
+
+/// Bound on one read, from the start of the request to the end of its body.
+/// Under `pkarr` it also covers finding the homeserver and its endpoints.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
-/// Bound on finding a pubky's homeserver in `pkarr` mode: the Pkarr lookup,
-/// then, separately, the homeserver's transport and storage addressing. The
-/// HTTP exchange that follows keeps its own timeout.
-const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
-/// Bound on a network-only Pkarr lookup, which asks every DHT node near the
-/// key for its most recent record instead of stopping at the first answer.
-const REFRESH_TIMEOUT: Duration = Duration::from_secs(10);
 /// A deliverable is up to `DIGITAL_DELIVERY_MAX_BYTES` of ciphertext, read
 /// once at `digital_delivery.set`; the record timeout would cut it short.
 const DELIVERABLE_FETCH_TIMEOUT: Duration = Duration::from_secs(120);
@@ -763,7 +762,7 @@ enum Transport {
         base_url: String,
         http: reqwest::Client,
     },
-    Pkarr(pubky::Pubky),
+    Pkarr(PkarrTransport),
 }
 
 /// What [`HttpHomeserverClient::get`] asks a pubky's homeserver for.
@@ -854,39 +853,49 @@ impl HttpHomeserverClient {
     }
 
     /// A client that reads each pubky from the homeserver its Pkarr record
-    /// names. `builder` carries the Pkarr network (the SDK default in
+    /// names, at publicly routable addresses only, over HTTPS, following no
+    /// redirect. `builder` carries the Pkarr network (the SDK default in
     /// production, a local testnet in tests); the cache bounds are applied
     /// to it here.
     pub fn pkarr(
-        mut builder: pubky::PubkyHttpClientBuilder,
+        builder: pubky::PubkyHttpClientBuilder,
         cache: PkarrResolutionCache,
     ) -> anyhow::Result<Self> {
-        let ttl_seconds = u32::try_from(cache.ttl.as_secs()).unwrap_or(u32::MAX);
-        builder
-            .pkarr(|pkarr| {
-                pkarr
-                    .cache_size(cache.capacity)
-                    .minimum_ttl(ttl_seconds)
-                    .maximum_ttl(ttl_seconds)
-            })
-            .request_timeout(FETCH_TIMEOUT);
-        let client = builder
-            .build()
-            .map_err(|error| anyhow::anyhow!("homeserver Pkarr client: {error}"))?;
+        Self::pkarr_with(builder, cache, EndpointPolicy::PublicOnly)
+    }
+
+    /// [`Self::pkarr`] that also connects to loopback addresses, where the
+    /// homeservers of a local Pkarr testnet listen. Compiled into tests only;
+    /// no configuration reaches it.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn pkarr_with_loopback_homeservers(
+        builder: pubky::PubkyHttpClientBuilder,
+        cache: PkarrResolutionCache,
+    ) -> anyhow::Result<Self> {
+        Self::pkarr_with(builder, cache, EndpointPolicy::PublicOrLoopback)
+    }
+
+    fn pkarr_with(
+        builder: pubky::PubkyHttpClientBuilder,
+        cache: PkarrResolutionCache,
+        policy: EndpointPolicy,
+    ) -> anyhow::Result<Self> {
+        let transport = PkarrTransport::new(builder, cache, policy)?;
         tracing::info!(
             cache_capacity = cache.capacity,
             cache_ttl_seconds = cache.ttl.as_secs(),
             "homeserver client configured to resolve each pubky through Pkarr"
         );
         Ok(Self {
-            transport: Transport::Pkarr(pubky::Pubky::with_client(client)),
+            transport: Transport::Pkarr(transport),
         })
     }
 
     /// One `GET` of `target` on `pubky`'s homeserver, bounded by `timeout`
-    /// from the request's start to the end of its body. `Err` when the
-    /// homeserver was not found (logged here) or the request failed before a
-    /// status arrived (logged by the caller, as in `fixed` mode).
+    /// from the request's start (under `pkarr`, the homeserver lookup) to the
+    /// end of its body. `Err` when the homeserver was not found (logged here)
+    /// or the request failed before a status arrived (logged by the caller,
+    /// as in `fixed` mode).
     async fn get(
         &self,
         pubky: &str,
@@ -910,57 +919,14 @@ impl HttpHomeserverClient {
                     .map(Response::Fixed)
                     .map_err(|_| Unreached)
             }
-            Transport::Pkarr(sdk) => {
-                let homeserver = resolve_homeserver(sdk, pubky).await?;
-                // The owner rides in the path; the SDK rewrites it to the
-                // legacy `pubky-host` form for homeservers that predate
-                // path-addressed storage.
-                let url = match target {
-                    Target::Record(path) => url::Url::parse(&format!(
-                        "https://{}/storage/{pubky}{path}",
-                        homeserver.z32()
-                    )),
-                    Target::Events(query) => {
-                        url::Url::parse(&format!("https://{}/events-stream", homeserver.z32())).map(
-                            |mut url| {
-                                url.query_pairs_mut().extend_pairs(query);
-                                url
-                            },
-                        )
-                    }
-                };
-                let Ok(url) = url else {
-                    tracing::warn!(
-                        pubky_host_prefix = %pubky_host_prefix(pubky),
-                        "homeserver request path is not a URL path"
-                    );
-                    return Err(Unreached);
-                };
-                let request = match tokio::time::timeout(
-                    RESOLVE_TIMEOUT,
-                    sdk.client().request_async(pubky::Method::GET, url),
-                )
-                .await
-                {
-                    Ok(Ok(request)) => request,
-                    Ok(Err(_)) | Err(_) => {
-                        tracing::warn!(
-                            pubky_host_prefix = %pubky_host_prefix(pubky),
-                            homeserver_prefix = %pubky_host_prefix(&homeserver.z32()),
-                            "homeserver transport could not be resolved"
-                        );
-                        return Err(Unreached);
-                    }
-                };
-                request
-                    .timeout(timeout)
-                    .send()
+            Transport::Pkarr(transport) => {
+                transport
+                    .get(pubky, target, timeout)
                     .await
-                    .map(|response| Response::Pkarr {
+                    .map(|(response, homeserver)| Response::Pkarr {
                         response,
-                        homeserver: homeserver.z32(),
+                        homeserver,
                     })
-                    .map_err(|_| Unreached)
             }
         }
     }
@@ -1241,61 +1207,6 @@ fn pubky_host_prefix(seller_pubky: &str) -> &str {
     seller_pubky.get(..8).unwrap_or(seller_pubky)
 }
 
-/// The homeserver `pubky`'s Pkarr record names, through the SDK's bounded
-/// record cache. A pubky with no record, a record naming no homeserver, a
-/// failed or slow lookup are all `Unreached`, which every read maps to
-/// `Unavailable`: an identity that cannot be resolved right now is never
-/// read as one whose records are gone.
-async fn resolve_homeserver(
-    sdk: &pubky::Pubky,
-    pubky: &str,
-) -> Result<pubky::PublicKey, Unreached> {
-    let prefix = pubky_host_prefix(pubky);
-    let Ok(user) = pubky::PublicKey::try_from_z32(pubky) else {
-        tracing::warn!(pubky_host_prefix = %prefix, "homeserver resolution refused a malformed pubky");
-        return Err(Unreached);
-    };
-    let failure = match tokio::time::timeout(RESOLVE_TIMEOUT, sdk.get_homeserver_of(&user)).await {
-        Ok(Ok(Some(homeserver))) => return Ok(homeserver),
-        Ok(Ok(None)) => "no homeserver record",
-        Ok(Err(_)) => "lookup failed",
-        Err(_) => "lookup timed out",
-    };
-    tracing::warn!(
-        pubky_host_prefix = %prefix,
-        failure,
-        "homeserver resolution failed"
-    );
-    Err(Unreached)
-}
-
-/// Reads `pubky`'s Pkarr record from the network, past the cache, which the
-/// answer then refreshes, so [`resolve_homeserver`] names the homeserver the
-/// record names now.
-async fn refresh_record(sdk: &pubky::Pubky, pubky: &str) -> HomeserverRefresh {
-    let prefix = pubky_host_prefix(pubky);
-    let Ok(user) = pubky::PublicKey::try_from_z32(pubky) else {
-        tracing::warn!(pubky_host_prefix = %prefix, "homeserver refresh refused a malformed pubky");
-        return HomeserverRefresh::Unavailable;
-    };
-    let lookup = sdk
-        .client()
-        .pkarr()
-        .resolve(&user, pubky::pkarr::ResolvePolicy::NetworkOnly);
-    let failure = match tokio::time::timeout(REFRESH_TIMEOUT, lookup).await {
-        Ok(Ok(_)) => return HomeserverRefresh::Refreshed,
-        Ok(Err(pubky::pkarr::errors::ResolveError::NotFound)) => "no record",
-        Ok(Err(_)) => "lookup failed",
-        Err(_) => "lookup timed out",
-    };
-    tracing::warn!(
-        pubky_host_prefix = %prefix,
-        failure,
-        "homeserver refresh failed"
-    );
-    HomeserverRefresh::Unavailable
-}
-
 impl HomeserverListingClient for HttpHomeserverClient {
     fn fetch_grant_session_proof<'a>(
         &'a self,
@@ -1546,7 +1457,7 @@ impl HomeserverListingClient for HttpHomeserverClient {
         Box::pin(async move {
             match &self.transport {
                 Transport::Fixed { .. } => HomeserverRefresh::Fixed,
-                Transport::Pkarr(sdk) => refresh_record(sdk, pubky).await,
+                Transport::Pkarr(transport) => transport.refresh(pubky).await,
             }
         })
     }
