@@ -19,12 +19,16 @@
 mod common;
 
 use std::future::Future;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::panic::AssertUnwindSafe;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::http::StatusCode;
+use pubky_testnet::pubky::pkarr::dns::rdata::SVCB;
+use pubky_testnet::pubky::pkarr::{Keypair as PkarrKeypair, SignedPacket};
 use pubky_testnet::pubky::{ClientId, Keypair, PubkySession, PublicKey};
 use pubky_testnet::pubky_homeserver::storage_config::StorageConfigToml;
 use pubky_testnet::pubky_homeserver::{ConfigToml, ConnectionString, HomeserverApp, MockDataDir};
@@ -32,6 +36,9 @@ use pubky_testnet::Testnet;
 use serde_json::{json, Value};
 use sqlx::postgres::PgConnectOptions;
 use sqlx::{ConnectOptions, PgPool};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
 use uuid::Uuid;
 
 use common::{execute, new_actor, register_command, sync_command, test_app_with_homeserver_client};
@@ -141,12 +148,203 @@ where
     );
 }
 
+/// A `pkarr` client that also connects to loopback, where the testnet's
+/// homeservers listen.
 fn pkarr_client(testnet: &Testnet, ttl: Duration) -> HttpHomeserverClient {
-    HttpHomeserverClient::pkarr(
+    HttpHomeserverClient::pkarr_with_loopback_homeservers(
         testnet.client_builder(),
         PkarrResolutionCache { capacity: 64, ttl },
     )
     .expect("pkarr homeserver client builds")
+}
+
+/// The production `pkarr` client, on the testnet's DHT: public addresses
+/// only.
+fn public_only_client(testnet: &Testnet) -> HttpHomeserverClient {
+    HttpHomeserverClient::pkarr(testnet.client_builder(), PkarrResolutionCache::default())
+        .expect("pkarr homeserver client builds")
+}
+
+/// Where a homeserver key's own record says it can be reached.
+#[derive(Default)]
+struct Endpoints {
+    /// Addresses and a port for the key itself (an HTTPS record targeting `.`).
+    direct: Option<(Vec<IpAddr>, u16)>,
+    /// An ICANN domain and port.
+    icann: Option<(&'static str, u16)>,
+}
+
+async fn publish(testnet: &Testnet, packet: &SignedPacket) {
+    testnet
+        .pkarr_client_builder()
+        .build()
+        .expect("pkarr client")
+        .publish(packet)
+        .await
+        .expect("publish on the testnet DHT");
+}
+
+/// Publishes `homeserver`'s endpoint record.
+async fn publish_endpoints(testnet: &Testnet, homeserver: &PkarrKeypair, endpoints: Endpoints) {
+    let mut packet = SignedPacket::builder();
+    if let Some((addresses, port)) = endpoints.direct {
+        let mut svcb = SVCB::new(1, ".".try_into().expect("root name"));
+        svcb.set_port(port);
+        packet = packet.https(".".try_into().expect("root name"), svcb, 60);
+        for address in addresses {
+            packet = packet.address(".".try_into().expect("root name"), address, 60);
+        }
+    }
+    if let Some((domain, port)) = endpoints.icann {
+        let mut svcb = SVCB::new(10, domain.try_into().expect("domain name"));
+        svcb.set_port(port);
+        packet = packet.https(".".try_into().expect("root name"), svcb, 60);
+    }
+    publish(testnet, &packet.sign(homeserver).expect("endpoint record")).await;
+}
+
+/// Publishes a record for a new user naming `homeserver`, and returns the
+/// user's pubky.
+async fn publish_user_on(testnet: &Testnet, homeserver: &PkarrKeypair) -> String {
+    let user = PkarrKeypair::random();
+    let target = homeserver.public_key().to_z32();
+    let packet = SignedPacket::builder()
+        .https(
+            "_pubky".try_into().expect("_pubky name"),
+            SVCB::new(0, target.as_str().try_into().expect("homeserver name")),
+            60,
+        )
+        .sign(&user)
+        .expect("user record");
+    publish(testnet, &packet).await;
+    user.public_key().to_z32()
+}
+
+/// A loopback listener that answers a plain-HTTP `GET` with `200` and a
+/// listing record, and counts connections and the plain-HTTP requests among
+/// them.
+struct Listener {
+    port: u16,
+    connections: Arc<AtomicUsize>,
+    plain_http_requests: Arc<AtomicUsize>,
+}
+
+async fn listener() -> Listener {
+    let socket = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = socket.local_addr().expect("address").port();
+    let connections = Arc::new(AtomicUsize::new(0));
+    let plain_http_requests = Arc::new(AtomicUsize::new(0));
+    let (counted, plain) = (connections.clone(), plain_http_requests.clone());
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = socket.accept().await {
+            counted.fetch_add(1, Ordering::SeqCst);
+            let plain = plain.clone();
+            tokio::spawn(async move {
+                let mut start = [0u8; 4];
+                if stream.read_exact(&mut start).await.is_err() || &start != b"GET " {
+                    return;
+                }
+                plain.fetch_add(1, Ordering::SeqCst);
+                let body = serde_json::to_vec(&listing_record("x", LISTING_ID, "internal"))
+                    .expect("record");
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(&body).await;
+            });
+        }
+    });
+    Listener {
+        port,
+        connections,
+        plain_http_requests,
+    }
+}
+
+impl Listener {
+    fn connections(&self) -> usize {
+        self.connections.load(Ordering::SeqCst)
+    }
+
+    fn plain_http_requests(&self) -> usize {
+        self.plain_http_requests.load(Ordering::SeqCst)
+    }
+}
+
+/// A homeserver on loopback holding `keypair`, over TLS pinned to that key
+/// as a real one is, that answers every request with `302` to `location`.
+/// Returns its port and the number of requests it answered.
+async fn redirecting_homeserver(
+    keypair: &PkarrKeypair,
+    location: String,
+) -> (u16, Arc<AtomicUsize>) {
+    let socket = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = socket.local_addr().expect("address").port();
+    let acceptor = TlsAcceptor::from(Arc::new(keypair.to_rpk_rustls_server_config()));
+    let answered = Arc::new(AtomicUsize::new(0));
+    let counted = answered.clone();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = socket.accept().await {
+            let (acceptor, counted, location) =
+                (acceptor.clone(), counted.clone(), location.clone());
+            tokio::spawn(async move {
+                let Ok(mut tls) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match tls.read(&mut buffer).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(read) => request.extend_from_slice(&buffer[..read]),
+                    }
+                }
+                counted.fetch_add(1, Ordering::SeqCst);
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {location}\r\n\
+                     Content-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = tls.write_all(response.as_bytes()).await;
+                let _ = tls.shutdown().await;
+            });
+        }
+    });
+    (port, answered)
+}
+
+/// The reads of `pubky` a homeserver at an address the client refuses (or
+/// one that answers only with a redirect) must all fail as `Unavailable`.
+async fn assert_refused(client: &HttpHomeserverClient, pubky: &str) {
+    assert_eq!(
+        client.fetch_listing(pubky, LISTING_ID).await,
+        HomeserverFetchOutcome::Unavailable
+    );
+    assert_eq!(
+        client.fetch_listing_raw(pubky, LISTING_ID).await,
+        HomeserverRawFetchOutcome::Unavailable
+    );
+    assert_eq!(
+        client
+            .fetch_deliverable_digest(pubky, DELIVERABLE_ID, 1, 1024 * 1024)
+            .await,
+        DeliverableFetchOutcome::Unavailable
+    );
+    assert!(
+        matches!(
+            client
+                .listing_events(pubky, LISTINGS_PATH, None, false, 10)
+                .await,
+            HomeserverEventsOutcome::Unavailable | HomeserverEventsOutcome::Rejected { .. }
+        ),
+        "never events, never UnknownUser"
+    );
+    assert_eq!(
+        confirm_deleted(client, pubky, LISTING_ID).await,
+        DeletionCheck::Unavailable { retry_after: None }
+    );
 }
 
 /// Signs `keypair` up on `homeserver`, which publishes its Pkarr record
@@ -880,6 +1078,179 @@ fn the_follower_restarts_a_seller_who_moved_and_tombstones_a_delete_below_the_ol
             follower_position(&app.pool, &seller.pubky).await,
             (Some(last_new_cursor), Some(new.z32())),
             "the position now counts on the new homeserver"
+        );
+    });
+}
+
+#[test]
+fn a_redirect_from_a_homeserver_is_not_followed() {
+    on_testnet(async {
+        let testnet = testnet().await;
+        let internal = listener().await;
+        let client = pkarr_client(&testnet, PkarrResolutionCache::default().ttl);
+        for scheme in ["http", "https"] {
+            let homeserver = PkarrKeypair::random();
+            let (port, answered) = redirecting_homeserver(
+                &homeserver,
+                format!(
+                    "{scheme}://127.0.0.1:{}{}",
+                    internal.port,
+                    listing_path(LISTING_ID)
+                ),
+            )
+            .await;
+            publish_endpoints(
+                &testnet,
+                &homeserver,
+                Endpoints {
+                    direct: Some((vec![IpAddr::V4(Ipv4Addr::LOCALHOST)], port)),
+                    ..Endpoints::default()
+                },
+            )
+            .await;
+            let pubky = publish_user_on(&testnet, &homeserver).await;
+
+            assert_refused(&client, &pubky).await;
+            assert!(
+                answered.load(Ordering::SeqCst) > 0,
+                "the key-pinned homeserver was reached and answered 302"
+            );
+        }
+        assert_eq!(
+            internal.connections(),
+            0,
+            "no redirect target was contacted"
+        );
+    });
+}
+
+#[test]
+fn a_record_naming_an_internal_address_is_refused() {
+    on_testnet(async {
+        let mut testnet = testnet().await;
+        let real = testnet
+            .create_random_homeserver()
+            .await
+            .expect("homeserver")
+            .public_key();
+        let seller = Keypair::random();
+        let seller_pubky = seller.public_key().z32();
+        let session = account(&testnet, &seller, &real).await;
+        let record = listing_record(&seller_pubky, LISTING_ID, "on loopback");
+        put(
+            &session,
+            &listing_path(LISTING_ID),
+            &serde_json::to_vec(&record).expect("record"),
+        )
+        .await;
+        let production = public_only_client(&testnet);
+
+        // The testnet homeserver publishes only loopback endpoints: readable
+        // through the test seam, refused by the production client.
+        assert_eq!(
+            pkarr_client(&testnet, PkarrResolutionCache::default().ttl)
+                .fetch_listing(&seller_pubky, LISTING_ID)
+                .await,
+            HomeserverFetchOutcome::Found(record)
+        );
+        assert_refused(&production, &seller_pubky).await;
+
+        // Direct addresses (IPv4, IPv4-mapped IPv6), an ICANN IP literal and an
+        // ICANN name that resolves to loopback: no connection is made to any.
+        let internal = listener().await;
+        for endpoints in [
+            Endpoints {
+                direct: Some((vec![IpAddr::V4(Ipv4Addr::LOCALHOST)], internal.port)),
+                ..Endpoints::default()
+            },
+            Endpoints {
+                direct: Some((
+                    vec![IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped())],
+                    internal.port,
+                )),
+                ..Endpoints::default()
+            },
+            Endpoints {
+                icann: Some(("127.0.0.1", internal.port)),
+                ..Endpoints::default()
+            },
+            Endpoints {
+                icann: Some(("localhost", internal.port)),
+                ..Endpoints::default()
+            },
+        ] {
+            let homeserver = PkarrKeypair::random();
+            publish_endpoints(&testnet, &homeserver, endpoints).await;
+            let pubky = publish_user_on(&testnet, &homeserver).await;
+            assert_refused(&production, &pubky).await;
+        }
+        assert_eq!(
+            internal.connections(),
+            0,
+            "no internal address was contacted"
+        );
+
+        // Private, link-local and shared addresses stay refused even where the
+        // test seam allows loopback; so does loopback in its IPv4-mapped form.
+        let seam = pkarr_client(&testnet, PkarrResolutionCache::default().ttl);
+        for address in [
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+            IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)),
+            IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1)),
+            IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped()),
+        ] {
+            let homeserver = PkarrKeypair::random();
+            publish_endpoints(
+                &testnet,
+                &homeserver,
+                Endpoints {
+                    direct: Some((vec![address], internal.port)),
+                    ..Endpoints::default()
+                },
+            )
+            .await;
+            let pubky = publish_user_on(&testnet, &homeserver).await;
+            assert_refused(&seam, &pubky).await;
+        }
+        assert_eq!(
+            internal.connections(),
+            0,
+            "no internal address was contacted"
+        );
+    });
+}
+
+#[test]
+fn a_homeserver_reachable_only_over_plain_http_is_refused() {
+    on_testnet(async {
+        let testnet = testnet().await;
+        // An ICANN endpoint whose port serves the record over plain HTTP, as the
+        // testnet homeservers' `localhost` endpoints do.
+        let plain = listener().await;
+        let homeserver = PkarrKeypair::random();
+        publish_endpoints(
+            &testnet,
+            &homeserver,
+            Endpoints {
+                icann: Some(("localhost", plain.port)),
+                ..Endpoints::default()
+            },
+        )
+        .await;
+        let pubky = publish_user_on(&testnet, &homeserver).await;
+
+        assert_refused(
+            &pkarr_client(&testnet, PkarrResolutionCache::default().ttl),
+            &pubky,
+        )
+        .await;
+        assert!(plain.connections() > 0, "the endpoint was tried, over TLS");
+        assert_eq!(
+            plain.plain_http_requests(),
+            0,
+            "no plain-HTTP request was sent"
         );
     });
 }

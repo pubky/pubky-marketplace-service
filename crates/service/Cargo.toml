@@ -32,7 +32,7 @@ sha3.workspace = true
 subtle.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["net"] }
 tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -40,9 +40,17 @@ url.workspace = true
 uuid.workspace = true
 hkdf = "0.12"
 pubky = { version = "=0.16.1", features = ["json"] }
-# The response type of `pubky`'s HTTP client, which `HOMESERVER_RESOLUTION=pkarr`
-# reads go through. The service's own HTTP client stays on reqwest 0.12.
+# The HTTP client of `HOMESERVER_RESOLUTION=pkarr` reads: the reqwest major
+# `pkarr` resolves and pins TLS for. The service's own HTTP client stays on
+# reqwest 0.12.
 pubky-reqwest = { package = "reqwest", version = "0.13", default-features = false }
+# `pkarr` reads: endpoint streams, the homeserver `/info` cache, and the TLS
+# configuration of ICANN-domain homeservers (the roots and provider the `pubky`
+# SDK uses for them).
+futures-lite = "2"
+lru = "0.16"
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
+webpki-roots = "1"
 # RFC 9180 HPKE (DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305),
 # the suite the Shop seals delivery envelopes with. The connector worker opens
 # the opt-in connector address envelope with it; the same crate pubky-core's
@@ -65,3 +73,5 @@ apollo-compiler = "1.33.0"
 # (tests/homeserver_pkarr_test.rs). Its homeservers keep their state in
 # Postgres databases they create on the `DATABASE_URL` server.
 pubky-testnet = { version = "=0.16.2", default-features = false }
+# A key-pinned TLS homeserver that answers with a redirect.
+tokio-rustls = { version = "0.26", default-features = false }
