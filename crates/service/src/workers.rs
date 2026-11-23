@@ -2060,13 +2060,67 @@ async fn refund_after_buyer_cancel(
     Ok(true)
 }
 
+/// A verified completion for an order whose refund the seller has already
+/// recorded (`refunded_external`): the money came and went back, so the
+/// payment closes as `refunded` against that record and nobody is asked to
+/// act. An order without a recorded refund reference cannot be reconciled
+/// and waits in manual review instead. Runs in the caller's transaction,
+/// which holds the payment and order locks.
+async fn close_completion_for_refunded_order(
+    mut tx: Transaction<'_, Postgres>,
+    row: &ClaimedCorrelation,
+    payment: &PaymentRow,
+    order: &OrderRow,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    let reference = order
+        .external_refund
+        .as_ref()
+        .and_then(|refund| refund["transaction_id"].as_str())
+        .map(str::to_string);
+    let Some(reference) = reference else {
+        tracing::error!(
+            payment_id = %payment.id,
+            correlation_id = %row.id,
+            "ALERT verified locks completion for a refunded order without a refund reference; \
+             routing to manual review"
+        );
+        return apply_manual_review(tx, row, payment, now).await;
+    };
+    if !crate::bitcoin_review::close_refunded_locks_payment(
+        &mut tx,
+        payment.id,
+        &payment.state,
+        &order.seller_pubky,
+        &reference,
+        row.id,
+        now,
+    )
+    .await?
+    {
+        anyhow::bail!(
+            "locks payment {} for a refunded order could not be closed",
+            payment.id
+        );
+    }
+    mark_correlation_completed(&mut tx, row.id, "refunded", now).await?;
+    tx.commit().await?;
+    tracing::warn!(
+        payment_id = %payment.id,
+        correlation_id = %row.id,
+        "verified locks completion for an order already refunded; closed as refunded"
+    );
+    Ok(true)
+}
+
 /// Applies one independently verified completed Locks result. Advances
 /// `awaiting_entitlement → confirmed` exactly once (payment CAS + the
 /// `events_one_payment_confirmed` unique index); routes a completion that
 /// arrives after marketplace expiry — or one whose order can no longer be
 /// confirmed — to `manual_review`; makes a completion for an order the
-/// buyer cancelled first refund-required; treats an already-advanced
-/// payment as a harmless duplicate.
+/// buyer cancelled first refund-required; closes a completion for an order
+/// whose refund is already recorded as `refunded`; treats an
+/// already-advanced payment as a harmless duplicate.
 async fn apply_completed_lifecycle(
     pool: &PgPool,
     row: &ClaimedCorrelation,
@@ -2091,6 +2145,9 @@ async fn apply_completed_lifecycle(
             };
             if cancelled_by_buyer(&mut tx, row.id, &payment, &order).await? {
                 return refund_after_buyer_cancel(tx, row, &payment, &order, now).await;
+            }
+            if order.state == "refunded_external" {
+                return close_completion_for_refunded_order(tx, row, &payment, &order, now).await;
             }
             let mut confirmation = sqlx::Acquire::begin(&mut *tx).await?;
             match confirm_order(
@@ -2168,10 +2225,12 @@ async fn apply_completed_lifecycle(
             if cancelled_by_buyer(&mut tx, row.id, &payment, &order).await? {
                 return refund_after_buyer_cancel(tx, row, &payment, &order, now).await;
             }
+            if order.state == "refunded_external" {
+                return close_completion_for_refunded_order(tx, row, &payment, &order, now).await;
+            }
             if !matches!(order.state.as_str(), "pending_payment" | "cancelled") {
-                // The seller already recorded an external refund on the
-                // cancelled order: late money can neither complete it nor
-                // ask for the refund again, so a human reconciles the fact.
+                // Late money can complete only a pending or cancelled order;
+                // any other state is kept for a human rather than paid.
                 tracing::warn!(
                     payment_id = %payment.id,
                     correlation_id = %row.id,

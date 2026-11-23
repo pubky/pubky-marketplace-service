@@ -20,6 +20,7 @@ use marketplace_domain::state_machines::{can_transition, order_machine, return_m
 use marketplace_domain::{Command, ErrorCode};
 use serde_json::json;
 use sqlx::{Postgres, Transaction};
+use uuid::Uuid;
 
 use crate::clock::format_timestamp;
 use crate::handlers::{fetch_order_for_update, finish_order_action, guard_order_action};
@@ -460,6 +461,14 @@ pub async fn record_external_refund(
     refund_chain: Option<&dyn RefundChain>,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
+    // Payment before order, the lock order every settlement path takes: a
+    // Locks payment under refund-required review closes with this refund.
+    let payment: Option<(Uuid, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT id, adapter, state, review_reason FROM payments WHERE order_id = $1 FOR UPDATE",
+    )
+    .bind(payload.order_id)
+    .fetch_optional(&mut **tx)
+    .await?;
     let Some(order) = fetch_order_for_update(tx, payload.order_id).await? else {
         return Ok(Err(CommandFailure::refused(
             crate::refusal_audit::RefusalKind::NotFound,
@@ -643,6 +652,26 @@ pub async fn record_external_refund(
     .bind(now)
     .fetch_one(&mut **tx)
     .await?;
+
+    // The refund the review asked for is now recorded: the Locks payment has
+    // no other way out of `manual_review`, so it closes as `refunded` here.
+    if let Some((payment_id, adapter, state, review_reason)) = &payment {
+        if adapter == "locks"
+            && state == "manual_review"
+            && review_reason.as_deref() == Some("refund_required")
+        {
+            crate::bitcoin_review::close_refunded_locks_payment(
+                tx,
+                *payment_id,
+                state,
+                actor,
+                &payload.transaction_id,
+                command.command_id,
+                now,
+            )
+            .await?;
+        }
+    }
 
     // Attestor annotation (ADR 0024 §5): the refund annotates the
     // order_ref; the attestation itself is never revoked.

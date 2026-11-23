@@ -624,11 +624,17 @@ pub fn payment_machine() -> AggregateMachine {
             // abandoned branch) resolves a `manual_review` payment exactly
             // once — `confirmed` for the paid/refunded outcomes, `expired`
             // for abandoned. `resolution_outcome` distinguishes a resolved
-            // payment from a naturally confirmed/expired one.
+            // payment from a naturally confirmed/expired one. A Locks
+            // payment under refund-required review closes the same way, as
+            // `refunded`, when the seller records the refund on its order
+            // (`locks_refund_reconciliation`); no client command confirms.
             t(
                 "manual_review",
                 "confirmed",
-                vec![Server("paykit_resolution")],
+                vec![
+                    Server("paykit_resolution"),
+                    Server("locks_refund_reconciliation"),
+                ],
             ),
             t(
                 "manual_review",
@@ -850,13 +856,22 @@ mod tests {
     #[test]
     fn paykit_resolution_edges_are_server_only_and_one_way() {
         let payments = payment_machine();
-        for target in ["confirmed", "expired"] {
+        for (target, via) in [
+            (
+                "confirmed",
+                vec![
+                    Server("paykit_resolution"),
+                    Server("locks_refund_reconciliation"),
+                ],
+            ),
+            ("expired", vec![Server("paykit_resolution")]),
+        ] {
             let transition = payments
                 .transitions
                 .iter()
                 .find(|t| t.from == "manual_review" && t.to == target)
                 .unwrap_or_else(|| panic!("manual_review -> {target} exists"));
-            assert_eq!(transition.via, vec![Server("paykit_resolution")]);
+            assert_eq!(transition.via, via);
         }
         // `confirmed` is terminal: no edge out of it at all (no un-pay).
         for target in [

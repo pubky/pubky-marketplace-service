@@ -2257,10 +2257,83 @@ async fn a_completion_for_an_order_cancelled_without_expiring_its_payment_is_ref
     );
 }
 
+/// What the seller's order view says is waiting on someone.
+async fn seller_next_actor(app: &TestApp, seller: &TestActor, order: &PendingOrder) -> Value {
+    let (status, body) = common::send(
+        app.router.clone(),
+        "GET",
+        &format!("/v1/orders/{}", order.order_id),
+        Some(&seller.token),
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body["next_actor"].clone()
+}
+
+/// The Locks payment is closed as refunded against the seller's recorded
+/// refund `reference`: nothing is paid, nobody is asked to act.
+async fn assert_closed_as_refunded(
+    app: &TestApp,
+    seller: &TestActor,
+    order: &PendingOrder,
+    reference: &str,
+) {
+    let (state, outcome, basis, resolved_by, refund_reference): (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT state, resolution_outcome, resolution_basis, resolved_by_pubky, \
+         refund_reference FROM payments WHERE id = $1::uuid",
+    )
+    .bind(&order.payment_id)
+    .fetch_one(&app.pool)
+    .await
+    .expect("payment row");
+    assert_eq!(
+        (
+            state.as_str(),
+            outcome.as_deref(),
+            basis.as_deref(),
+            resolved_by.as_deref(),
+            refund_reference.as_deref()
+        ),
+        (
+            "confirmed",
+            Some("refunded"),
+            Some("seller_attestation"),
+            Some(seller.pubky.as_str()),
+            Some(reference)
+        )
+    );
+    assert_eq!(
+        order_state(&app.pool, &order.order_id).await,
+        "refunded_external"
+    );
+    assert_eq!(confirmation_events(&app.pool).await, 0, "nothing is paid");
+    assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM receipts").await, 0);
+    assert_eq!(
+        count(
+            &app.pool,
+            "SELECT COUNT(*) FROM events WHERE kind = 'payment.resolved'"
+        )
+        .await,
+        1
+    );
+    assert_ne!(
+        seller_next_actor(app, seller, order).await,
+        json!("seller"),
+        "the seller is not asked for an action they cannot take"
+    );
+}
+
 /// The order is cancelled by the buyer (`buyer_cancel`) or by the payment
 /// window, and the seller records an external refund on it before the task
-/// completes. The completion can neither complete the order nor ask for the
-/// refund again: it waits in manual review, once, and the row stops polling.
+/// completes. The money came and went back: the completion closes the
+/// payment as refunded against that record, once, and the row stops polling.
 async fn a_completion_after_a_recorded_refund(pool: PgPool, buyer_cancel: bool) {
     let (app, fake) = test_app_with_locks(pool).await;
     let holder = Uuid::new_v4();
@@ -2307,17 +2380,15 @@ async fn a_completion_after_a_recorded_refund(pool: PgPool, buyer_cancel: bool) 
         .await;
     let summary = next_poll(&app, holder).await;
     assert_eq!(summary.locks_completions_applied, 1);
+    assert_closed_as_refunded(&app, &seller, &order, "manual-refund-1").await;
+    assert_eq!(manual_review_events(&app.pool).await, 0);
     assert_eq!(
-        review_facts(&app.pool, &order.payment_id).await,
-        ("manual_review".to_string(), None)
+        observation_history(&app.pool, &order.payment_id)
+            .await
+            .last()
+            .cloned(),
+        Some(("completed".to_string(), "refunded".to_string()))
     );
-    assert_eq!(
-        order_state(&app.pool, &order.order_id).await,
-        "refunded_external"
-    );
-    assert_eq!(confirmation_events(&app.pool).await, 0);
-    assert_eq!(manual_review_events(&app.pool).await, 1);
-    assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM receipts").await, 0);
     assert_eq!(
         count(
             &app.pool,
@@ -2340,17 +2411,73 @@ async fn a_completion_after_a_recorded_refund(pool: PgPool, buyer_cancel: bool) 
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn a_completion_after_the_buyer_cancelled_and_the_seller_refunded_waits_for_review(
+async fn a_completion_after_the_buyer_cancelled_and_the_seller_refunded_closes_as_refunded(
     pool: PgPool,
 ) {
     a_completion_after_a_recorded_refund(pool, true).await;
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn a_completion_after_the_window_lapsed_and_the_seller_refunded_waits_for_review(
+async fn a_completion_after_the_window_lapsed_and_the_seller_refunded_closes_as_refunded(
     pool: PgPool,
 ) {
     a_completion_after_a_recorded_refund(pool, false).await;
+}
+
+// The other ordering: the completion lands first and is refund-required,
+// which asks the seller to return the money and record it. Recording that
+// refund closes the payment as refunded, so the seller is not left with a
+// review they have no way to resolve.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn recording_the_refund_closes_a_refund_required_locks_payment(pool: PgPool) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let holder = Uuid::new_v4();
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
+    register_locks(&app, &buyer.token, &order, &seller.pubky).await;
+    cancel_as_buyer(&app, &buyer, &order, 50).await;
+    fake.complete_matching(&app.pool, TEST_BUNDLE_ID, &order.payment_id)
+        .await;
+    run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    assert_refund_required_after_cancel(&app, &order).await;
+    assert_eq!(
+        seller_next_actor(&app, &seller, &order).await,
+        json!("seller")
+    );
+
+    let refund = common::order_command(
+        "refund.record_external",
+        &order.order_id,
+        2,
+        json!({ "amount_minor": 1, "transaction_id": "manual-refund-2" }),
+        61,
+    );
+    let (status, body) = execute(&app, &seller.token, &refund).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_closed_as_refunded(&app, &seller, &order, "manual-refund-2").await;
+    assert_eq!(
+        review_facts(&app.pool, &order.payment_id)
+            .await
+            .1
+            .as_deref(),
+        Some("refund_required"),
+        "the review reason stays as the record of why the refund was owed"
+    );
+
+    // A replay of the same command changes nothing.
+    let (status, body) = execute(&app, &seller.token, &refund).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        count(
+            &app.pool,
+            "SELECT COUNT(*) FROM events WHERE kind = 'payment.resolved'"
+        )
+        .await,
+        1
+    );
 }
 
 // A verified completion whose still-pending order refuses confirmation (its

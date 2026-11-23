@@ -1229,12 +1229,19 @@ takes the refund-required shape (payment `manual_review` with
 and the order stays `cancelled`, even when the released unit is still
 free. An order cancelled before the cancel expired Locks payments (a
 cancelled order whose payment is still `awaiting_entitlement`) is treated
-the same way. A window expiry is different: its late completion takes the
-late-money fork and completes the order when the unit is free. When the
-seller has already recorded an external refund on the cancelled order
-(`refunded_external`), either kind of late completion waits in
-`manual_review` without a review reason: it can neither complete the order
-nor ask for the refund again.
+the same way. The seller returns the money and records it with
+`refund.record_external`; that command closes the refund-required Locks
+payment as `refunded` in the same transaction (`confirmed` with
+`resolution_outcome=refunded`, `resolution_basis=seller_attestation`, the
+recorded transaction id as `refund_reference`, one `payment.resolved` event
+by the system actor, server trigger `locks_refund_reconciliation`), the
+record the seller's `refunded` resolution writes for Paykit. A window expiry
+is different: its late completion takes the late-money fork and completes the
+order when the unit is free. When the seller has already recorded an
+external refund on the cancelled order (`refunded_external`) before the task
+completes, the completion closes the payment as `refunded` against that
+record in the same way: it neither completes the order nor asks for the
+refund again, and nobody is left with an action to take.
 
 ### `shared_manual` checkout and manual-review resolution (W1.15)
 
@@ -1677,9 +1684,10 @@ payment the buyer drove to `detected` has no `detected → expired` edge, so
 its lapsed order cancels and restocks with the payment record left
 untouched, exactly as buyer cancellation leaves it. Confirmed orders are
 `paid` and are never touched by the sweep. Money observed AFTER expiry is
-never dropped: a late Locks completion, a late paykit settlement (when the
-payment was already detected on-chain), and a late fiat verification all
-route the expired payment to `manual_review`.
+never dropped: a late paykit settlement (when the payment was already
+detected on-chain) and a late fiat verification route the expired payment
+to `manual_review`, and a late Locks completion follows "Expiry vs late
+completion" under Locks verification.
 
 **Cancellation.** Buyer/seller cancellation of a pending order releases the
 hold ONLY when one exists — an unheld pending order releases nothing, and
@@ -2476,15 +2484,25 @@ advance a payment (ADR-0019 §7).
 
   A completion verified after the bound (a payment confirming more than the
   allowance after the deadline, a Lock Server or Paykit unreachable for the
-  whole bound, or a Paykit window longer than the bound) takes the
-  late-money fork: the correlation keeps polling after the window (bounded
-  by the Lock Server's own task ageing), and a completion verified
-  **after** marketplace expiry completes the order if the unit is still
-  free, or leaves it unpaid and `refund_required` if the unit was sold,
-  retained in `manual_review` — never a confirmation of a dead order, never
-  silently discarded. A verified completion whose order can no longer be
-  confirmed (e.g. cancelled while pending, or a lapsed auction hold) goes
-  to `manual_review`.
+  whole bound, or a Paykit window longer than the bound) is never silently
+  discarded: the correlation keeps polling after the window (bounded by the
+  Lock Server's own task ageing). What a completion verified **after**
+  marketplace expiry does depends on how the order ended:
+  - **Window expiry** (`payment window elapsed`): the late-money fork. The
+    unit still free: the payment confirms and the order is paid
+    (`late_completion`). The unit gone: `manual_review` with
+    `review_reason=refund_required`, the order stays cancelled.
+  - **Buyer cancel**: refund-required whatever the stock (see "Buyer cancel
+    of a Locks order").
+  - **Refund already recorded** (`refunded_external`): the payment closes as
+    `refunded` against the seller's record; nothing is paid.
+  - **Any other refusal** (a still-pending order that refuses confirmation,
+    for example a lost hold or a lapsed auction hold): `manual_review`
+    without a review reason, written in the transaction that read the
+    payment.
+
+  A refund-required Locks payment closes as `refunded` when the seller
+  records the refund with `refund.record_external`.
 
   **Hold exposure.** No per-buyer or per-listing cap limits open Locks
   holds; the only per-buyer limit in the service is a drop's
@@ -2794,6 +2812,11 @@ aggregate sets change):
   already declared);
 - the payment aggregate's command list gains `payment.register_locks`.
 
+Closing a refunded Locks payment adds the server trigger
+`locks_refund_reconciliation` to payment `manual_review → confirmed`, beside
+`paykit_resolution`. The edge stays server-only: no client command confirms
+a payment.
+
 ## Resolved contract divergences
 
 The prototype service enums and the client-side TypeScript contracts
@@ -2814,7 +2837,7 @@ This service is canonical and resolves them as follows:
 | Auth handshake | ed25519 challenge–response: the service issued a nonce for the client to sign | Pubky AuthToken verified with `pubky-common`; challenge endpoint removed | A browser client cannot sign — the secret key lives in the user's signer (Pubky Ring), and the SDK `Keypair` exposes no signing method. The AuthToken is the mechanism Pubky provides for exactly this proof; the service adds single-use and acceptance-window enforcement. |
 | Payment projection | client `paymentSchema` requires `locks_bundle_id` | the field no longer exists: the bundle id lives only encrypted in `payment_locks_correlations` and is never serialized | ADR-0019 §8 forbids exposing `access credentials or bundle_id`. The client has made the field optional; it will never be sent. |
 | Payment adapter | sandbox only (`adapter = 'sandbox'`) | `sandbox` or `locks`; `payment.register_locks` flips a payment to `locks`, which permanently refuses `payment.sandbox_advance` | ADR-0019 §7: a Locks-correlated payment advances only by independent server-side verification of a completed Locks result — never by a client claim. |
-| Real payment advancement | none (the prototype had only the buyer-driven sandbox command) | server-driven: the worker verifies the Locks lifecycle (`POST /verification-task-lookups`) and confirms exactly once; the marketplace payment window expires on server time; a late completion goes to `manual_review` | ADR-0019 §7 and the upstream integration contract; Locks v1 leaves transport/status failures pending, so upstream trouble never expires a payment by itself. |
+| Real payment advancement | none (the prototype had only the buyer-driven sandbox command) | server-driven: the worker verifies the Locks lifecycle (`POST /verification-task-lookups`) and confirms exactly once; the marketplace payment window expires on server time; a late completion takes the late-money fork, is refund-required after a buyer cancel, or closes as `refunded` when the refund is already recorded | ADR-0019 §7 and the upstream integration contract; Locks v1 leaves transport/status failures pending, so upstream trouble never expires a payment by itself. |
 | Order delivery address | prototype order views carried the address | omitted from read projections (the client `orderSchema` never wanted it) | ADR-0019 §8: no private delivery details in exposed records. |
 | Receipts | client `receiptSchema` + sandbox `GET /v1/receipts/{id}` | durable `receipts` table (append-only), issued exactly once on payment confirmation; `GET /v1/receipts/{id}` for issuer and recipient | The table and issuing transition now exist, so the endpoint serves real rows; `orders.receipt_id` is populated on confirmation. |
 | Inventory after payment confirmation | prototype left the sold quantity in `reservedQuantity` forever | confirmation moves the order's line quantities reserved → sold and marks the winning auction reservation `converted` | The contract already declared listing `reserved → sold` and reservation `active → converted` under `payment_confirmation`; a durable ledger cannot hold quantities in a hold state forever. |
