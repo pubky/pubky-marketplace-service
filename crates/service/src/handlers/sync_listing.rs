@@ -13,14 +13,18 @@
 //! without knowing the aggregate's state, a pre-existing aggregate is never
 //! a conflict, and a record whose revision does not advance past the
 //! aggregate's is a successful no-op returning the current server revision.
+//!
+//! The homeserver reads (the record and, when it is missing, the deletion
+//! proof) run in [`prefetch`], before the command's transaction, so no
+//! database connection is held while the homeserver answers.
 
 use chrono::{DateTime, Utc};
 use marketplace_domain::commands::{
-    validate_public_listing_payload, Command, SaleFormat, SyncListingPayload,
+    validate_public_listing_payload, Command, CommandPayload, SaleFormat, SyncListingPayload,
 };
 use marketplace_domain::{ids, ErrorCode};
-use serde_json::json;
-use sqlx::{Postgres, Transaction};
+use serde_json::{json, Value};
+use sqlx::{PgPool, Postgres, Transaction};
 
 use crate::handlers::register_listing::apply_registration;
 use crate::handlers::{fetch_auction_reserve_for_update, fetch_listing, fetch_listing_for_update};
@@ -30,18 +34,84 @@ use crate::homeserver::{
 };
 use crate::listing_deletion::{
     confirm_missing_record_deleted, observe_live, tombstone, DeletionAuthority, DeletionCheck,
+    LiveListing,
 };
 use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
+
+/// What a `listing.sync` read from the seller's homeserver before its
+/// transaction.
+#[derive(Debug)]
+pub enum SyncPrefetch {
+    /// No read: not a sync, or one the handler refuses before reading.
+    NotNeeded,
+    Found(Value),
+    /// The record is missing. With the listing as it was live before the
+    /// deletion proof was read, and that proof; `None` when no live listing
+    /// was observed.
+    NotFound(Option<(LiveListing, DeletionCheck)>),
+    Unavailable,
+}
+
+/// The `listing.sync` payload whose record the executor must read before
+/// the transaction, or `None` for every other command and for a sync the
+/// handler refuses without reading (no homeserver, or an aggregate id that
+/// is not its seller's and listing's).
+pub fn record_request(command: &Command, has_homeserver: bool) -> Option<&SyncListingPayload> {
+    let CommandPayload::SyncListing(payload) = &command.payload else {
+        return None;
+    };
+    (has_homeserver
+        && command.aggregate_id
+            == ids::listing_aggregate_id(&payload.seller_pubky, &payload.listing_id))
+    .then_some(payload)
+}
+
+/// Reads the seller's record and, when it is missing and the listing is
+/// live, observes the listing and reads the deletion proof. The handler
+/// tombstones only if the listing's `record_epoch` is still the observed
+/// one, so a register, sync or revival accepted meanwhile wins.
+pub async fn prefetch(
+    pool: &PgPool,
+    homeserver: &dyn HomeserverListingClient,
+    command: &Command,
+    payload: &SyncListingPayload,
+) -> Result<SyncPrefetch, sqlx::Error> {
+    Ok(
+        match homeserver
+            .fetch_listing(&payload.seller_pubky, &payload.listing_id)
+            .await
+        {
+            HomeserverFetchOutcome::Found(record) => SyncPrefetch::Found(record),
+            HomeserverFetchOutcome::Unavailable => SyncPrefetch::Unavailable,
+            HomeserverFetchOutcome::NotFound => {
+                let proof = match observe_live(pool, &command.aggregate_id).await? {
+                    Some(observed) => Some((
+                        observed,
+                        confirm_missing_record_deleted(
+                            homeserver,
+                            &payload.seller_pubky,
+                            &payload.listing_id,
+                        )
+                        .await,
+                    )),
+                    None => None,
+                };
+                SyncPrefetch::NotFound(proof)
+            }
+        },
+    )
+}
 
 pub async fn handle(
     tx: &mut Transaction<'_, Postgres>,
     actor: &str,
     command: &Command,
     payload: &SyncListingPayload,
-    homeserver: Option<&dyn HomeserverListingClient>,
+    has_homeserver: bool,
+    prefetched: &SyncPrefetch,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
-    let mut outcome = sync(tx, actor, command, payload, homeserver, now).await?;
+    let mut outcome = sync(tx, actor, command, payload, has_homeserver, prefetched, now).await?;
     // A sync that converged the listing to its record but could not convert it
     // to per-variant stock says so: `variant_conversion` names the state
     // (`deferred`, or `blocked` when the record itself has to change) and why.
@@ -69,18 +139,19 @@ async fn sync(
     actor: &str,
     command: &Command,
     payload: &SyncListingPayload,
-    homeserver: Option<&dyn HomeserverListingClient>,
+    has_homeserver: bool,
+    prefetched: &SyncPrefetch,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     // Fail closed: without a configured homeserver there is no canonical
     // record to derive registration from.
-    let Some(homeserver) = homeserver else {
+    if !has_homeserver {
         return Ok(Err(CommandFailure::refused(
             crate::refusal_audit::RefusalKind::InvalidCommand,
             ErrorCode::InvalidCommand,
             "Listing sync is not enabled on this deployment.",
         )));
-    };
+    }
 
     let expected_aggregate_id =
         ids::listing_aggregate_id(&payload.seller_pubky, &payload.listing_id);
@@ -92,15 +163,14 @@ async fn sync(
         )));
     }
 
-    let record = match homeserver
-        .fetch_listing(&payload.seller_pubky, &payload.listing_id)
-        .await
-    {
-        HomeserverFetchOutcome::Found(record) => record,
-        HomeserverFetchOutcome::NotFound => {
-            return settle_missing_record(tx, actor, command, payload, homeserver, now).await;
+    let record = match prefetched {
+        SyncPrefetch::Found(record) => record,
+        SyncPrefetch::NotFound(proof) => {
+            return settle_missing_record(tx, actor, command, proof.as_ref(), now).await;
         }
-        HomeserverFetchOutcome::Unavailable => {
+        // `NotNeeded` reaches here only if the executor and the refusals
+        // above disagree; nothing was read, so nothing is registered.
+        SyncPrefetch::Unavailable | SyncPrefetch::NotNeeded => {
             return Ok(Err(CommandFailure::refused(
                 crate::refusal_audit::RefusalKind::UpstreamUnavailable,
                 ErrorCode::UpstreamUnavailable,
@@ -109,27 +179,29 @@ async fn sync(
         }
     };
 
-    let registration =
-        match registration_payload_from_record(&payload.seller_pubky, &payload.listing_id, &record)
-        {
-            Ok(Some(registration)) => registration,
-            Ok(None) => {
-                return Ok(Err(CommandFailure::refused(
-                    crate::refusal_audit::RefusalKind::InvalidState,
-                    ErrorCode::InvalidState,
-                    "The seller's listing record could not be interpreted for registration.",
-                )))
-            }
-            // A present-but-invalid digitalLock refuses the sync rather than
-            // healing the listing to no lock.
-            Err(MalformedDigitalLock) => {
-                return Ok(Err(CommandFailure::refused(
-                    crate::refusal_audit::RefusalKind::InvalidState,
-                    ErrorCode::InvalidState,
-                    "The seller's listing record carries an invalid Locks payment lock.",
-                )))
-            }
-        };
+    let registration = match registration_payload_from_record(
+        &payload.seller_pubky,
+        &payload.listing_id,
+        record,
+    ) {
+        Ok(Some(registration)) => registration,
+        Ok(None) => {
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::InvalidState,
+                ErrorCode::InvalidState,
+                "The seller's listing record could not be interpreted for registration.",
+            )))
+        }
+        // A present-but-invalid digitalLock refuses the sync rather than
+        // healing the listing to no lock.
+        Err(MalformedDigitalLock) => {
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::InvalidState,
+                ErrorCode::InvalidState,
+                "The seller's listing record carries an invalid Locks payment lock.",
+            )))
+        }
+    };
     if registration.registers_unlimited_cap_with_physical_methods() {
         return Ok(Err(
             crate::handlers::register_listing::unlimited_cap_refusal(),
@@ -421,14 +493,14 @@ async fn confirm_record(
 }
 
 /// The fetch found no record. A registered listing whose deletion the
-/// seller's event stream confirms is tombstoned; an already tombstoned one
-/// is a convergent no-op. Anything else keeps the definitive 404.
+/// seller's event stream confirms ([`prefetch`]) is tombstoned; an already
+/// tombstoned one is a convergent no-op. Anything else keeps the definitive
+/// 404.
 async fn settle_missing_record(
     tx: &mut Transaction<'_, Postgres>,
     actor: &str,
     command: &Command,
-    payload: &SyncListingPayload,
-    homeserver: &dyn HomeserverListingClient,
+    proof: Option<&(LiveListing, DeletionCheck)>,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     let not_found = || {
@@ -444,14 +516,13 @@ async fn settle_missing_record(
     if current.is_deleted() {
         return Ok(Ok(deleted_success(&current, vec![])));
     }
-    let Some(observed) = observe_live(&mut **tx, &command.aggregate_id).await? else {
-        return Ok(Err(not_found()));
-    };
-    let DeletionCheck::Deleted {
-        cursor,
-        homeserver: event_homeserver,
-    } = confirm_missing_record_deleted(homeserver, &payload.seller_pubky, &payload.listing_id)
-        .await
+    let Some((
+        observed,
+        DeletionCheck::Deleted {
+            cursor,
+            homeserver: event_homeserver,
+        },
+    )) = proof
     else {
         return Ok(Err(not_found()));
     };
@@ -459,7 +530,7 @@ async fn settle_missing_record(
         tx,
         DeletionAuthority::Command,
         &command.aggregate_id,
-        &cursor,
+        cursor,
         event_homeserver.as_deref(),
         observed.record_epoch,
         actor,
