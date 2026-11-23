@@ -9,11 +9,14 @@
 //!   check runs in the transport's DNS resolvers, on the addresses the
 //!   connection is then made to, so a name that resolves differently between
 //!   a check and the connect (DNS rebinding) still cannot reach an internal
-//!   address. An ICANN endpoint named by an IP literal, which skips the
-//!   resolver, is checked before any request is built;
+//!   address. An ICANN endpoint is classified as URL parsing reads it, so an
+//!   IP literal in any form (`127.1`, `2130706433`, `0x7f.0.0.1`), which the
+//!   HTTP client connects to without resolving, is checked as that address;
+//!   and the host of every URL built is checked again before it is sent;
 //! - follows no redirect, speaks only HTTPS and uses no proxy;
-//! - looks a pubky's homeserver up with the newest record the network holds
-//!   whenever its cache holds no fresh one;
+//! - reads a pubky's record, and its homeserver's, from the cache while
+//!   fresh, otherwise from the newest record the network holds, keeping a
+//!   cached record the network has nothing newer than;
 //! - bounds each read, from the lookup to the end of the body, by one budget.
 //!
 //! It replaces the `pubky` SDK's request path (`PubkyHttpClient::request_async`),
@@ -32,14 +35,13 @@ use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use futures_lite::StreamExt;
-use pubky::pkarr::dns::rdata::RData;
+use pubky::pkarr::dns::rdata::{RData, SVCParam, SVCB};
 use pubky::pkarr::errors::ResolveError;
-use pubky::pkarr::extra::endpoints::Endpoint;
 use pubky::pkarr::{self, Cache, CacheKey, InMemoryCache, ResolvePolicy, SignedPacket};
 use pubky_common::constants::features::PATH_ADDRESSED_STORAGE;
 use pubky_reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use tokio::time::Instant;
+use url::Host;
 
 use super::{pubky_host_prefix, HomeserverRefresh, PkarrResolutionCache, Target, Unreached};
 
@@ -162,37 +164,144 @@ fn allowed_addrs(addrs: Vec<SocketAddr>, policy: EndpointPolicy) -> Resolving {
     })
 }
 
-/// Resolves a homeserver key to the addresses its own record lists
-/// (endpoints whose target is `.`), keeping those the policy allows.
-struct DirectResolver {
+/// The Pkarr client and the record cache it shares with the transport.
+#[derive(Clone)]
+struct Records {
     pkarr: pkarr::Client,
+    cache: Arc<InMemoryCache>,
+    ttl_seconds: u32,
+}
+
+impl Records {
+    /// `key`'s record: the cached one while it is fresh; otherwise the most
+    /// recent record the network holds, never the first answer a DHT node
+    /// gives, which could be a record `key` has since replaced.
+    async fn current(&self, key: &pkarr::PublicKey) -> Result<SignedPacket, ResolveError> {
+        let cached = self.cache.get(&CacheKey::from(key));
+        if let Some(packet) = cached
+            .as_ref()
+            .filter(|packet| !packet.is_expired(self.ttl_seconds, self.ttl_seconds))
+        {
+            return Ok(packet.clone());
+        }
+        self.from_network(key, cached).await
+    }
+
+    /// `key`'s most recent record on the network, read past the cache.
+    async fn latest(&self, key: &pkarr::PublicKey) -> Result<SignedPacket, ResolveError> {
+        let cached = self.cache.get(&CacheKey::from(key));
+        self.from_network(key, cached).await
+    }
+
+    /// The network's answer, or `cached` when that is more recent still: the
+    /// Pkarr client never replaces a cached record with an older one, but it
+    /// returns the older one, and an expired cached record would otherwise
+    /// lose to it on every read. A cached record the network has nothing
+    /// newer than is marked as just seen, so it is fresh again.
+    async fn from_network(
+        &self,
+        key: &pkarr::PublicKey,
+        cached: Option<SignedPacket>,
+    ) -> Result<SignedPacket, ResolveError> {
+        let network = self.pkarr.resolve(key, ResolvePolicy::NetworkOnly).await?;
+        Ok(more_recent(&self.cache, cached, network))
+    }
+}
+
+fn more_recent(
+    cache: &InMemoryCache,
+    cached: Option<SignedPacket>,
+    network: SignedPacket,
+) -> SignedPacket {
+    match cached {
+        Some(mut cached) if cached.more_recent_than(&network) => {
+            cached.refresh();
+            cache.put(&CacheKey::from(&cached.public_key()), &cached);
+            cached
+        }
+        _ => network,
+    }
+}
+
+/// Resolves a homeserver key to the addresses its own record lists for
+/// itself, keeping those the policy allows.
+struct DirectResolver {
+    records: Records,
     policy: EndpointPolicy,
 }
 
 impl Resolve for DirectResolver {
     fn resolve(&self, name: Name) -> Resolving {
-        let pkarr = self.pkarr.clone();
+        let records = self.records.clone();
         let policy = self.policy;
         let name = name.as_str().to_owned();
         Box::pin(async move {
-            if pkarr::PublicKey::try_from(name.as_str()).is_err() {
-                return Err(Box::new(NoPublicAddress) as Box<dyn std::error::Error + Send + Sync>);
-            }
-            let addrs = direct_addrs(&pkarr, &name).await;
+            let addrs = match pkarr::PublicKey::try_from(name.as_str()) {
+                Ok(key) if key.to_z32() == name => match records.current(&key).await {
+                    Ok(packet) => direct_addrs(&packet),
+                    Err(_) => Vec::new(),
+                },
+                _ => Vec::new(),
+            };
             allowed_addrs(addrs, policy).await
         })
     }
 }
 
-async fn direct_addrs(pkarr: &pkarr::Client, homeserver: &str) -> Vec<SocketAddr> {
-    pkarr
-        .resolve_https_endpoints(homeserver)
-        .collect::<Vec<Endpoint>>()
-        .await
-        .iter()
-        .filter(|endpoint| endpoint.target() == ".")
-        .flat_map(Endpoint::to_socket_addrs)
-        .collect()
+/// The homeserver's HTTPS records at its key, lowest priority value first.
+fn https_records(packet: &SignedPacket) -> Vec<&SVCB<'_>> {
+    let mut records: Vec<&SVCB<'_>> = packet
+        .resource_records("@")
+        .filter_map(|record| match &record.rdata {
+            RData::HTTPS(https) => Some(&https.0),
+            _ => None,
+        })
+        .collect();
+    records.sort_by_key(|svcb| svcb.priority);
+    records
+}
+
+fn port_of(svcb: &SVCB<'_>) -> Option<u16> {
+    svcb.iter_params()
+        .find_map(|param| match param {
+            SVCParam::Port(port) => Some(*port),
+            _ => None,
+        })
+        .filter(|port| *port > 0)
+}
+
+/// Whether an HTTPS record names the homeserver's own addresses (target `.`).
+fn targets_itself(svcb: &SVCB<'_>) -> bool {
+    let target = svcb.target.to_string();
+    target.is_empty() || target == "."
+}
+
+/// The addresses a homeserver's record lists for itself: its `A` and `AAAA`
+/// records, at the port of each HTTPS record that targets `.` (0, the URL's
+/// own port, when unset).
+fn direct_addrs(packet: &SignedPacket) -> Vec<SocketAddr> {
+    let ips: Vec<IpAddr> = packet
+        .resource_records("@")
+        .filter_map(|record| match &record.rdata {
+            RData::A(a) => Some(IpAddr::V4(Ipv4Addr::from(a.address))),
+            RData::AAAA(aaaa) => Some(IpAddr::V6(Ipv6Addr::from(aaaa.address))),
+            _ => None,
+        })
+        .collect();
+    let mut addrs = Vec::new();
+    for svcb in https_records(packet) {
+        if !targets_itself(svcb) {
+            continue;
+        }
+        let port = port_of(svcb).unwrap_or(0);
+        for ip in &ips {
+            let addr = SocketAddr::new(*ip, port);
+            if !addrs.contains(&addr) {
+                addrs.push(addr);
+            }
+        }
+    }
+    addrs
 }
 
 /// Resolves an ICANN domain through the system resolver, keeping the
@@ -239,13 +348,71 @@ fn hardened(builder: pubky_reqwest::ClientBuilder) -> pubky_reqwest::ClientBuild
 }
 
 /// Where a homeserver can be reached, from its Pkarr record.
+#[derive(Debug, PartialEq, Eq)]
 struct Route {
     /// The record lists a direct address the policy allows; the homeserver
     /// is reached at its key, over TLS pinned to that key.
     direct: bool,
-    /// ICANN endpoints, in the record's priority order: a domain and its
-    /// port (443 when unset).
-    icann: Vec<(String, Option<u16>)>,
+    /// ICANN endpoints, in the record's priority order: a host and its port
+    /// (443 when unset). A host is a domain exactly as the record wrote it
+    /// (lowercase, no trailing dot), or an IP address the policy allows.
+    icann: Vec<(Host<String>, Option<u16>)>,
+}
+
+impl Route {
+    fn of(packet: &SignedPacket, policy: EndpointPolicy) -> Self {
+        let direct = direct_addrs(packet)
+            .iter()
+            .any(|addr| policy.allows(addr.ip()));
+        let mut icann = Vec::new();
+        for svcb in https_records(packet) {
+            if targets_itself(svcb) {
+                continue;
+            }
+            let target = svcb.target.to_string();
+            // Another Pkarr key: a delegation, which homeservers do not
+            // publish for themselves and which is not followed.
+            if pkarr::PublicKey::try_from(target.as_str()).is_ok() {
+                continue;
+            }
+            if let Some(host) = icann_host(&target, policy) {
+                icann.push((host, port_of(svcb)));
+            }
+        }
+        Self { direct, icann }
+    }
+}
+
+/// The host an ICANN target names, as URL parsing reads it. A target that
+/// parses as an IP address in any form is that address, kept only if the
+/// policy allows it; a domain is kept only if parsing leaves it unchanged
+/// apart from case, so the URL's host is the name the record wrote.
+fn icann_host(target: &str, policy: EndpointPolicy) -> Option<Host<String>> {
+    let name = target.strip_suffix('.').unwrap_or(target);
+    match Host::parse(name).ok()? {
+        Host::Domain(domain) if domain == name.to_ascii_lowercase() => Some(Host::Domain(domain)),
+        Host::Domain(_) => None,
+        Host::Ipv4(ip) => policy.allows(IpAddr::V4(ip)).then_some(Host::Ipv4(ip)),
+        Host::Ipv6(ip) => policy.allows(IpAddr::V6(ip)).then_some(Host::Ipv6(ip)),
+    }
+}
+
+/// Whether `url` will connect to `expected`: no user info, and a host equal
+/// to it; an IP host must also be one the policy allows.
+fn connects_to(url: &url::Url, expected: &Host<String>, policy: EndpointPolicy) -> bool {
+    if !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
+    match (url.host(), expected) {
+        (Some(Host::Domain(domain)), Host::Domain(expected)) => domain == expected,
+        (Some(Host::Ipv4(ip)), Host::Ipv4(expected)) => {
+            ip == *expected && policy.allows(IpAddr::V4(ip))
+        }
+        (Some(Host::Ipv6(ip)), Host::Ipv6(expected)) => {
+            ip == *expected && policy.allows(IpAddr::V6(ip))
+        }
+        _ => false,
+    }
 }
 
 /// What one exchange asks a homeserver for.
@@ -300,11 +467,7 @@ impl Exchange<'_> {
 }
 
 pub(super) struct PkarrTransport {
-    pkarr: pkarr::Client,
-    /// The Pkarr client's record cache, read directly to tell a fresh
-    /// record from a miss.
-    records: Arc<InMemoryCache>,
-    record_ttl_seconds: u32,
+    records: Records,
     direct: pubky_reqwest::Client,
     icann: pubky_reqwest::Client,
     /// Per homeserver key: when its `/info` was read, and whether it
@@ -335,12 +498,17 @@ impl PkarrTransport {
             .map_err(|error| anyhow::anyhow!("homeserver Pkarr client: {error}"))?
             .pkarr()
             .clone();
+        let records = Records {
+            pkarr: pkarr.clone(),
+            cache: records,
+            ttl_seconds: record_ttl_seconds,
+        };
         let direct = hardened(pubky_reqwest::Client::builder())
             .dns_resolver(Arc::new(DirectResolver {
-                pkarr: pkarr.clone(),
+                records: records.clone(),
                 policy,
             }))
-            .use_preconfigured_tls(rustls::ClientConfig::from(pkarr.clone()))
+            .use_preconfigured_tls(rustls::ClientConfig::from(pkarr))
             .build()?;
         let icann = hardened(pubky_reqwest::Client::builder())
             .dns_resolver(Arc::new(IcannResolver { policy }))
@@ -350,9 +518,7 @@ impl PkarrTransport {
             NonZeroUsize::new(ADDRESSING_CACHE_CAPACITY).expect("non-zero capacity"),
         ));
         Ok(Self {
-            pkarr,
             records,
-            record_ttl_seconds,
             direct,
             icann,
             addressing,
@@ -393,16 +559,18 @@ impl PkarrTransport {
             }
         };
         let route = match tokio::time::timeout_at(deadline, self.route(&homeserver)).await {
-            Ok(route) if route.direct || !route.icann.is_empty() => route,
-            outcome => {
+            Ok(Ok(route)) if route.direct || !route.icann.is_empty() => Ok(route),
+            Ok(Ok(_)) => Err("no endpoint at an allowed address"),
+            Ok(Err(failure)) => Err(failure),
+            Err(_) => Err("endpoint lookup timed out"),
+        };
+        let route = match route {
+            Ok(route) => route,
+            Err(failure) => {
                 tracing::warn!(
                     pubky_host_prefix = %prefix,
                     homeserver_prefix = %pubky_host_prefix(&homeserver),
-                    failure = if outcome.is_ok() {
-                        "no endpoint at an allowed address"
-                    } else {
-                        "endpoint lookup timed out"
-                    },
+                    failure,
                     "homeserver transport could not be resolved"
                 );
                 return Err(Unreached);
@@ -420,60 +588,35 @@ impl PkarrTransport {
         Ok((response, homeserver))
     }
 
-    /// The homeserver `user`'s record names: from a cached record still
-    /// within the cache TTL, otherwise from the newest record on the network,
-    /// never the first answer, which a DHT node could replay from before the
-    /// user moved.
+    /// The homeserver `user`'s current record names ([`Records::current`]).
     async fn homeserver_of(
         &self,
         user: &pkarr::PublicKey,
     ) -> Result<pkarr::PublicKey, &'static str> {
-        let fresh = self
+        let packet = self
             .records
-            .get(&CacheKey::from(user))
-            .filter(|packet| !packet.is_expired(self.record_ttl_seconds, self.record_ttl_seconds));
-        let packet = match fresh {
-            Some(packet) => packet,
-            None => match self.pkarr.resolve(user, ResolvePolicy::NetworkOnly).await {
-                Ok(packet) => packet,
-                Err(ResolveError::NotFound) => return Err("no homeserver record"),
-                Err(_) => return Err("lookup failed"),
-            },
-        };
+            .current(user)
+            .await
+            .map_err(|error| match error {
+                ResolveError::NotFound => "no homeserver record",
+                _ => "lookup failed",
+            })?;
         homeserver_named_by(&packet).ok_or("no homeserver record")
     }
 
-    async fn route(&self, homeserver: &str) -> Route {
-        let endpoints: Vec<Endpoint> = self
-            .pkarr
-            .resolve_https_endpoints(homeserver)
-            .collect()
-            .await;
-        let mut route = Route {
-            direct: false,
-            icann: Vec::new(),
-        };
-        for endpoint in &endpoints {
-            match endpoint.domain() {
-                None => {
-                    route.direct |= endpoint.target() == "."
-                        && endpoint
-                            .to_socket_addrs()
-                            .iter()
-                            .any(|addr| self.policy.allows(addr.ip()));
-                }
-                Some(domain) => {
-                    if domain
-                        .parse::<IpAddr>()
-                        .is_ok_and(|ip| !self.policy.allows(ip))
-                    {
-                        continue;
-                    }
-                    route.icann.push((domain.to_owned(), endpoint.port()));
-                }
-            }
-        }
-        route
+    /// The endpoints of `homeserver`'s current record ([`Records::current`]),
+    /// the same rule as a user's.
+    async fn route(&self, homeserver: &str) -> Result<Route, &'static str> {
+        let key = pkarr::PublicKey::try_from(homeserver).map_err(|_| "malformed homeserver key")?;
+        let packet = self
+            .records
+            .current(&key)
+            .await
+            .map_err(|error| match error {
+                ResolveError::NotFound => "no endpoint record",
+                _ => "endpoint lookup failed",
+            })?;
+        Ok(Route::of(&packet, self.policy))
     }
 
     /// Whether `homeserver` advertises path-addressed storage in its `/info`,
@@ -510,7 +653,9 @@ impl PkarrTransport {
     }
 
     /// Sends `exchange` to the homeserver's direct addresses, then, if no
-    /// connection could be made there, to each ICANN endpoint in turn.
+    /// connection could be made there, to each ICANN endpoint in turn. An
+    /// endpoint whose URL would connect anywhere but the host it was built
+    /// for is skipped.
     async fn send(
         &self,
         homeserver: &str,
@@ -518,17 +663,21 @@ impl PkarrTransport {
         exchange: &Exchange<'_>,
         deadline: Instant,
     ) -> Result<pubky_reqwest::Response, Unreached> {
-        let direct = route
-            .direct
-            .then(|| (&self.direct, format!("https://{homeserver}")));
-        let icann = route.icann.iter().map(|(domain, port)| {
-            let base = match port {
-                Some(port) => format!("https://{domain}:{port}"),
-                None => format!("https://{domain}"),
-            };
-            (&self.icann, base)
+        let direct = route.direct.then(|| {
+            (
+                &self.direct,
+                Host::Domain(homeserver.to_owned()),
+                format!("https://{homeserver}"),
+            )
         });
-        for (client, base) in direct.into_iter().chain(icann) {
+        let icann = route.icann.iter().map(|(host, port)| {
+            let base = match port {
+                Some(port) => format!("https://{host}:{port}"),
+                None => format!("https://{host}"),
+            };
+            (&self.icann, host.clone(), base)
+        });
+        for (client, host, base) in direct.into_iter().chain(icann) {
             let Some((url, pubky_host)) = exchange.url(&base) else {
                 tracing::warn!(
                     homeserver_prefix = %pubky_host_prefix(homeserver),
@@ -536,6 +685,13 @@ impl PkarrTransport {
                 );
                 return Err(Unreached);
             };
+            if !connects_to(&url, &host, self.policy) {
+                tracing::warn!(
+                    homeserver_prefix = %pubky_host_prefix(homeserver),
+                    "homeserver endpoint skipped: its URL names another host"
+                );
+                continue;
+            }
             let mut request = client
                 .get(url)
                 .timeout(deadline.saturating_duration_since(Instant::now()));
@@ -552,8 +708,8 @@ impl PkarrTransport {
     }
 
     /// Reads `pubky`'s Pkarr record from the network, past the cache, which
-    /// the answer then refreshes, so the reads that follow go to the
-    /// homeserver the record names now.
+    /// then holds the most recent record seen ([`Records::latest`]), so the
+    /// reads that follow go to the homeserver the record names now.
     pub(super) async fn refresh(&self, pubky: &str) -> HomeserverRefresh {
         let prefix = pubky_host_prefix(pubky);
         let user = match pkarr::PublicKey::try_from(pubky) {
@@ -563,7 +719,7 @@ impl PkarrTransport {
                 return HomeserverRefresh::Unavailable;
             }
         };
-        let lookup = self.pkarr.resolve(&user, ResolvePolicy::NetworkOnly);
+        let lookup = self.records.latest(&user);
         let failure = match tokio::time::timeout(REFRESH_TIMEOUT, lookup).await {
             Ok(Ok(_)) => return HomeserverRefresh::Refreshed,
             Ok(Err(ResolveError::NotFound)) => "no record",
@@ -783,5 +939,180 @@ mod tests {
         .resolve("localhost".parse().unwrap())
         .await;
         assert!(resolved.is_err(), "localhost resolves only to loopback");
+    }
+
+    /// A homeserver record with an HTTPS endpoint (port 6286) per target, in
+    /// priority order, and `addresses` at its key. Targets are written
+    /// unchecked, as a record read off the network may hold any bytes.
+    fn endpoint_record(targets: &[&str], addresses: &[&str]) -> SignedPacket {
+        let mut packet = SignedPacket::builder();
+        for (priority, target) in (1..).zip(targets) {
+            let name = if *target == "." {
+                ".".try_into().unwrap()
+            } else {
+                pkarr::dns::Name::new_unchecked(target)
+            };
+            let mut svcb = SVCB::new(priority, name);
+            svcb.set_port(6286);
+            packet = packet.https(".".try_into().unwrap(), svcb, 60);
+        }
+        for address in addresses {
+            packet = packet.address(".".try_into().unwrap(), address.parse().unwrap(), 60);
+        }
+        packet.sign(&pkarr::Keypair::random()).unwrap()
+    }
+
+    #[test]
+    fn icann_endpoints_are_classified_as_urls_read_them() {
+        let delegated = pkarr::Keypair::random().public_key().to_z32();
+        let targets = [
+            "127.1",
+            "2130706433",
+            "0x7f.0.0.1",
+            "0177.0.0.1",
+            "10.1",
+            "169.254.43518",
+            "127.0.0.1.",
+            "[::1]",
+            "[::ffff:127.0.0.1]",
+            "user@8.8.8.8",
+            "8.8.8.8:80",
+            "ex%61mple.com",
+            delegated.as_str(),
+            "8.8.4.4",
+            "134744072",
+            "Homeserver.Example.",
+            "pubky.example",
+        ];
+        let record = endpoint_record(&targets, &[]);
+        assert_eq!(
+            Route::of(&record, EndpointPolicy::PublicOnly),
+            Route {
+                direct: false,
+                icann: vec![
+                    (Host::Ipv4(Ipv4Addr::new(8, 8, 4, 4)), Some(6286)),
+                    (Host::Ipv4(Ipv4Addr::new(8, 8, 8, 8)), Some(6286)),
+                    (Host::Domain("homeserver.example".to_owned()), Some(6286)),
+                    (Host::Domain("pubky.example".to_owned()), Some(6286)),
+                ],
+            }
+        );
+        // The loopback forms are loopback, not domains: the test seam, which
+        // allows loopback, reads each as 127.0.0.1.
+        let seam = Route::of(
+            &endpoint_record(&["127.1", "2130706433", "0x7f.0.0.1", "127.0.0.1."], &[]),
+            EndpointPolicy::PublicOrLoopback,
+        );
+        assert_eq!(
+            seam.icann,
+            vec![(Host::Ipv4(Ipv4Addr::LOCALHOST), Some(6286)); 4]
+        );
+    }
+
+    #[test]
+    fn direct_endpoints_use_the_records_own_addresses() {
+        let internal = endpoint_record(&["."], &["10.0.0.1", "127.0.0.1"]);
+        assert!(!Route::of(&internal, EndpointPolicy::PublicOnly).direct);
+        assert!(Route::of(&internal, EndpointPolicy::PublicOrLoopback).direct);
+
+        let mixed = endpoint_record(&[".", "pubky.example"], &["10.0.0.1", "8.8.8.8"]);
+        assert_eq!(
+            direct_addrs(&mixed),
+            vec![
+                "10.0.0.1:6286".parse::<SocketAddr>().unwrap(),
+                "8.8.8.8:6286".parse().unwrap(),
+            ]
+        );
+        assert_eq!(
+            Route::of(&mixed, EndpointPolicy::PublicOnly),
+            Route {
+                direct: true,
+                icann: vec![(Host::Domain("pubky.example".to_owned()), Some(6286))],
+            }
+        );
+    }
+
+    #[test]
+    fn a_url_connects_only_to_the_host_it_was_built_for() {
+        let url = |url: &str| url::Url::parse(url).unwrap();
+        let domain = |name: &str| Host::Domain(name.to_owned());
+        let public = EndpointPolicy::PublicOnly;
+        assert!(connects_to(
+            &url("https://pubky.example:6286/pub/x"),
+            &domain("pubky.example"),
+            public
+        ));
+        assert!(!connects_to(
+            &url("https://other.example/pub/x"),
+            &domain("pubky.example"),
+            public
+        ));
+        assert!(!connects_to(
+            &url("https://user@pubky.example/pub/x"),
+            &domain("pubky.example"),
+            public
+        ));
+        assert!(!connects_to(
+            &url("https://127.1/pub/x"),
+            &domain("127.1"),
+            public
+        ));
+        let loopback = Host::Ipv4(Ipv4Addr::LOCALHOST);
+        assert!(!connects_to(&url("https://127.1/pub/x"), &loopback, public));
+        assert!(connects_to(
+            &url("https://127.1/pub/x"),
+            &loopback,
+            EndpointPolicy::PublicOrLoopback
+        ));
+        let public_ip = Host::Ipv4(Ipv4Addr::new(8, 8, 8, 8));
+        assert!(connects_to(
+            &url("https://8.8.8.8/pub/x"),
+            &public_ip,
+            public
+        ));
+        assert!(!connects_to(
+            &url("https://8.8.4.4/pub/x"),
+            &public_ip,
+            public
+        ));
+    }
+
+    #[test]
+    fn a_cached_record_newer_than_the_networks_answer_is_kept() {
+        let keypair = pkarr::Keypair::random();
+        let key = CacheKey::from(&keypair.public_key());
+        let record = |target: &str| {
+            SignedPacket::builder()
+                .https(
+                    "_pubky".try_into().unwrap(),
+                    SVCB::new(0, target.try_into().unwrap()),
+                    60,
+                )
+                .sign(&keypair)
+                .unwrap()
+        };
+        let older = record("older.example");
+        let newer = record("newer.example");
+        assert!(newer.more_recent_than(&older));
+        let cache = InMemoryCache::new(NonZeroUsize::new(4).unwrap());
+
+        // An expired cached record still beats an older network answer, and
+        // is cached again as just seen.
+        let mut expired = newer.clone();
+        expired.set_last_seen(&pkarr::Timestamp::from(0));
+        assert!(expired.is_expired(60, 60));
+        let kept = more_recent(&cache, Some(expired), older.clone());
+        assert_eq!(kept.timestamp(), newer.timestamp());
+        let cached = cache.get(&key).expect("the kept record is cached");
+        assert_eq!(cached.timestamp(), newer.timestamp());
+        assert!(!cached.is_expired(60, 60));
+
+        // A newer network answer wins; the Pkarr client caches it itself.
+        let fresh = InMemoryCache::new(NonZeroUsize::new(4).unwrap());
+        let chosen = more_recent(&fresh, Some(older.clone()), newer.clone());
+        assert_eq!(chosen.timestamp(), newer.timestamp());
+        assert!(fresh.get(&key).is_none());
+        let chosen = more_recent(&fresh, None, older.clone());
+        assert_eq!(chosen.timestamp(), older.timestamp());
     }
 }

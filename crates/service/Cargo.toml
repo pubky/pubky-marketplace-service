@@ -44,10 +44,9 @@ pubky = { version = "=0.16.1", features = ["json"] }
 # `pkarr` resolves and pins TLS for. The service's own HTTP client stays on
 # reqwest 0.12.
 pubky-reqwest = { package = "reqwest", version = "0.13", default-features = false }
-# `pkarr` reads: endpoint streams, the homeserver `/info` cache, and the TLS
-# configuration of ICANN-domain homeservers (the roots and provider the `pubky`
-# SDK uses for them).
-futures-lite = "2"
+# `pkarr` reads: the homeserver `/info` cache, and the TLS configuration of
+# ICANN-domain homeservers (the roots and provider the `pubky` SDK uses for
+# them).
 lru = "0.16"
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
 webpki-roots = "1"
