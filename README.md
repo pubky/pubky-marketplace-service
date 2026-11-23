@@ -280,29 +280,43 @@ rather than the SDK's:
   are IPv6 forms that carry such an IPv4 address (IPv4-mapped, NAT64,
   6to4). The check runs on the addresses the connection is made to, after
   DNS resolution, so a name that resolves differently by the time of the
-  connect (DNS rebinding) cannot reach an internal address. A homeserver
-  with no allowed address is unavailable. A firewall that drops the
-  service's egress to private and link-local ranges is still worth having.
+  connect (DNS rebinding) cannot reach an internal address. An ICANN
+  endpoint is read as a URL reads it: a name such as `127.1`, `2130706433`
+  or `0x7f.0.0.1` is an IPv4 address, which the HTTP client connects to
+  without resolving, so it is checked as that address. Every request's URL
+  is checked again before it is sent: it must name the host its endpoint
+  was read as. A homeserver with no allowed address is unavailable. A
+  firewall that drops the service's egress to private and link-local ranges
+  is still worth having.
 - **HTTPS only, no redirects, no proxy.** A homeserver reached at its own
   key is verified against that key (TLS with the raw public key its record
   names); one reached at an ICANN domain is verified against the WebPKI
   roots. A `3xx` answer is not followed: the read is unavailable.
-- **Newest record.** A pubky's homeserver is taken from its cached record
-  while that is fresh, otherwise from the most recent record the network
-  holds, never the first answer a DHT node gives, which could be an older
-  record naming a homeserver the pubky has left.
+- **Newest record.** A pubky's homeserver, and that homeserver's endpoints,
+  are taken from the cached record while it is fresh, otherwise from the
+  most recent record the network holds, never the first answer a DHT node
+  gives, which could be an older record naming a homeserver the pubky has
+  left. A cached record more recent than anything the network still holds
+  is kept.
 - **Same timeouts as `fixed`.** Each read is bounded by one budget, from
   the lookup of the pubky's homeserver to the end of the body: 10 s, or
   120 s for a digital deliverable. A deletion proof first reads the
-  seller's record from the network, bounded by 10 s. `listing.sync` makes
-  its reads (the record, then, for a missing record, the deletion proof:
-  the network lookup, the record again and the event stream, at most 40 s)
-  before its database transaction, so no database connection waits on a
-  homeserver for it. Other commands still read inside their transaction,
-  as they do under `fixed` and within the same per-read budget: offers
-  (the listing record), `drop.sync`, Locks preparation (content locks),
-  digital deliverables (up to 120 s) and the return policy and seller terms
-  captured when an order is paid.
+  seller's record from the network, bounded by 10 s.
+- **Bounded reads inside transactions.** `listing.sync` makes its reads
+  (the record, then, for a missing record, the deletion proof: the network
+  lookup, the record again and the event stream, at most 40 s) and
+  `digital_delivery.set` reads its file back (up to 120 s) before the
+  database transaction, so no database connection waits on a homeserver for
+  them. The other reads stay inside their transaction, as under `fixed` and
+  within the same 10 s budget: offers (the listing record), `drop.sync`,
+  Locks preparation (content locks) and the return policy and seller terms
+  captured when an order is paid (`payment.sandbox_advance`, Locks
+  preparation, payment-method bind). Each of those commands holds one of 4
+  permits per process while its transaction is open, so homeservers that
+  stall can hold at most 4 of the main pool's 20 connections. A command
+  that finds none free is refused at once with `UPSTREAM_UNAVAILABLE` and
+  can be retried; a replay is answered from its stored result. Under
+  `fixed` no permit is taken.
 
 Both modes give each read the same outcomes and body caps. A
 record is found, missing (the pubky's homeserver answered 404) or
