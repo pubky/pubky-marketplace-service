@@ -1157,10 +1157,26 @@ fn a_record_naming_an_internal_address_is_refused() {
         );
         assert_refused(&production, &seller_pubky).await;
 
-        // Direct addresses (IPv4, IPv4-mapped IPv6), an ICANN IP literal and an
-        // ICANN name that resolves to loopback: no connection is made to any.
+        // Direct addresses (IPv4, IPv4-mapped IPv6), ICANN IP literals in every
+        // form URL parsing reads as an address (and the HTTP client then
+        // connects to without resolving), and an ICANN name that resolves to
+        // loopback: no connection is made to any.
         let internal = listener().await;
-        for endpoints in [
+        let literals = [
+            "127.0.0.1",
+            "127.0.0.1.",
+            "127.1",
+            "2130706433",
+            "0x7f.0.0.1",
+            "0177.0.0.1",
+            "10.1",
+            "169.254.43518",
+        ]
+        .map(|literal| Endpoints {
+            icann: Some((literal, internal.port)),
+            ..Endpoints::default()
+        });
+        for endpoints in literals.into_iter().chain([
             Endpoints {
                 direct: Some((vec![IpAddr::V4(Ipv4Addr::LOCALHOST)], internal.port)),
                 ..Endpoints::default()
@@ -1173,14 +1189,10 @@ fn a_record_naming_an_internal_address_is_refused() {
                 ..Endpoints::default()
             },
             Endpoints {
-                icann: Some(("127.0.0.1", internal.port)),
-                ..Endpoints::default()
-            },
-            Endpoints {
                 icann: Some(("localhost", internal.port)),
                 ..Endpoints::default()
             },
-        ] {
+        ]) {
             let homeserver = PkarrKeypair::random();
             publish_endpoints(&testnet, &homeserver, endpoints).await;
             let pubky = publish_user_on(&testnet, &homeserver).await;
