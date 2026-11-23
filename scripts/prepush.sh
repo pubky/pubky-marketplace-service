@@ -124,8 +124,8 @@ prepush_clean_workspace_members() {
 # Workspace artifacts copied from a shared target name another tree's sources,
 # so only dependency artifacts are reused. Clean every workspace member in a
 # seeded, unmarked or differently-owned target, and mark empty targets to avoid
-# a later clean. PREPUSH_CARGO_TARGET overrides the private target location; an
-# existing shared target only seeds it when the paths differ.
+# a later clean. PREPUSH_CARGO_TARGET overrides the private target location; a
+# new private target is seeded from CARGO_TARGET_DIR only when the paths differ.
 shared_target="${CARGO_TARGET_DIR:-}"
 private_target="${PREPUSH_CARGO_TARGET:-/Volumes/t7/vibes-dev/.cargo-target/marketplace-service/$(basename "$ROOT")}"
 origin=existing
@@ -136,8 +136,9 @@ if [ "$origin" = new ] && [ -n "$shared_target" ] && [ -d "$shared_target" ] && 
   seed="${private_target}.partial"
   rm -rf "$seed"
   mkdir -p "$(dirname "$private_target")"
-  if cp -cR "$shared_target" "$seed" 2>/dev/null || cp -R "$shared_target" "$seed"; then
+  if cp -cRH "$shared_target" "$seed" 2>/dev/null || cp -RH "$shared_target" "$seed"; then
     mv "$seed" "$private_target"
+    rm -f "$private_target/.prepush-members-clean"
     origin=seeded
   else
     rm -rf "$seed"

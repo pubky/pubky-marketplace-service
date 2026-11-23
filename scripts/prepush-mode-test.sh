@@ -2,7 +2,8 @@
 # Proves the fast and full modes of scripts/prepush.sh run the right steps,
 # and that scripts/prepush-packages.sh maps a change to its packages.
 # Runs the real scripts in a throwaway workspace. cargo and docker are
-# stand-ins on PATH that log their arguments; nothing is built or started.
+# stand-ins on PATH that log their arguments; metadata and clean go to the
+# real cargo, and nothing is built or started.
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -21,7 +22,8 @@ fail() {
 
 REAL_CARGO="$(command -v cargo)"
 mkdir -p "$WORK/bin"
-# metadata goes to the real cargo, so package widening reads a real graph.
+# metadata and clean go to the real cargo, so package widening reads a real
+# graph and member cleaning really removes copied workspace artifacts.
 cat > "$WORK/bin/cargo" <<'EOF'
 #!/usr/bin/env bash
 if [ "${1:-}" = metadata ]; then
@@ -34,6 +36,10 @@ if [ "${1:-}" = metadata ]; then
 fi
 printf '%s\n' "$*" >> "$FAKE_LOG/cargo"
 if [ "${1:-}" = clean ]; then
+  if [ "${FAKE_CLEAN_REQUIRE_NO_MARKER:-0}" = 1 ] && [ -e "${CARGO_TARGET_DIR:?}/.prepush-members-clean" ]; then
+    echo 'fake cargo: clean found a copied marker' >&2
+    exit 102
+  fi
   if [ "${FAKE_CLEAN_FAIL:-0}" = 1 ]; then
     echo 'fake cargo: clean failed' >&2
     exit 101
@@ -242,6 +248,17 @@ cargo_log | grep -Fqx "$expected_clean" || fail "seeded target: expected $expect
 [ "$(cat "$WORK/seeded-target/.prepush-members-clean")" = "$PWD" ] \
   || fail "seeded target: marker has the wrong root"
 
+echo "test: gate: seeding follows a shared-target symlink without marking its target"
+ln -s "$WORK/shared-target" "$WORK/shared-target-link"
+commit_change crates/service/src/lib.rs
+st="$(CARGO_TARGET_DIR="$WORK/shared-target-link" PREPUSH_CARGO_TARGET="$WORK/symlink-seeded-target" gate)"
+expect_ok "$st" "symlinked shared target" fast
+[ ! -L "$WORK/symlink-seeded-target" ] || fail "symlinked shared target: private target is a symlink"
+[ -f "$WORK/symlink-seeded-target/artifact" ] || fail "symlinked shared target: artifact was not copied"
+[ ! -e "$WORK/shared-target/.prepush-members-clean" ] \
+  || fail "symlinked shared target: clean marker landed in the shared directory"
+cargo_log | grep -Fqx "$expected_clean" || fail "symlinked shared target: expected $expected_clean: $(cargo_log)"
+
 echo "test: gate: an existing unmarked target survives a failed clean"
 mkdir -p "$WORK/uncleanable-target"
 printf 'keep\n' > "$WORK/uncleanable-target/sentinel"
@@ -255,12 +272,16 @@ grep -Fqx "prepush: cannot clean workspace members in $WORK/uncleanable-target; 
 grep -q '^fake cargo: clean failed$' "$WORK/out" \
   || fail "failed existing-target clean hid cargo stderr: $(cat "$WORK/out")"
 
-echo "test: gate: a marker copied from the shared target does not skip the seeded clean"
+echo "test: gate: a copied marker is removed before the seeded clean"
 mkdir -p "$WORK/marked-shared-target"
 printf '%s\n' "$PWD" > "$WORK/marked-shared-target/.prepush-members-clean"
 commit_change crates/service/src/lib.rs
-st="$(CARGO_TARGET_DIR="$WORK/marked-shared-target" PREPUSH_CARGO_TARGET="$WORK/copied-marker-target" gate)"
+st="$(CARGO_TARGET_DIR="$WORK/marked-shared-target" PREPUSH_CARGO_TARGET="$WORK/copied-marker-target" \
+  FAKE_CLEAN_REQUIRE_NO_MARKER=1 gate)"
 expect_ok "$st" "copied marker" fast
+if grep -q '^fake cargo: clean found a copied marker$' "$WORK/out"; then
+  fail "copied marker survived until the seeded clean"
+fi
 [ "$(cargo_log | grep -Fxc "$expected_clean" || true)" = 1 ] \
   || fail "copied marker skipped the seeded clean: $(cargo_log)"
 [ "$(cat "$WORK/copied-marker-target/.prepush-members-clean")" = "$PWD" ] \
@@ -367,6 +388,13 @@ st="$(gate)"
 expect_ok "$st" "docs fast" fast
 [ "$(cargo_log)" = 'fmt --check' ] || fail "docs fast: cargo calls: $(cargo_log)"
 [ ! -e "$WORK/log/docker" ] || fail "docs fast started Postgres: $(cat "$WORK/log/docker")"
+
+echo "test: gate: fmt-only exits before creating or cleaning a fresh target"
+commit_change docs/readme.md
+st="$(PREPUSH_CARGO_TARGET="$WORK/fmt-only-target" FAKE_CLEAN_FAIL=1 gate)"
+expect_ok "$st" "fmt-only fresh target" fast
+[ "$(cargo_log)" = 'fmt --check' ] || fail "fmt-only fresh target: cargo calls: $(cargo_log)"
+[ ! -e "$WORK/fmt-only-target" ] || fail "fmt-only fresh target: target path was created"
 
 echo "test: gate: fast runs the workspace for a Cargo.lock change"
 commit_change Cargo.lock
