@@ -261,15 +261,50 @@ follows. `HOMESERVER_RESOLUTION` decides where those reads go:
   does not host reads as missing (404), and its event stream as an unhosted
   user. This is the behaviour of every release before the setting existed.
 - **`pkarr`**. Each read goes to the homeserver the pubky's own Pkarr record
-  names, found with the `pubky` SDK on the public Pkarr network (mainline
-  DHT and the SDK's default relays) and reached over the SDK's transport.
-  `HOMESERVER_URL` is not read and must be unset: the service refuses to
-  boot with it set, so a deployment never believes it is pinned to a
-  homeserver it is not using. Finding the pubky's homeserver and the
-  homeserver's own address is bounded by 5 s; the request then keeps the
-  same timeouts as `fixed`.
+  names, found with the `pubky` SDK's Pkarr client on the public Pkarr
+  network (mainline DHT and the SDK's default relays). `HOMESERVER_URL` is
+  not read and must be unset: the service refuses to boot with it set, so a
+  deployment never believes it is pinned to a homeserver it is not using.
+  Switch to `pkarr` only in a rollout of its own, after every instance runs
+  an image with migration 0099 under `fixed`
+  ([migrations](docs/migrations.md#homeserver-scoped-deletion-cursors-0099)).
 
-Both modes give each read the same outcomes, body caps and timeouts. A
+Under `pkarr` anyone who publishes a Pkarr record chooses where the service
+connects, so the service reaches homeservers through a transport of its own
+rather than the SDK's:
+
+- **Public addresses only.** A connection is made only to a globally
+  routable unicast address. Loopback, private (RFC 1918), shared (CGNAT,
+  100.64/10), link-local, unique-local, multicast, unspecified, broadcast,
+  reserved, documentation and benchmarking addresses are refused, and so
+  are IPv6 forms that carry such an IPv4 address (IPv4-mapped, NAT64,
+  6to4). The check runs on the addresses the connection is made to, after
+  DNS resolution, so a name that resolves differently by the time of the
+  connect (DNS rebinding) cannot reach an internal address. A homeserver
+  with no allowed address is unavailable. A firewall that drops the
+  service's egress to private and link-local ranges is still worth having.
+- **HTTPS only, no redirects, no proxy.** A homeserver reached at its own
+  key is verified against that key (TLS with the raw public key its record
+  names); one reached at an ICANN domain is verified against the WebPKI
+  roots. A `3xx` answer is not followed: the read is unavailable.
+- **Newest record.** A pubky's homeserver is taken from its cached record
+  while that is fresh, otherwise from the most recent record the network
+  holds, never the first answer a DHT node gives, which could be an older
+  record naming a homeserver the pubky has left.
+- **Same timeouts as `fixed`.** Each read is bounded by one budget, from
+  the lookup of the pubky's homeserver to the end of the body: 10 s, or
+  120 s for a digital deliverable. A deletion proof first reads the
+  seller's record from the network, bounded by 10 s. `listing.sync` makes
+  its reads (the record, then, for a missing record, the deletion proof:
+  the network lookup, the record again and the event stream, at most 40 s)
+  before its database transaction, so no database connection waits on a
+  homeserver for it. Other commands still read inside their transaction,
+  as they do under `fixed` and within the same per-read budget: offers
+  (the listing record), `drop.sync`, Locks preparation (content locks),
+  digital deliverables (up to 120 s) and the return policy and seller terms
+  captured when an order is paid.
+
+Both modes give each read the same outcomes and body caps. A
 record is found, missing (the pubky's homeserver answered 404) or
 unavailable. Under `pkarr` a pubky with no Pkarr record, a malformed pubky,
 a failed or timed-out lookup and a homeserver that does not answer are all
@@ -283,10 +318,16 @@ own logs carry full keys, so the service's log filter keeps them
 
 Resolved records are cached in memory per process: at most 10,000 records
 (users' and their homeservers'), each used for 5 minutes whatever TTL its
-publisher set, then resolved again. A pubky that moves to another
+publisher set, then resolved again. Whether a homeserver serves
+path-addressed storage (`/storage/{pubky}/pub/…`, read from its `/info`)
+is cached for 60 s for at most 256 homeservers; one that does not is read
+in the legacy form with a `pubky-host` header. No other per-homeserver
+state is kept, so publishing many homeservers does not grow memory. A
+pubky that moves to another
 homeserver is read from the new one within 5 minutes of republishing its
 record; until then reads still go to the old homeserver. A deletion proof
-does not wait: it reads the seller's record from the network first. Event
+does not wait: it reads the seller's record from the network first, and
+takes the record's 404 and the `DEL` event from the same homeserver. Event
 cursors count on one homeserver, so the deletion follower keeps each
 seller's cursor with the homeserver it was read from and, once the seller is
 read from another one, follows the new homeserver's stream from its start
