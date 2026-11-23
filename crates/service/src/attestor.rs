@@ -22,8 +22,8 @@
 //! both-sides consent (ratified D2): the seller's standing preference AND
 //! the buyer's per-review opt-in. `price_decade`, the log decade of the
 //! bound listing's unit price paid, is always emitted (reviews decision
-//! RV1): it discloses only the order of magnitude the public listing price
-//! already shows.
+//! RV1): the order of magnitude of the listed price, or for an accepted
+//! offer of the agreed price, which the listing does not show.
 //!
 //! Key custody (ratified D6): the secret lives in the `ATTESTOR_SECRET_KEY`
 //! environment variable (KMS/env-held, same process as the service), to be
