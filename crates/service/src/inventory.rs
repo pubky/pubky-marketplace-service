@@ -565,19 +565,22 @@ async fn consume_rate(
 ) -> Result<bool, sqlx::Error> {
     let capacity = f64::from(config.authenticated_per_minute * config.burst_multiplier);
     let refill_per_second = f64::from(config.authenticated_per_minute) / 60.0;
+    // One bucket per seller and class, shared by all of the seller's
+    // sessions. The row lock is held until the caller's transaction ends, so
+    // a seller's concurrent requests serialize here before any listing lock.
     let remaining: Option<f64> = sqlx::query_scalar(
-        "INSERT INTO inventory_rate_limits \
-             (session_hash, endpoint_class, tokens, updated_at) \
+        "INSERT INTO inventory_actor_rate_limits \
+             (actor_pubky, endpoint_class, tokens, updated_at) \
          VALUES ($1, $2, $3 - 1, $4) \
-         ON CONFLICT (session_hash, endpoint_class) DO UPDATE SET \
-             tokens = LEAST($3, inventory_rate_limits.tokens + \
-                 GREATEST(EXTRACT(EPOCH FROM ($4 - inventory_rate_limits.updated_at)), 0) * $5) - 1, \
+         ON CONFLICT (actor_pubky, endpoint_class) DO UPDATE SET \
+             tokens = LEAST($3, inventory_actor_rate_limits.tokens + \
+                 GREATEST(EXTRACT(EPOCH FROM ($4 - inventory_actor_rate_limits.updated_at)), 0) * $5) - 1, \
              updated_at = $4 \
-         WHERE LEAST($3, inventory_rate_limits.tokens + \
-                 GREATEST(EXTRACT(EPOCH FROM ($4 - inventory_rate_limits.updated_at)), 0) * $5) >= 1 \
+         WHERE LEAST($3, inventory_actor_rate_limits.tokens + \
+                 GREATEST(EXTRACT(EPOCH FROM ($4 - inventory_actor_rate_limits.updated_at)), 0) * $5) >= 1 \
          RETURNING tokens",
     )
-    .bind(&session.token_hash)
+    .bind(&session.actor.0)
     .bind(endpoint_class)
     .bind(capacity)
     .bind(now)
@@ -1525,12 +1528,16 @@ pub async fn get_inventory_projection(
         Ok(false) => return finish_without_mutation(tx, rate_limited("inventory.read")).await,
         Err(_) => return internal_error(),
     }
+    // Per-variant SKUs, disabled variants and per-variant counts are served
+    // only to the listing's seller; another seller's listing answers like a
+    // missing one. Listing-level stock stays public through the catalog.
     let row: Option<ProjectedListing> = match sqlx::query_as(
         "SELECT seller_pubky, listing_id, server_revision, total_quantity, \
                 available_quantity, reserved_quantity, sold_quantity, made_to_order \
-         FROM listings WHERE aggregate_id = $1 AND deleted_at IS NULL",
+         FROM listings WHERE aggregate_id = $1 AND seller_pubky = $2 AND deleted_at IS NULL",
     )
     .bind(&aggregate_id)
+    .bind(&session.actor.0)
     .fetch_optional(&mut *tx)
     .await
     {

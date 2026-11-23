@@ -238,6 +238,26 @@ fn auth_error(status: StatusCode, message: &str) -> Response {
     (status, Json(json!({ "error": { "message": message } }))).into_response()
 }
 
+fn rate_limited(retry_after: i64) -> Response {
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(json!({
+            "ok": false,
+            "error": {
+                "code": "rate_limited",
+                "message": "The request rate limit was exceeded."
+            }
+        })),
+    )
+        .into_response();
+    response.headers_mut().insert(
+        axum::http::header::RETRY_AFTER,
+        axum::http::HeaderValue::from_str(&retry_after.to_string())
+            .expect("retry-after is a safe integer"),
+    );
+    response
+}
+
 pub async fn create_session(State(state): State<AppState>, body: Bytes) -> Response {
     let now = state.clock.now();
     let verified = match verify_auth_token(&body, now, state.config.auth_token_window_seconds) {
@@ -247,6 +267,26 @@ pub async fn create_session(State(state): State<AppState>, body: Bytes) -> Respo
             return auth_error(StatusCode::UNAUTHORIZED, "The auth token is invalid.");
         }
     };
+
+    // Spent only after the token verifies, so an unauthenticated caller
+    // cannot drain a pubky's bucket, and in its own short transaction before
+    // this handler opens one, so a request never holds two pool connections.
+    // A replayed token spends a token and is then refused below. Grant-session
+    // mints and grant-flow settlement do not spend this class: each already
+    // has its own per-pubky limit.
+    match crate::automation::consume_automation_rate(&state, &verified.pubky, "session.create")
+        .await
+    {
+        Ok(Some(retry_after)) => return rate_limited(retry_after),
+        Ok(None) => {}
+        Err(error) => {
+            tracing::error!(error = %error, "session creation rate limit failed");
+            return auth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Session could not be created.",
+            );
+        }
+    }
 
     let mut tx = match state.pool.begin().await {
         Ok(tx) => tx,
@@ -464,25 +504,7 @@ pub async fn list_sessions(State(state): State<AppState>, headers: HeaderMap) ->
     match crate::automation::consume_automation_rate(&state, &session.actor.0, "session.admin")
         .await
     {
-        Ok(Some(retry_after)) => {
-            let mut response = (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(json!({
-                    "ok": false,
-                    "error": {
-                        "code": "rate_limited",
-                        "message": "The request rate limit was exceeded."
-                    }
-                })),
-            )
-                .into_response();
-            response.headers_mut().insert(
-                axum::http::header::RETRY_AFTER,
-                axum::http::HeaderValue::from_str(&retry_after.to_string())
-                    .expect("retry-after is a safe integer"),
-            );
-            return response;
-        }
+        Ok(Some(retry_after)) => return rate_limited(retry_after),
         Ok(None) => {}
         Err(error) => {
             tracing::error!(error = %error, "session administration rate limit failed");
