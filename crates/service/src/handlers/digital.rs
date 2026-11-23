@@ -4,8 +4,9 @@
 //! deliverable. Each set issues the next version through the per-listing
 //! counter row, which survives `clear`, so a version never repeats: the
 //! version is part of the homeserver path and of the associated data. A file
-//! set reads the seller's homeserver ciphertext once to check its length and
-//! BLAKE3; the bytes are hashed as they stream and dropped.
+//! set reads the seller's homeserver ciphertext once, before the command's
+//! transaction, to check its length and BLAKE3; the bytes are hashed as they
+//! stream and dropped.
 //!
 //! Results, events and logs carry the deliverable id and version only. The
 //! file key, link and text exist in plaintext only in the command payload and
@@ -17,18 +18,18 @@ use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use chrono::{DateTime, Utc};
 use marketplace_domain::commands::{
-    ClearDigitalDeliveryPayload, DigitalDelivery, DigitalDeliveryKind, SetDigitalDeliveryPayload,
-    AES_GCM_TAG_BYTES,
+    ClearDigitalDeliveryPayload, CommandPayload, DigitalDelivery, DigitalDeliveryKind, DigitalFile,
+    SetDigitalDeliveryPayload, AES_GCM_TAG_BYTES,
 };
 use marketplace_domain::{Command, ErrorCode};
 use serde_json::{json, Value};
-use sqlx::{FromRow, Postgres, Transaction};
+use sqlx::{FromRow, PgPool, Postgres, Transaction};
 
 use crate::auth::Actor;
 use crate::clock::format_timestamp;
 use crate::digital::{version_aad, DigitalKeys};
 use crate::executor::insert_event;
-use crate::handlers::{fetch_listing, fetch_listing_for_update};
+use crate::handlers::{fetch_listing, fetch_listing_for_update, LISTING_COLUMNS};
 use crate::homeserver::{DeliverableFetchOutcome, HomeserverListingClient};
 use crate::model::{ListingRow, OrderRow};
 use crate::refusal_audit::RefusalKind;
@@ -308,18 +309,64 @@ fn sealed_payload(delivery: &DigitalDelivery) -> Value {
     }
 }
 
+/// What a `digital_delivery.set` read of its file before the transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilePrefetch {
+    /// No read: not a file set, or one the handler refuses before reading.
+    NotNeeded,
+    /// The file matched its declared length and BLAKE3.
+    Verified,
+    /// The homeserver has no such file, or another one.
+    Mismatched,
+    /// No homeserver, or it could not be read.
+    Unavailable,
+}
+
+/// The file a `digital_delivery.set` must read back before its transaction,
+/// or `None` for every other command and for a set the handler refuses
+/// before reading: no digital keys, or not the seller's digital listing, or
+/// a file over `max_bytes`. These are the checks [`set`] makes before it
+/// reads, so nobody but the seller can make the service read a homeserver
+/// path; it makes them again in its transaction.
+pub async fn file_request<'c>(
+    pool: &PgPool,
+    actor: &str,
+    command: &'c Command,
+    has_keys: bool,
+    max_bytes: i64,
+) -> Result<Option<&'c DigitalFile>, sqlx::Error> {
+    let CommandPayload::SetDigitalDelivery(payload) = &command.payload else {
+        return Ok(None);
+    };
+    let DigitalDelivery::File(file) = &payload.delivery else {
+        return Ok(None);
+    };
+    if !has_keys || file.size_bytes > max_bytes {
+        return Ok(None);
+    }
+    let listing: Option<ListingRow> = sqlx::query_as(&format!(
+        "SELECT {LISTING_COLUMNS} FROM listings WHERE aggregate_id = $1"
+    ))
+    .bind(&command.aggregate_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(listing
+        .filter(|listing| listing.seller_pubky == actor && publishes_digital(listing))
+        .map(|_| file))
+}
+
 /// Reads the file back from the seller's homeserver and checks it against
-/// the declared length and BLAKE3.
-async fn verify_file(
+/// the declared length and BLAKE3. The read is not repeated in the
+/// transaction: the file's version is the one after `expected_version`, and
+/// the handler's version compare-and-swap refuses the set if another set
+/// took that version since.
+pub async fn prefetch_file(
     homeserver: Option<&dyn HomeserverListingClient>,
     seller_pubky: &str,
-    file: &marketplace_domain::commands::DigitalFile,
-) -> Option<CommandFailure> {
+    file: &DigitalFile,
+) -> FilePrefetch {
     let Some(homeserver) = homeserver else {
-        return Some(unverifiable(
-            ErrorCode::UpstreamUnavailable,
-            RefusalKind::UpstreamUnavailable,
-        ));
+        return FilePrefetch::Unavailable;
     };
     let expected_len = (file.size_bytes + AES_GCM_TAG_BYTES) as u64;
     match homeserver
@@ -334,15 +381,26 @@ async fn verify_file(
         DeliverableFetchOutcome::Found { blake3, len }
             if len == expected_len && blake3 == file.ciphertext_blake3 =>
         {
-            None
+            FilePrefetch::Verified
         }
         DeliverableFetchOutcome::Found { .. }
         | DeliverableFetchOutcome::NotFound
-        | DeliverableFetchOutcome::TooLarge => Some(unverifiable(
+        | DeliverableFetchOutcome::TooLarge => FilePrefetch::Mismatched,
+        DeliverableFetchOutcome::Unavailable => FilePrefetch::Unavailable,
+    }
+}
+
+/// The refusal for a file whose read did not verify it. A set the executor
+/// did not read for passed the handler's checks only after that decision (a
+/// concurrent write), and is refused as retryable.
+fn verify_file(prefetched: FilePrefetch) -> Option<CommandFailure> {
+    match prefetched {
+        FilePrefetch::Verified => None,
+        FilePrefetch::Mismatched => Some(unverifiable(
             ErrorCode::InvalidState,
             RefusalKind::InvalidState,
         )),
-        DeliverableFetchOutcome::Unavailable => Some(unverifiable(
+        FilePrefetch::Unavailable | FilePrefetch::NotNeeded => Some(unverifiable(
             ErrorCode::UpstreamUnavailable,
             RefusalKind::UpstreamUnavailable,
         )),
@@ -357,7 +415,7 @@ pub async fn set(
     command: &Command,
     payload: &SetDigitalDeliveryPayload,
     keys: Option<&DigitalKeys>,
-    homeserver: Option<&dyn HomeserverListingClient>,
+    prefetched: FilePrefetch,
     max_bytes: i64,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
@@ -384,9 +442,10 @@ pub async fn set(
                 REASON_TOO_LARGE,
             )));
         }
-        // The read happens before any row lock, so a slow homeserver never
-        // holds up checkouts of this listing.
-        if let Some(failure) = verify_file(homeserver, &listing.seller_pubky, file).await {
+        // The executor read the file before the transaction
+        // ([`prefetch_file`]), so a slow homeserver holds neither a database
+        // connection nor this listing's row lock.
+        if let Some(failure) = verify_file(prefetched) {
             return Ok(Err(failure));
         }
     }

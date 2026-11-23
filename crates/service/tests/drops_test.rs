@@ -12,17 +12,28 @@
 
 mod common;
 
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
 use axum::http::StatusCode;
 use marketplace_service::clock::Clock;
+use marketplace_service::homeserver::{
+    HomeserverFetchOutcome, HomeserverListingClient, TRANSACTION_READS_BUSY,
+};
 use marketplace_service::workers::run_once;
 use serde_json::{json, Value};
 use sqlx::PgPool;
+use tokio::sync::{watch, Semaphore};
 use uuid::Uuid;
 
 use common::{
     cancel_drop_command, count, drop_aggregate, drop_record_json, execute, indexed_command_id,
     listing_aggregate, new_actor, register_command, register_listing_command, release_drop_command,
-    reserve_command, sync_drop_command, test_app_with_homeserver, ts_after, TestApp,
+    reserve_command, sync_drop_command, test_app_with_homeserver, test_app_with_homeserver_client,
+    ts_after, CommandMirrorHomeserver, TestApp,
 };
 
 const DROP_ID: &str = "winter_drop";
@@ -1893,4 +1904,157 @@ async fn a_claim_whose_payment_started_survives_the_claim_window_and_confirms(po
             .await
             .expect("listing row exists");
     assert_eq!((available, reserved, sold), (4, 0, 1));
+}
+
+// === Reads inside a transaction are bounded ===
+
+/// A homeserver that bounds the reads commands make inside a transaction
+/// with `permits`, as a `pkarr` client does, and whose drop reads wait for
+/// `release`, then serve `record` (`None`: no such drop).
+struct StallingDropHomeserver {
+    record: std::sync::Mutex<Option<Value>>,
+    permits: Arc<Semaphore>,
+    release: watch::Sender<bool>,
+    drop_reads: AtomicUsize,
+}
+
+impl HomeserverListingClient for StallingDropHomeserver {
+    fn fetch_listing<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        listing_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
+        CommandMirrorHomeserver.fetch_listing(seller_pubky, listing_id)
+    }
+
+    fn fetch_drop<'a>(
+        &'a self,
+        _seller_pubky: &'a str,
+        _drop_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
+        Box::pin(async move {
+            self.drop_reads.fetch_add(1, Ordering::SeqCst);
+            let mut release = self.release.subscribe();
+            release
+                .wait_for(|released| *released)
+                .await
+                .expect("release");
+            match self.record.lock().expect("lock").clone() {
+                Some(record) => HomeserverFetchOutcome::Found(record),
+                None => HomeserverFetchOutcome::NotFound,
+            }
+        })
+    }
+
+    fn transaction_reads(&self) -> Option<Arc<Semaphore>> {
+        Some(self.permits.clone())
+    }
+}
+
+async fn open_transactions(pool: &PgPool) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_stat_activity \
+         WHERE datname = current_database() AND backend_type = 'client backend' \
+         AND pid <> pg_backend_pid() AND xact_start IS NOT NULL",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("activity")
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn homeserver_reads_in_transactions_are_refused_once_the_permits_are_taken(pool: PgPool) {
+    let homeserver = Arc::new(StallingDropHomeserver {
+        record: std::sync::Mutex::new(None),
+        permits: Arc::new(Semaphore::new(2)),
+        release: watch::channel(false).0,
+        drop_reads: AtomicUsize::new(0),
+    });
+    let app = Arc::new(test_app_with_homeserver_client(pool.clone(), homeserver.clone()).await);
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (status, body) = execute(&app, &seller.token, &register_command(&seller.pubky, 5)).await;
+    assert_eq!(status, StatusCode::OK, "register: {body}");
+    let sync = |n: u64| sync_drop_command(&seller.pubky, DROP_ID, n);
+
+    // Two syncs take both permits and wait on the homeserver inside their
+    // transactions.
+    let stalled: Vec<_> = (1..=2)
+        .map(|n| {
+            let (app, token, command) = (app.clone(), buyer.token.clone(), sync(n));
+            tokio::spawn(async move { execute(&app, &token, &command).await })
+        })
+        .collect();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while homeserver.drop_reads.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("both syncs read the homeserver");
+    assert_eq!(open_transactions(&pool).await, 2);
+
+    // A third is refused at once, as retryable, with no read and no
+    // transaction, rather than waiting for a connection.
+    let (status, body) = tokio::time::timeout(
+        Duration::from_secs(5),
+        execute(&app, &buyer.token, &sync(3)),
+    )
+    .await
+    .expect("refused without waiting");
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(
+        body["error"]["code"],
+        json!("UPSTREAM_UNAVAILABLE"),
+        "{body}"
+    );
+    assert_eq!(body["error"]["message"], json!(TRANSACTION_READS_BUSY));
+    assert_eq!(homeserver.drop_reads.load(Ordering::SeqCst), 2);
+
+    // Commands that read no homeserver in their transaction still run.
+    let (status, body) = execute(
+        &app,
+        &seller.token,
+        &register_listing_command(&seller.pubky, "boots_02", 5, 1),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "register while saturated: {body}");
+
+    // Released, the stalled syncs finish (the drop has no record yet).
+    homeserver.release.send_replace(true);
+    for task in stalled {
+        let (status, body) = task.await.expect("sync task");
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    }
+    assert_eq!(open_transactions(&pool).await, 0);
+
+    *homeserver.record.lock().expect("lock") = Some(drop_record_json(
+        &seller.pubky,
+        DROP_ID,
+        1,
+        &["boots_01"],
+        &ts_after(600),
+        Some(&ts_after(4_200)),
+        10,
+        2,
+    ));
+    let (status, synced) = execute(&app, &buyer.token, &sync(4)).await;
+    assert_eq!(status, StatusCode::OK, "sync with a free permit: {synced}");
+
+    // With every permit taken, a replay is answered from its stored result
+    // and a new sync is refused.
+    let held = homeserver
+        .permits
+        .clone()
+        .try_acquire_many_owned(2)
+        .expect("the permits were returned");
+    let (status, replay) = execute(&app, &buyer.token, &sync(4)).await;
+    assert_eq!(status, StatusCode::OK, "{replay}");
+    assert_eq!(replay, synced);
+    let (status, body) = execute(&app, &buyer.token, &sync(5)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    drop(held);
+    let (status, body) = execute(&app, &buyer.token, &sync(5)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(homeserver.drop_reads.load(Ordering::SeqCst), 4);
 }

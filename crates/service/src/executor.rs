@@ -15,6 +15,7 @@ use sqlx::{Postgres, Transaction};
 use std::time::Instant;
 use uuid::Uuid;
 
+use crate::homeserver::HomeserverListingClient;
 use crate::logging::{log_command, log_invalid_command};
 use crate::model::redact_command_result;
 use crate::refusal_audit::{CommandKind, RefusalKind, SurfaceKind};
@@ -278,10 +279,11 @@ pub async fn execute_with_edge(
         shipping = crate::shipping::ShippingPlan::read(state, &command).await?;
     }
 
-    // A `listing.register` that needs the seller's public record, and every
+    // A `listing.register` that needs the seller's public record, every
     // `listing.sync` (the record and, when it is missing, the deletion
-    // proof), read the seller's homeserver here, before the transaction and
-    // the command's advisory lock, so a slow homeserver never holds a domain
+    // proof) and a `digital_delivery.set` of a file (the file, read back)
+    // read the seller's homeserver here, before the transaction and the
+    // command's advisory lock, so a slow homeserver never holds a domain
     // connection or blocks a duplicate. The command enters its flight first,
     // so a concurrent duplicate waits for this submission instead of reading
     // the homeserver too, and a replay or a conflicting reuse of the command
@@ -293,9 +295,19 @@ pub async fn execute_with_edge(
             .await?;
     let sync_request =
         crate::handlers::sync_listing::record_request(&command, state.homeserver.is_some());
+    let file_request = crate::handlers::digital::file_request(
+        &state.pool,
+        actor,
+        &command,
+        state.digital.is_some(),
+        state.config.digital_delivery_max_bytes,
+    )
+    .await?;
     let mut prefetched = crate::handlers::register_listing::RegisterRecordPrefetch::NotNeeded;
     let mut synced = crate::handlers::sync_listing::SyncPrefetch::NotNeeded;
-    let _flight = if register_request.is_some() || sync_request.is_some() {
+    let mut file = crate::handlers::digital::FilePrefetch::NotNeeded;
+    let _flight = if register_request.is_some() || sync_request.is_some() || file_request.is_some()
+    {
         let flight = state.command_flights.enter(actor, command.command_id).await;
         if let Some((stored_hash, stored_result)) =
             stored_command_result(&state.pool, actor, command.command_id).await?
@@ -322,9 +334,72 @@ pub async fn execute_with_edge(
                 crate::handlers::sync_listing::prefetch(&state.pool, homeserver, &command, payload)
                     .await?;
         }
+        if let Some(request) = file_request {
+            file = crate::handlers::digital::prefetch_file(
+                state.homeserver.as_deref(),
+                actor,
+                request,
+            )
+            .await;
+        }
         Some(flight)
     } else {
         None
+    };
+
+    // The commands whose handlers still read the seller's homeserver inside
+    // the transaction get the client only with a permit for that read, when
+    // the client bounds them (`pkarr`: [`crate::homeserver::TRANSACTION_READS`]),
+    // held until the transaction ends. With none free the command is refused
+    // as retryable rather than queued; a replay is answered from its stored
+    // result.
+    let (homeserver, _transaction_read) = if reads_homeserver_in_transaction(&command.payload) {
+        match crate::homeserver::try_transaction_read(state.homeserver.as_deref()) {
+            Ok(permit) => (state.homeserver.as_deref(), permit),
+            Err(crate::homeserver::TransactionReadsBusy) => {
+                if let Some((stored_hash, stored_result)) =
+                    stored_command_result(&state.pool, actor, command.command_id).await?
+                {
+                    return Ok(stored_result_response(
+                        state,
+                        actor,
+                        &command,
+                        &request_hash,
+                        &stored_hash,
+                        stored_result,
+                        started,
+                    ));
+                }
+                let failure = CommandFailure::refused(
+                    RefusalKind::UpstreamUnavailable,
+                    ErrorCode::UpstreamUnavailable,
+                    crate::homeserver::TRANSACTION_READS_BUSY,
+                );
+                log_command(
+                    actor,
+                    command.kind(),
+                    &command.command_id.to_string(),
+                    &command.aggregate_id,
+                    "refused",
+                    Some(failure.code()),
+                    Some(failure.message()),
+                    command.expected_revision,
+                    started.elapsed().as_millis() as u64,
+                );
+                enqueue_refusal(
+                    state,
+                    actor,
+                    state.clock.now(),
+                    SurfaceKind::V1Command,
+                    command_kind(&command.payload),
+                    failure.refusal_kind(),
+                    Some(command.command_id),
+                );
+                return Ok(failure_response(&failure));
+            }
+        }
+    } else {
+        (None, None)
     };
 
     let mut tx = state.pool.begin().await?;
@@ -357,8 +432,10 @@ pub async fn execute_with_edge(
         &mut tx,
         actor,
         &command,
+        homeserver,
         &prefetched,
         &synced,
+        file,
         &fence,
         &shipping,
         now,
@@ -701,14 +778,31 @@ fn command_kind(payload: &CommandPayload) -> CommandKind {
     }
 }
 
+/// The commands whose handlers read the seller's homeserver inside their
+/// transaction: an offer's listing terms, a drop's record, a Locks content
+/// lock, and the seller's terms an order captures on payment.
+fn reads_homeserver_in_transaction(payload: &CommandPayload) -> bool {
+    matches!(
+        payload,
+        CommandPayload::SyncDrop(_)
+            | CommandPayload::CreateOffer(_)
+            | CommandPayload::CounterOffer(_)
+            | CommandPayload::AcceptOffer(_)
+            | CommandPayload::AdvanceSandboxPayment(_)
+            | CommandPayload::PrepareLocks(_)
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn dispatch(
     state: &AppState,
     tx: &mut Transaction<'_, Postgres>,
     actor: &str,
     command: &Command,
+    homeserver: Option<&dyn HomeserverListingClient>,
     prefetched: &crate::handlers::register_listing::RegisterRecordPrefetch,
     synced: &crate::handlers::sync_listing::SyncPrefetch,
+    file: crate::handlers::digital::FilePrefetch,
     fence: &crate::region_fence::FencePlan,
     shipping: &crate::shipping::ShippingPlan,
     now: DateTime<Utc>,
@@ -731,15 +825,7 @@ async fn dispatch(
             .await
         }
         CommandPayload::SyncDrop(payload) => {
-            crate::handlers::drops::sync(
-                tx,
-                actor,
-                command,
-                payload,
-                state.homeserver.as_deref(),
-                now,
-            )
-            .await
+            crate::handlers::drops::sync(tx, actor, command, payload, homeserver, now).await
         }
         CommandPayload::CancelDrop(payload) => {
             crate::handlers::drops::cancel(tx, actor, command, payload, now).await
@@ -769,39 +855,15 @@ async fn dispatch(
             .await
         }
         CommandPayload::CreateOffer(payload) => {
-            crate::handlers::offers::create(
-                tx,
-                actor,
-                command,
-                payload,
-                state.homeserver.as_deref(),
-                shipping,
-                now,
-            )
-            .await
+            crate::handlers::offers::create(tx, actor, command, payload, homeserver, shipping, now)
+                .await
         }
         CommandPayload::CounterOffer(payload) => {
-            crate::handlers::offers::counter(
-                tx,
-                actor,
-                command,
-                payload,
-                state.homeserver.as_deref(),
-                now,
-            )
-            .await
+            crate::handlers::offers::counter(tx, actor, command, payload, homeserver, now).await
         }
         CommandPayload::AcceptOffer(payload) => {
-            crate::handlers::offers::accept(
-                tx,
-                actor,
-                command,
-                payload,
-                state.homeserver.as_deref(),
-                shipping,
-                now,
-            )
-            .await
+            crate::handlers::offers::accept(tx, actor, command, payload, homeserver, shipping, now)
+                .await
         }
         CommandPayload::OfferCheckout(payload) => {
             let hold_window_seconds = state
@@ -850,7 +912,7 @@ async fn dispatch(
                 command,
                 payload,
                 state.config.sandbox_payment_window_seconds,
-                state.homeserver.as_deref(),
+                homeserver,
                 state.confirm_keys(),
                 now,
             )
@@ -874,7 +936,7 @@ async fn dispatch(
                 command,
                 payload,
                 state.locks.as_deref(),
-                state.homeserver.as_deref(),
+                homeserver,
                 state.config.locks_payment_window_seconds,
                 state.config.region_policy().fence_modes(),
                 now,
@@ -927,7 +989,7 @@ async fn dispatch(
                 command,
                 payload,
                 state.digital.as_deref(),
-                state.homeserver.as_deref(),
+                file,
                 state.config.digital_delivery_max_bytes,
                 now,
             )
