@@ -22,7 +22,10 @@ use marketplace_service::listing_moderation::{HttpListingModerationClient, Listi
 use marketplace_service::refusal_audit::{
     AuditKeys, CommandKind, RefusalAuditRuntime, RefusalKind, SurfaceKind,
 };
-use marketplace_service::store_seller::{route_scope, RouteScope, StoreMode, ROUTES};
+use marketplace_service::store_seller::{
+    other_seller_rows, refuse_other_sellers, route_scope, OtherSellerRows, RouteScope, StoreMode,
+    ROUTES,
+};
 use marketplace_service::AppState;
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -806,6 +809,92 @@ async fn health_reports_the_mode_resolution_moderation_and_fx_source(pool: PgPoo
         config.fx_feed_url = "http://127.0.0.1:9/fx".to_string();
     });
     assert_eq!(health(&unpinned).await["fx_source"]["pinned"], json!(false));
+}
+
+async fn server_revision(pool: &PgPool, seller: &str) -> i64 {
+    sqlx::query_scalar("SELECT server_revision FROM listings WHERE aggregate_id = $1")
+        .bind(listing_aggregate(seller))
+        .fetch_one(pool)
+        .await
+        .expect("listing revision")
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn single_seller_mode_refuses_to_start_on_another_sellers_rows(pool: PgPool) {
+    let app = test_app(pool.clone()).await;
+    let store = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let single = StoreMode::SingleSeller(store.pubky.clone());
+
+    // The store seller's own listing, hold and order: it starts.
+    let (status, body) = execute(&app, &store.token, &register_command(&store.pubky, 3)).await;
+    assert_eq!(status, StatusCode::OK, "register: {body}");
+    let (status, body) = execute(&app, &buyer.token, &checkout_command(&store.pubky)).await;
+    assert_eq!(status, StatusCode::OK, "checkout: {body}");
+    let revision = server_revision(&pool, &store.pubky).await;
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &reserve_command(&store.pubky, 1, 1, revision),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "reserve: {body}");
+    refuse_other_sellers(&pool, &single)
+        .await
+        .expect("only the store seller's rows");
+
+    // Another seller's listing, hold and order: it refuses, naming them.
+    let bob = new_actor(&app).await;
+    let other_buyer = new_actor(&app).await;
+    let (status, body) = execute(&app, &bob.token, &register_command(&bob.pubky, 3)).await;
+    assert_eq!(status, StatusCode::OK, "register: {body}");
+    let error = refuse_other_sellers(&pool, &single)
+        .await
+        .expect_err("another seller's listing");
+    assert!(
+        error
+            .to_string()
+            .contains("holds 1 listings, 0 orders and 0 holds of other sellers"),
+        "{error}"
+    );
+    let (status, body) = execute(&app, &other_buyer.token, &checkout_command(&bob.pubky)).await;
+    assert_eq!(status, StatusCode::OK, "checkout: {body}");
+    let revision = server_revision(&pool, &bob.pubky).await;
+    let (status, body) = execute(
+        &app,
+        &other_buyer.token,
+        &reserve_command(&bob.pubky, 2, 1, revision),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "reserve: {body}");
+    assert_eq!(
+        other_seller_rows(&pool, &store.pubky).await.expect("rows"),
+        OtherSellerRows {
+            listings: 1,
+            orders: 1,
+            holds: 1,
+            sellers: vec![format!("{}…", &bob.pubky[..8])],
+        }
+    );
+    let error = refuse_other_sellers(&pool, &single)
+        .await
+        .expect_err("another seller's listing, hold and order")
+        .to_string();
+    assert_eq!(
+        error,
+        format!(
+            "STORE_SELLER_PUBKY is set, but the database holds 1 listings, 1 orders and 1 holds \
+             of other sellers ({}…); single-seller mode needs a database that only its store \
+             seller has used; refusing to start",
+            &bob.pubky[..8]
+        )
+    );
+    assert!(!error.contains(&bob.pubky), "{error}");
+
+    // Marketplace mode serves every seller and checks nothing.
+    refuse_other_sellers(&pool, &StoreMode::Marketplace)
+        .await
+        .expect("marketplace mode");
 }
 
 const STORE_SECRET: &str = "0505050505050505050505050505050505050505050505050505050505050505";
