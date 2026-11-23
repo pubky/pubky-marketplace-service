@@ -427,9 +427,23 @@ the `v1_command` surface under its own command kind, a route on the
 still issued to any identity, so buyers sign in as before. Public reads
 (`/v0` projections, `/health`) are not filtered; they only show what the
 guarded writes let in. The mode is meant for a database that has only ever
-served the store seller, and the service refuses to start in it, after
-migrations, while the database holds a listing, an order or a stock hold of
-another seller. The message counts them and names up to three of those
+served the store seller. After migrations, the service refuses to start in
+it while the database holds any of these for another seller, in any state
+(soft-deleted, disconnected or disabled rows included):
+
+- a listing (`listings`), an order (`orders`) or a stock hold on their
+  listing (`reservations`);
+- a store connection (`connector_connections`), pending ones included;
+- a payment configuration (`seller_payment_configs`) or accepted payment
+  option (`seller_accepted_payment_options`);
+- an automation webhook endpoint (`webhook_endpoints`);
+- seller settings, the band consent of a `seller_settings:` aggregate
+  (`attestation_band_consents`).
+
+Drops, offers, bids and pickup or digital details hang off a listing, so
+the listing count covers them. Sessions, `/priv` data-key envelopes and
+notifications belong to identities, which may be buyers, and are not
+counted. The message counts each kind and names up to three of those
 sellers by the first eight characters of their pubky. Nothing is removed:
 start the store on its own database, or unset `STORE_SELLER_PUBKY`.
 
