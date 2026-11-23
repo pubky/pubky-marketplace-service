@@ -2257,6 +2257,102 @@ async fn a_completion_for_an_order_cancelled_without_expiring_its_payment_is_ref
     );
 }
 
+/// The order is cancelled by the buyer (`buyer_cancel`) or by the payment
+/// window, and the seller records an external refund on it before the task
+/// completes. The completion can neither complete the order nor ask for the
+/// refund again: it waits in manual review, once, and the row stops polling.
+async fn a_completion_after_a_recorded_refund(pool: PgPool, buyer_cancel: bool) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let holder = Uuid::new_v4();
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
+    register_locks(&app, &buyer.token, &order, &seller.pubky).await;
+    if buyer_cancel {
+        cancel_as_buyer(&app, &buyer, &order, 50).await;
+    } else {
+        // A task the Lock Server does not know (`not_found`) is not live, so
+        // the window sweeps the order; a live task would keep its unit held.
+        fake.set_outcome(TEST_BUNDLE_ID, LocksLookupOutcome::NotFound);
+        run_once(&app.state, holder, app.clock.now())
+            .await
+            .expect("worker pass runs");
+        app.clock.advance_seconds(3_601);
+        let summary = run_once(&app.state, holder, app.clock.now())
+            .await
+            .expect("worker pass runs");
+        assert_eq!(summary.payment_windows_expired, 1);
+    }
+    assert_eq!(order_state(&app.pool, &order.order_id).await, "cancelled");
+    assert_eq!(
+        payment_state(&app.pool, &order.payment_id).await.0,
+        "expired"
+    );
+
+    let refund = common::order_command(
+        "refund.record_external",
+        &order.order_id,
+        2,
+        json!({ "amount_minor": 1, "transaction_id": "manual-refund-1" }),
+        60,
+    );
+    let (status, body) = execute(&app, &seller.token, &refund).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        order_state(&app.pool, &order.order_id).await,
+        "refunded_external"
+    );
+
+    fake.complete_matching(&app.pool, TEST_BUNDLE_ID, &order.payment_id)
+        .await;
+    let summary = next_poll(&app, holder).await;
+    assert_eq!(summary.locks_completions_applied, 1);
+    assert_eq!(
+        review_facts(&app.pool, &order.payment_id).await,
+        ("manual_review".to_string(), None)
+    );
+    assert_eq!(
+        order_state(&app.pool, &order.order_id).await,
+        "refunded_external"
+    );
+    assert_eq!(confirmation_events(&app.pool).await, 0);
+    assert_eq!(manual_review_events(&app.pool).await, 1);
+    assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM receipts").await, 0);
+    assert_eq!(
+        count(
+            &app.pool,
+            "SELECT COUNT(*) FROM outbox WHERE kind = 'notification.payment_refund_required'"
+        )
+        .await,
+        0,
+        "nobody is asked to refund twice"
+    );
+    assert_eq!(listing_stock(&app.pool).await, (1, 0), "no unit re-taken");
+    assert_eq!(
+        correlation_outcome(&app.pool, &order.payment_id).await,
+        ("completed".to_string(), Some("completed".to_string()))
+    );
+
+    let lookups = fake.lookup_count();
+    let summary = next_poll(&app, holder).await;
+    assert_eq!(summary.locks_completions_applied, 0);
+    assert_eq!(fake.lookup_count(), lookups, "the row stopped polling");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_completion_after_the_buyer_cancelled_and_the_seller_refunded_waits_for_review(
+    pool: PgPool,
+) {
+    a_completion_after_a_recorded_refund(pool, true).await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_completion_after_the_window_lapsed_and_the_seller_refunded_waits_for_review(
+    pool: PgPool,
+) {
+    a_completion_after_a_recorded_refund(pool, false).await;
+}
+
 // A verified completion whose still-pending order refuses confirmation (its
 // hold is gone) is kept under manual review in the transaction that read the
 // payment, so nothing can move the payment in between. A buyer cancel that

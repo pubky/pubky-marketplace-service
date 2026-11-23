@@ -1230,7 +1230,11 @@ and the order stays `cancelled`, even when the released unit is still
 free. An order cancelled before the cancel expired Locks payments (a
 cancelled order whose payment is still `awaiting_entitlement`) is treated
 the same way. A window expiry is different: its late completion takes the
-late-money fork and completes the order when the unit is free.
+late-money fork and completes the order when the unit is free. When the
+seller has already recorded an external refund on the cancelled order
+(`refunded_external`), either kind of late completion waits in
+`manual_review` without a review reason: it can neither complete the order
+nor ask for the refund again.
 
 ### `shared_manual` checkout and manual-review resolution (W1.15)
 

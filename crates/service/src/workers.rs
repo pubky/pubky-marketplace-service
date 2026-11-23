@@ -1951,12 +1951,14 @@ async fn mark_correlation_completed(
     Ok(())
 }
 
-/// Moves the `awaiting_entitlement` payment of a verified completion whose
-/// order cannot be confirmed (refused by the confirmation invariants) to
-/// `manual_review`, in the caller's transaction. The caller still holds the
-/// payment and order locks it read them under, so neither a buyer cancel
-/// nor the window sweep can move the payment first. The correlation plus its
-/// observation row retain the history; the completion is never discarded.
+/// Moves the payment of a verified completion whose order cannot be
+/// confirmed to `manual_review`, in the caller's transaction: an
+/// `awaiting_entitlement` payment the confirmation invariants refused, or an
+/// `expired` one whose order already carries a recorded refund. The caller
+/// still holds the payment and order locks it read them under, so neither a
+/// buyer cancel nor the window sweep can move the payment first. The
+/// correlation plus its observation row retain the history; the completion
+/// is never discarded.
 async fn apply_manual_review(
     mut tx: Transaction<'_, Postgres>,
     row: &ClaimedCorrelation,
@@ -1965,10 +1967,11 @@ async fn apply_manual_review(
 ) -> anyhow::Result<bool> {
     let (revision,): (i64,) = sqlx::query_as(
         "UPDATE payments SET state = 'manual_review', revision = revision + 1, \
-         manual_review_entered_at = $2, updated_at = $2 \
-         WHERE id = $1 AND state = 'awaiting_entitlement' RETURNING revision",
+         manual_review_entered_at = $3, updated_at = $3 \
+         WHERE id = $1 AND state = $2 RETURNING revision",
     )
     .bind(payment.id)
+    .bind(&payment.state)
     .bind(now)
     .fetch_one(&mut *tx)
     .await?;
@@ -2164,6 +2167,18 @@ async fn apply_completed_lifecycle(
             };
             if cancelled_by_buyer(&mut tx, row.id, &payment, &order).await? {
                 return refund_after_buyer_cancel(tx, row, &payment, &order, now).await;
+            }
+            if !matches!(order.state.as_str(), "pending_payment" | "cancelled") {
+                // The seller already recorded an external refund on the
+                // cancelled order: late money can neither complete it nor
+                // ask for the refund again, so a human reconciles the fact.
+                tracing::warn!(
+                    payment_id = %payment.id,
+                    correlation_id = %row.id,
+                    order_state = %order.state,
+                    "late locks completion for an order that left cancelled; routing to manual review"
+                );
+                return apply_manual_review(tx, row, &payment, now).await;
             }
             match apply_late_money(
                 &mut tx,
