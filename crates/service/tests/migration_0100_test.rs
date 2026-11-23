@@ -7,9 +7,17 @@
 //! back-out restarts every cursor on the configured homeserver and clears the
 //! listing markers that name another one, leaving the guard enabled. The follower
 //! across a real homeserver move is exercised in `homeserver_pkarr_test.rs`.
+//! A database already at 0099, `main`'s last migration, takes 0100 through
+//! the service's own startup migrator.
 
+mod common;
+
+use sqlx::migrate::Migrator;
 use sqlx::PgPool;
+use std::borrow::Cow;
 use uuid::Uuid;
+
+static ALL_MIGRATIONS: Migrator = sqlx::migrate!("./migrations");
 
 const AGGREGATE: &str = "listing:seller_boots_01";
 const SELLER: &str = "seller";
@@ -401,4 +409,128 @@ async fn migration_0100_scopes_deletion_cursors_to_their_homeserver_and_is_rerun
             .expect_err("the guard is back")
             .to_string();
     assert!(refused.contains("would move backwards"), "{refused}");
+}
+
+async fn applied_versions(pool: &PgPool) -> Vec<i64> {
+    sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE success ORDER BY version")
+        .fetch_all(pool)
+        .await
+        .expect("applied versions")
+}
+
+#[sqlx::test(migrations = false)]
+async fn migration_0100_applies_on_a_database_already_at_0099(pool: PgPool) {
+    common::restore_0032_retention_connlimit(&pool).await;
+    let through_0099 = Migrator {
+        migrations: Cow::Owned(
+            ALL_MIGRATIONS
+                .iter()
+                .filter(|migration| migration.version <= 99)
+                .cloned()
+                .collect(),
+        ),
+        ..Migrator::DEFAULT
+    };
+    through_0099
+        .run(&pool)
+        .await
+        .expect("the catalog through 0099 migrates");
+    assert_eq!(applied_versions(&pool).await.last(), Some(&99));
+    let homeserver_columns: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.columns WHERE column_name IN \
+         ('homeserver', 'deleted_event_homeserver', 'revived_from_homeserver') \
+         AND table_name IN ('listing_deletion_cursors', 'listings')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("homeserver columns");
+    assert_eq!(
+        homeserver_columns, 0,
+        "0099's schema has no homeserver column"
+    );
+
+    // A seller's inventory bucket and a follower cursor as a binary at 0099
+    // writes them.
+    sqlx::query(
+        "INSERT INTO inventory_actor_rate_limits \
+             (actor_pubky, endpoint_class, tokens, updated_at) \
+         VALUES ($1, 'inventory.read', 7, now())",
+    )
+    .bind(SELLER)
+    .execute(&pool)
+    .await
+    .expect("a 0099 inventory bucket");
+    let holder = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO worker_leases (task, holder, lease_until, fence) \
+         VALUES ('listing_deletions', $1, now() + interval '1 minute', 1)",
+    )
+    .bind(holder)
+    .execute(&pool)
+    .await
+    .expect("follower lease");
+    let follower = format!("follower:{holder}:1");
+    let mut tx = pool.begin().await.expect("cursor tx");
+    sqlx::query("SELECT set_config('marketplace.listing_deletion_authority', $1, true)")
+        .bind(&follower)
+        .execute(&mut *tx)
+        .await
+        .expect("authority");
+    sqlx::query(
+        "INSERT INTO listing_deletion_cursors (seller_pubky, event_cursor, polled_at) \
+         VALUES ($1, '500', now())",
+    )
+    .bind(SELLER)
+    .execute(&mut *tx)
+    .await
+    .expect("a 0099-era cursor");
+    tx.commit().await.expect("cursor commits");
+
+    marketplace_service::migrations::run(&pool)
+        .await
+        .expect("the startup migrator applies 0100 after 0099");
+    let applied = applied_versions(&pool).await;
+    assert_eq!(
+        applied
+            .iter()
+            .copied()
+            .filter(|version| (98..=100).contains(version))
+            .collect::<Vec<_>>(),
+        [98, 99, 100]
+    );
+    let classes: String = sqlx::query_scalar(
+        "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
+         WHERE conname = 'automation_rate_limits_endpoint_class_check'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("0099's automation classes");
+    assert!(classes.contains("'session.create'"), "{classes}");
+    let tokens: f64 = sqlx::query_scalar(
+        "SELECT tokens FROM inventory_actor_rate_limits \
+         WHERE actor_pubky = $1 AND endpoint_class = 'inventory.read'",
+    )
+    .bind(SELLER)
+    .fetch_one(&pool)
+    .await
+    .expect("the 0099 bucket survives 0100");
+    assert_eq!(tokens, 7.0);
+
+    assert_eq!(
+        stored_cursor(&pool).await,
+        (Some("500".to_string()), None),
+        "the 0099-era cursor keeps NULL, the configured homeserver"
+    );
+    let refused = write_cursor(&pool, &follower, Some("400"), None)
+        .await
+        .expect_err("backwards on the configured homeserver");
+    assert!(refused.contains("would move backwards"), "{refused}");
+    let other = homeserver('a');
+    write_cursor(&pool, &follower, Some("3"), Some(&other))
+        .await
+        .expect("a lower cursor on another homeserver");
+    assert_eq!(
+        stored_cursor(&pool).await,
+        (Some("3".to_string()), Some(other))
+    );
 }
