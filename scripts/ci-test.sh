@@ -39,6 +39,7 @@ SERIAL=(
   rolling_overlap_test
   manual_review_resolve_test
   migrator_tolerance_test
+  store_seller_test
 )
 
 is_serial() {

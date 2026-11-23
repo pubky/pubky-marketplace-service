@@ -38,6 +38,10 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/inventory/listings/{aggregate_id}",
             get(crate::inventory::get_inventory_projection),
         )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::store_seller::require_store_seller,
+        ))
         .route_layer(middleware::from_fn(auth::require_inventory_capability))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -78,6 +82,10 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/webhooks/{id}",
             delete(crate::automation::delete_webhook),
         )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::store_seller::require_store_seller,
+        ))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             crate::automation::require_automation_rate,
@@ -165,6 +173,10 @@ pub fn build_router(state: AppState) -> Router {
             "/v1/connectors/{id}/pushes/{order}/retry",
             post(crate::connectors::routes::retry_push),
         )
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::store_seller::require_store_seller,
+        ))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_session,
@@ -300,6 +312,10 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
+            crate::store_seller::require_store_seller,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
             auth::require_session,
         ));
 
@@ -427,6 +443,16 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
         "paykit_rail": {
             "bitcoin_offer_available": bitcoin_offer_available,
             "age_seconds": age_seconds,
+        },
+        "store": {
+            "mode": state.config.store_mode.as_str(),
+            "seller": state.config.store_mode.store_seller(),
+        },
+        "homeserver_resolution": state.homeserver.as_ref().and_then(|homeserver| homeserver.resolution()),
+        "listing_moderation": if state.listing_moderation.is_some() { "on" } else { "off" },
+        "fx_source": {
+            "provider": crate::fx::FX_SOURCE,
+            "pinned": state.config.fx_feed_url == crate::fx::FX_URL,
         },
     });
     // Present only while the USDT flag is on, so the body is byte-identical

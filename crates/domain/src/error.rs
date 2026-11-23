@@ -64,6 +64,11 @@ pub enum ErrorCode {
     /// The shipping profile changed since the buyer saw its rates, so the
     /// quote the buyer chose no longer applies. The client re-quotes.
     ShippingChanged,
+    /// The deployment serves one seller (`STORE_SELLER_PUBKY`) and the
+    /// command or route acts for another seller's listing, drop, offer,
+    /// order, payment or settings. A 409, not a 403, for the reason given at
+    /// `ListingModerated`.
+    SellerNotServed,
 }
 
 impl ErrorCode {
@@ -97,7 +102,8 @@ impl ErrorCode {
             | ErrorCode::CommerceUnavailableInRegion
             | ErrorCode::ShippingUnavailableToCountry
             | ErrorCode::ShippingUnavailable
-            | ErrorCode::ShippingChanged => 409,
+            | ErrorCode::ShippingChanged
+            | ErrorCode::SellerNotServed => 409,
             ErrorCode::UpstreamUnavailable => 503,
         }
     }

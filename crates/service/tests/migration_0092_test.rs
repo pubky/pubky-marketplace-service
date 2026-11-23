@@ -55,7 +55,7 @@ async fn the_mode_is_one_of_two_values_or_null_and_the_command_kind_is_catalogue
         );
     }
     let kinds: Vec<(i16, String)> = sqlx::query_as(
-        "SELECT id, name FROM command_refusal_command_kinds WHERE id >= 43 ORDER BY id",
+        "SELECT id, name FROM command_refusal_command_kinds WHERE id = 43 ORDER BY id",
     )
     .fetch_all(&pool)
     .await
