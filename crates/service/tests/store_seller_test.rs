@@ -503,6 +503,114 @@ async fn every_command_naming_another_seller_is_refused_and_audited(pool: PgPool
     assert!(audited(&pool, SurfaceKind::SellerRoute).await.is_empty());
 }
 
+/// The kinds whose payload names nothing their aggregate does not: the
+/// listing (inventory, offers, bids, pickup and digital details), the drop,
+/// or the actor's own seller settings. Every other kind names a seller or a
+/// record in its payload.
+const AGGREGATE_ONLY: &[&str] = &[
+    "drop.cancel",
+    "drop.release_listings",
+    "inventory.reserve",
+    "offer.create",
+    "auction.place_bid",
+    "auction.close",
+    "pickup_details.set",
+    "pickup_details.clear",
+    "digital_delivery.set",
+    "digital_delivery.clear",
+    "attestation.set_band_consent",
+];
+
+/// `command` under an aggregate that names nothing of `bob`'s: `store`'s
+/// own listing or drop, or a fresh id of the same kind. A checkout's
+/// aggregate names nothing already.
+fn neutral(mut command: Value, bob: &str, store: &str) -> Value {
+    let aggregate = command["aggregate_id"].as_str().unwrap().to_string();
+    let (kind, rest) = aggregate.split_once(':').expect("kind:id aggregate");
+    command["aggregate_id"] = json!(match kind {
+        "listing" | "drop" => format!("{kind}:{}", rest.replacen(bob, store, 1)),
+        "checkout" => aggregate.clone(),
+        _ => format!("{kind}:{}", Uuid::new_v4()),
+    });
+    fresh(command)
+}
+
+/// For every kind not in [`AGGREGATE_ONLY`], the refusal case under a
+/// neutral aggregate, so only the payload names `bob` or his records. An
+/// offer checkout names the offer and the listing, so it has a case for
+/// each.
+fn payload_cases(other: &OtherSeller, store: &str) -> BTreeMap<String, Value> {
+    let bob = other.bob.pubky.as_str();
+    let mut cases: BTreeMap<String, Value> = refusal_cases(other)
+        .into_iter()
+        .filter(|(kind, _)| !AGGREGATE_ONLY.contains(&kind.as_str()))
+        .map(|(kind, command)| (kind, neutral(command, bob, store)))
+        .collect();
+    let checkout = cases.remove("offer.checkout").expect("offer.checkout case");
+    let mut by_offer = fresh(checkout.clone());
+    by_offer["payload"]["listing_aggregate_id"] = json!(listing_aggregate(store));
+    let mut by_listing = fresh(checkout);
+    by_listing["payload"]["offer_id"] = json!(Uuid::new_v4().to_string());
+    cases.insert("offer.checkout (offer)".to_string(), by_offer);
+    cases.insert("offer.checkout (listing)".to_string(), by_listing);
+    cases
+}
+
+/// Each payload subject in `store_seller::command_subjects` is needed on
+/// its own: with the aggregate naming nothing of the other seller's, the
+/// payload alone is refused.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn every_payload_naming_another_seller_is_refused_under_a_neutral_aggregate(pool: PgPool) {
+    let base = test_app(pool.clone()).await;
+    let other = other_seller(&base).await;
+    let store = new_actor(&base).await;
+    let app = single_seller(&base, &store.pubky, None);
+
+    let cases = payload_cases(&other, &store.pubky);
+    let kinds: BTreeSet<String> = cases
+        .values()
+        .map(|command| command["kind"].as_str().unwrap().to_string())
+        .collect();
+    let aggregate_only: BTreeSet<String> = AGGREGATE_ONLY.iter().map(ToString::to_string).collect();
+    assert!(aggregate_only.is_subset(&parsed_command_kinds()));
+    assert_eq!(
+        kinds
+            .union(&aggregate_only)
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        parsed_command_kinds(),
+        "a kind either names something in its payload or is listed in AGGREGATE_ONLY"
+    );
+    let bobs = [
+        other.bob.pubky.as_str(),
+        other.order_id.as_str(),
+        other.payment_id.as_str(),
+        OFFER_COMMAND_ID,
+    ];
+    let before = domain_rows(&pool).await;
+    for (case, command) in &cases {
+        let aggregate = command["aggregate_id"].as_str().unwrap();
+        assert!(
+            bobs.iter().all(|bob| !aggregate.contains(bob)),
+            "{case}: {aggregate} is not neutral"
+        );
+        for actor in [&other.buyer, &store] {
+            let (status, body) = execute(&app, &actor.token, command).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{case}: {body}");
+            assert_eq!(
+                body["error"]["code"],
+                json!("SELLER_NOT_SERVED"),
+                "{case}: {body}"
+            );
+        }
+    }
+    assert_eq!(
+        domain_rows(&pool).await,
+        before,
+        "no command wrote anything"
+    );
+}
+
 fn command_kind(command: &Value) -> CommandKind {
     let parsed = marketplace_domain::commands::parse_command(command)
         .unwrap_or_else(|issues| panic!("fixture does not parse: {issues:?} {command}"));
