@@ -811,20 +811,36 @@ rewrite, no backfill, no index; it sets `lock_timeout` like 0050. Directly
 rerunnable: each column is added only if missing, each check is dropped and
 re-added, and the functions and trigger are replaced.
 
-**Deploy mode: rolling.** A binary from before 0100 never reads the columns;
-its cursor writes leave `homeserver` as it is and stay monotonic, and its
-tombstones leave `deleted_event_homeserver` NULL, as `fixed` writes it. The
-revival trigger clears `deleted_event_homeserver` with the cursor it moves.
+**Deploy mode: rolling, under `fixed`.** A binary from before 0100 never
+reads the columns; its cursor writes leave `homeserver` as it is and stay
+monotonic, and its tombstones leave `deleted_event_homeserver` NULL, as
+`fixed` writes it. The revival trigger clears `deleted_event_homeserver`
+with the cursor it moves.
+
+**Switch to `pkarr` in a later rollout.** Roll the image out with
+`HOMESERVER_RESOLUTION=fixed` (the default) first, and set `pkarr` only in a
+separate rollout once every instance runs an image with 0100. While an image
+from before 0100 still runs beside a `pkarr` one, its follower writes a
+cursor counted on `HOMESERVER_URL`'s homeserver into a row whose
+`homeserver` names the seller's own; the guard accepts it (same homeserver,
+cursor forward), and the `pkarr` follower then reads that homeserver from a
+position in another's numbering and can skip the seller's deletes. Nothing
+is lost (checkout's lifecycle gate re-reads the record), but deleted
+listings can stay live. The service does not enforce the order: what it
+would have to detect is an older image still running, which the database
+does not record, and refusing only when 0100 was applied in the same boot
+would stop the first `pkarr` instance of a combined rollout but none after
+it.
 
 ### Backing out 0100
 
 An image from before it runs on the migrated database, with the replaced
 guards, which behave as 0051's while every homeserver column is NULL. Under
-`HOMESERVER_RESOLUTION=fixed` they all are; an image from before 0100 cannot
-run `pkarr`. After a `pkarr` deployment, first restart every cursor that
-names a homeserver on the configured one, which the older image would
-otherwise read from a position on another homeserver. The cursor guard
-accepts the write under the current follower lease, which it share-locks:
+`HOMESERVER_RESOLUTION=fixed` they all are. After a `pkarr` deployment,
+first restart every cursor that names a homeserver on the configured one,
+which the older image would otherwise read from a position on another
+homeserver. The cursor guard accepts the write under the current follower
+lease, which it share-locks:
 
 ```sql
 BEGIN;

@@ -28,9 +28,13 @@ the `listing_deletions` lease.
 - **A delete is proven where the seller lives now.** Under `pkarr` every
   deletion proof (the follower's and `listing.sync`'s) first reads the
   seller's Pkarr record from the network, past the cache, and reads the
-  record and the event stream from the homeserver it names. A cached
-  record that still names a homeserver the seller left never proves a
-  delete there; a record that cannot be read leaves the listing as it is.
+  record and the event stream from the homeserver it names. The record's
+  404 and the `DEL` must come from the same homeserver; if the seller's
+  homeserver changes between the two reads the proof is unavailable and
+  is tried again later. A cached record that still names a homeserver the
+  seller left never proves a delete there; a record that cannot be read
+  leaves the listing as it is. `listing.sync` makes these reads before its
+  database transaction and settles the result inside it.
 - **Revivals are confirmed.** Each pass first confirms up to five revived
   listings not yet confirmed at their current generation
   (`listing_revival_checks`, 0051), least recently tried first, within the
@@ -154,6 +158,9 @@ existing row keeps `NULL`, the configured homeserver, so a `fixed`
 deployment compares cursors exactly as before. An old replica in the overlap
 writes no homeserver: its cursor writes stay monotonic on the stored
 homeserver and its tombstones name the configured one, which is what
-`fixed` writes. `pkarr` cannot run beside an image from before 0100, which
-needs `HOMESERVER_URL`. Backing out is in
+`fixed` writes. That holds only while every instance runs `fixed`: an old
+replica beside a `pkarr` one writes its configured homeserver's cursor
+into a row naming the seller's own homeserver, which the `pkarr` follower
+then trusts. Switch to `pkarr` in a later rollout, once every instance runs
+0100. The rollout order and backing out are in
 [migrations.md](migrations.md#homeserver-scoped-deletion-cursors-0100).
