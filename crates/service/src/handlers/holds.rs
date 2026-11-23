@@ -10,7 +10,7 @@
 //!   fiat `FIAT_PAYMENT_WINDOW_SECONDS` (default 600), bitcoin
 //!   `BITCOIN_PAYMENT_WINDOW_SECONDS` (default 1800, also Paykit
 //!   `expires_at`);
-//! - `payment.register_locks` — window `LOCKS_PAYMENT_WINDOW_SECONDS`;
+//! - `payment.prepare_locks` — window `LOCKS_PAYMENT_WINDOW_SECONDS`;
 //! - `payment.sandbox_advance` leaving `awaiting_entitlement` — window
 //!   `SANDBOX_PAYMENT_WINDOW_SECONDS`.
 //!
