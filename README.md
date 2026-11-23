@@ -72,7 +72,9 @@ also has
   `HOMESERVER_RESOLUTION=pkarr` resolves each pubky's own homeserver instead
   (see [Homeserver reads](#homeserver-reads));
 - `NEXUS_URL` — the marketplace index the moderation gate reads (an http(s)
-  URL; see [Listing moderation](#listing-moderation));
+  URL; see [Listing moderation](#listing-moderation)), unless a
+  single-seller deployment sets `LISTING_MODERATION=off` (see
+  [Single-seller mode](#single-seller-mode));
 - `REFUSAL_AUDIT_DATABASE_URL` and `REFUSAL_AUDIT_RETENTION_DATABASE_URL` —
   two separate Postgres URLs that log in as
   `marketplace_refusal_audit_writer_login` and
@@ -157,7 +159,9 @@ Configuration is environment-based. Window keys and their defaults also live in
 | `DATABASE_URL` | required | Postgres connection string |
 | `HOMESERVER_RESOLUTION` | `fixed` | where homeserver reads go: `fixed` sends every read to `HOMESERVER_URL`; `pkarr` reads each pubky from the homeserver its Pkarr record names. Any other value refuses to boot. See [Homeserver reads](#homeserver-reads) |
 | `HOMESERVER_URL` | required with `fixed` | homeserver base URL (http(s)) the `listing.sync` command and every other homeserver read fetch seller-signed records from; the service refuses to boot without it under `fixed`, and refuses to boot with it set under `pkarr` |
-| `NEXUS_URL` | required | base URL (http(s)) of the marketplace index (Nexus) the service asks whether a listing is moderated before it accepts a checkout, a bid or an offer on it; the service refuses to boot without it. See [Listing moderation](#listing-moderation) |
+| `NEXUS_URL` | required unless `LISTING_MODERATION=off` | base URL (http(s)) of the marketplace index (Nexus) the service asks whether a listing is moderated before it accepts a checkout, a bid or an offer on it; the service refuses to boot without it while moderation is on, and with it set while moderation is off. See [Listing moderation](#listing-moderation) |
+| `STORE_SELLER_PUBKY` | unset | binds the service to one seller (single-seller mode): every command and signed-in route that names another seller's listing, drop, settings, offer, order, payment or receipt is refused with `SELLER_NOT_SERVED`. Unset serves every seller (marketplace mode). Must be a 52-character z-base-32 pubky without a `pubky` prefix, or the service refuses to boot. See [Single-seller mode](#single-seller-mode) |
+| `LISTING_MODERATION` | `on` | `on` asks the index (`NEXUS_URL`) before selling a listing; `off` builds no moderation gate and does not read `NEXUS_URL`. `off` is allowed only with `STORE_SELLER_PUBKY` set; any other value, or `off` in marketplace mode, refuses to boot. See [Single-seller mode](#single-seller-mode) |
 | `REFUSAL_AUDIT_*` | required | refusal-audit logins, HMAC key pair and attestations; see [Run](#run) |
 | `BIND_ADDR` | `127.0.0.1:8080` | HTTP listen address |
 | `ALLOWED_ORIGINS` | empty | comma-separated exact CORS origins |
@@ -384,6 +388,56 @@ answers are cached (5 minutes, per listing); a "clear" answer is never cached,
 so a moderation placed meanwhile is seen on the next command and lifting one
 takes effect once the cached answer expires. Orders created before a listing
 was moderated are not cancelled by this check.
+
+A single-seller deployment may switch the gate off with
+`LISTING_MODERATION=off` (see [Single-seller mode](#single-seller-mode)).
+
+### Single-seller mode
+
+`STORE_SELLER_PUBKY` binds the service to one seller's shop. Unset, the
+service is a marketplace and serves every seller exactly as before.
+
+When it is set, one check (`store_seller` in the service crate) decides
+whether a request concerns the store seller, and refuses anything else:
+
+- **Commands.** Every `POST /v1/commands` kind, and every item of
+  `POST /v1/listings/sync-many`, is checked by the sellers it names: the
+  aggregate's seller (`listing:`, `drop:`, `seller_settings:`), the seller in
+  the payload, every checkout line's listing, the listing of an offer
+  checkout, and the seller of the offer, order or payment it acts on. That
+  covers the seller's own commands (listing registration and sync, drops,
+  pickup details, digital deliverables, band consent, fulfilment, returns,
+  refunds) and every buyer command against a listing (checkout, offers,
+  bids, Locks prepare and register). A refused command answers
+  `SELLER_NOT_SERVED` (HTTP 409) before its transaction and writes nothing; a
+  command id that already has a stored result is answered from it.
+- **Signed-in routes.** Each route of the router has a scope in
+  `store_seller::ROUTES`. Routes that act for the caller as a seller
+  (inventory, inventory automations, webhooks, every `/v1/connectors` route
+  and `/v0/sellers/me/payment-config`) are served only to the store seller.
+  Routes that name a listing, drop, seller, order, payment or receipt in
+  their path are served only when that record belongs to the store seller.
+  The caller's own sessions, offers, orders, notifications and private-key
+  envelopes stay open, and a route with no scope is refused. A refusal
+  answers `SELLER_NOT_SERVED` (HTTP 409).
+
+Every refusal writes a refusal-audit row (`seller_not_served`): a command on
+the `v1_command` surface under its own command kind, a route on the
+`seller_route` surface under the `seller_route` command kind. Sessions are
+still issued to any identity, so buyers sign in as before. Public reads
+(`/v0` projections, `/health`) are not filtered; they only show what the
+guarded writes let in. The mode is meant for a database that has only ever
+served the store seller; another seller's existing records are not removed,
+and every route and command for them is refused.
+
+`LISTING_MODERATION=off` is allowed only in this mode. The moderation gate is
+then not built, `NEXUS_URL` is not read and must be unset, and the boot log
+says so. In marketplace mode `off` refuses to boot.
+
+`GET /health` reports the deployment: `store` (`mode` and `seller`),
+`homeserver_resolution` (`fixed` or `pkarr`), `listing_moderation` (`on` or
+`off`) and `fx_source` (the FX provider and whether its URL is the pinned
+one). See [`docs/api.md`](docs/api.md#health).
 
 ### Region modes
 

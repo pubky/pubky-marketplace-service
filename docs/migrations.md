@@ -825,6 +825,30 @@ Then forget the version:
 DELETE FROM _sqlx_migrations WHERE version = 99;
 ```
 
+## Single-seller refusals (0100)
+
+0100 appends one row to each append-only refusal-audit catalog for
+[single-seller mode](../README.md#single-seller-mode): refusal kind
+`seller_not_served` (id 41), surface `seller_route` (id 3) and command kind
+`seller_route` (id 44). Like 0082 it inserts with `ON CONFLICT (id) DO
+NOTHING` and fails loudly if any of those ids holds anything else, so it is
+directly rerunnable. No table, column or index changes.
+
+**Deploy mode: rolling.** An image from before 0100 never writes the new ids
+and does not read `STORE_SELLER_PUBKY`; the rows are harmless to it. Set
+`STORE_SELLER_PUBKY` only once every serving binary is from 0100 or later:
+an older one would serve every seller.
+
+### Backing out 0100
+
+An image from before it runs on the migrated database. The catalog rows stay
+(the tables are append-only) and are harmless; any refusal-audit buckets that
+reference them age out with the ordinary retention. Forget the version:
+
+```sql
+DELETE FROM _sqlx_migrations WHERE version = 100;
+```
+
 ## Numbers claimed by open pull requests
 
 `main` has 0001 to 0079 (0068 and 0069 were never used). A new migration must
@@ -848,6 +872,7 @@ assume it is free:
 | 0097 | `0097_connector_product_sync_fences.sql` | connector product sync: per-group rebase instants and the unlink fence on product snapshots |
 | 0098 | `0098_seller_wallet_receipt_confirmation.sql` | seller wallet receipt confirms payment (#215) |
 | 0099 | `0099_homeserver_scoped_deletion_cursors.sql` | homeserver-scoped listing deletion cursors and revival markers (`HOMESERVER_RESOLUTION=pkarr`) |
+| 0100 | `0100_single_seller_refusals.sql` | the `seller_not_served` refusal kind and the `seller_route` surface and command kind (single-seller mode), stacked on 0099 |
 
 This table describes unmerged work and goes stale as pull requests land; trust
 `crates/service/migrations/` on `main` over it. sqlx does not reject two files

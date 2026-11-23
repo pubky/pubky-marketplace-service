@@ -342,7 +342,7 @@ request failed, so clients should branch on HTTP status first, and parse
    | `NOT_FOUND` | 404 |
    | `REVISION_CONFLICT`, `IDEMPOTENCY_CONFLICT`, `INSUFFICIENT_INVENTORY`, `INVARIANT_VIOLATION`, `OFFER_EXPIRED`, `INVALID_STATE`, `AUCTION_CLOSED`, `BID_TOO_LOW`, `SELLER_REGISTRATION_REQUIRED` | 409 |
    | `AWARD_EXPIRED`, `AWARD_ALREADY_CONVERTED`, `AWARD_QUANTITY_MISMATCH`, `AWARD_VARIANT_MISMATCH`, `AWARD_LISTING_CHANGED`, `AWARD_HOLD_MISSING` | 409 |
-   | `LISTING_MODERATED`, `LISTING_NOT_ACTIVE` | 409 |
+   | `LISTING_MODERATED`, `LISTING_NOT_ACTIVE`, `SELLER_NOT_SERVED` | 409 |
    | `SHIPPING_UNAVAILABLE_TO_COUNTRY`, `SHIPPING_UNAVAILABLE`, `SHIPPING_CHANGED` | 409 |
    | `SELLER_UNAVAILABLE_IN_REGION`, `SELLER_ANNUAL_LIMIT_REACHED`, `DIGITAL_UNAVAILABLE_IN_REGION`, `COMMERCE_UNAVAILABLE_IN_REGION` | 409 |
    | `UPSTREAM_UNAVAILABLE` | 503 (retriable) |
@@ -357,6 +357,16 @@ request failed, so clients should branch on HTTP status first, and parse
    when the marketplace index reports the listing, or its seller, as
    moderated (see [Listing moderation](../README.md#listing-moderation)). It is a
    409, not a 403, because clients read a 403 on a command as a session problem.
+
+   `SELLER_NOT_SERVED` refuses, in a single-seller deployment
+   (`STORE_SELLER_PUBKY` set), every command that names another seller's
+   listing, drop, settings, offer, order or payment, before the command's
+   transaction and without writing anything. Signed-in routes that act for a
+   seller, or name another seller's record in their path, answer it too, in
+   this command envelope (`{"ok":false,"error":{"code":"SELLER_NOT_SERVED",...}}`,
+   HTTP 409) whatever envelope the route uses otherwise. A marketplace
+   deployment never returns it (see
+   [Single-seller mode](../README.md#single-seller-mode)).
 
    `LISTING_NOT_ACTIVE` refuses `checkout.create`, `offer.create`,
    `offer.counter`, `offer.accept` and `auction.place_bid` when the seller's
@@ -2172,9 +2182,25 @@ Liveness plus a capability summary. Always `200` while the process is up:
   "payment_confirmation": "seller",
   "digital_release": "seller",
   "commit": "2f844c1084c4",
-  "paykit_rail": { "bitcoin_offer_available": true, "age_seconds": 12 }
+  "paykit_rail": { "bitcoin_offer_available": true, "age_seconds": 12 },
+  "store": { "mode": "marketplace", "seller": null },
+  "homeserver_resolution": "fixed",
+  "listing_moderation": "on",
+  "fx_source": { "provider": "blocktank", "pinned": true }
 }
 ```
+
+`store.mode` is `marketplace` or `single_seller`; in single-seller mode
+`store.seller` is the `STORE_SELLER_PUBKY` the deployment serves, otherwise
+`null` (see [Single-seller mode](../README.md#single-seller-mode)).
+`homeserver_resolution` is the `HOMESERVER_RESOLUTION` in force (`fixed` or
+`pkarr`; see [Homeserver reads](../README.md#homeserver-reads)).
+`listing_moderation` is `on` when the moderation gate asks the index before a
+sale and `off` when a single-seller deployment set `LISTING_MODERATION=off`.
+`fx_source.provider` names the FX feed the service prices against (always
+`blocktank` today) and `fx_source.pinned` is `true` when `FX_FEED_URL` is the
+pinned Blocktank URL. These are configuration values only; no URL, key or
+secret is reported.
 
 `commit` is the first 12 characters of the git SHA the image was built from
 (the `GIT_COMMIT` Docker build arg, set by the production image workflow), or
