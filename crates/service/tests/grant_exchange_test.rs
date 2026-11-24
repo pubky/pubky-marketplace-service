@@ -6,8 +6,10 @@
 //!
 //! Covered: a grant exchanged at the configured homeserver completes; one
 //! whose issuer names another homeserver is refused with nothing sent to it;
-//! one whose issuer is not the asserted pubky is not exchanged;
-//! a homeserver's redirect is not followed; records naming an internal
+//! one whose issuer is not the asserted pubky is not exchanged; an answer
+//! for another pubky, homeserver, grant or client id than the exchanged
+//! grant's is refused; a homeserver's redirect is not followed; records
+//! naming an internal
 //! address, in every form, are refused with no connection made; and an
 //! endpoint that speaks only plain HTTP is never sent a plain-HTTP request.
 //!
@@ -22,7 +24,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::panic::AssertUnwindSafe;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::http::StatusCode;
@@ -33,9 +35,11 @@ use marketplace_service::config::Config;
 use marketplace_service::grant;
 use marketplace_service::grant::test_support::GrantTestAuthority;
 use marketplace_service::homeserver_transport::EndpointPolicy;
+use pubky_common::auth::grant_session_responses::{GrantSessionInfo, GrantSessionResponse};
+use pubky_common::auth::jws::{ClientId, GrantId};
 use pubky_testnet::pubky::pkarr::dns::rdata::SVCB;
 use pubky_testnet::pubky::pkarr::{Keypair as PkarrKeypair, SignedPacket};
-use pubky_testnet::pubky::{Keypair, PublicKey};
+use pubky_testnet::pubky::{GrantClaims, Keypair, PublicKey};
 use pubky_testnet::pubky_homeserver::ConnectionString;
 use pubky_testnet::Testnet;
 use serde_json::json;
@@ -373,6 +377,110 @@ async fn redirecting_homeserver(
     (port, answered)
 }
 
+/// What [`answering_homeserver`] answers a grant exchange with: the session
+/// the grant is for, or that session with one field changed.
+#[derive(Clone, Copy, Debug)]
+enum Answer {
+    Exact,
+    OtherPubky,
+    OtherHomeserver,
+    OtherGrantId,
+    OtherClientId,
+}
+
+/// A homeserver on loopback holding `keypair`, over TLS pinned to that key,
+/// that answers every request with a grant session for the posted grant,
+/// changed as `answer` currently says.
+async fn answering_homeserver(keypair: &PkarrKeypair, answer: Arc<Mutex<Answer>>) -> u16 {
+    let socket = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = socket.local_addr().expect("address").port();
+    let acceptor = TlsAcceptor::from(Arc::new(keypair.to_rpk_rustls_server_config()));
+    let homeserver: PublicKey = keypair.public_key().into();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = socket.accept().await {
+            let (acceptor, answer, homeserver) =
+                (acceptor.clone(), answer.clone(), homeserver.clone());
+            tokio::spawn(async move {
+                let Ok(mut tls) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let Some(body) = read_request_body(&mut tls).await else {
+                    return;
+                };
+                let request: serde_json::Value =
+                    serde_json::from_slice(&body).expect("exchange request is JSON");
+                let claims = GrantClaims::decode(request["grant"].as_str().expect("grant"))
+                    .expect("the posted grant decodes");
+                let mut session = GrantSessionInfo {
+                    homeserver,
+                    pubky: claims.iss.clone(),
+                    client_id: claims.client_id.clone(),
+                    capabilities: claims.caps.clone(),
+                    grant_id: claims.jti.clone(),
+                    token_expires_at: claims.exp,
+                    grant_expires_at: claims.exp,
+                    created_at: claims.iat,
+                };
+                let answer = *answer.lock().expect("answer");
+                match answer {
+                    Answer::Exact => {}
+                    Answer::OtherPubky => session.pubky = Keypair::random().public_key(),
+                    Answer::OtherHomeserver => {
+                        session.homeserver = Keypair::random().public_key();
+                    }
+                    Answer::OtherGrantId => session.grant_id = GrantId::generate(),
+                    Answer::OtherClientId => {
+                        session.client_id = ClientId::new("other.example").expect("client id");
+                    }
+                }
+                let body = serde_json::to_vec(&GrantSessionResponse {
+                    token: "test-bearer".to_string(),
+                    session,
+                })
+                .expect("session JSON");
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = tls.write_all(head.as_bytes()).await;
+                let _ = tls.write_all(&body).await;
+                let _ = tls.shutdown().await;
+            });
+        }
+    });
+    port
+}
+
+/// The body of one HTTP/1.1 request with a `Content-Length`.
+async fn read_request_body<S: AsyncReadExt + Unpin>(stream: &mut S) -> Option<Vec<u8>> {
+    let mut request = Vec::new();
+    let mut buffer = [0u8; 4096];
+    let head_end = loop {
+        if let Some(at) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+            break at + 4;
+        }
+        match stream.read(&mut buffer).await {
+            Ok(0) | Err(_) => return None,
+            Ok(read) => request.extend_from_slice(&buffer[..read]),
+        }
+    };
+    let head = String::from_utf8_lossy(&request[..head_end]).to_ascii_lowercase();
+    let length: usize = head
+        .lines()
+        .find_map(|line| line.strip_prefix("content-length:"))?
+        .trim()
+        .parse()
+        .ok()?;
+    while request.len() < head_end + length {
+        match stream.read(&mut buffer).await {
+            Ok(0) | Err(_) => return None,
+            Ok(read) => request.extend_from_slice(&buffer[..read]),
+        }
+    }
+    Some(request[head_end..head_end + length].to_vec())
+}
+
 #[test]
 fn a_grant_exchanged_at_the_configured_homeserver_completes() {
     on_testnet(|pool| async move {
@@ -574,6 +682,53 @@ fn a_redirect_from_the_homeserver_is_not_followed() {
             0,
             "no redirect target was contacted"
         );
+    });
+}
+
+#[test]
+fn an_answer_for_another_session_than_the_exchanged_grant_is_refused() {
+    on_testnet(|pool| async move {
+        let network = network().await;
+        let homeserver = PkarrKeypair::random();
+        let answer = Arc::new(Mutex::new(Answer::Exact));
+        let port = answering_homeserver(&homeserver, answer.clone()).await;
+        let user = user_on(
+            &network,
+            &homeserver,
+            Endpoints {
+                direct: Some((vec![IpAddr::V4(Ipv4Addr::LOCALHOST)], port)),
+                ..Endpoints::default()
+            },
+        )
+        .await;
+        let (app, authority) = service(
+            pool,
+            &network,
+            homeserver.public_key().into(),
+            EndpointPolicy::PublicOrLoopback,
+        )
+        .await;
+
+        let refused = ("failed".to_string(), Some("grant_exchange".to_string()));
+        for (case, expected) in [
+            (Answer::Exact, ("complete".to_string(), None)),
+            (Answer::OtherPubky, refused.clone()),
+            (Answer::OtherHomeserver, refused.clone()),
+            (Answer::OtherGrantId, refused.clone()),
+            (Answer::OtherClientId, refused.clone()),
+        ] {
+            *answer.lock().expect("answer") = case;
+            assert_eq!(
+                run_flow(&app, &authority, &network, &user).await,
+                expected,
+                "{case:?}"
+            );
+        }
+        let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM auth_sessions")
+            .fetch_one(&app.pool)
+            .await
+            .expect("session count");
+        assert_eq!(sessions, 1, "only the exact answer minted a session");
     });
 }
 

@@ -2296,7 +2296,8 @@ homeserver:
   expiry and the worker's lease, and reads at most 64 KiB of answer.
 
 A homeserver that cannot be reached under these rules, refuses the grant or
-answers with anything but a session for the grant's issuer ends the flow as
+answers with anything but a session for the exchanged grant (its issuer,
+grant id and client id, issued by that homeserver) ends the flow as
 `failed` with terminal code `grant_exchange`. A grant whose issuer is not the
 pubky the Shop asserted for the flow ends as `mismatch` with terminal code
 `identity_mismatch` before the relay inbox is acknowledged and before any

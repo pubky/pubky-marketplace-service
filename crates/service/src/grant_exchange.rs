@@ -56,7 +56,8 @@ impl GrantExchange {
 
     /// Exchanges `grant_jws` (whose decoded claims are `claims`), proving
     /// possession of `client_key`, for a session at the issuer's homeserver.
-    /// The session's pubky is the grant's issuer. The request is given until
+    /// The session is for the grant's issuer, id and client id, at that
+    /// homeserver; any other answer is refused. The request is given until
     /// `deadline`; the caller bounds the lookups before it.
     pub async fn exchange(
         &self,
@@ -149,14 +150,35 @@ impl GrantExchange {
                 return Err(ExchangeRefusal::Failed);
             }
         };
-        if session.pubky != claims.iss {
+        if let Some(field) = mismatched_field(&session, &homeserver, claims) {
             tracing::warn!(
                 homeserver_prefix = %key_prefix(&homeserver.to_z32()),
-                "grant exchange answer names another pubky than the grant's issuer"
+                field,
+                "grant exchange answer is not a session for the exchanged grant"
             );
             return Err(ExchangeRefusal::Failed);
         }
         Ok(session)
+    }
+}
+
+/// The first field of `session` that differs from what exchanging the grant
+/// of `claims` at `homeserver` must answer, if any.
+fn mismatched_field(
+    session: &GrantSessionInfo,
+    homeserver: &pkarr::PublicKey,
+    claims: &GrantClaims,
+) -> Option<&'static str> {
+    if session.pubky != claims.iss {
+        Some("pubky")
+    } else if pkarr::PublicKey::from(session.homeserver.clone()) != *homeserver {
+        Some("homeserver")
+    } else if session.grant_id != claims.jti {
+        Some("grant_id")
+    } else if session.client_id != claims.client_id {
+        Some("client_id")
+    } else {
+        None
     }
 }
 
