@@ -6,6 +6,7 @@
 //!
 //! Covered: a grant exchanged at the configured homeserver completes; one
 //! whose issuer names another homeserver is refused with nothing sent to it;
+//! one whose issuer is not the asserted pubky is not exchanged;
 //! a homeserver's redirect is not followed; records naming an internal
 //! address, in every form, are refused with no connection made; and an
 //! endpoint that speaks only plain HTTP is never sent a plain-HTTP request.
@@ -156,11 +157,23 @@ async fn run_flow(
     network: &Network,
     user: &Keypair,
 ) -> (String, Option<String>) {
+    run_flow_approved_by(app, authority, network, &user.public_key(), user).await
+}
+
+/// [`run_flow`] for a flow the Shop asserted for `asserted`, approved by
+/// `approver`.
+async fn run_flow_approved_by(
+    app: &TestApp,
+    authority: &GrantTestAuthority,
+    network: &Network,
+    asserted: &PublicKey,
+    approver: &Keypair,
+) -> (String, Option<String>) {
     // A fresh minute of the per-client creation limit for every flow.
     app.clock.advance_seconds(61);
     let result_key = SigningKey::from_bytes(&[19u8; 32]);
     let assertion = authority.sign_bootstrap_assertion(
-        &user.public_key().z32(),
+        &asserted.z32(),
         &[23u8; 32],
         &encode_pubky(&result_key.verifying_key().to_bytes()),
         app.clock.now(),
@@ -180,7 +193,7 @@ async fn run_flow(
         .testnet
         .sdk()
         .expect("testnet sdk")
-        .signer(user.clone())
+        .signer(approver.clone())
         .approve_auth(body["authorization_url"].as_str().expect("url"))
         .await
         .expect("grant posted to the relay inbox");
@@ -459,6 +472,61 @@ fn a_grant_from_another_homeserver_is_refused_before_anything_is_sent_to_it() {
         assert!(
             other_listener.connections() > 0,
             "the configured homeserver's endpoint is reached"
+        );
+    });
+}
+
+#[test]
+fn a_grant_from_another_pubky_than_asserted_is_not_exchanged() {
+    on_testnet(|pool| async move {
+        let network = network().await;
+        let homeserver = PkarrKeypair::random();
+        let endpoint = listener().await;
+        let approver = user_on(
+            &network,
+            &homeserver,
+            Endpoints {
+                direct: Some((vec![IpAddr::V4(Ipv4Addr::LOCALHOST)], endpoint.port)),
+                ..Endpoints::default()
+            },
+        )
+        .await;
+        let (app, authority) = service(
+            pool,
+            &network,
+            homeserver.public_key().into(),
+            EndpointPolicy::PublicOrLoopback,
+        )
+        .await;
+
+        assert_eq!(
+            run_flow_approved_by(
+                &app,
+                &authority,
+                &network,
+                &Keypair::random().public_key(),
+                &approver,
+            )
+            .await,
+            (
+                "mismatch".to_string(),
+                Some("identity_mismatch".to_string())
+            )
+        );
+        assert_eq!(
+            endpoint.connections(),
+            0,
+            "nothing was sent to the homeserver"
+        );
+
+        // The approver's own flow is exchanged at that endpoint.
+        assert_eq!(
+            run_flow(&app, &authority, &network, &approver).await,
+            ("failed".to_string(), Some("grant_exchange".to_string()))
+        );
+        assert!(
+            endpoint.connections() > 0,
+            "the homeserver's endpoint is reached"
         );
     });
 }

@@ -2297,7 +2297,10 @@ homeserver:
 
 A homeserver that cannot be reached under these rules, refuses the grant or
 answers with anything but a session for the grant's issuer ends the flow as
-`failed` with terminal code `grant_exchange`. Before the exchange the worker
+`failed` with terminal code `grant_exchange`. A grant whose issuer is not the
+pubky the Shop asserted for the flow ends as `mismatch` with terminal code
+`identity_mismatch` before the relay inbox is acknowledged and before any
+exchange request. Before the exchange the worker also
 checks the approval as the SDK does: a bare grant bound to the flow's client
 key and client id, with ordered timestamps, approving nothing the flow did not
 request (`invalid`, `grant_invalid` otherwise). The relay inbox and the Pkarr

@@ -3017,6 +3017,19 @@ async fn process_lease(
             return Ok(());
         }
     };
+    // A grant from anyone but the asserted pubky could never settle, so it
+    // is neither acknowledged nor exchanged. Its unverified issuer is not
+    // recorded as the approver.
+    if claims.iss.z32() != lease.expected_pubky {
+        drop(heartbeat);
+        guard.disarm();
+        require_applied(
+            terminalize_owned(state, &lease, "mismatch", "identity_mismatch", None, now).await?,
+            "identity_mismatch",
+            lease.flow_id,
+        )?;
+        return Ok(());
+    }
     let requested_capabilities = Capabilities::from(claims.caps.clone())
         .normalize()
         .to_string();
