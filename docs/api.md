@@ -2345,8 +2345,9 @@ lifetime. Only a live homeserver session can write the document, so a revoked
 grant cannot mint by itself. Two limits remain: a document written by another
 live session of the same user also passes, and revoking a grant does not
 revoke sessions already minted from it; they live until they expire. Sellers
-whose homeserver is not `HOMESERVER_URL` cannot pass the document read and
-keep the approval flow.
+whose homeserver is not `HOMESERVER_URL` cannot pass the document read, and the
+approval flow refuses them too (`homeserver_not_allowed`); they can sign in
+with `POST /v1/auth/sessions`.
 
 The session's capabilities are the grant's narrowed to the marketplace scopes:
 `/pub/pubky.app/marketplace-service/v1/:rw`, plus `/priv/pubky.app/:rw` when the
