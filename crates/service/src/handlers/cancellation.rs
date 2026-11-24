@@ -53,6 +53,7 @@ use marketplace_domain::{ids, Command, ErrorCode};
 use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
+use crate::clock::Clock;
 use crate::executor::insert_event;
 use crate::handlers::holds::{release_lines, HeldQuantity};
 use crate::handlers::{fetch_order_for_update, finish_order_action, guard_order_action};
@@ -66,7 +67,7 @@ pub async fn request(
     command: &Command,
     payload: &RequestCancellationPayload,
     locks_live_task_hold_seconds: i64,
-    now: DateTime<Utc>,
+    clock: &dyn Clock,
 ) -> Result<HandlerResult, sqlx::Error> {
     // Payment before order: the settlement paths lock in that order, so a
     // cancel racing a confirmation waits instead of deadlocking. A Locks
@@ -90,6 +91,10 @@ pub async fn request(
             "The order was not found.",
         )));
     };
+    // Read once the payment, correlation and order locks are held, so the
+    // live-task bound and every timestamp written below are judged at the
+    // instant the cancel actually decides, not before a lock wait.
+    let now = clock.now();
     if let Some(failure) = guard_order_action(actor, command, &order) {
         return Ok(Err(failure));
     }

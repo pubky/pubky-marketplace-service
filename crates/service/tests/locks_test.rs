@@ -2855,6 +2855,301 @@ async fn a_buyer_cancel_racing_the_registration_of_a_prepared_payment_is_refused
     assert_eq!(preparation_state, "registered");
 }
 
+/// A connection holding an open transaction that locks one row with
+/// `statement` (bound to `id`), and its backend pid.
+async fn hold_row_lock(app: &TestApp, statement: &str, id: &str) -> (PgConnection, i32) {
+    let options = app.pool.connect_options().clone();
+    let mut holder = PgConnection::connect_with(&options)
+        .await
+        .expect("holder connection");
+    sqlx::query("BEGIN")
+        .execute(&mut holder)
+        .await
+        .expect("holder transaction");
+    sqlx::query(statement)
+        .bind(id)
+        .execute(&mut holder)
+        .await
+        .expect("holder row lock");
+    let (holder_pid,): (i32,) = sqlx::query_as("SELECT pg_backend_pid()")
+        .fetch_one(&mut holder)
+        .await
+        .expect("holder pid");
+    (holder, holder_pid)
+}
+
+const LOCK_THE_ORDER: &str = "SELECT id FROM orders WHERE id = $1::uuid FOR UPDATE";
+
+/// Prepares the order's Locks payment and returns its window end.
+async fn prepare_and_read_window(
+    app: &TestApp,
+    buyer: &TestActor,
+    order: &PendingOrder,
+    command_number: u64,
+) -> chrono::DateTime<chrono::Utc> {
+    let (status, body) = execute(
+        app,
+        &buyer.token,
+        &common::prepare_locks_command(&order.payment_id, command_number),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "preparation: {body}");
+    let (window_expires_at,): (chrono::DateTime<chrono::Utc>,) = sqlx::query_as(
+        "SELECT window_expires_at FROM payment_locks_correlations WHERE payment_id = $1::uuid",
+    )
+    .bind(&order.payment_id)
+    .fetch_one(&app.pool)
+    .await
+    .expect("correlation row exists");
+    window_expires_at
+}
+
+/// Runs `command` while `holder` keeps it waiting on a row lock, moves the
+/// clock by `advance_seconds` once it is waiting, then releases the lock.
+async fn execute_across_a_lock_wait(
+    app: &TestApp,
+    token: &str,
+    command: &Value,
+    mut holder: PgConnection,
+    holder_pid: i32,
+    advance_seconds: i64,
+) -> (StatusCode, Value) {
+    let interleave = async {
+        wait_for_lock_waiters(&app.pool, holder_pid, 1, "the command").await;
+        app.clock.advance_seconds(advance_seconds);
+        sqlx::query("ROLLBACK")
+            .execute(&mut holder)
+            .await
+            .expect("holder rollback");
+    };
+    let (outcome, ()) = tokio::join!(execute(app, token, command), interleave);
+    outcome
+}
+
+fn assert_preparation_expired(status: StatusCode, body: &Value) {
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], json!("INVALID_STATE"), "{body}");
+    assert_eq!(
+        body["error"]["message"],
+        json!("The Locks preparation has expired."),
+        "{body}"
+    );
+}
+
+// A registration that enters one second before the registration grace ends
+// and waits on the order row lock across that bound is judged at the instant
+// it holds the lock, so it is refused and the payment stays prepared.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_registration_that_waits_across_the_grace_bound_is_refused(pool: PgPool) {
+    let (app, _fake) = test_app_with_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
+    let window = prepare_and_read_window(&app, &buyer, &order, 120).await;
+    app.clock
+        .set(window + chrono::Duration::seconds(REGISTRATION_GRACE_SECONDS - 1));
+
+    let (holder, holder_pid) = hold_row_lock(&app, LOCK_THE_ORDER, &order.order_id).await;
+    let register = register_locks_command(
+        &order.payment_id,
+        2,
+        TEST_BUNDLE_ID,
+        &lock_resource_for(&seller.pubky),
+        121,
+    );
+    let (status, body) =
+        execute_across_a_lock_wait(&app, &buyer.token, &register, holder, holder_pid, 2).await;
+    assert_preparation_expired(status, &body);
+    let (preparation_state,): (String,) = sqlx::query_as(
+        "SELECT preparation_state FROM payment_locks_correlations WHERE payment_id = $1::uuid",
+    )
+    .bind(&order.payment_id)
+    .fetch_one(&app.pool)
+    .await
+    .expect("correlation row exists");
+    assert_eq!(preparation_state, "prepared");
+    assert_eq!(
+        binding_outcomes(&app.pool, &order.payment_id).await,
+        ["prepared"]
+    );
+}
+
+// A registration that waits on the order row lock and acquires it inside
+// the grace attaches, and every timestamp it writes is the instant it held
+// the lock, not the instant it entered.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_registration_after_a_lock_wait_records_the_instant_it_held_the_locks(pool: PgPool) {
+    let (app, _fake) = test_app_with_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
+    let window = prepare_and_read_window(&app, &buyer, &order, 122).await;
+    app.clock.set(window + chrono::Duration::seconds(100));
+    let locked_at = window + chrono::Duration::seconds(400);
+
+    let (holder, holder_pid) = hold_row_lock(&app, LOCK_THE_ORDER, &order.order_id).await;
+    let register = register_locks_command(
+        &order.payment_id,
+        2,
+        TEST_BUNDLE_ID,
+        &lock_resource_for(&seller.pubky),
+        123,
+    );
+    let (status, body) =
+        execute_across_a_lock_wait(&app, &buyer.token, &register, holder, holder_pid, 300).await;
+    assert_eq!(status, StatusCode::OK, "registration: {body}");
+
+    let (correlation_updated_at,): (chrono::DateTime<chrono::Utc>,) = sqlx::query_as(
+        "SELECT updated_at FROM payment_locks_correlations WHERE payment_id = $1::uuid",
+    )
+    .bind(&order.payment_id)
+    .fetch_one(&app.pool)
+    .await
+    .expect("correlation row exists");
+    let (recorded_at,): (chrono::DateTime<chrono::Utc>,) = sqlx::query_as(
+        "SELECT recorded_at FROM payment_locks_binding_outcomes \
+         WHERE payment_id = $1::uuid AND outcome = 'registered'",
+    )
+    .bind(&order.payment_id)
+    .fetch_one(&app.pool)
+    .await
+    .expect("registered outcome");
+    let (payment_updated_at,): (chrono::DateTime<chrono::Utc>,) =
+        sqlx::query_as("SELECT updated_at FROM payments WHERE id = $1::uuid")
+            .bind(&order.payment_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("payment row exists");
+    let (occurred_at,): (chrono::DateTime<chrono::Utc>,) = sqlx::query_as(
+        "SELECT occurred_at FROM events WHERE aggregate_id = $1 AND kind = 'payment.locks_registered'",
+    )
+    .bind(format!("payment:{}", order.payment_id))
+    .fetch_one(&app.pool)
+    .await
+    .expect("registration event");
+    assert_eq!(
+        [
+            correlation_updated_at,
+            recorded_at,
+            payment_updated_at,
+            occurred_at
+        ],
+        [locked_at; 4]
+    );
+}
+
+// A preparation replay that enters one second before the registration grace
+// ends and waits on the correlation row lock across that bound is refused:
+// it no longer hands out the client reference.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_preparation_replay_that_waits_across_the_grace_bound_is_refused(pool: PgPool) {
+    let (app, _fake) = test_app_with_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
+    let window = prepare_and_read_window(&app, &buyer, &order, 124).await;
+    app.clock
+        .set(window + chrono::Duration::seconds(REGISTRATION_GRACE_SECONDS - 1));
+
+    let (holder, holder_pid) = key_share_the_correlation(&app, &order.payment_id).await;
+    let replay = common::prepare_locks_command(&order.payment_id, 125);
+    let (status, body) =
+        execute_across_a_lock_wait(&app, &buyer.token, &replay, holder, holder_pid, 2).await;
+    assert_preparation_expired(status, &body);
+    assert!(body["result"]["client_reference"].is_null(), "{body}");
+}
+
+// A buyer cancel of a prepared payment that enters one second before the
+// registration grace ends, when the preparation still counts as a live
+// task, and waits on the order row lock across that bound is judged at the
+// instant it holds the locks: the grace is over, so the order is cancelled,
+// and its writes carry that instant.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_buyer_cancel_that_waits_across_the_grace_bound_is_judged_after_the_wait(pool: PgPool) {
+    let (app, _fake) = test_app_with_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
+    let window = prepare_and_read_window(&app, &buyer, &order, 126).await;
+    app.clock
+        .set(window + chrono::Duration::seconds(REGISTRATION_GRACE_SECONDS - 1));
+    let (status, body) = request_cancel(&app, &buyer, &order, 127).await;
+    assert_refused_as_live(status, &body);
+    let locked_at = window + chrono::Duration::seconds(REGISTRATION_GRACE_SECONDS + 1);
+
+    let (holder, holder_pid) = hold_row_lock(&app, LOCK_THE_ORDER, &order.order_id).await;
+    let cancel = cancel_command(&app, &order, 128).await;
+    let (status, body) =
+        execute_across_a_lock_wait(&app, &buyer.token, &cancel, holder, holder_pid, 2).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(order_state(&app.pool, &order.order_id).await, "cancelled");
+    assert_eq!(listing_quantities(&app.pool).await, (1, 0, 0));
+    let (state, _, _) = payment_state(&app.pool, &order.payment_id).await;
+    assert_eq!(state, "expired");
+    let (payment_updated_at,): (chrono::DateTime<chrono::Utc>,) =
+        sqlx::query_as("SELECT updated_at FROM payments WHERE id = $1::uuid")
+            .bind(&order.payment_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("payment row exists");
+    let (order_updated_at,): (chrono::DateTime<chrono::Utc>,) =
+        sqlx::query_as("SELECT updated_at FROM orders WHERE id = $1::uuid")
+            .bind(&order.order_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("order row exists");
+    assert_eq!([payment_updated_at, order_updated_at], [locked_at; 2]);
+}
+
+// The window sweep discovers a registered payment the Lock Server answered
+// `not_found` for, then waits on its correlation row lock. The expiry is
+// stamped with the instant the sweep held that lock, not the instant its
+// pass began.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_window_sweep_that_waits_on_the_correlation_stamps_the_instant_it_held_it(pool: PgPool) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
+    register_locks(&app, &buyer.token, &order, &seller.pubky).await;
+    let locks = app.state.locks.clone().expect("locks runtime");
+    fake.set_outcome(TEST_BUNDLE_ID, LocksLookupOutcome::NotFound);
+    workers::verify_due_locks_lifecycles(&app.state, &locks, app.clock.now())
+        .await
+        .expect("lookup");
+    app.clock.advance_seconds(3_601);
+    let locked_at = app.clock.now() + chrono::Duration::seconds(50);
+
+    let (mut holder, holder_pid) = key_share_the_correlation(&app, &order.payment_id).await;
+    let interleave = async {
+        wait_for_lock_waiters(&app.pool, holder_pid, 1, "the sweep").await;
+        app.clock.advance_seconds(50);
+        sqlx::query("ROLLBACK")
+            .execute(&mut holder)
+            .await
+            .expect("holder rollback");
+    };
+    let (expired, ()) = tokio::join!(
+        workers::expire_due_payment_windows(&app.state, app.clock.now()),
+        interleave
+    );
+    assert_eq!(expired.expect("window sweep"), 1);
+    assert_eq!(order_state(&app.pool, &order.order_id).await, "cancelled");
+    let (payment_updated_at,): (chrono::DateTime<chrono::Utc>,) =
+        sqlx::query_as("SELECT updated_at FROM payments WHERE id = $1::uuid")
+            .bind(&order.payment_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("payment row exists");
+    let (order_updated_at,): (chrono::DateTime<chrono::Utc>,) =
+        sqlx::query_as("SELECT updated_at FROM orders WHERE id = $1::uuid")
+            .bind(&order.order_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("order row exists");
+    assert_eq!([payment_updated_at, order_updated_at], [locked_at; 2]);
+}
+
 // A completion lands while the buyer cancels past the bound. Its lookup has
 // claimed the row and is parked; the cancel locks the payment and is parked
 // before the correlation; the released completion then waits for the

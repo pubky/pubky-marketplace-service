@@ -63,7 +63,7 @@ use serde_json::json;
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-use crate::clock::format_timestamp;
+use crate::clock::{format_timestamp, Clock};
 use crate::executor::insert_event;
 use crate::handlers::{fetch_order_for_update, holds};
 use crate::homeserver::{HomeserverFetchOutcome, HomeserverListingClient};
@@ -123,7 +123,7 @@ pub async fn register(
     command: &Command,
     payload: &RegisterLocksPayload,
     locks: Option<&LocksRuntime>,
-    now: DateTime<Utc>,
+    clock: &dyn Clock,
 ) -> Result<HandlerResult, sqlx::Error> {
     // Fail closed: without configured keys the bundle id cannot be stored
     // encrypted, so the deployment refuses the command outright.
@@ -208,6 +208,9 @@ pub async fn register(
             "Payment order is missing.",
         )));
     };
+    // Read only once the payment, correlation and order locks are held: an
+    // instant taken before a lock wait could pass the grace after it ended.
+    let now = clock.now();
     if order.state != "pending_payment"
         || !order.stock_held
         || order.hold_expires_at != Some(window_expires_at)
@@ -493,7 +496,7 @@ pub async fn prepare(
     prefetched: &LocksPrefetch,
     payment_window_seconds: i64,
     fence: Option<&crate::region_policy::RegionModes>,
-    now: DateTime<Utc>,
+    clock: &dyn Clock,
 ) -> Result<HandlerResult, sqlx::Error> {
     let (Some(locks), true) = (locks, homeserver_configured) else {
         return Ok(Err(CommandFailure::refused(
@@ -543,6 +546,10 @@ pub async fn prepare(
     .bind(payment.id)
     .fetch_optional(&mut **tx)
     .await?;
+    // The replay reads no order fields, so the payment and correlation locks
+    // are the last it waits on; the grace is judged at an instant read after
+    // both.
+    let now = clock.now();
     match existing.as_ref() {
         Some((
             state,
@@ -620,6 +627,10 @@ pub async fn prepare(
             "Payment order is missing.",
         )));
     };
+    // The hold and the correlation's window are armed from an instant read
+    // once the order lock is held too, so waiting for these row locks cannot
+    // shorten the window or backdate the preparation.
+    let now = clock.now();
     if order.state != "pending_payment" {
         return Ok(Err(CommandFailure::refused(
             crate::refusal_audit::RefusalKind::InvalidState,

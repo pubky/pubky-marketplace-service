@@ -32,16 +32,21 @@ pub const MAX_PAYKIT_PREPARE_TTL_SECONDS: i64 = 86_400;
 /// `payment_window` (24 h), plus the 10 minutes the Lock Server allows
 /// between proof submission and invoice creation, plus a 2-hour
 /// confirmation allowance for a payment seen before the Paykit deadline.
+/// The registration grace ([`crate::locks::REGISTRATION_GRACE_SECONDS`])
+/// takes 600 s of that allowance.
 pub const DEFAULT_LOCKS_LIVE_TASK_HOLD_SECONDS: i64 = 86_400 + 600 + 7_200;
 /// Smallest `LOCKS_LIVE_TASK_HOLD_SECONDS`: the Lock Server's invoice
 /// admission alone.
 pub const MIN_LOCKS_LIVE_TASK_HOLD_SECONDS: i64 = 600;
 /// paykit-server's default `payment_window` (24 h) plus the Lock Server's
-/// 600 s invoice admission: the latest default Paykit deadline after the
-/// hold window. A smaller `LOCKS_LIVE_TASK_HOLD_SECONDS` is accepted with a
-/// startup warning, because it is safe only with a Lock Server whose Paykit
-/// `payment_window` is that much shorter, which the service cannot see.
-pub const PAYKIT_DEFAULT_LOCKS_DEADLINE_SECONDS: i64 = 86_400 + 600;
+/// 600 s invoice admission plus the 600 s registration grace: the latest
+/// default Paykit deadline after the hold window, for a bundle submitted
+/// and registered at the end of the grace. A smaller
+/// `LOCKS_LIVE_TASK_HOLD_SECONDS` is accepted with a startup warning,
+/// because it is safe only with a Lock Server whose Paykit `payment_window`
+/// is that much shorter, which the service cannot see.
+pub const PAYKIT_DEFAULT_LOCKS_DEADLINE_SECONDS: i64 =
+    86_400 + 600 + crate::locks::REGISTRATION_GRACE_SECONDS;
 /// Largest `LOCKS_LIVE_TASK_HOLD_SECONDS` (30 days).
 pub const MAX_LOCKS_LIVE_TASK_HOLD_SECONDS: i64 = 2_592_000;
 
@@ -119,8 +124,9 @@ pub struct Config {
     /// (`LOCKS_LIVE_TASK_HOLD_SECONDS`, default
     /// [`DEFAULT_LOCKS_LIVE_TASK_HOLD_SECONDS`], range 600..=2592000). The
     /// operator must keep it above the Lock Server's Paykit `payment_window`
-    /// plus 600 s of invoice admission, or a payment confirming before the
-    /// Paykit deadline can find its unit released. Only the range is
+    /// plus 600 s of invoice admission plus the 600 s registration grace, or
+    /// a payment confirming before the Paykit deadline can find its unit
+    /// released. Only the range is
     /// enforced, with a startup warning below
     /// [`PAYKIT_DEFAULT_LOCKS_DEADLINE_SECONDS`]: neither the lock nor the
     /// Lock Server's task lookup carries that window, and the service does
@@ -493,7 +499,8 @@ impl Config {
             tracing::warn!(
                 locks_live_task_hold_seconds,
                 "LOCKS_LIVE_TASK_HOLD_SECONDS is below paykit-server's default payment_window \
-                 plus invoice admission ({PAYKIT_DEFAULT_LOCKS_DEADLINE_SECONDS} s): a Locks \
+                 plus invoice admission plus the registration grace \
+                 ({PAYKIT_DEFAULT_LOCKS_DEADLINE_SECONDS} s): a Locks \
                  order can be released while its task can still complete, unless the Lock \
                  Server's Paykit payment_window is that much shorter"
             );
@@ -1543,8 +1550,8 @@ mod tests {
         for (value, expected, warns) in [
             (None, DEFAULT_LOCKS_LIVE_TASK_HOLD_SECONDS, false),
             (Some("600"), 600, true),
-            (Some("86999"), 86_999, true),
-            (Some("87000"), 87_000, false),
+            (Some("87599"), 87_599, true),
+            (Some("87600"), 87_600, false),
             (Some("2592000"), 2_592_000, false),
         ] {
             let _guard = ENV_LOCK.lock().expect("env lock");

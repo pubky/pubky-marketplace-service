@@ -112,6 +112,16 @@ row lock while holding it. The sweep therefore waits for the correlation
 instead of skipping it: nothing that holds it waits for a lock the sweep
 holds.
 
+These paths judge time only after their last row-lock wait. Registration,
+the buyer's cancel and a first preparation read the injected clock once the
+payment, correlation and order are locked; a preparation replay, which reads
+no order fields, reads it once the payment and correlation are locked. The
+sweep advances its tick instant by the clock's movement up to the moment
+the correlation lock is granted. The registration grace, the live-task
+bound, the armed hold and every timestamp these paths write therefore use
+an instant after the wait, so a transaction that enters before a bound and
+waits across it is judged past the bound.
+
 ## Where a retry is enough
 
 `workers::expire_due_payment_windows` and `expiry::expire_due_reservations`

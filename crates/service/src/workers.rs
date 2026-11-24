@@ -4511,6 +4511,19 @@ pub async fn expire_due_payment_windows(
     state: &AppState,
     now: DateTime<Utc>,
 ) -> anyhow::Result<u64> {
+    expire_payment_windows_since(state, now, state.clock.now()).await
+}
+
+/// [`expire_due_payment_windows`] for a pass whose `now` was read when the
+/// injected clock showed `started`. Each Locks candidate is re-checked and
+/// expired at `now` advanced by the clock's movement since `started`, read
+/// after its row-lock wait: an instant read before the wait would stamp the
+/// expiry with a time already past.
+async fn expire_payment_windows_since(
+    state: &AppState,
+    now: DateTime<Utc>,
+    started: DateTime<Utc>,
+) -> anyhow::Result<u64> {
     let pool = &state.pool;
     let mut tx = pool.begin().await?;
     // A `preparing` bitcoin order is excluded here: its expiry must first
@@ -4541,16 +4554,20 @@ pub async fn expire_due_payment_windows(
 
     let mut expired = 0u64;
     for (order_id, payment_id, payment_state, buyer_pubky) in due {
-        if !lock_held_due_order(&mut tx, &predicate, order_id, payment_id, now).await? {
+        let locked_at = lock_held_due_order(&mut tx, &predicate, order_id, payment_id, || {
+            now + (state.clock.now() - started)
+        })
+        .await?;
+        let Some(locked_at) = locked_at else {
             continue;
-        }
+        };
         expire_held_order(
             &mut tx,
             order_id,
             payment_id,
             &payment_state,
             &buyer_pubky,
-            now,
+            locked_at,
         )
         .await?;
         expired += 1;
@@ -4819,10 +4836,11 @@ const SWEEPABLE_PAYMENT: &str = "(p.state IN ('awaiting_entitlement', 'detected'
 /// - a registered task the Lock Server last reported `pending` or
 ///   `in_progress`, or that no lookup has answered yet (status NULL), up to
 ///   `hold_seconds` (`LOCKS_LIVE_TASK_HOLD_SECONDS`) past the window. The
-///   Shop submits the bundle inside the window, and the task's Paykit
-///   deadline falls at most 600 s of invoice admission plus Paykit's
-///   `payment_window` after that; the bound keeps a silent Lock Server from
-///   pinning stock forever.
+///   Shop submits the bundle before registering it, and registration lands
+///   no later than the 600 s registration grace past the window, so the
+///   task's Paykit deadline falls at most that grace plus 600 s of invoice
+///   admission plus Paykit's `payment_window` after the window; the bound
+///   keeps a silent Lock Server from pinning stock forever.
 /// - a payment prepared but not registered, up to
 ///   [`crate::locks::REGISTRATION_GRACE_SECONDS`] past the window: its
 ///   bundle may be at the Lock Server already, and the service has no bundle
@@ -4910,18 +4928,21 @@ async fn lock_sweep_order(
 /// between this check and the release. The correlation lock waits rather
 /// than skips: its other holders either lock the payment first (which this
 /// transaction holds) or write the correlation alone and take no further
-/// row lock.
+/// row lock. The predicate is judged at `instant()`, read once that wait is
+/// over, and that instant is returned for the expiry; the order lock that
+/// follows skips rather than waits.
 async fn lock_held_due_order(
     tx: &mut Transaction<'_, Postgres>,
     predicate: &str,
     order_id: Uuid,
     payment_id: Uuid,
-    now: DateTime<Utc>,
-) -> Result<bool, sqlx::Error> {
+    instant: impl FnOnce() -> DateTime<Utc>,
+) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
     sqlx::query("SELECT id FROM payment_locks_correlations WHERE payment_id = $1 FOR UPDATE")
         .bind(payment_id)
         .execute(&mut **tx)
         .await?;
+    let now = instant();
     let locked: Option<(Uuid,)> = sqlx::query_as(&format!(
         "SELECT o.id FROM orders o JOIN payments p ON p.order_id = o.id \
          WHERE {predicate} AND o.id = $2 AND p.id = $3 \
@@ -4932,7 +4953,7 @@ async fn lock_held_due_order(
     .bind(payment_id)
     .fetch_optional(&mut **tx)
     .await?;
-    Ok(locked.is_some())
+    Ok(locked.map(|_| now))
 }
 
 /// Cancels leftover unbound checkouts (`pending_payment`, no hold, no
@@ -5957,6 +5978,7 @@ pub async fn run_once(
     holder: Uuid,
     now: DateTime<Utc>,
 ) -> anyhow::Result<WorkerSummary> {
+    let started = state.clock.now();
     let lease_seconds = state.config.worker_lease_seconds;
     let mut summary = WorkerSummary::default();
 
@@ -6085,7 +6107,7 @@ pub async fn run_once(
         }
     }
     if try_acquire_lease(&state.pool, TASK_PAYMENT_WINDOW, holder, now, lease_seconds).await? {
-        let result = expire_due_payment_windows(state, now).await;
+        let result = expire_payment_windows_since(state, now, started).await;
         release_lease(&state.pool, TASK_PAYMENT_WINDOW, holder, now).await?;
         summary.payment_windows_expired = result?;
     }
