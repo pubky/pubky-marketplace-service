@@ -312,6 +312,22 @@ impl std::fmt::Debug for ExpectedLocksBinding {
     }
 }
 
+/// How long past its hold window a prepared but unregistered Locks payment
+/// stays held and can still register. The client submits the proof bundle
+/// between preparation and registration, and the Lock Server creates the
+/// task inside that submission, so the grace covers a submission and
+/// registration in flight when the window ends, and a client retrying a
+/// registration whose reply it lost. A prepared row has no bundle id to look
+/// up, so a longer hold would let any buyer pin the unit by preparing and
+/// walking away.
+pub const REGISTRATION_GRACE_SECONDS: i64 = 600;
+
+/// The `payment_locks_observations.observed_status` a buyer's cancel of an
+/// unpaid Locks order appends to its correlation history, beside the payment
+/// expiry it performs. A task that completes afterwards takes the late-money
+/// fork: it never confirms the cancelled order through the ordinary path.
+pub const BUYER_CANCELLED: &str = "buyer_cancelled";
+
 /// Static labels for a completed task the service cannot verify against the
 /// prepared payment. Each parks the payment in `manual_review`; none
 /// confirms. Written to `payment_locks_correlations.last_observed_status`
@@ -327,6 +343,8 @@ pub mod unverified {
     pub const UNOPENABLE: &str = "binding_unopenable";
     /// Every label above, for queries that select parked payments.
     pub const ALL: [&str; 4] = [MISSING, UNVERIFIABLE, MALFORMED, UNOPENABLE];
+    /// The labels retried before parking (`workers::LOCKS_UNVERIFIED_RETRY_SECONDS`).
+    pub const RETRIED: [&str; 2] = [MALFORMED, UNOPENABLE];
 }
 
 /// Why a completed task does not qualify its payment. Each variant is a

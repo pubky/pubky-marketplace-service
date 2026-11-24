@@ -1785,7 +1785,7 @@ pub const LOCKS_UNVERIFIED_RETRY_SECONDS: i64 = 86_400;
 
 /// The observation outcome marking the first sighting of `label` while it
 /// is still being retried.
-fn unverified_retry_outcome(label: &str) -> String {
+pub(crate) fn unverified_retry_outcome(label: &str) -> String {
     format!("retry_{label}")
 }
 
@@ -4489,11 +4489,12 @@ pub async fn verify_due_paykit_payments(
 /// NULL (pre-#50 rows the 0012 backfill missed) is already elapsed.
 ///
 /// This is a marketplace policy transition: an upstream failure never expires
-/// a payment by itself. The one upstream fact it waits on is a registered
-/// Locks task that is live or not yet looked up ([`live_locks_task`]): that
-/// task can still grant the buyer access, so its order stays held until the
-/// task completes, fails or expires, or `LOCKS_LIVE_TASK_HOLD_SECONDS` past
-/// the window. A Locks correlation keeps polling after the window (bounded
+/// a payment by itself. The one upstream fact it waits on is a Locks task
+/// that may still grant the buyer access ([`live_locks_task`]): a registered
+/// task that is live or not yet looked up, held until it completes, fails or
+/// expires, or `LOCKS_LIVE_TASK_HOLD_SECONDS` past the window; or a prepared
+/// payment not yet registered, held for a short registration grace past the
+/// window. A Locks correlation keeps polling after the window (bounded
 /// by the Lock Server's own task ageing), so a completion verified later
 /// still takes the late-money fork. Payments already under `manual_review` are deliberately
 /// NOT swept: a human decides those — their money may be real, so their
@@ -4812,27 +4813,40 @@ const SWEEPABLE_PAYMENT: &str = "(p.state IN ('awaiting_entitlement', 'detected'
          AND c.last_observed_status IN ('binding_missing', 'binding_unverifiable', \
              'binding_malformed', 'binding_unopenable'))))";
 
-/// A Locks payment whose registered task can still grant the buyer access:
-/// the Lock Server last reported it `pending`/`in_progress`, or no lookup
-/// has succeeded yet (status NULL; a missing task records `not_found`).
-/// Registration needs the bundle id the Lock Server returns on proof
-/// submission, so the task exists before the hold window ends, and its
-/// Paykit deadline falls at most 600 s of invoice admission plus Paykit's
-/// `payment_window` after that. Neither the window sweep nor the buyer's
-/// `order.cancel_request` may cancel such an order and release its unit;
-/// `hold_seconds`
-/// (`LOCKS_LIVE_TASK_HOLD_SECONDS`) past the window bounds the wait so a
-/// silent Lock Server cannot pin stock forever. `$1` is `now`; the bound
-/// is a validated integer, inlined so callers bind only `$1`.
+/// A Locks payment whose task at the Lock Server can still grant the buyer
+/// access. Neither the window sweep nor the buyer's `order.cancel_request`
+/// may cancel such an order and release its unit:
+/// - a registered task the Lock Server last reported `pending` or
+///   `in_progress`, or that no lookup has answered yet (status NULL), up to
+///   `hold_seconds` (`LOCKS_LIVE_TASK_HOLD_SECONDS`) past the window. The
+///   Shop submits the bundle inside the window, and the task's Paykit
+///   deadline falls at most 600 s of invoice admission plus Paykit's
+///   `payment_window` after that; the bound keeps a silent Lock Server from
+///   pinning stock forever.
+/// - a payment prepared but not registered, up to
+///   [`crate::locks::REGISTRATION_GRACE_SECONDS`] past the window: its
+///   bundle may be at the Lock Server already, and the service has no bundle
+///   id to look it up.
+///
+/// A registered task answering `not_found` is not live. The Lock Server
+/// creates the task inside the submission request, before the client can
+/// register its bundle id, so `not_found` means a bundle that was never
+/// submitted; holding it would let any buyer pin the unit by registering an
+/// invented bundle id. `$1` is `now`; the bound is a validated integer,
+/// inlined so callers bind only `$1`.
 pub(crate) fn live_locks_task(hold_seconds: i64) -> String {
+    let grace = crate::locks::REGISTRATION_GRACE_SECONDS;
     format!(
         "(p.adapter = 'locks' AND p.state = 'awaiting_entitlement' \
          AND o.hold_expires_at IS NOT NULL \
-         AND o.hold_expires_at > $1 - make_interval(secs => {hold_seconds}) \
          AND EXISTS (SELECT 1 FROM payment_locks_correlations c WHERE c.payment_id = p.id \
-             AND c.preparation_state = 'registered' AND c.verification_state = 'pending' \
-             AND (c.last_observed_status IS NULL \
-                 OR c.last_observed_status IN ('pending', 'in_progress'))))"
+             AND c.verification_state = 'pending' \
+             AND ((c.preparation_state = 'prepared' \
+                     AND o.hold_expires_at > $1 - make_interval(secs => {grace})) \
+                 OR (c.preparation_state = 'registered' \
+                     AND o.hold_expires_at > $1 - make_interval(secs => {hold_seconds}) \
+                     AND (c.last_observed_status IS NULL \
+                         OR c.last_observed_status IN ('pending', 'in_progress'))))))"
     )
 }
 
@@ -4891,8 +4905,8 @@ async fn lock_sweep_order(
 /// payment, correlation, order lock order that registration takes. `predicate`
 /// is the whole sweep predicate, checked again under those locks; `false`
 /// skips the candidate this tick. Discovery read the correlation without
-/// locking it, so a verifier may have committed `not_found` to `pending` since;
-/// with the row locked until this transaction commits, no status write lands
+/// locking it, so a verifier may have committed a live status since; with
+/// the row locked until this transaction commits, no status write lands
 /// between this check and the release. The correlation lock waits rather
 /// than skips: its other holders either lock the payment first (which this
 /// transaction holds) or write the correlation alone and take no further

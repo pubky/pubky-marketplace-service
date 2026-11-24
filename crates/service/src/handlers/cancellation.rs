@@ -30,15 +30,21 @@
 //! activation can publish it afterwards. Once money is observed on the
 //! request (`detected`, `awaiting_seller_confirmation`, `confirmed`), or
 //! PayPal has reported a payment the seller has yet to confirm
-//! (`gateway_payment_seen_at`), the buyer can no longer cancel: the hold
-//! stays with the payment it backs.
+//! (`gateway_payment_seen_at`), or the Lock Server reported a Locks task
+//! `completed` that is still being verified, the buyer can no longer cancel:
+//! the hold stays with the payment it backs.
 //!
-//! Locks-rail orders: while the order's registered Locks task can still
-//! grant access (the window sweep's live-task predicate), the immediate
-//! cancel is refused with `locks_task_live`, because the service cannot end
-//! the task at the Lock Server. Once the Lock Server reports the task
-//! terminal or unknown, or `LOCKS_LIVE_TASK_HOLD_SECONDS` past the window
-//! has passed, the cancel proceeds as for any unpaid order.
+//! Locks-rail orders: while the order's Locks task can still grant access
+//! (the window sweep's live-task predicate: a registered task that is live
+//! or not yet looked up, or a payment prepared but not registered, within
+//! their bounds), the immediate cancel is refused with `locks_task_live`,
+//! because the service cannot end the task at the Lock Server. A task the
+//! Lock Server reported `completed` whose binding is still being verified is
+//! refused like money observed on a Paykit request. Otherwise the cancel
+//! proceeds as for any unpaid order: it expires the unpaid payment the same
+//! way and appends `buyer_cancelled` to the correlation's history, so a
+//! task registered before the cancel that still completes takes the
+//! late-money fork.
 
 use chrono::{DateTime, Utc};
 use marketplace_domain::commands::{OrderActionPayload, RequestCancellationPayload};
@@ -113,7 +119,9 @@ pub async fn request(
         )));
     }
     if order.state == "pending_payment"
-        && (paykit_money_observed(&order) || order.gateway_payment_seen_at.is_some())
+        && (paykit_money_observed(&order)
+            || order.gateway_payment_seen_at.is_some()
+            || locks_completion_unverified(tx, payment.as_ref()).await?)
     {
         return Ok(Err(CommandFailure::refused(
             crate::refusal_audit::RefusalKind::InvalidState,
@@ -226,6 +234,7 @@ pub async fn request(
 
     let paykit_void = match (&payment, immediate) {
         (Some(payment), true) => {
+            end_locks_payment(tx, payment, actor, command.command_id, now).await?;
             end_paykit_request(tx, &order, payment, actor, command.command_id, now).await?
         }
         _ => None,
@@ -274,7 +283,34 @@ fn paykit_money_observed(order: &OrderRow) -> bool {
     )
 }
 
-/// Whether the order's registered Locks task can still grant the buyer
+/// The Lock Server reported the order's Locks task `completed` and the
+/// service is still retrying the verification of its binding
+/// (`retry_binding_*`): the buyer already holds access, as money observed on
+/// a Paykit request, so the hold stays with the payment. The caller holds the
+/// payment and correlation rows.
+async fn locks_completion_unverified(
+    tx: &mut Transaction<'_, Postgres>,
+    payment: Option<&LockedPayment>,
+) -> Result<bool, sqlx::Error> {
+    let Some(payment) = payment.filter(|payment| payment.adapter == "locks") else {
+        return Ok(false);
+    };
+    let retried: Vec<String> = crate::locks::unverified::RETRIED
+        .iter()
+        .map(|label| crate::workers::unverified_retry_outcome(label))
+        .collect();
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM payment_locks_correlations WHERE payment_id = $1 \
+         AND verification_state = 'pending' AND last_observed_status = ANY($2))",
+    )
+    .bind(payment.id)
+    .bind(&retried)
+    .fetch_one(&mut **tx)
+    .await
+}
+
+/// Whether the order's Locks task (registered, or a prepared payment whose
+/// bundle may already be at the Lock Server) can still grant the buyer
 /// access, by the window sweep's own predicate
 /// ([`crate::workers::live_locks_task`]): the service cannot end the task
 /// at the Lock Server, so releasing the unit now could leave the buyer with
@@ -353,24 +389,7 @@ async fn end_paykit_request(
         return Ok(None);
     }
     if payment.state == "awaiting_entitlement" {
-        let (revision,): (i64,) = sqlx::query_as(
-            "UPDATE payments SET state = 'expired', revision = revision + 1, \
-             updated_at = $2 WHERE id = $1 RETURNING revision",
-        )
-        .bind(payment.id)
-        .bind(now)
-        .fetch_one(&mut **tx)
-        .await?;
-        insert_event(
-            tx,
-            command_id,
-            &ids::payment_aggregate_id(payment.id),
-            revision,
-            actor,
-            "payment.expired",
-            now,
-        )
-        .await?;
+        expire_unpaid_payment(tx, payment, actor, command_id, now).await?;
     }
     if order.paykit_activation_state.as_deref() != Some("preparing") {
         return Ok(None);
@@ -402,6 +421,66 @@ async fn end_paykit_request(
     };
     void_preparing_request(tx, order.id, now).await?;
     Ok(Some(pin))
+}
+
+/// Ends the Locks leg of an unpaid order the buyer cancels, inside the
+/// cancel transaction. The `awaiting_entitlement` payment expires and the
+/// correlation's history records [`crate::locks::BUYER_CANCELLED`], so a
+/// task the buyer registered before cancelling that still completes takes
+/// the late-money fork, never an ordinary confirmation of the cancelled
+/// order. The correlation keeps polling so that completion surfaces.
+async fn end_locks_payment(
+    tx: &mut Transaction<'_, Postgres>,
+    payment: &LockedPayment,
+    actor: &str,
+    command_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    if payment.adapter != "locks" || payment.state != "awaiting_entitlement" {
+        return Ok(());
+    }
+    expire_unpaid_payment(tx, payment, actor, command_id, now).await?;
+    sqlx::query(
+        "INSERT INTO payment_locks_observations (correlation_id, observed_status, outcome, \
+         observed_at) SELECT id, $2, 'payment_expired', $3 \
+         FROM payment_locks_correlations WHERE payment_id = $1",
+    )
+    .bind(payment.id)
+    .bind(crate::locks::BUYER_CANCELLED)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// `awaiting_entitlement` to `expired` by the buyer's cancel (the payment
+/// machine's `order.cancel_request` edge).
+async fn expire_unpaid_payment(
+    tx: &mut Transaction<'_, Postgres>,
+    payment: &LockedPayment,
+    actor: &str,
+    command_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    let (revision,): (i64,) = sqlx::query_as(
+        "UPDATE payments SET state = 'expired', revision = revision + 1, \
+         updated_at = $2 WHERE id = $1 RETURNING revision",
+    )
+    .bind(payment.id)
+    .bind(now)
+    .fetch_one(&mut **tx)
+    .await?;
+    insert_event(
+        tx,
+        command_id,
+        &ids::payment_aggregate_id(payment.id),
+        revision,
+        actor,
+        "payment.expired",
+        now,
+    )
+    .await?;
+    Ok(())
 }
 
 /// `preparing → voided` for an order that is no longer payable: the request

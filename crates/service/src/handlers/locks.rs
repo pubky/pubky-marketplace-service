@@ -25,9 +25,15 @@
 //!
 //! REGISTRATION only attaches the buyer-generated bundle id to that
 //! prepared row: it accepts no resource, criterion, economics, or reference
-//! from the client, requires receiver-clock eligibility (the prepared
-//! window open, the order still holding it), and seals the bundle with the
-//! payment-bound key. Neither step advances the payment: only the
+//! from the client, requires receiver-clock eligibility (the order still
+//! holding the prepared window, and the preparation held: inside the window
+//! or up to [`crate::locks::REGISTRATION_GRACE_SECONDS`] past it), and seals
+//! the bundle with the payment-bound key. The client submits the bundle to
+//! the Lock Server before it registers, so the window sweep and the buyer's
+//! cancel keep a prepared payment for the same grace
+//! ([`crate::workers::live_locks_task`]), and a registration in flight at
+//! the window end, or retried after a lost reply, can still land. Neither
+//! step advances the payment: only the
 //! background worker's independent verification of a completed Locks
 //! result does that (ADR-0019 §7 — the service must not forge completion
 //! from client input).
@@ -37,10 +43,11 @@
 //!   (executor); a prepare replay unseals the buyer-scoped reference;
 //! - a changed replay under the same command id is an idempotency conflict
 //!   (executor);
-//! - a repeated prepare recovers the same live reference for the same
-//!   buyer, is `UNAUTHORIZED` for any other actor, is a stable
-//!   `INVALID_STATE` after registration or expiry, and a concurrent double
-//!   prepare produces exactly one row, one hold, and one reference;
+//! - a repeated prepare recovers the same reference for the same buyer
+//!   while the preparation is held, is `UNAUTHORIZED` for any other actor,
+//!   is a stable `INVALID_STATE` after registration or once the grace has
+//!   passed, and a concurrent double prepare produces exactly one row, one
+//!   hold, and one reference;
 //! - a second registration for the same payment or order is refused
 //!   (`INVALID_STATE`, backstopped by the table's UNIQUE constraints);
 //! - the same `{creator, bundle_id}` identity can never correlate a second
@@ -100,6 +107,14 @@ where
     .execute(executor)
     .await?;
     Ok(())
+}
+
+/// Whether a preparation whose window ends at `window_expires_at` is still
+/// held: inside the window, or up to
+/// [`crate::locks::REGISTRATION_GRACE_SECONDS`] past it, the grace the
+/// window sweep keeps an unregistered preparation for.
+fn preparation_held(window_expires_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    now < window_expires_at + chrono::Duration::seconds(crate::locks::REGISTRATION_GRACE_SECONDS)
 }
 
 pub async fn register(
@@ -182,9 +197,10 @@ pub async fn register(
         )));
     }
     // Receiver-clock eligibility, under the payment/order locks: attachment
-    // is allowed only while the prepared window is still open and the order
-    // still holds exactly that window. Without this an elapsed preparation
-    // could attach (and later confirm) before the expiry sweep runs.
+    // is allowed only while the order still holds exactly the prepared
+    // window and the preparation is held. Without this a preparation past
+    // its grace could attach (and later confirm) before the expiry sweep
+    // runs.
     let Some(order) = fetch_order_for_update(tx, payment.order_id).await? else {
         return Ok(Err(CommandFailure::refused(
             crate::refusal_audit::RefusalKind::InvariantViolation,
@@ -202,7 +218,7 @@ pub async fn register(
             "The order no longer holds the prepared Locks payment window.",
         )));
     }
-    if now >= window_expires_at {
+    if !preparation_held(window_expires_at, now) {
         return Ok(Err(CommandFailure::refused(
             crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
@@ -516,8 +532,9 @@ pub async fn prepare(
     // The prepared-row replay is checked BEFORE the revision gate: a second
     // prepare — including the loser of a concurrent double prepare, which
     // observes the winner's revision bump — recovers the same live
-    // reference rather than conflicting (DESIGN §3.2). An elapsed
-    // preparation is never replayed.
+    // reference rather than conflicting (DESIGN §3.2). A preparation is
+    // replayed while it is held, so a client that lost its registration can
+    // still attach the bundle it submitted; past its grace it never is.
     let existing: Option<PreparedRow> = sqlx::query_as(
         "SELECT preparation_state, client_reference_ciphertext, window_expires_at, \
          expected_resource_hash, criterion_id \
@@ -534,7 +551,7 @@ pub async fn prepare(
             Some(resource_hash),
             Some(criterion_id),
         )) if state == "prepared" => {
-            if now >= *expires_at {
+            if !preparation_held(*expires_at, now) {
                 return Ok(Err(CommandFailure::refused(
                     crate::refusal_audit::RefusalKind::InvalidState,
                     ErrorCode::InvalidState,
