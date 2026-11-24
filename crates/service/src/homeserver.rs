@@ -648,6 +648,13 @@ pub struct HttpHomeserverClient {
     http: reqwest::Client,
 }
 
+/// Controls whether a fetched record's public path is safe to include in logs.
+#[derive(Clone, Copy)]
+enum FetchRecordKind {
+    Public,
+    ContentLock,
+}
+
 impl HttpHomeserverClient {
     pub fn new(base_url: &str) -> anyhow::Result<Self> {
         let base_url = base_url.trim_end_matches('/').to_string();
@@ -659,7 +666,12 @@ impl HttpHomeserverClient {
         Ok(Self { base_url, http })
     }
 
-    async fn fetch_inner(&self, seller_pubky: &str, path: &str) -> HomeserverFetchOutcome {
+    async fn fetch_inner(
+        &self,
+        seller_pubky: &str,
+        path: &str,
+        record_kind: FetchRecordKind,
+    ) -> HomeserverFetchOutcome {
         let prefix = pubky_host_prefix(seller_pubky);
         let url = format!("{}{path}", self.base_url);
         let response = self
@@ -671,33 +683,80 @@ impl HttpHomeserverClient {
         let response = match response {
             Ok(response) => response,
             Err(_) => {
-                tracing::warn!("homeserver record fetch transport failure");
+                match record_kind {
+                    FetchRecordKind::Public => {
+                        tracing::warn!("homeserver record fetch transport failure");
+                    }
+                    FetchRecordKind::ContentLock => {
+                        tracing::warn!(
+                            record = "content_lock",
+                            pubky_host_prefix = %prefix,
+                            "homeserver record fetch transport failure"
+                        );
+                    }
+                }
                 return HomeserverFetchOutcome::Unavailable;
             }
         };
         let status = response.status();
         if status == reqwest::StatusCode::NOT_FOUND {
-            tracing::warn!(
-                path = %path,
-                pubky_host_prefix = %prefix,
-                status = %status,
-                "homeserver record fetch not found"
-            );
+            match record_kind {
+                FetchRecordKind::Public => {
+                    tracing::warn!(
+                        path = %path,
+                        pubky_host_prefix = %prefix,
+                        status = %status,
+                        "homeserver record fetch not found"
+                    );
+                }
+                FetchRecordKind::ContentLock => {
+                    tracing::warn!(
+                        record = "content_lock",
+                        pubky_host_prefix = %prefix,
+                        status = %status,
+                        "homeserver record fetch not found"
+                    );
+                }
+            }
             return HomeserverFetchOutcome::NotFound;
         }
         if !status.is_success() {
-            tracing::warn!(
-                path = %path,
-                pubky_host_prefix = %prefix,
-                status = %status,
-                "homeserver record fetch rejected"
-            );
+            match record_kind {
+                FetchRecordKind::Public => {
+                    tracing::warn!(
+                        path = %path,
+                        pubky_host_prefix = %prefix,
+                        status = %status,
+                        "homeserver record fetch rejected"
+                    );
+                }
+                FetchRecordKind::ContentLock => {
+                    tracing::warn!(
+                        record = "content_lock",
+                        pubky_host_prefix = %prefix,
+                        status = %status,
+                        "homeserver record fetch rejected"
+                    );
+                }
+            }
             return HomeserverFetchOutcome::Unavailable;
         }
         match response.json::<Value>().await {
             Ok(record) => HomeserverFetchOutcome::Found(record),
             Err(_) => {
-                tracing::warn!("homeserver record fetch returned a non-JSON body");
+                match record_kind {
+                    FetchRecordKind::Public => {
+                        tracing::warn!("homeserver record fetch returned a non-JSON body");
+                    }
+                    FetchRecordKind::ContentLock => {
+                        tracing::warn!(
+                            record = "content_lock",
+                            pubky_host_prefix = %prefix,
+                            status = %status,
+                            "homeserver record fetch returned a non-JSON body"
+                        );
+                    }
+                }
                 HomeserverFetchOutcome::Unavailable
             }
         }
@@ -918,6 +977,7 @@ impl HomeserverListingClient for HttpHomeserverClient {
             self.fetch_inner(
                 seller_pubky,
                 &format!("/pub/pubky.app/marketplace/v1/listings/{listing_id}"),
+                FetchRecordKind::Public,
             )
             .await
         })
@@ -968,6 +1028,7 @@ impl HomeserverListingClient for HttpHomeserverClient {
             self.fetch_inner(
                 seller_pubky,
                 &format!("/pub/pubky.app/marketplace/v1/drops/{drop_id}"),
+                FetchRecordKind::Public,
             )
             .await
         })
@@ -978,14 +1039,20 @@ impl HomeserverListingClient for HttpHomeserverClient {
         creator_pubky: &'a str,
         content_path: &'a str,
     ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
-        Box::pin(async move { self.fetch_inner(creator_pubky, content_path).await })
+        Box::pin(async move {
+            self.fetch_inner(creator_pubky, content_path, FetchRecordKind::ContentLock)
+                .await
+        })
     }
 
     fn fetch_shop<'a>(
         &'a self,
         seller_pubky: &'a str,
     ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
-        Box::pin(async move { self.fetch_inner(seller_pubky, SHOP_PATH).await })
+        Box::pin(async move {
+            self.fetch_inner(seller_pubky, SHOP_PATH, FetchRecordKind::Public)
+                .await
+        })
     }
 
     fn fetch_deliverable_digest<'a>(

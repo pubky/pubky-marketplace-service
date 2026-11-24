@@ -2298,8 +2298,12 @@ advance a payment (ADR-0019 §7).
   payment/order and the Locks lifecycle identity `{creator, bundle_id}`.
   The bundle id is the buyer's cryptographically random lifecycle handle —
   a bearer secret — and the lock resource's creator must equal the order's
-  seller.   The correlation binds order id, buyer, creator, BLAKE3 lock
-  resource hash, amount, asset, and payment policy version (`1`)
+  seller. The bundle id must be the canonical 26-character uppercase Crockford
+  base32 encoding of 16 bytes; the last character's two low bits are padding
+  and must be zero, so it is one of `0 4 8 C G M R W`. Any other spelling is
+  refused with 422 `INVALID_COMMAND` and an issue at `payload.bundle_id`; the
+  value is not echoed. The correlation binds order id, buyer, creator, BLAKE3
+  lock resource hash, amount, asset, and payment policy version (`1`)
   (upstream-integration "Transaction-service correlation"). Registration
   is a payment lock point (see Inventory semantics above): it acquires the
   order's inventory hold and arms the payment window — the correlation

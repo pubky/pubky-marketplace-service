@@ -3079,6 +3079,31 @@ mod tests {
     }
 
     #[test]
+    fn bundle_id_encoder_outputs_pass_domain_validation() {
+        let ascending: [u8; 16] = std::array::from_fn(|index| index as u8);
+        let descending: [u8; 16] = std::array::from_fn(|index| 255 - index as u8);
+        let alternating: [u8; 16] =
+            std::array::from_fn(|index| if index % 2 == 0 { 0x00 } else { 0xff });
+        for bytes in [[0; 16], [0xff; 16], ascending, descending, alternating] {
+            let bundle_id = crockford_bundle_id(&bytes);
+            let raw = serde_json::json!({
+                "version": 1,
+                "command_id": "00000000-0000-4000-8000-000000001201",
+                "aggregate_id": "order:00000000-0000-4000-8000-00000000aaaa",
+                "expected_revision": 2,
+                "issued_at": "2026-08-19T22:00:00.000Z",
+                "kind": "payment.register_locks",
+                "payload": {
+                    "payment_id": "00000000-0000-4000-8000-00000000bbbb",
+                    "bundle_id": bundle_id,
+                },
+            });
+            marketplace_domain::commands::parse_command(&raw)
+                .expect("the service encoder emits a canonical bundle id");
+        }
+    }
+
+    #[test]
     fn paypal_email_validation_accepts_plain_addresses_only() {
         validate_paypal_email("merchant@example.com").unwrap();
         validate_paypal_email("a.b+c@sub.example.co").unwrap();

@@ -1645,12 +1645,28 @@ fn country_code_regex() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"^[A-Z]{2}$").expect("valid regex"))
 }
 
-/// Canonical uppercase Crockford base32 (no I, L, O, U), 26 characters: the
-/// Locks `BundleId` wire encoding of 16 bytes. Only the canonical form is
-/// accepted so one bundle identity cannot alias two lookup tokens.
+/// Uppercase Crockford base32 (no I, L, O, U), 26 characters: the shape of
+/// the Locks `BundleId` wire encoding of 16 bytes.
 fn crockford_bundle_id_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"^[0-9ABCDEFGHJKMNPQRSTVWXYZ]{26}$").expect("valid regex"))
+}
+
+/// Whether `value` is the canonical Locks `BundleId` wire encoding. Twenty-six
+/// Crockford characters carry 130 bits and the id is 128 bits, so the last
+/// character's two low bits are padding and must be zero. Re-encoding the
+/// decoded 16 bytes enforces that rule, so one bundle identity cannot alias
+/// multiple lookup tokens.
+fn is_canonical_bundle_id(value: &str) -> bool {
+    if !crockford_bundle_id_regex().is_match(value) {
+        return false;
+    }
+    let Some(decoded) =
+        base32::decode(base32::Alphabet::Crockford, value).filter(|decoded| decoded.len() == 16)
+    else {
+        return false;
+    };
+    base32::encode(base32::Alphabet::Crockford, &decoded) == value
 }
 
 /// Canonical uppercase Crockford base32, 52 characters: the Locks `LockId`
@@ -2479,7 +2495,7 @@ fn validate_register_locks(
     payload: RegisterLocksPayload,
 ) -> Result<CommandPayload, Vec<ValidationIssue>> {
     let mut issues = Vec::new();
-    if !crockford_bundle_id_regex().is_match(&payload.bundle_id) {
+    if !is_canonical_bundle_id(&payload.bundle_id) {
         issues.push(issue(
             "payload.bundle_id",
             "Expected a canonical 26-character Crockford-base32 bundle id",
@@ -4310,6 +4326,41 @@ mod tests {
             let serialized = serde_json::to_string(&issues).expect("issues serialize");
             assert!(!serialized.contains(TEST_BUNDLE_ID));
         }
+    }
+
+    #[test]
+    fn rejects_non_zero_bundle_id_padding_without_echoing_it() {
+        for final_character in ['X', 'Y', 'Z'] {
+            let bundle = format!("{}{final_character}", &TEST_BUNDLE_ID[..25]);
+            let mut raw = register_locks_command_json();
+            raw["payload"]["bundle_id"] = json!(bundle.clone());
+            let issues = parse_command(&raw).expect_err("non-zero padding must be refused");
+            assert!(issues.iter().any(|i| i.path == "payload.bundle_id"));
+            let serialized = serde_json::to_string(&issues).expect("issues serialize");
+            assert!(!serialized.contains(&bundle));
+        }
+    }
+
+    #[test]
+    fn bundle_id_padding_accepts_exactly_the_eight_canonical_final_characters() {
+        const ALPHABET: &str = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+        let mut accepted = Vec::new();
+        for (value, final_character) in ALPHABET.chars().enumerate() {
+            let bundle = format!("{}{final_character}", &TEST_BUNDLE_ID[..25]);
+            let mut raw = register_locks_command_json();
+            raw["payload"]["bundle_id"] = json!(bundle);
+            if parse_command(&raw).is_ok() {
+                assert_eq!(value % 4, 0, "non-zero padding accepted: {final_character}");
+                accepted.push(final_character);
+            }
+        }
+        let expected: Vec<char> = ALPHABET
+            .chars()
+            .enumerate()
+            .filter_map(|(value, character)| (value % 4 == 0).then_some(character))
+            .collect();
+        assert_eq!(accepted.len(), 8);
+        assert_eq!(accepted, expected);
     }
 
     #[test]
