@@ -2276,6 +2276,13 @@ homeserver ends as `invalid` with terminal code `homeserver_not_allowed`
 before a request is sent to that homeserver. A user on another homeserver can
 still sign in with `POST /v1/auth/sessions`.
 
+At boot the service also reads `HOMESERVER_PUBKY`'s Pkarr record in the
+background, for at most 10 s and connecting to no endpoint; the check never
+delays or fails the boot. It logs an error once when the record is missing,
+does not name `HOMESERVER_URL`'s host (the key itself, one of its ICANN
+targets or one of its own addresses), or names no endpoint the exchange may
+connect to.
+
 The exchange does not use the `pubky` SDK's HTTP client. Its request to the
 homeserver:
 

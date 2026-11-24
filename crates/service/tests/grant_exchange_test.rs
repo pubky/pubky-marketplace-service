@@ -12,8 +12,9 @@
 //! naming an internal
 //! address, in every form, are refused with no connection made; a record
 //! mixing refused and allowed addresses is connected to only at the allowed
-//! ones; and an endpoint that speaks only plain HTTP is never sent a
-//! plain-HTTP request.
+//! ones; an endpoint that speaks only plain HTTP is never sent a plain-HTTP
+//! request; and the boot check of `HOMESERVER_PUBKY` reads, without
+//! connecting, whether its record names `HOMESERVER_URL`'s host.
 //!
 //! A homeserver hands its database to `pubky_testnet::drop_test_databases`
 //! only once its last task is gone, so each test runs on a runtime of its own
@@ -36,7 +37,8 @@ use marketplace_service::clock::Clock;
 use marketplace_service::config::Config;
 use marketplace_service::grant;
 use marketplace_service::grant::test_support::GrantTestAuthority;
-use marketplace_service::homeserver_transport::EndpointPolicy;
+use marketplace_service::grant_exchange::GrantExchange;
+use marketplace_service::homeserver_transport::{EndpointPolicy, RecordCheck};
 use pubky_common::auth::grant_session_responses::{GrantSessionInfo, GrantSessionResponse};
 use pubky_common::auth::jws::{ClientId, GrantId};
 use pubky_testnet::pubky::pkarr::dns::rdata::SVCB;
@@ -891,6 +893,109 @@ fn a_record_mixing_refused_and_allowed_addresses_is_connected_only_at_the_allowe
             reached.iter().all(|ip| *ip == allowed),
             "no refused address was connected to: {reached:?} (refused: {refused:?})"
         );
+    });
+}
+
+#[test]
+fn the_boot_check_reads_whether_the_homeserver_record_names_homeserver_url() {
+    on_testnet(|_pool| async move {
+        let mut network = network().await;
+        let homeserver = network
+            .testnet
+            .create_random_homeserver()
+            .await
+            .expect("homeserver");
+        let (key, icann_url) = (homeserver.public_key(), homeserver.icann_http_url());
+        let pkarr = network
+            .testnet
+            .client()
+            .expect("testnet client")
+            .pkarr()
+            .clone();
+        let check = |key: PublicKey, policy: EndpointPolicy, url: String| {
+            let pkarr = pkarr.clone();
+            async move {
+                GrantExchange::new(pkarr, key, policy)
+                    .expect("exchange")
+                    .check_homeserver_url(&url, Duration::from_secs(10))
+                    .await
+            }
+        };
+        let loopback = EndpointPolicy::PublicOrLoopback;
+
+        // The testnet homeserver names its key, 127.0.0.1 and `localhost`.
+        for url in [
+            icann_url.to_string(),
+            format!("https://{}", key.z32()),
+            "https://127.0.0.1:6286".to_string(),
+        ] {
+            assert_eq!(
+                check(key.clone(), loopback, url.clone()).await,
+                RecordCheck::Named,
+                "{url}"
+            );
+        }
+        for url in [
+            "https://homeserver.example",
+            "https://10.0.0.1",
+            "not a url",
+        ] {
+            assert_eq!(
+                check(key.clone(), loopback, url.to_string()).await,
+                RecordCheck::NotNamed,
+                "{url}"
+            );
+        }
+        assert_eq!(
+            check(
+                Keypair::random().public_key(),
+                loopback,
+                icann_url.to_string()
+            )
+            .await,
+            RecordCheck::NoRecord
+        );
+
+        // A record naming only internal addresses: named, but nothing the
+        // exchange may connect to. The check itself connects to nothing.
+        let internal = PkarrKeypair::random();
+        let endpoint = listener().await;
+        publish(
+            &network,
+            vec![endpoint_record(
+                &internal,
+                Endpoints {
+                    direct: Some((
+                        vec![
+                            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+                            IpAddr::V4(Ipv4Addr::LOCALHOST),
+                        ],
+                        endpoint.port,
+                    )),
+                    ..Endpoints::default()
+                },
+            )],
+        )
+        .await;
+        assert_eq!(
+            check(
+                internal.public_key().into(),
+                EndpointPolicy::PublicOnly,
+                "https://10.0.0.1".to_string()
+            )
+            .await,
+            RecordCheck::NoAllowedEndpoint
+        );
+        assert_eq!(
+            check(
+                internal.public_key().into(),
+                loopback,
+                format!("https://127.0.0.1:{}", endpoint.port)
+            )
+            .await,
+            RecordCheck::Named
+        );
+        assert_eq!(endpoint.connections(), 0, "the check connected to nothing");
     });
 }
 

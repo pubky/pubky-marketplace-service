@@ -9,7 +9,7 @@
 //! at `HOMESERVER_URL` every pubky is read from); any other is refused before
 //! a request is sent to it.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use pubky::pkarr;
 use pubky::{GrantClaims, Keypair, PublicKey};
@@ -18,7 +18,7 @@ use pubky_common::auth::jws::{sign_jws, PopNonce, POP_JWS_TYP};
 use pubky_common::auth::pop::PopProofClaims;
 use tokio::time::Instant;
 
-use crate::homeserver_transport::{key_prefix, EndpointPolicy, HomeserverTransport};
+use crate::homeserver_transport::{key_prefix, EndpointPolicy, HomeserverTransport, RecordCheck};
 
 pub const GRANT_SESSION_PATH: &str = "/auth/grant/session";
 /// A grant session answer is a bearer and a few fields of metadata.
@@ -159,6 +159,63 @@ impl GrantExchange {
             return Err(ExchangeRefusal::Failed);
         }
         Ok(session)
+    }
+
+    /// Checks that the configured homeserver's Pkarr record names the host
+    /// of `homeserver_url` (`HOMESERVER_URL`) among its endpoints, and an
+    /// endpoint the exchange may connect to. Reads the record only, within
+    /// `timeout`, and logs the outcome once: at error level when the record
+    /// is missing or does not match.
+    pub async fn check_homeserver_url(
+        &self,
+        homeserver_url: &str,
+        timeout: Duration,
+    ) -> RecordCheck {
+        let homeserver_prefix = self.homeserver.to_z32();
+        let homeserver_prefix = key_prefix(&homeserver_prefix);
+        let Some(host) = url::Url::parse(homeserver_url)
+            .ok()
+            .and_then(|url| url.host().map(|host| host.to_owned()))
+        else {
+            tracing::error!(
+                homeserver_prefix,
+                "HOMESERVER_URL names no host to check HOMESERVER_PUBKY against"
+            );
+            return RecordCheck::NotNamed;
+        };
+        let check = tokio::time::timeout(
+            timeout,
+            self.transport.check_record(&self.homeserver, &host),
+        )
+        .await
+        .unwrap_or(RecordCheck::Unavailable);
+        match check {
+            RecordCheck::Named => tracing::info!(
+                homeserver_prefix,
+                homeserver_host = %host,
+                "HOMESERVER_PUBKY's record names HOMESERVER_URL's host"
+            ),
+            RecordCheck::NotNamed => tracing::error!(
+                homeserver_prefix,
+                homeserver_host = %host,
+                "HOMESERVER_PUBKY's record does not name HOMESERVER_URL's host; grant sign-ins \
+                 of users at HOMESERVER_URL will be refused"
+            ),
+            RecordCheck::NoAllowedEndpoint => tracing::error!(
+                homeserver_prefix,
+                homeserver_host = %host,
+                "HOMESERVER_PUBKY's record names no endpoint the grant exchange may connect to"
+            ),
+            RecordCheck::NoRecord => tracing::error!(
+                homeserver_prefix,
+                "HOMESERVER_PUBKY has no Pkarr record; grant exchanges will fail"
+            ),
+            RecordCheck::Unavailable => tracing::warn!(
+                homeserver_prefix,
+                "HOMESERVER_PUBKY's Pkarr record could not be read to check it against HOMESERVER_URL"
+            ),
+        }
+        check
     }
 }
 

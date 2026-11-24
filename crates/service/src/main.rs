@@ -148,6 +148,11 @@ async fn main() -> anyhow::Result<()> {
     // silently re-open the unregistered-listing dead-end it exists to fix.
     let homeserver = Arc::new(marketplace_service::homeserver::client_from_env()?);
     tracing::info!("homeserver listing sync enabled");
+    if let Some(grant) = &grant {
+        grant.spawn_homeserver_check(
+            std::env::var(marketplace_service::homeserver::ENV_HOMESERVER_URL).unwrap_or_default(),
+        );
+    }
     // NEXUS_URL is required: checkout, bids and offers on a moderated listing
     // are refused from the index's moderation state, and running without it
     // would sell moderated listings by omission.

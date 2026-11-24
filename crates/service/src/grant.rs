@@ -316,6 +316,8 @@ fn client_ip_header_from_env() -> anyhow::Result<Option<HeaderName>> {
 }
 
 const ENV_HOMESERVER_PUBKY: &str = "HOMESERVER_PUBKY";
+/// How long the boot check of `HOMESERVER_PUBKY` may wait for its record.
+const HOMESERVER_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The public key of the homeserver at `HOMESERVER_URL`: the only homeserver
 /// a grant is exchanged at. Surrounding whitespace, such as the trailing
@@ -567,6 +569,18 @@ impl GrantRuntime {
             notify: Arc::new(Notify::new()),
         };
         Ok(Some(Arc::new(runtime)))
+    }
+
+    /// Checks in the background that `HOMESERVER_PUBKY` is the homeserver at
+    /// `homeserver_url`, logging an error when its record says otherwise.
+    /// Never delays or fails the boot.
+    pub fn spawn_homeserver_check(&self, homeserver_url: String) {
+        let exchange = self.exchange.clone();
+        tokio::spawn(async move {
+            exchange
+                .check_homeserver_url(&homeserver_url, HOMESERVER_CHECK_TIMEOUT)
+                .await;
+        });
     }
 
     pub fn active_key_epoch(&self) -> i16 {

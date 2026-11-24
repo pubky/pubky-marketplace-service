@@ -358,6 +358,45 @@ fn connects_to(url: &url::Url, expected: &Host<String>, policy: EndpointPolicy) 
     }
 }
 
+/// Whether a homeserver's record names `host` as one of its endpoints: the
+/// homeserver's key, an address it lists for itself, or an ICANN target as
+/// URL parsing reads it. A domain's trailing dot is ignored on both sides.
+fn names_host(packet: &SignedPacket, homeserver: &pkarr::PublicKey, host: &Host<String>) -> bool {
+    let host = match host {
+        Host::Domain(domain) => Host::Domain(domain.strip_suffix('.').unwrap_or(domain).to_owned()),
+        other => other.clone(),
+    };
+    let direct = |ip: IpAddr| direct_addrs(packet).iter().any(|addr| addr.ip() == ip);
+    let named_directly = match &host {
+        Host::Domain(domain) => *domain == homeserver.to_z32(),
+        Host::Ipv4(ip) => direct(IpAddr::V4(*ip)),
+        Host::Ipv6(ip) => direct(IpAddr::V6(*ip)),
+    };
+    named_directly
+        || https_records(packet)
+            .into_iter()
+            .filter(|svcb| !targets_itself(svcb))
+            .any(|svcb| {
+                let target = svcb.target.to_string();
+                Host::parse(target.strip_suffix('.').unwrap_or(&target)).as_ref() == Ok(&host)
+            })
+}
+
+/// What a homeserver's current record says about a host it is expected at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordCheck {
+    /// The record names the host, and an endpoint the policy allows.
+    Named,
+    /// The record does not name the host among its endpoints.
+    NotNamed,
+    /// The record names the host, but no endpoint the policy allows.
+    NoAllowedEndpoint,
+    /// The homeserver has no record.
+    NoRecord,
+    /// The record could not be read.
+    Unavailable,
+}
+
 /// The homeserver key a user's record names in its `_pubky` HTTPS or SVCB
 /// record, as the `pubky` SDK reads it.
 fn homeserver_named_by(packet: &SignedPacket) -> Option<pkarr::PublicKey> {
@@ -437,6 +476,27 @@ impl HomeserverTransport {
     pub async fn route(&self, homeserver: &pkarr::PublicKey) -> Result<Route, ResolveError> {
         let packet = self.records.current(homeserver).await?;
         Ok(Route::of(&packet, self.policy))
+    }
+
+    /// Whether `homeserver`'s current record names `host`, read without
+    /// connecting to any endpoint.
+    pub async fn check_record(
+        &self,
+        homeserver: &pkarr::PublicKey,
+        host: &Host<String>,
+    ) -> RecordCheck {
+        let packet = match self.records.current(homeserver).await {
+            Ok(packet) => packet,
+            Err(ResolveError::NotFound) => return RecordCheck::NoRecord,
+            Err(_) => return RecordCheck::Unavailable,
+        };
+        if !names_host(&packet, homeserver, host) {
+            RecordCheck::NotNamed
+        } else if Route::of(&packet, self.policy).is_empty() {
+            RecordCheck::NoAllowedEndpoint
+        } else {
+            RecordCheck::Named
+        }
     }
 
     /// Sends the request `build` makes for `path` (an absolute path, no query
@@ -776,6 +836,40 @@ mod tests {
                 icann: vec![(Host::Domain("pubky.example".to_owned()), Some(6286))],
             }
         );
+    }
+
+    #[test]
+    fn a_record_names_its_key_its_own_addresses_and_its_icann_targets() {
+        let record = endpoint_record(
+            &[".", "Homeserver.Example.", "2130706433"],
+            &["8.8.8.8", "2606:4700::1111"],
+        );
+        let key = record.public_key();
+        let named = |url: &str| {
+            let url = url::Url::parse(url).unwrap();
+            names_host(&record, &key, &url.host().unwrap().to_owned())
+        };
+        for url in [
+            format!("https://{}", key.to_z32()),
+            "https://homeserver.example".to_owned(),
+            "https://HOMESERVER.example./pub/".to_owned(),
+            "http://homeserver.example:6286".to_owned(),
+            "https://127.0.0.1".to_owned(),
+            "https://8.8.8.8".to_owned(),
+            "https://[2606:4700::1111]".to_owned(),
+        ] {
+            assert!(named(&url), "{url} is named");
+        }
+        for url in [
+            format!("https://{}", pkarr::Keypair::random().public_key().to_z32()),
+            "https://homeserver.example.com".to_owned(),
+            "https://www.homeserver.example".to_owned(),
+            "https://example".to_owned(),
+            "https://8.8.4.4".to_owned(),
+            "https://[::1]".to_owned(),
+        ] {
+            assert!(!named(&url), "{url} is not named");
+        }
     }
 
     #[tokio::test]
