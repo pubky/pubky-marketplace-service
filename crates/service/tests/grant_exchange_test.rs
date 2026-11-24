@@ -10,8 +10,10 @@
 //! for another pubky, homeserver, grant or client id than the exchanged
 //! grant's is refused; a homeserver's redirect is not followed; records
 //! naming an internal
-//! address, in every form, are refused with no connection made; and an
-//! endpoint that speaks only plain HTTP is never sent a plain-HTTP request.
+//! address, in every form, are refused with no connection made; a record
+//! mixing refused and allowed addresses is connected to only at the allowed
+//! ones; and an endpoint that speaks only plain HTTP is never sent a
+//! plain-HTTP request.
 //!
 //! A homeserver hands its database to `pubky_testnet::drop_test_databases`
 //! only once its last task is gone, so each test runs on a runtime of its own
@@ -334,6 +336,43 @@ impl Listener {
     fn plain_http_requests(&self) -> usize {
         self.plain_http_requests.load(Ordering::SeqCst)
     }
+}
+
+/// A listener on every local IPv4 address that records the local address
+/// each connection reached.
+struct AddressListener {
+    port: u16,
+    reached: Arc<Mutex<Vec<IpAddr>>>,
+}
+
+async fn address_listener() -> AddressListener {
+    let socket = TcpListener::bind("0.0.0.0:0").await.expect("bind");
+    let port = socket.local_addr().expect("address").port();
+    let reached = Arc::new(Mutex::new(Vec::new()));
+    let recorded = reached.clone();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = socket.accept().await {
+            if let Ok(local) = stream.local_addr() {
+                recorded.lock().expect("reached").push(local.ip());
+            }
+        }
+    });
+    AddressListener { port, reached }
+}
+
+impl AddressListener {
+    fn reached(&self) -> Vec<IpAddr> {
+        self.reached.lock().expect("reached").clone()
+    }
+}
+
+/// This host's address on its default route, if it has one: a local address
+/// that is not loopback. Connecting a UDP socket sends nothing.
+fn host_address() -> Option<IpAddr> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("192.0.2.1:9").ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    (!ip.is_loopback() && !ip.is_unspecified()).then_some(ip)
 }
 
 /// A homeserver on loopback holding `keypair`, over TLS pinned to that key
@@ -802,6 +841,55 @@ fn a_record_naming_an_internal_address_is_refused_in_every_form() {
             internal.connections(),
             0,
             "no internal address was contacted"
+        );
+    });
+}
+
+#[test]
+fn a_record_mixing_refused_and_allowed_addresses_is_connected_only_at_the_allowed_one() {
+    on_testnet(|pool| async move {
+        let network = network().await;
+        let endpoint = address_listener().await;
+        // Refused addresses that would otherwise reach the listener, listed
+        // before the allowed one so an unfiltered connector tries them first.
+        let refused: Vec<IpAddr> = host_address()
+            .into_iter()
+            .chain([IpAddr::V6(Ipv4Addr::new(127, 0, 0, 2).to_ipv6_mapped())])
+            .collect();
+        let allowed = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let homeserver = PkarrKeypair::random();
+        let user = user_on(
+            &network,
+            &homeserver,
+            Endpoints {
+                direct: Some((
+                    refused.iter().copied().chain([allowed]).collect(),
+                    endpoint.port,
+                )),
+                ..Endpoints::default()
+            },
+        )
+        .await;
+        let (app, authority) = service(
+            pool,
+            &network,
+            homeserver.public_key().into(),
+            EndpointPolicy::PublicOrLoopback,
+        )
+        .await;
+
+        assert_eq!(
+            run_flow(&app, &authority, &network, &user).await,
+            ("failed".to_string(), Some("grant_exchange".to_string()))
+        );
+        let reached = endpoint.reached();
+        assert!(
+            reached.contains(&allowed),
+            "the allowed address was connected to: {reached:?} (refused: {refused:?})"
+        );
+        assert!(
+            reached.iter().all(|ip| *ip == allowed),
+            "no refused address was connected to: {reached:?} (refused: {refused:?})"
         );
     });
 }
