@@ -663,7 +663,7 @@ pub async fn record_external_refund(
             && review_reason.as_deref() == Some("refund_required")
             && terms.covered_by(&external_refund) == Some(true)
         {
-            crate::bitcoin_review::close_refunded_locks_payment(
+            let closed = crate::bitcoin_review::close_refunded_locks_payment(
                 tx,
                 *payment_id,
                 state,
@@ -673,6 +673,13 @@ pub async fn record_external_refund(
                 now,
             )
             .await?;
+            if !closed {
+                tracing::error!(
+                    payment_id = %payment_id,
+                    order_id = %order.id,
+                    "ALERT a refund-required locks payment did not close with its covering refund"
+                );
+            }
         }
     }
 

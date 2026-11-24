@@ -1235,8 +1235,9 @@ seller's `refund_cap`), that command closes the refund-required Locks
 payment as `refunded` in the same transaction (`confirmed` with
 `resolution_outcome=refunded`, `resolution_basis=seller_attestation`, the
 recorded transaction id as `refund_reference`, one `payment.resolved` event
-by the system actor, server trigger `locks_refund_reconciliation`), the
-record the seller's `refunded` resolution writes for Paykit. A window expiry
+by the system actor, server trigger `locks_refund_reconciliation`): the
+payment columns the seller's `refunded` resolution writes for Paykit, with
+no `paykit_manual_resolutions` row and no `payment_resolved` notice. A window expiry
 is different: its late completion takes the late-money fork and completes the
 order when the unit is free. When the seller has already recorded an
 external refund on the cancelled order (`refunded_external`) before the task
@@ -1245,7 +1246,10 @@ record in the same way when the record covers it: it neither completes the
 order nor asks for the refund again, and nobody is left with an action to
 take. A partial refund closes nothing: money is still owed, so a
 refund-required payment stays in review, and a completion that lands after
-a partial record waits in `manual_review` for an operator.
+a partial record waits in `manual_review` for an operator. A payment in
+`manual_review` on a `refunded_external` order is an operator's: the seller
+can neither record a second refund nor resolve the review, so the order's
+`next_actor` is null rather than the seller.
 
 ### `shared_manual` checkout and manual-review resolution (W1.15)
 
@@ -2494,8 +2498,9 @@ advance a payment (ADR-0019 §7).
   marketplace expiry does depends on how the order ended:
   - **Window expiry** (`payment window elapsed`): the late-money fork. The
     unit still free: the payment confirms and the order is paid
-    (`late_completion`). The unit gone: `manual_review` with
-    `review_reason=refund_required`, the order stays cancelled.
+    (`late_completion`). The unit gone, a digital delivery the seller can
+    no longer make, or a sale over the seller's annual limit: `manual_review`
+    with `review_reason=refund_required`, the order stays cancelled.
   - **Buyer cancel**: refund-required whatever the stock (see "Buyer cancel
     of a Locks order").
   - **Refund already recorded** (`refunded_external`): when the record covers
@@ -2818,9 +2823,11 @@ aggregate sets change):
 - the payment aggregate's command list gains `payment.register_locks`.
 
 Closing a refunded Locks payment adds the server trigger
-`locks_refund_reconciliation` to payment `manual_review → confirmed`, beside
-`paykit_resolution`. The edge stays server-only: no client command confirms
-a payment.
+`locks_refund_reconciliation` to payment `manual_review → confirmed` (beside
+`paykit_resolution`; the edge stays server-only, so no client command
+confirms a payment), and to `expired → confirmed` and
+`awaiting_entitlement → confirmed`, which a completion for an order whose
+covering refund is already recorded takes directly.
 
 ## Resolved contract divergences
 

@@ -2410,6 +2410,11 @@ async fn a_completion_after_a_recorded_refund(pool: PgPool, buyer_cancel: bool, 
             ("manual_review".to_string(), None),
             "money is still owed: an operator decides"
         );
+        assert_eq!(
+            seller_next_actor(&app, &seller, &order).await,
+            Value::Null,
+            "the review is an operator's: the seller has nothing left to do"
+        );
         assert_eq!(manual_review_events(&app.pool).await, 1);
         assert_eq!(
             count(
@@ -2516,6 +2521,11 @@ async fn a_refund_recorded_after_a_refund_required_completion(pool: PgPool, full
                 Some("refund_required".to_string())
             ),
             "a partial refund leaves money owed"
+        );
+        assert_eq!(
+            seller_next_actor(&app, &seller, &order).await,
+            Value::Null,
+            "the review is an operator's: the seller has nothing left to do"
         );
     }
     assert_eq!(

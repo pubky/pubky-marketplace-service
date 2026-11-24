@@ -1204,7 +1204,7 @@ impl OrderRow {
         actor: &str,
         payment_state: Option<&str>,
     ) {
-        if payment_state == Some("manual_review") {
+        if payment_state == Some("manual_review") && !operator_owned_review(&self.state) {
             view["next_actor"] = json!("seller");
         }
         if actor == self.seller_pubky {
@@ -1522,6 +1522,15 @@ pub(crate) fn can_reveal_delivery_address(
     actor == seller && fulfillment == "shipping" && matches!(state, "paid" | "processing")
 }
 
+/// A payment left in `manual_review` on an order whose refund is already
+/// recorded (`refunded_external`, a partial refund) waits for an operator:
+/// the seller cannot record a second refund, and no seller resolution
+/// accepts that order state, so naming the seller would show a task nobody
+/// can do.
+fn operator_owned_review(order_state: &str) -> bool {
+    order_state == "refunded_external"
+}
+
 fn next_actor_for_order(
     state: &str,
     payment_method_bound: bool,
@@ -1530,7 +1539,7 @@ fn next_actor_for_order(
     paykit_request_state: Option<&str>,
     payment_state: Option<&str>,
 ) -> Option<&'static str> {
-    if payment_state == Some("manual_review") {
+    if payment_state == Some("manual_review") && !operator_owned_review(state) {
         return Some("seller");
     }
     match state {
@@ -1865,6 +1874,17 @@ mod tests {
         assert_eq!(
             next_actor_for_order("cancelled", true, false, true, None, Some("manual_review")),
             Some("seller")
+        );
+        assert_eq!(
+            next_actor_for_order(
+                "refunded_external",
+                true,
+                false,
+                true,
+                None,
+                Some("manual_review")
+            ),
+            None
         );
     }
 
