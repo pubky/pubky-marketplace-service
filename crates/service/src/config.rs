@@ -108,10 +108,11 @@ pub struct Config {
     /// How long past `locks_payment_window_seconds` a Locks order stays held
     /// while its registered task is live or not yet looked up
     /// (`LOCKS_LIVE_TASK_HOLD_SECONDS`, default
-    /// [`DEFAULT_LOCKS_LIVE_TASK_HOLD_SECONDS`], range 600..=2592000). Must
-    /// exceed the Lock Server's Paykit `payment_window` plus 600 s of invoice
-    /// admission, or a payment confirming before the Paykit deadline can
-    /// find its unit released.
+    /// [`DEFAULT_LOCKS_LIVE_TASK_HOLD_SECONDS`], range 600..=2592000). The
+    /// operator must keep it above the Lock Server's Paykit `payment_window`
+    /// plus 600 s of invoice admission, or a payment confirming before the
+    /// Paykit deadline can find its unit released. Only the range is
+    /// enforced: the service cannot read paykit-server's configuration.
     pub locks_live_task_hold_seconds: i64,
     /// Unbound leftover cancel (`CHECKOUT_HOLD_WINDOW_SECONDS`, default
     /// 900, minimum 60). Ordinary `checkout.create` does not hold stock;
