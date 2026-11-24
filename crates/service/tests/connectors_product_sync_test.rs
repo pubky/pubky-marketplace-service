@@ -17,6 +17,7 @@ use common::connector_provider::{
     api, as_json, map_listing, query_param, raw, rebuild, save_credentials, start_connect,
     test_keys, test_settings,
 };
+use common::lock_order::wait_until_blocked_by;
 use common::shopify_fake::{FakeShopify, Fault, ACCESS_TOKEN, GOOD_CODE};
 use common::{execute, new_actor, register_command, register_listing_command, TestActor, TestApp};
 use hmac::{Hmac, Mac};
@@ -968,17 +969,6 @@ async fn an_override_change_racing_an_unlink_never_deadlocks(pool: PgPool) {
     }
 }
 
-async fn lock_activity(pool: &PgPool) -> Vec<(i32, Option<String>, Option<String>, String)> {
-    sqlx::query_as(
-        "SELECT pid, wait_event_type, wait_event, left(query, 160) \
-         FROM pg_stat_activity WHERE datname = current_database() \
-         AND pid <> pg_backend_pid() ORDER BY pid",
-    )
-    .fetch_all(pool)
-    .await
-    .expect("activity")
-}
-
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_first_read_racing_an_unlink_never_rolls_the_mapping_back(pool: PgPool) {
     let r = rig(pool).await;
@@ -999,6 +989,10 @@ async fn a_first_read_racing_an_unlink_never_rolls_the_mapping_back(pool: PgPool
     // Hold the sync lock so the unlink holds the connection row while its
     // first snapshot insert and the product read contend.
     let mut holder = r.app.pool.begin().await.expect("holder");
+    let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *holder)
+        .await
+        .expect("holder backend");
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('connector-sync|' || $1::text, 0))")
         .bind(r.connection)
         .execute(&mut *holder)
@@ -1018,55 +1012,13 @@ async fn a_first_read_racing_an_unlink_never_rolls_the_mapping_back(pool: PgPool
         )
         .await
     });
-    let mut unlink_pid: Option<i32> = None;
-    for attempt in 0..200 {
-        unlink_pid = sqlx::query_scalar(
-            "SELECT pid FROM pg_stat_activity \
-             WHERE datname = current_database() AND wait_event_type = 'Lock' \
-               AND wait_event = 'advisory' AND query LIKE '%connector-sync|%'",
-        )
-        .fetch_optional(&r.app.pool)
-        .await
-        .expect("unlink wait poll");
-        if unlink_pid.is_some() {
-            break;
-        }
-        assert!(
-            attempt < 199,
-            "unlink never waited: {:?}",
-            lock_activity(&r.app.pool).await
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
-    let unlink_pid = unlink_pid.expect("unlink backend");
+    let unlink_pid = wait_until_blocked_by(&r.app.pool, &[holder_pid], &[]).await;
 
     let read_pool = r.app.pool.clone();
     let observing = tokio::spawn(async move {
         product_sync::observe(&read_pool, read_started, connection, &product).await
     });
-    let mut read_waiting = false;
-    for attempt in 0..200 {
-        read_waiting = sqlx::query_scalar::<_, i32>(
-            "SELECT pid FROM pg_stat_activity \
-             WHERE datname = current_database() AND pid <> $1 \
-               AND wait_event_type = 'Lock' AND wait_event <> 'advisory'",
-        )
-        .bind(unlink_pid)
-        .fetch_optional(&r.app.pool)
-        .await
-        .expect("read wait poll")
-        .is_some();
-        if read_waiting {
-            break;
-        }
-        assert!(
-            attempt < 199,
-            "read never waited: {:?}",
-            lock_activity(&r.app.pool).await
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
-    assert!(read_waiting);
+    wait_until_blocked_by(&r.app.pool, &[unlink_pid], &[holder_pid]).await;
 
     holder.rollback().await.expect("release sync lock");
     let (unlinked, observed) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
@@ -1446,6 +1398,31 @@ impl Rig {
         assert_eq!(status, StatusCode::OK, "{body}");
     }
 
+    /// Removes a product's mappings without stamping its snapshot's fence, as
+    /// a binary from before 0097 did.
+    async fn unlink_like_an_old_binary(&self, product: &str) {
+        let mut tx = self.app.pool.begin().await.expect("old binary unlink");
+        sqlx::query(
+            "UPDATE connector_product_snapshots SET unlinked_at = NULL \
+             WHERE connection_id = $1 AND provider_product_id = $2",
+        )
+        .bind(self.connection)
+        .bind(product)
+        .execute(&mut *tx)
+        .await
+        .expect("clear old fence");
+        sqlx::query(
+            "DELETE FROM connector_variant_map \
+             WHERE connection_id = $1 AND provider_product_id = $2",
+        )
+        .bind(self.connection)
+        .bind(product)
+        .execute(&mut *tx)
+        .await
+        .expect("delete old mappings");
+        tx.commit().await.expect("old binary unlink");
+    }
+
     /// The products of the connection that have a snapshot row.
     async fn snapshot_rows(&self) -> Vec<String> {
         sqlx::query_scalar(
@@ -1650,30 +1627,9 @@ async fn an_orphan_left_without_a_fence_by_an_old_binary_expires_by_its_creation
     r.poll().await;
 
     // The boots were linked, then an old binary removed their mapping without
-    // stamping the snapshot's fence or leaving changes and overrides behind.
+    // stamping the snapshot's fence.
     r.app.clock.advance_seconds(5);
-    sqlx::query(
-        "WITH old_unlink AS ( \
-             UPDATE connector_product_snapshots SET unlinked_at = NULL \
-             WHERE connection_id = $1 AND provider_product_id = $2 \
-             RETURNING connection_id \
-         ), old_mappings AS ( \
-             DELETE FROM connector_variant_map \
-             WHERE connection_id = $1 AND provider_product_id = $2 \
-             RETURNING connection_id \
-         ), old_changes AS ( \
-             DELETE FROM connector_product_changes \
-             WHERE connection_id = $1 AND provider_product_id = $2 AND state = 'pending' \
-             RETURNING connection_id \
-         ) \
-         DELETE FROM connector_sync_overrides \
-         WHERE connection_id = $1 AND listing_id = 'boots_01'",
-    )
-    .bind(r.connection)
-    .bind(BOOTS)
-    .execute(&r.app.pool)
-    .await
-    .expect("old binary unlink");
+    r.unlink_like_an_old_binary(BOOTS).await;
     r.app.clock.advance_seconds(retention + 1);
 
     // The other product is also unlinked without a fence, but its snapshot is
@@ -1686,28 +1642,7 @@ async fn an_orphan_left_without_a_fence_by_an_old_binary_expires_by_its_creation
     ]))
     .await;
     r.app.clock.advance_seconds(5);
-    sqlx::query(
-        "WITH old_unlink AS ( \
-             UPDATE connector_product_snapshots SET unlinked_at = NULL \
-             WHERE connection_id = $1 AND provider_product_id = $2 \
-             RETURNING connection_id \
-         ), old_mappings AS ( \
-             DELETE FROM connector_variant_map \
-             WHERE connection_id = $1 AND provider_product_id = $2 \
-             RETURNING connection_id \
-         ), old_changes AS ( \
-             DELETE FROM connector_product_changes \
-             WHERE connection_id = $1 AND provider_product_id = $2 AND state = 'pending' \
-             RETURNING connection_id \
-         ) \
-         DELETE FROM connector_sync_overrides \
-         WHERE connection_id = $1 AND listing_id = 'boots_01'",
-    )
-    .bind(r.connection)
-    .bind(OTHER)
-    .execute(&r.app.pool)
-    .await
-    .expect("old binary unlink");
+    r.unlink_like_an_old_binary(OTHER).await;
     sqlx::query(
         "UPDATE connector_product_snapshots SET unlinked_at = NULL \
          WHERE connection_id = $1 AND provider_product_id = $2",
@@ -1727,6 +1662,22 @@ async fn an_orphan_left_without_a_fence_by_an_old_binary_expires_by_its_creation
         r.snapshot_rows().await,
         vec![MUG.to_string(), OTHER.to_string()],
         "only the null-fenced orphan older than the retention is deleted"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_fenced_orphan_with_an_old_creation_is_judged_by_its_fence(pool: PgPool) {
+    let r = rig(pool).await;
+    let retention = product_sync::ORPHAN_SNAPSHOT_RETENTION.num_seconds();
+    r.poll().await;
+    r.app.clock.advance_seconds(retention + 1);
+    r.save_mappings(json!([])).await;
+
+    r.poll().await;
+    assert_eq!(
+        r.snapshot_rows().await,
+        vec![BOOTS.to_string()],
+        "a recent fence keeps the row although its creation is older than the retention"
     );
 }
 

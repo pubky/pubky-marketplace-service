@@ -90,10 +90,11 @@ const LONGEST_CATALOG_WALK_SECONDS: i64 =
 
 /// How long an unlinked product's emptied snapshot row is kept: twice the
 /// longest catalog walk, so a read in flight when the product was unlinked
-/// has normally finished long before its row goes. Correctness does not rest
-/// on it: a read of an unlinked product does nothing, and a read that
-/// outlives the row (a removal is dated by its delivery, which can wait in
-/// the inbound queue) is dropped by the fence the next link sets.
+/// has normally finished long before its row goes. A row without a fence (an
+/// unlink by a binary from before 0097) expires by its `created_at` instead.
+/// Correctness does not rest on it: a read of an unlinked product does nothing,
+/// and a read that outlives the row (a removal is dated by its delivery, which
+/// can wait in the inbound queue) is dropped by the fence the next link sets.
 pub const ORPHAN_SNAPSHOT_RETENTION: chrono::Duration =
     chrono::Duration::seconds(2 * LONGEST_CATALOG_WALK_SECONDS);
 
@@ -480,6 +481,9 @@ async fn lock_snapshots(
     connection_id: Uuid,
     products: &[String],
 ) -> Result<(), sqlx::Error> {
+    if products.is_empty() {
+        return Ok(());
+    }
     sqlx::query("SELECT 1 FROM connector_connections WHERE id = $1 FOR KEY SHARE")
         .bind(connection_id)
         .execute(&mut **tx)
@@ -1028,10 +1032,9 @@ pub struct Links {
 /// then reads the clock, so the change's instant is later than any read
 /// planned under these links could have started before the lock was held.
 /// A read that starts between this instant and the commit is kept: it read
-/// the store after this instant, and its [`compare`] either commits before
-/// [`apply_links`] locks the product's snapshot row, whose reset then
-/// replaces what it wrote, or waits for this commit and is judged by the
-/// links and followers committed here.
+/// the store after this instant, waits for the mapping change's commit at the
+/// connection row, and is then judged by the links and followers committed
+/// here.
 /// Pass the result to [`apply_links`] in the same transaction once the
 /// mappings are written.
 pub async fn lock_links(
