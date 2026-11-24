@@ -83,6 +83,31 @@ path holds while it waits for that path's variant row. Every path above
 expiry, reservation expiry, the Bitcoin re-hold, `inventory.adjust`,
 registration and sync) takes the listing row first.
 
+## A payment, then its Locks correlation, then its order
+
+A path that locks a Locks payment's `payment_locks_correlations` row together
+with the payment locks the payment row first. `payment.register_locks` then
+locks the correlation and the order. The held-window sweep
+(`workers::expire_due_payment_windows`) does the same: its discovery
+statement locks the payment, then `lock_held_due_order` locks the
+correlation and the order and checks the whole sweep predicate again,
+including whether the task is live. The correlation stays locked until the
+sweep commits, so a status the verifier records after discovery is either
+visible to that check or written after the sweep commits.
+
+The completion paths (`apply_completed_lifecycle`, `apply_manual_review`,
+`park_unverified_completion`) lock the payment first as well;
+`apply_completed_lifecycle` then locks the order before the correlation.
+Payment, correlation and order are one-to-one, so holding the payment
+already serializes these paths with the sweep and with registration, and
+the order of the two later locks cannot form a cycle. The verifier's
+status writes (`claim_due_correlations`, `record_status_observation`,
+`record_upstream_terminal`, `record_binding_refusal`,
+`bound_unverified_retry`) lock the correlation row alone and take no other
+row lock while holding it. The sweep therefore waits for the correlation
+instead of skipping it: nothing that holds it waits for a lock the sweep
+holds.
+
 ## Where a retry is enough
 
 `workers::expire_due_payment_windows` and `expiry::expire_due_reservations`

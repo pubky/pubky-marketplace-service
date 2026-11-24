@@ -2762,9 +2762,13 @@ advance a payment (ADR-0019 §7).
   does not know records `not_found` and is swept at the window), and keeps
   its unit held until Locks reports the task terminal or
   `LOCKS_LIVE_TASK_HOLD_SECONDS` past the window, whichever comes first;
-  the next pass then sweeps it. Locks ends the task when the buyer rejects
-  the Paykit proposal or lets it expire, or when the invoice expires
-  unpaid. It does not end it at the deadline when Paykit saw a matching
+  the next pass then sweeps it. The sweep locks the payment, then its
+  correlation row, then the order, and checks the task's status again
+  under those locks before it releases anything, so a lookup that records
+  the task live while the sweep runs either keeps the unit or is written
+  after the sweep commits ([lock order](docs/lock-order.md)). Locks ends
+  the task when the buyer rejects the Paykit proposal or lets it expire, or
+  when the invoice expires unpaid. It does not end it at the deadline when Paykit saw a matching
   payment before the deadline (Paykit never expires such an invoice, and
   the task stays pending until the payment has its confirmations), and it
   keeps the task pending while it cannot reach Paykit.
