@@ -112,7 +112,8 @@ pub struct Config {
     /// operator must keep it above the Lock Server's Paykit `payment_window`
     /// plus 600 s of invoice admission, or a payment confirming before the
     /// Paykit deadline can find its unit released. Only the range is
-    /// enforced: the service cannot read paykit-server's configuration.
+    /// enforced: neither the lock nor the Lock Server's task lookup carries
+    /// that window, and the service does not query Paykit for Locks orders.
     pub locks_live_task_hold_seconds: i64,
     /// Unbound leftover cancel (`CHECKOUT_HOLD_WINDOW_SECONDS`, default
     /// 900, minimum 60). Ordinary `checkout.create` does not hold stock;

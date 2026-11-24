@@ -178,7 +178,7 @@ Configuration is environment-based. Window keys and their defaults also live in
 | `LOCKS_BUNDLE_ENCRYPTION_KEY` | unset | 32-byte hex key encrypting bundle ids at rest (XChaCha20-Poly1305) |
 | `LOCKS_LOOKUP_HMAC_KEY` | unset | 32-byte hex key for the HMAC-SHA256 correlation lookup token; must differ from the encryption key |
 | `LOCKS_PAYMENT_WINDOW_SECONDS` | `3600` | hold window armed by the `payment.prepare_locks` lock point (≥ 60); `payment.register_locks` must land inside it, and the correlation window IS the hold window. The sweep skips it while a registered task is live or not yet looked up, for at most `LOCKS_LIVE_TASK_HOLD_SECONDS` past it (see "Expiry vs late completion") |
-| `LOCKS_LIVE_TASK_HOLD_SECONDS` | `94200` | how long past `LOCKS_PAYMENT_WINDOW_SECONDS` a Locks order stays held while the Lock Server reports its registered task `pending`/`in_progress` or no lookup has succeeded yet (600–2592000; startup checks only this range). **Operator requirement, not checked:** keep it above the Lock Server's Paykit `payment_window` + 600 s. That window is paykit-server configuration the service cannot read, and it is unrelated to `LOCKS_PAYMENT_WINDOW_SECONDS`. The default is paykit-server's default 24 h `payment_window` + 600 s invoice admission + a 2 h confirmation allowance. Raise it together with any longer Paykit `payment_window`; a lower value is accepted, and a completion verified past it takes the late-money fork (see "Expiry vs late completion") |
+| `LOCKS_LIVE_TASK_HOLD_SECONDS` | `94200` | how long past `LOCKS_PAYMENT_WINDOW_SECONDS` a Locks order stays held while the Lock Server reports its registered task `pending`/`in_progress` or no lookup has succeeded yet (600–2592000; startup checks only this range). **Operator requirement, not checked:** keep it above the Lock Server's Paykit `payment_window` + 600 s. The service is not given that window: neither the lock nor the Lock Server's task lookup carries it, and the service does not query Paykit for Locks orders. It is unrelated to `LOCKS_PAYMENT_WINDOW_SECONDS`. The default is paykit-server's default 24 h `payment_window` + 600 s invoice admission + a 2 h confirmation allowance. Raise it together with any longer Paykit `payment_window`; a lower value is accepted, and a completion verified after the order has been swept takes the late-money fork (see "Expiry vs late completion") |
 | `CHECKOUT_HOLD_WINDOW_SECONDS` | `900` | unbound leftover cancel for ordinary `pending_payment` rows with `stock_held=false` and no payment method (≥ 60). Ordinary `checkout.create` does not hold stock |
 | `FIAT_PAYMENT_WINDOW_SECONDS` | `600` | hold window armed by a PayPal payment-method bind (`POST /v0/orders/{id}/payment-method`) (≥ 60). Default 10 minutes; a deployment may set a longer override |
 | `BITCOIN_PAYMENT_WINDOW_SECONDS` | `1800` | hold window armed by a bitcoin payment-method bind; the same instant is Paykit `expires_at` (fork), or Paykit's activation-time deadline plus 60 s once an upstream request is active — never longer than the invoice the buyer is shown (≥ 60). Honor a deployment value ≥ 60; do not cap below a deployment override |
@@ -2430,7 +2430,7 @@ advance a payment (ADR-0019 §7).
   the Paykit invoice, at most 600 s after submission, and Paykit stamps
   `payment_deadline` from its own `payment_window` (default 24 h from
   invoice creation; a cross-currency invoice uses the shorter conversion
-  window). A lock's `payment_in` does not change it: paykit-server v0.1.1
+  window). A lock's `payment_in` does not change it: paykit-server (v0.1.1-rc4)
   only checks that the invoice request repeats the lock's value. The sweep
   therefore skips a registered payment whose latest lookup is `pending` or
   `in_progress`, or that no lookup has answered yet (a task the Lock Server
@@ -2445,8 +2445,10 @@ advance a payment (ADR-0019 §7).
   keeps the task pending while it cannot reach Paykit.
 
   **Operator coupling.** Keep `LOCKS_LIVE_TASK_HOLD_SECONDS` above the Lock
-  Server's Paykit `payment_window` + 600 s. The service cannot read that
-  configuration, so startup only checks the range (600–2592000). The
+  Server's Paykit `payment_window` + 600 s. The service is not given that
+  window (neither the lock nor the Lock Server's task lookup carries it,
+  and the service does not query Paykit for Locks orders), so startup only
+  checks the range (600–2592000). The
   default, 94200 s, is paykit-server's default 24 h + 600 s + a 2 h
   allowance for a payment Paykit saw before its deadline to confirm. With a
   Paykit `payment_window` longer than the bound minus 600 s, a payment made
