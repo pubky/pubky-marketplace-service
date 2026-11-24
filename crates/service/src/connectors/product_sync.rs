@@ -60,9 +60,12 @@
 //!
 //! Lock order, everywhere: the connection row, then the connection's sync
 //! lock (direction changes and mapping changes), then snapshot rows (several
-//! in product-id order), then change and override rows. A change's foreign
-//! key is its snapshot, so queueing one never touches the connection row. The
-//! orphan delete skips rows that are locked, so it never waits.
+//! in product-id order), then change and override rows. A snapshot insert
+//! takes the connection row in KEY SHARE mode before inserting: its foreign-
+//! key check would otherwise take that lock only after placing the new row's
+//! unique-key entry. A change's foreign key is its snapshot, so queueing one
+//! never touches the connection row. The orphan delete skips rows that are
+//! locked, so it never waits.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -464,15 +467,21 @@ impl SnapshotRow {
 }
 
 /// Ensures each product has a snapshot row (an empty one, never read, for a
-/// product without one) and locks the rows in product-id order. The insert
-/// waits for a concurrent first insert of the same row to commit, so the lock
-/// is always taken on the row that transaction wrote.
+/// product without one) and locks the rows in product-id order. The connection
+/// row is taken in KEY SHARE mode before the insert, whose foreign-key check
+/// would otherwise take it only after placing the new row's unique-key entry.
+/// The insert waits for a concurrent first insert of the same row to commit,
+/// so the lock is always taken on the row that transaction wrote.
 async fn lock_snapshots(
     tx: &mut Transaction<'_, Postgres>,
     now: DateTime<Utc>,
     connection_id: Uuid,
     products: &[String],
 ) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT 1 FROM connector_connections WHERE id = $1 FOR KEY SHARE")
+        .bind(connection_id)
+        .execute(&mut **tx)
+        .await?;
     sqlx::query(
         "INSERT INTO connector_product_snapshots \
          (connection_id, provider_product_id, checked_at, created_at) \

@@ -968,6 +968,153 @@ async fn an_override_change_racing_an_unlink_never_deadlocks(pool: PgPool) {
     }
 }
 
+async fn lock_activity(pool: &PgPool) -> Vec<(i32, Option<String>, Option<String>, String)> {
+    sqlx::query_as(
+        "SELECT pid, wait_event_type, wait_event, left(query, 160) \
+         FROM pg_stat_activity WHERE datname = current_database() \
+         AND pid <> pg_backend_pid() ORDER BY pid",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("activity")
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_first_read_racing_an_unlink_never_rolls_the_mapping_back(pool: PgPool) {
+    let r = rig(pool).await;
+    // A link made by an API binary from before 0097 has no snapshot row.
+    sqlx::query(
+        "DELETE FROM connector_product_snapshots \
+         WHERE connection_id = $1 AND provider_product_id = $2",
+    )
+    .bind(r.connection)
+    .bind(BOOTS)
+    .execute(&r.app.pool)
+    .await
+    .expect("delete rollout-era snapshot");
+    let read_started = r.now();
+    let product = r.store_product(BOOTS).await;
+    r.app.clock.advance_seconds(5);
+
+    // Hold the sync lock so the unlink holds the connection row while its
+    // first snapshot insert and the product read contend.
+    let mut holder = r.app.pool.begin().await.expect("holder");
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('connector-sync|' || $1::text, 0))")
+        .bind(r.connection)
+        .execute(&mut *holder)
+        .await
+        .expect("sync lock");
+
+    let router = r.app.router.clone();
+    let token = r.seller.token.clone();
+    let connection = r.connection;
+    let unlinking = tokio::spawn(async move {
+        common::send(
+            router,
+            "PUT",
+            &format!("/v1/connectors/{connection}/mappings"),
+            Some(&token),
+            &json!({ "mappings": [] }),
+        )
+        .await
+    });
+    let mut unlink_pid: Option<i32> = None;
+    for attempt in 0..200 {
+        unlink_pid = sqlx::query_scalar(
+            "SELECT pid FROM pg_stat_activity \
+             WHERE datname = current_database() AND wait_event_type = 'Lock' \
+               AND wait_event = 'advisory' AND query LIKE '%connector-sync|%'",
+        )
+        .fetch_optional(&r.app.pool)
+        .await
+        .expect("unlink wait poll");
+        if unlink_pid.is_some() {
+            break;
+        }
+        assert!(
+            attempt < 199,
+            "unlink never waited: {:?}",
+            lock_activity(&r.app.pool).await
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let unlink_pid = unlink_pid.expect("unlink backend");
+
+    let read_pool = r.app.pool.clone();
+    let observing = tokio::spawn(async move {
+        product_sync::observe(&read_pool, read_started, connection, &product).await
+    });
+    let mut read_waiting = false;
+    for attempt in 0..200 {
+        read_waiting = sqlx::query_scalar::<_, i32>(
+            "SELECT pid FROM pg_stat_activity \
+             WHERE datname = current_database() AND pid <> $1 \
+               AND wait_event_type = 'Lock' AND wait_event <> 'advisory'",
+        )
+        .bind(unlink_pid)
+        .fetch_optional(&r.app.pool)
+        .await
+        .expect("read wait poll")
+        .is_some();
+        if read_waiting {
+            break;
+        }
+        assert!(
+            attempt < 199,
+            "read never waited: {:?}",
+            lock_activity(&r.app.pool).await
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(read_waiting);
+
+    holder.rollback().await.expect("release sync lock");
+    let (unlinked, observed) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        tokio::join!(unlinking, observing)
+    })
+    .await
+    .expect("unlink and read finish");
+    let (status, body) = unlinked.expect("unlink task");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    if let Err(error) = observed.expect("read task") {
+        panic!("observe failed: {error}");
+    }
+
+    let linked: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM connector_variant_map \
+         WHERE connection_id = $1 AND provider_product_id = $2)",
+    )
+    .bind(r.connection)
+    .bind(BOOTS)
+    .fetch_one(&r.app.pool)
+    .await
+    .expect("mapping");
+    assert!(!linked, "the boots are unmapped");
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM connector_product_changes \
+         WHERE connection_id = $1 AND provider_product_id = $2 AND state = 'pending'",
+    )
+    .bind(r.connection)
+    .bind(BOOTS)
+    .fetch_one(&r.app.pool)
+    .await
+    .expect("pending changes");
+    assert_eq!(pending, 0);
+    let (fenced, empty): (bool, bool) = sqlx::query_as(
+        "SELECT unlinked_at IS NOT NULL, \
+                content IS NULL AND price IS NULL AND variants IS NULL AND status IS NULL \
+         FROM connector_product_snapshots \
+         WHERE connection_id = $1 AND provider_product_id = $2",
+    )
+    .bind(r.connection)
+    .bind(BOOTS)
+    .fetch_one(&r.app.pool)
+    .await
+    .expect("fenced snapshot");
+    assert!(fenced, "the mapping's fence is present");
+    assert!(empty, "the mapping emptied every base");
+}
+
 impl Rig {
     /// Links the mug listing to the boots' second variant, so both listings
     /// share one store product.
