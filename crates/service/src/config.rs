@@ -36,6 +36,12 @@ pub const DEFAULT_LOCKS_LIVE_TASK_HOLD_SECONDS: i64 = 86_400 + 600 + 7_200;
 /// Smallest `LOCKS_LIVE_TASK_HOLD_SECONDS`: the Lock Server's invoice
 /// admission alone.
 pub const MIN_LOCKS_LIVE_TASK_HOLD_SECONDS: i64 = 600;
+/// paykit-server's default `payment_window` (24 h) plus the Lock Server's
+/// 600 s invoice admission: the latest default Paykit deadline after the
+/// hold window. A smaller `LOCKS_LIVE_TASK_HOLD_SECONDS` is accepted with a
+/// startup warning, because it is safe only with a Lock Server whose Paykit
+/// `payment_window` is that much shorter, which the service cannot see.
+pub const PAYKIT_DEFAULT_LOCKS_DEADLINE_SECONDS: i64 = 86_400 + 600;
 /// Largest `LOCKS_LIVE_TASK_HOLD_SECONDS` (30 days).
 pub const MAX_LOCKS_LIVE_TASK_HOLD_SECONDS: i64 = 2_592_000;
 
@@ -102,7 +108,9 @@ pub struct Config {
     /// it — the correlation window IS the hold window. A payment still
     /// awaiting entitlement when it elapses moves to `expired`, the order is
     /// cancelled, and the hold restocks, unless its registered task is live
-    /// or not yet looked up (`locks_live_task_hold_seconds`).
+    /// or not yet looked up (`locks_live_task_hold_seconds`), or the payment
+    /// is prepared but not registered
+    /// ([`crate::locks::REGISTRATION_GRACE_SECONDS`]).
     /// Deliberately separate from upstream failure; Locks v1 leaves
     /// transport/status failures pending (ADR-0019 §7).
     pub locks_payment_window_seconds: i64,
@@ -113,8 +121,10 @@ pub struct Config {
     /// operator must keep it above the Lock Server's Paykit `payment_window`
     /// plus 600 s of invoice admission, or a payment confirming before the
     /// Paykit deadline can find its unit released. Only the range is
-    /// enforced: neither the lock nor the Lock Server's task lookup carries
-    /// that window, and the service does not query Paykit for Locks orders.
+    /// enforced, with a startup warning below
+    /// [`PAYKIT_DEFAULT_LOCKS_DEADLINE_SECONDS`]: neither the lock nor the
+    /// Lock Server's task lookup carries that window, and the service does
+    /// not query Paykit for Locks orders.
     pub locks_live_task_hold_seconds: i64,
     /// Unbound leftover cancel (`CHECKOUT_HOLD_WINDOW_SECONDS`, default
     /// 900, minimum 60). Ordinary `checkout.create` does not hold stock;
@@ -479,6 +489,15 @@ impl Config {
             MIN_LOCKS_LIVE_TASK_HOLD_SECONDS,
             MAX_LOCKS_LIVE_TASK_HOLD_SECONDS,
         )?;
+        if locks_live_task_hold_seconds < PAYKIT_DEFAULT_LOCKS_DEADLINE_SECONDS {
+            tracing::warn!(
+                locks_live_task_hold_seconds,
+                "LOCKS_LIVE_TASK_HOLD_SECONDS is below paykit-server's default payment_window \
+                 plus invoice admission ({PAYKIT_DEFAULT_LOCKS_DEADLINE_SECONDS} s): a Locks \
+                 order can be released while its task can still complete, unless the Lock \
+                 Server's Paykit payment_window is that much shorter"
+            );
+        }
         let checkout_hold_window_seconds = env_i64("CHECKOUT_HOLD_WINDOW_SECONDS", 900)?;
         if checkout_hold_window_seconds < 60 {
             anyhow::bail!("CHECKOUT_HOLD_WINDOW_SECONDS must be at least 60");
@@ -1036,7 +1055,7 @@ mod tests {
         parse_review_blind_window_days, refusal_audit_keys_from_env, reject_audit_url_reuse,
         required_postgres_url, validate_postgres_url, Config, DigitalRelease, PaymentConfirmation,
         AUTOMATION_RATE_LIMIT_MAX_TOKENS, DEFAULT_AUTO_COMPLETE_DAYS, DEFAULT_DELIVERY_ASSUME_DAYS,
-        DEFAULT_PAYPAL_CHECKOUT_URL,
+        DEFAULT_LOCKS_LIVE_TASK_HOLD_SECONDS, DEFAULT_PAYPAL_CHECKOUT_URL,
     };
     use crate::payment_attempt::{MarketplaceAssets, MarketplaceContract};
     use crate::store_seller::StoreMode;
@@ -1517,6 +1536,35 @@ mod tests {
 
         let (_, logs) = from_env_with_region_env(Some("none"), None, None);
         assert!(logs.is_empty(), "no legacy flag, no warning: {logs}");
+    }
+
+    #[test]
+    fn a_locks_live_task_hold_below_paykits_default_deadline_is_accepted_with_a_warning() {
+        for (value, expected, warns) in [
+            (None, DEFAULT_LOCKS_LIVE_TASK_HOLD_SECONDS, false),
+            (Some("600"), 600, true),
+            (Some("86999"), 86_999, true),
+            (Some("87000"), 87_000, false),
+            (Some("2592000"), 2_592_000, false),
+        ] {
+            let _guard = ENV_LOCK.lock().expect("env lock");
+            let logs = LogBuffer::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .finish();
+            let config = tracing::subscriber::with_default(subscriber, || {
+                from_env_with(&[("LOCKS_LIVE_TASK_HOLD_SECONDS", value)])
+            })
+            .expect("from_env accepts the hold");
+            let logs = String::from_utf8(logs.0.lock().expect("log buffer").clone()).expect("utf8");
+            assert_eq!(config.locks_live_task_hold_seconds, expected, "{value:?}");
+            assert_eq!(
+                logs.contains("WARN") && logs.contains("LOCKS_LIVE_TASK_HOLD_SECONDS is below"),
+                warns,
+                "{value:?}: {logs}"
+            );
+        }
     }
 
     #[test]
