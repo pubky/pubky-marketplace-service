@@ -492,6 +492,27 @@ per-client limiter. None emits `X-RateLimit-*` headers; the only signal is the
 carry `Access-Control-Expose-Headers: retry-after`, so browser clients can
 read the delay.
 
+Both persisted limiters keep a bucket's `updated_at` monotonic. Concurrent
+requests can reach a bucket in a different order than they read the clock; a
+request whose time is earlier than the stored `updated_at` spends its token
+with no refill and leaves `updated_at` unchanged, so no refill interval is
+credited twice.
+
+A stored `updated_at` up to 5 minutes ahead of the serving instance's clock is
+kept: that instance earns no refill until its clock passes the stored time, so
+an empty bucket admits again at most that difference plus one refill interval
+later. A stored `updated_at` more than 5 minutes ahead (a broken clock or a
+hand-edited row) is implausible. The next request, admitted or refused, resets
+it to its own time and credits no refill, so the bucket admits again within one
+refill interval of that request.
+
+Instances must keep their clocks synchronized well within 5 minutes. When two
+instances' clocks differ by more than that, or a request's clock sample waits
+more than 5 minutes for a database connection or the bucket lock before it is
+applied, a request can reset a genuine later `updated_at`, and the next
+request then credits the difference as refill, up to the bucket capacity, each
+time this happens.
+
 ### Automation limiter
 
 A token bucket per `(actor pubky, endpoint class)`, stored in
@@ -520,7 +541,10 @@ A token bucket per `(actor pubky, endpoint class)`, stored in
   which bucket is charged.
 - When the bucket is empty: `429` with `Retry-After: <integer seconds>`
   (rounded up, minimum 1) and
-  `{"ok":false,"error":{"code":"rate_limited","message":"..."}}`.
+  `{"ok":false,"error":{"code":"rate_limited","message":"..."}}`. The delay
+  includes any time until this instance's clock reaches the bucket's
+  `updated_at` (at most 5 minutes, see above), plus the refill time for one
+  token.
 
 ### Inventory limiter
 
@@ -535,7 +559,10 @@ sessions share one bucket per class, so the rate below is per seller.
 | `INVENTORY_RATE_LIMIT_BURST_MULTIPLIER` | 2 | max 10 |
 
 Capacity must be at most 20000. A `429` always carries `Retry-After: 1` and an
-inventory-shaped envelope with `limit_class`. An exact idempotent replay of an
+inventory-shaped envelope with `limit_class`. The fixed delay can be shorter
+than the actual wait: a bucket whose `updated_at` is ahead of the serving
+instance's clock (up to 5 minutes, see above) admits again only after that
+instance's clock passes it, plus one refill interval. An exact idempotent replay of an
 earlier adjustment returns its stored `200` before the limiter is consulted.
 
 ### Public availability limiter

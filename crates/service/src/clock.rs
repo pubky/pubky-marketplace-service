@@ -17,6 +17,25 @@ impl Clock for SystemClock {
     }
 }
 
+/// How far ahead of this instance's clock a stored rate-bucket `updated_at`
+/// may be before it is treated as implausible.
+///
+/// Within this window a later stored timestamp is kept as is: the request
+/// earns no refill until its clock passes it, and the timestamp never moves
+/// back, so requests that reach a bucket out of clock order (or from
+/// instances whose clocks differ by up to this much) credit no refill
+/// interval twice. A stored timestamp further ahead (a broken clock or a
+/// hand-edited row) is reset to `now` by the next request, admitted or
+/// refused, with no refill credited, so such a bucket recovers within one
+/// refill interval.
+///
+/// Instances must keep their clocks synchronized well inside this window. A
+/// larger difference between instances, or a clock sample that waits longer
+/// than this for a pool connection or the bucket lock, lets one request reset
+/// a genuine later timestamp, and the next request then credits that
+/// difference as refill (up to the bucket capacity).
+pub const MAX_BUCKET_TIMESTAMP_AHEAD: chrono::TimeDelta = chrono::TimeDelta::minutes(5);
+
 /// Deterministic clock for tests, mirroring the injectable `now` of the
 /// TypeScript prototype suite.
 pub struct AdjustableClock {
