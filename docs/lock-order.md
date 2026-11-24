@@ -93,7 +93,9 @@ statement locks the payment, then `lock_held_due_order` locks the
 correlation and the order and checks the whole sweep predicate again,
 including whether the task is live. The correlation stays locked until the
 sweep commits, so a status the verifier records after discovery is either
-visible to that check or written after the sweep commits.
+visible to that check or written after the sweep commits. The buyer's
+`order.cancel_request` on a Locks payment takes the same three locks in the
+same order before it checks whether the task is live.
 
 The completion paths (`apply_completed_lifecycle`, `apply_manual_review`,
 `park_unverified_completion`) lock the payment first as well;

@@ -1986,7 +1986,8 @@ route the expired payment to `manual_review`.
 **Cancellation.** Buyer/seller cancellation of a pending order releases the
 hold ONLY when one exists — an unheld pending order releases nothing, and
 the quantity-balance `CHECK` constraints prove no negative movement can
-happen.
+happen. A pending Locks order whose registered task is live is not
+cancelled at all (see "Expiry vs late completion").
 
 **Drops keep lock-at-claim.** See Drops below: the FCFS race is the
 product, so drop gating still debits the drop AND moves the listing unit at
@@ -2035,9 +2036,11 @@ and refund branches):
   inventory conversion, notification) is shared by both paths.
 - **Cancellation.** `order.cancel_request` (buyer only, from
   `pending_payment`/`paid`/`processing`): an unpaid order cancels
-  immediately, and its held stock — ONLY when a payment lock point (or a
-  drop claim) actually acquired one; an unheld pending order releases
-  nothing — returns to the listing; a paid order moves
+  immediately, and its held stock (ONLY when a payment lock point or a
+  drop claim actually acquired one; an unheld pending order releases
+  nothing) returns to the listing; an unpaid Locks order whose registered
+  task is live is refused with `409 INVALID_STATE` and `error.reason:
+  "locks_task_live"` (see "Expiry vs late completion"); a paid order moves
   to `cancel_requested` awaiting the seller. `order.cancel_approve` (seller
   only, from `cancel_requested`) moves the order to `cancelled` and returns
   the sold quantities to available under the same quantity-balance
@@ -2766,7 +2769,12 @@ advance a payment (ADR-0019 §7).
   correlation row, then the order, and checks the task's status again
   under those locks before it releases anything, so a lookup that records
   the task live while the sweep runs either keeps the unit or is written
-  after the sweep commits ([lock order](docs/lock-order.md)). Locks ends
+  after the sweep commits ([lock order](docs/lock-order.md)). The buyer's
+  `order.cancel_request` makes the same check under the same locks: the
+  service cannot end a task at the Lock Server, so while the task is live
+  the cancel is refused with `409 INVALID_STATE` and `error.reason:
+  "locks_task_live"`, and once the task is terminal, `not_found` or past
+  the bound it cancels and releases the unit as before. Locks ends
   the task when the buyer rejects the Paykit proposal or lets it expire, or
   when the invoice expires unpaid. It does not end it at the deadline when Paykit saw a matching
   payment before the deadline (Paykit never expires such an invoice, and
@@ -2792,8 +2800,8 @@ advance a payment (ADR-0019 §7).
   free, or leaves it unpaid and `refund_required` if the unit was sold,
   retained in `manual_review`, never a confirmation of a dead order, never
   silently discarded. A verified completion whose order can no longer be
-  confirmed (e.g. cancelled while pending, or a lapsed auction hold) goes
-  to `manual_review`.
+  confirmed (e.g. cancelled while the Lock Server did not know the task,
+  or a lapsed auction hold) goes to `manual_review`.
 
   **Hold exposure.** No per-buyer or per-listing cap limits open Locks
   holds; the only per-buyer limit in the service is a drop's
@@ -2808,7 +2816,8 @@ advance a payment (ADR-0019 §7).
   (default 1 h) and its unit is released on the next pass. While the Lock
   Server cannot reach Paykit, or the service has had no answer from the
   Lock Server since registration, every registered order is held up to
-  the same bound.
+  the same bound. The buyer cannot release such a unit early either: the
+  cancel is refused while the task is live.
 
   This exposure is accepted: holding the unit is what keeps a payment made
   inside Paykit's deadline from ending `refund_required`. An operator who
