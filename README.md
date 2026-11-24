@@ -1223,8 +1223,8 @@ cancel transaction and appends `buyer_cancelled` (outcome
 `payment_expired`) to the correlation's observation history; the
 correlation keeps polling. Registration is refused once the order left
 `pending_payment`, so a task that completes afterwards was registered
-before the cancel: the buyer paid, then withdrew. Its verified completion
-takes the refund-required shape (payment `manual_review` with
+before the cancel, at a time the buyer could still cancel. Its verified
+completion takes the refund-required shape (payment `manual_review` with
 `review_reason=refund_required`, buyer and seller notified, no receipt)
 and the order stays `cancelled`, even when the released unit is still
 free. An order cancelled before the cancel expired Locks payments (a
