@@ -51,8 +51,13 @@ Contents:
 - CORS: only the exact origins in `ALLOWED_ORIGINS` are allowed. Allowed
   request headers are `Content-Type`, `Authorization` and `Idempotency-Key`;
   allowed methods are `GET`, `POST`, `PUT`, `PATCH`, `DELETE`. Responses to an
-  allowed origin expose `Retry-After`; a disallowed origin gets no CORS
-  headers. Server-to-server clients are not subject to CORS.
+  allowed origin carry `Access-Control-Allow-Origin` and expose `Retry-After`
+  through `Access-Control-Expose-Headers`. For a disallowed origin both of
+  those headers are omitted, so the browser blocks the request and cannot read
+  the response. A disallowed `OPTIONS` preflight still carries
+  `Access-Control-Allow-Methods` and `Access-Control-Allow-Headers`; the
+  missing `Access-Control-Allow-Origin` is what fails it. Server-to-server
+  clients are not subject to CORS.
 - Axum extractor failures (a body that is not valid JSON, a query parameter of
   the wrong type) are answered by the framework with a plain-text body and no
   envelope. Treat any non-JSON error body as a malformed request.

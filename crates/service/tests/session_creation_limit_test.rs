@@ -419,6 +419,110 @@ async fn creation_retry_after_rounds_up_a_sub_microsecond_wait(pool: PgPool) {
     assert_eq!(creation_bucket(&app, &pubky).await, (0.0, ahead));
 }
 
+/// 7 tokens a minute is one token per 8,571.43 ms, so the whole-millisecond
+/// admission needs 8,572 ms of refill. A bucket 428.5 ms ahead of the clock
+/// admits at 9,000.5 ms, so nine seconds is still too early.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn creation_retry_after_for_seven_per_minute_admits_at_the_advertised_second(pool: PgPool) {
+    let mut config = wide_window_config();
+    config.automation_rate_limit_per_minute = 7;
+    let app = test_app_with_config(pool, config).await;
+    let start = Utc::now().trunc_subsecs(3);
+    let ahead = start + Duration::microseconds(428_500);
+    let (keypair, pubky) = random_keypair();
+    seed_creation_bucket(&app, &pubky, 0.0, ahead).await;
+
+    let (status, headers) = post_token_at(&app, &keypair, start).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(retry_after_seconds(&headers), 10);
+
+    let (status, _) = post_token_at(&app, &keypair, start + Duration::seconds(9)).await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "8,571 whole milliseconds of refill is still short of one token"
+    );
+    assert_eq!(creation_bucket(&app, &pubky).await, (0.0, ahead));
+
+    let (status, _) = post_token_at(&app, &keypair, start + Duration::seconds(10)).await;
+    assert_eq!(status, StatusCode::CREATED);
+}
+
+/// A client that waits exactly the advertised `Retry-After` is admitted, and
+/// one that retries a second earlier is not, for waits that end just either
+/// side of a whole millisecond or whole second on the serving clock's
+/// nanoseconds. Each case is `(bucket timestamp minus now in ns, expected
+/// Retry-After)` for an empty bucket.
+async fn assert_retry_after_is_honoured(app: &TestApp, per_minute: i64, cases: &[(i64, i64)]) {
+    let anchor = Utc::now().trunc_subsecs(6) + Duration::minutes(2);
+    for &(offset_ns, expected) in cases {
+        let label = format!("{per_minute}/min, bucket {offset_ns} ns from now");
+        let (keypair, pubky) = random_keypair();
+        seed_creation_bucket(app, &pubky, 0.0, anchor).await;
+        let start = anchor - Duration::nanoseconds(offset_ns);
+
+        let (status, headers) = post_token_at(app, &keypair, start).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{label}");
+        let seconds = retry_after_seconds(&headers);
+        assert_eq!(seconds, expected, "{label}");
+        if seconds > 1 {
+            let (status, _) =
+                post_token_at(app, &keypair, start + Duration::seconds(seconds - 1)).await;
+            assert_eq!(
+                status,
+                StatusCode::TOO_MANY_REQUESTS,
+                "{label}: one second sooner is too early"
+            );
+        }
+        let (status, _) = post_token_at(app, &keypair, start + Duration::seconds(seconds)).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{label}: the advertised second"
+        );
+    }
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn creation_retry_after_at_seven_per_minute_is_honoured_at_clock_boundaries(pool: PgPool) {
+    let mut config = wide_window_config();
+    config.automation_rate_limit_per_minute = 7;
+    let app = test_app_with_config(pool, config).await;
+    assert_retry_after_is_honoured(
+        &app,
+        7,
+        &[
+            (428_500_000, 10),
+            (427_999_999, 9),
+            (428_000_001, 10),
+            (0, 9),
+            (-1_000_000_000, 8),
+            (-500_000, 9),
+        ],
+    )
+    .await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn creation_retry_after_at_sixty_per_minute_is_honoured_at_nanosecond_boundaries(
+    pool: PgPool,
+) {
+    let mut config = wide_window_config();
+    config.automation_rate_limit_per_minute = 60;
+    let app = test_app_with_config(pool, config).await;
+    assert_retry_after_is_honoured(
+        &app,
+        60,
+        &[
+            (59_999_999_999, 61),
+            (60_000_000_000, 61),
+            (60_000_000_001, 62),
+            (-1, 1),
+        ],
+    )
+    .await;
+}
+
 async fn post_token_from(
     app: &TestApp,
     origin: &str,

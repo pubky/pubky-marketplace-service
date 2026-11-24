@@ -21,7 +21,9 @@ use sqlx::{FromRow, Row};
 use uuid::Uuid;
 
 use crate::auth::Actor;
-use crate::clock::{format_timestamp, MAX_BUCKET_TIMESTAMP_AHEAD};
+use crate::clock::{
+    format_timestamp, refilled_tokens, retry_after_seconds, MAX_BUCKET_TIMESTAMP_AHEAD,
+};
 use crate::handlers::LISTING_COLUMNS;
 use crate::homeserver::HomeserverRawFetchOutcome;
 use crate::model::ListingRow;
@@ -118,21 +120,20 @@ pub async fn consume_automation_rate(
     // implausibly far ahead is reset to `now`, with no refill credited.
     let implausible = updated_at > now + MAX_BUCKET_TIMESTAMP_AHEAD;
     let effective = if implausible { now } else { updated_at };
-    let elapsed = (now - effective).num_milliseconds().max(0) as f64 / 1_000.0;
-    let available = (stored + elapsed * rate / 60.0).min(capacity);
+    let available = refilled_tokens(stored, (now - effective).num_milliseconds(), rate, capacity);
     let (written, retry_after) = if available >= 1.0 {
         (Some((available - 1.0, effective.max(now))), None)
     } else {
-        // Refill starts only once this clock reaches the bucket's timestamp.
-        // The serving clock can carry nanoseconds while stored timestamps are
-        // whole microseconds, so the wait keeps full precision and the
-        // ceiling below never rounds a fraction down.
-        let pending = (effective - now)
-            .num_nanoseconds()
-            .unwrap_or(i64::MAX)
-            .max(0) as f64
-            / 1_000_000_000.0;
-        let seconds = (pending + (1.0 - available) * 60.0 / rate).ceil().max(1.0) as i64;
+        // Admission counts refill in whole milliseconds from the stored
+        // state, which can be after `now`. The delay is measured to that same
+        // threshold (at nanosecond precision of the serving clock), so a
+        // client that waits it is admitted rather than refused again. The
+        // measure starts from the state this refusal leaves behind.
+        let seconds = if implausible {
+            retry_after_seconds(available, rate, capacity, now, now)
+        } else {
+            retry_after_seconds(stored, rate, capacity, effective, now)
+        };
         (implausible.then_some((available, now)), Some(seconds))
     };
     if let Some((tokens, written_at)) = written {
