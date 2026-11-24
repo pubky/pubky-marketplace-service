@@ -1038,3 +1038,81 @@ async fn named_rate_limit_defaults_and_replay_bypass_are_enforced(pool: PgPool) 
     // The inventory limiter reports a fixed one-second wait.
     assert_retry_after_seconds(&headers, 1);
 }
+
+async fn seed_read_bucket(app: &TestApp, pubky: &str, tokens: f64, at: chrono::DateTime<Utc>) {
+    sqlx::query(
+        "INSERT INTO inventory_actor_rate_limits (actor_pubky, endpoint_class, tokens, updated_at) \
+         VALUES ($1, 'inventory.read', $2, $3)",
+    )
+    .bind(pubky)
+    .bind(tokens)
+    .bind(at)
+    .execute(&app.pool)
+    .await
+    .expect("seed read bucket");
+}
+
+async fn projection_from(
+    app: &TestApp,
+    origin: &str,
+    token: &str,
+    aggregate_id: &str,
+) -> (StatusCode, axum::http::HeaderMap) {
+    use tower::ServiceExt;
+    let request = axum::http::Request::builder()
+        .method("GET")
+        .uri(format!("/v1/inventory/listings/{aggregate_id}"))
+        .header(axum::http::header::ORIGIN, origin)
+        .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(axum::body::Body::empty())
+        .expect("request builds");
+    let response = app
+        .router
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("request executes");
+    (response.status(), response.headers().clone())
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn inventory_429_exposes_retry_after_to_allowed_origins_only(pool: PgPool) {
+    let app = test_app(pool).await;
+    let seller = new_actor(&app).await;
+    register(&app, &seller, 3).await;
+    seed_read_bucket(&app, &seller.pubky, 0.0, app.clock.now()).await;
+    let aggregate = listing_aggregate(&seller.pubky);
+    let allowed = "http://localhost:3000";
+
+    let (status, headers) = projection_from(&app, allowed, &seller.token, &aggregate).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_retry_after_seconds(&headers, 1);
+    assert_eq!(
+        headers
+            .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .and_then(|value| value.to_str().ok()),
+        Some(allowed)
+    );
+    let exposed = headers
+        .get(axum::http::header::ACCESS_CONTROL_EXPOSE_HEADERS)
+        .and_then(|value| value.to_str().ok())
+        .expect("Access-Control-Expose-Headers is missing");
+    assert!(
+        exposed
+            .split(',')
+            .any(|name| name.trim().eq_ignore_ascii_case("retry-after")),
+        "exposed headers: {exposed}"
+    );
+
+    let (status, headers) =
+        projection_from(&app, "https://elsewhere.example", &seller.token, &aggregate).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    let cors: Vec<_> = headers
+        .keys()
+        .filter(|name| name.as_str().starts_with("access-control-"))
+        .collect();
+    assert!(
+        cors.is_empty(),
+        "a disallowed origin got CORS headers: {cors:?}"
+    );
+}

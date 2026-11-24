@@ -166,6 +166,73 @@ async fn replayed_token_is_refused(pool: PgPool) {
     assert_eq!(creation_tokens(&app, &pubky).await, Some(238.0));
 }
 
+async fn post_token_from(
+    app: &TestApp,
+    origin: &str,
+    bytes: Vec<u8>,
+) -> (StatusCode, axum::http::HeaderMap) {
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/auth/sessions")
+        .header(axum::http::header::ORIGIN, origin)
+        .body(axum::body::Body::from(bytes))
+        .expect("request builds");
+    let response = app
+        .router
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("request executes");
+    (response.status(), response.headers().clone())
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn limited_creation_exposes_retry_after_to_allowed_origins_only(pool: PgPool) {
+    let app = test_app_with_config(pool, one_token_config()).await;
+    let (keypair, _) = random_keypair();
+    app.clock.set(Utc::now());
+    let allowed = "http://localhost:3000";
+
+    let (status, _) = post_token_from(&app, allowed, auth_token_bytes(&keypair)).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, headers) = post_token_from(&app, allowed, auth_token_bytes(&keypair)).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(headers.contains_key(axum::http::header::RETRY_AFTER));
+    assert_eq!(
+        headers
+            .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .and_then(|value| value.to_str().ok()),
+        Some(allowed)
+    );
+    let exposed = headers
+        .get(axum::http::header::ACCESS_CONTROL_EXPOSE_HEADERS)
+        .and_then(|value| value.to_str().ok())
+        .expect("Access-Control-Expose-Headers is missing");
+    assert!(
+        exposed
+            .split(',')
+            .any(|name| name.trim().eq_ignore_ascii_case("retry-after")),
+        "exposed headers: {exposed}"
+    );
+
+    let (status, headers) = post_token_from(
+        &app,
+        "https://elsewhere.example",
+        auth_token_bytes(&keypair),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(headers.contains_key(axum::http::header::RETRY_AFTER));
+    let cors: Vec<_> = headers
+        .keys()
+        .filter(|name| name.as_str().starts_with("access-control-"))
+        .collect();
+    assert!(
+        cors.is_empty(),
+        "a disallowed origin got CORS headers: {cors:?}"
+    );
+}
+
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn replayed_token_with_an_empty_bucket_is_limited(pool: PgPool) {
     let app = test_app_with_config(pool, one_token_config()).await;

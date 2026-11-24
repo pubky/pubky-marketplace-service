@@ -50,8 +50,9 @@ Contents:
   came from `POST /v1/auth/sessions`.
 - CORS: only the exact origins in `ALLOWED_ORIGINS` are allowed. Allowed
   request headers are `Content-Type`, `Authorization` and `Idempotency-Key`;
-  allowed methods are `GET`, `POST`, `PUT`, `PATCH`, `DELETE`. Server-to-server
-  clients are not subject to CORS.
+  allowed methods are `GET`, `POST`, `PUT`, `PATCH`, `DELETE`. Responses to an
+  allowed origin expose `Retry-After`; a disallowed origin gets no CORS
+  headers. Server-to-server clients are not subject to CORS.
 - Axum extractor failures (a body that is not valid JSON, a query parameter of
   the wrong type) are answered by the framework with a plain-text body and no
   envelope. Treat any non-JSON error body as a malformed request.
@@ -487,7 +488,9 @@ The inventory error codes are listed with the [inventory endpoints](#inventory).
 Two independent limiters guard the authenticated surfaces, and the public
 [listing availability](#public-listing-availability) read has its own
 per-client limiter. None emits `X-RateLimit-*` headers; the only signal is the
-`429` response and its `Retry-After` header.
+`429` response and its `Retry-After` header. Responses to an allowed origin
+carry `Access-Control-Expose-Headers: retry-after`, so browser clients can
+read the delay.
 
 ### Automation limiter
 

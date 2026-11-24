@@ -390,8 +390,25 @@ pub fn build_router(state: AppState) -> Router {
         .merge(connectors)
         .merge(connector_ingress)
         .layer(cors)
+        .layer(middleware::map_response(expose_retry_after))
         .layer(middleware::from_fn(log_request))
         .with_state(state)
+}
+
+/// Lets allowed browser origins read `Retry-After` on a `429`. tower-http's
+/// `expose_headers` would send the header to every origin, so it is added
+/// only where the CORS layer already allowed the origin.
+async fn expose_retry_after(mut response: Response) -> Response {
+    if response
+        .headers()
+        .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+    {
+        response.headers_mut().insert(
+            header::ACCESS_CONTROL_EXPOSE_HEADERS,
+            header::HeaderValue::from_static("retry-after"),
+        );
+    }
+    response
 }
 
 async fn log_request(request: axum::extract::Request, next: middleware::Next) -> Response {
