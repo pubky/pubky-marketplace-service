@@ -2268,8 +2268,9 @@ approved grant, with a proof of possession of the flow's client key, for a
 session at the grant issuer's homeserver
 (`POST /auth/grant/session`). The service reads every pubky from the one
 homeserver at `HOMESERVER_URL`, so it exchanges grants only there:
-`HOMESERVER_PUBKY` is that homeserver's pubky (52-character z-base-32), and the
-service refuses to boot with the grant flow enabled and without it. The
+`HOMESERVER_PUBKY` is that homeserver's pubky (52-character z-base-32,
+surrounding whitespace ignored), and the service refuses to boot with the
+grant flow enabled and without it, or with a malformed value. The
 issuer's Pkarr record names its homeserver; a flow whose issuer names any other
 homeserver ends as `invalid` with terminal code `homeserver_not_allowed`
 before a request is sent to that homeserver. A user on another homeserver can

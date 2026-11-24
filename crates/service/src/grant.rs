@@ -318,12 +318,15 @@ fn client_ip_header_from_env() -> anyhow::Result<Option<HeaderName>> {
 const ENV_HOMESERVER_PUBKY: &str = "HOMESERVER_PUBKY";
 
 /// The public key of the homeserver at `HOMESERVER_URL`: the only homeserver
-/// a grant is exchanged at.
+/// a grant is exchanged at. Surrounding whitespace, such as the trailing
+/// newline of a mounted secret, is ignored.
 fn homeserver_pubky_from_env() -> anyhow::Result<PublicKey> {
-    let value = std::env::var(ENV_HOMESERVER_PUBKY).map_err(|_| {
-        anyhow::anyhow!("{ENV_HOMESERVER_PUBKY} must be set when the grant flow is enabled")
-    })?;
-    match PublicKey::try_from_z32(&value) {
+    let value = std::env::var(ENV_HOMESERVER_PUBKY).unwrap_or_default();
+    let value = value.trim();
+    if value.is_empty() {
+        anyhow::bail!("{ENV_HOMESERVER_PUBKY} must be set when the grant flow is enabled");
+    }
+    match PublicKey::try_from_z32(value) {
         Ok(key) if key.z32() == value => Ok(key),
         _ => anyhow::bail!("{ENV_HOMESERVER_PUBKY} must be a 52-character z-base-32 pubky"),
     }
