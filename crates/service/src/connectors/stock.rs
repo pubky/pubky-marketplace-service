@@ -5,9 +5,9 @@
 //! level for a mapped variant becomes a delta against the listing's
 //! `available` quantity and goes through the same handler a seller's own
 //! automation uses: same validation, same revision check, same idempotency
-//! table, same `inventory.adjusted` event. Only the per-session rate bucket is
-//! skipped: it is keyed to a stored bearer session, and the worker is paced by
-//! its own queue and backoff. The worker acts as the connection's seller
+//! table, same `inventory.adjusted` event. Only the per-seller rate bucket is
+//! skipped: it budgets the seller's own bearer-session requests, and the worker
+//! is paced by its own queue and backoff. The worker acts as the connection's seller
 //! through an in-process session that carries only the inventory capability;
 //! no seller bearer exists or is stored.
 //!

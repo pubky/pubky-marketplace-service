@@ -750,6 +750,37 @@ version:
 DELETE FROM _sqlx_migrations WHERE version = 97;
 ```
 
+## Per-seller inventory rate buckets (0099)
+
+0099 creates `inventory_actor_rate_limits`, one inventory token bucket per
+seller pubky and endpoint class (`inventory.adjust`, `inventory.read`),
+shared by all of that seller's sessions. It has no foreign key, so revoking or
+expiring a session does not refill a seller's budget. It also widens the
+`automation_rate_limits` endpoint-class CHECK with `session.create`, spent by
+`POST /v1/auth/sessions`, as `NOT VALID` with the complete class list (like
+0072). `inventory_rate_limits`, the per-session buckets, stays in place with
+its rows; the new binary neither reads nor writes it. Directly rerunnable, with
+a short `lock_timeout`.
+
+**Deploy mode: rolling.** A binary from before 0099 keeps its per-session
+inventory buckets, never spends `session.create`, and serves the inventory
+view to any session with the inventory capability. The per-seller budget, the
+session-creation limit and the seller-only inventory view therefore apply once
+every instance runs this version; replicas still on the old version keep the
+old behaviour until they drain. The environment defaults are unchanged and now
+mean per seller: `INVENTORY_AUTHENTICATED_RATE_LIMIT_PER_MINUTE` (120) times
+`INVENTORY_RATE_LIMIT_BURST_MULTIPLIER` (2) is 240 tokens shared by a seller's
+sessions per class.
+
+### Backing out 0099
+
+An image from before it ignores the new table and never writes the new class.
+Keep both and only forget the version:
+
+```sql
+DELETE FROM _sqlx_migrations WHERE version = 99;
+```
+
 ## Numbers claimed by open pull requests
 
 `main` has 0001 to 0079 (0068 and 0069 were never used). A new migration must
@@ -772,6 +803,7 @@ assume it is free:
 | 0096 | `0096_connector_product_sync.sql` | connector product sync: sync directions, product snapshots and the change queue for the Shop |
 | 0097 | `0097_connector_product_sync_fences.sql` | connector product sync: per-group rebase instants and the unlink fence on product snapshots |
 | 0098 | `0098_seller_wallet_receipt_confirmation.sql` | seller confirmations may rest on the seller's wallet Receipt: the `seller_wallet_receipt` basis and `wallet_receipt` |
+| 0099 | `0099_inventory_actor_rate_limits.sql` | per-seller inventory rate buckets and the `session.create` automation class |
 
 This table describes unmerged work and goes stale as pull requests land; trust
 `crates/service/migrations/` on `main` over it. sqlx does not reject two files

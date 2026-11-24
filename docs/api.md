@@ -89,7 +89,7 @@ and write. "Automation" means the inventory capability plus the
 | --- | --- | --- |
 | GET | `/health` | [Operational endpoints](#operational-endpoints) |
 | GET | `/ready` | [Operational endpoints](#operational-endpoints) |
-| POST | `/v1/auth/sessions` | Exchange an AuthToken for a bearer. |
+| POST | `/v1/auth/sessions` | Exchange an AuthToken for a bearer; consumes the `session.create` rate limit of the token's pubky. |
 | GET | `/v1/auth/sessions` | Needs a bearer with the inventory capability (checked in the handler); consumes the `session.admin` rate limit. |
 | POST | `/v1/auth/grant-session-challenges` | Issue a short-lived challenge for a grant session. `404 grant_session_unavailable` unless `MARKETPLACE_GRANT_SESSION_ENABLED`. See [Grant sessions](#grant-sessions). |
 | POST | `/v1/auth/grant-sessions` | Mint a bearer from a Shop sign-in grant, an issued challenge and a custom proof. `404 grant_session_unavailable` unless `MARKETPLACE_GRANT_SESSION_ENABLED`. See [Grant sessions](#grant-sessions). |
@@ -236,6 +236,12 @@ replay is rejected.
   custody](priv-key-custody.md)).
 - Failures use the [auth envelope](#error-envelopes): `401` for an invalid,
   stale or replayed token.
+- Each verified token spends one `session.create` token of its pubky's
+  [automation bucket](#automation-limiter), before the replay check; an invalid
+  token spends nothing. When the bucket is empty the answer is `429` with
+  `Retry-After: <integer seconds>` and
+  `{"ok":false,"error":{"code":"rate_limited","message":"..."}}`, and no session
+  is stored.
 
 ### Using the token
 
@@ -498,6 +504,7 @@ A token bucket per `(actor pubky, endpoint class)`, stored in
   | Class | Matches |
   | --- | --- |
   | `session.admin` | Paths starting with `/v1/auth/sessions` (including `GET /v1/auth/sessions`, which spends the token in its handler) |
+  | `session.create` | `POST /v1/auth/sessions`, keyed by the token's pubky after it verifies. Grant-session mints and grant-flow settlement do not spend it: each has its own per-pubky limit (`grant_session.mint`, and the grant flow's per-pubky flow limit) |
   | `grant_session.mint` | `POST /v1/auth/grant-session-challenges`, keyed by the grant's pubky after the proof verifies (a mint needs an issued challenge, so this bounds mints too) |
   | `listing.sync_many` | `/v1/listings/sync-many` |
   | `webhook.admin` | `/v1/webhooks...` |
@@ -514,8 +521,9 @@ A token bucket per `(actor pubky, endpoint class)`, stored in
 
 ### Inventory limiter
 
-Separate buckets in `inventory_rate_limits`, keyed by the session token hash,
-with classes `inventory.adjust` and `inventory.read`.
+Separate buckets in `inventory_actor_rate_limits`, keyed by the seller's
+pubky, with classes `inventory.adjust` and `inventory.read`. All of a seller's
+sessions share one bucket per class, so the rate below is per seller.
 
 | Variable | Default | Range |
 | --- | --- | --- |
@@ -1301,9 +1309,12 @@ listing's sums:
 ]
 ```
 
-Any session holding the inventory capability may read any listing's
-projection; this read is not restricted to the listing's seller. `404
-listing_not_found` for an unknown listing. A sample of both documents is kept
+The projection is served only to the listing's seller, on a session holding
+the inventory capability: per-variant SKUs, withdrawn variants and per-variant
+counts are seller data. Another seller's listing, like an unknown one, is `404
+listing_not_found` with the same body. Listing-level stock stays public through
+`GET /v1/listings/{id}` and the [listing
+availability](#public-listing-availability) read. A sample of both documents is kept
 in `contracts/samples/inventory.json`, and the JSON Schemas are generated from
 the Rust types (`inventory_adjust_schema()` and
 `inventory_projection_schema()` in `crates/service/src/inventory.rs`).

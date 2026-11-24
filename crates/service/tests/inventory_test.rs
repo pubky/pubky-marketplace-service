@@ -169,10 +169,13 @@ async fn genuine_auth_path_enforces_semantic_inventory_capability(pool: PgPool) 
     register(&app, &exact, 3).await;
     let aggregate = listing_aggregate(&exact.pubky);
 
-    for actor in [&exact, &broader] {
-        let (status, body) = projection(&app, Some(&actor.token), &aggregate).await;
-        assert_eq!(status, StatusCode::OK, "covered grant rejected: {body}");
-    }
+    let (status, body) = projection(&app, Some(&exact.token), &aggregate).await;
+    assert_eq!(status, StatusCode::OK, "covered grant rejected: {body}");
+    // A covered grant passes the capability check; the view is still the
+    // seller's only.
+    let (status, body) = projection(&app, Some(&broader.token), &aggregate).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "foreign seller read: {body}");
+    assert_eq!(body["error"]["code"], json!("listing_not_found"));
     for actor in [&readonly, &writeonly, &unrelated] {
         let (status, body) = projection(&app, Some(&actor.token), &aggregate).await;
         assert_eq!(
@@ -225,7 +228,7 @@ async fn exact_replay_returns_original_result_before_rate_accounting(pool: PgPoo
     assert_eq!(first["result"]["stock"]["total"], json!(7));
     assert_eq!(first["result"]["stock"]["available"], json!(7));
     let before_tokens: f64 = sqlx::query_scalar(
-        "SELECT tokens FROM inventory_rate_limits WHERE endpoint_class = 'inventory.adjust'",
+        "SELECT tokens FROM inventory_actor_rate_limits WHERE endpoint_class = 'inventory.adjust'",
     )
     .fetch_one(&app.pool)
     .await
@@ -238,7 +241,7 @@ async fn exact_replay_returns_original_result_before_rate_accounting(pool: PgPoo
         "replay returns the immutable original result"
     );
     let after_tokens: f64 = sqlx::query_scalar(
-        "SELECT tokens FROM inventory_rate_limits WHERE endpoint_class = 'inventory.adjust'",
+        "SELECT tokens FROM inventory_actor_rate_limits WHERE endpoint_class = 'inventory.adjust'",
     )
     .fetch_one(&app.pool)
     .await
@@ -354,7 +357,7 @@ async fn exhausted_rate_bucket_cannot_delay_or_suppress_changed_replay_quarantin
         assert_eq!(body["error"]["code"], json!("revision_conflict"));
     }
     let tokens: f64 = sqlx::query_scalar(
-        "SELECT tokens FROM inventory_rate_limits WHERE endpoint_class = 'inventory.adjust'",
+        "SELECT tokens FROM inventory_actor_rate_limits WHERE endpoint_class = 'inventory.adjust'",
     )
     .fetch_one(&app.pool)
     .await
@@ -373,7 +376,7 @@ async fn exhausted_rate_bucket_cannot_delay_or_suppress_changed_replay_quarantin
     // lock without depending on that operational bucket.
     let mut rate_lock = app.pool.begin().await.expect("rate lock transaction");
     sqlx::query(
-        "SELECT tokens FROM inventory_rate_limits \
+        "SELECT tokens FROM inventory_actor_rate_limits \
          WHERE endpoint_class = 'inventory.adjust' FOR UPDATE",
     )
     .fetch_one(&mut *rate_lock)
@@ -610,7 +613,7 @@ async fn unavailable_variant_lookups_consume_rate_before_remote_io_and_stop_at_4
     }
     assert_eq!(fetch_count.load(Ordering::SeqCst), 240);
     let tokens: f64 = sqlx::query_scalar(
-        "SELECT tokens FROM inventory_rate_limits WHERE endpoint_class = 'inventory.adjust'",
+        "SELECT tokens FROM inventory_actor_rate_limits WHERE endpoint_class = 'inventory.adjust'",
     )
     .fetch_one(&app.pool)
     .await
@@ -679,7 +682,7 @@ async fn variant_fetch_uses_prefetch_clock_for_rate_and_fresh_clock_for_mutation
         .expect("real HTTP lookup reaches delayed response barrier");
 
     let rate_updated_at: chrono::DateTime<Utc> = sqlx::query_scalar(
-        "SELECT updated_at FROM inventory_rate_limits \
+        "SELECT updated_at FROM inventory_actor_rate_limits \
          WHERE endpoint_class = 'inventory.adjust'",
     )
     .fetch_one(&app.pool)

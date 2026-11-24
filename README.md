@@ -167,7 +167,7 @@ Configuration is environment-based. Window keys and their defaults also live in
 | `FX_FEED_URL` | fixed production URL | FX rate feed for the sampler. A release binary ignores this variable and always uses the fixed URL; only in-process test configuration repoints it |
 | `AUTOMATION_RATE_LIMIT_PER_MINUTE` | `120` | seller automation rate limit per `(actor, endpoint class)`; see [`docs/api.md`](docs/api.md#rate-limits) |
 | `AUTOMATION_RATE_LIMIT_BURST_MULTIPLIER` | `2` | burst capacity multiplier (max 10); rate × multiplier must be at most 20000 |
-| `INVENTORY_AUTHENTICATED_RATE_LIMIT_PER_MINUTE` | `120` | inventory API rate per session (1–10000) |
+| `INVENTORY_AUTHENTICATED_RATE_LIMIT_PER_MINUTE` | `120` | inventory API rate per seller, shared by all of the seller's sessions (1–10000) |
 | `INVENTORY_ANONYMOUS_RATE_LIMIT_PER_MINUTE` | `20` | inventory API rate for requests without a valid session |
 | `INVENTORY_RATE_LIMIT_BURST_MULTIPLIER` | `2` | inventory burst multiplier (max 10) |
 | `EVENT_RETENTION_DAYS` | `30` | seller event feed retention; older cursors answer `410 cursor_expired` |
