@@ -827,6 +827,109 @@ async fn the_store_seller_and_its_buyers_are_served(pool: PgPool) {
     );
 }
 
+/// `(endpoint_class, tokens, updated_at)` of a seller's inventory buckets.
+async fn inventory_buckets(pool: &PgPool, seller: &str) -> Vec<(String, f64, String)> {
+    sqlx::query_as(
+        "SELECT endpoint_class, tokens, updated_at::TEXT FROM inventory_actor_rate_limits \
+         WHERE actor_pubky = $1 ORDER BY endpoint_class",
+    )
+    .bind(seller)
+    .fetch_all(pool)
+    .await
+    .expect("inventory buckets")
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn inventory_routes_serve_the_store_seller_and_refuse_others_before_their_budget(
+    pool: PgPool,
+) {
+    let base = test_app(pool.clone()).await;
+    let app = single_seller(&base, &encode_store(), None);
+    let store = common::actor_from_secret(&app, STORE_SECRET).await;
+    let bob = new_actor(&app).await;
+    let (status, body) = execute(&app, &store.token, &register_command(&store.pubky, 3)).await;
+    assert_eq!(status, StatusCode::OK, "register: {body}");
+    let aggregate = listing_aggregate(&store.pubky);
+    let projection = format!("/v1/inventory/listings/{aggregate}");
+    let adjust = |revision: i64| {
+        json!({
+            "schema_version": 1,
+            "kind": "inventory.adjust",
+            "aggregate_id": aggregate,
+            "listing_id": "boots_01",
+            "expected_revision": revision,
+            "delta": 1,
+            "idempotency_key": Uuid::new_v4(),
+        })
+    };
+
+    // The store seller reads and adjusts its own inventory on its own
+    // per-seller budget.
+    let (status, body) = send(
+        app.router.clone(),
+        "GET",
+        &projection,
+        Some(&store.token),
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "store read: {body}");
+    assert_eq!(body["seller_pubky"], json!(store.pubky));
+    assert_eq!(body["stock"]["total"], json!(3));
+    let revision = server_revision(&pool, &store.pubky).await;
+    let (status, body) = send(
+        app.router.clone(),
+        "POST",
+        "/v1/inventory/adjust",
+        Some(&store.token),
+        &adjust(revision),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "store adjust: {body}");
+    let store_buckets = inventory_buckets(&pool, &store.pubky).await;
+    assert_eq!(
+        store_buckets
+            .iter()
+            .map(|(class, _, _)| class.as_str())
+            .collect::<Vec<_>>(),
+        ["inventory.adjust", "inventory.read"],
+        "{store_buckets:?}"
+    );
+
+    // Another seller is refused by the guard before the handler, so it
+    // neither opens a bucket of its own nor spends the store seller's.
+    let revision = server_revision(&pool, &store.pubky).await;
+    for (method, body) in [("GET", Value::Null), ("POST", adjust(revision))] {
+        let uri = if method == "GET" {
+            projection.as_str()
+        } else {
+            "/v1/inventory/adjust"
+        };
+        let (status, body) = send(app.router.clone(), method, uri, Some(&bob.token), &body).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{method} {uri}: {body}");
+        assert_eq!(body["error"]["code"], json!("SELLER_NOT_SERVED"));
+    }
+    assert!(inventory_buckets(&pool, &bob.pubky).await.is_empty());
+    assert_eq!(inventory_buckets(&pool, &store.pubky).await, store_buckets);
+    assert_eq!(server_revision(&pool, &store.pubky).await, revision);
+
+    // Signing in spends the identity's own `session.create` budget; those
+    // buckets are not another seller's records and do not stop a restart.
+    let session_buckets: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM automation_rate_limits \
+         WHERE endpoint_class = 'session.create' AND seller_pubky IN ($1, $2)",
+    )
+    .bind(&store.pubky)
+    .bind(&bob.pubky)
+    .fetch_one(&pool)
+    .await
+    .expect("session buckets");
+    assert_eq!(session_buckets, 2);
+    refuse_other_sellers(&pool, &app.state.config.store_mode)
+        .await
+        .expect("rate buckets are not another seller's rows");
+}
+
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn marketplace_mode_serves_every_seller(pool: PgPool) {
     let app = test_app(pool).await;
