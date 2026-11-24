@@ -2283,6 +2283,15 @@ does not name `HOMESERVER_URL`'s host (the key itself, one of its ICANN
 targets or one of its own addresses), or names no endpoint the exchange may
 connect to.
 
+Deploy note: set `HOMESERVER_PUBKY` before enabling
+`MARKETPLACE_GRANT_FLOW_ENABLED`, or before rolling out a build that requires
+it on a deployment where the flag is already on; it is the same key the Shop
+deploys as `PUBKY_RUNTIME_HOMESERVER`. With the flag off the setting is not
+read. The exchange connects only to public addresses, so a private DNS
+override that resolves the homeserver's domain to an internal address (for
+example inside a VPC) makes every exchange fail; the boot check reads only the
+record and does not detect it.
+
 The exchange does not use the `pubky` SDK's HTTP client. Its request to the
 homeserver:
 
