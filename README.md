@@ -190,8 +190,8 @@ Configuration is environment-based. Window keys and their defaults also live in
 | `LOCKS_SERVER_URL` | unset | Lock Server base URL; setting it enables Locks verification |
 | `LOCKS_BUNDLE_ENCRYPTION_KEY` | unset | 32-byte hex key encrypting bundle ids at rest (XChaCha20-Poly1305) |
 | `LOCKS_LOOKUP_HMAC_KEY` | unset | 32-byte hex key for the HMAC-SHA256 correlation lookup token; must differ from the encryption key |
-| `LOCKS_PAYMENT_WINDOW_SECONDS` | `3600` | hold window armed by the `payment.prepare_locks` lock point (≥ 60); `payment.register_locks` must land inside it, and the correlation window IS the hold window. The sweep skips it while a registered task is live or not yet looked up, for at most `LOCKS_LIVE_TASK_HOLD_SECONDS` past it (see "Expiry vs late completion") |
-| `LOCKS_LIVE_TASK_HOLD_SECONDS` | `94200` | how long past `LOCKS_PAYMENT_WINDOW_SECONDS` a Locks order stays held while the Lock Server reports its registered task `pending`/`in_progress` or no lookup has succeeded yet (600 to 2592000; startup checks only this range). **Operator requirement, not checked:** keep it above the Lock Server's Paykit `payment_window` + 600 s. The service is not given that window: neither the lock nor the Lock Server's task lookup carries it, and the service does not query Paykit for Locks orders. It is unrelated to `LOCKS_PAYMENT_WINDOW_SECONDS`. The default is paykit-server's default 24 h `payment_window` + 600 s invoice admission + a 2 h confirmation allowance. Raise it together with any longer Paykit `payment_window`; a lower value is accepted, and a completion verified after the order has been swept takes the late-money fork (see "Expiry vs late completion") |
+| `LOCKS_PAYMENT_WINDOW_SECONDS` | `3600` | hold window armed by the `payment.prepare_locks` lock point (≥ 60); the correlation window IS the hold window. The sweep skips it while a registered task is live or not yet looked up, for at most `LOCKS_LIVE_TASK_HOLD_SECONDS` past it, and while the payment is prepared but not registered, for a fixed 600 s registration grace past it; `payment.register_locks` must land inside the window or that grace (see "Expiry vs late completion") |
+| `LOCKS_LIVE_TASK_HOLD_SECONDS` | `94200` | how long past `LOCKS_PAYMENT_WINDOW_SECONDS` a Locks order stays held while the Lock Server reports its registered task `pending`/`in_progress` or no lookup has succeeded yet (600 to 2592000). **Operator requirement:** keep it above the Lock Server's Paykit `payment_window` + 600 s. The service is not given that window: neither the lock nor the Lock Server's task lookup carries it, and the service does not query Paykit for Locks orders. Startup refuses values outside the range and logs a warning for a value below 87000 (paykit-server's default 24 h `payment_window` + 600 s), which is only safe with a Lock Server whose Paykit window is that much shorter. It is unrelated to `LOCKS_PAYMENT_WINDOW_SECONDS`. The default is paykit-server's default 24 h `payment_window` + 600 s invoice admission + a 2 h confirmation allowance. Raise it together with any longer Paykit `payment_window`; otherwise a completion verified after the order has been swept takes the late-money fork (see "Expiry vs late completion") |
 | `CHECKOUT_HOLD_WINDOW_SECONDS` | `900` | unbound leftover cancel for ordinary `pending_payment` rows with `stock_held=false` and no payment method (≥ 60). Ordinary `checkout.create` does not hold stock |
 | `FIAT_PAYMENT_WINDOW_SECONDS` | `600` | hold window armed by a PayPal payment-method bind (`POST /v0/orders/{id}/payment-method`) (≥ 60). Default 10 minutes; a deployment may set a longer override |
 | `BITCOIN_PAYMENT_WINDOW_SECONDS` | `1800` | hold window armed by a bitcoin payment-method bind; the same instant is Paykit `expires_at` (fork), or Paykit's activation-time deadline plus 60 s once an upstream request is active — never longer than the invoice the buyer is shown (≥ 60). Honor a deployment value ≥ 60; do not cap below a deployment override |
@@ -1532,6 +1532,30 @@ cannot retract a published request, and `resolve(abandoned)` would stop
 paykit observing it. Once money is observed (`detected`,
 `awaiting_seller_confirmation`, `confirmed`) the buyer's cancel is refused.
 
+**Buyer cancel of a Locks order.** The service cannot end a task at the
+Lock Server, so `order.cancel_request` on an unpaid Locks order is refused
+with `409 INVALID_STATE` and `error.reason: "locks_task_live"` while the
+window sweep would keep the order: its registered task is live or not yet
+looked up and `LOCKS_LIVE_TASK_HOLD_SECONDS` past the window has not
+passed, or its payment is prepared but not registered and the 600 s
+registration grace past the window has not passed (see "Expiry vs late
+completion"). When the Lock Server reported the task `completed` and the
+service is still retrying the verification of its binding
+(`retry_binding_malformed`, `retry_binding_unopenable`), the buyer already
+holds access, so the cancel is refused with `409 INVALID_STATE` ("This
+order can no longer be cancelled."), as for money observed on a Paykit
+request; the window sweep still releases that state at the window. The
+cancel takes the payment, correlation and order locks and checks all of
+this under them. Once the cancel is allowed, it expires the payment
+(`awaiting_entitlement` to `expired`) in the cancel transaction and appends
+`buyer_cancelled` (outcome `payment_expired`) to the correlation's
+observation history; the correlation keeps polling. Registration is
+refused once the payment expired, so only a task registered before the
+cancel can still complete, and its verified completion takes the
+late-money fork (completes the order if the unit is still free,
+`refund_required` if it is gone) instead of failing to confirm a
+cancelled order.
+
 ### `shared_manual` checkout and manual-review resolution (W1.15)
 
 A seller whose Paykit creator is `shared_manual` confirms Bitcoin payments
@@ -1941,7 +1965,7 @@ and arms a bounded server-time hold window on the order
 
 | Lock point | Window |
 | --- | --- |
-| `payment.prepare_locks` | `LOCKS_PAYMENT_WINDOW_SECONDS` (default 3600): the existing correlation window IS the hold window; one window concept, not two. `payment.register_locks` must land inside it |
+| `payment.prepare_locks` | `LOCKS_PAYMENT_WINDOW_SECONDS` (default 3600): the existing correlation window IS the hold window; one window concept, not two. `payment.register_locks` must land while the order still holds it: inside it, or within the 600 s registration grace past it (see "Expiry vs late completion") |
 | `POST /v0/orders/{id}/payment-method` (PayPal) | `FIAT_PAYMENT_WINDOW_SECONDS` (default 600, min 60) |
 | `POST /v0/orders/{id}/payment-method` (bitcoin) | `BITCOIN_PAYMENT_WINDOW_SECONDS` (default 1800, min 60) — equals Paykit `expires_at` |
 | An auction winner's order (`auction.close`, worker close) | The winning reservation's 30 minutes from the close. It is the order's `hold_expires_at` from creation, and a bind never moves it. A bind after the reservation ended is refused (409 `INVALID_STATE`, reason `auction_window_ended`) |
@@ -2039,15 +2063,19 @@ and refund branches):
   immediately, and its held stock (ONLY when a payment lock point or a
   drop claim actually acquired one; an unheld pending order releases
   nothing) returns to the listing; an unpaid Locks order whose registered
-  task is live is refused with `409 INVALID_STATE` and `error.reason:
-  "locks_task_live"` (see "Expiry vs late completion"); a paid order moves
+  task is live, or whose payment is prepared but not registered, is refused
+  with `409 INVALID_STATE` and `error.reason: "locks_task_live"`, and one
+  whose task the Lock Server reported `completed` but the service is still
+  verifying is refused like an order with money observed (see "Buyer
+  cancel of a Locks order"); a paid order moves
   to `cancel_requested` awaiting the seller. `order.cancel_approve` (seller
   only, from `cancel_requested`) moves the order to `cancelled` and returns
   the sold quantities to available under the same quantity-balance
   constraint (see the divergence table for the resulting listing
   `sold → available` transition). Cancellation never touches a confirmed
-  payment: it stays confirmed with its receipt intact (an unpaid Paykit
-  payment expires; see "Buyer cancel of a Bitcoin order"), and
+  payment: it stays confirmed with its receipt intact (an unpaid Paykit or
+  Locks payment expires; see "Buyer cancel of a Bitcoin order" and "Buyer
+  cancel of a Locks order"), and
   the only money path out of a cancelled order is the externally evidenced
   `refund.record_external` — the service never claims to move funds. An
   auction winner's cancel releases the winning hold through the reservation
@@ -2745,63 +2773,98 @@ advance a payment (ADR-0019 §7).
   in `manual_review` instead of confirming.
 - **Expiry vs late completion.** The `payment_window` task sweeps the
   ORDER's hold window (`LOCKS_PAYMENT_WINDOW_SECONDS`, armed by
-  `payment.prepare_locks`; `payment.register_locks` must land inside it;
-  the correlation window IS the hold window): once it elapses on server
-  time with the payment still `awaiting_entitlement`, the hold restocks,
-  the payment moves to `expired`, and the order is cancelled with the
-  stored reason `payment window elapsed`, deliberately separate from
-  upstream failure.
+  `payment.prepare_locks`: the correlation window IS the hold window):
+  once it elapses on server time with the payment still
+  `awaiting_entitlement`, the hold restocks, the payment moves to
+  `expired`, and the order is cancelled with the stored reason `payment
+  window elapsed`, deliberately separate from upstream failure.
 
-  The service does not set the buyer's deadline. Registration needs the
-  bundle id the Lock Server returns when the proof is submitted, so the
-  task exists before the window ends; the Lock Server's worker then creates
-  the Paykit invoice, at most 600 s after submission, and Paykit stamps
-  `payment_deadline` from its own `payment_window` (default 24 h from
-  invoice creation; a cross-currency invoice uses the shorter conversion
-  window). A lock's `payment_in` does not change it: paykit-server (v0.1.1-rc4)
-  only checks that the invoice request repeats the lock's value. The sweep
-  therefore skips a registered payment whose latest lookup is `pending` or
-  `in_progress`, or that no lookup has answered yet (a task the Lock Server
-  does not know records `not_found` and is swept at the window), and keeps
-  its unit held until Locks reports the task terminal or
-  `LOCKS_LIVE_TASK_HOLD_SECONDS` past the window, whichever comes first;
-  the next pass then sweeps it. The sweep locks the payment, then its
-  correlation row, then the order, and checks the task's status again
-  under those locks before it releases anything, so a lookup that records
-  the task live while the sweep runs either keeps the unit or is written
-  after the sweep commits ([lock order](docs/lock-order.md)). The buyer's
-  `order.cancel_request` makes the same check under the same locks: the
-  service cannot end a task at the Lock Server, so while the task is live
-  the cancel is refused with `409 INVALID_STATE` and `error.reason:
-  "locks_task_live"`, and once the task is terminal, `not_found` or past
-  the bound it cancels and releases the unit as before. Locks ends
-  the task when the buyer rejects the Paykit proposal or lets it expire, or
-  when the invoice expires unpaid. It does not end it at the deadline when Paykit saw a matching
-  payment before the deadline (Paykit never expires such an invoice, and
-  the task stays pending until the payment has its confirmations), and it
-  keeps the task pending while it cannot reach Paykit.
+  The service does not set the buyer's deadline. The Shop submits the
+  proof bundle to the Lock Server between `payment.prepare_locks` and
+  `payment.register_locks` (it needs the prepared `client_reference` for
+  the bundle and attaches the bundle id afterwards), and it can only
+  prepare inside the window, so its task exists before the window ends;
+  the Lock Server's worker then creates the Paykit invoice, at most 600 s
+  after submission, and Paykit stamps `payment_deadline` from its own
+  `payment_window` (default 24 h from invoice creation; a cross-currency
+  invoice uses the shorter conversion window). A lock's `payment_in` does
+  not change it: paykit-server (v0.1.1-rc4) only checks that the invoice
+  request repeats the lock's value. The sweep therefore keeps the unit of
+  a payment whose Lock Server task may still grant access:
+  - a registered payment whose latest lookup is `pending` or
+    `in_progress`, or that no lookup has answered yet: until Locks reports
+    the task terminal (`failed`, `expired`, `completed`) or
+    `LOCKS_LIVE_TASK_HOLD_SECONDS` past the window, whichever comes first;
+  - a payment prepared but not registered: its bundle may already be at
+    the Lock Server (a registration in flight when the window ends, or one
+    whose reply was lost), and the service has no bundle id to look it up.
+    It is held for a fixed 600 s registration grace past the window
+    (`locks::REGISTRATION_GRACE_SECONDS`), during which the preparation
+    still replays and `payment.register_locks` still lands; the registered
+    task is then held like any other.
+
+  The next pass after either bound sweeps the order. A registered bundle
+  the Lock Server answers `not_found` for holds nothing and is swept at
+  the window. The Lock Server creates the task inside the submission
+  request (pubky/locks `submit_proof_bundle`) and answers
+  `verification_task_not_found` only when no task store has the handle, so
+  after the Shop's submit-then-register flow `not_found` means a bundle
+  that was never submitted (or a different or reset Lock Server).
+  Registration performs no lookup, so holding `not_found` would let any
+  buyer pin a unit for the whole bound by registering an invented bundle
+  id. The sweep locks the payment, then its correlation row, then the
+  order, and checks the whole predicate again under those locks before it
+  releases anything, so a registration or a status the verifier records
+  while the sweep runs either keeps the unit or is written after the sweep
+  commits ([lock order](docs/lock-order.md)). The buyer's
+  `order.cancel_request` makes the same check under the same locks and is
+  refused while it holds (see "Buyer cancel of a Locks order"). Locks ends
+  the task when the
+  buyer rejects the Paykit proposal or lets it expire, or when the invoice
+  expires unpaid. It does not end it at the deadline when Paykit saw a
+  matching payment before the deadline (Paykit never expires such an
+  invoice, and the task stays pending until the payment has its
+  confirmations), and it keeps the task pending while it cannot reach
+  Paykit.
 
   **Operator coupling.** Keep `LOCKS_LIVE_TASK_HOLD_SECONDS` above the Lock
   Server's Paykit `payment_window` + 600 s. The service is not given that
   window (neither the lock nor the Lock Server's task lookup carries it,
-  and the service does not query Paykit for Locks orders), so startup only
-  checks the range (600 to 2592000). The
-  default, 94200 s, is paykit-server's default 24 h + 600 s + a 2 h
-  allowance for a payment Paykit saw before its deadline to confirm. With a
-  Paykit `payment_window` longer than the bound minus 600 s, a payment made
-  after the bound takes the late-money fork below.
+  and the service does not query Paykit for Locks orders), so startup
+  refuses only values outside 600 to 2592000 and logs a warning for a value
+  below 87000 s (paykit-server's default 24 h `payment_window` + 600 s):
+  such a value is only safe with a Lock Server whose Paykit window is
+  that much shorter. The default, 94200 s, is paykit-server's default
+  24 h + 600 s + a 2 h allowance for a payment Paykit saw before its
+  deadline to confirm. With a Paykit `payment_window` longer than the
+  bound minus 600 s, a payment made after the bound takes the late-money
+  fork below.
 
   A completion verified after the bound (a payment confirming more than the
   allowance after the deadline, a Lock Server or Paykit unreachable for the
-  whole bound, or a Paykit window longer than the bound) takes the
-  late-money fork: the correlation keeps polling after the window (bounded
-  by the Lock Server's own task ageing), and a completion verified
-  **after** marketplace expiry completes the order if the unit is still
+  whole bound, a Paykit window longer than the bound, or a bundle the buyer
+  registered and submitted only later) takes the late-money fork: the
+  correlation keeps polling after the window (bounded by the Lock Server's
+  own task ageing), and a completion verified **after** marketplace expiry
+  or after the buyer's cancel completes the order if the unit is still
   free, or leaves it unpaid and `refund_required` if the unit was sold,
   retained in `manual_review`, never a confirmation of a dead order, never
-  silently discarded. A verified completion whose order can no longer be
-  confirmed (e.g. cancelled while the Lock Server did not know the task,
-  or a lapsed auction hold) goes to `manual_review`.
+  silently discarded. A verified completion whose pending order can no
+  longer be confirmed (e.g. a lost hold or a lapsed auction hold) goes to
+  `manual_review`.
+
+  **Residuals.** The service sees a task only once its bundle is
+  registered. If the Shop submits the bundle and the registration does not
+  land within the window plus the 600 s grace (the tab closed or the
+  network lost between submission and registration, and the buyer pays
+  later from the wallet), the order is cancelled and the unit released
+  while the Lock Server grants the buyer access, and the completion leaves
+  no record here. Closing this needs the service to know the bundle id
+  before submission (minting it at `payment.prepare_locks` and sealing it
+  like `client_reference`, so a prepared row can be polled), or the Shop to
+  retry its registration before it offers Cancel; neither is part of this
+  service today. A registered `not_found` correlation keeps being polled,
+  with no age bound, until it changes or its row is removed.
 
   **Hold exposure.** No per-buyer or per-listing cap limits open Locks
   holds; the only per-buyer limit in the service is a drop's
@@ -2824,6 +2887,13 @@ advance a payment (ADR-0019 §7).
   prefers shorter free holds can lower `LOCKS_LIVE_TASK_HOLD_SECONDS`; a
   completion verified past the lower bound then takes the late-money fork
   above.
+
+  A preparation that is never registered holds its unit for the window
+  plus the 600 s registration grace, 1 h 10 min with the defaults, and the
+  buyer cannot cancel it sooner: the service cannot tell an abandoned
+  preparation from one whose bundle is already at the Lock Server. The
+  grace is fixed and short because a prepared row has no bundle id to look
+  up.
 - **History.** Every observed upstream status change and every marketplace
   action on it is appended to `payment_locks_observations` (append-only by
   trigger, statuses only — no bearer material), so late-completion and
@@ -3026,7 +3096,8 @@ see [`docs/api.md`](docs/api.md#webhooks)).
   Inventory semantics above): a lapsed hold restocks, the payment expires,
   and the order cancels with the stored reason `payment window elapsed`,
   except a Locks payment whose registered task is live or not yet looked
-  up (see "Expiry vs late completion"). The two tasks take separate leases,
+  up, or that is prepared but not registered and inside its registration
+  grace (see "Expiry vs late completion"). The two tasks take separate leases,
   so a terminal status one instance observes is swept on that pass or the
   next. Both carry the same lease, crash-safety and at-most-once effect
   properties as the other tasks (payment CAS + unique event index).

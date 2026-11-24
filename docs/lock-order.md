@@ -86,16 +86,18 @@ registration and sync) takes the listing row first.
 ## A payment, then its Locks correlation, then its order
 
 A path that locks a Locks payment's `payment_locks_correlations` row together
-with the payment locks the payment row first. `payment.register_locks` then
-locks the correlation and the order. The held-window sweep
-(`workers::expire_due_payment_windows`) does the same: its discovery
-statement locks the payment, then `lock_held_due_order` locks the
+with the payment locks the payment row first. `payment.prepare_locks` and
+`payment.register_locks` then lock the correlation and the order. The
+held-window sweep (`workers::expire_due_payment_windows`) does the same: its
+discovery statement locks the payment, then `lock_held_due_order` locks the
 correlation and the order and checks the whole sweep predicate again,
-including whether the task is live. The correlation stays locked until the
-sweep commits, so a status the verifier records after discovery is either
-visible to that check or written after the sweep commits. The buyer's
-`order.cancel_request` on a Locks payment takes the same three locks in the
-same order before it checks whether the task is live.
+including whether the payment is prepared or its task is live. The
+correlation stays locked until the sweep commits, so a status the verifier
+records after discovery is either visible to that check or written after the
+sweep commits, and a registration waits for the payment the sweep holds. The
+buyer's `order.cancel_request` on a Locks payment takes the same three locks
+in the same order before it checks the same predicate, and appends its
+`buyer_cancelled` observation under the correlation lock it holds.
 
 The completion paths (`apply_completed_lifecycle`, `apply_manual_review`,
 `park_unverified_completion`) lock the payment first as well;
