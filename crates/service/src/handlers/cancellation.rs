@@ -32,6 +32,13 @@
 //! PayPal has reported a payment the seller has yet to confirm
 //! (`gateway_payment_seen_at`), the buyer can no longer cancel: the hold
 //! stays with the payment it backs.
+//!
+//! Locks-rail orders: while the order's registered Locks task can still
+//! grant access (the window sweep's live-task predicate), the immediate
+//! cancel is refused with `locks_task_live`, because the service cannot end
+//! the task at the Lock Server. Once the Lock Server reports the task
+//! terminal or unknown, or `LOCKS_LIVE_TASK_HOLD_SECONDS` past the window
+//! has passed, the cancel proceeds as for any unpaid order.
 
 use chrono::{DateTime, Utc};
 use marketplace_domain::commands::{OrderActionPayload, RequestCancellationPayload};
@@ -52,11 +59,24 @@ pub async fn request(
     actor: &str,
     command: &Command,
     payload: &RequestCancellationPayload,
+    locks_live_task_hold_seconds: i64,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     // Payment before order: the settlement paths lock in that order, so a
-    // cancel racing a confirmation waits instead of deadlocking.
+    // cancel racing a confirmation waits instead of deadlocking. A Locks
+    // payment's correlation is locked between the two, as the window sweep
+    // does, so no status write lands between the live-task check below and
+    // the release.
     let payment = lock_payment(tx, payload.order_id).await?;
+    if let Some(payment) = payment
+        .as_ref()
+        .filter(|payment| payment.adapter == "locks")
+    {
+        sqlx::query("SELECT id FROM payment_locks_correlations WHERE payment_id = $1 FOR UPDATE")
+            .bind(payment.id)
+            .execute(&mut **tx)
+            .await?;
+    }
     let Some(order) = fetch_order_for_update(tx, payload.order_id).await? else {
         return Ok(Err(CommandFailure::refused(
             crate::refusal_audit::RefusalKind::NotFound,
@@ -99,6 +119,23 @@ pub async fn request(
             crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "This order can no longer be cancelled.",
+        )));
+    }
+    if order.state == "pending_payment"
+        && locks_task_live(
+            tx,
+            payment.as_ref(),
+            &order,
+            locks_live_task_hold_seconds,
+            now,
+        )
+        .await?
+    {
+        return Ok(Err(CommandFailure::refused_with_reason(
+            crate::refusal_audit::RefusalKind::InvalidState,
+            ErrorCode::InvalidState,
+            "This order's Locks payment is still in progress. It can be cancelled once that payment ends.",
+            "locks_task_live",
         )));
     }
 
@@ -235,6 +272,33 @@ fn paykit_money_observed(order: &OrderRow) -> bool {
         order.paykit_request_state.as_deref(),
         Some("detected" | "awaiting_seller_confirmation" | "confirmed")
     )
+}
+
+/// Whether the order's registered Locks task can still grant the buyer
+/// access, by the window sweep's own predicate
+/// ([`crate::workers::live_locks_task`]): the service cannot end the task
+/// at the Lock Server, so releasing the unit now could leave the buyer with
+/// access and no unit. The caller holds the payment, correlation and order
+/// rows.
+async fn locks_task_live(
+    tx: &mut Transaction<'_, Postgres>,
+    payment: Option<&LockedPayment>,
+    order: &OrderRow,
+    hold_seconds: i64,
+    now: DateTime<Utc>,
+) -> Result<bool, sqlx::Error> {
+    if payment.is_none_or(|payment| payment.adapter != "locks") {
+        return Ok(false);
+    }
+    sqlx::query_scalar(&format!(
+        "SELECT EXISTS (SELECT 1 FROM orders o JOIN payments p ON p.order_id = o.id \
+         WHERE o.id = $2 AND {live})",
+        live = crate::workers::live_locks_task(hold_seconds)
+    ))
+    .bind(now)
+    .bind(order.id)
+    .fetch_one(&mut **tx)
+    .await
 }
 
 /// The order's payment row, locked: `(id, adapter, state)`.

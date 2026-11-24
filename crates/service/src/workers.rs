@@ -4818,12 +4818,13 @@ const SWEEPABLE_PAYMENT: &str = "(p.state IN ('awaiting_entitlement', 'detected'
 /// Registration needs the bundle id the Lock Server returns on proof
 /// submission, so the task exists before the hold window ends, and its
 /// Paykit deadline falls at most 600 s of invoice admission plus Paykit's
-/// `payment_window` after that. The window sweep must not cancel such an
-/// order and release its unit; `hold_seconds`
+/// `payment_window` after that. Neither the window sweep nor the buyer's
+/// `order.cancel_request` may cancel such an order and release its unit;
+/// `hold_seconds`
 /// (`LOCKS_LIVE_TASK_HOLD_SECONDS`) past the window bounds the wait so a
 /// silent Lock Server cannot pin stock forever. `$1` is `now`; the bound
 /// is a validated integer, inlined so callers bind only `$1`.
-fn live_locks_task(hold_seconds: i64) -> String {
+pub(crate) fn live_locks_task(hold_seconds: i64) -> String {
     format!(
         "(p.adapter = 'locks' AND p.state = 'awaiting_entitlement' \
          AND o.hold_expires_at IS NOT NULL \

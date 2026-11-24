@@ -1159,7 +1159,15 @@ async fn dispatch(
             .await
         }
         CommandPayload::RequestCancellation(payload) => {
-            crate::handlers::cancellation::request(tx, actor, command, payload, now).await
+            crate::handlers::cancellation::request(
+                tx,
+                actor,
+                command,
+                payload,
+                state.config.locks_live_task_hold_seconds,
+                now,
+            )
+            .await
         }
         CommandPayload::ApproveCancellation(payload) => {
             crate::handlers::cancellation::approve(tx, actor, command, payload, now).await

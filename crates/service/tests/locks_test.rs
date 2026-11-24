@@ -2075,8 +2075,9 @@ async fn a_task_seen_live_after_the_sweeps_discovery_keeps_its_unit(pool: PgPool
 }
 
 // A verified completion whose order can no longer be confirmed (the buyer
-// cancelled while the lifecycle was pending) is retained under manual
-// review instead of confirming a dead order — and instead of vanishing.
+// cancelled while the Lock Server did not know the task yet) is retained
+// under manual review instead of confirming a dead order, and instead of
+// vanishing.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn completion_that_cannot_confirm_the_order_goes_to_manual_review(pool: PgPool) {
     let (app, fake) = test_app_with_locks(pool).await;
@@ -2085,6 +2086,10 @@ async fn completion_that_cannot_confirm_the_order_goes_to_manual_review(pool: Pg
     let buyer = new_actor(&app).await;
     let order = create_pending_locks_order(&app, &seller, &buyer).await;
     register_locks(&app, &buyer.token, &order, &seller.pubky).await;
+    fake.set_outcome(TEST_BUNDLE_ID, LocksLookupOutcome::NotFound);
+    run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
 
     let cancel = common::order_command(
         "order.cancel_request",
@@ -2099,6 +2104,7 @@ async fn completion_that_cannot_confirm_the_order_goes_to_manual_review(pool: Pg
 
     fake.complete_matching(&app.pool, TEST_BUNDLE_ID, &order.payment_id)
         .await;
+    app.clock.advance_seconds(31);
     let summary = run_once(&app.state, holder, app.clock.now())
         .await
         .expect("worker pass runs");
@@ -2116,6 +2122,285 @@ async fn completion_that_cannot_confirm_the_order_goes_to_manual_review(pool: Pg
         0,
         "a dead order is never confirmed"
     );
+}
+
+/// The buyer's `order.cancel_request` at the order's current revision.
+async fn request_cancel(
+    app: &TestApp,
+    buyer: &TestActor,
+    order: &PendingOrder,
+    command_number: u64,
+) -> (StatusCode, Value) {
+    execute(
+        app,
+        &buyer.token,
+        &cancel_command(app, order, command_number).await,
+    )
+    .await
+}
+
+async fn cancel_command(app: &TestApp, order: &PendingOrder, command_number: u64) -> Value {
+    let (revision,): (i64,) = sqlx::query_as("SELECT revision FROM orders WHERE id = $1::uuid")
+        .bind(&order.order_id)
+        .fetch_one(&app.pool)
+        .await
+        .expect("order row");
+    common::order_command(
+        "order.cancel_request",
+        &order.order_id,
+        revision,
+        json!({ "reason": "Changed my mind" }),
+        command_number,
+    )
+}
+
+fn assert_refused_as_live(status: StatusCode, body: &Value) {
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], json!("INVALID_STATE"), "{body}");
+    assert_eq!(body["error"]["reason"], json!("locks_task_live"), "{body}");
+}
+
+// The service cannot end a Locks task at the Lock Server, so while the
+// registered task can still grant the buyer access (never looked up yet, or
+// reported pending) the buyer's cancel is refused and the order keeps its
+// unit. The completion that follows confirms the held order.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_buyer_cancel_is_refused_while_the_locks_task_is_live_and_the_completion_confirms(
+    pool: PgPool,
+) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let holder = Uuid::new_v4();
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
+    register_locks(&app, &buyer.token, &order, &seller.pubky).await;
+
+    let (status, body) = request_cancel(&app, &buyer, &order, 60).await;
+    assert_refused_as_live(status, &body);
+
+    fake.set_outcome(
+        TEST_BUNDLE_ID,
+        LocksLookupOutcome::Status(LocksTaskStatus::Pending),
+    );
+    run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    let (status, body) = request_cancel(&app, &buyer, &order, 61).await;
+    assert_refused_as_live(status, &body);
+    assert_eq!(
+        order_state(&app.pool, &order.order_id).await,
+        "pending_payment"
+    );
+    assert_eq!(listing_quantities(&app.pool).await, (0, 1, 0));
+
+    fake.complete_matching(&app.pool, TEST_BUNDLE_ID, &order.payment_id)
+        .await;
+    app.clock.advance_seconds(31);
+    let summary = run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    assert_eq!(summary.locks_completions_applied, 1);
+    let (state, _, _) = payment_state(&app.pool, &order.payment_id).await;
+    assert_eq!(state, "confirmed");
+    assert_eq!(order_state(&app.pool, &order.order_id).await, "paid");
+    assert_eq!(listing_quantities(&app.pool).await, (0, 0, 1));
+    assert_eq!(
+        count(
+            &app.pool,
+            "SELECT COUNT(*) FROM events WHERE kind = 'order.cancelled'"
+        )
+        .await,
+        0
+    );
+}
+
+// Once the Lock Server reports the task terminal, nothing can grant access
+// any more and the buyer's cancel releases the unit as for any unpaid order.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_buyer_can_cancel_once_the_locks_task_is_terminal(pool: PgPool) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let holder = Uuid::new_v4();
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
+    register_locks(&app, &buyer.token, &order, &seller.pubky).await;
+    fake.set_outcome(
+        TEST_BUNDLE_ID,
+        LocksLookupOutcome::Status(LocksTaskStatus::InProgress),
+    );
+    run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    let (status, body) = request_cancel(&app, &buyer, &order, 62).await;
+    assert_refused_as_live(status, &body);
+
+    fake.set_outcome(
+        TEST_BUNDLE_ID,
+        LocksLookupOutcome::Status(LocksTaskStatus::Expired),
+    );
+    app.clock.advance_seconds(31);
+    run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    assert_eq!(
+        correlation_outcome(&app.pool, &order.payment_id).await,
+        ("upstream_expired".to_string(), Some("expired".to_string()))
+    );
+    let (status, body) = request_cancel(&app, &buyer, &order, 63).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(order_state(&app.pool, &order.order_id).await, "cancelled");
+    assert_eq!(listing_quantities(&app.pool).await, (1, 0, 0));
+}
+
+// A Lock Server that keeps reporting the task live holds the cancel only up
+// to the same bound as the window sweep: `LOCKS_LIVE_TASK_HOLD_SECONDS` past
+// the window, the buyer's cancel releases the unit.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_buyer_can_cancel_a_live_locks_task_past_the_bound(pool: PgPool) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let holder = Uuid::new_v4();
+    let bound = app.state.config.locks_live_task_hold_seconds;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
+    register_locks(&app, &buyer.token, &order, &seller.pubky).await;
+    fake.set_outcome(
+        TEST_BUNDLE_ID,
+        LocksLookupOutcome::Status(LocksTaskStatus::Pending),
+    );
+    run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+
+    app.clock.advance_seconds(3_600 + bound - 1);
+    let (status, body) = request_cancel(&app, &buyer, &order, 64).await;
+    assert_refused_as_live(status, &body);
+
+    app.clock.advance_seconds(2);
+    let (status, body) = request_cancel(&app, &buyer, &order, 65).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(order_state(&app.pool, &order.order_id).await, "cancelled");
+    assert_eq!(listing_quantities(&app.pool).await, (1, 0, 0));
+}
+
+// A lookup in flight while the buyer cancels: the Lock Server first did not
+// know the task (`not_found`, so a cancel would be allowed), and the parked
+// lookup answers `pending`. A separate transaction parks the cancel with two
+// locks the verifier's status write does not conflict with: a key-share lock
+// on the correlation row and an uncommitted event on the order's next
+// revision. A cancel that locks the correlation waits at the first; one that
+// does not stops at the second, after it has already decided to release.
+// The verifier commits `pending` while the cancel is parked, and the cancel
+// must then be refused.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_buyer_cancel_sees_a_live_status_the_verifier_commits_meanwhile(pool: PgPool) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
+    register_locks(&app, &buyer.token, &order, &seller.pubky).await;
+    let locks = app.state.locks.clone().expect("locks runtime");
+    fake.set_outcome(TEST_BUNDLE_ID, LocksLookupOutcome::NotFound);
+    workers::verify_due_locks_lifecycles(&app.state, &locks, app.clock.now())
+        .await
+        .expect("first lookup");
+
+    app.clock.advance_seconds(61);
+    let release = fake.park_next_lookup();
+    let verifier = tokio::spawn({
+        let state = app.state.clone();
+        let locks = locks.clone();
+        let now = app.clock.now();
+        async move { workers::verify_due_locks_lifecycles(&state, &locks, now).await }
+    });
+    while fake.lookup_count() < 2 {
+        tokio::task::yield_now().await;
+    }
+
+    let options = app.pool.connect_options().clone();
+    let mut holder = PgConnection::connect_with(&options)
+        .await
+        .expect("holder connection");
+    sqlx::query("BEGIN")
+        .execute(&mut holder)
+        .await
+        .expect("holder transaction");
+    sqlx::query(
+        "SELECT id FROM payment_locks_correlations WHERE payment_id = $1::uuid FOR KEY SHARE",
+    )
+    .bind(&order.payment_id)
+    .execute(&mut holder)
+    .await
+    .expect("key-share the correlation");
+    let (revision,): (i64,) = sqlx::query_as("SELECT revision FROM orders WHERE id = $1::uuid")
+        .bind(&order.order_id)
+        .fetch_one(&app.pool)
+        .await
+        .expect("order row");
+    sqlx::query(
+        "INSERT INTO events (id, command_id, aggregate_id, revision, actor_pubky, kind, occurred_at) \
+         VALUES ($1, $2, $3, $4, 'lock-order-test', 'test.hold', now())",
+    )
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .bind(format!("order:{}", order.order_id))
+    .bind(revision + 1)
+    .execute(&mut holder)
+    .await
+    .expect("park the cancel on the order's next event");
+    let (holder_pid,): (i32,) = sqlx::query_as("SELECT pg_backend_pid()")
+        .fetch_one(&mut holder)
+        .await
+        .expect("holder pid");
+
+    let cancel = cancel_command(&app, &order, 66).await;
+    let interleave = async {
+        let started = tokio::time::Instant::now();
+        loop {
+            let parked: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+                 WHERE datname = current_database() AND pid <> $1 AND wait_event_type = 'Lock')",
+            )
+            .bind(holder_pid)
+            .fetch_one(&app.pool)
+            .await
+            .expect("lock-wait probe");
+            if parked {
+                break;
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "the cancel never parked"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        fake.set_outcome(
+            TEST_BUNDLE_ID,
+            LocksLookupOutcome::Status(LocksTaskStatus::Pending),
+        );
+        release.notify_one();
+        let applied = verifier
+            .await
+            .expect("verifier joins")
+            .expect("verifier pass");
+        assert_eq!(applied, 0);
+        assert_eq!(
+            correlation_outcome(&app.pool, &order.payment_id).await,
+            ("pending".to_string(), Some("pending".to_string())),
+            "the verifier committed the live status while the cancel was parked"
+        );
+        sqlx::query("ROLLBACK")
+            .execute(&mut holder)
+            .await
+            .expect("holder rollback");
+    };
+    let ((status, body), ()) = tokio::join!(execute(&app, &buyer.token, &cancel), interleave);
+    assert_refused_as_live(status, &body);
+    assert_eq!(
+        order_state(&app.pool, &order.order_id).await,
+        "pending_payment"
+    );
+    assert_eq!(listing_quantities(&app.pool).await, (0, 1, 0));
 }
 
 // The verification task participates in the lease discipline like every
