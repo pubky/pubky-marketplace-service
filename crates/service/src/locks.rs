@@ -312,6 +312,12 @@ impl std::fmt::Debug for ExpectedLocksBinding {
     }
 }
 
+/// The `payment_locks_observations.observed_status` a buyer's cancel of an
+/// unpaid Locks order appends to its correlation history, beside the payment
+/// expiry it performs. A task that completes afterwards is refund-required:
+/// it never confirms or revives the cancelled order.
+pub const BUYER_CANCELLED: &str = "buyer_cancelled";
+
 /// Static labels for a completed task the service cannot verify against the
 /// prepared payment. Each parks the payment in `manual_review`; none
 /// confirms. Written to `payment_locks_correlations.last_observed_status`

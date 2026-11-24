@@ -27,10 +27,12 @@
 //! bounded, abortable, and resumable across restarts. Marketplace
 //! payment-window expiry is a separate server-time transition over the
 //! ORDER's armed inventory-hold window ("only a payment locks an item"):
-//! a lapsed hold restocks, the payment expires, and the order cancels.
-//! Locks v1 leaves transport/status failures pending, so upstream trouble
-//! never expires a payment by itself — and a completion verified after the
-//! window goes to `manual_review`, never silently discarded.
+//! a lapsed hold restocks, the payment expires, and the order cancels —
+//! except while the Lock Server reports the order's Locks task live, since
+//! that task can still grant access. Locks v1 leaves transport/status
+//! failures pending, so upstream trouble never expires a payment by itself —
+//! and a completion verified after the window takes the late-money fork,
+//! never silently discarded.
 //!
 //! Delivery autocomplete semantics (ADR-0019): there is NO carrier
 //! tracking feed, so post-purchase liveness is server time. A `shipped`
@@ -52,7 +54,7 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use uuid::Uuid;
 
-use crate::bitcoin_review::{apply_late_money, LateMoneyOutcome};
+use crate::bitcoin_review::{apply_late_money, refund_required, LateMoneyOutcome};
 use crate::handlers::auction::{close_locked_auction, parse_auction};
 use crate::handlers::payment::confirm_order;
 use crate::handlers::{fetch_order_for_update, insert_notification_intent, LISTING_COLUMNS};
@@ -60,7 +62,7 @@ use crate::homeserver::HomeserverListingClient;
 use crate::locks::{
     BindingRefusal, LocksClientBinding, LocksLookupOutcome, LocksRuntime, LocksTaskStatus,
 };
-use crate::model::{ListingRow, PaymentRow};
+use crate::model::{ListingRow, OrderRow, PaymentRow};
 use crate::payment_attempt::{AcceptedAsset, OfferedAssets, PaymentAsset, PaymentTerms};
 use crate::payments::{
     ActivationTerms, PaykitClient, PaykitCommandError, PaykitLifecycleTarget, PaykitStatusOutcome,
@@ -1949,59 +1951,183 @@ async fn mark_correlation_completed(
     Ok(())
 }
 
-/// Moves the payment to `manual_review` from `from_state` (a completion that
-/// can no longer confirm the order: verified after the marketplace window,
-/// or refused by the confirmation invariants). The compare-and-swap makes a
-/// redelivered completion harmless, and the correlation plus its observation
-/// row retain the history — a late completion is never silently discarded.
+/// Moves the payment of a verified completion whose order cannot be
+/// confirmed to `manual_review`, in the caller's transaction: an
+/// `awaiting_entitlement` payment the confirmation invariants refused, or an
+/// `expired` one whose order already carries a recorded refund. The caller
+/// still holds the payment and order locks it read them under, so neither a
+/// buyer cancel nor the window sweep can move the payment first. The
+/// correlation plus its observation row retain the history; the completion
+/// is never discarded.
 async fn apply_manual_review(
-    pool: &PgPool,
+    mut tx: Transaction<'_, Postgres>,
     row: &ClaimedCorrelation,
-    from_state: &str,
+    payment: &PaymentRow,
     now: DateTime<Utc>,
 ) -> anyhow::Result<bool> {
-    let mut tx = pool.begin().await?;
-    let updated: Option<(i64, String)> = sqlx::query_as(
+    let (revision,): (i64,) = sqlx::query_as(
         "UPDATE payments SET state = 'manual_review', revision = revision + 1, \
          manual_review_entered_at = $3, updated_at = $3 \
-         WHERE id = $1 AND state = $2 RETURNING revision, buyer_pubky",
+         WHERE id = $1 AND state = $2 RETURNING revision",
     )
-    .bind(row.payment_id)
-    .bind(from_state)
+    .bind(payment.id)
+    .bind(&payment.state)
     .bind(now)
-    .fetch_optional(&mut *tx)
+    .fetch_one(&mut *tx)
     .await?;
-    let applied = match updated {
-        Some((revision, buyer_pubky)) => {
-            crate::executor::insert_event(
-                &mut tx,
-                row.id,
-                &ids::payment_aggregate_id(row.payment_id),
-                revision,
-                &buyer_pubky,
-                "payment.manual_review",
-                now,
-            )
-            .await?;
-            mark_correlation_completed(&mut tx, row.id, "manual_review", now).await?;
-            true
-        }
-        None => {
-            // The payment moved concurrently; keep the completed fact.
-            mark_correlation_completed(&mut tx, row.id, "none", now).await?;
-            false
-        }
-    };
+    crate::executor::insert_event(
+        &mut tx,
+        row.id,
+        &ids::payment_aggregate_id(payment.id),
+        revision,
+        &payment.buyer_pubky,
+        "payment.manual_review",
+        now,
+    )
+    .await?;
+    mark_correlation_completed(&mut tx, row.id, "manual_review", now).await?;
     tx.commit().await?;
-    Ok(applied)
+    Ok(true)
+}
+
+/// Whether the buyer cancelled the order before its Locks task completed.
+/// The cancel expires the payment and appends
+/// [`crate::locks::BUYER_CANCELLED`] to the correlation's history, which
+/// tells it apart from a window expiry. A cancel that predates that record
+/// left the payment `awaiting_entitlement` on the cancelled order, a pair
+/// no other path produces: the window sweep expires the payment, and the
+/// refund and resolution paths cancel only from `manual_review`.
+async fn cancelled_by_buyer(
+    tx: &mut Transaction<'_, Postgres>,
+    correlation_id: Uuid,
+    payment: &PaymentRow,
+    order: &OrderRow,
+) -> Result<bool, sqlx::Error> {
+    if order.state != "cancelled" {
+        return Ok(false);
+    }
+    if payment.state == "awaiting_entitlement" {
+        return Ok(true);
+    }
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM payment_locks_observations \
+         WHERE correlation_id = $1 AND observed_status = $2)",
+    )
+    .bind(correlation_id)
+    .bind(crate::locks::BUYER_CANCELLED)
+    .fetch_one(&mut **tx)
+    .await
+}
+
+/// A verified completion for an order the buyer cancelled first. The buyer
+/// paid and then withdrew, so the money goes back: the payment takes the
+/// refund-required shape (`manual_review`, `review_reason =
+/// refund_required`, both parties notified, no receipt) and the order stays
+/// cancelled even when its released unit is still free. Runs in the
+/// caller's transaction, which holds the payment and order locks.
+async fn refund_after_buyer_cancel(
+    mut tx: Transaction<'_, Postgres>,
+    row: &ClaimedCorrelation,
+    payment: &PaymentRow,
+    order: &OrderRow,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    if let Err(failure) = refund_required(
+        &mut tx,
+        payment,
+        order,
+        "cancelled by the buyer before payment completed",
+        row.id,
+        &payment.buyer_pubky,
+        now,
+    )
+    .await
+    {
+        tx.rollback().await?;
+        anyhow::bail!(
+            "refund of locks completion {} after buyer cancel failed: {:?}",
+            row.id,
+            std::mem::discriminant(&failure)
+        );
+    }
+    mark_correlation_completed(&mut tx, row.id, "manual_review", now).await?;
+    tx.commit().await?;
+    tracing::warn!(
+        payment_id = %payment.id,
+        correlation_id = %row.id,
+        "verified locks completion for a buyer-cancelled order; refund required"
+    );
+    Ok(true)
+}
+
+/// A verified completion for an order whose refund the seller has already
+/// recorded (`refunded_external`): when the record covers the payment, the
+/// money came and went back, so the payment closes as `refunded` against
+/// that record and nobody is asked to act. A partial record, or one without
+/// a reference, leaves money unaccounted for and waits in manual review for
+/// an operator instead. Runs in the caller's transaction, which holds the
+/// payment and order locks.
+async fn close_completion_for_refunded_order(
+    mut tx: Transaction<'_, Postgres>,
+    row: &ClaimedCorrelation,
+    payment: &PaymentRow,
+    order: &OrderRow,
+    now: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    let covered = order
+        .external_refund
+        .as_ref()
+        .and_then(|refund| crate::refund_destination::refund_terms(order).covered_by(refund))
+        == Some(true);
+    let reference = order
+        .external_refund
+        .as_ref()
+        .and_then(|refund| refund["transaction_id"].as_str())
+        .map(str::to_string)
+        .filter(|_| covered);
+    let Some(reference) = reference else {
+        tracing::error!(
+            payment_id = %payment.id,
+            correlation_id = %row.id,
+            "ALERT verified locks completion for a refunded order whose recorded refund \
+             does not cover it; routing to manual review"
+        );
+        return apply_manual_review(tx, row, payment, now).await;
+    };
+    if !crate::bitcoin_review::close_refunded_locks_payment(
+        &mut tx,
+        payment.id,
+        &payment.state,
+        &order.seller_pubky,
+        &reference,
+        row.id,
+        now,
+    )
+    .await?
+    {
+        anyhow::bail!(
+            "locks payment {} for a refunded order could not be closed",
+            payment.id
+        );
+    }
+    mark_correlation_completed(&mut tx, row.id, "refunded", now).await?;
+    tx.commit().await?;
+    tracing::warn!(
+        payment_id = %payment.id,
+        correlation_id = %row.id,
+        "verified locks completion for an order already refunded; closed as refunded"
+    );
+    Ok(true)
 }
 
 /// Applies one independently verified completed Locks result. Advances
 /// `awaiting_entitlement → confirmed` exactly once (payment CAS + the
 /// `events_one_payment_confirmed` unique index); routes a completion that
 /// arrives after marketplace expiry — or one whose order can no longer be
-/// confirmed — to `manual_review`; treats an already-advanced payment as a
-/// harmless duplicate.
+/// confirmed — to `manual_review`; makes a completion for an order the
+/// buyer cancelled first refund-required; closes a completion for an order
+/// whose refund is already recorded as `refunded`; treats an
+/// already-advanced payment as a harmless duplicate.
 async fn apply_completed_lifecycle(
     pool: &PgPool,
     row: &ClaimedCorrelation,
@@ -2024,8 +2150,15 @@ async fn apply_completed_lifecycle(
             let Some(order) = fetch_order_for_update(&mut tx, payment.order_id).await? else {
                 anyhow::bail!("correlation {} references a missing order", row.id);
             };
+            if cancelled_by_buyer(&mut tx, row.id, &payment, &order).await? {
+                return refund_after_buyer_cancel(tx, row, &payment, &order, now).await;
+            }
+            if order.state == "refunded_external" {
+                return close_completion_for_refunded_order(tx, row, &payment, &order, now).await;
+            }
+            let mut confirmation = sqlx::Acquire::begin(&mut *tx).await?;
             match confirm_order(
-                &mut tx,
+                &mut confirmation,
                 &payment.buyer_pubky,
                 row.id,
                 &payment,
@@ -2036,6 +2169,7 @@ async fn apply_completed_lifecycle(
             .await?
             {
                 Ok((order, _receipt, _receipt_event_id)) => {
+                    confirmation.commit().await?;
                     let (revision,): (i64,) = sqlx::query_as(
                         "UPDATE payments SET state = 'confirmed', revision = revision + 1, \
                          updated_at = $2 WHERE id = $1 RETURNING revision",
@@ -2077,16 +2211,17 @@ async fn apply_completed_lifecycle(
                 Err(failure) => {
                     // The entitlement is real but the order can no longer be
                     // confirmed (e.g. a lapsed auction hold). Roll back the
-                    // partial confirmation effects, then retain the fact
-                    // under manual review.
-                    tx.rollback().await?;
+                    // partial confirmation effects to the savepoint, then
+                    // retain the fact under manual review while the payment
+                    // and order are still locked.
+                    confirmation.rollback().await?;
                     tracing::warn!(
                         payment_id = %payment.id,
                         correlation_id = %row.id,
                         code = ?failure.code(),
                         "verified locks completion could not confirm the order; routing to manual review"
                     );
-                    apply_manual_review(pool, row, "awaiting_entitlement", now).await
+                    apply_manual_review(tx, row, &payment, now).await
                 }
             }
         }
@@ -2094,6 +2229,23 @@ async fn apply_completed_lifecycle(
             let Some(order) = fetch_order_for_update(&mut tx, payment.order_id).await? else {
                 anyhow::bail!("correlation {} references a missing order", row.id);
             };
+            if cancelled_by_buyer(&mut tx, row.id, &payment, &order).await? {
+                return refund_after_buyer_cancel(tx, row, &payment, &order, now).await;
+            }
+            if order.state == "refunded_external" {
+                return close_completion_for_refunded_order(tx, row, &payment, &order, now).await;
+            }
+            if !matches!(order.state.as_str(), "pending_payment" | "cancelled") {
+                // Late money can complete only a pending or cancelled order;
+                // any other state is kept for a human rather than paid.
+                tracing::warn!(
+                    payment_id = %payment.id,
+                    correlation_id = %row.id,
+                    order_state = %order.state,
+                    "late locks completion for an order that left cancelled; routing to manual review"
+                );
+                return apply_manual_review(tx, row, &payment, now).await;
+            }
             match apply_late_money(
                 &mut tx,
                 keys,
@@ -3002,6 +3154,9 @@ async fn apply_confirmed_paykit_payment(
                 "confirmed paykit payment could not confirm the order; routing to manual review"
             );
             let mut tx = pool.begin().await?;
+            // Payment before order, as `record_external_refund` and every
+            // settlement path lock them.
+            lock_order_payment(&mut tx, row.id).await?;
             record_settlement_rail(&mut tx, row.id, observation, usdt, now).await?;
             let updated: Option<(i64,)> = sqlx::query_as(
                 "UPDATE payments SET state = 'manual_review', revision = revision + 1, \
@@ -4486,10 +4641,14 @@ pub async fn verify_due_paykit_payments(
 /// the buyer simply checks out again. A held order with `hold_expires_at`
 /// NULL (pre-#50 rows the 0012 backfill missed) is already elapsed.
 ///
-/// This is a marketplace policy transition, independent of upstream state; a
-/// Locks correlation keeps polling (bounded by the Lock Server's own task
-/// ageing), so a completion verified later still surfaces as
-/// `manual_review`. Payments already under `manual_review` are deliberately
+/// This is a marketplace policy transition: an upstream failure never expires
+/// a payment by itself. The one upstream fact it waits on is a registered
+/// Locks task that is live or not yet looked up ([`live_locks_task`]): that
+/// task can still grant the buyer access, so its order stays held until the
+/// task completes, fails or expires, or `LOCKS_LIVE_TASK_HOLD_SECONDS` past
+/// the window. A Locks correlation keeps polling after the window (bounded
+/// by the Lock Server's own task ageing), so a completion verified later
+/// still takes the late-money fork. Payments already under `manual_review` are deliberately
 /// NOT swept: a human decides those — their money may be real, so their
 /// hold is never auto-released. The one exception is a Locks payment parked
 /// because its completed task could not be verified against the prepared
@@ -4519,8 +4678,9 @@ pub async fn expire_due_payment_windows(
     let due: Vec<(Uuid, Uuid, String, String)> = sqlx::query_as(&format!(
         "SELECT o.id, p.id, p.state, o.buyer_pubky \
          FROM orders o JOIN payments p ON p.order_id = o.id \
-         WHERE {HELD_DUE_ORDER} AND {SWEEPABLE_PAYMENT} \
-         ORDER BY o.hold_expires_at NULLS FIRST FOR UPDATE OF p SKIP LOCKED"
+         WHERE {HELD_DUE_ORDER} AND {SWEEPABLE_PAYMENT} AND NOT {live_locks_task} \
+         ORDER BY o.hold_expires_at NULLS FIRST FOR UPDATE OF p SKIP LOCKED",
+        live_locks_task = live_locks_task(state.config.locks_live_task_hold_seconds)
     ))
     .bind(now)
     .fetch_all(&mut *tx)
@@ -4799,6 +4959,29 @@ const SWEEPABLE_PAYMENT: &str = "(p.state IN ('awaiting_entitlement', 'detected'
          AND c.verification_state = 'upstream_failed' \
          AND c.last_observed_status IN ('binding_missing', 'binding_unverifiable', \
              'binding_malformed', 'binding_unopenable'))))";
+
+/// A Locks payment whose registered task can still grant the buyer access:
+/// the Lock Server last reported it `pending`/`in_progress`, or no lookup
+/// has succeeded yet (status NULL; a missing task records `not_found`).
+/// Registration needs the bundle id the Lock Server returns on proof
+/// submission, so the task exists before the hold window ends, and its
+/// Paykit deadline falls at most 600 s of invoice admission plus Paykit's
+/// `payment_window` after that. The window sweep must not cancel such an
+/// order and release its unit; `hold_seconds`
+/// (`LOCKS_LIVE_TASK_HOLD_SECONDS`) past the window bounds the wait so a
+/// silent Lock Server cannot pin stock forever. `$1` is `now`; the bound
+/// is a validated integer, inlined so callers bind only `$1`.
+fn live_locks_task(hold_seconds: i64) -> String {
+    format!(
+        "(p.adapter = 'locks' AND p.state = 'awaiting_entitlement' \
+         AND o.hold_expires_at IS NOT NULL \
+         AND o.hold_expires_at > $1 - make_interval(secs => {hold_seconds}) \
+         AND EXISTS (SELECT 1 FROM payment_locks_correlations c WHERE c.payment_id = p.id \
+             AND c.preparation_state = 'registered' AND c.verification_state = 'pending' \
+             AND (c.last_observed_status IS NULL \
+                 OR c.last_observed_status IN ('pending', 'in_progress'))))"
+    )
+}
 
 /// The order half of the held-window expiry predicate; `$1` is `now`.
 const HELD_DUE_ORDER: &str = "o.state = 'pending_payment' AND o.stock_held \

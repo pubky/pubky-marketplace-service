@@ -32,6 +32,12 @@
 //! PayPal has reported a payment the seller has yet to confirm
 //! (`gateway_payment_seen_at`), the buyer can no longer cancel: the hold
 //! stays with the payment it backs.
+//!
+//! Locks-rail orders: the immediate cancel expires the unpaid payment the
+//! same way and appends `buyer_cancelled` to the correlation's history. A
+//! task the buyer registered before cancelling may still complete; the
+//! worker then takes the refund-required shape and leaves the order
+//! cancelled, whether or not the released unit is still free.
 
 use chrono::{DateTime, Utc};
 use marketplace_domain::commands::{OrderActionPayload, RequestCancellationPayload};
@@ -189,6 +195,7 @@ pub async fn request(
 
     let paykit_void = match (&payment, immediate) {
         (Some(payment), true) => {
+            end_locks_payment(tx, payment, actor, command.command_id, now).await?;
             end_paykit_request(tx, &order, payment, actor, command.command_id, now).await?
         }
         _ => None,
@@ -289,24 +296,7 @@ async fn end_paykit_request(
         return Ok(None);
     }
     if payment.state == "awaiting_entitlement" {
-        let (revision,): (i64,) = sqlx::query_as(
-            "UPDATE payments SET state = 'expired', revision = revision + 1, \
-             updated_at = $2 WHERE id = $1 RETURNING revision",
-        )
-        .bind(payment.id)
-        .bind(now)
-        .fetch_one(&mut **tx)
-        .await?;
-        insert_event(
-            tx,
-            command_id,
-            &ids::payment_aggregate_id(payment.id),
-            revision,
-            actor,
-            "payment.expired",
-            now,
-        )
-        .await?;
+        expire_unpaid_payment(tx, payment, actor, command_id, now).await?;
     }
     if order.paykit_activation_state.as_deref() != Some("preparing") {
         return Ok(None);
@@ -338,6 +328,66 @@ async fn end_paykit_request(
     };
     void_preparing_request(tx, order.id, now).await?;
     Ok(Some(pin))
+}
+
+/// Ends the Locks leg of an unpaid order the buyer cancels, inside the
+/// cancel transaction. The `awaiting_entitlement` payment expires and the
+/// correlation's history records [`crate::locks::BUYER_CANCELLED`], so a
+/// task the buyer registered before cancelling that still completes is
+/// refund-required, never a confirmation of the cancelled order. The
+/// correlation keeps polling so that completion surfaces.
+async fn end_locks_payment(
+    tx: &mut Transaction<'_, Postgres>,
+    payment: &LockedPayment,
+    actor: &str,
+    command_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    if payment.adapter != "locks" || payment.state != "awaiting_entitlement" {
+        return Ok(());
+    }
+    expire_unpaid_payment(tx, payment, actor, command_id, now).await?;
+    sqlx::query(
+        "INSERT INTO payment_locks_observations (correlation_id, observed_status, outcome, \
+         observed_at) SELECT id, $2, 'payment_expired', $3 \
+         FROM payment_locks_correlations WHERE payment_id = $1",
+    )
+    .bind(payment.id)
+    .bind(crate::locks::BUYER_CANCELLED)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// `awaiting_entitlement → expired` by the buyer's cancel (the payment
+/// machine's `order.cancel_request` edge).
+async fn expire_unpaid_payment(
+    tx: &mut Transaction<'_, Postgres>,
+    payment: &LockedPayment,
+    actor: &str,
+    command_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    let (revision,): (i64,) = sqlx::query_as(
+        "UPDATE payments SET state = 'expired', revision = revision + 1, \
+         updated_at = $2 WHERE id = $1 RETURNING revision",
+    )
+    .bind(payment.id)
+    .bind(now)
+    .fetch_one(&mut **tx)
+    .await?;
+    insert_event(
+        tx,
+        command_id,
+        &ids::payment_aggregate_id(payment.id),
+        revision,
+        actor,
+        "payment.expired",
+        now,
+    )
+    .await?;
+    Ok(())
 }
 
 /// `preparing → voided` for an order that is no longer payable: the request

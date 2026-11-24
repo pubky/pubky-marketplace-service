@@ -29,7 +29,12 @@ settled Bitcoin payments at once.
 
 ## A refund hash after its order
 
-`refund.record_external` on a USDT order locks the order row, then takes
+`refund.record_external` locks the order's payment row, then the order row,
+like every settlement path: a refund-required Locks payment closes in that
+transaction. The Paykit confirmation fallback that writes a refused
+settlement to manual review in a fresh transaction locks the payment before
+it records the paid rail on the order, so the two wait on each other instead
+of deadlocking. On a USDT order the command then takes
 `pg_advisory_xact_lock(hashtextextended('refund-tx|' || lower(hash), 0))`
 before it checks that no other order recorded the same Arbitrum transaction
 hash. Two records of one hash on two orders hold different order rows and

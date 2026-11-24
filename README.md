@@ -177,7 +177,8 @@ Configuration is environment-based. Window keys and their defaults also live in
 | `LOCKS_SERVER_URL` | unset | Lock Server base URL; setting it enables Locks verification |
 | `LOCKS_BUNDLE_ENCRYPTION_KEY` | unset | 32-byte hex key encrypting bundle ids at rest (XChaCha20-Poly1305) |
 | `LOCKS_LOOKUP_HMAC_KEY` | unset | 32-byte hex key for the HMAC-SHA256 correlation lookup token; must differ from the encryption key |
-| `LOCKS_PAYMENT_WINDOW_SECONDS` | `3600` | hold window armed by the `payment.register_locks` lock point (≥ 60); the correlation window IS the hold window |
+| `LOCKS_PAYMENT_WINDOW_SECONDS` | `3600` | hold window armed by the `payment.prepare_locks` lock point (≥ 60); `payment.register_locks` must land inside it, and the correlation window IS the hold window. The sweep skips it while a registered task is live or not yet looked up, for at most `LOCKS_LIVE_TASK_HOLD_SECONDS` past it (see "Expiry vs late completion") |
+| `LOCKS_LIVE_TASK_HOLD_SECONDS` | `94200` | how long past `LOCKS_PAYMENT_WINDOW_SECONDS` a Locks order stays held while the Lock Server reports its registered task `pending`/`in_progress` or no lookup has succeeded yet (600–2592000; startup checks only this range). **Operator requirement, not checked:** keep it above the Lock Server's Paykit `payment_window` + 600 s. The service is not given that window: neither the lock nor the Lock Server's task lookup carries it, and the service does not query Paykit for Locks orders. It is unrelated to `LOCKS_PAYMENT_WINDOW_SECONDS`. The default is paykit-server's default 24 h `payment_window` + 600 s invoice admission + a 2 h confirmation allowance. Raise it together with any longer Paykit `payment_window`; a lower value is accepted, and a completion verified after the order has been swept takes the late-money fork (see "Expiry vs late completion") |
 | `CHECKOUT_HOLD_WINDOW_SECONDS` | `900` | unbound leftover cancel for ordinary `pending_payment` rows with `stock_held=false` and no payment method (≥ 60). Ordinary `checkout.create` does not hold stock |
 | `FIAT_PAYMENT_WINDOW_SECONDS` | `600` | hold window armed by a PayPal payment-method bind (`POST /v0/orders/{id}/payment-method`) (≥ 60). Default 10 minutes; a deployment may set a longer override |
 | `BITCOIN_PAYMENT_WINDOW_SECONDS` | `1800` | hold window armed by a bitcoin payment-method bind; the same instant is Paykit `expires_at` (fork), or Paykit's activation-time deadline plus 60 s once an upstream request is active — never longer than the invoice the buyer is shown (≥ 60). Honor a deployment value ≥ 60; do not cap below a deployment override |
@@ -1229,6 +1230,40 @@ cannot retract a published request, and `resolve(abandoned)` would stop
 paykit observing it. Once money is observed (`detected`,
 `awaiting_seller_confirmation`, `confirmed`) the buyer's cancel is refused.
 
+**Buyer cancel of a Locks order.** `order.cancel_request` on an unpaid
+Locks order expires its payment (`awaiting_entitlement → expired`) in the
+cancel transaction and appends `buyer_cancelled` (outcome
+`payment_expired`) to the correlation's observation history; the
+correlation keeps polling. Registration is refused once the order left
+`pending_payment`, so a task that completes afterwards was registered
+before the cancel, at a time the buyer could still cancel. Its verified
+completion takes the refund-required shape (payment `manual_review` with
+`review_reason=refund_required`, buyer and seller notified, no receipt)
+and the order stays `cancelled`, even when the released unit is still
+free. An order cancelled before the cancel expired Locks payments (a
+cancelled order whose payment is still `awaiting_entitlement`) is treated
+the same way. The seller returns the money and records it with
+`refund.record_external`; when the recorded amount covers the payment (the
+seller's `refund_cap`), that command closes the refund-required Locks
+payment as `refunded` in the same transaction (`confirmed` with
+`resolution_outcome=refunded`, `resolution_basis=seller_attestation`, the
+recorded transaction id as `refund_reference`, one `payment.resolved` event
+by the system actor, server trigger `locks_refund_reconciliation`): the
+payment columns the seller's `refunded` resolution writes for Paykit, with
+no `paykit_manual_resolutions` row and no `payment_resolved` notice. A window expiry
+is different: its late completion takes the late-money fork and completes the
+order when the unit is free. When the seller has already recorded an
+external refund on the cancelled order (`refunded_external`) before the task
+completes, the completion closes the payment as `refunded` against that
+record in the same way when the record covers it: it neither completes the
+order nor asks for the refund again, and nobody is left with an action to
+take. A partial refund closes nothing: money is still owed, so a
+refund-required payment stays in review, and a completion that lands after
+a partial record waits in `manual_review` for an operator. A payment in
+`manual_review` on a `refunded_external` order is an operator's: the seller
+can neither record a second refund nor resolve the review, so the order's
+`next_actor` is null rather than the seller.
+
 ### `shared_manual` checkout and manual-review resolution (W1.15)
 
 A seller whose Paykit creator is `shared_manual` confirms Bitcoin payments
@@ -1635,7 +1670,7 @@ and arms a bounded server-time hold window on the order
 
 | Lock point | Window |
 | --- | --- |
-| `payment.register_locks` | `LOCKS_PAYMENT_WINDOW_SECONDS` (default 3600) — the existing correlation window IS the hold window; one window concept, not two |
+| `payment.prepare_locks` | `LOCKS_PAYMENT_WINDOW_SECONDS` (default 3600) — the existing correlation window IS the hold window; one window concept, not two. `payment.register_locks` must land inside it |
 | `POST /v0/orders/{id}/payment-method` (PayPal) | `FIAT_PAYMENT_WINDOW_SECONDS` (default 600, min 60) |
 | `POST /v0/orders/{id}/payment-method` (bitcoin) | `BITCOIN_PAYMENT_WINDOW_SECONDS` (default 1800, min 60) — equals Paykit `expires_at` |
 | An auction winner's order (`auction.close`, worker close) | The winning reservation's 30 minutes from the close. It is the order's `hold_expires_at` from creation, and a bind never moves it. A bind after the reservation ended is refused (409 `INVALID_STATE`, reason `auction_window_ended`) |
@@ -1665,15 +1700,18 @@ shared lock order), the payment moves to `expired`
 and the ORDER is cancelled (`pending_payment → cancelled`, the contract's
 `server`-triggered `payment_window` variant) with the stored
 `cancellation_reason` `payment window elapsed`. Post-expiry the buyer
-simply checks out again. Payments under `manual_review` are deliberately
+simply checks out again. A registered Locks payment whose task the Lock
+Server last reported live, or has not answered for yet, is not swept yet
+(see "Expiry vs late completion"). Payments under `manual_review` are deliberately
 not swept (a human decides those — their money may be real); a sandbox
 payment the buyer drove to `detected` has no `detected → expired` edge, so
 its lapsed order cancels and restocks with the payment record left
 untouched, exactly as buyer cancellation leaves it. Confirmed orders are
 `paid` and are never touched by the sweep. Money observed AFTER expiry is
-never dropped: a late Locks completion, a late paykit settlement (when the
-payment was already detected on-chain), and a late fiat verification all
-route the expired payment to `manual_review`.
+never dropped: a late paykit settlement (when the payment was already
+detected on-chain) and a late fiat verification route the expired payment
+to `manual_review`, and a late Locks completion follows "Expiry vs late
+completion" under Locks verification.
 
 **Cancellation.** Buyer/seller cancellation of a pending order releases the
 hold ONLY when one exists — an unheld pending order releases nothing, and
@@ -1735,8 +1773,9 @@ and refund branches):
   the sold quantities to available under the same quantity-balance
   constraint (see the divergence table for the resulting listing
   `sold → available` transition). Cancellation never touches a confirmed
-  payment: it stays confirmed with its receipt intact (an unpaid Paykit
-  payment expires; see "Buyer cancel of a Bitcoin order"), and
+  payment: it stays confirmed with its receipt intact (an unpaid Paykit or
+  Locks payment expires; see "Buyer cancel of a Bitcoin order" and "Buyer
+  cancel of a Locks order"), and
   the only money path out of a cancelled order is the externally evidenced
   `refund.record_external` — the service never claims to move funds. An
   auction winner's cancel releases the winning hold through the reservation
@@ -2429,18 +2468,88 @@ advance a payment (ADR-0019 §7).
   otherwise every Locks completion arrives without a binding and is parked
   in `manual_review` instead of confirming.
 - **Expiry vs late completion.** The `payment_window` task sweeps the
-  ORDER's hold window (`LOCKS_PAYMENT_WINDOW_SECONDS`, armed at
-  registration — the correlation window IS the hold window): once it
-  elapses on server time with the payment still `awaiting_entitlement`,
-  the hold restocks, the payment moves to `expired`, and the order is
-  cancelled with the stored reason `payment window elapsed` — deliberately
-  separate from upstream failure. The correlation keeps polling after the
-  window (bounded by the Lock Server's own task ageing), so a completion
-  verified **after** marketplace expiry moves the payment
-  `expired → manual_review` and is retained — never a confirmation of a
-  dead order, never silently discarded. A verified completion whose order
-  can no longer be confirmed (e.g. cancelled while pending, or a lapsed
-  auction hold) also goes to `manual_review`.
+  ORDER's hold window (`LOCKS_PAYMENT_WINDOW_SECONDS`, armed by
+  `payment.prepare_locks`; `payment.register_locks` must land inside it —
+  the correlation window IS the hold window): once it elapses on server
+  time with the payment still `awaiting_entitlement`, the hold restocks,
+  the payment moves to `expired`, and the order is cancelled with the
+  stored reason `payment window elapsed` — deliberately separate from
+  upstream failure.
+
+  The service does not set the buyer's deadline. Registration needs the
+  bundle id the Lock Server returns when the proof is submitted, so the
+  task exists before the window ends; the Lock Server's worker then creates
+  the Paykit invoice, at most 600 s after submission, and Paykit stamps
+  `payment_deadline` from its own `payment_window` (default 24 h from
+  invoice creation; a cross-currency invoice uses the shorter conversion
+  window). A lock's `payment_in` does not change it: paykit-server (v0.1.1-rc4)
+  only checks that the invoice request repeats the lock's value. The sweep
+  therefore skips a registered payment whose latest lookup is `pending` or
+  `in_progress`, or that no lookup has answered yet (a task the Lock Server
+  does not know records `not_found` and is swept at the window), and keeps
+  its unit held until Locks reports the task terminal or
+  `LOCKS_LIVE_TASK_HOLD_SECONDS` past the window, whichever comes first;
+  the next pass then sweeps it. Locks ends the task when the buyer rejects
+  the Paykit proposal or lets it expire, or when the invoice expires
+  unpaid. It does not end it at the deadline when Paykit saw a matching
+  payment before the deadline (Paykit never expires such an invoice, and
+  the task stays pending until the payment has its confirmations), and it
+  keeps the task pending while it cannot reach Paykit.
+
+  **Operator coupling.** Keep `LOCKS_LIVE_TASK_HOLD_SECONDS` above the Lock
+  Server's Paykit `payment_window` + 600 s. The service is not given that
+  window (neither the lock nor the Lock Server's task lookup carries it,
+  and the service does not query Paykit for Locks orders), so startup only
+  checks the range (600–2592000). The
+  default, 94200 s, is paykit-server's default 24 h + 600 s + a 2 h
+  allowance for a payment Paykit saw before its deadline to confirm. With a
+  Paykit `payment_window` longer than the bound minus 600 s, a payment made
+  after the bound takes the late-money fork below.
+
+  A completion verified after the bound (a payment confirming more than the
+  allowance after the deadline, a Lock Server or Paykit unreachable for the
+  whole bound, or a Paykit window longer than the bound) is never silently
+  discarded: the correlation keeps polling after the window (bounded by the
+  Lock Server's own task ageing). What a completion verified **after**
+  marketplace expiry does depends on how the order ended:
+  - **Window expiry** (`payment window elapsed`): the late-money fork. The
+    unit still free: the payment confirms and the order is paid
+    (`late_completion`). The unit gone, a digital delivery the seller can
+    no longer make, or a sale over the seller's annual limit: `manual_review`
+    with `review_reason=refund_required`, the order stays cancelled.
+  - **Buyer cancel**: refund-required whatever the stock (see "Buyer cancel
+    of a Locks order").
+  - **Refund already recorded** (`refunded_external`): when the record covers
+    the payment, it closes as `refunded` against the seller's record and
+    nothing is paid; a partial record leaves it in `manual_review`.
+  - **Any other refusal** (a still-pending order that refuses confirmation,
+    for example a lost hold or a lapsed auction hold): `manual_review`
+    without a review reason, written in the transaction that read the
+    payment.
+
+  A refund-required Locks payment closes as `refunded` when the seller
+  records a refund that covers it with `refund.record_external`.
+
+  **Hold exposure.** No per-buyer or per-listing cap limits open Locks
+  holds; the only per-buyer limit in the service is a drop's
+  `per_buyer_limit`. A Locks order holds the units its lock is priced for
+  (the lock amount must equal the order total, so one unit at the listing
+  price). A buyer who prepares, submits the proof, registers and accepts
+  the Paykit proposal without paying keeps that unit for the window plus
+  the bound — 1 h + 26 h 10 min with the defaults — without moving any
+  money, and can repeat it with as many orders and keys as there are
+  units; other buyers are refused with `Another buyer's payment is holding
+  this item.` An unaccepted proposal ends at Paykit's proposal window
+  (default 1 h) and its unit is released on the next pass. While the Lock
+  Server cannot reach Paykit, or the service has had no answer from the
+  Lock Server since registration, every registered order is held up to
+  the same bound.
+
+  This exposure is accepted: holding the unit is what keeps a payment made
+  inside Paykit's deadline from ending `refund_required`. An operator who
+  prefers shorter free holds can lower `LOCKS_LIVE_TASK_HOLD_SECONDS`; a
+  completion verified past the lower bound then takes the late-money fork
+  above.
 - **History.** Every observed upstream status change and every marketplace
   action on it is appended to `payment_locks_observations` (append-only by
   trigger, statuses only — no bearer material), so late-completion and
@@ -2641,10 +2750,12 @@ see [`docs/api.md`](docs/api.md#webhooks)).
   configured. The `payment_window` sweep always runs and covers EVERY armed
   hold window (Locks, fiat/bitcoin bind, sandbox, drop claims — see
   Inventory semantics above): a lapsed hold restocks, the payment expires,
-  and the order cancels with the stored reason `payment window elapsed`.
-  Both hold the same leases and carry the same crash-safety and
-  at-most-once effect properties as the other tasks (payment CAS + unique
-  event index).
+  and the order cancels with the stored reason `payment window elapsed`,
+  except a Locks payment whose registered task is live or not yet looked
+  up (see "Expiry vs late completion"). The two tasks take separate leases,
+  so a terminal status one instance observes is swept on that pass or the
+  next. Both carry the same lease, crash-safety and at-most-once effect
+  properties as the other tasks (payment CAS + unique event index).
 
 ## PostgreSQL invariants (ADR-0019 §4)
 
@@ -2727,6 +2838,13 @@ aggregate sets change):
   already declared);
 - the payment aggregate's command list gains `payment.register_locks`.
 
+Closing a refunded Locks payment adds the server trigger
+`locks_refund_reconciliation` to payment `manual_review → confirmed` (beside
+`paykit_resolution`; the edge stays server-only, so no client command
+confirms a payment), and to `expired → confirmed` and
+`awaiting_entitlement → confirmed`, which a completion for an order whose
+covering refund is already recorded takes directly.
+
 ## Resolved contract divergences
 
 The prototype service enums and the client-side TypeScript contracts
@@ -2747,7 +2865,7 @@ This service is canonical and resolves them as follows:
 | Auth handshake | ed25519 challenge–response: the service issued a nonce for the client to sign | Pubky AuthToken verified with `pubky-common`; challenge endpoint removed | A browser client cannot sign — the secret key lives in the user's signer (Pubky Ring), and the SDK `Keypair` exposes no signing method. The AuthToken is the mechanism Pubky provides for exactly this proof; the service adds single-use and acceptance-window enforcement. |
 | Payment projection | client `paymentSchema` requires `locks_bundle_id` | the field no longer exists: the bundle id lives only encrypted in `payment_locks_correlations` and is never serialized | ADR-0019 §8 forbids exposing `access credentials or bundle_id`. The client has made the field optional; it will never be sent. |
 | Payment adapter | sandbox only (`adapter = 'sandbox'`) | `sandbox` or `locks`; `payment.register_locks` flips a payment to `locks`, which permanently refuses `payment.sandbox_advance` | ADR-0019 §7: a Locks-correlated payment advances only by independent server-side verification of a completed Locks result — never by a client claim. |
-| Real payment advancement | none (the prototype had only the buyer-driven sandbox command) | server-driven: the worker verifies the Locks lifecycle (`POST /verification-task-lookups`) and confirms exactly once; the marketplace payment window expires on server time; a late completion goes to `manual_review` | ADR-0019 §7 and the upstream integration contract; Locks v1 leaves transport/status failures pending, so upstream trouble never expires a payment by itself. |
+| Real payment advancement | none (the prototype had only the buyer-driven sandbox command) | server-driven: the worker verifies the Locks lifecycle (`POST /verification-task-lookups`) and confirms exactly once; the marketplace payment window expires on server time; a late completion takes the late-money fork, is refund-required after a buyer cancel, or closes as `refunded` when the refund is already recorded | ADR-0019 §7 and the upstream integration contract; Locks v1 leaves transport/status failures pending, so upstream trouble never expires a payment by itself. |
 | Order delivery address | prototype order views carried the address | omitted from read projections (the client `orderSchema` never wanted it) | ADR-0019 §8: no private delivery details in exposed records. |
 | Receipts | client `receiptSchema` + sandbox `GET /v1/receipts/{id}` | durable `receipts` table (append-only), issued exactly once on payment confirmation; `GET /v1/receipts/{id}` for issuer and recipient | The table and issuing transition now exist, so the endpoint serves real rows; `orders.receipt_id` is populated on confirmation. |
 | Inventory after payment confirmation | prototype left the sold quantity in `reservedQuantity` forever | confirmation moves the order's line quantities reserved → sold and marks the winning auction reservation `converted` | The contract already declared listing `reserved → sold` and reservation `active → converted` under `payment_confirmation`; a durable ledger cannot hold quantities in a hold state forever. |

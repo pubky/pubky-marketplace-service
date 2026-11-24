@@ -1916,6 +1916,55 @@ async fn hold_late_settlement(
     Ok(())
 }
 
+/// Closes a Locks payment whose money the seller has already returned and
+/// recorded as the order's external refund: `confirmed` with
+/// `resolution_outcome = 'refunded'` on the seller's attestation, the record
+/// the seller's `refunded` resolution writes for Paykit. The server makes
+/// the move (`payment.resolved` by the system actor); no client command
+/// confirms a payment. `from_state` is the locked payment's state. Returns
+/// whether the payment moved.
+pub(crate) async fn close_refunded_locks_payment(
+    tx: &mut Transaction<'_, Postgres>,
+    payment_id: Uuid,
+    from_state: &str,
+    seller_pubky: &str,
+    refund_reference: &str,
+    resolution_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<bool, sqlx::Error> {
+    let cas: Option<(i64,)> = sqlx::query_as(
+        "UPDATE payments SET state = 'confirmed', revision = revision + 1, \
+         resolution_id = $3, resolution_outcome = 'refunded', \
+         resolution_basis = 'seller_attestation', resolved_at = $4, \
+         resolved_by_pubky = $5, refund_reference = $6, \
+         manual_review_entered_at = NULL, updated_at = $4 \
+         WHERE id = $1 AND state = $2 AND adapter = 'locks' \
+         AND resolution_outcome IS NULL RETURNING revision",
+    )
+    .bind(payment_id)
+    .bind(from_state)
+    .bind(resolution_id)
+    .bind(now)
+    .bind(seller_pubky)
+    .bind(refund_reference)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((revision,)) = cas else {
+        return Ok(false);
+    };
+    insert_event(
+        tx,
+        resolution_id,
+        &ids::payment_aggregate_id(payment_id),
+        revision,
+        crate::workers::SYSTEM_ACTOR,
+        "payment.resolved",
+        now,
+    )
+    .await?;
+    Ok(true)
+}
+
 /// The #50 stock-gone shape: payment `manual_review` with
 /// `review_reason = refund_required`, a pending order cancelled with any
 /// hold it still holds released, both parties notified, no receipt. Shared

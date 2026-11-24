@@ -900,6 +900,10 @@
             {
               "trigger": "server",
               "name": "late_completion"
+            },
+            {
+              "trigger": "server",
+              "name": "locks_refund_reconciliation"
             }
           ]
         },
@@ -980,6 +984,10 @@
             {
               "trigger": "server",
               "name": "late_completion"
+            },
+            {
+              "trigger": "server",
+              "name": "locks_refund_reconciliation"
             }
           ]
         },
@@ -990,6 +998,10 @@
             {
               "trigger": "server",
               "name": "paykit_resolution"
+            },
+            {
+              "trigger": "server",
+              "name": "locks_refund_reconciliation"
             }
           ]
         },

@@ -581,10 +581,11 @@ pub fn payment_machine() -> AggregateMachine {
                     Command("payment.sandbox_advance"),
                     Server("locks_verification"),
                     Server("late_completion"),
+                    Server("locks_refund_reconciliation"),
                 ],
             ),
-            // A buyer's cancel of an unpaid Paykit-rail order ends its
-            // payment, so money that still reaches the request is late.
+            // A buyer's cancel of an unpaid Paykit- or Locks-rail order ends
+            // its payment, so money that still reaches it is late.
             t(
                 "awaiting_entitlement",
                 "expired",
@@ -618,17 +619,33 @@ pub fn payment_machine() -> AggregateMachine {
                 "manual_review",
                 vec![Server("locks_late_completion"), Server("late_completion")],
             ),
-            t("expired", "confirmed", vec![Server("late_completion")]),
+            // `locks_refund_reconciliation`: a verified Locks completion for an
+            // order whose covering refund is already recorded closes as
+            // `refunded` straight from the payment's state.
+            t(
+                "expired",
+                "confirmed",
+                vec![
+                    Server("late_completion"),
+                    Server("locks_refund_reconciliation"),
+                ],
+            ),
             // The Paykit manual-review resolution (design §B.9 r12): the
             // listing seller (or the seven-day inactivity reaper, same
             // abandoned branch) resolves a `manual_review` payment exactly
             // once — `confirmed` for the paid/refunded outcomes, `expired`
             // for abandoned. `resolution_outcome` distinguishes a resolved
-            // payment from a naturally confirmed/expired one.
+            // payment from a naturally confirmed/expired one. A Locks
+            // payment under refund-required review closes the same way, as
+            // `refunded`, when the seller records the refund on its order
+            // (`locks_refund_reconciliation`); no client command confirms.
             t(
                 "manual_review",
                 "confirmed",
-                vec![Server("paykit_resolution")],
+                vec![
+                    Server("paykit_resolution"),
+                    Server("locks_refund_reconciliation"),
+                ],
             ),
             t(
                 "manual_review",
@@ -850,13 +867,22 @@ mod tests {
     #[test]
     fn paykit_resolution_edges_are_server_only_and_one_way() {
         let payments = payment_machine();
-        for target in ["confirmed", "expired"] {
+        for (target, via) in [
+            (
+                "confirmed",
+                vec![
+                    Server("paykit_resolution"),
+                    Server("locks_refund_reconciliation"),
+                ],
+            ),
+            ("expired", vec![Server("paykit_resolution")]),
+        ] {
             let transition = payments
                 .transitions
                 .iter()
                 .find(|t| t.from == "manual_review" && t.to == target)
                 .unwrap_or_else(|| panic!("manual_review -> {target} exists"));
-            assert_eq!(transition.via, vec![Server("paykit_resolution")]);
+            assert_eq!(transition.via, via);
         }
         // `confirmed` is terminal: no edge out of it at all (no un-pay).
         for target in [
@@ -877,7 +903,24 @@ mod tests {
             .iter()
             .find(|t| t.from == "expired" && t.to == "confirmed")
             .expect("expired -> confirmed exists");
-        assert_eq!(expired_confirmed.via, vec![Server("late_completion")]);
+        assert_eq!(
+            expired_confirmed.via,
+            vec![
+                Server("late_completion"),
+                Server("locks_refund_reconciliation"),
+            ]
+        );
+        let awaiting_confirmed = payments
+            .transitions
+            .iter()
+            .find(|t| t.from == "awaiting_entitlement" && t.to == "confirmed")
+            .expect("awaiting_entitlement -> confirmed exists");
+        assert!(
+            awaiting_confirmed
+                .via
+                .contains(&Server("locks_refund_reconciliation")),
+            "the refund-first Locks closure is declared on the edge it takes"
+        );
         let orders = order_machine();
         let transition = orders
             .transitions
