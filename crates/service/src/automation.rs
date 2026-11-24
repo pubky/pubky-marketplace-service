@@ -124,13 +124,14 @@ pub async fn consume_automation_rate(
         (Some((available - 1.0, effective.max(now))), None)
     } else {
         // Refill starts only once this clock reaches the bucket's timestamp.
-        // Whole microseconds (the stored precision), so the ceiling below
-        // never rounds down a fraction of a millisecond.
+        // The serving clock can carry nanoseconds while stored timestamps are
+        // whole microseconds, so the wait keeps full precision and the
+        // ceiling below never rounds a fraction down.
         let pending = (effective - now)
-            .num_microseconds()
+            .num_nanoseconds()
             .unwrap_or(i64::MAX)
             .max(0) as f64
-            / 1_000_000.0;
+            / 1_000_000_000.0;
         let seconds = (pending + (1.0 - available) * 60.0 / rate).ceil().max(1.0) as i64;
         (implausible.then_some((available, now)), Some(seconds))
     };

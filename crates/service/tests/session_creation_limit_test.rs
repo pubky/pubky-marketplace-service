@@ -401,6 +401,24 @@ async fn creation_retry_after_rounds_up_a_sub_millisecond_wait(pool: PgPool) {
     assert_eq!(creation_bucket(&app, &pubky).await, (0.0, ahead));
 }
 
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn creation_retry_after_rounds_up_a_sub_microsecond_wait(pool: PgPool) {
+    let mut config = wide_window_config();
+    // One token refills every second.
+    config.automation_rate_limit_per_minute = 60;
+    let app = test_app_with_config(pool, config).await;
+    let ahead = Utc::now().trunc_subsecs(6) + Duration::seconds(60);
+    let start = ahead - Duration::seconds(60) - Duration::nanoseconds(1);
+    let (keypair, pubky) = random_keypair();
+    seed_creation_bucket(&app, &pubky, 0.0, ahead).await;
+
+    let (status, headers) = post_token_at(&app, &keypair, start).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    // 60 s and 1 ns until this clock reaches the bucket, then 1 s for one token.
+    assert_eq!(retry_after_seconds(&headers), 62);
+    assert_eq!(creation_bucket(&app, &pubky).await, (0.0, ahead));
+}
+
 async fn post_token_from(
     app: &TestApp,
     origin: &str,
