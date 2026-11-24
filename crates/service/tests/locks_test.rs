@@ -25,7 +25,7 @@ use marketplace_service::locks::{
 use marketplace_service::workers::{self, run_once, try_acquire_lease};
 use marketplace_service::AppState;
 use serde_json::{json, Value};
-use sqlx::PgPool;
+use sqlx::{Connection, PgConnection, PgPool};
 use uuid::Uuid;
 
 use common::{
@@ -1944,6 +1944,134 @@ async fn a_never_observed_locks_task_is_held_up_to_the_bound(pool: PgPool) {
     assert_eq!(summary.payment_windows_expired, 1);
     assert_eq!(order_state(&app.pool, &order.order_id).await, "cancelled");
     assert_eq!(listing_quantities(&app.pool).await, (1, 0, 0));
+}
+
+// A lookup in flight while the window lapses, answering after the sweep's
+// discovery read the task as not live (`not_found`). The verifier commits
+// `pending` before the sweep decides; the sweep must see it and keep the
+// unit. A separate transaction parks the sweep after discovery with two locks
+// the verifier's status write does not conflict with: a key-share lock on the
+// correlation row and an uncommitted event on the payment's next revision. A
+// sweep that locks the correlation waits at the first; one that does not
+// stops at the second, after it has already decided to expire the order.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_task_seen_live_after_the_sweeps_discovery_keeps_its_unit(pool: PgPool) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
+    register_locks(&app, &buyer.token, &order, &seller.pubky).await;
+    let locks = app.state.locks.clone().expect("locks runtime");
+    fake.set_outcome(TEST_BUNDLE_ID, LocksLookupOutcome::NotFound);
+    workers::verify_due_locks_lifecycles(&app.state, &locks, app.clock.now())
+        .await
+        .expect("first lookup");
+    assert_eq!(
+        correlation_outcome(&app.pool, &order.payment_id).await,
+        ("pending".to_string(), Some("not_found".to_string()))
+    );
+
+    app.clock.advance_seconds(3_601);
+    let now = app.clock.now();
+    let release = fake.park_next_lookup();
+    let verifier = tokio::spawn({
+        let state = app.state.clone();
+        let locks = locks.clone();
+        async move { workers::verify_due_locks_lifecycles(&state, &locks, now).await }
+    });
+    while fake.lookup_count() < 2 {
+        tokio::task::yield_now().await;
+    }
+
+    let options = app.pool.connect_options().clone();
+    let mut holder = PgConnection::connect_with(&options)
+        .await
+        .expect("holder connection");
+    sqlx::query("BEGIN")
+        .execute(&mut holder)
+        .await
+        .expect("holder transaction");
+    sqlx::query(
+        "SELECT id FROM payment_locks_correlations WHERE payment_id = $1::uuid FOR KEY SHARE",
+    )
+    .bind(&order.payment_id)
+    .execute(&mut holder)
+    .await
+    .expect("key-share the correlation");
+    let (_, _, revision) = payment_state(&app.pool, &order.payment_id).await;
+    sqlx::query(
+        "INSERT INTO events (id, command_id, aggregate_id, revision, actor_pubky, kind, occurred_at) \
+         VALUES ($1, $2, $3, $4, 'lock-order-test', 'test.hold', now())",
+    )
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .bind(format!("payment:{}", order.payment_id))
+    .bind(revision + 1)
+    .execute(&mut holder)
+    .await
+    .expect("park the sweep on the payment's next event");
+    let (holder_pid,): (i32,) = sqlx::query_as("SELECT pg_backend_pid()")
+        .fetch_one(&mut holder)
+        .await
+        .expect("holder pid");
+
+    let sweep = tokio::spawn({
+        let state = app.state.clone();
+        async move { workers::expire_due_payment_windows(&state, now).await }
+    });
+    let started = tokio::time::Instant::now();
+    loop {
+        let parked: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+             WHERE datname = current_database() AND pid <> $1 AND wait_event_type = 'Lock')",
+        )
+        .bind(holder_pid)
+        .fetch_one(&app.pool)
+        .await
+        .expect("lock-wait probe");
+        if parked {
+            break;
+        }
+        assert!(
+            !sweep.is_finished(),
+            "the sweep finished without reaching the parked order"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the sweep never parked after discovery"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    fake.set_outcome(
+        TEST_BUNDLE_ID,
+        LocksLookupOutcome::Status(LocksTaskStatus::Pending),
+    );
+    release.notify_one();
+    let applied = verifier
+        .await
+        .expect("verifier joins")
+        .expect("verifier pass");
+    assert_eq!(applied, 0);
+    assert_eq!(
+        correlation_outcome(&app.pool, &order.payment_id).await,
+        ("pending".to_string(), Some("pending".to_string())),
+        "the verifier committed the live status while the sweep was parked"
+    );
+
+    sqlx::query("ROLLBACK")
+        .execute(&mut holder)
+        .await
+        .expect("holder rollback");
+    let expired = sweep.await.expect("sweep joins").expect("window sweep");
+    assert_eq!(expired, 0, "a task live at the decision is not swept");
+    let (state, _, _) = payment_state(&app.pool, &order.payment_id).await;
+    assert_eq!(state, "awaiting_entitlement");
+    assert_eq!(
+        order_state(&app.pool, &order.order_id).await,
+        "pending_payment"
+    );
+    assert_eq!(listing_quantities(&app.pool).await, (0, 1, 0));
 }
 
 // A verified completion whose order can no longer be confirmed (the buyer

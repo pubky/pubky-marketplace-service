@@ -4520,14 +4520,19 @@ pub async fn expire_due_payment_windows(
     // seller-window reaper (which routes the payment to `manual_review`
     // with the hold PRESERVED) owns it — the buyer demonstrably paid on
     // chain, so the ordinary sweep must never release that stock.
-    // Discovery locks only the payment rows; each order is locked after
-    // its payment (see `lock_sweep_order`).
+    // Discovery locks only the payment rows; each payment's Locks
+    // correlation and then its order are locked after it, and the whole
+    // predicate is checked again under those locks (see
+    // `lock_held_due_order`).
+    let predicate = format!(
+        "{HELD_DUE_ORDER} AND {SWEEPABLE_PAYMENT} AND NOT {live_locks_task}",
+        live_locks_task = live_locks_task(state.config.locks_live_task_hold_seconds)
+    );
     let due: Vec<(Uuid, Uuid, String, String)> = sqlx::query_as(&format!(
         "SELECT o.id, p.id, p.state, o.buyer_pubky \
          FROM orders o JOIN payments p ON p.order_id = o.id \
-         WHERE {HELD_DUE_ORDER} AND {SWEEPABLE_PAYMENT} AND NOT {live_locks_task} \
-         ORDER BY o.hold_expires_at NULLS FIRST FOR UPDATE OF p SKIP LOCKED",
-        live_locks_task = live_locks_task(state.config.locks_live_task_hold_seconds)
+         WHERE {predicate} \
+         ORDER BY o.hold_expires_at NULLS FIRST FOR UPDATE OF p SKIP LOCKED"
     ))
     .bind(now)
     .fetch_all(&mut *tx)
@@ -4535,7 +4540,7 @@ pub async fn expire_due_payment_windows(
 
     let mut expired = 0u64;
     for (order_id, payment_id, payment_state, buyer_pubky) in due {
-        if !lock_sweep_order(&mut tx, HELD_DUE_ORDER, order_id, now).await? {
+        if !lock_held_due_order(&mut tx, &predicate, order_id, payment_id, now).await? {
             continue;
         }
         expire_held_order(
@@ -4875,6 +4880,41 @@ async fn lock_sweep_order(
     ))
     .bind(bound)
     .bind(order_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(locked.is_some())
+}
+
+/// Locks one held-window candidate after the discovery statement locked its
+/// payment: the payment's Locks correlation row, then the order, in the
+/// payment, correlation, order lock order that registration takes. `predicate`
+/// is the whole sweep predicate, checked again under those locks; `false`
+/// skips the candidate this tick. Discovery read the correlation without
+/// locking it, so a verifier may have committed `not_found` to `pending` since;
+/// with the row locked until this transaction commits, no status write lands
+/// between this check and the release. The correlation lock waits rather
+/// than skips: its other holders either lock the payment first (which this
+/// transaction holds) or write the correlation alone and take no further
+/// row lock.
+async fn lock_held_due_order(
+    tx: &mut Transaction<'_, Postgres>,
+    predicate: &str,
+    order_id: Uuid,
+    payment_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query("SELECT id FROM payment_locks_correlations WHERE payment_id = $1 FOR UPDATE")
+        .bind(payment_id)
+        .execute(&mut **tx)
+        .await?;
+    let locked: Option<(Uuid,)> = sqlx::query_as(&format!(
+        "SELECT o.id FROM orders o JOIN payments p ON p.order_id = o.id \
+         WHERE {predicate} AND o.id = $2 AND p.id = $3 \
+         FOR UPDATE OF o SKIP LOCKED"
+    ))
+    .bind(now)
+    .bind(order_id)
+    .bind(payment_id)
     .fetch_optional(&mut **tx)
     .await?;
     Ok(locked.is_some())
