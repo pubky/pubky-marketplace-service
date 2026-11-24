@@ -707,10 +707,11 @@ before it was planned for a previous link, or for none, and is dropped). A
 linked product has a snapshot row from its link on, and an unlinked product's
 row stays, emptied of its bases, until the connector worker's stock poll
 deletes it once its fence is older than `ORPHAN_SNAPSHOT_RETENTION` (twice
-the longest catalog walk, 12,000 seconds); linking the product again writes a
-new row and fence. 0097 inserts an empty row for every linked product that
-has none. `rebased_at` from 0096 is copied into each group's column and is no
-longer read or written. Directly rerunnable.
+the longest catalog walk, 12,000 seconds). A row without a fence (an unlink by
+a binary from before 0097) expires by its `created_at` instead. Linking the
+product again writes a new row and fence. 0097 inserts an empty row for every
+linked product that has none. `rebased_at` from 0096 is copied into each
+group's column and is no longer read or written. Directly rerunnable.
 
 **Deploy mode: rolling, together with 0096, the API before the worker.** No
 binary that reads `rebased_at` shipped: 0096 and 0097 reach production in one

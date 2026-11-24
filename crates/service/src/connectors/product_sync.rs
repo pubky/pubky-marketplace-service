@@ -54,9 +54,11 @@
 //! product and group keep at most their pending change and their latest
 //! resolution (the dismissal a later observation is compared with), and an
 //! unlinked product keeps only its emptied snapshot row, which the stock poll
-//! deletes after [`ORPHAN_SNAPSHOT_RETENTION`]. A read of a product that is
-//! not linked does nothing, and linking it again sets a new fence, so the row
-//! is not needed for the fence once the product is unlinked.
+//! deletes once its fence is older than [`ORPHAN_SNAPSHOT_RETENTION`]. A row
+//! without a fence (an unlink by a binary from before 0097) expires by its
+//! `created_at` instead. A read of a product that is not linked does nothing,
+//! and linking it again sets a new fence, so the row is not needed for the
+//! fence once the product is unlinked.
 //!
 //! Lock order, everywhere: the connection row, then the connection's sync
 //! lock (direction changes and mapping changes), then snapshot rows (several
@@ -1139,10 +1141,12 @@ pub async fn apply_links(
 
 /// Deletes the snapshot rows of products no listing links whose link fence
 /// is older than [`ORPHAN_SNAPSHOT_RETENTION`], on every connection, in
-/// batches. Rows another transaction holds (a mapping change linking the
-/// product again, a read) are skipped and taken by a later pass; a link that
-/// commits after a row was deleted writes the row again with a newer fence.
-/// Returns how many rows were deleted.
+/// batches. A row without a fence (an unlink by a binary from before 0097)
+/// expires by its `created_at` instead; a fenced row is judged by its fence
+/// alone. Rows another transaction holds (a mapping change linking the product
+/// again, a read) are skipped and taken by a later pass; a link that commits
+/// after a row was deleted writes the row again with a newer fence. Returns
+/// how many rows were deleted.
 pub async fn delete_old_orphans(pool: &PgPool, now: DateTime<Utc>) -> Result<u64, sqlx::Error> {
     let cutoff = now - ORPHAN_SNAPSHOT_RETENTION;
     let mut deleted = 0;
@@ -1151,7 +1155,8 @@ pub async fn delete_old_orphans(pool: &PgPool, now: DateTime<Utc>) -> Result<u64
             "DELETE FROM connector_product_snapshots s USING ( \
                  SELECT o.connection_id, o.provider_product_id \
                  FROM connector_product_snapshots o \
-                 WHERE o.unlinked_at < $1 AND NOT EXISTS ( \
+                 WHERE (o.unlinked_at < $1 OR (o.unlinked_at IS NULL \
+                   AND o.created_at < $1)) AND NOT EXISTS ( \
                      SELECT 1 FROM connector_variant_map m \
                      WHERE m.connection_id = o.connection_id \
                        AND m.provider_product_id = o.provider_product_id) \

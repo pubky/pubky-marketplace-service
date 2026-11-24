@@ -1643,6 +1643,94 @@ async fn the_stock_poll_deletes_old_orphan_snapshots_only(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_orphan_left_without_a_fence_by_an_old_binary_expires_by_its_creation(pool: PgPool) {
+    let r = rig(pool).await;
+    let retention = product_sync::ORPHAN_SNAPSHOT_RETENTION.num_seconds();
+    r.link_mug().await;
+    r.poll().await;
+
+    // The boots were linked, then an old binary removed their mapping without
+    // stamping the snapshot's fence or leaving changes and overrides behind.
+    r.app.clock.advance_seconds(5);
+    sqlx::query(
+        "WITH old_unlink AS ( \
+             UPDATE connector_product_snapshots SET unlinked_at = NULL \
+             WHERE connection_id = $1 AND provider_product_id = $2 \
+             RETURNING connection_id \
+         ), old_mappings AS ( \
+             DELETE FROM connector_variant_map \
+             WHERE connection_id = $1 AND provider_product_id = $2 \
+             RETURNING connection_id \
+         ), old_changes AS ( \
+             DELETE FROM connector_product_changes \
+             WHERE connection_id = $1 AND provider_product_id = $2 AND state = 'pending' \
+             RETURNING connection_id \
+         ) \
+         DELETE FROM connector_sync_overrides \
+         WHERE connection_id = $1 AND listing_id = 'boots_01'",
+    )
+    .bind(r.connection)
+    .bind(BOOTS)
+    .execute(&r.app.pool)
+    .await
+    .expect("old binary unlink");
+    r.app.clock.advance_seconds(retention + 1);
+
+    // The other product is also unlinked without a fence, but its snapshot is
+    // younger than the retention. The mug stays linked and has no fence.
+    r.save_mappings(json!([
+        { "listing_id": "boots_01", "provider_product_id": OTHER,
+          "provider_variant_id": OTHER_VARIANT },
+        { "listing_id": "mug_01", "provider_product_id": MUG,
+          "provider_variant_id": MUG_VARIANT },
+    ]))
+    .await;
+    r.app.clock.advance_seconds(5);
+    sqlx::query(
+        "WITH old_unlink AS ( \
+             UPDATE connector_product_snapshots SET unlinked_at = NULL \
+             WHERE connection_id = $1 AND provider_product_id = $2 \
+             RETURNING connection_id \
+         ), old_mappings AS ( \
+             DELETE FROM connector_variant_map \
+             WHERE connection_id = $1 AND provider_product_id = $2 \
+             RETURNING connection_id \
+         ), old_changes AS ( \
+             DELETE FROM connector_product_changes \
+             WHERE connection_id = $1 AND provider_product_id = $2 AND state = 'pending' \
+             RETURNING connection_id \
+         ) \
+         DELETE FROM connector_sync_overrides \
+         WHERE connection_id = $1 AND listing_id = 'boots_01'",
+    )
+    .bind(r.connection)
+    .bind(OTHER)
+    .execute(&r.app.pool)
+    .await
+    .expect("old binary unlink");
+    sqlx::query(
+        "UPDATE connector_product_snapshots SET unlinked_at = NULL \
+         WHERE connection_id = $1 AND provider_product_id = $2",
+    )
+    .bind(r.connection)
+    .bind(MUG)
+    .execute(&r.app.pool)
+    .await
+    .expect("linked row without a fence");
+
+    assert_eq!(
+        r.snapshot_rows().await,
+        vec![BOOTS.to_string(), MUG.to_string(), OTHER.to_string()]
+    );
+    r.poll().await;
+    assert_eq!(
+        r.snapshot_rows().await,
+        vec![MUG.to_string(), OTHER.to_string()],
+        "only the null-fenced orphan older than the retention is deleted"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_read_from_before_an_unlink_completing_after_its_row_was_deleted_changes_nothing(
     pool: PgPool,
 ) {
