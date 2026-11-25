@@ -2523,6 +2523,54 @@ mod tests {
     }
 
     #[test]
+    fn a_huge_retry_after_reads_as_a_bounded_delay() {
+        let year = Duration::from_secs(crate::resolve_delivery::MAX_RETRY_AFTER_SECONDS as u64);
+        for value in ["9999999999999", "9223372036854775807", "9223372036854776"] {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                reqwest::header::RETRY_AFTER,
+                value.parse().expect("header value"),
+            );
+            assert_eq!(retry_after_from(&headers), Some(year), "{value}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_homeserver_asking_for_an_endless_wait_is_a_bounded_rejection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock homeserver binds");
+        let address = listener.local_addr().expect("mock homeserver address");
+        let server = tokio::spawn(async move {
+            let overloaded = Router::new().fallback(|| async {
+                (
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    [("retry-after", "9223372036854775807")],
+                )
+            });
+            axum::serve(listener, overloaded)
+                .await
+                .expect("mock homeserver serves");
+        });
+        let client =
+            HttpHomeserverClient::new(&format!("http://{address}")).expect("client builds");
+
+        let outcome = client
+            .listing_events(&"s".repeat(52), LISTINGS_PATH, None, false, 10)
+            .await;
+
+        assert_eq!(
+            outcome,
+            HomeserverEventsOutcome::Rejected {
+                retry_after: Some(Duration::from_secs(
+                    crate::resolve_delivery::MAX_RETRY_AFTER_SECONDS as u64
+                ))
+            }
+        );
+        server.abort();
+    }
+
+    #[test]
     fn http_client_requires_an_http_base_url() {
         assert!(HttpHomeserverClient::new("ftp://homeserver.example").is_err());
         assert!(HttpHomeserverClient::new("https://homeserver.example/").is_ok());
