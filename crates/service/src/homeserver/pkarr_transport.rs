@@ -164,11 +164,66 @@ fn allowed_addrs(addrs: Vec<SocketAddr>, policy: EndpointPolicy) -> Resolving {
     })
 }
 
+/// The record cache the Pkarr client and the transport share, in which a
+/// record is never replaced by an older one. The check and the write are one
+/// step under one lock, whoever writes: the Pkarr client, or a lookup that
+/// read the cache before awaiting the network and writes back what it read.
+#[derive(Debug, Clone)]
+struct MonotonicCache {
+    records: InMemoryCache,
+    writes: Arc<Mutex<()>>,
+}
+
+impl MonotonicCache {
+    fn new(capacity: NonZeroUsize) -> Self {
+        Self {
+            records: InMemoryCache::new(capacity),
+            writes: Arc::new(Mutex::new(())),
+        }
+    }
+
+    /// Stores `packet` unless the cache holds a more recent record for its
+    /// key, and returns the most recent record the cache holds.
+    fn keep(&self, packet: SignedPacket) -> SignedPacket {
+        let _writing = self.writes.lock().unwrap_or_else(PoisonError::into_inner);
+        let key = CacheKey::from(&packet.public_key());
+        match self.records.get_read_only(&key) {
+            Some(held) if held.more_recent_than(&packet) => held,
+            _ => {
+                self.records.put(&key, &packet);
+                packet
+            }
+        }
+    }
+}
+
+impl Cache for MonotonicCache {
+    fn capacity(&self) -> usize {
+        self.records.capacity()
+    }
+
+    fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    fn put(&self, _key: &CacheKey, signed_packet: &SignedPacket) {
+        self.keep(signed_packet.clone());
+    }
+
+    fn get(&self, key: &CacheKey) -> Option<SignedPacket> {
+        self.records.get(key)
+    }
+
+    fn get_read_only(&self, key: &CacheKey) -> Option<SignedPacket> {
+        self.records.get_read_only(key)
+    }
+}
+
 /// The Pkarr client and the record cache it shares with the transport.
 #[derive(Clone)]
 struct Records {
     pkarr: pkarr::Client,
-    cache: Arc<InMemoryCache>,
+    cache: Arc<MonotonicCache>,
     ttl_seconds: u32,
 }
 
@@ -193,11 +248,12 @@ impl Records {
         self.network_record(key, cached).await
     }
 
-    /// The network's answer, or `cached` when that is more recent still: the
-    /// Pkarr client never replaces a cached record with an older one, but it
-    /// returns the older one, and an expired cached record would otherwise
-    /// lose to it on every read. A cached record the network has nothing
-    /// newer than is marked as just seen, so it is fresh again.
+    /// The network's answer, or `cached` when that is more recent still: an
+    /// expired cached record would otherwise lose to an older network answer
+    /// on every read. A cached record the network has nothing newer than is
+    /// marked as just seen, so it is fresh again. Either way the result is
+    /// the most recent record the cache holds once the lookup is done, so a
+    /// record another lookup stored while this one waited is not lost.
     async fn network_record(
         &self,
         key: &pkarr::PublicKey,
@@ -209,18 +265,18 @@ impl Records {
 }
 
 fn more_recent(
-    cache: &InMemoryCache,
+    cache: &MonotonicCache,
     cached: Option<SignedPacket>,
     network: SignedPacket,
 ) -> SignedPacket {
-    match cached {
+    let chosen = match cached {
         Some(mut cached) if cached.more_recent_than(&network) => {
             cached.refresh();
-            cache.put(&CacheKey::from(&cached.public_key()), &cached);
             cached
         }
         _ => network,
-    }
+    };
+    cache.keep(chosen)
 }
 
 /// Resolves a homeserver key to the addresses its own record lists for
@@ -484,7 +540,7 @@ impl PkarrTransport {
     ) -> anyhow::Result<Self> {
         let capacity = NonZeroUsize::new(cache.capacity)
             .ok_or_else(|| anyhow::anyhow!("the Pkarr record cache needs a capacity"))?;
-        let records = Arc::new(InMemoryCache::new(capacity));
+        let records = Arc::new(MonotonicCache::new(capacity));
         let record_ttl_seconds = u32::try_from(cache.ttl.as_secs()).unwrap_or(u32::MAX);
         let shared: Arc<dyn Cache> = records.clone();
         builder.pkarr(|pkarr| {
@@ -1077,24 +1133,28 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn a_cached_record_newer_than_the_networks_answer_is_kept() {
-        let keypair = pkarr::Keypair::random();
-        let key = CacheKey::from(&keypair.public_key());
-        let record = |target: &str| {
+    fn records_of(keypair: &pkarr::Keypair) -> impl Fn(&str) -> SignedPacket + '_ {
+        |target: &str| {
             SignedPacket::builder()
                 .https(
                     "_pubky".try_into().unwrap(),
                     SVCB::new(0, target.try_into().unwrap()),
                     60,
                 )
-                .sign(&keypair)
+                .sign(keypair)
                 .unwrap()
-        };
+        }
+    }
+
+    #[test]
+    fn a_cached_record_newer_than_the_networks_answer_is_kept() {
+        let keypair = pkarr::Keypair::random();
+        let key = CacheKey::from(&keypair.public_key());
+        let record = records_of(&keypair);
         let older = record("older.example");
         let newer = record("newer.example");
         assert!(newer.more_recent_than(&older));
-        let cache = InMemoryCache::new(NonZeroUsize::new(4).unwrap());
+        let cache = MonotonicCache::new(NonZeroUsize::new(4).unwrap());
 
         // An expired cached record still beats an older network answer, and
         // is cached again as just seen.
@@ -1107,12 +1167,65 @@ mod tests {
         assert_eq!(cached.timestamp(), newer.timestamp());
         assert!(!cached.is_expired(60, 60));
 
-        // A newer network answer wins; the Pkarr client caches it itself.
-        let fresh = InMemoryCache::new(NonZeroUsize::new(4).unwrap());
+        // A newer network answer wins and is cached.
+        let fresh = MonotonicCache::new(NonZeroUsize::new(4).unwrap());
         let chosen = more_recent(&fresh, Some(older.clone()), newer.clone());
         assert_eq!(chosen.timestamp(), newer.timestamp());
-        assert!(fresh.get(&key).is_none());
-        let chosen = more_recent(&fresh, None, older.clone());
-        assert_eq!(chosen.timestamp(), older.timestamp());
+        assert_eq!(
+            fresh.get(&key).expect("cached").timestamp(),
+            newer.timestamp()
+        );
+    }
+
+    #[test]
+    fn a_record_is_never_replaced_by_an_older_one() {
+        let keypair = pkarr::Keypair::random();
+        let key = CacheKey::from(&keypair.public_key());
+        let record = records_of(&keypair);
+        let oldest = record("oldest.example");
+        let middle = record("middle.example");
+        let newest = record("newest.example");
+        assert!(middle.more_recent_than(&oldest) && newest.more_recent_than(&middle));
+        let cache = MonotonicCache::new(NonZeroUsize::new(4).unwrap());
+
+        cache.put(&key, &middle);
+        cache.put(&key, &newest);
+        cache.put(&key, &oldest);
+        cache.put(&key, &middle);
+        assert_eq!(
+            cache.get(&key).expect("cached").timestamp(),
+            newest.timestamp(),
+            "an older record, written by the Pkarr client or not, does not replace a newer one"
+        );
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn a_lookup_that_waited_does_not_replace_a_record_stored_meanwhile() {
+        let keypair = pkarr::Keypair::random();
+        let key = CacheKey::from(&keypair.public_key());
+        let record = records_of(&keypair);
+        let oldest = record("oldest.example");
+        let middle = record("middle.example");
+        let newest = record("newest.example");
+        let cache = MonotonicCache::new(NonZeroUsize::new(4).unwrap());
+        cache.put(&key, &middle);
+
+        // This lookup read `middle` from the cache and went to the network,
+        // which answers with an older record. Another lookup stores `newest`
+        // before this one finishes.
+        let mut snapshot = cache.get(&key).expect("cached");
+        snapshot.set_last_seen(&pkarr::Timestamp::from(0));
+        cache.put(&key, &newest);
+        let result = more_recent(&cache, Some(snapshot), oldest);
+
+        assert_eq!(
+            result.timestamp(),
+            newest.timestamp(),
+            "the lookup answers with the most recent record, so the next read does not go back to the homeserver the seller left"
+        );
+        let held = cache.get(&key).expect("cached");
+        assert_eq!(held.timestamp(), newest.timestamp());
+        assert!(!held.is_expired(60, 60));
     }
 }
