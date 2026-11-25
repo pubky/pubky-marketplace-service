@@ -88,17 +88,58 @@ else
   echo "prepush: packages ${packages[*]}"
 fi
 
+if [ "${#packages[@]}" -eq 0 ]; then
+  echo "prepush: cargo fmt"
+  cargo fmt --check
+  echo "prepush: clippy and tests skipped (no package changed)"
+  prepush_stamp "$sha"
+  seconds="$(( $(date +%s) - start ))"
+  echo "PREPUSH OK ${sha} ${seconds} ${PREPUSH_MODE}"
+  exit 0
+fi
+
+prepush_clean_workspace_members() {
+  local target="$1" metadata names member
+  local members=() clean_args=()
+  metadata="$(CARGO_TARGET_DIR="$target" cargo metadata --no-deps --format-version 1 --locked)" || return 1
+  names="$(printf '%s' "$metadata" | jq -r '
+    .workspace_members as $members
+    | .packages[]
+    | select(.id as $id | $members | index($id))
+    | .name
+  ')" || return 1
+  while IFS= read -r member; do
+    [ -n "$member" ] && members+=("$member")
+  done <<< "$names"
+  [ "${#members[@]}" -gt 0 ] || return 1
+  for member in "${members[@]}"; do
+    clean_args+=(-p "$member")
+  done
+  CARGO_TARGET_DIR="$target" cargo clean "${clean_args[@]}" >/dev/null || return 1
+  printf '%s\n' "$ROOT" > "$target/.prepush-members-clean" || return 1
+  echo "prepush: cleaned ${#members[@]} workspace members from ${target}"
+}
+
 # Sibling worktrees share one Cargo target unless this gate overrides it.
-# A shared target can run another tree's test binary. This checkout gets its own;
-# PREPUSH_CARGO_TARGET names a different one.
+# Workspace artifacts copied from a shared target name another tree's sources,
+# so only dependency artifacts are reused. Clean every workspace member in a
+# seeded, unmarked or differently-owned target, and mark empty targets to avoid
+# a later clean. PREPUSH_CARGO_TARGET overrides the private target location; a
+# new private target is seeded from CARGO_TARGET_DIR only when the paths differ.
 shared_target="${CARGO_TARGET_DIR:-}"
 private_target="${PREPUSH_CARGO_TARGET:-/Volumes/t7/vibes-dev/.cargo-target/marketplace-service/$(basename "$ROOT")}"
-if [ ! -d "$private_target" ] && [ -n "$shared_target" ] && [ -d "$shared_target" ] && [ "$shared_target" != "$private_target" ]; then
+origin=existing
+if [ ! -d "$private_target" ]; then
+  origin=new
+fi
+if [ "$origin" = new ] && [ -n "$shared_target" ] && [ -d "$shared_target" ] && [ "$shared_target" != "$private_target" ]; then
   seed="${private_target}.partial"
   rm -rf "$seed"
   mkdir -p "$(dirname "$private_target")"
-  if cp -cR "$shared_target" "$seed" 2>/dev/null || cp -R "$shared_target" "$seed"; then
+  if cp -cRH "$shared_target" "$seed" 2>/dev/null || cp -RH "$shared_target" "$seed"; then
     mv "$seed" "$private_target"
+    rm -f "$private_target/.prepush-members-clean"
+    origin=seeded
   else
     rm -rf "$seed"
     mkdir -p "$private_target"
@@ -106,17 +147,25 @@ if [ ! -d "$private_target" ] && [ -n "$shared_target" ] && [ -d "$shared_target
 fi
 mkdir -p "$private_target"
 export CARGO_TARGET_DIR="$private_target"
+marker="$private_target/.prepush-members-clean"
+if [ "$origin" = new ]; then
+  printf '%s\n' "$ROOT" > "$marker"
+elif [ "$origin" = seeded ] || [ ! -f "$marker" ] || [ "$(cat "$marker")" != "$ROOT" ]; then
+  if ! prepush_clean_workspace_members "$private_target"; then
+    if [ "$origin" = seeded ]; then
+      rm -rf "$private_target"
+      mkdir -p "$private_target"
+      printf '%s\n' "$ROOT" > "$marker"
+      echo "prepush: could not clean workspace members; using an empty target"
+    else
+      echo "prepush: cannot clean workspace members in ${private_target}; delete it or set PREPUSH_CARGO_TARGET to a new path" >&2
+      exit 1
+    fi
+  fi
+fi
 
 echo "prepush: cargo fmt"
 cargo fmt --check
-
-if [ "${#packages[@]}" -eq 0 ]; then
-  echo "prepush: clippy and tests skipped (no package changed)"
-  prepush_stamp "$sha"
-  seconds="$(( $(date +%s) - start ))"
-  echo "PREPUSH OK ${sha} ${seconds} ${PREPUSH_MODE}"
-  exit 0
-fi
 
 clippy_scope=()
 test_args=()
