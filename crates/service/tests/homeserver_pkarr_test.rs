@@ -317,6 +317,52 @@ async fn redirecting_homeserver(
     (port, answered)
 }
 
+/// A homeserver on loopback holding `keypair`, over TLS pinned to that key,
+/// that keeps each connection open and answers every request on it with a
+/// listing record titled `title`. Returns its port and the number of
+/// connections it accepted.
+async fn keep_alive_homeserver(keypair: &PkarrKeypair, title: &str) -> (u16, Arc<AtomicUsize>) {
+    let socket = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = socket.local_addr().expect("address").port();
+    let acceptor = TlsAcceptor::from(Arc::new(keypair.to_rpk_rustls_server_config()));
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counted = accepted.clone();
+    let body = serde_json::to_vec(&listing_record("x", LISTING_ID, title)).expect("record");
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = socket.accept().await {
+            counted.fetch_add(1, Ordering::SeqCst);
+            let (acceptor, body) = (acceptor.clone(), body.clone());
+            tokio::spawn(async move {
+                let Ok(mut tls) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 1024];
+                loop {
+                    while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        match tls.read(&mut buffer).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(read) => request.extend_from_slice(&buffer[..read]),
+                        }
+                    }
+                    request.clear();
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\n\r\n",
+                        body.len()
+                    );
+                    if tls.write_all(head.as_bytes()).await.is_err()
+                        || tls.write_all(&body).await.is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (port, accepted)
+}
+
 /// The reads of `pubky` a homeserver at an address the client refuses (or
 /// one that answers only with a redirect) must all fail as `Unavailable`.
 async fn assert_refused(client: &HttpHomeserverClient, pubky: &str) {
@@ -1123,6 +1169,49 @@ fn a_redirect_from_a_homeserver_is_not_followed() {
             0,
             "no redirect target was contacted"
         );
+    });
+}
+
+#[test]
+fn a_homeserver_that_republishes_its_direct_port_is_reached_at_the_new_one() {
+    on_testnet(async {
+        let testnet = testnet().await;
+        let homeserver = PkarrKeypair::random();
+        let (old_port, old_connections) =
+            keep_alive_homeserver(&homeserver, "at the old port").await;
+        let (new_port, new_connections) =
+            keep_alive_homeserver(&homeserver, "at the new port").await;
+        let direct = |port| Endpoints {
+            direct: Some((vec![IpAddr::V4(Ipv4Addr::LOCALHOST)], port)),
+            ..Endpoints::default()
+        };
+        publish_endpoints(&testnet, &homeserver, direct(old_port)).await;
+        let pubky = publish_user_on(&testnet, &homeserver).await;
+
+        let ttl = Duration::from_secs(3);
+        let client = pkarr_client(&testnet, ttl);
+        let resolved_at = Instant::now();
+        let title = |outcome: HomeserverFetchOutcome| match outcome {
+            HomeserverFetchOutcome::Found(record) => record["title"].as_str().map(str::to_owned),
+            _ => None,
+        };
+        for _ in 0..2 {
+            assert_eq!(
+                title(client.fetch_listing(&pubky, LISTING_ID).await).as_deref(),
+                Some("at the old port")
+            );
+        }
+        assert_eq!(new_connections.load(Ordering::SeqCst), 0);
+
+        publish_endpoints(&testnet, &homeserver, direct(new_port)).await;
+        tokio::time::sleep_until((resolved_at + ttl + Duration::from_secs(1)).into()).await;
+        assert_eq!(
+            title(client.fetch_listing(&pubky, LISTING_ID).await).as_deref(),
+            Some("at the new port"),
+            "a connection made before the republish is not reused for the new record's endpoint"
+        );
+        assert!(old_connections.load(Ordering::SeqCst) >= 1);
+        assert!(new_connections.load(Ordering::SeqCst) >= 1);
     });
 }
 

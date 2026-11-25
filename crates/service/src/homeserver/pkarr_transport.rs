@@ -559,7 +559,12 @@ impl PkarrTransport {
             cache: records,
             ttl_seconds: record_ttl_seconds,
         };
+        // Every direct request connects anew. A pooled connection is not
+        // resolved again, so one made before the homeserver republished its
+        // address or port would keep serving at the old endpoint under the
+        // same URL.
         let direct = hardened(pubky_reqwest::Client::builder())
+            .pool_max_idle_per_host(0)
             .dns_resolver(Arc::new(DirectResolver {
                 records: records.clone(),
                 policy,
