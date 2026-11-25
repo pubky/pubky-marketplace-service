@@ -112,15 +112,21 @@ row lock while holding it. The sweep therefore waits for the correlation
 instead of skipping it: nothing that holds it waits for a lock the sweep
 holds.
 
-These paths judge time only after their last row-lock wait. Registration,
-the buyer's cancel and a first preparation read the injected clock once the
-payment, correlation and order are locked; a preparation replay, which reads
-no order fields, reads it once the payment and correlation are locked. The
-sweep advances its tick instant by the clock's movement up to the moment
-the correlation lock is granted. The registration grace, the live-task
-bound, the armed hold and every timestamp these paths write therefore use
-an instant after the wait, so a transaction that enters before a bound and
-waits across it is judged past the bound.
+These paths judge time only once the locks their time checks depend on are
+held. Registration, the buyer's cancel and a first preparation read the
+injected clock once the payment, correlation and order are locked; a
+preparation replay, which reads no order fields, reads it once the payment
+and correlation are locked. The sweep advances its tick instant by the
+clock's movement up to the moment the correlation lock is granted. The
+registration grace, the live-task bound, the armed hold and every timestamp
+these paths take from the clock therefore use an instant read after those
+waits, so a transaction that enters before a bound and waits across it is
+judged past the bound. Work after the read does not move it: a first
+preparation still reads the seller's homeserver records and waits for the
+seller's region lock and its listing and variant rows, and a cancel or a
+sweep waits for the stock rows it releases, so a first preparation's window
+can start up to that long before it commits. No time check depends on those
+rows.
 
 ## Where a retry is enough
 

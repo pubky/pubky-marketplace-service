@@ -2746,26 +2746,12 @@ async fn a_buyer_cancel_sees_a_live_status_the_verifier_commits_meanwhile(pool: 
 /// locks the correlation `FOR UPDATE` waits for it; the verifier's status
 /// writes do not.
 async fn key_share_the_correlation(app: &TestApp, payment_id: &str) -> (PgConnection, i32) {
-    let options = app.pool.connect_options().clone();
-    let mut holder = PgConnection::connect_with(&options)
-        .await
-        .expect("holder connection");
-    sqlx::query("BEGIN")
-        .execute(&mut holder)
-        .await
-        .expect("holder transaction");
-    sqlx::query(
+    hold_row_lock(
+        app,
         "SELECT id FROM payment_locks_correlations WHERE payment_id = $1::uuid FOR KEY SHARE",
+        payment_id,
     )
-    .bind(payment_id)
-    .execute(&mut holder)
     .await
-    .expect("key-share the correlation");
-    let (holder_pid,): (i32,) = sqlx::query_as("SELECT pg_backend_pid()")
-        .fetch_one(&mut holder)
-        .await
-        .expect("holder pid");
-    (holder, holder_pid)
 }
 
 /// Waits until `waiters` backends other than `holder_pid` wait on a row lock.
@@ -3036,6 +3022,49 @@ async fn a_registration_after_a_lock_wait_records_the_instant_it_held_the_locks(
         ],
         [locked_at; 4]
     );
+}
+
+// A first preparation that waits on the order row lock arms its hold and
+// its window from the instant it held that lock: the window is not
+// shortened, nor the preparation backdated, by the time spent waiting.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_first_preparation_after_a_lock_wait_arms_its_window_from_the_instant_it_held_the_locks(
+    pool: PgPool,
+) {
+    let (app, _fake) = test_app_with_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
+    let locked_at = app.clock.now() + chrono::Duration::seconds(300);
+    let window =
+        locked_at + chrono::Duration::seconds(app.state.config.locks_payment_window_seconds);
+
+    let (holder, holder_pid) = hold_row_lock(&app, LOCK_THE_ORDER, &order.order_id).await;
+    let prepare = common::prepare_locks_command(&order.payment_id, 129);
+    let (status, body) =
+        execute_across_a_lock_wait(&app, &buyer.token, &prepare, holder, holder_pid, 300).await;
+    assert_eq!(status, StatusCode::OK, "preparation: {body}");
+
+    let (created_at, window_expires_at): (
+        chrono::DateTime<chrono::Utc>,
+        chrono::DateTime<chrono::Utc>,
+    ) = sqlx::query_as(
+        "SELECT created_at, window_expires_at FROM payment_locks_correlations \
+             WHERE payment_id = $1::uuid",
+    )
+    .bind(&order.payment_id)
+    .fetch_one(&app.pool)
+    .await
+    .expect("correlation row exists");
+    let (hold_expires_at,): (Option<chrono::DateTime<chrono::Utc>>,) =
+        sqlx::query_as("SELECT hold_expires_at FROM orders WHERE id = $1::uuid")
+            .bind(&order.order_id)
+            .fetch_one(&app.pool)
+            .await
+            .expect("order row exists");
+    assert_eq!(created_at, locked_at);
+    assert_eq!(window_expires_at, window);
+    assert_eq!(hold_expires_at, Some(window));
 }
 
 // A preparation replay that enters one second before the registration grace
