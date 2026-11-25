@@ -1215,6 +1215,59 @@ fn a_homeserver_that_republishes_its_direct_port_is_reached_at_the_new_one() {
     });
 }
 
+/// Publishes an endpoint record for `homeserver` that lists the direct
+/// address `port` on loopback and, when `delegate` is given, hands the same
+/// host over to that key as well.
+async fn publish_direct_with_delegate(
+    testnet: &Testnet,
+    homeserver: &PkarrKeypair,
+    port: u16,
+    delegate: Option<&PkarrKeypair>,
+) {
+    let root =
+        || -> pubky_testnet::pubky::pkarr::dns::Name<'_> { ".".try_into().expect("root name") };
+    let mut direct = SVCB::new(1, ".".try_into().expect("root name"));
+    direct.set_port(port);
+    let mut packet = SignedPacket::builder().https(root(), direct, 60).address(
+        root(),
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        60,
+    );
+    if let Some(delegate) = delegate {
+        let target = delegate.public_key().to_z32();
+        packet = packet.https(
+            root(),
+            SVCB::new(2, target.as_str().try_into().expect("delegate name")),
+            60,
+        );
+    }
+    publish(testnet, &packet.sign(homeserver).expect("endpoint record")).await;
+}
+
+#[test]
+fn a_homeserver_presenting_a_key_it_only_delegates_to_is_refused() {
+    on_testnet(async {
+        let testnet = testnet().await;
+        let homeserver = PkarrKeypair::random();
+        let delegate = PkarrKeypair::random();
+        let (port, accepted) = keep_alive_homeserver(&delegate, "served under the delegate").await;
+        publish_direct_with_delegate(&testnet, &homeserver, port, Some(&delegate)).await;
+        publish_direct_with_delegate(&testnet, &delegate, port, None).await;
+        let pubky = publish_user_on(&testnet, &homeserver).await;
+        let client = pkarr_client(&testnet, PkarrResolutionCache::default().ttl);
+
+        assert_eq!(
+            client.fetch_listing(&pubky, LISTING_ID).await,
+            HomeserverFetchOutcome::Unavailable,
+            "the connection must be pinned to the host's own key, with no lookup of other keys"
+        );
+        assert!(
+            accepted.load(Ordering::SeqCst) >= 1,
+            "the server was dialed"
+        );
+    });
+}
+
 #[test]
 fn a_record_naming_an_internal_address_is_refused() {
     on_testnet(async {

@@ -388,6 +388,93 @@ impl Resolve for IcannResolver {
     }
 }
 
+/// The TLS configuration of direct homeserver endpoints: the server must
+/// present the raw public key the request is addressed to, its own.
+fn direct_tls() -> rustls::ClientConfig {
+    rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("the provider supports the default protocol versions")
+    .dangerous()
+    .with_custom_certificate_verifier(Arc::new(PinnedKeyVerifier {
+        algorithms: rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms,
+    }))
+    .with_no_client_auth()
+}
+
+/// Accepts a server whose raw public key is the one named by the host of the
+/// request, and no other. The Pkarr client's own verifier also accepts keys
+/// the host's record delegates to, and finds them by resolving records inside
+/// the handshake, blocking the runtime thread that drives it for as long as
+/// those lookups take. A homeserver's own key needs no lookup: the host is
+/// the key.
+#[derive(Debug)]
+struct PinnedKeyVerifier {
+    algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+impl rustls::client::danger::ServerCertVerifier for PinnedKeyVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if !intermediates.is_empty() {
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::UnknownIssuer,
+            ));
+        }
+        let not_valid_for_name =
+            || rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidForName);
+        let rustls::pki_types::ServerName::DnsName(host) = server_name else {
+            return Err(not_valid_for_name());
+        };
+        let key = pkarr::PublicKey::try_from(host.as_ref()).map_err(|_| not_valid_for_name())?;
+        if key.to_public_key_der().as_bytes() == end_entity.as_ref() {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::UnknownIssuer,
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature_with_raw_key(
+            message,
+            &rustls::pki_types::SubjectPublicKeyInfoDer::from(cert.as_ref()),
+            dss,
+            &self.algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![rustls::SignatureScheme::ED25519]
+    }
+
+    fn requires_raw_public_keys(&self) -> bool {
+        true
+    }
+}
+
 /// The TLS configuration of ICANN-domain homeservers: the WebPKI roots and
 /// the provider the `pubky` SDK uses for them.
 fn icann_tls() -> anyhow::Result<rustls::ClientConfig> {
@@ -577,7 +664,7 @@ impl PkarrTransport {
                 records: records.clone(),
                 policy,
             }))
-            .use_preconfigured_tls(rustls::ClientConfig::from(pkarr))
+            .use_preconfigured_tls(direct_tls())
             .build()?;
         let icann = hardened(pubky_reqwest::Client::builder())
             .dns_resolver(Arc::new(IcannResolver { policy }))
@@ -1211,6 +1298,53 @@ mod tests {
             "an older record, written by the Pkarr client or not, does not replace a newer one"
         );
         assert_eq!(cache.len(), 1);
+    }
+
+    fn pinned_verifier() -> PinnedKeyVerifier {
+        PinnedKeyVerifier {
+            algorithms: rustls::crypto::aws_lc_rs::default_provider()
+                .signature_verification_algorithms,
+        }
+    }
+
+    fn verified(
+        host: &str,
+        presented: &pkarr::PublicKey,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+    ) -> bool {
+        use rustls::client::danger::ServerCertVerifier;
+        let certificate =
+            rustls::pki_types::CertificateDer::from(presented.to_public_key_der().to_vec());
+        let name = rustls::pki_types::ServerName::try_from(host.to_owned()).expect("server name");
+        pinned_verifier()
+            .verify_server_cert(
+                &certificate,
+                intermediates,
+                &name,
+                &[],
+                rustls::pki_types::UnixTime::now(),
+            )
+            .is_ok()
+    }
+
+    #[test]
+    fn the_direct_verifier_accepts_only_the_hosts_own_key() {
+        let homeserver = pkarr::Keypair::random().public_key();
+        let other = pkarr::Keypair::random().public_key();
+        let host = homeserver.to_z32();
+
+        assert!(verified(&host, &homeserver, &[]));
+        assert!(!verified(&host, &other, &[]));
+        assert!(!verified("homeserver.example", &homeserver, &[]));
+        assert!(!verified("127.0.0.1", &homeserver, &[]));
+        let extra = rustls::pki_types::CertificateDer::from(other.to_public_key_der().to_vec());
+        assert!(!verified(&host, &homeserver, &[extra]));
+        use rustls::client::danger::ServerCertVerifier;
+        assert!(pinned_verifier().requires_raw_public_keys());
+        assert_eq!(
+            pinned_verifier().supported_verify_schemes(),
+            vec![rustls::SignatureScheme::ED25519]
+        );
     }
 
     #[test]
