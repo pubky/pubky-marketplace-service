@@ -881,7 +881,8 @@ fn event_listing_id<'a>(seller_pubky: &str, uri: &'a str) -> Option<&'a str> {
 /// last event before the first one that could not be settled (homeserver
 /// unavailable, deadline, settle cap, or a record accepted after the
 /// delete was confirmed), so nothing is skipped. A read the homeserver
-/// rejected (`429`, `5xx`) or could not answer is not a successful poll: the
+/// rejected (`429`, `5xx`), could not answer, or did not answer before the
+/// pass deadline is not a successful poll: the
 /// seller keeps its last successful `polled_at`, and backs off alone, by the
 /// homeserver's `Retry-After` or bounded exponentially, while the other
 /// sellers go on. The pass stops at the
@@ -973,7 +974,21 @@ pub async fn follow_homeserver_deletions(pass: &FollowerPass<'_>) -> anyhow::Res
                 }
                 continue;
             }
-            None => break,
+            // The pass deadline ran out during this seller's read (the first,
+            // or the restart from the start of a new homeserver's stream).
+            // Counted as a failed poll, so the seller backs off like any
+            // other that could not be read in time and the sellers behind it
+            // are polled by the next pass. The stored cursor stays.
+            None => {
+                let failed = Poll::Failed {
+                    failures: failures.saturating_add(1),
+                    retry_after: None,
+                };
+                if let Err(halt) = pass.record_poll(&seller_pubky, None, failed).await? {
+                    return Ok(halted(tombstoned, halt));
+                }
+                break;
+            }
         };
 
         let mut settled_through: Option<&str> = None;

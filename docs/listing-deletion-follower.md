@@ -51,8 +51,10 @@ the `listing_deletions` lease.
   could not answer for moves behind the ones not yet tried and stays due.
 - **A rejected read is not a poll.** When the homeserver answers the event
   stream (or the record fetch that confirms a `DEL`) with a `429`, a `5xx`,
-  or nothing, the seller's `polled_at` stays its last successful poll, its
-  consecutive `failures` count grows, and it is not read again before
+  or nothing, or does not answer before the pass deadline (the restart read
+  of a seller who moved included), the seller's `polled_at` stays its last
+  successful poll, its consecutive `failures` count grows, and it is not
+  read again before
   `retry_not_before` (migration 0059): 60 s doubling to 15 min, or the
   homeserver's `Retry-After` when that is longer, capped at one hour. The
   cursor still advances over what was settled. Only that seller waits: due
