@@ -489,6 +489,35 @@ async fn restore_observes_preexisting_inbox_message_on_one_durable_lease(pool: P
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_grant_from_another_pubky_ends_as_a_mismatch_without_an_ack(pool: PgPool) {
+    let relay = RelayInbox::spawn().await;
+    let harness = create_awaiting_flow(pool.clone(), relay.clone()).await;
+    PubkySigner::new(Keypair::random())
+        .expect("signer")
+        .approve_auth(&harness.authorization_url)
+        .await
+        .expect("grant posted to inbox");
+
+    let scanned = grant::poll_once(&harness.app.state)
+        .await
+        .expect("one durable lease");
+    assert_eq!(scanned, 1);
+    harness.relay.wait_idle().await;
+
+    let (status, terminal_code) = flow_row(&harness.pool, harness.flow_id).await;
+    assert_eq!(
+        (status.as_str(), terminal_code.as_deref()),
+        ("mismatch", Some("identity_mismatch"))
+    );
+    assert_eq!(harness.relay.deletes(), 0, "the inbox must not be ACKed");
+    assert_eq!(
+        approved_pubky(&harness.pool, harness.flow_id).await,
+        None,
+        "the unverified issuer is not recorded"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn sdk_poll_that_never_returns_fails_grant_exchange_within_cap(pool: PgPool) {
     let relay = RelayInbox::spawn().await;
     let harness = create_awaiting_flow_timeouts(pool.clone(), relay.clone(), 1).await;

@@ -22,10 +22,10 @@ use chrono::{DateTime, Duration, Utc};
 use ed25519_dalek::{Signature, VerifyingKey};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
-use pubky::deep_links::{DeepLink, GrantRelayChannel};
+use pubky::deep_links::{DeepLink, GrantApprovalFormat, GrantRelayChannel};
 use pubky::{
     AuthFlowKind, Capabilities, Capability, ClientId, EncryptedHttpRelayInboxChannel,
-    GrantAuthFlowState, GrantClaims, PubkyGrantAuthFlow, PubkyHttpClient, PublicKey,
+    GrantAuthFlowState, GrantClaims, Keypair, PubkyGrantAuthFlow, PubkyHttpClient, PublicKey,
 };
 use rand::RngCore;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -39,6 +39,8 @@ use uuid::Uuid;
 use crate::address_search::resolve_client_address;
 use crate::auth;
 use crate::clock::format_timestamp;
+use crate::grant_exchange::{ExchangeRefusal, GrantExchange};
+use crate::homeserver_transport::EndpointPolicy;
 use crate::priv_keys;
 use crate::seal;
 use crate::AppState;
@@ -252,7 +254,9 @@ pub struct GrantRuntime {
     result_hash_keys: SecretKeyRing,
     assertion_keys: VerifyKeyRing,
     request_keys: VerifyKeyRing,
+    /// The relay inbox client.
     client: PubkyHttpClient,
+    exchange: Arc<GrantExchange>,
     notify: Arc<Notify>,
 }
 
@@ -308,6 +312,25 @@ fn client_ip_header_from_env() -> anyhow::Result<Option<HeaderName>> {
             .map(Some)
             .map_err(|_| anyhow::anyhow!("{ENV_CLIENT_IP_HEADER} is not a header name")),
         None => Ok(None),
+    }
+}
+
+const ENV_HOMESERVER_PUBKY: &str = "HOMESERVER_PUBKY";
+/// How long the boot check of `HOMESERVER_PUBKY` may wait for its record.
+const HOMESERVER_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The public key of the homeserver at `HOMESERVER_URL`: the only homeserver
+/// a grant is exchanged at. Surrounding whitespace, such as the trailing
+/// newline of a mounted secret, is ignored.
+fn homeserver_pubky_from_env() -> anyhow::Result<PublicKey> {
+    let value = std::env::var(ENV_HOMESERVER_PUBKY).unwrap_or_default();
+    let value = value.trim();
+    if value.is_empty() {
+        anyhow::bail!("{ENV_HOMESERVER_PUBKY} must be set when the grant flow is enabled");
+    }
+    match PublicKey::try_from_z32(value) {
+        Ok(key) if key.z32() == value => Ok(key),
+        _ => anyhow::bail!("{ENV_HOMESERVER_PUBKY} must be a 52-character z-base-32 pubky"),
     }
 }
 
@@ -518,6 +541,13 @@ impl GrantRuntime {
                 .unwrap_or_else(|_| "https://shop.pubky.app".to_string()),
             session_ttl_seconds,
         };
+        let homeserver = homeserver_pubky_from_env()?;
+        let client = PubkyHttpClient::new()?;
+        let exchange = GrantExchange::new(
+            client.pkarr().clone(),
+            homeserver,
+            EndpointPolicy::PublicOnly,
+        )?;
         let runtime = Self {
             config,
             encryption_keys: parse_secret_ring(
@@ -534,10 +564,23 @@ impl GrantRuntime {
             )?,
             assertion_keys: parse_verify_ring("SHOP_GRANT_ASSERTION_VERIFYING_KEYS_JSON")?,
             request_keys: parse_verify_ring("SHOP_BFF_REQUEST_VERIFYING_KEYS_JSON")?,
-            client: PubkyHttpClient::new()?,
+            client,
+            exchange: Arc::new(exchange),
             notify: Arc::new(Notify::new()),
         };
         Ok(Some(Arc::new(runtime)))
+    }
+
+    /// Checks in the background that `HOMESERVER_PUBKY` is the homeserver at
+    /// `homeserver_url`, logging an error when its record says otherwise.
+    /// Never delays or fails the boot.
+    pub fn spawn_homeserver_check(&self, homeserver_url: String) {
+        let exchange = self.exchange.clone();
+        tokio::spawn(async move {
+            exchange
+                .check_homeserver_url(&homeserver_url, HOMESERVER_CHECK_TIMEOUT)
+                .await;
+        });
     }
 
     pub fn active_key_epoch(&self) -> i16 {
@@ -658,6 +701,13 @@ pub mod test_support {
             rand::rngs::OsRng.fill_bytes(&mut bff_state_key);
             let assertion_key = SigningKey::from_bytes(&assertion_seed);
             let request_key = SigningKey::from_bytes(&request_seed);
+            let client = PubkyHttpClient::new().expect("test Pubky client");
+            let exchange = GrantExchange::new(
+                client.pkarr().clone(),
+                Keypair::random().public_key(),
+                EndpointPolicy::PublicOnly,
+            )
+            .expect("test grant exchange");
             let runtime = GrantRuntime {
                 config: GrantConfig {
                     client_id: "marketplace.localhost".to_string(),
@@ -708,7 +758,8 @@ pub mod test_support {
                     },
                     previous: None,
                 },
-                client: PubkyHttpClient::new().expect("test Pubky client"),
+                client,
+                exchange: Arc::new(exchange),
                 notify: Arc::new(Notify::new()),
             };
             bff_state_key.fill(0);
@@ -724,6 +775,24 @@ pub mod test_support {
                 .expect("the authority is the sole owner of the runtime");
             runtime.config.client_ip_header =
                 Some(HeaderName::from_bytes(name.as_bytes()).expect("test header name"));
+            self
+        }
+
+        /// Relays and resolves through `client` (a testnet's), exchanging
+        /// grants only at `homeserver`, at addresses `policy` allows.
+        pub fn with_network(
+            mut self,
+            client: PubkyHttpClient,
+            homeserver: PublicKey,
+            policy: EndpointPolicy,
+        ) -> Self {
+            let runtime = Arc::get_mut(&mut self.runtime)
+                .expect("the authority is the sole owner of the runtime");
+            runtime.exchange = Arc::new(
+                GrantExchange::new(client.pkarr().clone(), homeserver, policy)
+                    .expect("test grant exchange"),
+            );
+            runtime.client = client;
             self
         }
 
@@ -2512,18 +2581,82 @@ fn require_applied(applied: bool, op: &str, flow_id: Uuid) -> anyhow::Result<()>
     }
 }
 
-fn inbox_from_saved(saved: &GrantAuthFlowState) -> anyhow::Result<(Url, [u8; 32])> {
-    match DeepLink::from_str(&saved.authorization_url)
-        .map_err(|error| anyhow::anyhow!("saved grant deep link is invalid: {error}"))?
-    {
-        DeepLink::SigninGrant(link) => {
-            shared_secret_inbox(&link.params().relay, link.params().relay_channel)
-        }
-        DeepLink::SignupGrant(link) => {
-            shared_secret_inbox(&link.params().relay, link.params().relay_channel)
-        }
-        _ => anyhow::bail!("saved grant state must contain a grant deep link"),
+/// A saved grant flow: the inbox its approval arrives in, the request that
+/// approval must answer and the client key that proves possession of it.
+struct SavedGrantRequest {
+    relay: Url,
+    secret: [u8; 32],
+    client_id: ClientId,
+    capabilities: Capabilities,
+    approval_format: GrantApprovalFormat,
+    client_key: Keypair,
+}
+
+fn request_from_saved(saved: &GrantAuthFlowState) -> anyhow::Result<SavedGrantRequest> {
+    let (relay, channel, client_id, client_pk, capabilities, approval_format) =
+        match DeepLink::from_str(&saved.authorization_url)
+            .map_err(|error| anyhow::anyhow!("saved grant deep link is invalid: {error}"))?
+        {
+            DeepLink::SigninGrant(link) => {
+                let params = link.params().clone();
+                (
+                    params.relay,
+                    params.relay_channel,
+                    params.client_id,
+                    params.client_pk,
+                    params.capabilities,
+                    params.approval_format,
+                )
+            }
+            DeepLink::SignupGrant(link) => {
+                let params = link.params().clone();
+                (
+                    params.relay,
+                    params.relay_channel,
+                    params.client_id,
+                    params.client_pk,
+                    params.capabilities,
+                    params.approval_format,
+                )
+            }
+            _ => anyhow::bail!("saved grant state must contain a grant deep link"),
+        };
+    let (relay, secret) = shared_secret_inbox(&relay, channel)?;
+    if saved.approval_key_secret.is_some() {
+        anyhow::bail!("saved grant state has an approval key for a shared-secret channel");
     }
+    let client_key = Keypair::from_secret(&saved.client_key_secret);
+    if client_key.public_key() != client_pk {
+        anyhow::bail!("saved grant client key does not match the deep link");
+    }
+    Ok(SavedGrantRequest {
+        relay,
+        secret,
+        client_id,
+        capabilities,
+        approval_format,
+        client_key,
+    })
+}
+
+/// The checks the `pubky` SDK makes of an approval before exchanging it: a
+/// bare grant, bound to this flow's client key and id, with ordered
+/// timestamps (expiry is the homeserver's to judge), approving no action the
+/// request did not ask for. The grant's signature is the homeserver's to
+/// verify.
+fn approval_answers(claims: &GrantClaims, request: &SavedGrantRequest) -> bool {
+    request.approval_format == GrantApprovalFormat::BareGrant
+        && claims.cnf == request.client_key.public_key()
+        && claims.client_id == request.client_id
+        && claims.iat < claims.exp
+        && claims.caps.iter().all(|approved| {
+            approved.actions().iter().all(|action| {
+                request.capabilities.iter().any(|requested| {
+                    requested.scope_covers_path(approved.scope())
+                        && requested.actions().contains(action)
+                })
+            })
+        })
 }
 
 /// The service always starts bare-grant flows, which use the shared-secret
@@ -2539,11 +2672,20 @@ fn shared_secret_inbox(relay: &Url, channel: GrantRelayChannel) -> anyhow::Resul
     }
 }
 
-fn decode_grant_claims(payload: &[u8]) -> anyhow::Result<GrantClaims> {
-    let text = std::str::from_utf8(payload)
+fn decode_grant(payload: Vec<u8>) -> anyhow::Result<(String, GrantClaims)> {
+    let text = String::from_utf8(payload)
         .map_err(|_| anyhow::anyhow!("grant inbox payload is not UTF-8"))?;
-    GrantClaims::decode(text)
-        .map_err(|error| anyhow::anyhow!("grant inbox payload is invalid: {error}"))
+    let claims = GrantClaims::decode(&text)
+        .map_err(|error| anyhow::anyhow!("grant inbox payload is invalid: {error}"))?;
+    Ok((text, claims))
+}
+
+/// Resolves when the exchange must stop: the lease heartbeat failed or the
+/// flow expired.
+async fn exchange_stopped(state: &AppState, lease: &FlowLease, heartbeat_failed: &AtomicBool) {
+    while !heartbeat_failed.load(Ordering::SeqCst) && state.clock.now() < lease.expires_at {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 async fn heartbeat_lease(
@@ -2816,8 +2958,8 @@ async fn process_lease(
             return Ok(());
         }
     };
-    let (relay_url, secret) = match inbox_from_saved(&stored.state) {
-        Ok(parts) => parts,
+    let request = match request_from_saved(&stored.state) {
+        Ok(request) => request,
         Err(_) => {
             require_applied(
                 terminalize_owned(state, &lease, "invalid", "grant_invalid", None, now).await?,
@@ -2827,7 +2969,7 @@ async fn process_lease(
             return Ok(());
         }
     };
-    let channel = match EncryptedHttpRelayInboxChannel::new(relay_url, secret) {
+    let channel = match EncryptedHttpRelayInboxChannel::new(request.relay.clone(), request.secret) {
         Ok(channel) => channel,
         Err(_) => {
             require_applied(
@@ -2848,12 +2990,10 @@ async fn process_lease(
             heartbeat_failed.clone(),
         ),
     };
-    // PubkyGrantAuthFlow::restore starts AuthRelayListener, which DELETE-ACKs
-    // before the flume send. ACK-after-commit is therefore impossible on that
-    // path. Poll the production inbox channel (GET is idempotent until DELETE),
-    // persist exchanging (approved_pubky + renewed lease_until) as the
-    // no-migration sub-state, then restore so PKARR still runs. The reaper
-    // never lease_losts a row whose approved_pubky is set.
+    // Poll the inbox (GET is idempotent until DELETE), persist exchanging
+    // (approved_pubky + renewed lease_until) as the no-migration sub-state,
+    // and only then ACK. The reaper never lease_losts a row whose
+    // approved_pubky is set.
     let deadline = tokio::time::Instant::now() + remaining;
     let payload = match poll_inbox_until(&channel, &runtime.client, deadline).await {
         Ok(payload) => payload,
@@ -2879,8 +3019,8 @@ async fn process_lease(
         )?;
         return Ok(());
     };
-    let claims = match decode_grant_claims(&payload) {
-        Ok(claims) => claims,
+    let (grant_jws, claims) = match decode_grant(payload) {
+        Ok(decoded) => decoded,
         Err(_) => {
             guard.disarm();
             require_applied(
@@ -2891,11 +3031,24 @@ async fn process_lease(
             return Ok(());
         }
     };
+    // A grant from anyone but the asserted pubky could never settle, so it
+    // is neither acknowledged nor exchanged. Its unverified issuer is not
+    // recorded as the approver.
+    if claims.iss.z32() != lease.expected_pubky {
+        drop(heartbeat);
+        guard.disarm();
+        require_applied(
+            terminalize_owned(state, &lease, "mismatch", "identity_mismatch", None, now).await?,
+            "identity_mismatch",
+            lease.flow_id,
+        )?;
+        return Ok(());
+    }
     let requested_capabilities = Capabilities::from(claims.caps.clone())
         .normalize()
         .to_string();
     // Unsigned GrantClaims caps are a requested-set bound only. Persist
-    // uses the homeserver-verified session after restore.
+    // uses the homeserver-verified session after the exchange.
     let approved_pubky = claims.iss.z32();
     require_applied(
         enter_exchanging(
@@ -2909,71 +3062,59 @@ async fn process_lease(
         lease.flow_id,
     )?;
     guard.disarm();
-    drop(channel);
-    let flow = match PubkyGrantAuthFlow::restore(stored.state, runtime.client.clone()) {
-        Ok(flow) => flow,
-        Err(_) => {
-            require_applied(
-                terminalize_owned(
-                    state,
-                    &lease,
-                    "invalid",
-                    "grant_invalid",
-                    Some(&approved_pubky),
-                    state.clock.now(),
-                )
-                .await?,
-                "grant_invalid",
-                lease.flow_id,
-            )?;
-            return Ok(());
-        }
-    };
-    // Restore spawns a new GET; the inbox still holds the payload until this
-    // listener DELETEs. Bound the exchange: flow expires_at, a hard
+    // Bound the ACK and the exchange: flow expires_at, a hard
     // MARKETPLACE_GRANT_EXCHANGE_TIMEOUT_SECONDS ceiling, and heartbeat death.
-    // An unbounded try_poll_once + lease renewal would pin verifying forever.
+    // An unbounded exchange + lease renewal would pin verifying forever.
     let exchange_deadline = tokio::time::Instant::now()
         + remaining_exchange(
             &lease,
             state.clock.now(),
             runtime.config.exchange_timeout_seconds,
         );
-    let outcome = loop {
-        let heartbeat_lost = heartbeat_failed.load(Ordering::SeqCst);
-        let timed_out = tokio::time::Instant::now() >= exchange_deadline
-            || state.clock.now() >= lease.expires_at;
-        if heartbeat_lost || timed_out {
-            drop(flow);
-            drop(heartbeat);
-            let applied = terminalize_owned(
-                state,
-                &lease,
-                "failed",
-                "grant_exchange",
-                Some(&approved_pubky),
-                state.clock.now(),
-            )
-            .await?;
-            if heartbeat_lost && !applied {
-                return Ok(());
+    let outcome = tokio::select! {
+        outcome = tokio::time::timeout_at(exchange_deadline, async {
+            if channel.ack(&runtime.client).await.is_err() {
+                tracing::warn!(
+                    flow_prefix = flow_prefix(lease.flow_id),
+                    "grant inbox ACK failed"
+                );
             }
-            require_applied(applied, "grant_exchange", lease.flow_id)?;
+            if !approval_answers(&claims, &request) {
+                return Err(("invalid", "grant_invalid"));
+            }
+            runtime
+                .exchange
+                .exchange(&grant_jws, &claims, &request.client_key, exchange_deadline)
+                .await
+                .map_err(|refusal| match refusal {
+                    ExchangeRefusal::HomeserverNotAllowed => ("invalid", "homeserver_not_allowed"),
+                    ExchangeRefusal::Failed => ("failed", "grant_exchange"),
+                })
+        }) => outcome.ok(),
+        () = exchange_stopped(state, &lease, &heartbeat_failed) => None,
+    };
+    drop(channel);
+    drop(heartbeat);
+    let Some(outcome) = outcome else {
+        let heartbeat_lost = heartbeat_failed.load(Ordering::SeqCst);
+        let applied = terminalize_owned(
+            state,
+            &lease,
+            "failed",
+            "grant_exchange",
+            Some(&approved_pubky),
+            state.clock.now(),
+        )
+        .await?;
+        if heartbeat_lost && !applied {
             return Ok(());
         }
-        match flow.try_poll_once().await {
-            Ok(Some(session)) => break Ok(session),
-            Ok(None) => {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-            Err(error) => break Err(error),
-        }
+        require_applied(applied, "grant_exchange", lease.flow_id)?;
+        return Ok(());
     };
-    drop(flow);
-    drop(heartbeat);
     match outcome {
         Ok(session) => {
-            let verified_capabilities = Capabilities::from(session.info().capabilities().to_vec())
+            let verified_capabilities = Capabilities::from(session.capabilities.clone())
                 .normalize()
                 .to_string();
             require_applied(
@@ -2981,7 +3122,7 @@ async fn process_lease(
                     state,
                     runtime,
                     &lease,
-                    &session.public_key().z32(),
+                    &session.pubky.z32(),
                     &requested_capabilities,
                     &verified_capabilities,
                     state.clock.now(),
@@ -2992,14 +3133,7 @@ async fn process_lease(
                 lease.flow_id,
             )?;
         }
-        Err(error) => {
-            let (status, code) = match error {
-                pubky::Error::Authentication(_) | pubky::Error::Parse(_) => {
-                    ("invalid", "grant_invalid")
-                }
-                pubky::Error::Pkarr(_) | pubky::Error::Request(_) => ("failed", "grant_exchange"),
-                pubky::Error::Build(_) => ("failed", "relay_transport"),
-            };
+        Err((status, code)) => {
             require_applied(
                 terminalize_owned(
                     state,

@@ -2226,8 +2226,9 @@ exposing it to the relay. They are mounted only when
 requests rather than a bearer token, and are not a public contract. Do not
 build third-party clients on them; use `POST /v1/auth/sessions` instead.
 
-Configuration (defaults in parentheses): `MARKETPLACE_GRANT_CLIENT_ID` and
-`MARKETPLACE_GRANT_RELAY_URL` (https) are required when enabled;
+Configuration (defaults in parentheses): `MARKETPLACE_GRANT_CLIENT_ID`,
+`MARKETPLACE_GRANT_RELAY_URL` (https) and `HOMESERVER_PUBKY` (see
+[The grant exchange](#the-grant-exchange)) are required when enabled;
 `MARKETPLACE_GRANT_FLOW_TTL_SECONDS` (300, 60..600),
 `MARKETPLACE_GRANT_VERIFY_LEASE_SECONDS` (30, 10..60),
 `MARKETPLACE_GRANT_EXCHANGE_TIMEOUT_SECONDS` (30, 1..120),
@@ -2259,6 +2260,69 @@ and only used during rotation): `GRANT_FLOW_ENCRYPTION_KEY_B64` with
 `GRANT_RESULT_HMAC_KEY_EPOCH`, `GRANT_RESULT_HMAC_PREVIOUS_ROOT_B64` with
 `GRANT_RESULT_HMAC_PREVIOUS_KEY_EPOCH`, `SHOP_GRANT_ASSERTION_VERIFYING_KEYS_JSON`
 and `SHOP_BFF_REQUEST_VERIFYING_KEYS_JSON`.
+
+### The grant exchange
+
+Once the signer's approval arrives in the relay inbox, the worker exchanges the
+approved grant, with a proof of possession of the flow's client key, for a
+session at the grant issuer's homeserver
+(`POST /auth/grant/session`). The service reads every pubky from the one
+homeserver at `HOMESERVER_URL`, so it exchanges grants only there:
+`HOMESERVER_PUBKY` is that homeserver's pubky (52-character z-base-32,
+surrounding whitespace ignored), and the service refuses to boot with the
+grant flow enabled and without it, or with a malformed value. The
+issuer's Pkarr record names its homeserver; a flow whose issuer names any other
+homeserver ends as `invalid` with terminal code `homeserver_not_allowed`
+before a request is sent to that homeserver. A user on another homeserver can
+still sign in with `POST /v1/auth/sessions`.
+
+At boot the service also reads `HOMESERVER_PUBKY`'s Pkarr record in the
+background, for at most 10 s and connecting to no endpoint; the check never
+delays or fails the boot. It logs an error once when the record is missing,
+does not name `HOMESERVER_URL`'s host (the key itself, one of its ICANN
+targets or one of its own addresses), or names no endpoint the exchange may
+connect to.
+
+Deploy note: set `HOMESERVER_PUBKY` before enabling
+`MARKETPLACE_GRANT_FLOW_ENABLED`, or before rolling out a build that requires
+it on a deployment where the flag is already on; it is the same key the Shop
+deploys as `PUBKY_RUNTIME_HOMESERVER`. With the flag off the setting is not
+read. The exchange connects only to public addresses, so a private DNS
+override that resolves the homeserver's domain to an internal address (for
+example inside a VPC) makes every exchange fail; the boot check reads only the
+record and does not detect it.
+
+The exchange does not use the `pubky` SDK's HTTP client. Its request to the
+homeserver:
+
+- goes only to an endpoint the homeserver's own Pkarr record names: its key,
+  at the record's addresses, over TLS pinned to that key; or an ICANN domain
+  over TLS with the public web roots;
+- connects only to globally routable addresses, checked on the address
+  actually connected. Refused: loopback, private, shared (CGNAT), link-local,
+  unique-local, multicast, reserved, documentation and other special-purpose
+  ranges, and IPv6 forms that carry an IPv4 address (IPv4-mapped, NAT64, 6to4,
+  Teredo, IPv4-compatible). An ICANN target that is an IP address in any
+  notation URL parsing accepts (`127.1`, `2130706433`, `0x7f.0.0.1`,
+  `169.254.43518`, bracketed IPv6) is checked as that address, and a name
+  connects only to those of its resolved addresses that pass;
+- follows no redirect, speaks only HTTPS and uses no proxy;
+- never opens a connection only to probe whether an endpoint is reachable;
+- is bounded by `MARKETPLACE_GRANT_EXCHANGE_TIMEOUT_SECONDS`, the flow's
+  expiry and the worker's lease, and reads at most 64 KiB of answer.
+
+A homeserver that cannot be reached under these rules, refuses the grant or
+answers with anything but a session for the exchanged grant (its issuer,
+grant id and client id, issued by that homeserver) ends the flow as
+`failed` with terminal code `grant_exchange`. A grant whose issuer is not the
+pubky the Shop asserted for the flow ends as `mismatch` with terminal code
+`identity_mismatch` before the relay inbox is acknowledged and before any
+exchange request. Before the exchange the worker also
+checks the approval as the SDK does: a bare grant bound to the flow's client
+key and client id, with ordered timestamps, approving nothing the flow did not
+request (`invalid`, `grant_invalid` otherwise). The relay inbox and the Pkarr
+lookups use the SDK's client, toward the operator's
+`MARKETPLACE_GRANT_RELAY_URL` and Pkarr relays and the DHT.
 
 ## Grant sessions
 
@@ -2302,8 +2366,9 @@ lifetime. Only a live homeserver session can write the document, so a revoked
 grant cannot mint by itself. Two limits remain: a document written by another
 live session of the same user also passes, and revoking a grant does not
 revoke sessions already minted from it; they live until they expire. Sellers
-whose homeserver is not `HOMESERVER_URL` cannot pass the document read and
-keep the approval flow.
+whose homeserver is not `HOMESERVER_URL` cannot pass the document read, and the
+approval flow refuses them too (`homeserver_not_allowed`); they can sign in
+with `POST /v1/auth/sessions`.
 
 The session's capabilities are the grant's narrowed to the marketplace scopes:
 `/pub/pubky.app/marketplace-service/v1/:rw`, plus `/priv/pubky.app/:rw` when the
