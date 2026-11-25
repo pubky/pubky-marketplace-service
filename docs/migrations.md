@@ -836,11 +836,31 @@ it.
 
 An image from before it runs on the migrated database, with the replaced
 guards, which behave as 0051's while every homeserver column is NULL. Under
-`HOMESERVER_RESOLUTION=fixed` they all are. After a `pkarr` deployment,
-first restart every cursor that names a homeserver on the configured one,
+`HOMESERVER_RESOLUTION=fixed` they all are.
+
+After a `pkarr` deployment, **drain every `pkarr` writer before the first
+statement below.** The cursor reset and the marker cleanup are separate
+transactions, so a `pkarr` follower pass could write a cursor after the
+reset, and a `pkarr` command (`listing.sync`, or a register that reads the
+record to revive a listing) could create a tombstone or revival marker after
+the cleanup; either leaves a pre-0100 replica a cursor or marker counted on
+another homeserver. Stop every replica that runs `HOMESERVER_RESOLUTION=pkarr`,
+wait for its in-flight commands to finish, and wait until the follower lease
+has ended:
+
+```sql
+SELECT holder, lease_until FROM worker_leases WHERE task = 'listing_deletions';
+```
+
+Run the statements below only when `lease_until` is in the past. The cursor
+guard checks the lease row's holder and fence, not its expiry, so the first
+statement still takes its authority from that row. Start no `pkarr` replica
+again, and no pre-0100 one before the last statement has run.
+
+Then restart every cursor that names a homeserver on the configured one,
 which the older image would otherwise read from a position on another
-homeserver. The cursor guard accepts the write under the current follower
-lease, which it share-locks:
+homeserver. The cursor guard accepts the write under the lease row's holder
+and fence, which it share-locks:
 
 ```sql
 BEGIN;
