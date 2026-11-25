@@ -52,6 +52,9 @@ const DELIVERABLE_FETCH_TIMEOUT: Duration = Duration::from_secs(120);
 /// Where Shop writes a seller's encrypted deliverable.
 pub const DELIVERABLES_PATH: &str = "/pub/pubky.app/marketplace/v1/deliverables/";
 const MAX_AWARD_LISTING_BYTES: usize = 1024 * 1024;
+/// A listing, drop, shop or content-lock record is read no further than this,
+/// whichever homeserver answers.
+const MAX_RECORD_BYTES: usize = 1024 * 1024;
 
 /// One listing-record fetch result. Transport failures, non-2xx responses
 /// other than a definitive 404, and non-JSON bodies are `Unavailable`
@@ -835,12 +838,38 @@ impl Response {
         }
     }
 
-    async fn bytes(self) -> Result<impl AsRef<[u8]>, Unreached> {
-        match self {
-            Self::Fixed(response) => response.bytes().await.map_err(|_| Unreached),
-            Self::Pkarr { response, .. } => response.bytes().await.map_err(|_| Unreached),
+    /// The whole body, streamed chunk by chunk so a body without a
+    /// `Content-Length`, or one that lies about it, is never held past
+    /// `max_bytes`.
+    async fn body_capped(&mut self, max_bytes: usize) -> BodyRead {
+        if self
+            .content_length()
+            .is_some_and(|length| length > max_bytes as u64)
+        {
+            return BodyRead::TooLarge;
+        }
+        let mut body = Vec::new();
+        loop {
+            match self.chunk().await {
+                Ok(Some(chunk)) => {
+                    let chunk = chunk.as_ref();
+                    match body.len().checked_add(chunk.len()) {
+                        Some(next) if next <= max_bytes => body.extend_from_slice(chunk),
+                        _ => return BodyRead::TooLarge,
+                    }
+                }
+                Ok(None) => return BodyRead::Complete(body),
+                Err(Unreached) => return BodyRead::Failed,
+            }
         }
     }
+}
+
+/// How [`Response::body_capped`] ended.
+enum BodyRead {
+    Complete(Vec<u8>),
+    TooLarge,
+    Failed,
 }
 
 /// Controls whether a fetched record's public path is safe to include in logs.
@@ -965,7 +994,7 @@ impl HttpHomeserverClient {
         let response = self
             .get(seller_pubky, Target::Record(path), FETCH_TIMEOUT)
             .await;
-        let response = match response {
+        let mut response = match response {
             Ok(response) => response,
             Err(Unreached) => {
                 match record_kind {
@@ -1027,11 +1056,17 @@ impl HttpHomeserverClient {
             }
             return (HomeserverFetchOutcome::Unavailable, homeserver);
         }
-        let record = response
-            .bytes()
-            .await
-            .ok()
-            .and_then(|body| serde_json::from_slice::<Value>(body.as_ref()).ok());
+        let record = match response.body_capped(MAX_RECORD_BYTES).await {
+            BodyRead::Complete(body) => serde_json::from_slice::<Value>(&body).ok(),
+            BodyRead::TooLarge => {
+                tracing::warn!(
+                    pubky_host_prefix = %prefix,
+                    "homeserver record fetch refused a body over the size limit"
+                );
+                return (HomeserverFetchOutcome::Unavailable, homeserver);
+            }
+            BodyRead::Failed => None,
+        };
         match record {
             Some(record) => (HomeserverFetchOutcome::Found(record), homeserver),
             None => {
@@ -1054,9 +1089,8 @@ impl HttpHomeserverClient {
     }
 
     async fn fetch_inner_bytes(&self, seller_pubky: &str, path: &str) -> HomeserverFetchOutcome {
-        const MAX_RECORD_BYTES: usize = 1024 * 1024;
         let prefix = pubky_host_prefix(seller_pubky);
-        let response = match self
+        let mut response = match self
             .get(seller_pubky, Target::Record(path), FETCH_TIMEOUT)
             .await
         {
@@ -1073,28 +1107,20 @@ impl HttpHomeserverClient {
             );
             return HomeserverFetchOutcome::NotFound;
         }
-        if !status.is_success()
-            || response
-                .content_length()
-                .is_some_and(|length| length > MAX_RECORD_BYTES as u64)
-        {
-            if !status.is_success() {
-                tracing::warn!(
-                    path = %path,
-                    pubky_host_prefix = %prefix,
-                    status = %status,
-                    "homeserver record fetch rejected"
-                );
-            }
+        if !status.is_success() {
+            tracing::warn!(
+                path = %path,
+                pubky_host_prefix = %prefix,
+                status = %status,
+                "homeserver record fetch rejected"
+            );
             return HomeserverFetchOutcome::Unavailable;
         }
-        match response.bytes().await {
-            Ok(bytes) if bytes.as_ref().len() <= MAX_RECORD_BYTES => {
-                serde_json::from_slice(bytes.as_ref())
-                    .map(HomeserverFetchOutcome::Found)
-                    .unwrap_or(HomeserverFetchOutcome::Unavailable)
-            }
-            _ => HomeserverFetchOutcome::Unavailable,
+        match response.body_capped(MAX_RECORD_BYTES).await {
+            BodyRead::Complete(body) => serde_json::from_slice(&body)
+                .map(HomeserverFetchOutcome::Found)
+                .unwrap_or(HomeserverFetchOutcome::Unavailable),
+            BodyRead::TooLarge | BodyRead::Failed => HomeserverFetchOutcome::Unavailable,
         }
     }
 }
