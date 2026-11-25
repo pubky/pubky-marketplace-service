@@ -14,7 +14,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SubsecRound, Utc};
 use marketplace_domain::commands::DigitalDeliveryKind;
 use marketplace_domain::ErrorCode;
 use serde_json::{json, Value};
@@ -22,7 +22,7 @@ use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::auth::Actor;
-use crate::clock::format_timestamp;
+use crate::clock::{format_timestamp, refilled_tokens, retry_after_seconds};
 use crate::digital::{pin_aad, version_aad, DigitalKeys};
 use crate::handlers::digital::{no_store, payment_taken_back, DIGITAL_ENDED_ORDER_STATES};
 use crate::model::OrderRow;
@@ -284,12 +284,21 @@ async fn consume_read_token(
     .bind(now)
     .fetch_one(&mut **tx)
     .await?;
-    let elapsed = (now - updated_at).num_milliseconds().max(0) as f64 / 1_000.0;
-    let available = (stored + elapsed * per_minute / 60.0).min(per_minute);
+    let available = refilled_tokens(
+        stored,
+        (now - updated_at).num_milliseconds(),
+        per_minute,
+        per_minute,
+    );
     let (tokens, retry_after) = if available >= 1.0 {
         (available - 1.0, None)
     } else {
-        let seconds = ((1.0 - available) * 60.0 / per_minute).ceil().max(1.0) as i64;
+        // Measured to the whole-millisecond threshold admission uses, from
+        // the state the update below leaves: `available` tokens at the later
+        // of the stored timestamp (which can be after `now`) and `now` as the
+        // column stores it, in whole microseconds.
+        let written_at = updated_at.max(now.trunc_subsecs(6));
+        let seconds = retry_after_seconds(available, per_minute, per_minute, written_at, now);
         (available, Some(seconds))
     };
     sqlx::query(

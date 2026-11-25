@@ -1038,3 +1038,280 @@ async fn named_rate_limit_defaults_and_replay_bypass_are_enforced(pool: PgPool) 
     // The inventory limiter reports a fixed one-second wait.
     assert_retry_after_seconds(&headers, 1);
 }
+
+async fn read_bucket(app: &TestApp, pubky: &str) -> (f64, chrono::DateTime<Utc>) {
+    sqlx::query_as(
+        "SELECT tokens, updated_at FROM inventory_actor_rate_limits \
+         WHERE actor_pubky = $1 AND endpoint_class = 'inventory.read'",
+    )
+    .bind(pubky)
+    .fetch_one(&app.pool)
+    .await
+    .expect("read bucket row")
+}
+
+async fn seed_read_bucket(app: &TestApp, pubky: &str, tokens: f64, at: chrono::DateTime<Utc>) {
+    sqlx::query(
+        "INSERT INTO inventory_actor_rate_limits (actor_pubky, endpoint_class, tokens, updated_at) \
+         VALUES ($1, 'inventory.read', $2, $3)",
+    )
+    .bind(pubky)
+    .bind(tokens)
+    .bind(at)
+    .execute(&app.pool)
+    .await
+    .expect("seed read bucket");
+}
+
+async fn read_at(app: &TestApp, seller: &TestActor, at: chrono::DateTime<Utc>) {
+    app.clock.set(at);
+    let (status, body) =
+        projection(app, Some(&seller.token), &listing_aggregate(&seller.pubky)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn inventory_requests_in_reverse_clock_order_credit_refill_once(pool: PgPool) {
+    use chrono::SubsecRound;
+    // Defaults: 120 per minute (2 tokens a second), capacity 240.
+    let app = test_app(pool).await;
+    let in_order = new_actor(&app).await;
+    let reversed = new_actor(&app).await;
+    register(&app, &in_order, 3).await;
+    register(&app, &reversed, 3).await;
+    let start = Utc::now().trunc_subsecs(3);
+    let early = start + chrono::Duration::seconds(10);
+    let late = start + chrono::Duration::seconds(30);
+    seed_read_bucket(&app, &in_order.pubky, 100.0, start).await;
+    seed_read_bucket(&app, &reversed.pubky, 100.0, start).await;
+
+    read_at(&app, &in_order, early).await;
+    read_at(&app, &in_order, late).await;
+    read_at(&app, &reversed, late).await;
+    read_at(&app, &reversed, early).await;
+
+    // 100 + 30 s of refill (60 tokens) - 2 spent.
+    assert_eq!(read_bucket(&app, &in_order.pubky).await, (158.0, late));
+    assert_eq!(
+        read_bucket(&app, &reversed.pubky).await,
+        (158.0, late),
+        "the older request spends a token and leaves updated_at where it was"
+    );
+
+    read_at(&app, &in_order, late).await;
+    read_at(&app, &reversed, late).await;
+    assert_eq!(read_bucket(&app, &in_order.pubky).await.0, 157.0);
+    assert_eq!(
+        read_bucket(&app, &reversed.pubky).await.0,
+        157.0,
+        "no refill interval is credited twice"
+    );
+}
+
+async fn projection_from(
+    app: &TestApp,
+    origin: &str,
+    token: &str,
+    aggregate_id: &str,
+) -> (StatusCode, axum::http::HeaderMap) {
+    use tower::ServiceExt;
+    let request = axum::http::Request::builder()
+        .method("GET")
+        .uri(format!("/v1/inventory/listings/{aggregate_id}"))
+        .header(axum::http::header::ORIGIN, origin)
+        .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(axum::body::Body::empty())
+        .expect("request builds");
+    let response = app
+        .router
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("request executes");
+    (response.status(), response.headers().clone())
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn inventory_429_exposes_retry_after_to_allowed_origins_only(pool: PgPool) {
+    let app = test_app(pool).await;
+    let seller = new_actor(&app).await;
+    register(&app, &seller, 3).await;
+    seed_read_bucket(&app, &seller.pubky, 0.0, app.clock.now()).await;
+    let aggregate = listing_aggregate(&seller.pubky);
+    let allowed = "http://localhost:3000";
+
+    let (status, headers) = projection_from(&app, allowed, &seller.token, &aggregate).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_retry_after_seconds(&headers, 1);
+    assert_eq!(
+        headers
+            .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .and_then(|value| value.to_str().ok()),
+        Some(allowed)
+    );
+    let exposed = headers
+        .get(axum::http::header::ACCESS_CONTROL_EXPOSE_HEADERS)
+        .and_then(|value| value.to_str().ok())
+        .expect("Access-Control-Expose-Headers is missing");
+    assert!(
+        exposed
+            .split(',')
+            .any(|name| name.trim().eq_ignore_ascii_case("retry-after")),
+        "exposed headers: {exposed}"
+    );
+
+    let (status, headers) =
+        projection_from(&app, "https://elsewhere.example", &seller.token, &aggregate).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    let cors: Vec<_> = headers
+        .keys()
+        .filter(|name| name.as_str().starts_with("access-control-"))
+        .collect();
+    assert!(
+        cors.is_empty(),
+        "a disallowed origin got CORS headers: {cors:?}"
+    );
+}
+
+async fn read_status_at(
+    app: &TestApp,
+    seller: &TestActor,
+    at: chrono::DateTime<Utc>,
+) -> StatusCode {
+    app.clock.set(at);
+    let (status, body) =
+        projection(app, Some(&seller.token), &listing_aggregate(&seller.pubky)).await;
+    assert!(
+        matches!(status, StatusCode::OK | StatusCode::TOO_MANY_REQUESTS),
+        "{status}: {body}"
+    );
+    status
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn refusals_from_a_slower_clock_never_rewind_an_inventory_bucket(pool: PgPool) {
+    use chrono::SubsecRound;
+    // Defaults: 120 per minute, so one token refills every 500 ms.
+    let app = test_app(pool).await;
+    let seller = new_actor(&app).await;
+    register(&app, &seller, 3).await;
+    let late = Utc::now().trunc_subsecs(3);
+    let one_refill = chrono::Duration::milliseconds(500);
+    // A second instance whose clock runs a minute behind.
+    let behind = chrono::Duration::seconds(60);
+    seed_read_bucket(&app, &seller.pubky, 0.0, late).await;
+
+    let mut admitted = 0;
+    for cycle in 1..=5 {
+        let previous = late + one_refill * (cycle - 1);
+        let fast = late + one_refill * cycle;
+        assert_eq!(
+            read_status_at(&app, &seller, previous - behind).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            read_bucket(&app, &seller.pubky).await,
+            (0.0, previous),
+            "a refusal from the slower clock leaves the bucket alone"
+        );
+        for _ in 0..3 {
+            if read_status_at(&app, &seller, fast).await == StatusCode::OK {
+                admitted += 1;
+            }
+        }
+        assert_eq!(read_bucket(&app, &seller.pubky).await, (0.0, fast));
+    }
+    assert_eq!(admitted, 5, "one admission per refill interval");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn far_future_empty_inventory_bucket_resets_on_refusal(pool: PgPool) {
+    use chrono::SubsecRound;
+    // Defaults: 120 per minute, so one token refills every 500 ms.
+    let app = test_app(pool).await;
+    let seller = new_actor(&app).await;
+    register(&app, &seller, 3).await;
+    let start = Utc::now().trunc_subsecs(3);
+    let one_refill = chrono::Duration::milliseconds(500);
+    seed_read_bucket(&app, &seller.pubky, 0.0, start + chrono::Duration::hours(1)).await;
+
+    assert_eq!(
+        read_status_at(&app, &seller, start).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        read_bucket(&app, &seller.pubky).await,
+        (0.0, start),
+        "the refusal resets the timestamp to its own time and credits no refill"
+    );
+    assert_eq!(
+        read_status_at(
+            &app,
+            &seller,
+            start + one_refill - chrono::Duration::milliseconds(1)
+        )
+        .await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(read_bucket(&app, &seller.pubky).await, (0.0, start));
+    read_at(&app, &seller, start + one_refill).await;
+    assert_eq!(
+        read_bucket(&app, &seller.pubky).await,
+        (0.0, start + one_refill)
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn far_future_inventory_bucket_with_tokens_resets_on_admission(pool: PgPool) {
+    use chrono::SubsecRound;
+    let app = test_app(pool).await;
+    let seller = new_actor(&app).await;
+    register(&app, &seller, 3).await;
+    let start = Utc::now().trunc_subsecs(3);
+    seed_read_bucket(&app, &seller.pubky, 3.0, start + chrono::Duration::hours(1)).await;
+
+    read_at(&app, &seller, start).await;
+    assert_eq!(
+        read_bucket(&app, &seller.pubky).await,
+        (2.0, start),
+        "the admitted request writes its own time, credits no refill and spends one token"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn inventory_bucket_ahead_inside_the_window_waits_for_the_clock(pool: PgPool) {
+    use chrono::SubsecRound;
+    // Defaults: 120 per minute, so one token refills every 500 ms.
+    let app = test_app(pool).await;
+    let seller = new_actor(&app).await;
+    register(&app, &seller, 3).await;
+    let start = Utc::now().trunc_subsecs(3);
+    let one_refill = chrono::Duration::milliseconds(500);
+    let ahead = start + chrono::Duration::minutes(2);
+    seed_read_bucket(&app, &seller.pubky, 0.0, ahead).await;
+
+    assert_eq!(
+        read_status_at(&app, &seller, start).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        read_bucket(&app, &seller.pubky).await,
+        (0.0, ahead),
+        "a timestamp inside the window is kept"
+    );
+    assert_eq!(
+        read_status_at(
+            &app,
+            &seller,
+            ahead + one_refill - chrono::Duration::milliseconds(1)
+        )
+        .await,
+        StatusCode::TOO_MANY_REQUESTS,
+        "time before the stored timestamp is not credited as refill"
+    );
+    read_at(&app, &seller, ahead + one_refill).await;
+    assert_eq!(
+        read_bucket(&app, &seller.pubky).await,
+        (0.0, ahead + one_refill)
+    );
+}

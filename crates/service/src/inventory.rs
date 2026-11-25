@@ -24,6 +24,7 @@ use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::auth::AuthSession;
+use crate::clock::MAX_BUCKET_TIMESTAMP_AHEAD;
 use crate::homeserver::HomeserverRawFetchOutcome;
 use crate::variant_stock::{self, VariantRow};
 use crate::AppState;
@@ -568,16 +569,29 @@ async fn consume_rate(
     // One bucket per seller and class, shared by all of the seller's
     // sessions. The row lock is held until the caller's transaction ends, so
     // a seller's concurrent requests serialize here before any listing lock.
+    // Requests can reach the row in a different order than they sampled the
+    // clock, so `updated_at` only moves forward: a request with an older
+    // `now` spends a token without crediting refill or rewinding the bucket.
+    // Only a stored timestamp more than `MAX_BUCKET_TIMESTAMP_AHEAD` past
+    // `now` (`$6`) is implausible; it counts as `now`, so no refill is
+    // credited and the write resets it.
+    let implausible_after = now + MAX_BUCKET_TIMESTAMP_AHEAD;
     let remaining: Option<f64> = sqlx::query_scalar(
         "INSERT INTO inventory_actor_rate_limits \
              (actor_pubky, endpoint_class, tokens, updated_at) \
          VALUES ($1, $2, $3 - 1, $4) \
          ON CONFLICT (actor_pubky, endpoint_class) DO UPDATE SET \
              tokens = LEAST($3, inventory_actor_rate_limits.tokens + \
-                 GREATEST(EXTRACT(EPOCH FROM ($4 - inventory_actor_rate_limits.updated_at)), 0) * $5) - 1, \
-             updated_at = $4 \
+                 GREATEST(EXTRACT(EPOCH FROM ($4 - \
+                     CASE WHEN inventory_actor_rate_limits.updated_at > $6 THEN $4 \
+                          ELSE inventory_actor_rate_limits.updated_at END)), 0) * $5) - 1, \
+             updated_at = GREATEST($4, \
+                 CASE WHEN inventory_actor_rate_limits.updated_at > $6 THEN $4 \
+                      ELSE inventory_actor_rate_limits.updated_at END) \
          WHERE LEAST($3, inventory_actor_rate_limits.tokens + \
-                 GREATEST(EXTRACT(EPOCH FROM ($4 - inventory_actor_rate_limits.updated_at)), 0) * $5) >= 1 \
+                 GREATEST(EXTRACT(EPOCH FROM ($4 - \
+                     CASE WHEN inventory_actor_rate_limits.updated_at > $6 THEN $4 \
+                          ELSE inventory_actor_rate_limits.updated_at END)), 0) * $5) >= 1 \
          RETURNING tokens",
     )
     .bind(&session.actor.0)
@@ -585,8 +599,24 @@ async fn consume_rate(
     .bind(capacity)
     .bind(now)
     .bind(refill_per_second)
+    .bind(implausible_after)
     .fetch_optional(&mut **tx)
     .await?;
+    if remaining.is_none() {
+        // A refused request writes nothing unless the stored timestamp is
+        // implausible; then it resets it to `now` and credits no refill.
+        sqlx::query(
+            "UPDATE inventory_actor_rate_limits SET updated_at = $3, tokens = LEAST($5, tokens) \
+             WHERE actor_pubky = $1 AND endpoint_class = $2 AND updated_at > $4",
+        )
+        .bind(&session.actor.0)
+        .bind(endpoint_class)
+        .bind(now)
+        .bind(implausible_after)
+        .bind(capacity)
+        .execute(&mut **tx)
+        .await?;
+    }
     Ok(remaining.is_some())
 }
 

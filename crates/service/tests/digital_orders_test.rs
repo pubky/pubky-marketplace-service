@@ -1692,6 +1692,54 @@ async fn download_rate_limited_per_order_and_buyer(pool: PgPool) {
     assert_retry_after(&headers, 2);
 }
 
+/// An order bucket with half a token whose timestamp is 0.5 ms ahead of the
+/// clock. Ten reads a minute is one token per 6,000 ms, so 3,000 ms of refill
+/// is needed once the clock reaches the timestamp: 3,000.5 ms, which is four
+/// seconds. Three seconds counts only 2,999 whole milliseconds.
+async fn ahead_order_bucket_refused(
+    app: &TestApp,
+    paykit: &FakePaykit,
+) -> (TestActor, DigitalOrder, chrono::DateTime<chrono::Utc>) {
+    let (_seller, buyer, order) = paykit_delivered_order(app, paykit).await;
+    let now = chrono::SubsecRound::trunc_subsecs(app.clock.now(), 3);
+    app.clock.set(now);
+    insert_read_bucket(
+        &app.pool,
+        &format!("order:{}", order.order_id),
+        0.5,
+        now + chrono::Duration::microseconds(500),
+    )
+    .await;
+    let (status, headers, body) = read_delivery_response(app, &buyer.token, &order.order_id).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_retry_after(&headers, 4);
+    (buyer, order, now)
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn read_retry_after_waits_for_a_bucket_timestamp_ahead_of_the_clock(pool: PgPool) {
+    let (app, paykit) = paykit_app(pool).await;
+    let (buyer, order, now) = ahead_order_bucket_refused(&app, &paykit).await;
+    app.clock.set(now + chrono::Duration::seconds(4));
+    let (status, _, body) = read_delivery(&app, &buyer.token, &order.order_id).await;
+    assert_eq!(status, StatusCode::OK, "the advertised second: {body}");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn read_retry_one_second_early_is_still_refused(pool: PgPool) {
+    let (app, paykit) = paykit_app(pool).await;
+    let (buyer, order, now) = ahead_order_bucket_refused(&app, &paykit).await;
+    app.clock.set(now + chrono::Duration::seconds(3));
+    let (status, headers, body) = read_delivery_response(&app, &buyer.token, &order.order_id).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    // The refusal credited 2,999 ms and moved the timestamp to this clock;
+    // one more millisecond of refill is under a second away.
+    assert_retry_after(&headers, 1);
+    app.clock.set(now + chrono::Duration::seconds(4));
+    let (status, _, body) = read_delivery(&app, &buyer.token, &order.order_id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
 // An idle bucket is full again. Deleting it and reading is the same as
 // refilling it and reading: the next `per_minute` reads succeed, and the
 // one after that waits 6 seconds, the order bucket's one-token cost.

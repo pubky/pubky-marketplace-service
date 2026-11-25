@@ -21,7 +21,9 @@ use sqlx::{FromRow, Row};
 use uuid::Uuid;
 
 use crate::auth::Actor;
-use crate::clock::format_timestamp;
+use crate::clock::{
+    format_timestamp, refilled_tokens, retry_after_seconds, MAX_BUCKET_TIMESTAMP_AHEAD,
+};
 use crate::handlers::LISTING_COLUMNS;
 use crate::homeserver::HomeserverRawFetchOutcome;
 use crate::model::ListingRow;
@@ -112,26 +114,42 @@ pub async fn consume_automation_rate(
     .fetch_optional(&mut *tx)
     .await?;
     let (stored, updated_at) = row.unwrap_or((capacity, now));
-    let elapsed = (now - updated_at).num_milliseconds().max(0) as f64 / 1_000.0;
-    let available = (stored + elapsed * rate / 60.0).min(capacity);
-    let (tokens, retry_after) = if available >= 1.0 {
-        (available - 1.0, None)
+    // `updated_at` only moves forward: a request whose clock sample is older
+    // than the stored one earns no refill and must not rewind the bucket, or
+    // a later request would credit the same interval again. Only a timestamp
+    // implausibly far ahead is reset to `now`, with no refill credited.
+    let implausible = updated_at > now + MAX_BUCKET_TIMESTAMP_AHEAD;
+    let effective = if implausible { now } else { updated_at };
+    let available = refilled_tokens(stored, (now - effective).num_milliseconds(), rate, capacity);
+    let (written, retry_after) = if available >= 1.0 {
+        (Some((available - 1.0, effective.max(now))), None)
     } else {
-        let seconds = ((1.0 - available) * 60.0 / rate).ceil().max(1.0) as i64;
-        (available, Some(seconds))
+        // Admission counts refill in whole milliseconds from the stored
+        // state, which can be after `now`. The delay is measured to that same
+        // threshold (at nanosecond precision of the serving clock), so a
+        // client that waits it is admitted rather than refused again. The
+        // measure starts from the state this refusal leaves behind.
+        let seconds = if implausible {
+            retry_after_seconds(available, rate, capacity, now, now)
+        } else {
+            retry_after_seconds(stored, rate, capacity, effective, now)
+        };
+        (implausible.then_some((available, now)), Some(seconds))
     };
-    sqlx::query(
-        "INSERT INTO automation_rate_limits \
-         (seller_pubky, endpoint_class, tokens, updated_at) VALUES ($1, $2, $3, $4) \
-         ON CONFLICT (seller_pubky, endpoint_class) DO UPDATE \
-         SET tokens = EXCLUDED.tokens, updated_at = EXCLUDED.updated_at",
-    )
-    .bind(actor)
-    .bind(class)
-    .bind(tokens)
-    .bind(now)
-    .execute(&mut *tx)
-    .await?;
+    if let Some((tokens, written_at)) = written {
+        sqlx::query(
+            "INSERT INTO automation_rate_limits \
+             (seller_pubky, endpoint_class, tokens, updated_at) VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (seller_pubky, endpoint_class) DO UPDATE \
+             SET tokens = EXCLUDED.tokens, updated_at = EXCLUDED.updated_at",
+        )
+        .bind(actor)
+        .bind(class)
+        .bind(tokens)
+        .bind(written_at)
+        .execute(&mut *tx)
+        .await?;
+    }
     tx.commit().await?;
     Ok(retry_after)
 }

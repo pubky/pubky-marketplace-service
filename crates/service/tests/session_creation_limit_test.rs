@@ -5,7 +5,7 @@
 mod common;
 
 use axum::http::StatusCode;
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, SubsecRound, Utc};
 use common::{
     auth_token_bytes, random_keypair, send_bytes, test_app, test_app_with_config, TestApp,
 };
@@ -164,6 +164,430 @@ async fn replayed_token_is_refused(pool: PgPool) {
     // verified request spends exactly one token, the replay included.
     assert_eq!(after_first, 239.0);
     assert_eq!(creation_tokens(&app, &pubky).await, Some(238.0));
+}
+
+async fn creation_bucket(app: &TestApp, pubky: &str) -> (f64, DateTime<Utc>) {
+    sqlx::query_as(
+        "SELECT tokens, updated_at FROM automation_rate_limits \
+         WHERE seller_pubky = $1 AND endpoint_class = 'session.create'",
+    )
+    .bind(pubky)
+    .fetch_one(&app.pool)
+    .await
+    .expect("bucket row")
+}
+
+async fn seed_creation_bucket(app: &TestApp, pubky: &str, tokens: f64, at: DateTime<Utc>) {
+    sqlx::query(
+        "INSERT INTO automation_rate_limits (seller_pubky, endpoint_class, tokens, updated_at) \
+         VALUES ($1, 'session.create', $2, $3)",
+    )
+    .bind(pubky)
+    .bind(tokens)
+    .bind(at)
+    .execute(&app.pool)
+    .await
+    .expect("seed bucket");
+}
+
+async fn create_session_at(
+    app: &TestApp,
+    keypair: &pubky_common::crypto::Keypair,
+    at: DateTime<Utc>,
+) {
+    app.clock.set(at);
+    let (status, _, body) = post_token(app, auth_token_bytes(keypair)).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn creation_requests_in_reverse_clock_order_credit_refill_once(pool: PgPool) {
+    // Defaults: 120 per minute (2 tokens a second), capacity 240.
+    let app = test_app(pool).await;
+    let start = Utc::now().trunc_subsecs(3);
+    let early = start + Duration::seconds(10);
+    let late = start + Duration::seconds(30);
+    let (in_order_keys, in_order) = random_keypair();
+    let (reversed_keys, reversed) = random_keypair();
+    seed_creation_bucket(&app, &in_order, 100.0, start).await;
+    seed_creation_bucket(&app, &reversed, 100.0, start).await;
+
+    create_session_at(&app, &in_order_keys, early).await;
+    create_session_at(&app, &in_order_keys, late).await;
+    create_session_at(&app, &reversed_keys, late).await;
+    create_session_at(&app, &reversed_keys, early).await;
+
+    // 100 + 30 s of refill (60 tokens) - 2 spent.
+    assert_eq!(creation_bucket(&app, &in_order).await, (158.0, late));
+    assert_eq!(
+        creation_bucket(&app, &reversed).await,
+        (158.0, late),
+        "the older request spends a token and leaves updated_at where it was"
+    );
+
+    create_session_at(&app, &in_order_keys, late).await;
+    create_session_at(&app, &reversed_keys, late).await;
+    assert_eq!(creation_bucket(&app, &in_order).await.0, 157.0);
+    assert_eq!(
+        creation_bucket(&app, &reversed).await.0,
+        157.0,
+        "no refill interval is credited twice"
+    );
+}
+
+fn retry_after_seconds(headers: &axum::http::HeaderMap) -> i64 {
+    headers
+        .get(axum::http::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
+        .expect("Retry-After is an integer")
+}
+
+/// Defaults, with a token acceptance window wide enough for the clock moves
+/// below.
+fn wide_window_config() -> Config {
+    let mut config = Config::for_tests();
+    config.auth_token_window_seconds = 7_200;
+    config
+}
+
+async fn post_token_at(
+    app: &TestApp,
+    keypair: &pubky_common::crypto::Keypair,
+    at: DateTime<Utc>,
+) -> (StatusCode, axum::http::HeaderMap) {
+    app.clock.set(at);
+    let (status, headers, body) = post_token(app, auth_token_bytes(keypair)).await;
+    assert!(
+        matches!(status, StatusCode::CREATED | StatusCode::TOO_MANY_REQUESTS),
+        "{status}: {body}"
+    );
+    (status, headers)
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn refusals_from_a_slower_clock_never_rewind_a_creation_bucket(pool: PgPool) {
+    // Defaults: 120 per minute, so one token refills every 500 ms.
+    let app = test_app_with_config(pool, wide_window_config()).await;
+    let late = Utc::now().trunc_subsecs(3);
+    let one_refill = Duration::milliseconds(500);
+    // A second instance whose clock runs a minute behind.
+    let behind = Duration::seconds(60);
+    let (keypair, pubky) = random_keypair();
+    seed_creation_bucket(&app, &pubky, 0.0, late).await;
+
+    let mut admitted = 0;
+    for cycle in 1..=5 {
+        let previous = late + one_refill * (cycle - 1);
+        let fast = late + one_refill * cycle;
+        let (status, headers) = post_token_at(&app, &keypair, previous - behind).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        // 60 s until the slower clock reaches the bucket, then 500 ms.
+        assert_eq!(retry_after_seconds(&headers), 61);
+        assert_eq!(
+            creation_bucket(&app, &pubky).await,
+            (0.0, previous),
+            "a refusal from the slower clock leaves the bucket alone"
+        );
+        for _ in 0..3 {
+            if post_token_at(&app, &keypair, fast).await.0 == StatusCode::CREATED {
+                admitted += 1;
+            }
+        }
+        assert_eq!(creation_bucket(&app, &pubky).await, (0.0, fast));
+    }
+    assert_eq!(admitted, 5, "one admission per refill interval");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn far_future_empty_creation_bucket_resets_on_refusal(pool: PgPool) {
+    // Defaults: 120 per minute, so one token refills every 500 ms.
+    let app = test_app_with_config(pool, wide_window_config()).await;
+    let start = Utc::now().trunc_subsecs(3);
+    let one_refill = Duration::milliseconds(500);
+    let (keypair, pubky) = random_keypair();
+    seed_creation_bucket(&app, &pubky, 0.0, start + Duration::hours(1)).await;
+
+    let (status, headers) = post_token_at(&app, &keypair, start).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(retry_after_seconds(&headers), 1);
+    assert_eq!(
+        creation_bucket(&app, &pubky).await,
+        (0.0, start),
+        "the refusal resets the timestamp to its own time and credits no refill"
+    );
+    let (status, _) = post_token_at(
+        &app,
+        &keypair,
+        start + one_refill - Duration::milliseconds(1),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(creation_bucket(&app, &pubky).await, (0.0, start));
+    create_session_at(&app, &keypair, start + one_refill).await;
+    assert_eq!(
+        creation_bucket(&app, &pubky).await,
+        (0.0, start + one_refill)
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn far_future_creation_bucket_with_tokens_resets_on_admission(pool: PgPool) {
+    let app = test_app_with_config(pool, wide_window_config()).await;
+    let start = Utc::now().trunc_subsecs(3);
+    let (keypair, pubky) = random_keypair();
+    seed_creation_bucket(&app, &pubky, 3.0, start + Duration::hours(1)).await;
+
+    create_session_at(&app, &keypair, start).await;
+    assert_eq!(
+        creation_bucket(&app, &pubky).await,
+        (2.0, start),
+        "the admitted request writes its own time, credits no refill and spends one token"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn creation_bucket_ahead_inside_the_window_waits_for_the_clock(pool: PgPool) {
+    // Defaults: 120 per minute, so one token refills every 500 ms.
+    let app = test_app_with_config(pool, wide_window_config()).await;
+    let start = Utc::now().trunc_subsecs(3);
+    let one_refill = Duration::milliseconds(500);
+    let ahead = start + Duration::minutes(2);
+    let (keypair, pubky) = random_keypair();
+    seed_creation_bucket(&app, &pubky, 0.0, ahead).await;
+
+    let (status, headers) = post_token_at(&app, &keypair, start).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    // 120 s until this clock reaches the bucket, then 500 ms for one token.
+    assert_eq!(retry_after_seconds(&headers), 121);
+    assert_eq!(
+        creation_bucket(&app, &pubky).await,
+        (0.0, ahead),
+        "a timestamp inside the window is kept"
+    );
+    let (status, _) = post_token_at(
+        &app,
+        &keypair,
+        ahead + one_refill - Duration::milliseconds(1),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "time before the stored timestamp is not credited as refill"
+    );
+    create_session_at(&app, &keypair, ahead + one_refill).await;
+    assert_eq!(
+        creation_bucket(&app, &pubky).await,
+        (0.0, ahead + one_refill)
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn creation_retry_after_rounds_up_a_sub_millisecond_wait(pool: PgPool) {
+    let mut config = wide_window_config();
+    // One token refills every second.
+    config.automation_rate_limit_per_minute = 60;
+    let app = test_app_with_config(pool, config).await;
+    let start = Utc::now().trunc_subsecs(3);
+    let ahead = start + Duration::microseconds(60_000_500);
+    let (keypair, pubky) = random_keypair();
+    seed_creation_bucket(&app, &pubky, 0.0, ahead).await;
+
+    let (status, headers) = post_token_at(&app, &keypair, start).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    // 60.0005 s until this clock reaches the bucket, then 1 s for one token.
+    assert_eq!(retry_after_seconds(&headers), 62);
+    assert_eq!(creation_bucket(&app, &pubky).await, (0.0, ahead));
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn creation_retry_after_rounds_up_a_sub_microsecond_wait(pool: PgPool) {
+    let mut config = wide_window_config();
+    // One token refills every second.
+    config.automation_rate_limit_per_minute = 60;
+    let app = test_app_with_config(pool, config).await;
+    let ahead = Utc::now().trunc_subsecs(6) + Duration::seconds(60);
+    let start = ahead - Duration::seconds(60) - Duration::nanoseconds(1);
+    let (keypair, pubky) = random_keypair();
+    seed_creation_bucket(&app, &pubky, 0.0, ahead).await;
+
+    let (status, headers) = post_token_at(&app, &keypair, start).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    // 60 s and 1 ns until this clock reaches the bucket, then 1 s for one token.
+    assert_eq!(retry_after_seconds(&headers), 62);
+    assert_eq!(creation_bucket(&app, &pubky).await, (0.0, ahead));
+}
+
+/// 7 tokens a minute is one token per 8,571.43 ms, so the whole-millisecond
+/// admission needs 8,572 ms of refill. A bucket 428.5 ms ahead of the clock
+/// admits at 9,000.5 ms, so nine seconds is still too early.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn creation_retry_after_for_seven_per_minute_admits_at_the_advertised_second(pool: PgPool) {
+    let mut config = wide_window_config();
+    config.automation_rate_limit_per_minute = 7;
+    let app = test_app_with_config(pool, config).await;
+    let start = Utc::now().trunc_subsecs(3);
+    let ahead = start + Duration::microseconds(428_500);
+    let (keypair, pubky) = random_keypair();
+    seed_creation_bucket(&app, &pubky, 0.0, ahead).await;
+
+    let (status, headers) = post_token_at(&app, &keypair, start).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(retry_after_seconds(&headers), 10);
+
+    let (status, _) = post_token_at(&app, &keypair, start + Duration::seconds(9)).await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "8,571 whole milliseconds of refill is still short of one token"
+    );
+    assert_eq!(creation_bucket(&app, &pubky).await, (0.0, ahead));
+
+    let (status, _) = post_token_at(&app, &keypair, start + Duration::seconds(10)).await;
+    assert_eq!(status, StatusCode::CREATED);
+}
+
+/// A client that waits exactly the advertised `Retry-After` is admitted, and
+/// one that retries a second earlier is not, for waits that end just either
+/// side of a whole millisecond or whole second on the serving clock's
+/// nanoseconds. Each case is `(bucket timestamp minus now in ns, expected
+/// Retry-After)` for an empty bucket.
+async fn assert_retry_after_is_honoured(app: &TestApp, per_minute: i64, cases: &[(i64, i64)]) {
+    let anchor = Utc::now().trunc_subsecs(6) + Duration::minutes(2);
+    for &(offset_ns, expected) in cases {
+        let label = format!("{per_minute}/min, bucket {offset_ns} ns from now");
+        let (keypair, pubky) = random_keypair();
+        seed_creation_bucket(app, &pubky, 0.0, anchor).await;
+        let start = anchor - Duration::nanoseconds(offset_ns);
+
+        let (status, headers) = post_token_at(app, &keypair, start).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{label}");
+        let seconds = retry_after_seconds(&headers);
+        assert_eq!(seconds, expected, "{label}");
+        if seconds > 1 {
+            let (status, _) =
+                post_token_at(app, &keypair, start + Duration::seconds(seconds - 1)).await;
+            assert_eq!(
+                status,
+                StatusCode::TOO_MANY_REQUESTS,
+                "{label}: one second sooner is too early"
+            );
+        }
+        let (status, _) = post_token_at(app, &keypair, start + Duration::seconds(seconds)).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{label}: the advertised second"
+        );
+    }
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn creation_retry_after_at_seven_per_minute_is_honoured_at_clock_boundaries(pool: PgPool) {
+    let mut config = wide_window_config();
+    config.automation_rate_limit_per_minute = 7;
+    let app = test_app_with_config(pool, config).await;
+    assert_retry_after_is_honoured(
+        &app,
+        7,
+        &[
+            (428_500_000, 10),
+            (427_999_999, 9),
+            (428_000_001, 10),
+            (0, 9),
+            (-1_000_000_000, 8),
+            (-500_000, 9),
+        ],
+    )
+    .await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn creation_retry_after_at_sixty_per_minute_is_honoured_at_nanosecond_boundaries(
+    pool: PgPool,
+) {
+    let mut config = wide_window_config();
+    config.automation_rate_limit_per_minute = 60;
+    let app = test_app_with_config(pool, config).await;
+    assert_retry_after_is_honoured(
+        &app,
+        60,
+        &[
+            (59_999_999_999, 61),
+            (60_000_000_000, 61),
+            (60_000_000_001, 62),
+            (-1, 1),
+        ],
+    )
+    .await;
+}
+
+async fn post_token_from(
+    app: &TestApp,
+    origin: &str,
+    bytes: Vec<u8>,
+) -> (StatusCode, axum::http::HeaderMap) {
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/auth/sessions")
+        .header(axum::http::header::ORIGIN, origin)
+        .body(axum::body::Body::from(bytes))
+        .expect("request builds");
+    let response = app
+        .router
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("request executes");
+    (response.status(), response.headers().clone())
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn limited_creation_exposes_retry_after_to_allowed_origins_only(pool: PgPool) {
+    let app = test_app_with_config(pool, one_token_config()).await;
+    let (keypair, _) = random_keypair();
+    app.clock.set(Utc::now());
+    let allowed = "http://localhost:3000";
+
+    let (status, _) = post_token_from(&app, allowed, auth_token_bytes(&keypair)).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, headers) = post_token_from(&app, allowed, auth_token_bytes(&keypair)).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(headers.contains_key(axum::http::header::RETRY_AFTER));
+    assert_eq!(
+        headers
+            .get(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .and_then(|value| value.to_str().ok()),
+        Some(allowed)
+    );
+    let exposed = headers
+        .get(axum::http::header::ACCESS_CONTROL_EXPOSE_HEADERS)
+        .and_then(|value| value.to_str().ok())
+        .expect("Access-Control-Expose-Headers is missing");
+    assert!(
+        exposed
+            .split(',')
+            .any(|name| name.trim().eq_ignore_ascii_case("retry-after")),
+        "exposed headers: {exposed}"
+    );
+
+    let (status, headers) = post_token_from(
+        &app,
+        "https://elsewhere.example",
+        auth_token_bytes(&keypair),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(headers.contains_key(axum::http::header::RETRY_AFTER));
+    let cors: Vec<_> = headers
+        .keys()
+        .filter(|name| name.as_str().starts_with("access-control-"))
+        .collect();
+    assert!(
+        cors.is_empty(),
+        "a disallowed origin got CORS headers: {cors:?}"
+    );
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]

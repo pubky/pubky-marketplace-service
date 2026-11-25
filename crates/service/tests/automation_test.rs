@@ -206,6 +206,59 @@ async fn bitcoin_manual_resolve_cors_preflight_allows_idempotency_key(pool: PgPo
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn disallowed_origin_preflight_omits_allow_origin_and_expose_headers(pool: PgPool) {
+    let app = test_app(pool).await;
+    let preflight = |origin: &'static str| {
+        Request::builder()
+            .method("OPTIONS")
+            .uri(format!("/v1/auth/sessions/{}", Uuid::nil()))
+            .header("origin", origin)
+            .header("access-control-request-method", "DELETE")
+            .header("access-control-request-headers", "authorization")
+            .body(Body::empty())
+            .expect("preflight builds")
+    };
+
+    let allowed = app
+        .router
+        .clone()
+        .oneshot(preflight("http://localhost:3000"))
+        .await
+        .expect("preflight executes");
+    assert_eq!(
+        allowed
+            .headers()
+            .get("access-control-allow-origin")
+            .and_then(|value| value.to_str().ok()),
+        Some("http://localhost:3000")
+    );
+
+    let disallowed = app
+        .router
+        .clone()
+        .oneshot(preflight("https://elsewhere.example"))
+        .await
+        .expect("preflight executes");
+    let headers = disallowed.headers();
+    assert!(
+        headers.contains_key("access-control-allow-methods"),
+        "{headers:?}"
+    );
+    assert!(
+        headers.contains_key("access-control-allow-headers"),
+        "{headers:?}"
+    );
+    assert!(
+        !headers.contains_key("access-control-allow-origin"),
+        "{headers:?}"
+    );
+    assert!(
+        !headers.contains_key("access-control-expose-headers"),
+        "{headers:?}"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn listing_export_event_cursor_and_sync_many_are_seller_scoped(pool: PgPool) {
     let app = test_app(pool).await;
     let seller = new_actor(&app).await;
