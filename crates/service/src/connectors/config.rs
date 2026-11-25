@@ -37,6 +37,8 @@ pub const APP_SECRET_RETENTION_SECONDS: i64 = 30 * 24 * 3600;
 pub const WEBHOOK_BODY_LIMIT: usize = 256 * 1024;
 pub const CALLBACK_BODY_LIMIT: usize = 64 * 1024;
 pub const MAX_CATALOG_PAGES_PER_POLL: usize = 50;
+/// The longest `CONNECTOR_PROVIDER_TIMEOUT_SECONDS` accepted.
+pub const MAX_PROVIDER_TIMEOUT_SECONDS: u64 = 120;
 
 #[derive(Debug, Clone)]
 pub struct ConnectorSettings {
@@ -105,7 +107,12 @@ impl ConnectorSettings {
             })?;
         }
         settings.lease = seconds(ENV_CONNECTOR_PUSH_LEASE_SECONDS, 300, 60, 3600)?;
-        settings.provider_timeout = seconds(ENV_CONNECTOR_PROVIDER_TIMEOUT_SECONDS, 30, 1, 120)?;
+        settings.provider_timeout = seconds(
+            ENV_CONNECTOR_PROVIDER_TIMEOUT_SECONDS,
+            30,
+            1,
+            MAX_PROVIDER_TIMEOUT_SECONDS,
+        )?;
         settings.max_attempts = bounded(ENV_CONNECTOR_MAX_ATTEMPTS, 12, 1, 100)? as i32;
         settings.backoff_base = seconds(ENV_CONNECTOR_BACKOFF_BASE_SECONDS, 30, 1, 3600)?;
         settings.backoff_max = seconds(ENV_CONNECTOR_BACKOFF_MAX_SECONDS, 3600, 1, 86_400)?;

@@ -709,11 +709,14 @@ async fn run_action(
 /// Reads each mapped connection's catalog and applies the stock it reports,
 /// and compares each linked product with its base (`product_sync`). The
 /// webhook path is the fast one; this closes the gaps a missed webhook leaves.
-/// Returns how many listings' stock changed.
+/// It first deletes the old snapshot rows of unlinked products, on every
+/// connection, disconnected ones included, so a mapping save only ever writes
+/// the products it changes. Returns how many listings' stock changed.
 pub async fn poll_stock(state: &AppState) -> Result<u64, sqlx::Error> {
     let Some(runtime) = runtime_of(state) else {
         return Ok(0);
     };
+    product_sync::delete_old_orphans(&state.pool, state.clock.now()).await?;
     let mut applied = 0;
     for connection in store::connected_with_mappings(&state.pool).await? {
         applied += poll_connection_stock(state, runtime, &connection).await?;

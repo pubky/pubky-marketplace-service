@@ -414,7 +414,13 @@ async fn handle(
             store_refund(state, &connection, due, &order, &amounts, echo, now).await
         }
         InboundEvent::AppUninstalled => {
-            store::disconnect(&state.pool, connection.id, now, retention_end(now)).await?;
+            store::disconnect(
+                &state.pool,
+                connection.id,
+                &*state.clock,
+                retention_end(now),
+            )
+            .await?;
             store::raise_alert(
                 &state.pool,
                 now,
@@ -467,7 +473,13 @@ async fn compliance(
             Handled::Applied("no store customer data is held".to_string()),
         ),
         ComplianceTopic::ShopRedact => {
-            store::disconnect(&state.pool, connection.id, now, retention_end(now)).await?;
+            store::disconnect(
+                &state.pool,
+                connection.id,
+                &*state.clock,
+                retention_end(now),
+            )
+            .await?;
             // The privacy topics that matter for this store are handled: the
             // retained app secret has done its job.
             store::delete_app_credentials(&state.pool, connection.id).await?;

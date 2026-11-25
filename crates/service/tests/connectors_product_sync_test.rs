@@ -17,6 +17,7 @@ use common::connector_provider::{
     api, as_json, map_listing, query_param, raw, rebuild, save_credentials, start_connect,
     test_keys, test_settings,
 };
+use common::lock_order::wait_until_blocked_by;
 use common::shopify_fake::{FakeShopify, Fault, ACCESS_TOKEN, GOOD_CODE};
 use common::{execute, new_actor, register_command, register_listing_command, TestActor, TestApp};
 use hmac::{Hmac, Mac};
@@ -968,6 +969,104 @@ async fn an_override_change_racing_an_unlink_never_deadlocks(pool: PgPool) {
     }
 }
 
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_first_read_racing_an_unlink_never_rolls_the_mapping_back(pool: PgPool) {
+    let r = rig(pool).await;
+    // A link made by an API binary from before 0097 has no snapshot row.
+    sqlx::query(
+        "DELETE FROM connector_product_snapshots \
+         WHERE connection_id = $1 AND provider_product_id = $2",
+    )
+    .bind(r.connection)
+    .bind(BOOTS)
+    .execute(&r.app.pool)
+    .await
+    .expect("delete rollout-era snapshot");
+    let read_started = r.now();
+    let product = r.store_product(BOOTS).await;
+    r.app.clock.advance_seconds(5);
+
+    // Hold the sync lock so the unlink holds the connection row while its
+    // first snapshot insert and the product read contend.
+    let mut holder = r.app.pool.begin().await.expect("holder");
+    let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *holder)
+        .await
+        .expect("holder backend");
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('connector-sync|' || $1::text, 0))")
+        .bind(r.connection)
+        .execute(&mut *holder)
+        .await
+        .expect("sync lock");
+
+    let router = r.app.router.clone();
+    let token = r.seller.token.clone();
+    let connection = r.connection;
+    let unlinking = tokio::spawn(async move {
+        common::send(
+            router,
+            "PUT",
+            &format!("/v1/connectors/{connection}/mappings"),
+            Some(&token),
+            &json!({ "mappings": [] }),
+        )
+        .await
+    });
+    let unlink_pid = wait_until_blocked_by(&r.app.pool, &[holder_pid], &[]).await;
+
+    let read_pool = r.app.pool.clone();
+    let observing = tokio::spawn(async move {
+        product_sync::observe(&read_pool, read_started, connection, &product).await
+    });
+    wait_until_blocked_by(&r.app.pool, &[unlink_pid], &[holder_pid]).await;
+
+    holder.rollback().await.expect("release sync lock");
+    let (unlinked, observed) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        tokio::join!(unlinking, observing)
+    })
+    .await
+    .expect("unlink and read finish");
+    let (status, body) = unlinked.expect("unlink task");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    if let Err(error) = observed.expect("read task") {
+        panic!("observe failed: {error}");
+    }
+
+    let linked: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM connector_variant_map \
+         WHERE connection_id = $1 AND provider_product_id = $2)",
+    )
+    .bind(r.connection)
+    .bind(BOOTS)
+    .fetch_one(&r.app.pool)
+    .await
+    .expect("mapping");
+    assert!(!linked, "the boots are unmapped");
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM connector_product_changes \
+         WHERE connection_id = $1 AND provider_product_id = $2 AND state = 'pending'",
+    )
+    .bind(r.connection)
+    .bind(BOOTS)
+    .fetch_one(&r.app.pool)
+    .await
+    .expect("pending changes");
+    assert_eq!(pending, 0);
+    let (fenced, empty): (bool, bool) = sqlx::query_as(
+        "SELECT unlinked_at IS NOT NULL, \
+                content IS NULL AND price IS NULL AND variants IS NULL AND status IS NULL \
+         FROM connector_product_snapshots \
+         WHERE connection_id = $1 AND provider_product_id = $2",
+    )
+    .bind(r.connection)
+    .bind(BOOTS)
+    .fetch_one(&r.app.pool)
+    .await
+    .expect("fenced snapshot");
+    assert!(fenced, "the mapping's fence is present");
+    assert!(empty, "the mapping emptied every base");
+}
+
 impl Rig {
     /// Links the mug listing to the boots' second variant, so both listings
     /// share one store product.
@@ -1197,7 +1296,7 @@ async fn migration_0097_gives_each_group_the_shared_rebase_instant_and_reruns(po
     sqlx::query(
         "UPDATE connector_product_snapshots \
          SET rebased_at = $3, content_rebased_at = NULL, price_rebased_at = $4, \
-             variants_rebased_at = NULL \
+             variants_rebased_at = NULL, unlinked_at = NULL \
          WHERE connection_id = $1 AND provider_product_id = $2",
     )
     .bind(r.connection)
@@ -1286,4 +1385,355 @@ async fn a_first_read_from_before_an_unlink_is_dropped_after_the_product_is_link
     r.poll().await;
     let changes = r.changes().await;
     assert_eq!(only(&changes, "content")["base"]["title"], "Trail Boots II");
+}
+
+const OTHER: &str = "gid://shopify/Product/9099";
+const OTHER_VARIANT: &str = "gid://shopify/ProductVariant/59099";
+
+impl Rig {
+    async fn save_mappings(&self, mappings: Value) {
+        let (status, body) = self
+            .call("PUT", "/mappings", &json!({ "mappings": mappings }))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    /// Removes a product's mappings without stamping its snapshot's fence, as
+    /// a binary from before 0097 did.
+    async fn unlink_like_an_old_binary(&self, product: &str) {
+        let mut tx = self.app.pool.begin().await.expect("old binary unlink");
+        sqlx::query(
+            "UPDATE connector_product_snapshots SET unlinked_at = NULL \
+             WHERE connection_id = $1 AND provider_product_id = $2",
+        )
+        .bind(self.connection)
+        .bind(product)
+        .execute(&mut *tx)
+        .await
+        .expect("clear old fence");
+        sqlx::query(
+            "DELETE FROM connector_variant_map \
+             WHERE connection_id = $1 AND provider_product_id = $2",
+        )
+        .bind(self.connection)
+        .bind(product)
+        .execute(&mut *tx)
+        .await
+        .expect("delete old mappings");
+        tx.commit().await.expect("old binary unlink");
+    }
+
+    /// The products of the connection that have a snapshot row.
+    async fn snapshot_rows(&self) -> Vec<String> {
+        sqlx::query_scalar(
+            "SELECT provider_product_id FROM connector_product_snapshots \
+             WHERE connection_id = $1 ORDER BY provider_product_id",
+        )
+        .bind(self.connection)
+        .fetch_all(&self.app.pool)
+        .await
+        .expect("snapshots")
+    }
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_mapping_change_that_removes_a_products_last_follower_withdraws_its_change(pool: PgPool) {
+    let r = rig(pool).await;
+    r.link_mug_to_boots().await;
+    r.override_groups("boots_01", json!({ "content": "off" }))
+        .await;
+    r.poll().await;
+    r.edit(BOOTS, json!({ "title": "Trail Boots II" }));
+    r.app.clock.advance_seconds(5);
+    r.poll().await;
+    only(&r.changes().await, "content");
+
+    // The mug, the only listing that follows the boots' content, is unlinked;
+    // the boots listing stays linked with content off.
+    r.app.clock.advance_seconds(5);
+    r.save_mappings(json!([
+        { "listing_id": "boots_01", "provider_product_id": BOOTS,
+          "provider_variant_id": BOOTS_VARIANT },
+    ]))
+    .await;
+    assert_eq!(
+        r.changes().await,
+        Vec::<Value>::new(),
+        "nothing follows the boots' content any more"
+    );
+    let content: Option<Value> = sqlx::query_scalar(
+        "SELECT content FROM connector_product_snapshots \
+         WHERE connection_id = $1 AND provider_product_id = $2",
+    )
+    .bind(r.connection)
+    .bind(BOOTS)
+    .fetch_one(&r.app.pool)
+    .await
+    .expect("snapshot");
+    assert_eq!(content, None, "the group's base was dropped");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn linking_a_listing_that_follows_a_group_nobody_followed_takes_the_store_as_it_is(
+    pool: PgPool,
+) {
+    let r = rig(pool).await;
+    r.override_groups("boots_01", json!({ "content": "off" }))
+        .await;
+    r.poll().await;
+    // The store's title changes while no listing follows the content.
+    r.edit(BOOTS, json!({ "title": "Trail Boots II" }));
+    r.app.clock.advance_seconds(5);
+    r.poll().await;
+    assert_eq!(r.changes().await, Vec::<Value>::new());
+
+    // The mug, which follows the content, is linked to the boots.
+    r.app.clock.advance_seconds(5);
+    r.link_mug_to_boots().await;
+    r.app.clock.advance_seconds(5);
+    r.poll().await;
+    assert_eq!(
+        r.changes().await,
+        Vec::<Value>::new(),
+        "an edit made while nobody followed the content is not replayed"
+    );
+    r.edit(BOOTS, json!({ "title": "Trail Boots III" }));
+    r.app.clock.advance_seconds(5);
+    r.poll().await;
+    let changes = r.changes().await;
+    let content = only(&changes, "content");
+    assert_eq!(content["base"]["title"], "Trail Boots II");
+    assert_eq!(content["proposed"]["title"], "Trail Boots III");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_split_switch_that_unmaps_a_products_last_follower_withdraws_its_change(pool: PgPool) {
+    let r = rig(pool).await;
+    // The mug listing combines the boots' second variant and the mug, so a
+    // switch to split variants unmaps it.
+    r.save_mappings(json!([
+        { "listing_id": "boots_01", "provider_product_id": BOOTS,
+          "provider_variant_id": BOOTS_VARIANT },
+        { "listing_id": "mug_01", "variant_id": "a", "provider_product_id": BOOTS,
+          "provider_variant_id": BOOTS_SECOND_VARIANT },
+        { "listing_id": "mug_01", "variant_id": "b", "provider_product_id": MUG,
+          "provider_variant_id": MUG_VARIANT },
+    ]))
+    .await;
+    r.override_groups("boots_01", json!({ "content": "off" }))
+        .await;
+    r.poll().await;
+    r.edit(BOOTS, json!({ "title": "Trail Boots II" }));
+    r.app.clock.advance_seconds(5);
+    r.poll().await;
+    only(&r.changes().await, "content");
+
+    r.app.clock.advance_seconds(5);
+    let (status, body) = r
+        .call("PUT", "/settings", &json!({ "variant_mode": "split" }))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["unmapped_listings"],
+        json!([{ "listing_id": "mug_01", "mappings_removed": 2 }])
+    );
+    assert_eq!(
+        r.changes().await,
+        Vec::<Value>::new(),
+        "the boots listing left linked does not follow the content"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_read_planned_under_the_old_link_but_started_after_the_unlink_is_dropped_after_a_relink(
+    pool: PgPool,
+) {
+    let r = rig(pool).await;
+    r.poll().await;
+    r.app.clock.advance_seconds(5);
+    r.save_mappings(json!([])).await;
+    // A read planned while the boots were linked starts after the unlink's
+    // instant (the unlink was still waiting for its locks) and is delayed.
+    r.app.clock.advance_seconds(2);
+    let read_started = r.now();
+    let old = r.store_product(BOOTS).await;
+    r.app.clock.advance_seconds(3);
+    r.edit(BOOTS, json!({ "title": "Trail Boots II" }));
+    r.fake.lock().products_gone.insert(BOOTS.into(), None);
+    map_listing(
+        &r.app,
+        &r.seller,
+        r.connection,
+        "boots_01",
+        BOOTS,
+        BOOTS_VARIANT,
+    )
+    .await;
+
+    let late = product_sync::observe(&r.app.pool, read_started, r.connection, &old)
+        .await
+        .expect("observe");
+    assert!(late.stale, "a read planned for the previous link: {late:?}");
+    let late_removal =
+        product_sync::observe_removed(&r.app.pool, read_started, r.connection, BOOTS)
+            .await
+            .expect("observe");
+    assert!(late_removal.stale, "{late_removal:?}");
+    assert_eq!(r.changes().await, Vec::<Value>::new());
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn the_stock_poll_deletes_old_orphan_snapshots_only(pool: PgPool) {
+    let r = rig(pool).await;
+    let retention = product_sync::ORPHAN_SNAPSHOT_RETENTION.num_seconds();
+    r.link_mug().await;
+    r.poll().await;
+    // Both unlinked; the mug is linked again after the retention, the boots
+    // are not.
+    r.app.clock.advance_seconds(5);
+    r.save_mappings(json!([])).await;
+    r.app.clock.advance_seconds(retention + 1);
+    r.save_mappings(json!([
+        { "listing_id": "mug_01", "provider_product_id": MUG,
+          "provider_variant_id": MUG_VARIANT },
+        { "listing_id": "boots_01", "provider_product_id": OTHER,
+          "provider_variant_id": OTHER_VARIANT },
+    ]))
+    .await;
+    // A product unlinked a moment ago.
+    r.app.clock.advance_seconds(1);
+    r.save_mappings(json!([
+        { "listing_id": "mug_01", "provider_product_id": MUG,
+          "provider_variant_id": MUG_VARIANT },
+    ]))
+    .await;
+    assert_eq!(
+        r.snapshot_rows().await,
+        vec![BOOTS.to_string(), MUG.to_string(), OTHER.to_string()]
+    );
+    r.poll().await;
+    assert_eq!(
+        r.snapshot_rows().await,
+        vec![MUG.to_string(), OTHER.to_string()],
+        "only the boots' row is an orphan older than the retention"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn an_orphan_left_without_a_fence_by_an_old_binary_expires_by_its_creation(pool: PgPool) {
+    let r = rig(pool).await;
+    let retention = product_sync::ORPHAN_SNAPSHOT_RETENTION.num_seconds();
+    r.link_mug().await;
+    r.poll().await;
+
+    // The boots were linked, then an old binary removed their mapping without
+    // stamping the snapshot's fence.
+    r.app.clock.advance_seconds(5);
+    r.unlink_like_an_old_binary(BOOTS).await;
+    r.app.clock.advance_seconds(retention + 1);
+
+    // The other product is also unlinked without a fence, but its snapshot is
+    // younger than the retention. The mug stays linked and has no fence.
+    r.save_mappings(json!([
+        { "listing_id": "boots_01", "provider_product_id": OTHER,
+          "provider_variant_id": OTHER_VARIANT },
+        { "listing_id": "mug_01", "provider_product_id": MUG,
+          "provider_variant_id": MUG_VARIANT },
+    ]))
+    .await;
+    r.app.clock.advance_seconds(5);
+    r.unlink_like_an_old_binary(OTHER).await;
+    sqlx::query(
+        "UPDATE connector_product_snapshots SET unlinked_at = NULL \
+         WHERE connection_id = $1 AND provider_product_id = $2",
+    )
+    .bind(r.connection)
+    .bind(MUG)
+    .execute(&r.app.pool)
+    .await
+    .expect("linked row without a fence");
+
+    assert_eq!(
+        r.snapshot_rows().await,
+        vec![BOOTS.to_string(), MUG.to_string(), OTHER.to_string()]
+    );
+    r.poll().await;
+    assert_eq!(
+        r.snapshot_rows().await,
+        vec![MUG.to_string(), OTHER.to_string()],
+        "only the null-fenced orphan older than the retention is deleted"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_fenced_orphan_with_an_old_creation_is_judged_by_its_fence(pool: PgPool) {
+    let r = rig(pool).await;
+    let retention = product_sync::ORPHAN_SNAPSHOT_RETENTION.num_seconds();
+    r.poll().await;
+    r.app.clock.advance_seconds(retention + 1);
+    r.save_mappings(json!([])).await;
+
+    r.poll().await;
+    assert_eq!(
+        r.snapshot_rows().await,
+        vec![BOOTS.to_string()],
+        "a recent fence keeps the row although its creation is older than the retention"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_read_from_before_an_unlink_completing_after_its_row_was_deleted_changes_nothing(
+    pool: PgPool,
+) {
+    let r = rig(pool).await;
+    let retention = product_sync::ORPHAN_SNAPSHOT_RETENTION.num_seconds();
+    r.poll().await;
+    r.app.clock.advance_seconds(5);
+    // A read starts while the boots are linked and is delayed past the
+    // unlink, the retention and the deletion of their row.
+    let slow_read_started = r.now();
+    let old = r.store_product(BOOTS).await;
+    r.app.clock.advance_seconds(5);
+    r.save_mappings(json!([])).await;
+    r.app.clock.advance_seconds(retention + 1);
+    r.poll().await;
+    assert_eq!(r.snapshot_rows().await, Vec::<String>::new());
+
+    let late = product_sync::observe(&r.app.pool, slow_read_started, r.connection, &old)
+        .await
+        .expect("observe");
+    let late_removal =
+        product_sync::observe_removed(&r.app.pool, slow_read_started, r.connection, BOOTS)
+            .await
+            .expect("observe");
+    assert_eq!((late.based, late.queued), (0, 0), "{late:?}");
+    assert_eq!(late_removal.queued, 0, "{late_removal:?}");
+    assert_eq!(
+        r.snapshot_rows().await,
+        Vec::<String>::new(),
+        "a read of an unlinked product writes nothing"
+    );
+
+    // Linked again, the same late read is older than the new link.
+    r.edit(BOOTS, json!({ "title": "Trail Boots II" }));
+    r.fake.lock().products_gone.insert(BOOTS.into(), None);
+    map_listing(
+        &r.app,
+        &r.seller,
+        r.connection,
+        "boots_01",
+        BOOTS,
+        BOOTS_VARIANT,
+    )
+    .await;
+    let late = product_sync::observe(&r.app.pool, slow_read_started, r.connection, &old)
+        .await
+        .expect("observe");
+    assert!(late.stale, "{late:?}");
+    let late_removal =
+        product_sync::observe_removed(&r.app.pool, slow_read_started, r.connection, BOOTS)
+            .await
+            .expect("observe");
+    assert!(late_removal.stale, "{late_removal:?}");
+    assert_eq!(r.changes().await, Vec::<Value>::new());
 }

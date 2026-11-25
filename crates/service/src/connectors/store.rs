@@ -18,6 +18,7 @@ use super::config::MAX_CONNECTIONS_PER_SELLER;
 use super::keys::{app_credential_aad, credential_aad, recipient_key_aad, ConnectorKeys};
 use super::provider::{AppContext, AppKind, ConnectionContext, CredentialSecret, ProviderKind};
 use super::recipient::NewRecipientKey;
+use crate::clock::Clock;
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ConnectionRow {
@@ -740,9 +741,10 @@ pub async fn public_stores(
 pub async fn disconnect(
     pool: &PgPool,
     id: Uuid,
-    now: DateTime<Utc>,
+    clock: &dyn Clock,
     retain_app_secret_until: DateTime<Utc>,
 ) -> Result<bool, sqlx::Error> {
+    let now = clock.now();
     let mut tx = pool.begin().await?;
     // The connection row first: anything that swaps the credential holds this
     // lock while it does, so a swap either completes before the delete below
@@ -755,6 +757,7 @@ pub async fn disconnect(
     .fetch_optional(&mut *tx)
     .await?;
     let installed = found.as_ref().map(|(installed, _)| *installed);
+    let links = super::product_sync::lock_links(&mut tx, clock, id).await?;
     for table in [
         "connector_credentials",
         "connector_recipient_keys",
@@ -794,7 +797,7 @@ pub async fn disconnect(
     if let Some((_, seller_pubky)) = &found {
         crate::variant_stock::end_unlinked_made_to_order(&mut tx, seller_pubky, now).await?;
     }
-    super::product_sync::forget_unlinked(&mut tx, now, id).await?;
+    super::product_sync::apply_links(&mut tx, id, &links).await?;
     tx.commit().await?;
     Ok(changed > 0)
 }
@@ -854,13 +857,20 @@ pub async fn set_variant_mode(
     pool: &PgPool,
     connection: &ConnectionRow,
     split: bool,
-    now: DateTime<Utc>,
+    clock: &dyn Clock,
 ) -> Result<VariantSwitch, sqlx::Error> {
+    let now = clock.now();
     let mut tx = pool.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('connector-map|' || $1::text, 0))")
         .bind(connection.id)
         .execute(&mut *tx)
         .await?;
+    // The connection row before the sync lock, as a mapping save takes them.
+    sqlx::query("SELECT 1 FROM connector_connections WHERE id = $1 FOR UPDATE")
+        .bind(connection.id)
+        .execute(&mut *tx)
+        .await?;
+    let links = super::product_sync::lock_links(&mut tx, clock, connection.id).await?;
     let mut unmapped = Vec::new();
     if split {
         let removed: Vec<(String, i64)> = sqlx::query_as(
@@ -897,7 +907,7 @@ pub async fn set_variant_mode(
     if !unmapped.is_empty() {
         crate::variant_stock::end_unlinked_made_to_order(&mut tx, &connection.seller_pubky, now)
             .await?;
-        super::product_sync::forget_unlinked(&mut tx, now, connection.id).await?;
+        super::product_sync::apply_links(&mut tx, connection.id, &links).await?;
         let names = unmapped
             .iter()
             .map(|listing| {
@@ -986,8 +996,9 @@ pub async fn replace_mappings(
     pool: &PgPool,
     connection: &ConnectionRow,
     mappings: &[MappingRow],
-    now: DateTime<Utc>,
+    clock: &dyn Clock,
 ) -> Result<(), MappingError> {
+    let now = clock.now();
     let mut tx = pool.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('connector-map|' || $1::text, 0))")
         .bind(connection.id)
@@ -1007,6 +1018,7 @@ pub async fn replace_mappings(
     if !matches!(status.as_str(), "connected" | "needs_attention" | "error") {
         return Err(MappingError::Database(sqlx::Error::RowNotFound));
     }
+    let links = super::product_sync::lock_links(&mut tx, clock, connection.id).await?;
     if variant_mode == "split" {
         let mut seen = std::collections::HashSet::new();
         if let Some(shared) = mappings
@@ -1076,7 +1088,7 @@ pub async fn replace_mappings(
         .await?;
     crate::variant_stock::end_unlinked_made_to_order(&mut tx, &connection.seller_pubky, now)
         .await?;
-    super::product_sync::forget_unlinked(&mut tx, now, connection.id).await?;
+    super::product_sync::apply_links(&mut tx, connection.id, &links).await?;
     tx.commit().await?;
     Ok(())
 }
