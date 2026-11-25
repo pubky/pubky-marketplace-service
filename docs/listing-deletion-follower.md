@@ -34,7 +34,13 @@ the `listing_deletions` lease.
   is tried again later. A cached record that still names a homeserver the
   seller left never proves a delete there; a record that cannot be read
   leaves the listing as it is. `listing.sync` makes these reads before its
-  database transaction and settles the result inside it.
+  database transaction and settles the result inside it. When its first
+  read of the record answers 404, `listing.sync` looks the seller up anew
+  and reads the record again: a record found there is the one it syncs,
+  whatever the cached homeserver said; a seller or homeserver that cannot
+  be read there answers `UPSTREAM_UNAVAILABLE`, never the 404; and only a
+  record missing there is a 404 or goes on to the proof. Under `fixed`
+  nothing is read again and the 404 stands.
 - **Revivals are confirmed.** Each pass first confirms up to five revived
   listings not yet confirmed at their current generation
   (`listing_revival_checks`, 0051), least recently tried first, within the

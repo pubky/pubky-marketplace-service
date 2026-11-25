@@ -33,8 +33,8 @@ use crate::homeserver::{
     MalformedDigitalLock,
 };
 use crate::listing_deletion::{
-    confirm_missing_record_deleted, observe_live, tombstone, DeletionAuthority, DeletionCheck,
-    LiveListing,
+    confirm_missing_record_deleted, observe_live, reread_missing_record, tombstone,
+    DeletionAuthority, DeletionCheck, LiveListing, RecordAfterMiss,
 };
 use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
 
@@ -66,10 +66,13 @@ pub fn record_request(command: &Command, has_homeserver: bool) -> Option<&SyncLi
     .then_some(payload)
 }
 
-/// Reads the seller's record and, when it is missing and the listing is
-/// live, observes the listing and reads the deletion proof. The handler
-/// tombstones only if the listing's `record_epoch` is still the observed
-/// one, so a register, sync or revival accepted meanwhile wins.
+/// Reads the seller's record. When it is missing, under `pkarr` the seller's
+/// homeserver is looked up anew and the record read again, so a record on the
+/// homeserver the seller moved to is synced, and a homeserver that cannot be
+/// read is `Unavailable`. A record still missing, with the listing live, gets
+/// its deletion proof. The handler tombstones only if the listing's
+/// `record_epoch` is still the observed one, so a register, sync or revival
+/// accepted meanwhile wins.
 pub async fn prefetch(
     pool: &PgPool,
     homeserver: &dyn HomeserverListingClient,
@@ -84,19 +87,33 @@ pub async fn prefetch(
             HomeserverFetchOutcome::Found(record) => SyncPrefetch::Found(record),
             HomeserverFetchOutcome::Unavailable => SyncPrefetch::Unavailable,
             HomeserverFetchOutcome::NotFound => {
-                let proof = match observe_live(pool, &command.aggregate_id).await? {
-                    Some(observed) => Some((
-                        observed,
-                        confirm_missing_record_deleted(
-                            homeserver,
-                            &payload.seller_pubky,
-                            &payload.listing_id,
-                        )
-                        .await,
-                    )),
-                    None => None,
-                };
-                SyncPrefetch::NotFound(proof)
+                // Observed before any further read, so the tombstone below
+                // is fenced on what was live before the proof was read.
+                let observed = observe_live(pool, &command.aggregate_id).await?;
+                match reread_missing_record(homeserver, &payload.seller_pubky, &payload.listing_id)
+                    .await
+                {
+                    RecordAfterMiss::Found(record) => SyncPrefetch::Found(record),
+                    RecordAfterMiss::Unavailable => SyncPrefetch::Unavailable,
+                    RecordAfterMiss::Missing {
+                        homeserver: record_homeserver,
+                    } => {
+                        let proof = match observed {
+                            Some(observed) => Some((
+                                observed,
+                                confirm_missing_record_deleted(
+                                    homeserver,
+                                    &payload.seller_pubky,
+                                    &payload.listing_id,
+                                    record_homeserver,
+                                )
+                                .await,
+                            )),
+                            None => None,
+                        };
+                        SyncPrefetch::NotFound(proof)
+                    }
+                }
             }
         },
     )

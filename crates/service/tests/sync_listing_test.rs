@@ -22,13 +22,15 @@ use common::{
 };
 use marketplace_service::homeserver::{
     HomeserverEvent, HomeserverEventKind, HomeserverEventsOutcome, HomeserverFetchOutcome,
-    HomeserverListingClient, HttpHomeserverClient,
+    HomeserverListingClient, HomeserverRefresh, HttpHomeserverClient,
 };
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 const LISTING_ID: &str = "boots_01";
+const OLD_HOMESERVER: &str = "7oboeqnfgtf5d6gohz1wao7rboe1q3ynexkbm5tmq4u49kxzej9y";
+const NEW_HOMESERVER: &str = "8pinxxgqs41n4aididenw5apqp1urfmzdztr8jt4abrkdn435ewo";
 
 /// A canonical camelCase homeserver listing record, shaped like the live
 /// records the reference client publishes (nulls for optional fields,
@@ -797,4 +799,243 @@ async fn sync_reads_the_homeserver_with_no_transaction_open(pool: PgPool) {
         vec![0, 0, 0],
         "record, record, events: no transaction open"
     );
+}
+
+/// A `pkarr` client whose cache still names the homeserver a seller left: the
+/// first read of the record answers 404. The seller's homeserver is then
+/// looked up anew (`refresh`) and the record read again (`reread`, from
+/// `reread_homeserver`); the latest event for the record is a `DEL` read from
+/// `events_homeserver`.
+struct MovedSeller {
+    refresh: HomeserverRefresh,
+    reread: HomeserverFetchOutcome,
+    reread_homeserver: Option<String>,
+    events_homeserver: Option<String>,
+}
+
+impl MovedSeller {
+    fn serving(record: Value) -> Arc<Self> {
+        Arc::new(Self {
+            refresh: HomeserverRefresh::Refreshed,
+            reread: HomeserverFetchOutcome::Found(record),
+            reread_homeserver: Some(NEW_HOMESERVER.to_owned()),
+            events_homeserver: Some(NEW_HOMESERVER.to_owned()),
+        })
+    }
+
+    fn missing_on_the_new_homeserver(events_homeserver: &str) -> Arc<Self> {
+        Arc::new(Self {
+            refresh: HomeserverRefresh::Refreshed,
+            reread: HomeserverFetchOutcome::NotFound,
+            reread_homeserver: Some(NEW_HOMESERVER.to_owned()),
+            events_homeserver: Some(events_homeserver.to_owned()),
+        })
+    }
+}
+
+impl HomeserverListingClient for MovedSeller {
+    fn fetch_listing<'a>(
+        &'a self,
+        _seller_pubky: &'a str,
+        _listing_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
+        Box::pin(async { HomeserverFetchOutcome::NotFound })
+    }
+
+    fn fetch_listing_from<'a>(
+        &'a self,
+        _seller_pubky: &'a str,
+        _listing_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = (HomeserverFetchOutcome, Option<String>)> + Send + 'a>> {
+        Box::pin(async { (self.reread.clone(), self.reread_homeserver.clone()) })
+    }
+
+    fn fetch_drop<'a>(
+        &'a self,
+        _seller_pubky: &'a str,
+        _drop_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
+        Box::pin(async { HomeserverFetchOutcome::NotFound })
+    }
+
+    fn listing_events<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        path: &'a str,
+        _after_cursor: Option<&'a str>,
+        _reverse: bool,
+        _limit: u16,
+    ) -> Pin<Box<dyn Future<Output = HomeserverEventsOutcome> + Send + 'a>> {
+        Box::pin(async move {
+            HomeserverEventsOutcome::Events {
+                homeserver: self.events_homeserver.clone(),
+                events: vec![HomeserverEvent {
+                    kind: HomeserverEventKind::Del,
+                    uri: format!("pubky://{seller_pubky}{path}"),
+                    cursor: "7".to_string(),
+                }],
+            }
+        })
+    }
+
+    fn refresh_homeserver<'a>(
+        &'a self,
+        _pubky: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HomeserverRefresh> + Send + 'a>> {
+        Box::pin(async { self.refresh })
+    }
+}
+
+fn record_of(seller_pubky: &str, revision: i64, quantities: &[i64]) -> Value {
+    let mut record = homeserver_record(revision, quantities);
+    record["ownerPubky"] = json!(seller_pubky);
+    record["listingId"] = json!(LISTING_ID);
+    record
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_sync_after_a_cached_404_uses_the_record_on_the_sellers_new_homeserver(pool: PgPool) {
+    let seller_pubky = {
+        let probe = test_app_without_homeserver(pool.clone()).await;
+        new_actor(&probe).await.pubky
+    };
+    let homeserver = MovedSeller::serving(record_of(&seller_pubky, 1, &[2, 3]));
+    let app = test_app_with_homeserver_client(pool, homeserver).await;
+    let buyer = new_actor(&app).await;
+
+    let (status, body) = execute(
+        &app,
+        &buyer.token,
+        &sync_command(&seller_pubky, LISTING_ID, 1),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the refreshed record registers the listing: {body}"
+    );
+    assert_eq!(body["result"]["kind"], json!("listing"), "{body}");
+    assert_eq!(
+        body["result"]["listing"]["total_quantity"],
+        json!(2),
+        "{body}"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_sync_refreshes_a_live_listing_from_the_new_homeserver_after_a_cached_404(pool: PgPool) {
+    let (app, _fake) = test_app_with_homeserver(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (status, body) = execute(&app, &seller.token, &register_command(&seller.pubky, 1)).await;
+    assert_eq!(status, StatusCode::OK, "register fixture failed: {body}");
+
+    let moved = test_app_with_homeserver_client(
+        pool,
+        MovedSeller::serving(record_of(&seller.pubky, 2, &[4])),
+    )
+    .await;
+    let (status, body) = execute(
+        &moved,
+        &buyer.token,
+        &sync_command(&seller.pubky, LISTING_ID, 1),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["kind"], json!("listing"), "{body}");
+    assert_eq!(
+        body["result"]["listing"]["listing_revision"],
+        json!(2),
+        "{body}"
+    );
+}
+
+async fn assert_upstream_unavailable(app: &TestApp, buyer_token: &str, seller_pubky: &str) {
+    let (status, body) =
+        execute(app, buyer_token, &sync_command(seller_pubky, LISTING_ID, 1)).await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "unexpected: {body}"
+    );
+    assert_eq!(
+        body["error"]["code"],
+        json!("UPSTREAM_UNAVAILABLE"),
+        "{body}"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_sync_is_unavailable_not_missing_when_the_current_homeserver_cannot_be_read(
+    pool: PgPool,
+) {
+    let seller_pubky = {
+        let probe = test_app_without_homeserver(pool.clone()).await;
+        new_actor(&probe).await.pubky
+    };
+    let cannot_be_looked_up = Arc::new(MovedSeller {
+        refresh: HomeserverRefresh::Unavailable,
+        reread: HomeserverFetchOutcome::NotFound,
+        reread_homeserver: None,
+        events_homeserver: None,
+    });
+    let app = test_app_with_homeserver_client(pool.clone(), cannot_be_looked_up).await;
+    let buyer = new_actor(&app).await;
+    assert_upstream_unavailable(&app, &buyer.token, &seller_pubky).await;
+
+    let cannot_be_read = Arc::new(MovedSeller {
+        refresh: HomeserverRefresh::Refreshed,
+        reread: HomeserverFetchOutcome::Unavailable,
+        reread_homeserver: None,
+        events_homeserver: None,
+    });
+    let app = test_app_with_homeserver_client(pool, cannot_be_read).await;
+    assert_upstream_unavailable(&app, &buyer.token, &seller_pubky).await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_record_missing_on_the_new_homeserver_is_deleted_only_by_a_delete_it_read(pool: PgPool) {
+    let (app, _fake) = test_app_with_homeserver(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (status, body) = execute(&app, &seller.token, &register_command(&seller.pubky, 1)).await;
+    assert_eq!(status, StatusCode::OK, "register fixture failed: {body}");
+
+    let from_the_old_homeserver = test_app_with_homeserver_client(
+        pool.clone(),
+        MovedSeller::missing_on_the_new_homeserver(OLD_HOMESERVER),
+    )
+    .await;
+    let (status, body) = execute(
+        &from_the_old_homeserver,
+        &buyer.token,
+        &sync_command(&seller.pubky, LISTING_ID, 1),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a delete from another homeserver proves nothing: {body}"
+    );
+    let (status, _) = read_listing(
+        &app,
+        &buyer.token,
+        &format!("listing:{}_{LISTING_ID}", seller.pubky),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the listing is still live");
+
+    let from_the_new_homeserver = test_app_with_homeserver_client(
+        pool,
+        MovedSeller::missing_on_the_new_homeserver(NEW_HOMESERVER),
+    )
+    .await;
+    let (status, body) = execute(
+        &from_the_new_homeserver,
+        &buyer.token,
+        &sync_command(&seller.pubky, LISTING_ID, 2),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["kind"], json!("listing_deleted"), "{body}");
 }

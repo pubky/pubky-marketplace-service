@@ -49,7 +49,7 @@ use marketplace_service::homeserver::{
     DELIVERABLES_PATH, LISTINGS_PATH, SHOP_PATH,
 };
 use marketplace_service::listing_deletion::{
-    confirm_deleted, confirm_missing_record_deleted, DeletionCheck,
+    confirm_deleted, reread_missing_record, DeletionCheck, RecordAfterMiss,
 };
 
 const CLIENT_ID: &str = "market.pubky.service-test";
@@ -1427,9 +1427,12 @@ fn a_stale_cache_naming_the_old_homeserver_cannot_prove_a_delete_there() {
             HomeserverFetchOutcome::NotFound,
             "the cached record still names the old homeserver"
         );
-        assert_eq!(
-            confirm_missing_record_deleted(&for_missing, &seller.pubky, LISTING_ID).await,
-            DeletionCheck::NotDeleted
+        assert!(
+            matches!(
+                reread_missing_record(&for_missing, &seller.pubky, LISTING_ID).await,
+                RecordAfterMiss::Found(_)
+            ),
+            "the record read again, from where the seller's record names now, is the new homeserver's"
         );
         assert_eq!(
             confirm_deleted(&for_confirm, &seller.pubky, LISTING_ID).await,

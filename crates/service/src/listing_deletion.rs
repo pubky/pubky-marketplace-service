@@ -46,6 +46,7 @@
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use serde_json::Value;
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
@@ -168,24 +169,56 @@ pub async fn confirm_deleted(
     record_then_latest_event(homeserver, seller_pubky, listing_id).await
 }
 
-/// The deletion proof for a caller whose record fetch already answered 404.
-/// With one configured homeserver that fetch is step (1). Under `pkarr` it
-/// may have gone to a homeserver a cached record still named, so after the
-/// fresh lookup the record is read again.
+/// The seller's record after a fetch of it answered 404. With one configured
+/// homeserver that answer stands. Under `pkarr` it may have come from a
+/// homeserver a cached record still named, so the seller's homeserver is
+/// looked up anew and the record read again.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RecordAfterMiss {
+    /// The homeserver the seller's record names now holds the record.
+    Found(Value),
+    /// The record is missing, on the homeserver that answered the read
+    /// (`None`: the configured one).
+    Missing { homeserver: Option<String> },
+    /// The seller's current homeserver could not be looked up or read.
+    Unavailable,
+}
+
+/// Looks the seller's homeserver up anew and reads the record again, for a
+/// caller whose first read answered 404. Under `fixed` nothing is read: the
+/// first answer was from the one configured homeserver.
+pub async fn reread_missing_record(
+    homeserver: &dyn HomeserverListingClient,
+    seller_pubky: &str,
+    listing_id: &str,
+) -> RecordAfterMiss {
+    match homeserver.refresh_homeserver(seller_pubky).await {
+        HomeserverRefresh::Fixed => RecordAfterMiss::Missing { homeserver: None },
+        HomeserverRefresh::Refreshed => {
+            match homeserver
+                .fetch_listing_from(seller_pubky, listing_id)
+                .await
+            {
+                (HomeserverFetchOutcome::Found(record), _) => RecordAfterMiss::Found(record),
+                (HomeserverFetchOutcome::NotFound, homeserver) => {
+                    RecordAfterMiss::Missing { homeserver }
+                }
+                (HomeserverFetchOutcome::Unavailable, _) => RecordAfterMiss::Unavailable,
+            }
+        }
+        HomeserverRefresh::Unavailable => RecordAfterMiss::Unavailable,
+    }
+}
+
+/// Step (2) of the deletion proof for a record [`reread_missing_record`]
+/// found missing on `record_homeserver`.
 pub async fn confirm_missing_record_deleted(
     homeserver: &dyn HomeserverListingClient,
     seller_pubky: &str,
     listing_id: &str,
+    record_homeserver: Option<String>,
 ) -> DeletionCheck {
-    match homeserver.refresh_homeserver(seller_pubky).await {
-        HomeserverRefresh::Fixed => {
-            latest_event_is_delete(homeserver, seller_pubky, listing_id).await
-        }
-        HomeserverRefresh::Refreshed => {
-            record_then_latest_event(homeserver, seller_pubky, listing_id).await
-        }
-        HomeserverRefresh::Unavailable => DeletionCheck::Unavailable { retry_after: None },
-    }
+    latest_event_from(homeserver, seller_pubky, listing_id, record_homeserver).await
 }
 
 /// Both steps, each answered by the same homeserver. Each read looks the
@@ -202,22 +235,33 @@ async fn record_then_latest_event(
         .await;
     match record {
         HomeserverFetchOutcome::NotFound => {
-            match latest_event_is_delete(homeserver, seller_pubky, listing_id).await {
-                DeletionCheck::Deleted {
-                    homeserver: event_homeserver,
-                    ..
-                } if event_homeserver != record_homeserver => {
-                    tracing::warn!(
-                        seller_prefix = %seller_pubky.get(..8).unwrap_or(seller_pubky),
-                        "listing deletion proof read its record and its events from different homeservers"
-                    );
-                    DeletionCheck::Unavailable { retry_after: None }
-                }
-                check => check,
-            }
+            latest_event_from(homeserver, seller_pubky, listing_id, record_homeserver).await
         }
         HomeserverFetchOutcome::Found(_) => DeletionCheck::NotDeleted,
         HomeserverFetchOutcome::Unavailable => DeletionCheck::Unavailable { retry_after: None },
+    }
+}
+
+/// Step (2), accepting a `DEL` only from `record_homeserver`, the homeserver
+/// that answered the 404.
+async fn latest_event_from(
+    homeserver: &dyn HomeserverListingClient,
+    seller_pubky: &str,
+    listing_id: &str,
+    record_homeserver: Option<String>,
+) -> DeletionCheck {
+    match latest_event_is_delete(homeserver, seller_pubky, listing_id).await {
+        DeletionCheck::Deleted {
+            homeserver: event_homeserver,
+            ..
+        } if event_homeserver != record_homeserver => {
+            tracing::warn!(
+                seller_prefix = %seller_pubky.get(..8).unwrap_or(seller_pubky),
+                "listing deletion proof read its record and its events from different homeservers"
+            );
+            DeletionCheck::Unavailable { retry_after: None }
+        }
+        check => check,
     }
 }
 
@@ -1085,7 +1129,7 @@ mod tests {
 
     use super::{
         confirm_deleted, confirm_missing_record_deleted, event_listing_id, follow_backoff,
-        listing_record_uri, DeletionCheck,
+        listing_record_uri, reread_missing_record, DeletionCheck, RecordAfterMiss,
     };
     use crate::homeserver::{
         HomeserverEvent, HomeserverEventKind, HomeserverEventsOutcome, HomeserverFetchOutcome,
@@ -1157,6 +1201,17 @@ mod tests {
         }
     }
 
+    /// The two steps a `listing.sync` takes after a 404: the record again,
+    /// then the proof if it is still missing.
+    async fn proof_after_a_404(homeservers: &Homeservers) -> DeletionCheck {
+        match reread_missing_record(homeservers, SELLER, LISTING).await {
+            RecordAfterMiss::Missing { homeserver } => {
+                confirm_missing_record_deleted(homeservers, SELLER, LISTING, homeserver).await
+            }
+            other => panic!("the record is missing on both reads: {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn a_delete_from_another_homeserver_than_the_404_proves_nothing() {
         let split = Homeservers {
@@ -1165,10 +1220,7 @@ mod tests {
         };
         let unavailable = DeletionCheck::Unavailable { retry_after: None };
         assert_eq!(confirm_deleted(&split, SELLER, LISTING).await, unavailable);
-        assert_eq!(
-            confirm_missing_record_deleted(&split, SELLER, LISTING).await,
-            unavailable
-        );
+        assert_eq!(proof_after_a_404(&split).await, unavailable);
 
         let same = Homeservers {
             record_from: "homeserver-a",
@@ -1179,10 +1231,7 @@ mod tests {
             homeserver: Some("homeserver-a".to_owned()),
         };
         assert_eq!(confirm_deleted(&same, SELLER, LISTING).await, deleted);
-        assert_eq!(
-            confirm_missing_record_deleted(&same, SELLER, LISTING).await,
-            deleted
-        );
+        assert_eq!(proof_after_a_404(&same).await, deleted);
     }
 
     fn seconds(failures: i32, retry_after: Option<u64>) -> i64 {
