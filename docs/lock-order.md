@@ -100,17 +100,23 @@ in the same order before it checks the same predicate, and appends its
 `buyer_cancelled` observation under the correlation lock it holds.
 
 The completion paths (`apply_completed_lifecycle`, `apply_manual_review`,
-`park_unverified_completion`) lock the payment first as well;
-`apply_completed_lifecycle` then locks the order before the correlation.
-Payment, correlation and order are one-to-one, so holding the payment
-already serializes these paths with the sweep and with registration, and
-the order of the two later locks cannot form a cycle. The verifier's
-status writes (`claim_due_correlations`, `record_status_observation`,
+`park_unverified_completion`) lock the payment first as well, then the
+correlation; `apply_completed_lifecycle` then locks the order, so every
+path takes the three in the same order. The verifier's status writes
+(`claim_due_correlations`, `record_status_observation`,
 `record_upstream_terminal`, `record_binding_refusal`,
 `bound_unverified_retry`) lock the correlation row alone and take no other
 row lock while holding it. The sweep therefore waits for the correlation
 instead of skipping it: nothing that holds it waits for a lock the sweep
 holds.
+
+Each lifecycle claim takes the next `claim_generation` of the row, and every
+one of the writes above requires the row to still carry the generation its
+claim took; the completion paths check it under the correlation lock before
+any payment or order effect. A row is claimed again once the poll interval
+has passed, even while the pass that claimed it before is still working
+through its batch, so without the generation that pass's late response
+could overwrite what the newer claim recorded.
 
 These paths judge time only once the locks their time checks depend on are
 held. Registration, the buyer's cancel and a first preparation read the

@@ -993,6 +993,7 @@ assume it is free:
 | 0101 | `0101_single_seller_refusals.sql` | the `seller_not_served` refusal kind and the `seller_route` surface and command kind (single-seller mode), stacked on 0100 |
 | 0102 | `0102_store_seller_binding.sql` | permanent one-row seller binding, release triggers and first-boot claim |
 | 0103 | `0103_fx_remove_static_rate_ceilings.sql` | replace static FX rate bands with finite positive checks, drop the 1.0 BTC fiat-quote cap, and admit built-in single-seller FX feed providers |
+| 0104 | `0104_locks_claim_generation.sql` | the Locks lifecycle claim generation that fences a stale pass's outcome writes |
 
 This table describes unmerged work and goes stale as pull requests land; trust
 `crates/service/migrations/` on `main` over it. sqlx does not reject two files
@@ -1117,3 +1118,32 @@ built-in single-seller feed providers (`blocktank`, `kraken`, `coinbase`,
 `DROP CONSTRAINT` plus `ADD CONSTRAINT ... NOT VALID` commits and releases
 `ACCESS EXCLUSIVE` before `VALIDATE CONSTRAINT` runs in a separate transaction
 under `lock_timeout = '10s'`.
+
+## Locks claim generation (0104)
+
+0104 adds `payment_locks_correlations.claim_generation BIGINT NOT NULL
+DEFAULT 0` (`lock_timeout` like 0091; a constant default rewrites nothing).
+Every lifecycle claim increments it and every outcome the claiming pass writes
+requires the generation its claim took, so a pass whose lease expired cannot
+overwrite what a newer claim recorded. Existing rows start at 0. Directly
+rerunnable: the column is added only if missing. It follows
+`0102_store_seller_binding.sql` and `0103_fx_remove_static_rate_ceilings.sql`
+on `main` and reads or writes nothing from 0100 to 0103.
+
+**Deploy mode: rolling.** A binary from before 0104 never reads or increments
+the column, and a row it inserts takes the default. While old and new binaries
+both run the lifecycle worker, a claim taken by an old binary leaves the
+generation unchanged, so a stale response from a new binary's older pass is
+not fenced against it: that overlap behaves as before the migration. A new
+binary before the migration fails its claim, so the migration applies first,
+as at every boot.
+
+### Backing out 0104
+
+An image from before it ignores the column. Keep it and only forget the
+version, or drop it after the old image is serving:
+
+```sql
+ALTER TABLE payment_locks_correlations DROP COLUMN IF EXISTS claim_generation;
+DELETE FROM _sqlx_migrations WHERE version = 104;
+```

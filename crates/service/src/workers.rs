@@ -22,9 +22,12 @@
 //! lookup and advances the payment on a completed result exactly once — the
 //! payment-state compare-and-swap plus the `events_one_payment_confirmed`
 //! unique index enforce the once, not application logic. A claim only stamps
-//! `last_checked_at`, so a crash between the lookup and the effect leaves
-//! the correlation pending and it is re-verified after the poll interval:
-//! bounded, abortable, and resumable across restarts. Marketplace
+//! `last_checked_at` and takes the next `claim_generation`, so a crash
+//! between the lookup and the effect leaves the correlation pending and it
+//! is re-verified after the poll interval: bounded, abortable, and
+//! resumable across restarts. Every outcome write requires the generation
+//! its claim took, so a pass whose claim was replaced by a newer one (its
+//! lease expired mid-batch) writes nothing for that row. Marketplace
 //! payment-window expiry is a separate server-time transition over the
 //! ORDER's armed inventory-hold window ("only a payment locks an item"):
 //! a lapsed hold restocks, the payment expires, and the order cancels,
@@ -1629,22 +1632,34 @@ struct ClaimedCorrelation {
     client_reference_ciphertext: Option<Vec<u8>>,
     expected_resource_ciphertext: Option<Vec<u8>>,
     criterion_id: Option<String>,
+    /// The generation this claim took. Every outcome write for the row
+    /// requires the row to still carry it.
+    claim_generation: i64,
 }
 
 /// Claims a batch of pending correlations due for a lifecycle lookup by
-/// stamping `last_checked_at`. The stamp is the only pre-effect write, so a
-/// holder that dies after claiming loses nothing: the row stays `pending`
-/// and is re-verified once the poll interval elapses. Only `registered`
-/// rows with a non-null bundle are claimable (the same predicates as the
+/// stamping `last_checked_at` and taking the next `claim_generation`. These
+/// are the only pre-effect writes, so a holder that dies after claiming
+/// loses nothing: the row stays `pending` and is re-verified once the poll
+/// interval elapses. Only `registered` rows with a non-null bundle are
+/// claimable (the same predicates as the
 /// `payment_locks_correlations_pending_idx` partial index): a prepared row
 /// has no bundle to look up and must never enter the batch.
+///
+/// A row is claimed again once the poll interval has passed since the last
+/// claim, even if the pass that made it is still working through its batch
+/// (a worker whose lease expired, or another instance that took the lease
+/// over). The generation orders the two claims: every outcome write
+/// requires the generation its claim took, so the older pass's late
+/// response is dropped instead of overwriting the newer claim's record.
 async fn claim_due_correlations(
     pool: &PgPool,
     now: DateTime<Utc>,
     poll_seconds: i64,
 ) -> Result<Vec<ClaimedCorrelation>, sqlx::Error> {
     sqlx::query_as(
-        "UPDATE payment_locks_correlations SET last_checked_at = $1, updated_at = $1 \
+        "UPDATE payment_locks_correlations SET last_checked_at = $1, updated_at = $1, \
+         claim_generation = claim_generation + 1 \
          WHERE id IN (\
              SELECT id FROM payment_locks_correlations \
              WHERE verification_state = 'pending' \
@@ -1653,13 +1668,33 @@ async fn claim_due_correlations(
              AND (last_checked_at IS NULL OR last_checked_at <= $2) \
              ORDER BY last_checked_at ASC NULLS FIRST LIMIT $3 FOR UPDATE SKIP LOCKED\
          ) RETURNING id, payment_id, creator_pubky, bundle_id_ciphertext, last_observed_status, \
-         client_reference_ciphertext, expected_resource_ciphertext, criterion_id",
+         client_reference_ciphertext, expected_resource_ciphertext, criterion_id, claim_generation",
     )
     .bind(now)
     .bind(now - chrono::Duration::seconds(poll_seconds))
     .bind(LOCKS_VERIFY_BATCH_SIZE)
     .fetch_all(pool)
     .await
+}
+
+/// Locks `row`'s correlation inside the caller's transaction if it is still
+/// `pending` and still carries the generation `row`'s claim took. `false`
+/// means a newer claim owns the row, or the row has ended: the caller then
+/// writes nothing. A caller that also locks the payment locks it first.
+async fn lock_claimed_correlation(
+    tx: &mut Transaction<'_, Postgres>,
+    row: &ClaimedCorrelation,
+) -> Result<bool, sqlx::Error> {
+    let locked: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM payment_locks_correlations \
+         WHERE id = $1 AND verification_state = 'pending' AND claim_generation = $2 \
+         FOR UPDATE",
+    )
+    .bind(row.id)
+    .bind(row.claim_generation)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(locked.is_some())
 }
 
 /// Appends one reconciliation-history row (append-only by trigger).
@@ -1686,6 +1721,11 @@ async fn insert_observation(
 /// Records a non-terminal upstream status (pending / in_progress /
 /// not_found). History rows are appended only on change, so steady polling
 /// does not grow the table.
+///
+/// `not_found` is recorded only over a row no lookup has answered yet (or
+/// one already `not_found`). Once the Lock Server has reported the task, or
+/// a completion is being retried, a later `not_found` does not mean the task
+/// can no longer grant access, so it must not make the task read as ended.
 async fn record_status_observation(
     pool: &PgPool,
     row: &ClaimedCorrelation,
@@ -1696,18 +1736,20 @@ async fn record_status_observation(
         return Ok(());
     }
     let mut tx = pool.begin().await?;
-    // A pass that read a non-terminal status before another pass refused or
-    // ended the correlation must not overwrite that terminal record, and a
-    // pass that read the same stale status as a concurrent one must not
-    // record the change twice.
+    // Only the claim that read the status may record it: a pass whose claim
+    // a newer one replaced, or whose row another pass refused or ended,
+    // writes nothing, and a pass that read the same status as a concurrent
+    // one does not record the change twice.
     let observed = sqlx::query(
         "UPDATE payment_locks_correlations SET last_observed_status = $2, updated_at = $3 \
-         WHERE id = $1 AND verification_state = 'pending' \
-         AND last_observed_status IS DISTINCT FROM $2",
+         WHERE id = $1 AND verification_state = 'pending' AND claim_generation = $4 \
+         AND last_observed_status IS DISTINCT FROM $2 \
+         AND ($2 <> 'not_found' OR last_observed_status IS NULL)",
     )
     .bind(row.id)
     .bind(observed_status)
     .bind(now)
+    .bind(row.claim_generation)
     .execute(&mut *tx)
     .await?;
     if observed.rows_affected() == 1 {
@@ -1732,12 +1774,13 @@ async fn record_upstream_terminal(
     let flipped = sqlx::query(
         "UPDATE payment_locks_correlations SET verification_state = $2, \
          last_observed_status = $3, updated_at = $4 \
-         WHERE id = $1 AND verification_state = 'pending'",
+         WHERE id = $1 AND verification_state = 'pending' AND claim_generation = $5",
     )
     .bind(row.id)
     .bind(verification_state)
     .bind(observed_status)
     .bind(now)
+    .bind(row.claim_generation)
     .execute(&mut *tx)
     .await?;
     if flipped.rows_affected() == 1 {
@@ -1763,11 +1806,12 @@ async fn record_binding_refusal(
     let flipped = sqlx::query(
         "UPDATE payment_locks_correlations SET verification_state = 'upstream_failed', \
          last_observed_status = $2, updated_at = $3 \
-         WHERE id = $1 AND verification_state = 'pending'",
+         WHERE id = $1 AND verification_state = 'pending' AND claim_generation = $4",
     )
     .bind(row.id)
     .bind(outcome)
     .bind(now)
+    .bind(row.claim_generation)
     .execute(&mut *tx)
     .await?;
     if flipped.rows_affected() == 1 {
@@ -1800,8 +1844,9 @@ pub(crate) fn unverified_retry_outcome(label: &str) -> String {
 ///
 /// Lock order is payment, then correlation, as in every confirmation path.
 /// The correlation compare-and-swap is the exactly-once gate: a second pass
-/// or a redelivered observation finds it no longer `pending` and changes
-/// nothing. Returns whether this call parked the payment.
+/// or a redelivered observation finds it no longer `pending`, or no longer
+/// at its claim's generation, and changes nothing. Returns whether this call
+/// parked the payment.
 async fn park_unverified_completion(
     pool: &PgPool,
     row: &ClaimedCorrelation,
@@ -1820,11 +1865,12 @@ async fn park_unverified_completion(
     let flipped = sqlx::query(
         "UPDATE payment_locks_correlations SET verification_state = 'upstream_failed', \
          last_observed_status = $2, updated_at = $3 \
-         WHERE id = $1 AND verification_state = 'pending'",
+         WHERE id = $1 AND verification_state = 'pending' AND claim_generation = $4",
     )
     .bind(row.id)
     .bind(label)
     .bind(now)
+    .bind(row.claim_generation)
     .execute(&mut *tx)
     .await?;
     if flipped.rows_affected() != 1 {
@@ -1887,14 +1933,7 @@ async fn bound_unverified_retry(
 ) -> anyhow::Result<Option<bool>> {
     let retry_outcome = unverified_retry_outcome(label);
     let mut tx = pool.begin().await?;
-    let pending: Option<(Uuid,)> = sqlx::query_as(
-        "SELECT id FROM payment_locks_correlations \
-         WHERE id = $1 AND verification_state = 'pending' FOR UPDATE",
-    )
-    .bind(row.id)
-    .fetch_optional(&mut *tx)
-    .await?;
-    if pending.is_none() {
+    if !lock_claimed_correlation(&mut tx, row).await? {
         tx.rollback().await?;
         return Ok(Some(false));
     }
@@ -1909,11 +1948,12 @@ async fn bound_unverified_retry(
     let Some(first_seen) = first_seen else {
         sqlx::query(
             "UPDATE payment_locks_correlations SET last_observed_status = $2, updated_at = $3 \
-             WHERE id = $1",
+             WHERE id = $1 AND claim_generation = $4",
         )
         .bind(row.id)
         .bind(&retry_outcome)
         .bind(now)
+        .bind(row.claim_generation)
         .execute(&mut *tx)
         .await?;
         insert_observation(&mut tx, row.id, "completed", &retry_outcome, now).await?;
@@ -1929,24 +1969,26 @@ async fn bound_unverified_retry(
         .map(Some)
 }
 
-/// Marks the correlation completed inside the caller's effect transaction.
+/// Marks the correlation completed inside the caller's effect transaction,
+/// which already holds it through [`lock_claimed_correlation`].
 async fn mark_correlation_completed(
     tx: &mut Transaction<'_, Postgres>,
-    correlation_id: Uuid,
+    row: &ClaimedCorrelation,
     outcome: &str,
     now: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
     let flipped = sqlx::query(
         "UPDATE payment_locks_correlations SET verification_state = 'completed', \
          last_observed_status = 'completed', completed_at = $2, updated_at = $2 \
-         WHERE id = $1 AND verification_state = 'pending'",
+         WHERE id = $1 AND verification_state = 'pending' AND claim_generation = $3",
     )
-    .bind(correlation_id)
+    .bind(row.id)
     .bind(now)
+    .bind(row.claim_generation)
     .execute(&mut **tx)
     .await?;
     if flipped.rows_affected() == 1 {
-        insert_observation(tx, correlation_id, "completed", outcome, now).await?;
+        insert_observation(tx, row.id, "completed", outcome, now).await?;
     }
     Ok(())
 }
@@ -1963,6 +2005,14 @@ async fn apply_manual_review(
     now: DateTime<Utc>,
 ) -> anyhow::Result<bool> {
     let mut tx = pool.begin().await?;
+    sqlx::query("SELECT id FROM payments WHERE id = $1 FOR UPDATE")
+        .bind(row.payment_id)
+        .execute(&mut *tx)
+        .await?;
+    if !lock_claimed_correlation(&mut tx, row).await? {
+        tx.rollback().await?;
+        return Ok(false);
+    }
     let updated: Option<(i64, String)> = sqlx::query_as(
         "UPDATE payments SET state = 'manual_review', revision = revision + 1, \
          manual_review_entered_at = $3, updated_at = $3 \
@@ -1985,12 +2035,12 @@ async fn apply_manual_review(
                 now,
             )
             .await?;
-            mark_correlation_completed(&mut tx, row.id, "manual_review", now).await?;
+            mark_correlation_completed(&mut tx, row, "manual_review", now).await?;
             true
         }
         None => {
             // The payment moved concurrently; keep the completed fact.
-            mark_correlation_completed(&mut tx, row.id, "none", now).await?;
+            mark_correlation_completed(&mut tx, row, "none", now).await?;
             false
         }
     };
@@ -2020,6 +2070,12 @@ async fn apply_completed_lifecycle(
     let Some(payment) = payment else {
         anyhow::bail!("correlation {} references a missing payment", row.id);
     };
+    // A completion read under a claim that a newer one has replaced applies
+    // nothing; the newer claim's own lookup reads the same completed task.
+    if !lock_claimed_correlation(&mut tx, row).await? {
+        tx.rollback().await?;
+        return Ok(false);
+    }
 
     match payment.state.as_str() {
         "awaiting_entitlement" => {
@@ -2067,7 +2123,7 @@ async fn apply_completed_lifecycle(
                         now,
                     )
                     .await?;
-                    mark_correlation_completed(&mut tx, row.id, "payment_confirmed", now).await?;
+                    mark_correlation_completed(&mut tx, row, "payment_confirmed", now).await?;
                     tx.commit().await?;
                     tracing::info!(
                         payment_id = %payment.id,
@@ -2117,7 +2173,7 @@ async fn apply_completed_lifecycle(
                         | LateMoneyOutcome::SellerReview
                         | LateMoneyOutcome::AmountMismatch => "manual_review",
                     };
-                    mark_correlation_completed(&mut tx, row.id, correlation_outcome, now).await?;
+                    mark_correlation_completed(&mut tx, row, correlation_outcome, now).await?;
                     tx.commit().await?;
                     tracing::info!(
                         payment_id = %payment.id,
@@ -2141,7 +2197,7 @@ async fn apply_completed_lifecycle(
         _ => {
             // Already confirmed or under review: a duplicate or reordered
             // completion has no further effect.
-            mark_correlation_completed(&mut tx, row.id, "none", now).await?;
+            mark_correlation_completed(&mut tx, row, "none", now).await?;
             tx.commit().await?;
             Ok(false)
         }

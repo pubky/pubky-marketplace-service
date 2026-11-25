@@ -2813,8 +2813,14 @@ advance a payment (ADR-0019 §7).
   that was never submitted (or a different or reset Lock Server).
   Registration performs no lookup, so holding `not_found` would let any
   buyer pin a unit for the whole bound by registering an invented bundle
-  id. The sweep locks the payment, then its correlation row, then the
-  order, and checks the whole predicate again under those locks before it
+  id. Only a first answer counts: once the Lock Server has reported the
+  task (`pending` or `in_progress`), or a completion is being retried, a
+  later `not_found` is not recorded. A task last reported `pending` or
+  `in_progress` stays live up to the bound; a completion being retried is
+  held against the buyer's cancel only, and the sweep releases its unit at
+  the end of the window. The sweep locks the payment, then its correlation
+  row, then the order, and checks the whole predicate again under those
+  locks before it
   releases anything, so a registration or a status the verifier records
   while the sweep runs either keeps the unit or is written after the sweep
   commits ([lock order](docs/lock-order.md)). The buyer's
@@ -2901,11 +2907,22 @@ advance a payment (ADR-0019 §7).
   action on it is appended to `payment_locks_observations` (append-only by
   trigger, statuses only — no bearer material), so late-completion and
   reconciliation history is durable.
-- **Crash safety.** A verification claim only stamps `last_checked_at`;
-  every effect commits in its own guarded transaction. A holder that dies
-  between lookup and effect leaves the correlation pending, and any
-  instance resumes it after the poll interval — bounded, abortable,
-  resumable, with the same lease discipline as every other worker task.
+- **Crash safety.** A verification claim only stamps `last_checked_at`
+  and takes the next `claim_generation`; every effect commits in its own
+  guarded transaction. A holder that dies between lookup and effect leaves
+  the correlation pending, and any instance resumes it after the poll
+  interval: bounded, abortable, resumable, with the same lease discipline
+  as every other worker task.
+- **Stale responses.** A row is claimed again once the poll interval has
+  passed, even while an older pass (whose lease expired, or which another
+  instance took over) is still working through its batch. Every outcome
+  write, from a status change to a confirmed completion, requires the
+  generation its own claim took, so the older pass's late response is
+  dropped and the newer claim records the task. A completed, failed or
+  expired task stays so at the Lock Server, so a dropped terminal response
+  is read again by the newer claim's lookup or the next one. `not_found` is
+  recorded only over a row no lookup has answered yet: once the Lock Server
+  has reported the task, a later `not_found` never makes it read as ended.
 
 ## Authentication (task 3.2)
 

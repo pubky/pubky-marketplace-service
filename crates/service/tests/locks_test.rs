@@ -6581,9 +6581,9 @@ async fn sealed_binding_facts_that_cannot_be_opened_are_retried_then_parked(pool
 }
 
 // Two passes that both looked up a malformed binding (the second re-claimed
-// the row after the poll interval) reach the first-sighting record at the
-// same time: the test holds the correlation row until both wait on it. The
-// sighting is recorded once, so the retry bound has one starting point.
+// the row after the poll interval) answer while the test holds the
+// correlation row. Only the newer claim records the first sighting, so the
+// retry bound has one starting point.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn concurrent_passes_record_the_first_sighting_of_a_malformed_binding_once(pool: PgPool) {
     let (app, fake) = test_app_with_locks(pool).await;
@@ -6622,9 +6622,10 @@ async fn concurrent_passes_record_the_first_sighting_of_a_malformed_binding_once
 
 /// Runs two worker passes over the same correlation (the second re-claims it
 /// after the poll interval while the first one's lookup is in flight) and
-/// lets both reach their writes at the same instant: the test holds the
-/// correlation row until both passes wait on a lock, then releases it.
-/// Returns what each pass applied.
+/// releases both answers while the test holds the correlation row. The first
+/// pass's claim is stale, so its write matches no row and it finishes
+/// without waiting on the held lock; the second waits until the test
+/// releases the row. Returns what each pass applied.
 async fn two_passes_meeting_on_the_held_correlation(
     app: &TestApp,
     fake: &FakeLocksClient,
@@ -6657,13 +6658,14 @@ async fn two_passes_meeting_on_the_held_correlation(
         .expect("correlation row held");
     release_first.notify_one();
     release_second.notify_one();
-    while count(
-        &app.pool,
-        "SELECT COUNT(*) FROM pg_stat_activity \
-         WHERE datname = current_database() AND wait_event_type = 'Lock'",
-    )
-    .await
-        < 2
+    while !first.is_finished()
+        || count(
+            &app.pool,
+            "SELECT COUNT(*) FROM pg_stat_activity \
+             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .await
+            < 1
     {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
@@ -6678,7 +6680,8 @@ async fn two_passes_meeting_on_the_held_correlation(
 }
 
 // Two passes that both saw the task `in_progress` record that status once:
-// the observation is written only if the stored status still differs.
+// only the newer claim writes it, and only if the stored status still
+// differs.
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn concurrent_passes_record_a_nonterminal_status_once(pool: PgPool) {
     let (app, fake) = test_app_with_locks(pool).await;
@@ -6704,5 +6707,496 @@ async fn concurrent_passes_record_a_nonterminal_status_once(pool: PgPool) {
     assert_eq!(
         correlation_outcome(&app.pool, &order.payment_id).await,
         ("pending".to_string(), Some("in_progress".to_string()))
+    );
+}
+
+/// Starts pass A, whose lookup stays in flight until the returned handle is
+/// notified, then lets the poll interval pass and runs pass B to the end
+/// against the fake's current outcome. B claimed the row after A did (as a
+/// worker that took over an expired lease would), so A's claim is stale by
+/// the time its lookup answers. Returns A's release, A's pass and what B
+/// applied.
+async fn a_pass_overtaken_by_a_newer_claim(
+    app: &TestApp,
+    fake: &FakeLocksClient,
+) -> (Arc<tokio::sync::Notify>, tokio::task::JoinHandle<u64>, u64) {
+    let locks = app.state.locks.clone().expect("locks runtime");
+    let before = fake.lookup_count();
+    let release = fake.park_next_lookup();
+    let stale = tokio::spawn({
+        let state = app.state.clone();
+        let locks = locks.clone();
+        let now = app.clock.now();
+        async move {
+            workers::verify_due_locks_lifecycles(&state, &locks, now)
+                .await
+                .expect("stale pass")
+        }
+    });
+    while fake.lookup_count() < before + 1 {
+        tokio::task::yield_now().await;
+    }
+    app.clock.advance_seconds(61);
+    let newer = workers::verify_due_locks_lifecycles(&app.state, &locks, app.clock.now())
+        .await
+        .expect("newer pass");
+    assert_eq!(
+        fake.lookup_count(),
+        before + 2,
+        "the newer pass re-claimed the row"
+    );
+    (release, stale, newer)
+}
+
+// Pass A's lookup is in flight when its claim goes stale; pass B re-claims
+// the row and records `pending`; then A's late `not_found` arrives. The claim
+// generation drops it, so the task still reads as live: the buyer's cancel is
+// refused and the window sweep keeps the unit.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_stale_not_found_after_a_newer_claim_saw_the_task_keeps_the_unit(pool: PgPool) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
+    register_locks(&app, &buyer.token, &order, &seller.pubky).await;
+    fake.set_outcome(
+        TEST_BUNDLE_ID,
+        LocksLookupOutcome::Status(LocksTaskStatus::Pending),
+    );
+    let (release, stale, newer) = a_pass_overtaken_by_a_newer_claim(&app, &fake).await;
+    assert_eq!(newer, 0);
+    assert_eq!(
+        correlation_outcome(&app.pool, &order.payment_id).await,
+        ("pending".to_string(), Some("pending".to_string()))
+    );
+
+    fake.set_outcome(TEST_BUNDLE_ID, LocksLookupOutcome::NotFound);
+    release.notify_one();
+    assert_eq!(stale.await.expect("stale pass joins"), 0);
+
+    app.clock.advance_seconds(3_600);
+    let expired = workers::expire_due_payment_windows(&app.state, app.clock.now())
+        .await
+        .expect("window sweep");
+    assert_eq!(expired, 0, "the sweep keeps the live task's unit");
+    let (status, body) = request_cancel(&app, &buyer, &order, 68).await;
+    assert_refused_as_live(status, &body);
+    assert_eq!(
+        order_state(&app.pool, &order.order_id).await,
+        "pending_payment"
+    );
+    assert_eq!(listing_quantities(&app.pool).await, (0, 1, 0));
+    assert_eq!(
+        payment_state(&app.pool, &order.payment_id).await.0,
+        "awaiting_entitlement"
+    );
+    assert_eq!(
+        correlation_outcome(&app.pool, &order.payment_id).await,
+        ("pending".to_string(), Some("pending".to_string()))
+    );
+    assert_eq!(
+        observation_history(&app.pool, &order.payment_id).await,
+        vec![("pending".to_string(), "none".to_string())]
+    );
+}
+
+// Pass B records `in_progress` after re-claiming the row; pass A's late
+// `pending` is older news and is dropped, so the status never moves back.
+// The next poll reads the completed task and confirms the order once.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_stale_pending_after_a_newer_claim_saw_in_progress_is_dropped(pool: PgPool) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let holder = Uuid::new_v4();
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
+    register_locks(&app, &buyer.token, &order, &seller.pubky).await;
+    fake.set_outcome(
+        TEST_BUNDLE_ID,
+        LocksLookupOutcome::Status(LocksTaskStatus::InProgress),
+    );
+    let (release, stale, _) = a_pass_overtaken_by_a_newer_claim(&app, &fake).await;
+
+    fake.set_outcome(
+        TEST_BUNDLE_ID,
+        LocksLookupOutcome::Status(LocksTaskStatus::Pending),
+    );
+    release.notify_one();
+    assert_eq!(stale.await.expect("stale pass joins"), 0);
+    assert_eq!(
+        correlation_outcome(&app.pool, &order.payment_id).await,
+        ("pending".to_string(), Some("in_progress".to_string()))
+    );
+
+    fake.complete_matching(&app.pool, TEST_BUNDLE_ID, &order.payment_id)
+        .await;
+    let summary = next_poll(&app, holder).await;
+    assert_eq!(summary.locks_completions_applied, 1);
+    assert_eq!(
+        payment_state(&app.pool, &order.payment_id).await.0,
+        "confirmed"
+    );
+    assert_eq!(order_state(&app.pool, &order.order_id).await, "paid");
+    assert_eq!(listing_quantities(&app.pool).await, (0, 0, 1));
+    assert_eq!(confirmation_events(&app.pool).await, 1);
+    assert_eq!(
+        observation_history(&app.pool, &order.payment_id).await,
+        vec![
+            ("in_progress".to_string(), "none".to_string()),
+            ("completed".to_string(), "payment_confirmed".to_string()),
+        ]
+    );
+}
+
+// Pass A's lookup reads the completed task after pass B re-claimed the row
+// and recorded `pending`. A applies nothing; the completed task stays so at
+// the Lock Server, so the next poll reads it again and confirms the order
+// exactly once.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_stale_completion_is_applied_once_by_the_next_poll(pool: PgPool) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let holder = Uuid::new_v4();
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
+    register_locks(&app, &buyer.token, &order, &seller.pubky).await;
+    fake.set_outcome(
+        TEST_BUNDLE_ID,
+        LocksLookupOutcome::Status(LocksTaskStatus::Pending),
+    );
+    let (release, stale, _) = a_pass_overtaken_by_a_newer_claim(&app, &fake).await;
+
+    fake.complete_matching(&app.pool, TEST_BUNDLE_ID, &order.payment_id)
+        .await;
+    release.notify_one();
+    assert_eq!(stale.await.expect("stale pass joins"), 0);
+    assert_eq!(
+        payment_state(&app.pool, &order.payment_id).await.0,
+        "awaiting_entitlement"
+    );
+    assert_eq!(
+        correlation_outcome(&app.pool, &order.payment_id).await,
+        ("pending".to_string(), Some("pending".to_string()))
+    );
+    assert_eq!(confirmation_events(&app.pool).await, 0);
+
+    let summary = next_poll(&app, holder).await;
+    assert_eq!(summary.locks_completions_applied, 1);
+    assert_eq!(
+        payment_state(&app.pool, &order.payment_id).await.0,
+        "confirmed"
+    );
+    assert_eq!(order_state(&app.pool, &order.order_id).await, "paid");
+    assert_eq!(confirmation_events(&app.pool).await, 1);
+    assert_eq!(
+        correlation_outcome(&app.pool, &order.payment_id).await,
+        ("completed".to_string(), Some("completed".to_string()))
+    );
+    next_poll(&app, holder).await;
+    assert_eq!(confirmation_events(&app.pool).await, 1, "confirmed once");
+}
+
+// Pass A's lookup reads the task `failed` after pass B re-claimed the row and
+// recorded `in_progress`. A's terminal record is dropped; a failed task
+// stays failed at the Lock Server, so the next poll reads it again and ends
+// the correlation.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_stale_failure_is_dropped_and_read_again_by_the_next_poll(pool: PgPool) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let holder = Uuid::new_v4();
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
+    register_locks(&app, &buyer.token, &order, &seller.pubky).await;
+    fake.set_outcome(
+        TEST_BUNDLE_ID,
+        LocksLookupOutcome::Status(LocksTaskStatus::InProgress),
+    );
+    let (release, stale, _) = a_pass_overtaken_by_a_newer_claim(&app, &fake).await;
+
+    fake.set_outcome(
+        TEST_BUNDLE_ID,
+        LocksLookupOutcome::Status(LocksTaskStatus::Failed),
+    );
+    release.notify_one();
+    assert_eq!(stale.await.expect("stale pass joins"), 0);
+    assert_eq!(
+        correlation_outcome(&app.pool, &order.payment_id).await,
+        ("pending".to_string(), Some("in_progress".to_string()))
+    );
+
+    next_poll(&app, holder).await;
+    assert_eq!(
+        correlation_outcome(&app.pool, &order.payment_id).await,
+        ("upstream_failed".to_string(), Some("failed".to_string()))
+    );
+    assert_eq!(
+        observation_history(&app.pool, &order.payment_id).await,
+        vec![
+            ("in_progress".to_string(), "none".to_string()),
+            ("failed".to_string(), "none".to_string()),
+        ]
+    );
+    assert_eq!(
+        payment_state(&app.pool, &order.payment_id).await.0,
+        "awaiting_entitlement"
+    );
+}
+
+#[derive(Clone, Copy, Debug)]
+enum UnconfirmableCompletion {
+    Unbound,
+    Malformed,
+    Foreign,
+}
+
+// A completed task that cannot confirm the payment (no binding, a malformed
+// one, or another payment's) parks the payment, starts a bounded retry or
+// refuses the correlation. Read by a pass whose claim went stale (pass B
+// re-claimed the row and recorded `pending`), it does none of these; the
+// next poll reads the same completed task and records it once.
+async fn a_stale_unconfirmable_completion_is_dropped_and_read_again(
+    pool: PgPool,
+    kind: UnconfirmableCompletion,
+) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let holder = Uuid::new_v4();
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
+    register_locks(&app, &buyer.token, &order, &seller.pubky).await;
+    fake.set_outcome(
+        TEST_BUNDLE_ID,
+        LocksLookupOutcome::Status(LocksTaskStatus::Pending),
+    );
+    let (release, stale, _) = a_pass_overtaken_by_a_newer_claim(&app, &fake).await;
+
+    let (completed, state_after, outcome_after, payment_after) = match kind {
+        UnconfirmableCompletion::Unbound => (
+            LocksLookupOutcome::Completed(None),
+            "upstream_failed",
+            "binding_missing",
+            "manual_review",
+        ),
+        UnconfirmableCompletion::Malformed => (
+            LocksLookupOutcome::CompletedMalformedBinding,
+            "pending",
+            "retry_binding_malformed",
+            "awaiting_entitlement",
+        ),
+        UnconfirmableCompletion::Foreign => (
+            LocksLookupOutcome::Completed(Some(echoed_binding(
+                &seller,
+                "x9Kq_3-jW0sN8uYv1tB6rZpLmE4cA2dHfG7iOoQwXyU",
+            ))),
+            "upstream_failed",
+            "binding_mismatch",
+            "awaiting_entitlement",
+        ),
+    };
+    fake.set_outcome(TEST_BUNDLE_ID, completed);
+    release.notify_one();
+    assert_eq!(stale.await.expect("stale pass joins"), 0, "{kind:?}");
+    assert_eq!(
+        correlation_outcome(&app.pool, &order.payment_id).await,
+        ("pending".to_string(), Some("pending".to_string())),
+        "{kind:?}"
+    );
+    assert_eq!(
+        observation_history(&app.pool, &order.payment_id).await,
+        vec![("pending".to_string(), "none".to_string())],
+        "{kind:?}"
+    );
+    assert_eq!(
+        payment_state(&app.pool, &order.payment_id).await.0,
+        "awaiting_entitlement",
+        "{kind:?}"
+    );
+    assert_eq!(manual_review_events(&app.pool).await, 0, "{kind:?}");
+
+    next_poll(&app, holder).await;
+    assert_eq!(
+        correlation_outcome(&app.pool, &order.payment_id).await,
+        (state_after.to_string(), Some(outcome_after.to_string())),
+        "{kind:?}"
+    );
+    assert_eq!(
+        observation_history(&app.pool, &order.payment_id).await,
+        vec![
+            ("pending".to_string(), "none".to_string()),
+            ("completed".to_string(), outcome_after.to_string()),
+        ],
+        "{kind:?}"
+    );
+    assert_eq!(
+        payment_state(&app.pool, &order.payment_id).await.0,
+        payment_after,
+        "{kind:?}"
+    );
+    assert_eq!(confirmation_events(&app.pool).await, 0, "{kind:?}");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_stale_unbound_completion_is_parked_once_by_the_next_poll(pool: PgPool) {
+    a_stale_unconfirmable_completion_is_dropped_and_read_again(
+        pool,
+        UnconfirmableCompletion::Unbound,
+    )
+    .await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_stale_malformed_completion_starts_its_retry_at_the_next_poll(pool: PgPool) {
+    a_stale_unconfirmable_completion_is_dropped_and_read_again(
+        pool,
+        UnconfirmableCompletion::Malformed,
+    )
+    .await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_stale_foreign_completion_is_refused_once_by_the_next_poll(pool: PgPool) {
+    a_stale_unconfirmable_completion_is_dropped_and_read_again(
+        pool,
+        UnconfirmableCompletion::Foreign,
+    )
+    .await;
+}
+
+// Pass B re-claimed the row and confirmed the payment; pass A's late answers
+// (a failed task, a malformed binding) change nothing about the settled
+// payment, its order or its history.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn stale_answers_after_a_newer_claim_settled_change_nothing(pool: PgPool) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
+    register_locks(&app, &buyer.token, &order, &seller.pubky).await;
+    fake.set_outcome(
+        TEST_BUNDLE_ID,
+        LocksLookupOutcome::Status(LocksTaskStatus::Pending),
+    );
+    let locks = app.state.locks.clone().expect("locks runtime");
+    let release_failed = fake.park_next_lookup();
+    let failed = tokio::spawn({
+        let state = app.state.clone();
+        let locks = locks.clone();
+        let now = app.clock.now();
+        async move { workers::verify_due_locks_lifecycles(&state, &locks, now).await }
+    });
+    while fake.lookup_count() < 1 {
+        tokio::task::yield_now().await;
+    }
+    app.clock.advance_seconds(61);
+    let release_malformed = fake.park_next_lookup();
+    let malformed = tokio::spawn({
+        let state = app.state.clone();
+        let locks = locks.clone();
+        let now = app.clock.now();
+        async move { workers::verify_due_locks_lifecycles(&state, &locks, now).await }
+    });
+    while fake.lookup_count() < 2 {
+        tokio::task::yield_now().await;
+    }
+
+    fake.complete_matching(&app.pool, TEST_BUNDLE_ID, &order.payment_id)
+        .await;
+    app.clock.advance_seconds(61);
+    let settled = workers::verify_due_locks_lifecycles(&app.state, &locks, app.clock.now())
+        .await
+        .expect("settling pass");
+    assert_eq!(settled, 1);
+    let history = observation_history(&app.pool, &order.payment_id).await;
+    assert_eq!(
+        history,
+        vec![("completed".to_string(), "payment_confirmed".to_string())]
+    );
+
+    fake.set_outcome(
+        TEST_BUNDLE_ID,
+        LocksLookupOutcome::Status(LocksTaskStatus::Failed),
+    );
+    release_failed.notify_one();
+    assert_eq!(
+        failed
+            .await
+            .expect("pass joins")
+            .expect("stale failed pass"),
+        0
+    );
+    fake.set_outcome(
+        TEST_BUNDLE_ID,
+        LocksLookupOutcome::CompletedMalformedBinding,
+    );
+    release_malformed.notify_one();
+    assert_eq!(
+        malformed
+            .await
+            .expect("pass joins")
+            .expect("stale malformed pass"),
+        0
+    );
+
+    assert_eq!(
+        correlation_outcome(&app.pool, &order.payment_id).await,
+        ("completed".to_string(), Some("completed".to_string()))
+    );
+    assert_eq!(
+        observation_history(&app.pool, &order.payment_id).await,
+        history
+    );
+    assert_eq!(
+        payment_state(&app.pool, &order.payment_id).await.0,
+        "confirmed"
+    );
+    assert_eq!(order_state(&app.pool, &order.order_id).await, "paid");
+    assert_eq!(confirmation_events(&app.pool).await, 1);
+    assert_eq!(manual_review_events(&app.pool).await, 0);
+}
+
+// Within one claim generation too, a `not_found` after the Lock Server has
+// reported the task does not make it read as ended: the status stays
+// `pending`, the buyer's cancel is refused and the window sweep keeps the
+// unit until the live-task bound.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_not_found_after_the_task_was_reported_keeps_the_unit(pool: PgPool) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let holder = Uuid::new_v4();
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
+    register_locks(&app, &buyer.token, &order, &seller.pubky).await;
+    fake.set_outcome(
+        TEST_BUNDLE_ID,
+        LocksLookupOutcome::Status(LocksTaskStatus::Pending),
+    );
+    run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+
+    fake.set_outcome(TEST_BUNDLE_ID, LocksLookupOutcome::NotFound);
+    next_poll(&app, holder).await;
+    assert_eq!(fake.lookup_count(), 2);
+    let (status, body) = request_cancel(&app, &buyer, &order, 69).await;
+    assert_refused_as_live(status, &body);
+
+    app.clock.advance_seconds(3_600);
+    let summary = run_once(&app.state, holder, app.clock.now())
+        .await
+        .expect("worker pass runs");
+    assert_eq!(summary.payment_windows_expired, 0);
+    assert_eq!(
+        order_state(&app.pool, &order.order_id).await,
+        "pending_payment"
+    );
+    assert_eq!(listing_quantities(&app.pool).await, (0, 1, 0));
+    assert_eq!(
+        correlation_outcome(&app.pool, &order.payment_id).await,
+        ("pending".to_string(), Some("pending".to_string()))
+    );
+    assert_eq!(
+        observation_history(&app.pool, &order.payment_id).await,
+        vec![("pending".to_string(), "none".to_string())]
     );
 }
