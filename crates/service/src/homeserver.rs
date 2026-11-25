@@ -52,9 +52,13 @@ const DELIVERABLE_FETCH_TIMEOUT: Duration = Duration::from_secs(120);
 /// Where Shop writes a seller's encrypted deliverable.
 pub const DELIVERABLES_PATH: &str = "/pub/pubky.app/marketplace/v1/deliverables/";
 const MAX_AWARD_LISTING_BYTES: usize = 1024 * 1024;
-/// A listing, drop, shop or content-lock record is read no further than this,
-/// whichever homeserver answers.
+/// The listing-bytes read stops here.
 const MAX_RECORD_BYTES: usize = 1024 * 1024;
+/// A listing, drop, shop or content-lock record is read no further than this,
+/// whichever homeserver answers. It bounds memory, not the product: a record
+/// over `MAX_AWARD_LISTING_BYTES` still reads here and is refused where a
+/// snapshot of its exact bytes is needed, as it was before the bound existed.
+const MAX_JSON_RECORD_BYTES: usize = 4 * 1024 * 1024;
 
 /// One listing-record fetch result. Transport failures, non-2xx responses
 /// other than a definitive 404, and non-JSON bodies are `Unavailable`
@@ -1056,7 +1060,7 @@ impl HttpHomeserverClient {
             }
             return (HomeserverFetchOutcome::Unavailable, homeserver);
         }
-        let record = match response.body_capped(MAX_RECORD_BYTES).await {
+        let record = match response.body_capped(MAX_JSON_RECORD_BYTES).await {
             BodyRead::Complete(body) => serde_json::from_slice::<Value>(&body).ok(),
             BodyRead::TooLarge => {
                 tracing::warn!(

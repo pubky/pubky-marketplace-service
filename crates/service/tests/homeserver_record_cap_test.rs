@@ -2,7 +2,8 @@
 //! lock) against a raw HTTP/1.1 server, so the response framing is exact.
 //! A body is read through a running byte cap: an over-cap body, declared or
 //! streamed without a length, is refused without being buffered whole, and a
-//! body of exactly the cap is read.
+//! body of exactly the cap is read. The JSON reads stop at 4 MiB; the
+//! listing-bytes read stops at 1 MiB.
 
 use std::time::Duration;
 
@@ -13,7 +14,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 const PUBKY: &str = "8pinxxgqs41n4aididenw5apqp1urfmzdztr8jt4abrkdn435ewo";
-const CAP: usize = 1024 * 1024;
+const JSON_CAP: usize = 4 * 1024 * 1024;
+const BYTES_CAP: usize = 1024 * 1024;
 
 /// A JSON document of exactly `len` bytes.
 fn json_of_len(len: usize) -> Vec<u8> {
@@ -57,9 +59,13 @@ async fn respond(mut stream: TcpStream) {
         .and_then(|path| path.rsplit('/').next())
         .unwrap_or_default()
         .to_string();
-    match case.as_str() {
-        "exact-cap" => {
-            let body = json_of_len(CAP);
+    let (kind, len) = case
+        .split_once(':')
+        .map(|(kind, len)| (kind, len.parse::<usize>().expect("length")))
+        .unwrap_or((case.as_str(), 0));
+    match kind {
+        "exact" => {
+            let body = json_of_len(len);
             let response = [
                 head("transfer-encoding: chunked\r\n").into_bytes(),
                 chunked(&body),
@@ -68,18 +74,18 @@ async fn respond(mut stream: TcpStream) {
             stream.write_all(&response).await.expect("write response");
             stream.shutdown().await.ok();
         }
-        "over-cap-chunked" => {
+        "over-chunked" => {
             let response = [
                 head("transfer-encoding: chunked\r\n").into_bytes(),
-                chunked(&json_of_len(CAP + 1)),
+                chunked(&json_of_len(len)),
             ]
             .concat();
             stream.write_all(&response).await.expect("write response");
             stream.shutdown().await.ok();
         }
-        "over-cap-length" => {
+        "over-length" => {
             stream
-                .write_all(head(&format!("content-length: {}\r\n", CAP + 1)).as_bytes())
+                .write_all(head(&format!("content-length: {len}\r\n")).as_bytes())
                 .await
                 .expect("write head");
             tokio::time::sleep(Duration::from_secs(30)).await;
@@ -115,86 +121,103 @@ async fn client() -> HttpHomeserverClient {
     HttpHomeserverClient::new(&format!("http://{address}")).expect("client")
 }
 
-/// Every record read the capped body applies to, for one case.
-async fn reads(
+const TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn within<T>(read: &str, call: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(TIMEOUT, call)
+        .await
+        .unwrap_or_else(|_| panic!("{read} must not wait on a body it refuses"))
+}
+
+/// The reads that stop at [`JSON_CAP`], for one case.
+async fn json_reads(
     client: &HttpHomeserverClient,
     case: &str,
 ) -> Vec<(&'static str, HomeserverFetchOutcome)> {
     let path = format!("/pub/pubky.app/marketplace/v1/{case}");
-    let within = |read: &'static str, outcome| async move { (read, outcome) };
-    let timeout = Duration::from_secs(5);
-    let refused = move |read: &'static str| format!("{read} must not wait on a body it refuses");
     vec![
-        within(
+        (
             "listing",
-            tokio::time::timeout(timeout, client.fetch_listing(PUBKY, case))
-                .await
-                .unwrap_or_else(|_| panic!("{}", refused("listing"))),
-        )
-        .await,
-        within(
+            within("listing", client.fetch_listing(PUBKY, case)).await,
+        ),
+        (
             "listing_from",
-            tokio::time::timeout(timeout, client.fetch_listing_from(PUBKY, case))
+            within("listing_from", client.fetch_listing_from(PUBKY, case))
                 .await
-                .unwrap_or_else(|_| panic!("{}", refused("listing_from")))
                 .0,
-        )
-        .await,
-        within(
-            "listing_bytes",
-            tokio::time::timeout(timeout, client.fetch_listing_bytes(PUBKY, case))
-                .await
-                .unwrap_or_else(|_| panic!("{}", refused("listing_bytes"))),
-        )
-        .await,
-        within(
-            "drop",
-            tokio::time::timeout(timeout, client.fetch_drop(PUBKY, case))
-                .await
-                .unwrap_or_else(|_| panic!("{}", refused("drop"))),
-        )
-        .await,
-        within(
+        ),
+        ("drop", within("drop", client.fetch_drop(PUBKY, case)).await),
+        (
             "content_lock",
-            tokio::time::timeout(timeout, client.fetch_content_lock(PUBKY, &path))
-                .await
-                .unwrap_or_else(|_| panic!("{}", refused("content_lock"))),
-        )
-        .await,
+            within("content_lock", client.fetch_content_lock(PUBKY, &path)).await,
+        ),
     ]
+}
+
+/// The read that stops at [`BYTES_CAP`], for one case.
+async fn bytes_read(client: &HttpHomeserverClient, case: &str) -> HomeserverFetchOutcome {
+    within("listing_bytes", client.fetch_listing_bytes(PUBKY, case)).await
+}
+
+fn found(outcome: &HomeserverFetchOutcome) -> bool {
+    matches!(outcome, HomeserverFetchOutcome::Found(_))
 }
 
 #[tokio::test]
 async fn a_body_of_exactly_the_cap_is_read() {
     let client = client().await;
-    for (read, outcome) in reads(&client, "exact-cap").await {
-        assert!(
-            matches!(outcome, HomeserverFetchOutcome::Found(_)),
-            "{read}: {outcome:?}"
-        );
+    for (read, outcome) in json_reads(&client, &format!("exact:{JSON_CAP}")).await {
+        assert!(found(&outcome), "{read}: {outcome:?}");
     }
+    let outcome = bytes_read(&client, &format!("exact:{BYTES_CAP}")).await;
+    assert!(found(&outcome), "listing_bytes: {outcome:?}");
 }
 
 #[tokio::test]
 async fn a_chunked_body_over_the_cap_without_a_length_is_refused() {
     let client = client().await;
-    for (read, outcome) in reads(&client, "over-cap-chunked").await {
+    for (read, outcome) in json_reads(&client, &format!("over-chunked:{}", JSON_CAP + 1)).await {
         assert_eq!(outcome, HomeserverFetchOutcome::Unavailable, "{read}");
     }
+    assert_eq!(
+        bytes_read(&client, &format!("over-chunked:{}", BYTES_CAP + 1)).await,
+        HomeserverFetchOutcome::Unavailable
+    );
 }
 
 #[tokio::test]
 async fn an_oversized_content_length_is_refused_without_reading_the_body() {
     let client = client().await;
-    for (read, outcome) in reads(&client, "over-cap-length").await {
+    for (read, outcome) in json_reads(&client, &format!("over-length:{}", JSON_CAP + 1)).await {
         assert_eq!(outcome, HomeserverFetchOutcome::Unavailable, "{read}");
     }
+    assert_eq!(
+        bytes_read(&client, &format!("over-length:{}", BYTES_CAP + 1)).await,
+        HomeserverFetchOutcome::Unavailable
+    );
 }
 
 #[tokio::test]
 async fn a_body_that_never_ends_is_cut_off_at_the_cap() {
     let client = client().await;
-    for (read, outcome) in reads(&client, "endless").await {
+    for (read, outcome) in json_reads(&client, "endless").await {
         assert_eq!(outcome, HomeserverFetchOutcome::Unavailable, "{read}");
     }
+    assert_eq!(
+        bytes_read(&client, "endless").await,
+        HomeserverFetchOutcome::Unavailable
+    );
+}
+
+#[tokio::test]
+async fn a_json_record_just_over_a_megabyte_still_reads_where_the_bytes_read_refuses_it() {
+    let client = client().await;
+    let case = format!("exact:{}", BYTES_CAP + 1);
+    for (read, outcome) in json_reads(&client, &case).await {
+        assert!(found(&outcome), "{read}: {outcome:?}");
+    }
+    assert_eq!(
+        bytes_read(&client, &case).await,
+        HomeserverFetchOutcome::Unavailable
+    );
 }
