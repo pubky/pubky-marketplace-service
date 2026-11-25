@@ -183,12 +183,20 @@ impl MonotonicCache {
     }
 
     /// Stores `packet` unless the cache holds a more recent record for its
-    /// key, and returns the most recent record the cache holds.
+    /// key, or the same record seen more recently, and returns the record
+    /// the cache holds afterwards. The second case matters because a relay
+    /// answers with the time it saw the record, which can be minutes old,
+    /// and writing that over a fresh entry would let it expire early.
     fn keep(&self, packet: SignedPacket) -> SignedPacket {
         let _writing = self.writes.lock().unwrap_or_else(PoisonError::into_inner);
         let key = CacheKey::from(&packet.public_key());
         match self.records.get_read_only(&key) {
-            Some(held) if held.more_recent_than(&packet) => held,
+            Some(held)
+                if held.more_recent_than(&packet)
+                    || (held.is_same_as(&packet) && held.last_seen() > packet.last_seen()) =>
+            {
+                held
+            }
             _ => {
                 self.records.put(&key, &packet);
                 packet
@@ -1203,6 +1211,41 @@ mod tests {
             "an older record, written by the Pkarr client or not, does not replace a newer one"
         );
         assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn an_identical_answer_seen_earlier_does_not_age_a_fresh_entry() {
+        let keypair = pkarr::Keypair::random();
+        let key = CacheKey::from(&keypair.public_key());
+        let record = records_of(&keypair)("record.example");
+        let cache = MonotonicCache::new(NonZeroUsize::new(4).unwrap());
+        let mut fresh = record.clone();
+        fresh.refresh();
+        cache.put(&key, &fresh);
+        let fresh_last_seen = *fresh.last_seen();
+
+        // A relay answers with the same record, last seen ten minutes ago:
+        // through the lookup path and through the Pkarr client's own write.
+        let mut stale = record.clone();
+        stale.set_last_seen(&pkarr::Timestamp::from(
+            fresh_last_seen.as_u64() - 600_000_000,
+        ));
+        let answered = more_recent(&cache, None, stale.clone());
+        cache.put(&key, &stale);
+
+        let held = cache.get(&key).expect("cached");
+        assert_eq!(*held.last_seen(), fresh_last_seen);
+        assert_eq!(*answered.last_seen(), fresh_last_seen);
+        assert!(!held.is_expired(60, 60));
+
+        // The same record seen later does refresh the entry.
+        let mut later = record;
+        later.set_last_seen(&pkarr::Timestamp::from(fresh_last_seen.as_u64() + 1_000));
+        cache.put(&key, &later);
+        assert_eq!(
+            cache.get(&key).expect("cached").last_seen().as_u64(),
+            fresh_last_seen.as_u64() + 1_000
+        );
     }
 
     #[test]
