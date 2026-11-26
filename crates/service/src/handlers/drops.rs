@@ -31,7 +31,7 @@
 
 use chrono::{DateTime, Utc};
 use marketplace_domain::commands::{
-    CancelDropPayload, Command, ReleaseDropListingsPayload, SyncDropPayload,
+    CancelDropPayload, Command, CommandPayload, ReleaseDropListingsPayload, SyncDropPayload,
 };
 use marketplace_domain::state_machines::{can_transition, drop_machine};
 use marketplace_domain::{ids, ErrorCode};
@@ -104,37 +104,72 @@ pub(crate) fn transition_due(drop: &DropRow, now: DateTime<Utc>) -> bool {
 }
 
 /// `drop.sync`: convergent registration from the seller's homeserver record.
+/// The check [`sync`] makes before it reads the drop record.
+fn sync_refusal(command: &Command, payload: &SyncDropPayload) -> Option<CommandFailure> {
+    let expected_aggregate_id = ids::drop_aggregate_id(&payload.seller_pubky, &payload.drop_id);
+    (command.aggregate_id != expected_aggregate_id).then(|| {
+        CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidCommand,
+            ErrorCode::InvalidCommand,
+            "The drop aggregate id does not match its seller and drop.",
+        )
+    })
+}
+
+/// Reads the drop record a `drop.sync` derives the drop from, before its
+/// transaction, as `listing.sync` reads its listing record: a slow
+/// homeserver holds no connection or row lock. `None` for every other
+/// command and for a sync [`sync`] refuses before reading. The record is
+/// fenced in the transaction by its revision against the stored drop's.
+pub async fn prefetch(
+    homeserver: Option<&dyn HomeserverListingClient>,
+    command: &Command,
+) -> Option<HomeserverFetchOutcome> {
+    let (CommandPayload::SyncDrop(payload), Some(homeserver)) = (&command.payload, homeserver)
+    else {
+        return None;
+    };
+    if sync_refusal(command, payload).is_some() {
+        return None;
+    }
+    Some(
+        homeserver
+            .fetch_drop(&payload.seller_pubky, &payload.drop_id)
+            .await,
+    )
+}
+
 pub async fn sync(
     tx: &mut Transaction<'_, Postgres>,
     actor: &str,
     command: &Command,
     payload: &SyncDropPayload,
-    homeserver: Option<&dyn HomeserverListingClient>,
+    homeserver_configured: bool,
+    fetched: Option<&HomeserverFetchOutcome>,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     // Fail closed: without a configured homeserver there is no canonical
     // record to derive the drop from.
-    let Some(homeserver) = homeserver else {
+    if !homeserver_configured {
         return Ok(Err(CommandFailure::refused(
             crate::refusal_audit::RefusalKind::InvalidCommand,
             ErrorCode::InvalidCommand,
             "Drop sync is not enabled on this deployment.",
         )));
-    };
-
-    let expected_aggregate_id = ids::drop_aggregate_id(&payload.seller_pubky, &payload.drop_id);
-    if command.aggregate_id != expected_aggregate_id {
-        return Ok(Err(CommandFailure::refused(
-            crate::refusal_audit::RefusalKind::InvalidCommand,
-            ErrorCode::InvalidCommand,
-            "The drop aggregate id does not match its seller and drop.",
-        )));
     }
 
-    let record = match homeserver
-        .fetch_drop(&payload.seller_pubky, &payload.drop_id)
-        .await
-    {
+    if let Some(failure) = sync_refusal(command, payload) {
+        return Ok(Err(failure));
+    }
+
+    let Some(fetched) = fetched else {
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvariantViolation,
+            ErrorCode::InvariantViolation,
+            "The drop record was not read before the sync.",
+        )));
+    };
+    let record = match fetched.clone() {
         HomeserverFetchOutcome::Found(record) => record,
         HomeserverFetchOutcome::NotFound => {
             return Ok(Err(CommandFailure::refused(

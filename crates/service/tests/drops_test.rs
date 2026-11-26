@@ -12,17 +12,26 @@
 
 mod common;
 
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
 use axum::http::StatusCode;
 use marketplace_service::clock::Clock;
+use marketplace_service::homeserver::{HomeserverFetchOutcome, HomeserverListingClient};
 use marketplace_service::workers::run_once;
 use serde_json::{json, Value};
 use sqlx::PgPool;
+use tokio::sync::watch;
 use uuid::Uuid;
 
 use common::{
     cancel_drop_command, count, drop_aggregate, drop_record_json, execute, indexed_command_id,
     listing_aggregate, new_actor, register_command, register_listing_command, release_drop_command,
-    reserve_command, sync_drop_command, test_app_with_homeserver, ts_after, TestApp,
+    reserve_command, sync_drop_command, test_app_with_homeserver, test_app_with_homeserver_client,
+    ts_after, CommandMirrorHomeserver, TestApp,
 };
 
 const DROP_ID: &str = "winter_drop";
@@ -1893,4 +1902,126 @@ async fn a_claim_whose_payment_started_survives_the_claim_window_and_confirms(po
             .await
             .expect("listing row exists");
     assert_eq!((available, reserved, sold), (4, 0, 1));
+}
+
+// === Drop reads hold no transaction ===
+
+/// A homeserver whose drop reads wait for `release`, then serve `record`
+/// (`None`: no such drop).
+struct StallingDropHomeserver {
+    record: std::sync::Mutex<Option<Value>>,
+    release: watch::Sender<bool>,
+    drop_reads: AtomicUsize,
+}
+
+impl HomeserverListingClient for StallingDropHomeserver {
+    fn fetch_listing<'a>(
+        &'a self,
+        seller_pubky: &'a str,
+        listing_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
+        CommandMirrorHomeserver.fetch_listing(seller_pubky, listing_id)
+    }
+
+    fn fetch_drop<'a>(
+        &'a self,
+        _seller_pubky: &'a str,
+        _drop_id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = HomeserverFetchOutcome> + Send + 'a>> {
+        Box::pin(async move {
+            self.drop_reads.fetch_add(1, Ordering::SeqCst);
+            let mut release = self.release.subscribe();
+            release
+                .wait_for(|released| *released)
+                .await
+                .expect("release");
+            match self.record.lock().expect("lock").clone() {
+                Some(record) => HomeserverFetchOutcome::Found(record),
+                None => HomeserverFetchOutcome::NotFound,
+            }
+        })
+    }
+}
+
+async fn open_transactions(pool: &PgPool) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_stat_activity \
+         WHERE datname = current_database() AND backend_type = 'client backend' \
+         AND pid <> pg_backend_pid() AND xact_start IS NOT NULL",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("activity")
+}
+
+/// Anyone may sync any drop, so a seller's stalled homeserver must not
+/// hold anything another command needs: the read is made before the
+/// transaction, and nothing bounds how many are made at once.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn stalled_drop_reads_hold_no_transaction_and_refuse_no_one(pool: PgPool) {
+    let homeserver = Arc::new(StallingDropHomeserver {
+        record: std::sync::Mutex::new(None),
+        release: watch::channel(false).0,
+        drop_reads: AtomicUsize::new(0),
+    });
+    let app = Arc::new(test_app_with_homeserver_client(pool.clone(), homeserver.clone()).await);
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (status, body) = execute(&app, &seller.token, &register_command(&seller.pubky, 5)).await;
+    assert_eq!(status, StatusCode::OK, "register: {body}");
+    let sync = |n: u64| sync_drop_command(&seller.pubky, DROP_ID, n);
+
+    // Every sync reads the homeserver and waits on it, none inside a
+    // transaction.
+    let stalled: Vec<_> = (1..=6)
+        .map(|n| {
+            let (app, token, command) = (app.clone(), buyer.token.clone(), sync(n));
+            tokio::spawn(async move { execute(&app, &token, &command).await })
+        })
+        .collect();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while homeserver.drop_reads.load(Ordering::SeqCst) < 6 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("every sync reads the homeserver");
+    assert_eq!(open_transactions(&pool).await, 0);
+
+    // Other commands run meanwhile.
+    let (status, body) = execute(
+        &app,
+        &seller.token,
+        &register_listing_command(&seller.pubky, "boots_02", 5, 1),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "register while stalled: {body}");
+
+    // Released, the stalled syncs finish (the drop has no record yet).
+    homeserver.release.send_replace(true);
+    for task in stalled {
+        let (status, body) = task.await.expect("sync task");
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    }
+    assert_eq!(open_transactions(&pool).await, 0);
+
+    *homeserver.record.lock().expect("lock") = Some(drop_record_json(
+        &seller.pubky,
+        DROP_ID,
+        1,
+        &["boots_01"],
+        &ts_after(600),
+        Some(&ts_after(4_200)),
+        10,
+        2,
+    ));
+    let (status, synced) = execute(&app, &buyer.token, &sync(7)).await;
+    assert_eq!(status, StatusCode::OK, "sync: {synced}");
+    assert_eq!(homeserver.drop_reads.load(Ordering::SeqCst), 7);
+
+    // A replay is answered from its stored result without a read.
+    let (status, replay) = execute(&app, &buyer.token, &sync(7)).await;
+    assert_eq!(status, StatusCode::OK, "{replay}");
+    assert_eq!(replay, synced);
+    assert_eq!(homeserver.drop_reads.load(Ordering::SeqCst), 7);
 }

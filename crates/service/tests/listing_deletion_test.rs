@@ -406,6 +406,7 @@ async fn a_deleted_auction_takes_no_bids_and_closes_unsold(pool: PgPool) {
         marketplace_service::listing_deletion::DeletionAuthority::Command,
         &aggregate_id,
         "7",
+        None,
         epoch,
         "system",
         Uuid::new_v4(),
@@ -953,6 +954,7 @@ async fn late_settlement(
                 marketplace_service::listing_deletion::DeletionAuthority::Command,
                 &aggregate_id,
                 "9",
+                None,
                 epoch,
                 "system",
                 Uuid::new_v4(),
@@ -1021,6 +1023,7 @@ async fn a_held_manual_review_on_a_deleted_listing_still_resolves_paid(pool: PgP
         marketplace_service::listing_deletion::DeletionAuthority::Command,
         &listing_aggregate(&seller.pubky),
         "9",
+        None,
         epoch,
         "system",
         Uuid::new_v4(),
@@ -1080,6 +1083,7 @@ async fn a_deleted_auctions_bid_history_is_kept_for_its_parties_only(pool: PgPoo
         marketplace_service::listing_deletion::DeletionAuthority::Command,
         &aggregate_id,
         "9",
+        None,
         epoch,
         "system",
         Uuid::new_v4(),
@@ -1170,6 +1174,7 @@ async fn a_tombstone_takes_drop_and_listing_locks_in_the_sell_out_confirm_order(
             marketplace_service::listing_deletion::DeletionAuthority::Command,
             &tombstone_id,
             "9",
+            None,
             epoch,
             "system",
             Uuid::new_v4(),
@@ -1300,6 +1305,7 @@ async fn tombstone_now(pool: &PgPool, aggregate_id: &str, now: chrono::DateTime<
         marketplace_service::listing_deletion::DeletionAuthority::Command,
         aggregate_id,
         "9",
+        None,
         epoch,
         "system",
         Uuid::new_v4(),
@@ -2343,6 +2349,7 @@ async fn a_delete_confirmed_before_a_revival_cannot_hide_the_revived_listing(poo
                 DeletionAuthority::Command,
                 &aggregate_id,
                 cursor,
+                None,
                 observed_epoch,
                 "system",
                 Uuid::new_v4(),
@@ -3025,7 +3032,8 @@ async fn a_record_registered_after_the_delete_was_confirmed_is_never_retired(poo
     assert_eq!(
         confirm_deleted(client, &seller.pubky, LISTING_ID).await,
         DeletionCheck::Deleted {
-            cursor: "2".to_string()
+            cursor: "2".to_string(),
+            homeserver: None,
         }
     );
 
@@ -3047,6 +3055,7 @@ async fn a_record_registered_after_the_delete_was_confirmed_is_never_retired(poo
         DeletionAuthority::Command,
         &aggregate_id,
         "2",
+        None,
         observed.record_epoch,
         "system",
         Uuid::new_v4(),
@@ -3224,7 +3233,8 @@ async fn an_unchanged_record_synced_after_the_delete_was_confirmed_is_never_reti
     assert_eq!(
         confirm_deleted(client, &seller.pubky, LISTING_ID).await,
         DeletionCheck::Deleted {
-            cursor: "2".to_string()
+            cursor: "2".to_string(),
+            homeserver: None,
         }
     );
 
@@ -3240,6 +3250,7 @@ async fn an_unchanged_record_synced_after_the_delete_was_confirmed_is_never_reti
         DeletionAuthority::Command,
         &aggregate_id,
         "2",
+        None,
         observed.record_epoch,
         "system",
         Uuid::new_v4(),
@@ -3521,4 +3532,91 @@ async fn throttled_sellers_do_not_hold_back_the_others(pool: PgPool) {
             "a seller inside its backoff is not asked again"
         );
     }
+}
+
+async fn follower_row(
+    pool: &PgPool,
+    seller: &str,
+) -> (
+    Option<String>,
+    i32,
+    Option<chrono::DateTime<chrono::Utc>>,
+    Option<chrono::DateTime<chrono::Utc>>,
+) {
+    sqlx::query_as(
+        "SELECT event_cursor, failures, polled_at, retry_not_before \
+         FROM listing_deletion_cursors WHERE seller_pubky = $1",
+    )
+    .bind(seller)
+    .fetch_one(pool)
+    .await
+    .expect("seller cursor row")
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_seller_whose_read_reaches_the_pass_deadline_backs_off_and_the_next_is_polled(
+    pool: PgPool,
+) {
+    use marketplace_service::listing_deletion::{follow_homeserver_deletions, FollowerPass};
+
+    let (app, homeserver) = test_app_with_homeserver(pool).await;
+    let one = new_actor(&app).await;
+    let two = new_actor(&app).await;
+    published_listing(&app, &homeserver, &one, 1).await;
+    published_listing(&app, &homeserver, &two, 1).await;
+    let (slow, healthy) = if one.pubky < two.pubky {
+        (one, two)
+    } else {
+        (two, one)
+    };
+    let holder = Uuid::new_v4();
+    let fence = take_follower_lease(&app, holder).await;
+
+    let pass = follower_pass(&app.state, holder, fence, 10_000);
+    follow_homeserver_deletions(&pass)
+        .await
+        .expect("first pass reads both sellers");
+    let (slow_cursor, _, slow_polled_at, _) = follower_row(&app.pool, &slow.pubky).await;
+    assert!(slow_cursor.is_some() && slow_polled_at.is_some());
+    let (_, _, healthy_polled_at, _) = follower_row(&app.pool, &healthy.pubky).await;
+
+    // Due again. The homeserver answers slower than the pass deadline, which
+    // ends the pass during the first due seller's read.
+    app.clock.advance_seconds(61);
+    let fence = take_follower_lease(&app, holder).await;
+    homeserver.set_delay(std::time::Duration::from_secs(3));
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+    let pass = FollowerPass {
+        deadline,
+        lease_deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+        ..follower_pass(&app.state, holder, fence, 10_000)
+    };
+    assert_eq!(
+        follow_homeserver_deletions(&pass)
+            .await
+            .expect("pass cut short"),
+        0
+    );
+    let (cursor, failures, polled_at, retry_not_before) =
+        follower_row(&app.pool, &slow.pubky).await;
+    assert_eq!(failures, 1, "the timeout counts as a failed poll");
+    assert_eq!(cursor, slow_cursor, "the stored cursor stays");
+    assert_eq!(polled_at, slow_polled_at, "it is not a successful poll");
+    assert!(
+        retry_not_before.is_some_and(|until| until > app.clock.now()),
+        "the existing backoff applies"
+    );
+
+    // The next pass leaves that seller backing off and polls the one behind it.
+    homeserver.set_delay(std::time::Duration::ZERO);
+    let pass = follower_pass(&app.state, holder, fence, 10_000);
+    follow_homeserver_deletions(&pass).await.expect("next pass");
+    let (_, failures, polled_at, _) = follower_row(&app.pool, &slow.pubky).await;
+    assert_eq!(failures, 1, "still backing off");
+    assert_eq!(polled_at, slow_polled_at);
+    let (_, _, polled_at, _) = follower_row(&app.pool, &healthy.pubky).await;
+    assert!(
+        polled_at > healthy_polled_at,
+        "the healthy seller behind it was polled"
+    );
 }

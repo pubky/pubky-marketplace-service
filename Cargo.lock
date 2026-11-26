@@ -2698,6 +2698,7 @@ dependencies = [
  "hmac 0.12.1",
  "hpke",
  "http-body-util",
+ "lru 0.16.4",
  "marketplace-domain",
  "marketplace-service",
  "pubky",

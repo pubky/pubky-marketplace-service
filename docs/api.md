@@ -381,6 +381,15 @@ request failed, so clients should branch on HTTP status first, and parse
    refused with `UPSTREAM_UNAVAILABLE` instead (see
    [Listing lifecycle](../README.md#listing-lifecycle)).
 
+   `offer.counter`, `offer.accept`, `payment.sandbox_advance`,
+   `payment.prepare_locks` and `POST /v0/orders/{id}/payment-method` read
+   the seller's homeserver before their database transaction (see
+   [Homeserver reads](../README.md#homeserver-reads)). One whose offer,
+   order or payment changed in between, so that the transaction needs a
+   record that was not read, is refused with `UPSTREAM_UNAVAILABLE`.
+   Nothing was changed; retry shortly. A replayed command is still answered
+   from its stored result.
+
    `BID_TOO_LOW` refuses an `auction.place_bid` whose maximum is under the
    bidder's minimum next bid. While no bid stands the minimum is the starting
    bid, so an opening bid may equal it (the visible price stays at the
@@ -2391,9 +2400,10 @@ be exactly the fields above, with `aud` equal to the origin of
 `client_id` to be listed in `MARKETPLACE_GRANT_SESSION_CLIENT_IDS`; and the
 grant to cover `/pub/pubky.app/marketplace-service/v1/` with read and write.
 A mint further requires the challenge to have been issued to the grant's
-pubky, unused and unexpired, and the proof document, read through
-`HOMESERVER_URL` with `pubky-host` set to the grant's issuer (body capped at
-8 KB), to equal the expected body. The challenge is then burned and the
+pubky, unused and unexpired, and the proof document, read from the grant
+issuer's homeserver (body capped at 8 KB; see
+[Homeserver reads](../README.md#homeserver-reads)), to equal the expected
+body. The challenge is then burned and the
 session inserted in one transaction.
 
 Because the challenge exists only from step 1, a document cannot be staged
@@ -2401,10 +2411,13 @@ while the grant is live and used after it is revoked, beyond one challenge
 lifetime. Only a live homeserver session can write the document, so a revoked
 grant cannot mint by itself. Two limits remain: a document written by another
 live session of the same user also passes, and revoking a grant does not
-revoke sessions already minted from it; they live until they expire. Sellers
-whose homeserver is not `HOMESERVER_URL` cannot pass the document read, and the
-approval flow refuses them too (`homeserver_not_allowed`); they can sign in
-with `POST /v1/auth/sessions`.
+revoke sessions already minted from it; they live until they expire. Under
+`HOMESERVER_RESOLUTION=fixed`, sellers whose homeserver is not `HOMESERVER_URL`
+cannot pass the document read, and the approval flow refuses them too
+(`homeserver_not_allowed`); they can sign in with `POST /v1/auth/sessions`.
+Under `pkarr` the document is read from whichever homeserver the issuer's Pkarr
+record names, but the approval flow still accepts only the homeserver
+`HOMESERVER_PUBKY` names.
 
 The session's capabilities are the grant's narrowed to the marketplace scopes:
 `/pub/pubky.app/marketplace-service/v1/:rw`, plus `/priv/pubky.app/:rw` when the

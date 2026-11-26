@@ -5,11 +5,13 @@
 //! compare-and-swap, and append-only offer history.
 
 use chrono::{DateTime, Utc};
-use marketplace_domain::commands::{CounterOfferPayload, OfferActionPayload, OfferTermsPayload};
+use marketplace_domain::commands::{
+    CommandPayload, CounterOfferPayload, OfferActionPayload, OfferTermsPayload,
+};
 use marketplace_domain::state_machines::{can_transition, listing_machine, offer_machine};
 use marketplace_domain::{ids, Command, ErrorCode, Money};
 use serde_json::{json, Value};
-use sqlx::{Postgres, Transaction};
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::clock::format_timestamp;
@@ -71,12 +73,198 @@ fn snapshot_line_shipping(snapshot: &AwardListingSnapshot) -> crate::shipping::L
     }
 }
 
+/// The seller's listing record an offer command read before its transaction
+/// ([`record_prefetch`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum RecordPrefetch {
+    /// No read: no homeserver, not an offer command, or one its handler
+    /// refuses before it needs the record.
+    NotNeeded,
+    /// The record of this seller's listing, as read.
+    Read {
+        seller_pubky: String,
+        listing_id: String,
+        outcome: HomeserverRawFetchOutcome,
+    },
+}
+
+impl RecordPrefetch {
+    /// The record read for this listing, if it was.
+    fn for_listing(
+        &self,
+        seller_pubky: &str,
+        listing_id: &str,
+    ) -> Option<&HomeserverRawFetchOutcome> {
+        match self {
+            Self::Read {
+                seller_pubky: read_seller,
+                listing_id: read_listing,
+                outcome,
+            } if read_seller == seller_pubky && read_listing == listing_id => Some(outcome),
+            Self::Read { .. } | Self::NotNeeded => None,
+        }
+    }
+}
+
+/// Reads the listing record an `offer.create`, `offer.counter` or
+/// `offer.accept` prices or pins its terms against, before its transaction,
+/// so a slow homeserver never holds the listing or offer row locks. Only a
+/// command that passes the checks its handler makes before using the record
+/// reads it: an offer on a live listing that is not the actor's own, or an
+/// actionable offer the actor takes part in and may act on now. The handler
+/// makes them again under its locks; the record is pinned on the offer by its
+/// revision and SHA-256, so a record read here is the one the offer keeps.
+pub async fn record_prefetch(
+    pool: &PgPool,
+    homeserver: Option<&dyn HomeserverListingClient>,
+    actor: &str,
+    command: &Command,
+    now: DateTime<Utc>,
+) -> Result<RecordPrefetch, sqlx::Error> {
+    let Some(homeserver) = homeserver else {
+        return Ok(RecordPrefetch::NotNeeded);
+    };
+    let listing = match &command.payload {
+        CommandPayload::CreateOffer(payload) => fetch_live_listing_row(pool, &command.aggregate_id)
+            .await?
+            .filter(|listing| create_refusal(listing, actor, command, payload).is_none()),
+        CommandPayload::CounterOffer(payload) => {
+            let offer = fetch_offer_row(pool, payload.offer_id)
+                .await?
+                .filter(|offer| {
+                    actionable_refusal(offer, actor, &command.aggregate_id, now).is_none()
+                        && counter_refusal(offer, actor, command, payload).is_none()
+                });
+            match offer {
+                Some(offer) => fetch_listing_row(pool, &offer.listing_aggregate_id).await?,
+                None => None,
+            }
+        }
+        CommandPayload::AcceptOffer(payload) => {
+            let offer = fetch_offer_row(pool, payload.offer_id)
+                .await?
+                .filter(|offer| {
+                    actionable_refusal(offer, actor, &command.aggregate_id, now).is_none()
+                        && accept_refusal(offer, actor, command).is_none()
+                });
+            match offer {
+                Some(offer) => fetch_listing_row(pool, &offer.listing_aggregate_id)
+                    .await?
+                    .filter(|listing| listing.seller_pubky == offer.seller_pubky),
+                None => None,
+            }
+        }
+        _ => None,
+    };
+    let Some(listing) = listing else {
+        return Ok(RecordPrefetch::NotNeeded);
+    };
+    let outcome = homeserver
+        .fetch_listing_raw(&listing.seller_pubky, &listing.listing_id)
+        .await;
+    Ok(RecordPrefetch::Read {
+        seller_pubky: listing.seller_pubky,
+        listing_id: listing.listing_id,
+        outcome,
+    })
+}
+
+async fn fetch_listing_row(
+    pool: &PgPool,
+    aggregate_id: &str,
+) -> Result<Option<ListingRow>, sqlx::Error> {
+    sqlx::query_as(&format!(
+        "SELECT {LISTING_COLUMNS} FROM listings WHERE aggregate_id = $1"
+    ))
+    .bind(aggregate_id)
+    .fetch_optional(pool)
+    .await
+}
+
+async fn fetch_live_listing_row(
+    pool: &PgPool,
+    aggregate_id: &str,
+) -> Result<Option<ListingRow>, sqlx::Error> {
+    Ok(fetch_listing_row(pool, aggregate_id)
+        .await?
+        .filter(|listing| !listing.is_deleted()))
+}
+
+async fn fetch_offer_row(pool: &PgPool, offer_id: Uuid) -> Result<Option<OfferRow>, sqlx::Error> {
+    sqlx::query_as(&format!("SELECT {OFFER_COLUMNS} FROM offers WHERE id = $1"))
+        .bind(offer_id)
+        .fetch_optional(pool)
+        .await
+}
+
+/// The message of an offer command whose listing record was not read before
+/// its transaction (the offer or listing changed in between).
+const RECORD_NOT_READ: &str =
+    "The seller's listing record was not read for this offer. Try again shortly.";
+
+/// The checks [`create`] makes on the listing before it reads its record.
+fn create_refusal(
+    listing: &ListingRow,
+    actor: &str,
+    command: &Command,
+    payload: &OfferTermsPayload,
+) -> Option<CommandFailure> {
+    if listing.seller_pubky == actor {
+        return Some(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::Unauthorized,
+            ErrorCode::Unauthorized,
+            "A seller cannot make an offer on their own listing.",
+        ));
+    }
+    if command.expected_revision != listing.server_revision {
+        return Some(CommandFailure::refused_with_revision(
+            crate::refusal_audit::RefusalKind::RevisionConflict,
+            ErrorCode::RevisionConflict,
+            "The listing revision is stale.",
+            listing.server_revision,
+        ));
+    }
+    if !listing.made_to_order && listing.available_quantity < payload.quantity {
+        return Some(CommandFailure::refused_with_revision(
+            crate::refusal_audit::RefusalKind::InsufficientInventory,
+            ErrorCode::InsufficientInventory,
+            "The requested offer quantity is unavailable.",
+            listing.server_revision,
+        ));
+    }
+    if !same_asset(listing, &payload.amount) {
+        return Some(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidCommand,
+            ErrorCode::InvalidCommand,
+            "Offer amount must use the listing asset and exponent.",
+        ));
+    }
+    // Offers settle through the listing's physical fulfillment: shipping or
+    // local pickup, chosen by the buyer at offer checkout (§A2). Digital
+    // items, the only other published method, take no offers.
+    if !listing
+        .fulfillment_methods
+        .iter()
+        .any(|m| m == "shipping" || m == "pickup")
+    {
+        return Some(CommandFailure::refused_with_reason(
+            crate::refusal_audit::RefusalKind::InvalidState,
+            ErrorCode::InvalidState,
+            "Offers are not available on digital items.",
+            "offers_unavailable_for_digital",
+        ));
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn create(
     tx: &mut Transaction<'_, Postgres>,
     actor: &str,
     command: &Command,
     payload: &OfferTermsPayload,
-    homeserver: Option<&dyn HomeserverListingClient>,
+    homeserver_configured: bool,
+    prefetched: &RecordPrefetch,
     shipping: &crate::shipping::ShippingPlan,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
@@ -87,56 +275,17 @@ pub async fn create(
             "The listing is not registered.",
         )));
     };
-    if listing.seller_pubky == actor {
-        return Ok(Err(CommandFailure::refused(
-            crate::refusal_audit::RefusalKind::Unauthorized,
-            ErrorCode::Unauthorized,
-            "A seller cannot make an offer on their own listing.",
-        )));
-    }
-    if command.expected_revision != listing.server_revision {
-        return Ok(Err(CommandFailure::refused_with_revision(
-            crate::refusal_audit::RefusalKind::RevisionConflict,
-            ErrorCode::RevisionConflict,
-            "The listing revision is stale.",
-            listing.server_revision,
-        )));
-    }
-    if !listing.made_to_order && listing.available_quantity < payload.quantity {
-        return Ok(Err(CommandFailure::refused_with_revision(
-            crate::refusal_audit::RefusalKind::InsufficientInventory,
-            ErrorCode::InsufficientInventory,
-            "The requested offer quantity is unavailable.",
-            listing.server_revision,
-        )));
-    }
-    if !same_asset(&listing, &payload.amount) {
-        return Ok(Err(CommandFailure::refused(
-            crate::refusal_audit::RefusalKind::InvalidCommand,
-            ErrorCode::InvalidCommand,
-            "Offer amount must use the listing asset and exponent.",
-        )));
-    }
-    // Offers settle through the listing's physical fulfillment: shipping or
-    // local pickup, chosen by the buyer at offer checkout (§A2). Digital
-    // items, the only other published method, take no offers.
-    if !listing
-        .fulfillment_methods
-        .iter()
-        .any(|m| m == "shipping" || m == "pickup")
-    {
-        return Ok(Err(CommandFailure::refused_with_reason(
-            crate::refusal_audit::RefusalKind::InvalidState,
-            ErrorCode::InvalidState,
-            "Offers are not available on digital items.",
-            "offers_unavailable_for_digital",
-        )));
+    if let Some(failure) = create_refusal(&listing, actor, command, payload) {
+        return Ok(Err(failure));
     }
 
-    let terms = if let Some(homeserver) = homeserver {
-        match homeserver
-            .fetch_listing_raw(&listing.seller_pubky, &listing.listing_id)
-            .await
+    // A record not read before the transaction (the listing changed in
+    // between) is priced as an unreachable one: from the registered row.
+    let terms = if homeserver_configured {
+        match prefetched
+            .for_listing(&listing.seller_pubky, &listing.listing_id)
+            .cloned()
+            .unwrap_or(HomeserverRawFetchOutcome::Unavailable)
         {
             HomeserverRawFetchOutcome::Found(raw) => match award_terms_from_bytes(&raw) {
                 Ok(snapshot) => Some(snapshot),
@@ -303,22 +452,22 @@ pub async fn counter(
     actor: &str,
     command: &Command,
     payload: &CounterOfferPayload,
-    homeserver: Option<&dyn HomeserverListingClient>,
+    homeserver_configured: bool,
+    prefetched: &RecordPrefetch,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
-    let locator: Option<OfferRow> = sqlx::query_as(&format!(
-        "SELECT {OFFER_COLUMNS} FROM offers \
-         WHERE id = $1 AND (buyer_pubky = $2 OR seller_pubky = $2)"
-    ))
-    .bind(payload.offer_id)
-    .bind(actor)
-    .fetch_optional(&mut **tx)
-    .await?;
-    let refreshed_terms = if let (Some(homeserver), Some(locator)) = (homeserver, locator.as_ref())
-    {
+    let offer =
+        match actionable_offer(tx, actor, payload.offer_id, &command.aggregate_id, now).await? {
+            Ok(offer) => offer,
+            Err(failure) => return Ok(Err(failure)),
+        };
+    if let Some(failure) = counter_refusal(&offer, actor, command, payload) {
+        return Ok(Err(failure));
+    }
+    let refreshed_terms = if homeserver_configured {
         let listing_id: Option<String> =
             sqlx::query_scalar("SELECT listing_id FROM listings WHERE aggregate_id = $1")
-                .bind(&locator.listing_aggregate_id)
+                .bind(&offer.listing_aggregate_id)
                 .fetch_optional(&mut **tx)
                 .await?;
         let Some(listing_id) = listing_id else {
@@ -328,12 +477,16 @@ pub async fn counter(
                 "The offer listing is unavailable.",
             )));
         };
-        match homeserver
-            .fetch_listing_raw(&locator.seller_pubky, &listing_id)
-            .await
-        {
+        let Some(outcome) = prefetched.for_listing(&offer.seller_pubky, &listing_id) else {
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::UpstreamUnavailable,
+                ErrorCode::UpstreamUnavailable,
+                RECORD_NOT_READ,
+            )));
+        };
+        match outcome {
             HomeserverRawFetchOutcome::Found(raw) => {
-                match award_terms_from_bytes_for_variant(&raw, locator.variant_id.as_deref()) {
+                match award_terms_from_bytes_for_variant(raw, offer.variant_id.as_deref()) {
                     Ok(snapshot) => Some(snapshot),
                     Err(_) => {
                         return Ok(Err(CommandFailure::refused(
@@ -362,33 +515,6 @@ pub async fn counter(
     } else {
         None
     };
-    let offer =
-        match actionable_offer(tx, actor, payload.offer_id, &command.aggregate_id, now).await? {
-            Ok(offer) => offer,
-            Err(failure) => return Ok(Err(failure)),
-        };
-    if command.expected_revision != offer.revision {
-        return Ok(Err(CommandFailure::refused_with_revision(
-            crate::refusal_audit::RefusalKind::RevisionConflict,
-            ErrorCode::RevisionConflict,
-            "The offer revision is stale.",
-            offer.revision,
-        )));
-    }
-    if actor == offer.offered_by {
-        return Ok(Err(CommandFailure::refused(
-            crate::refusal_audit::RefusalKind::Unauthorized,
-            ErrorCode::Unauthorized,
-            "The current offer author cannot counter their own terms.",
-        )));
-    }
-    if offer.currency != payload.amount.currency || offer.exponent != payload.amount.exponent {
-        return Ok(Err(CommandFailure::refused(
-            crate::refusal_audit::RefusalKind::InvalidCommand,
-            ErrorCode::InvalidCommand,
-            "Counteroffer amount must use the original asset and exponent.",
-        )));
-    }
     let refreshed_variant = if let Some(snapshot) = refreshed_terms.as_ref() {
         if snapshot.currency != payload.amount.currency
             || snapshot.exponent != payload.amount.exponent
@@ -541,44 +667,50 @@ pub async fn counter(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn accept(
     tx: &mut Transaction<'_, Postgres>,
     actor: &str,
     command: &Command,
     payload: &OfferActionPayload,
-    homeserver: Option<&dyn HomeserverListingClient>,
+    homeserver_configured: bool,
+    prefetched: &RecordPrefetch,
     shipping: &crate::shipping::ShippingPlan,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
-    let locator: Option<OfferRow> =
-        sqlx::query_as(&format!("SELECT {OFFER_COLUMNS} FROM offers WHERE id = $1"))
-            .bind(payload.offer_id)
-            .fetch_optional(&mut **tx)
-            .await?;
-    let Some(locator) = locator else {
-        return Ok(Err(CommandFailure::refused(
-            crate::refusal_audit::RefusalKind::NotFound,
-            ErrorCode::NotFound,
-            "The offer was not found.",
-        )));
-    };
-    let (snapshot, fetched_identity) = if let Some(homeserver) = homeserver {
-        let listing_id: Option<(String,)> =
-            sqlx::query_as("SELECT listing_id FROM listings WHERE aggregate_id = $1")
-                .bind(&locator.listing_aggregate_id)
-                .fetch_optional(&mut **tx)
-                .await?;
-        let Some((listing_id,)) = listing_id else {
+    let offer =
+        match actionable_offer(tx, actor, payload.offer_id, &command.aggregate_id, now).await? {
+            Ok(offer) => offer,
+            Err(failure) => return Ok(Err(failure)),
+        };
+    if let Some(failure) = accept_refusal(&offer, actor, command) {
+        return Ok(Err(failure));
+    }
+    let (snapshot, fetched_identity_present) = if homeserver_configured {
+        let Some(current_listing) = fetch_listing(tx, &offer.listing_aggregate_id).await? else {
             return Ok(Err(CommandFailure::refused(
                 crate::refusal_audit::RefusalKind::NotFound,
                 ErrorCode::NotFound,
                 "The offer listing is unavailable.",
             )));
         };
-        let raw = match homeserver
-            .fetch_listing_raw(&locator.seller_pubky, &listing_id)
-            .await
-        {
+        if current_listing.seller_pubky != offer.seller_pubky {
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::AwardListingChanged,
+                ErrorCode::AwardListingChanged,
+                "The listing snapshot does not match the offer terms.",
+            )));
+        }
+        let Some(outcome) =
+            prefetched.for_listing(&offer.seller_pubky, &current_listing.listing_id)
+        else {
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::UpstreamUnavailable,
+                ErrorCode::UpstreamUnavailable,
+                RECORD_NOT_READ,
+            )));
+        };
+        let raw = match outcome {
             HomeserverRawFetchOutcome::Found(raw) => raw,
             HomeserverRawFetchOutcome::TooLarge => {
                 // Design §7 designates an oversized seller record as a
@@ -597,8 +729,7 @@ pub async fn accept(
                 )));
             }
         };
-        let snapshot = match award_terms_from_bytes_for_variant(&raw, locator.variant_id.as_deref())
-        {
+        let snapshot = match award_terms_from_bytes_for_variant(raw, offer.variant_id.as_deref()) {
             Ok(snapshot) => snapshot,
             Err(_) => {
                 return Ok(Err(CommandFailure::refused(
@@ -608,82 +739,37 @@ pub async fn accept(
                 )));
             }
         };
-        (
-            snapshot,
-            Some((
-                locator.seller_pubky.clone(),
-                locator.listing_aggregate_id.clone(),
-                listing_id,
-            )),
-        )
+        (snapshot, true)
     } else {
         (
             AwardListingSnapshot {
-                raw_sha256: locator
+                raw_sha256: offer
                     .terms_listing_record_sha256
                     .clone()
-                    .unwrap_or_else(|| locator.listing_aggregate_id.clone()),
-                revision: locator.terms_listing_revision.unwrap_or(1),
+                    .unwrap_or_else(|| offer.listing_aggregate_id.clone()),
+                revision: offer.terms_listing_revision.unwrap_or(1),
                 title: "Marketplace item".to_string(),
-                currency: locator.currency.clone(),
-                exponent: locator.exponent,
+                currency: offer.currency.clone(),
+                exponent: offer.exponent,
                 shipping_minor: 0,
                 shipping: AwardShipping::Flat,
                 // Without a seller-signed record there is no pickup authority:
                 // the award stays shipping-only, as before.
                 fulfillment_methods: vec!["shipping".to_string()],
                 variants: vec![AwardVariantSnapshot {
-                    id: locator
+                    id: offer
                         .variant_id
                         .clone()
-                        .unwrap_or_else(|| locator.listing_aggregate_id.clone()),
+                        .unwrap_or_else(|| offer.listing_aggregate_id.clone()),
                     sku: None,
                     options: Value::Array(vec![]),
-                    quantity: locator.quantity,
+                    quantity: offer.quantity,
                     price: None,
                 }],
             },
-            None,
+            false,
         )
     };
-    let offer =
-        match actionable_offer(tx, actor, payload.offer_id, &command.aggregate_id, now).await? {
-            Ok(offer) => offer,
-            Err(failure) => return Ok(Err(failure)),
-        };
-    let fetched_identity_present = fetched_identity.is_some();
-    if let Some((fetched_seller, fetched_aggregate, fetched_listing_id)) = fetched_identity {
-        let current_listing = fetch_listing(tx, &offer.listing_aggregate_id).await?;
-        if offer.seller_pubky != fetched_seller
-            || offer.listing_aggregate_id != fetched_aggregate
-            || current_listing.as_ref().is_none_or(|listing| {
-                listing.seller_pubky != fetched_seller
-                    || listing.listing_id != fetched_listing_id
-                    || listing.aggregate_id != fetched_aggregate
-            })
-        {
-            return Ok(Err(CommandFailure::refused(
-                crate::refusal_audit::RefusalKind::AwardListingChanged,
-                ErrorCode::AwardListingChanged,
-                "The listing snapshot does not match the offer terms.",
-            )));
-        }
-    }
-    if command.expected_revision != offer.revision {
-        return Ok(Err(CommandFailure::refused_with_revision(
-            crate::refusal_audit::RefusalKind::RevisionConflict,
-            ErrorCode::RevisionConflict,
-            "The offer revision is stale.",
-            offer.revision,
-        )));
-    }
-    if actor == offer.offered_by {
-        return Ok(Err(CommandFailure::refused(
-            crate::refusal_audit::RefusalKind::Unauthorized,
-            ErrorCode::Unauthorized,
-            "The current offer author cannot accept their own terms.",
-        )));
-    }
     if offer
         .terms_listing_record_sha256
         .as_deref()
@@ -1075,35 +1161,102 @@ async fn actionable_offer(
             "The offer was not found.",
         )));
     };
+    match actionable_refusal(&offer, actor, aggregate_id, now) {
+        Some(failure) => Ok(Err(failure)),
+        None => Ok(Ok(offer)),
+    }
+}
+
+/// The checks [`actionable_offer`] makes on the offer row.
+fn actionable_refusal(
+    offer: &OfferRow,
+    actor: &str,
+    aggregate_id: &str,
+    now: DateTime<Utc>,
+) -> Option<CommandFailure> {
     if aggregate_id != offer.aggregate_id {
-        return Ok(Err(CommandFailure::refused(
+        return Some(CommandFailure::refused(
             crate::refusal_audit::RefusalKind::InvalidCommand,
             ErrorCode::InvalidCommand,
             "The offer aggregate id is invalid.",
-        )));
+        ));
     }
     if actor != offer.buyer_pubky && actor != offer.seller_pubky {
-        return Ok(Err(CommandFailure::refused(
+        return Some(CommandFailure::refused(
             crate::refusal_audit::RefusalKind::Unauthorized,
             ErrorCode::Unauthorized,
             "Only offer participants may act on it.",
-        )));
+        ));
     }
     if offer.state != "pending" && offer.state != "countered" {
-        return Ok(Err(CommandFailure::refused(
+        return Some(CommandFailure::refused(
             crate::refusal_audit::RefusalKind::InvalidState,
             ErrorCode::InvalidState,
             "The offer is no longer actionable.",
-        )));
+        ));
     }
     if offer.expires_at <= now {
-        return Ok(Err(CommandFailure::refused(
+        return Some(CommandFailure::refused(
             crate::refusal_audit::RefusalKind::OfferExpired,
             ErrorCode::OfferExpired,
             "The offer has expired.",
-        )));
+        ));
     }
-    Ok(Ok(offer))
+    None
+}
+
+/// The checks [`counter`] makes on an actionable offer before it uses the
+/// listing record.
+fn counter_refusal(
+    offer: &OfferRow,
+    actor: &str,
+    command: &Command,
+    payload: &CounterOfferPayload,
+) -> Option<CommandFailure> {
+    if command.expected_revision != offer.revision {
+        return Some(CommandFailure::refused_with_revision(
+            crate::refusal_audit::RefusalKind::RevisionConflict,
+            ErrorCode::RevisionConflict,
+            "The offer revision is stale.",
+            offer.revision,
+        ));
+    }
+    if actor == offer.offered_by {
+        return Some(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::Unauthorized,
+            ErrorCode::Unauthorized,
+            "The current offer author cannot counter their own terms.",
+        ));
+    }
+    if offer.currency != payload.amount.currency || offer.exponent != payload.amount.exponent {
+        return Some(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidCommand,
+            ErrorCode::InvalidCommand,
+            "Counteroffer amount must use the original asset and exponent.",
+        ));
+    }
+    None
+}
+
+/// The checks [`accept`] makes on an actionable offer before it uses the
+/// listing record.
+fn accept_refusal(offer: &OfferRow, actor: &str, command: &Command) -> Option<CommandFailure> {
+    if command.expected_revision != offer.revision {
+        return Some(CommandFailure::refused_with_revision(
+            crate::refusal_audit::RefusalKind::RevisionConflict,
+            ErrorCode::RevisionConflict,
+            "The offer revision is stale.",
+            offer.revision,
+        ));
+    }
+    if actor == offer.offered_by {
+        return Some(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::Unauthorized,
+            ErrorCode::Unauthorized,
+            "The current offer author cannot accept their own terms.",
+        ));
+    }
+    None
 }
 
 /// Moves an offer into a terminal state and appends the history entry

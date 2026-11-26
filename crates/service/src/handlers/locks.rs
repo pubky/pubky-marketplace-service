@@ -48,11 +48,12 @@
 
 use chrono::{DateTime, Utc};
 use marketplace_domain::commands::{
-    canonical_lock_resource, split_lock_resource, PrepareLocksPayload, RegisterLocksPayload,
+    canonical_lock_resource, split_lock_resource, CommandPayload, PrepareLocksPayload,
+    RegisterLocksPayload,
 };
 use marketplace_domain::{ids, Command, ErrorCode};
 use serde_json::json;
-use sqlx::{Postgres, Transaction};
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::clock::format_timestamp;
@@ -301,6 +302,167 @@ struct CheckoutSnapshot {
     order_id: Uuid,
 }
 
+/// The seller's content-lock document a checkout snapshot's sealed resource
+/// names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LockDocument {
+    resource: String,
+    creator: String,
+    path: String,
+}
+
+/// What a `payment.prepare_locks` read before its transaction.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LocksPrefetch {
+    /// No read: not a prepare, or one [`prepare`] refuses before reading.
+    NotNeeded,
+    /// The payment's lock document and the seller's terms, as read.
+    Read {
+        document: LockDocument,
+        content: HomeserverFetchOutcome,
+        terms: crate::seller_terms::TermsRead,
+    },
+}
+
+/// Opens the snapshot's sealed resource and names the document it points
+/// at, refusing as [`prepare`] does when it is not the order seller's.
+fn lock_document(
+    locks: &LocksRuntime,
+    payment: &PaymentRow,
+    snapshot: &CheckoutSnapshot,
+) -> Result<LockDocument, CommandFailure> {
+    let Some(resource) = locks.keys.open_prepared_value(
+        payment.id,
+        b"locks-checkout-resource:",
+        &snapshot.expected_resource_ciphertext,
+    ) else {
+        // A snapshot that does not authenticate under the configured key
+        // fails closed (tampering or a key rotation) rather than falling
+        // back to the mutable listing rows.
+        return Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvariantViolation,
+            ErrorCode::InvariantViolation,
+            "The checkout Locks snapshot could not be opened.",
+        ));
+    };
+    // The opened resource must be exactly the resource the snapshot
+    // sealed at checkout.
+    let resource_hash = blake3::hash(resource.as_bytes()).to_hex().to_string();
+    if resource_hash != snapshot.expected_resource_hash {
+        return Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
+            ErrorCode::InvalidState,
+            "The checkout Locks snapshot does not match the payment.",
+        ));
+    }
+    let Some(canonical_resource) = canonical_lock_resource(&resource) else {
+        return Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
+            ErrorCode::InvalidState,
+            "The seller's Locks resource is invalid.",
+        ));
+    };
+    // The document is fetched under the prefix the seller published it
+    // with (`/pub/locks.app/` or upstream's `/pub/app.locks/`).
+    let Some((creator, prefix, content_path)) = split_lock_resource(&canonical_resource) else {
+        return Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
+            ErrorCode::InvalidState,
+            "The seller's Locks resource is invalid.",
+        ));
+    };
+    if creator != payment.seller_pubky {
+        return Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::InvalidState,
+            ErrorCode::InvalidState,
+            "The seller's Locks resource creator does not match the order.",
+        ));
+    }
+    Ok(LockDocument {
+        creator: creator.to_string(),
+        path: format!("{prefix}{content_path}"),
+        resource,
+    })
+}
+
+/// Reads the seller's Locks document and terms a `payment.prepare_locks`
+/// needs, before its transaction, so a slow homeserver never holds the
+/// payment and order row locks. Only a prepare that passes the checks
+/// [`prepare`] makes before reading reads anything: the payment's buyer, on
+/// a payment awaiting entitlement with no Locks preparation, a pending order
+/// with no other rail bound, and a snapshot that matches the payment and
+/// names the order seller's document. [`prepare`] makes them again under its
+/// locks.
+pub async fn prefetch(
+    pool: &PgPool,
+    locks: Option<&LocksRuntime>,
+    homeserver: Option<&dyn HomeserverListingClient>,
+    actor: &str,
+    command: &Command,
+) -> Result<LocksPrefetch, sqlx::Error> {
+    let (CommandPayload::PrepareLocks(payload), Some(locks), Some(homeserver)) =
+        (&command.payload, locks, homeserver)
+    else {
+        return Ok(LocksPrefetch::NotNeeded);
+    };
+    let payment: Option<PaymentRow> = sqlx::query_as(&format!(
+        "SELECT {PAYMENT_COLUMNS} FROM payments WHERE id = $1"
+    ))
+    .bind(payload.payment_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(payment) = payment.filter(|payment| {
+        payment.buyer_pubky == actor
+            && command.aggregate_id == ids::payment_aggregate_id(payment.id)
+            && command.expected_revision == payment.revision
+            && payment.state == "awaiting_entitlement"
+    }) else {
+        return Ok(LocksPrefetch::NotNeeded);
+    };
+    let payable: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM orders o WHERE o.id = $1 \
+         AND o.state = 'pending_payment' AND o.payment_method IS NULL \
+         AND NOT EXISTS (SELECT 1 FROM payment_locks_correlations c WHERE c.payment_id = $2))",
+    )
+    .bind(payment.order_id)
+    .bind(payment.id)
+    .fetch_one(pool)
+    .await?;
+    if !payable {
+        return Ok(LocksPrefetch::NotNeeded);
+    }
+    let snapshot: Option<CheckoutSnapshot> = sqlx::query_as(
+        "SELECT expected_resource_ciphertext, expected_resource_hash, criterion_id, \
+         amount_minor, asset, exponent, expected_reader_pubky, expected_recipient_pubky, \
+         order_id FROM payment_locks_checkout_snapshots WHERE payment_id = $1",
+    )
+    .bind(payment.id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(snapshot) = snapshot.filter(|snapshot| {
+        snapshot.order_id == payment.order_id
+            && snapshot.expected_reader_pubky == payment.buyer_pubky
+            && snapshot.expected_recipient_pubky == payment.seller_pubky
+            && snapshot_matches_price_of_record(snapshot, &payment)
+    }) else {
+        return Ok(LocksPrefetch::NotNeeded);
+    };
+    let Ok(document) = lock_document(locks, &payment, &snapshot) else {
+        return Ok(LocksPrefetch::NotNeeded);
+    };
+    let content = homeserver
+        .fetch_content_lock(&document.creator, &document.path)
+        .await;
+    let terms =
+        crate::seller_terms::read_for_order(pool, Some(homeserver), payment.order_id, actor)
+            .await?;
+    Ok(LocksPrefetch::Read {
+        document,
+        content,
+        terms,
+    })
+}
+
 /// Creates the sole authoritative Locks preparation for a payment. The
 /// listing's seller-authored lock, rather than registration input, defines
 /// every expected fact retained on the correlation.
@@ -311,12 +473,13 @@ pub async fn prepare(
     command: &Command,
     payload: &PrepareLocksPayload,
     locks: Option<&LocksRuntime>,
-    homeserver: Option<&dyn HomeserverListingClient>,
+    homeserver_configured: bool,
+    prefetched: &LocksPrefetch,
     payment_window_seconds: i64,
     fence: Option<&crate::region_policy::RegionModes>,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
-    let (Some(locks), Some(homeserver)) = (locks, homeserver) else {
+    let (Some(locks), true) = (locks, homeserver_configured) else {
         return Ok(Err(CommandFailure::refused(
             crate::refusal_audit::RefusalKind::InvalidCommand,
             ErrorCode::InvalidCommand,
@@ -504,57 +667,29 @@ pub async fn prepare(
             "The checkout Locks snapshot does not match the payment.",
         )));
     }
-    let Some(resource) = locks.keys.open_prepared_value(
-        payment.id,
-        b"locks-checkout-resource:",
-        &snapshot.expected_resource_ciphertext,
-    ) else {
-        // A snapshot that does not authenticate under the configured key
-        // fails closed (tampering or a key rotation) rather than falling
-        // back to the mutable listing rows.
-        return Ok(Err(CommandFailure::refused(
-            crate::refusal_audit::RefusalKind::InvariantViolation,
-            ErrorCode::InvariantViolation,
-            "The checkout Locks snapshot could not be opened.",
-        )));
+    let document = match lock_document(locks, &payment, &snapshot) {
+        Ok(document) => document,
+        Err(failure) => return Ok(Err(failure)),
     };
-    // The opened resource must be exactly the resource the snapshot
-    // sealed at checkout.
-    let resource_hash = blake3::hash(resource.as_bytes()).to_hex().to_string();
-    if resource_hash != snapshot.expected_resource_hash {
-        return Ok(Err(CommandFailure::refused(
-            crate::refusal_audit::RefusalKind::InvalidState,
-            ErrorCode::InvalidState,
-            "The checkout Locks snapshot does not match the payment.",
-        )));
-    }
-    let Some(canonical_resource) = canonical_lock_resource(&resource) else {
-        return Ok(Err(CommandFailure::refused(
-            crate::refusal_audit::RefusalKind::InvalidState,
-            ErrorCode::InvalidState,
-            "The seller's Locks resource is invalid.",
-        )));
+    // The document was read before this transaction, from the same sealed
+    // snapshot; one read for another document (the payment changed in
+    // between) is not this payment's.
+    let (content, terms) = match prefetched {
+        LocksPrefetch::Read {
+            document: read,
+            content,
+            terms,
+        } if *read == document => (content, terms),
+        LocksPrefetch::Read { .. } | LocksPrefetch::NotNeeded => {
+            return Ok(Err(CommandFailure::refused(
+                crate::refusal_audit::RefusalKind::LocksUpstreamUnavailable,
+                ErrorCode::UpstreamUnavailable,
+                "The seller's Locks document was not read for this payment. Try again shortly.",
+            )));
+        }
     };
-    // The document is fetched under the prefix the seller published it
-    // with (`/pub/locks.app/` or upstream's `/pub/app.locks/`).
-    let Some((creator, prefix, content_path)) = split_lock_resource(&canonical_resource) else {
-        return Ok(Err(CommandFailure::refused(
-            crate::refusal_audit::RefusalKind::InvalidState,
-            ErrorCode::InvalidState,
-            "The seller's Locks resource is invalid.",
-        )));
-    };
-    if creator != payment.seller_pubky {
-        return Ok(Err(CommandFailure::refused(
-            crate::refusal_audit::RefusalKind::InvalidState,
-            ErrorCode::InvalidState,
-            "The seller's Locks resource creator does not match the order.",
-        )));
-    }
-    let content = match homeserver
-        .fetch_content_lock(creator, &format!("{prefix}{content_path}"))
-        .await
-    {
+    let resource = document.resource;
+    let content = match content.clone() {
         HomeserverFetchOutcome::Found(value) => value,
         HomeserverFetchOutcome::NotFound => {
             return Ok(Err(CommandFailure::refused(
@@ -601,14 +736,16 @@ pub async fn prepare(
             "The seller's Locks document does not match the payment.",
         )));
     }
-    crate::seller_terms::capture_for_order(
-        tx,
-        Some(homeserver),
-        order.id,
-        &order.seller_pubky,
-        now,
-    )
-    .await?;
+    if let Err(crate::seller_terms::TermsNotRead) =
+        crate::seller_terms::capture_for_order(tx, terms, order.id, &order.seller_pubky, now)
+            .await?
+    {
+        return Ok(Err(CommandFailure::refused(
+            crate::refusal_audit::RefusalKind::UpstreamUnavailable,
+            ErrorCode::UpstreamUnavailable,
+            crate::seller_terms::TERMS_NOT_READ,
+        )));
+    }
     // The EU seller's annual limit (legal launch plan C4) at payment start,
     // before any listing lock.
     if let Some(modes) = fence {

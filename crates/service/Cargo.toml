@@ -48,6 +48,8 @@ pubky-reqwest = { package = "reqwest", version = "0.13", default-features = fals
 # (the roots and provider the `pubky` SDK uses for them).
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
 webpki-roots = "1"
+# `pkarr` reads: the homeserver `/info` cache.
+lru = "0.16"
 # RFC 9180 HPKE (DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305),
 # the suite the Shop seals delivery envelopes with. The connector worker opens
 # the opt-in connector address envelope with it; the same crate pubky-core's

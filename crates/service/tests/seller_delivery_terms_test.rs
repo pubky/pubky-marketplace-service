@@ -24,7 +24,9 @@ use marketplace_service::clock::Clock;
 use marketplace_service::config::{
     DEFAULT_AUTO_COMPLETE_DAYS, DEFAULT_DELIVERY_ASSUME_DAYS, DEFAULT_DELIVERY_SWEEP_BATCH_SIZE,
 };
-use marketplace_service::seller_terms::capture_for_order;
+use marketplace_service::seller_terms::{
+    capture_for_order, read_for_order, TermsNotRead, TermsRead,
+};
 use marketplace_service::workers::{
     assume_due_deliveries, complete_due_delivered_orders, DELIVERY_SWEEP_MAX_BATCHES,
 };
@@ -444,16 +446,14 @@ async fn capture_happens_once_per_order(pool: PgPool) {
             json!({ "deliveryAssumeDays": 7, "autoCompleteDays": 9 }),
         ),
     );
+    let read = read_for_order(&app.pool, Some(client.as_ref()), order_id, &buyer.pubky)
+        .await
+        .expect("terms read");
     let mut tx = app.pool.begin().await.expect("tx");
-    capture_for_order(
-        &mut tx,
-        Some(client.as_ref()),
-        order_id,
-        &seller.pubky,
-        app.clock.now(),
-    )
-    .await
-    .expect("capture runs");
+    capture_for_order(&mut tx, &read, order_id, &seller.pubky, app.clock.now())
+        .await
+        .expect("capture runs")
+        .expect("the terms were read");
     tx.commit().await.expect("commit");
 
     homeserver.put_shop_record(
@@ -463,16 +463,19 @@ async fn capture_happens_once_per_order(pool: PgPool) {
             json!({ "deliveryAssumeDays": 20, "autoCompleteDays": 21 }),
         ),
     );
+    let read = read_for_order(&app.pool, Some(client.as_ref()), order_id, &buyer.pubky)
+        .await
+        .expect("terms read");
+    assert_eq!(
+        read,
+        TermsRead::NotRead,
+        "a captured order is not read again"
+    );
     let mut tx = app.pool.begin().await.expect("tx");
-    capture_for_order(
-        &mut tx,
-        Some(client.as_ref()),
-        order_id,
-        &seller.pubky,
-        app.clock.now(),
-    )
-    .await
-    .expect("second capture runs");
+    capture_for_order(&mut tx, &read, order_id, &seller.pubky, app.clock.now())
+        .await
+        .expect("second capture runs")
+        .expect("an order captured since its read is left as it is");
     tx.commit().await.expect("commit");
 
     assert_eq!(
@@ -482,17 +485,93 @@ async fn capture_happens_once_per_order(pool: PgPool) {
 
     // An unreadable record does not matter once the order is captured.
     homeserver.fail_shop_record(&seller.pubky);
+    let read = read_for_order(&app.pool, Some(client.as_ref()), order_id, &buyer.pubky)
+        .await
+        .expect("terms read");
     let mut tx = app.pool.begin().await.expect("tx");
-    capture_for_order(
-        &mut tx,
-        Some(client.as_ref()),
-        order_id,
+    capture_for_order(&mut tx, &read, order_id, &seller.pubky, app.clock.now())
+        .await
+        .expect("an already captured order never reads the record")
+        .expect("an already captured order is left as it is");
+    tx.commit().await.expect("commit");
+}
+
+/// The capture freezes only the records read for its own order. A read for
+/// another order, or none at all, freezes nothing; the payment start is
+/// refused and a retry reads them.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_capture_takes_only_the_records_read_for_its_order(pool: PgPool) {
+    let (app, homeserver) = test_app_with_shop_homeserver(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let other_buyer = new_actor(&app).await;
+    let pending = pending_order(&app, &seller, &buyer).await;
+    let order_id = Uuid::parse_str(&pending.order_id).expect("order uuid");
+    let (status, body) = execute(
+        &app,
+        &other_buyer.token,
+        &checkout_command_with_id(&seller.pubky, &Uuid::new_v4().to_string()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "second checkout: {body}");
+    let other_id = Uuid::parse_str(
+        body["result"]["orders"][0]["id"]
+            .as_str()
+            .expect("order id"),
+    )
+    .expect("order uuid");
+    let client = homeserver.client();
+    homeserver.put_shop_record(
         &seller.pubky,
-        app.clock.now(),
+        shop_record(&seller, json!({ "deliveryAssumeDays": 7 })),
+    );
+
+    // Nobody but the order's buyer has the seller's records read.
+    for actor in [&seller, &other_buyer] {
+        let read = read_for_order(&app.pool, Some(client.as_ref()), order_id, &actor.pubky)
+            .await
+            .expect("terms read");
+        assert_eq!(read, TermsRead::NotRead);
+    }
+
+    let other_read = read_for_order(
+        &app.pool,
+        Some(client.as_ref()),
+        other_id,
+        &other_buyer.pubky,
     )
     .await
-    .expect("an already captured order never reads the record");
+    .expect("terms read");
+    assert!(matches!(other_read, TermsRead::Read(_)));
+    for read in [TermsRead::NotRead, other_read] {
+        let mut tx = app.pool.begin().await.expect("tx");
+        let captured = capture_for_order(&mut tx, &read, order_id, &seller.pubky, app.clock.now())
+            .await
+            .expect("capture runs");
+        assert_eq!(captured, Err(TermsNotRead));
+        tx.commit().await.expect("commit");
+        assert_eq!(
+            terms_row(&app.pool, &pending.order_id).await,
+            (None, None, false),
+            "nothing is frozen"
+        );
+    }
+
+    // Without a homeserver there is nothing to read: the defaults freeze.
+    let read = read_for_order(&app.pool, None, order_id, &buyer.pubky)
+        .await
+        .expect("terms read");
+    assert_eq!(read, TermsRead::NoHomeserver);
+    let mut tx = app.pool.begin().await.expect("tx");
+    capture_for_order(&mut tx, &read, order_id, &seller.pubky, app.clock.now())
+        .await
+        .expect("capture runs")
+        .expect("the defaults need no read");
     tx.commit().await.expect("commit");
+    assert_eq!(
+        terms_row(&app.pool, &pending.order_id).await,
+        (None, None, true)
+    );
 }
 
 async fn bind_paypal(app: &TestApp, buyer: &TestActor, order_id: &str) -> (StatusCode, Value) {

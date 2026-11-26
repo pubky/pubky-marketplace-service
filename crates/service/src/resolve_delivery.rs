@@ -88,6 +88,12 @@ pub(crate) fn resolve_backoff_seconds(attempt_count: i32) -> i64 {
     (BACKOFF_BASE_SECONDS << shift).min(BACKOFF_CAP_SECONDS)
 }
 
+/// The longest delay-seconds `Retry-After` is read as: a year. A larger
+/// value is a request to wait longer than anything here schedules (the hard
+/// deadline and the follower's cap come first), and an unbounded one would
+/// overflow the date arithmetic below.
+pub(crate) const MAX_RETRY_AFTER_SECONDS: i64 = 366 * 24 * 60 * 60;
+
 /// Parses a `Retry-After` header (delay-seconds or HTTP-date) into a due
 /// instant. A malformed value falls back — the caller then uses the normal
 /// backoff. Zero, near-zero, and past values parse fine; the `max()` floor
@@ -95,7 +101,7 @@ pub(crate) fn resolve_backoff_seconds(attempt_count: i32) -> i64 {
 pub(crate) fn retry_after_due_at(header: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     let trimmed = header.trim();
     if let Ok(seconds) = trimmed.parse::<i64>() {
-        return Some(now + chrono::Duration::seconds(seconds.max(0)));
+        return Some(now + chrono::Duration::seconds(seconds.clamp(0, MAX_RETRY_AFTER_SECONDS)));
     }
     DateTime::parse_from_rfc2822(trimmed)
         .ok()
@@ -598,6 +604,25 @@ mod tests {
         // Malformed falls back (None).
         assert_eq!(retry_after_due_at("soon", now), None);
         assert_eq!(retry_after_due_at("", now), None);
+    }
+
+    #[test]
+    fn a_huge_retry_after_is_clamped_instead_of_overflowing() {
+        let now = at(1_000_000);
+        let ceiling = now + chrono::Duration::seconds(MAX_RETRY_AFTER_SECONDS);
+        for value in [
+            "31622400",
+            "31622401",
+            "9999999999999",
+            "9223372036854775807",
+            "9223372036854775",
+            "9223372036854776",
+        ] {
+            assert_eq!(retry_after_due_at(value, now), Some(ceiling), "{value}");
+        }
+        // Past i64: not a delay-seconds value at all.
+        assert_eq!(retry_after_due_at("9223372036854775808", now), None);
+        assert_eq!(retry_after_due_at("-9223372036854775808", now), Some(now));
     }
 
     #[test]

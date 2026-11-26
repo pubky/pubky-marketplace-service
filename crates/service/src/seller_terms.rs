@@ -26,7 +26,7 @@
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
-use sqlx::{Postgres, Transaction};
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use marketplace_domain::region::{shop_country_from_record, SellerStatus};
@@ -117,11 +117,91 @@ fn bounded_days(record: &Value, field: &str) -> Option<i32> {
     i32::try_from(days).ok()
 }
 
-/// Freezes the seller's delivery periods on the order, once. Call it at a
-/// payment lock point, inside the transaction that holds the order row.
+/// The message of a payment start refused with [`TermsNotRead`].
+pub const TERMS_NOT_READ: &str =
+    "The seller's terms were not read for this payment. Try again shortly.";
+
+/// The seller's records an order freezes when its payment starts, read
+/// before the transaction that freezes them ([`read_for_order`]), so no
+/// homeserver wait ever holds a connection, a row lock or a Paykit call.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TermsRead {
+    /// No homeserver is configured: the order freezes the defaults.
+    NoHomeserver,
+    /// Nothing was read: the command is refused before its payment starts,
+    /// or the order's terms were already captured.
+    NotRead,
+    /// The order's records, as read.
+    Read(Box<OrderRecords>),
+}
+
+impl TermsRead {
+    /// What a command that read nothing carries.
+    pub fn not_read(homeserver_configured: bool) -> Self {
+        if homeserver_configured {
+            Self::NotRead
+        } else {
+            Self::NoHomeserver
+        }
+    }
+}
+
+/// One order's shop record and return policy, as read.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrderRecords {
+    order_id: Uuid,
+    seller_pubky: String,
+    shop: HomeserverFetchOutcome,
+    return_policy: crate::return_policy::PolicyRead,
+}
+
+/// [`capture_for_order`] found the order's terms uncaptured with no records
+/// read for it: the order changed after the command's checks. Nothing is
+/// frozen; a retry reads them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TermsNotRead;
+
+/// Reads the seller's shop record and every line's listing record for an
+/// order whose terms are not yet captured, before the transaction that
+/// captures them. Only the order's buyer makes this read, so nobody can make
+/// the service read another seller's homeserver through a payment; callers
+/// make their own refusal checks first.
+pub async fn read_for_order(
+    pool: &PgPool,
+    homeserver: Option<&dyn HomeserverListingClient>,
+    order_id: Uuid,
+    buyer_pubky: &str,
+) -> Result<TermsRead, sqlx::Error> {
+    let Some(homeserver) = homeserver else {
+        return Ok(TermsRead::NoHomeserver);
+    };
+    let seller_pubky: Option<String> = sqlx::query_scalar(
+        "SELECT seller_pubky FROM orders \
+         WHERE id = $1 AND buyer_pubky = $2 AND delivery_terms_captured_at IS NULL",
+    )
+    .bind(order_id)
+    .bind(buyer_pubky)
+    .fetch_optional(pool)
+    .await?;
+    let Some(seller_pubky) = seller_pubky else {
+        return Ok(TermsRead::NotRead);
+    };
+    let shop = homeserver.fetch_shop(&seller_pubky).await;
+    let return_policy =
+        crate::return_policy::read_for_order(pool, homeserver, order_id, &seller_pubky).await?;
+    Ok(TermsRead::Read(Box::new(OrderRecords {
+        order_id,
+        seller_pubky,
+        shop,
+        return_policy,
+    })))
+}
+
+/// Freezes the seller's delivery periods on the order, once, from the
+/// records [`read_for_order`] read. Call it at a payment lock point, inside
+/// the transaction that holds the order row.
 ///
-/// - An order whose terms were already captured is left untouched, without
-///   reading the homeserver again.
+/// - An order whose terms were already captured is left untouched.
 /// - Without a configured homeserver, or when the seller has no shop record
 ///   (`NotFound`), the order captures no periods and the defaults apply.
 /// - When the shop record cannot be read (`Unavailable`), the payment still
@@ -129,13 +209,14 @@ fn bounded_days(record: &Value, field: &str) -> Option<i32> {
 ///   `ALERT seller_terms_fallback_unreadable_shop_record` is logged with the
 ///   seller pubky and order id, so payments are not coupled to homeserver
 ///   availability.
+/// - An uncaptured order with no records read for it is [`TermsNotRead`].
 pub async fn capture_for_order(
     tx: &mut Transaction<'_, Postgres>,
-    homeserver: Option<&dyn HomeserverListingClient>,
+    read: &TermsRead,
     order_id: Uuid,
     seller_pubky: &str,
     now: DateTime<Utc>,
-) -> Result<(), sqlx::Error> {
+) -> Result<Result<(), TermsNotRead>, sqlx::Error> {
     let already_captured: bool = sqlx::query_scalar(
         "SELECT delivery_terms_captured_at IS NOT NULL FROM orders WHERE id = $1",
     )
@@ -143,41 +224,53 @@ pub async fn capture_for_order(
     .fetch_one(&mut **tx)
     .await?;
     if already_captured {
-        return Ok(());
+        return Ok(Ok(()));
     }
-    let (terms, declaration, confirms_bitcoin) = match homeserver {
-        None => (
+    let (terms, declaration, confirms_bitcoin, return_policy) = match read {
+        TermsRead::NoHomeserver => (
             SellerDeliveryTerms::default(),
             SellerDeclaration::default(),
             Some(false),
+            None,
         ),
-        Some(homeserver) => match homeserver.fetch_shop(seller_pubky).await {
-            HomeserverFetchOutcome::Found(record) => (
-                SellerDeliveryTerms::from_shop_record(&record),
-                SellerDeclaration::from_shop_record(&record, now),
-                Some(confirms_bitcoin_payments(&record)),
-            ),
-            HomeserverFetchOutcome::NotFound => (
-                SellerDeliveryTerms::default(),
-                SellerDeclaration::undeclared(),
-                Some(false),
-            ),
-            HomeserverFetchOutcome::Unavailable => {
-                tracing::error!(
-                    seller_pubky = %seller_pubky,
-                    order_id = %order_id,
-                    "ALERT seller_terms_fallback_unreadable_shop_record: seller shop record \
-                     unreadable at payment start; order frozen with the configured default \
-                     delivery periods and no seller confirmation \
-                 (seller_pubky={seller_pubky} order_id={order_id})"
-                );
-                (
+        TermsRead::Read(records)
+            if records.order_id == order_id && records.seller_pubky == seller_pubky =>
+        {
+            let (terms, declaration, confirms_bitcoin) = match &records.shop {
+                HomeserverFetchOutcome::Found(record) => (
+                    SellerDeliveryTerms::from_shop_record(record),
+                    SellerDeclaration::from_shop_record(record, now),
+                    Some(confirms_bitcoin_payments(record)),
+                ),
+                HomeserverFetchOutcome::NotFound => (
                     SellerDeliveryTerms::default(),
-                    SellerDeclaration::default(),
-                    None,
-                )
-            }
-        },
+                    SellerDeclaration::undeclared(),
+                    Some(false),
+                ),
+                HomeserverFetchOutcome::Unavailable => {
+                    tracing::error!(
+                        seller_pubky = %seller_pubky,
+                        order_id = %order_id,
+                        "ALERT seller_terms_fallback_unreadable_shop_record: seller shop record \
+                         unreadable at payment start; order frozen with the configured default \
+                         delivery periods and no seller confirmation \
+                     (seller_pubky={seller_pubky} order_id={order_id})"
+                    );
+                    (
+                        SellerDeliveryTerms::default(),
+                        SellerDeclaration::default(),
+                        None,
+                    )
+                }
+            };
+            (
+                terms,
+                declaration,
+                confirms_bitcoin,
+                Some(&records.return_policy),
+            )
+        }
+        TermsRead::NotRead | TermsRead::Read(_) => return Ok(Err(TermsNotRead)),
     };
     sqlx::query(
         "UPDATE orders SET delivery_assume_days = $2, auto_complete_days = $3, \
@@ -195,10 +288,10 @@ pub async fn capture_for_order(
     .bind(declaration.status_confirmed_at)
     .execute(&mut **tx)
     .await?;
-    if let Some(homeserver) = homeserver {
-        crate::return_policy::capture_for_order(tx, homeserver, order_id, seller_pubky).await?;
+    if let Some(return_policy) = return_policy {
+        crate::return_policy::freeze(tx, order_id, return_policy).await?;
     }
-    Ok(())
+    Ok(Ok(()))
 }
 
 #[cfg(test)]

@@ -8,8 +8,15 @@ use marketplace_service::clock::SystemClock;
 use marketplace_service::config::Config;
 use marketplace_service::{http, workers, AppState};
 
-fn env_filter() -> EnvFilter {
-    EnvFilter::try_from_default_env()
+/// Whether `HOMESERVER_RESOLUTION` selects `pkarr`. A bad value is refused
+/// when the homeserver client is built.
+fn resolves_through_pkarr() -> bool {
+    std::env::var(marketplace_service::homeserver::ENV_HOMESERVER_RESOLUTION)
+        .is_ok_and(|value| value.trim() == "pkarr")
+}
+
+fn env_filter(pkarr: bool) -> EnvFilter {
+    let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,marketplace_service=info"))
         .add_directive("sqlx=warn".parse().expect("valid sqlx log directive"))
         .add_directive("hyper=warn".parse().expect("valid hyper log directive"))
@@ -19,14 +26,23 @@ fn env_filter() -> EnvFilter {
                 .expect("valid tower_http log directive"),
         )
         .add_directive("h2=warn".parse().expect("valid h2 log directive"))
-        .add_directive("rustls=warn".parse().expect("valid rustls log directive"))
+        .add_directive("rustls=warn".parse().expect("valid rustls log directive"));
+    if !pkarr {
+        return filter;
+    }
+    // Under `pkarr` every read resolves a seller, and the SDK's info and warn
+    // logs and pkarr's warnings (Pkarr lookups, transport fallbacks, DHT and
+    // relay failures) carry full pubkys.
+    filter
+        .add_directive("pubky=error".parse().expect("valid pubky log directive"))
+        .add_directive("pkarr=error".parse().expect("valid pkarr log directive"))
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .json()
-        .with_env_filter(env_filter())
+        .with_env_filter(env_filter(resolves_through_pkarr()))
         .init();
 
     let config = Config::from_env()?;
@@ -143,9 +159,10 @@ async fn main() -> anyhow::Result<()> {
         },
         "store connectors mode resolved"
     );
-    // HOMESERVER_URL is required: `listing.sync` fetches canonical
-    // seller-signed records from it, and running without the sync path would
-    // silently re-open the unregistered-listing dead-end it exists to fix.
+    // A homeserver source is required (HOMESERVER_URL, or
+    // HOMESERVER_RESOLUTION=pkarr): `listing.sync` fetches canonical
+    // seller-signed records through it, and running without the sync path
+    // would silently re-open the unregistered-listing dead-end it exists to fix.
     let homeserver = Arc::new(marketplace_service::homeserver::client_from_env()?);
     tracing::info!("homeserver listing sync enabled");
     if let Some(grant) = &grant {
@@ -281,12 +298,15 @@ const POOL_ACQUIRE_WAIT: Duration = Duration::from_secs(15);
 
 // A request or worker pass waits at most 15 s for a connection, instead of
 // the sqlx default of 30 s. That covers a payment-method bind, which holds
-// its transaction across the 10 s Paykit HTTP timeout. A command
-// transaction can hold a connection across a longer upstream read: the
-// deliverable read-back in `digital_delivery.set` (up to 120 s). A request
-// waiting behind one fails with `PoolTimedOut` after 15 s rather than 30 s.
-// The same 15 s also bounds opening a new connection. At boot the service
-// still waits up to `BOOT_DATABASE_WAIT` for the database.
+// its transaction across the 10 s Paykit HTTP timeout. No transaction holds
+// a connection across a homeserver read: every command and the bind read the
+// seller's homeserver (including the 120 s deliverable read-back of
+// `digital_delivery.set`) before their transaction opens, so under
+// `HOMESERVER_RESOLUTION=pkarr`, where sellers pick the homeserver, a stalled
+// one holds no connection. A request waiting behind a full pool fails with
+// `PoolTimedOut` after 15 s rather than 30 s. The same 15 s also bounds
+// opening a new connection. At boot the service still waits up to
+// `BOOT_DATABASE_WAIT` for the database.
 fn main_pool_options() -> PgPoolOptions {
     PgPoolOptions::new()
         .max_connections(20)
@@ -327,17 +347,35 @@ mod tests {
 
     #[test]
     fn dependency_directives_remain_at_warn() {
-        let filter = env_filter().to_string();
-        for directive in [
-            "sqlx=warn",
-            "hyper=warn",
-            "tower_http=warn",
-            "h2=warn",
-            "rustls=warn",
-        ] {
+        for pkarr in [false, true] {
+            let filter = env_filter(pkarr).to_string();
+            for directive in [
+                "sqlx=warn",
+                "hyper=warn",
+                "tower_http=warn",
+                "h2=warn",
+                "rustls=warn",
+            ] {
+                assert!(
+                    filter.contains(directive),
+                    "{directive} missing from {filter}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sdk_and_pkarr_logs_are_limited_to_errors_only_under_pkarr() {
+        let fixed = env_filter(false).to_string();
+        assert!(
+            !fixed.contains("pubky=") && !fixed.contains("pkarr="),
+            "fixed mode keeps the SDK and pkarr levels: {fixed}"
+        );
+        let pkarr = env_filter(true).to_string();
+        for directive in ["pubky=error", "pkarr=error"] {
             assert!(
-                filter.contains(directive),
-                "{directive} missing from {filter}"
+                pkarr.contains(directive),
+                "{directive} missing from {pkarr}"
             );
         }
     }
