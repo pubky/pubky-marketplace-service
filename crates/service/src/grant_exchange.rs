@@ -4,7 +4,9 @@
 //!
 //! The request goes through [`HomeserverTransport`], not the `pubky` SDK's
 //! grant flow, whose requests follow redirects, allow plain HTTP and connect
-//! to whatever address a record names. The issuer's homeserver must also be
+//! to whatever address a record names. At a direct address the homeserver
+//! must present its own key, checked without reading any record during the
+//! TLS handshake. The issuer's homeserver must also be
 //! the one the service is configured with (`HOMESERVER_PUBKY`, the homeserver
 //! at `HOMESERVER_URL` every pubky is read from); any other is refused before
 //! a request is sent to it.

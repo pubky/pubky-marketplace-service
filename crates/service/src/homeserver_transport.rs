@@ -14,7 +14,9 @@
 //!   HTTP client connects to without resolving, is checked as that address;
 //!   and the host of every URL built is checked again before it is sent;
 //! - follow no redirect, speak only HTTPS and use no proxy;
-//! - never open a connection only to probe whether an endpoint is reachable.
+//! - never open a connection only to probe whether an endpoint is reachable;
+//! - verify a direct endpoint's TLS key without any record lookup
+//!   ([`direct_tls`]): the host a request is addressed to is the key.
 //!
 //! It replaces the `pubky` SDK's request path, whose clients follow
 //! redirects, allow plain HTTP, connect to whatever addresses a record names
@@ -262,6 +264,94 @@ impl Resolve for IcannResolver {
     }
 }
 
+/// The TLS configuration of direct homeserver endpoints, of this transport
+/// and of the `HOMESERVER_RESOLUTION=pkarr` one: the server must present the
+/// raw public key the request is addressed to, its own.
+pub(crate) fn direct_tls() -> rustls::ClientConfig {
+    rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("the provider supports the default protocol versions")
+    .dangerous()
+    .with_custom_certificate_verifier(Arc::new(PinnedKeyVerifier {
+        algorithms: rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms,
+    }))
+    .with_no_client_auth()
+}
+
+/// Accepts a server whose raw public key is the one named by the host of the
+/// request, and no other. The Pkarr client's own verifier also accepts keys
+/// the host's record delegates to, and finds them by resolving records inside
+/// the handshake, blocking the runtime thread that drives it for as long as
+/// those lookups take. A homeserver's own key needs no lookup: the host is
+/// the key.
+#[derive(Debug)]
+struct PinnedKeyVerifier {
+    algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+impl rustls::client::danger::ServerCertVerifier for PinnedKeyVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if !intermediates.is_empty() {
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::UnknownIssuer,
+            ));
+        }
+        let not_valid_for_name =
+            || rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidForName);
+        let rustls::pki_types::ServerName::DnsName(host) = server_name else {
+            return Err(not_valid_for_name());
+        };
+        let key = pkarr::PublicKey::try_from(host.as_ref()).map_err(|_| not_valid_for_name())?;
+        if key.to_public_key_der().as_bytes() == end_entity.as_ref() {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::UnknownIssuer,
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature_with_raw_key(
+            message,
+            &rustls::pki_types::SubjectPublicKeyInfoDer::from(cert.as_ref()),
+            dss,
+            &self.algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![rustls::SignatureScheme::ED25519]
+    }
+
+    fn requires_raw_public_keys(&self) -> bool {
+        true
+    }
+}
+
 /// The TLS configuration of ICANN-domain homeservers: the WebPKI roots and
 /// the provider the `pubky` SDK uses for them.
 fn icann_tls() -> anyhow::Result<rustls::ClientConfig> {
@@ -428,15 +518,14 @@ pub struct HomeserverTransport {
 
 impl HomeserverTransport {
     /// Reads records through `pkarr`'s cache while fresh, otherwise the
-    /// network, and pins direct endpoints' TLS to the homeserver key with it.
+    /// network. Direct endpoints' TLS is pinned to the homeserver key
+    /// ([`direct_tls`]), checked without reading any record.
     pub fn new(pkarr: pkarr::Client, policy: EndpointPolicy) -> anyhow::Result<Self> {
-        let records: Arc<dyn RecordSource> = Arc::new(pkarr.clone());
-        Self::with_records(pkarr, records, policy)
+        Self::with_records(Arc::new(pkarr), policy)
     }
 
     /// Like [`Self::new`], with the records read from `records`.
     pub fn with_records(
-        pkarr: pkarr::Client,
         records: Arc<dyn RecordSource>,
         policy: EndpointPolicy,
     ) -> anyhow::Result<Self> {
@@ -445,7 +534,7 @@ impl HomeserverTransport {
                 records: records.clone(),
                 policy,
             }))
-            .use_preconfigured_tls(rustls::ClientConfig::from(pkarr))
+            .use_preconfigured_tls(direct_tls())
             .build()?;
         let icann = hardened(pubky_reqwest::Client::builder())
             .dns_resolver(Arc::new(IcannResolver { policy }))
@@ -985,5 +1074,330 @@ mod tests {
             .sign(&user)
             .unwrap();
         assert_eq!(homeserver_named_by(&domain), None);
+    }
+
+    fn pinned_verifier() -> PinnedKeyVerifier {
+        PinnedKeyVerifier {
+            algorithms: rustls::crypto::aws_lc_rs::default_provider()
+                .signature_verification_algorithms,
+        }
+    }
+
+    fn verified(
+        host: &str,
+        presented: &pkarr::PublicKey,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+    ) -> bool {
+        use rustls::client::danger::ServerCertVerifier;
+        let certificate =
+            rustls::pki_types::CertificateDer::from(presented.to_public_key_der().to_vec());
+        let name = rustls::pki_types::ServerName::try_from(host.to_owned()).expect("server name");
+        pinned_verifier()
+            .verify_server_cert(
+                &certificate,
+                intermediates,
+                &name,
+                &[],
+                rustls::pki_types::UnixTime::now(),
+            )
+            .is_ok()
+    }
+
+    #[test]
+    fn the_direct_verifier_accepts_only_the_hosts_own_key() {
+        let homeserver = pkarr::Keypair::random().public_key();
+        let other = pkarr::Keypair::random().public_key();
+        let host = homeserver.to_z32();
+
+        assert!(verified(&host, &homeserver, &[]));
+        assert!(!verified(&host, &other, &[]));
+        assert!(!verified("homeserver.example", &homeserver, &[]));
+        assert!(!verified("127.0.0.1", &homeserver, &[]));
+        let extra = rustls::pki_types::CertificateDer::from(other.to_public_key_der().to_vec());
+        assert!(!verified(&host, &homeserver, &[extra]));
+        use rustls::client::danger::ServerCertVerifier;
+        assert!(pinned_verifier().requires_raw_public_keys());
+        assert_eq!(
+            pinned_verifier().supported_verify_schemes(),
+            vec![rustls::SignatureScheme::ED25519]
+        );
+    }
+
+    /// Handshakes of the transport's direct client with a server on
+    /// loopback, while every record lookup the Pkarr client makes goes to a
+    /// relay that counts it. The Pkarr client caches nothing, so a lookup
+    /// during a handshake cannot be answered from memory unseen.
+    mod direct_handshakes {
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Mutex;
+
+        use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio::time::Instant;
+
+        use super::*;
+
+        /// How long the Pkarr client waits for a relay answer. A handshake
+        /// that made a lookup at a relay gone silent takes at least this.
+        const RELAY_TIMEOUT: Duration = Duration::from_secs(2);
+
+        /// A Pkarr relay on loopback serving the records it was given and
+        /// counting the lookups it receives. Once silenced it answers none.
+        #[derive(Clone)]
+        struct Relay {
+            url: String,
+            records: Arc<Mutex<HashMap<String, SignedPacket>>>,
+            lookups: Arc<AtomicUsize>,
+            silent: Arc<AtomicBool>,
+        }
+
+        impl Relay {
+            async fn start() -> Self {
+                let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let relay = Self {
+                    url: format!("http://{}", socket.local_addr().unwrap()),
+                    records: Arc::default(),
+                    lookups: Arc::default(),
+                    silent: Arc::default(),
+                };
+                let serving = relay.clone();
+                tokio::spawn(async move {
+                    while let Ok((mut stream, _)) = socket.accept().await {
+                        let relay = serving.clone();
+                        tokio::spawn(async move {
+                            let Some(head) = request_head(&mut stream).await else {
+                                return;
+                            };
+                            relay.lookups.fetch_add(1, Ordering::SeqCst);
+                            if relay.silent.load(Ordering::SeqCst) {
+                                let _ = stream.read(&mut [0u8; 1]).await;
+                                return;
+                            }
+                            let _ = stream.write_all(&relay.answer(&head)).await;
+                        });
+                    }
+                });
+                relay
+            }
+
+            fn serve(&self, packet: SignedPacket) {
+                self.records
+                    .lock()
+                    .unwrap()
+                    .insert(packet.public_key().to_z32(), packet);
+            }
+
+            fn answer(&self, head: &str) -> Vec<u8> {
+                let path = head.split_whitespace().nth(1).unwrap_or_default();
+                let key = path.split('?').next().unwrap_or_default();
+                let key = key.rsplit('/').next().unwrap_or_default();
+                match self.records.lock().unwrap().get(key) {
+                    Some(packet) => {
+                        let body = packet.to_relay_payload();
+                        let mut answer = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .into_bytes();
+                        answer.extend_from_slice(&body);
+                        answer
+                    }
+                    None => {
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_vec()
+                    }
+                }
+            }
+
+            fn lookups(&self) -> usize {
+                self.lookups.load(Ordering::SeqCst)
+            }
+
+            /// A Pkarr client that reads records only from this relay and
+            /// caches none.
+            fn client(&self) -> pkarr::Client {
+                pkarr::Client::builder()
+                    .no_default_network()
+                    .relays(&[self.url.as_str()])
+                    .unwrap()
+                    .cache_size(0)
+                    .relay_request_timeout(RELAY_TIMEOUT)
+                    .build()
+                    .unwrap()
+            }
+        }
+
+        async fn request_head<S: AsyncRead + Unpin>(stream: &mut S) -> Option<String> {
+            let mut head = Vec::new();
+            let mut buffer = [0u8; 1024];
+            while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                match stream.read(&mut buffer).await {
+                    Ok(0) | Err(_) => return None,
+                    Ok(read) => head.extend_from_slice(&buffer[..read]),
+                }
+            }
+            Some(String::from_utf8_lossy(&head).into_owned())
+        }
+
+        /// One TLS handshake the server ran: whether it completed, the relay
+        /// lookups made while it ran, and how long it took.
+        #[derive(Debug, Clone, Copy)]
+        struct Handshake {
+            completed: bool,
+            lookups: usize,
+            took: Duration,
+        }
+
+        /// A server on loopback presenting `presented`'s raw public key and
+        /// answering every request `200`. When `silence` is set, a connection
+        /// silences `relay` before the handshake starts.
+        async fn pinned_server(
+            presented: &pkarr::Keypair,
+            relay: &Relay,
+            silence: bool,
+        ) -> (u16, Arc<Mutex<Vec<Handshake>>>) {
+            let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = socket.local_addr().unwrap().port();
+            let acceptor =
+                tokio_rustls::TlsAcceptor::from(Arc::new(presented.to_rpk_rustls_server_config()));
+            let handshakes = Arc::new(Mutex::new(Vec::new()));
+            let (relay, recorded) = (relay.clone(), handshakes.clone());
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = socket.accept().await {
+                    if silence {
+                        relay.silent.store(true, Ordering::SeqCst);
+                    }
+                    let (started, before) = (Instant::now(), relay.lookups());
+                    let accepted = acceptor.accept(stream).await;
+                    recorded.lock().unwrap().push(Handshake {
+                        completed: accepted.is_ok(),
+                        lookups: relay.lookups() - before,
+                        took: started.elapsed(),
+                    });
+                    let Ok(mut tls) = accepted else {
+                        continue;
+                    };
+                    tokio::spawn(async move {
+                        if request_head(&mut tls).await.is_some() {
+                            let _ = tls
+                                .write_all(
+                                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                                )
+                                .await;
+                            let _ = tls.shutdown().await;
+                        }
+                    });
+                }
+            });
+            (port, handshakes)
+        }
+
+        /// `homeserver`'s record listing 127.0.0.1 at `port` for itself and,
+        /// if given, a delegation to `delegate`.
+        fn direct_record(
+            homeserver: &pkarr::Keypair,
+            port: u16,
+            delegate: Option<&pkarr::PublicKey>,
+        ) -> SignedPacket {
+            let mut direct = SVCB::new(1, ".".try_into().unwrap());
+            direct.set_port(port);
+            let mut packet = SignedPacket::builder()
+                .https(".".try_into().unwrap(), direct, 60)
+                .address(".".try_into().unwrap(), Ipv4Addr::LOCALHOST.into(), 60);
+            if let Some(delegate) = delegate {
+                let target = delegate.to_z32();
+                let mut delegated = SVCB::new(2, target.as_str().try_into().unwrap());
+                delegated.set_port(port);
+                packet = packet.https(".".try_into().unwrap(), delegated, 60);
+            }
+            packet.sign(homeserver).unwrap()
+        }
+
+        /// One `GET` through a transport reading `relay`'s records, to
+        /// `homeserver`'s direct endpoint.
+        async fn get(
+            relay: &Relay,
+            homeserver: &pkarr::PublicKey,
+        ) -> Result<pubky_reqwest::Response, Unsent> {
+            let transport =
+                HomeserverTransport::new(relay.client(), EndpointPolicy::PublicOrLoopback).unwrap();
+            let route = transport
+                .route(homeserver)
+                .await
+                .expect("the relay serves the homeserver's record");
+            assert!(!route.is_empty(), "the record lists a direct endpoint");
+            transport
+                .send(homeserver, &route, "/pub/x", |client, url| client.get(url))
+                .await
+        }
+
+        /// The handshakes the server recorded. A refused client can return
+        /// before the server reads its alert, so this waits for the first.
+        async fn handshakes_of(recorded: &Mutex<Vec<Handshake>>) -> Vec<Handshake> {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let handshakes = recorded.lock().unwrap().clone();
+                if !handshakes.is_empty() {
+                    return handshakes;
+                }
+                assert!(Instant::now() < deadline, "the server was reached");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_hosts_own_key_is_accepted_with_no_lookup_while_the_relay_is_silent() {
+            let relay = Relay::start().await;
+            let homeserver = pkarr::Keypair::random();
+            let (port, recorded) = pinned_server(&homeserver, &relay, true).await;
+            relay.serve(direct_record(&homeserver, port, None));
+
+            let response = get(&relay, &homeserver.public_key())
+                .await
+                .expect("the homeserver answers");
+            assert_eq!(response.status().as_u16(), 200);
+            for handshake in handshakes_of(&recorded).await {
+                assert!(handshake.completed, "{handshake:?}");
+                assert_eq!(handshake.lookups, 0, "{handshake:?}");
+                assert!(handshake.took < RELAY_TIMEOUT, "{handshake:?}");
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn another_key_is_refused_at_once_with_no_lookup() {
+            let relay = Relay::start().await;
+            let homeserver = pkarr::Keypair::random();
+            let impostor = pkarr::Keypair::random();
+            let (port, recorded) = pinned_server(&impostor, &relay, true).await;
+            relay.serve(direct_record(&homeserver, port, None));
+
+            assert!(get(&relay, &homeserver.public_key()).await.is_err());
+            for handshake in handshakes_of(&recorded).await {
+                assert!(!handshake.completed, "{handshake:?}");
+                assert_eq!(handshake.lookups, 0, "{handshake:?}");
+                assert!(handshake.took < RELAY_TIMEOUT, "{handshake:?}");
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_key_the_record_delegates_to_is_refused_with_no_lookup() {
+            let relay = Relay::start().await;
+            let homeserver = pkarr::Keypair::random();
+            let delegate = pkarr::Keypair::random();
+            let (port, recorded) = pinned_server(&delegate, &relay, false).await;
+            relay.serve(direct_record(
+                &homeserver,
+                port,
+                Some(&delegate.public_key()),
+            ));
+            relay.serve(direct_record(&delegate, port, None));
+
+            assert!(get(&relay, &homeserver.public_key()).await.is_err());
+            for handshake in handshakes_of(&recorded).await {
+                assert!(!handshake.completed, "{handshake:?}");
+                assert_eq!(handshake.lookups, 0, "{handshake:?}");
+            }
+        }
     }
 }
