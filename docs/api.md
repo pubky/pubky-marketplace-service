@@ -504,7 +504,8 @@ The inventory error codes are listed with the [inventory endpoints](#inventory).
 Two independent limiters guard the authenticated surfaces, and the public
 [listing availability](#public-listing-availability) read has its own
 per-client limiter. None emits `X-RateLimit-*` headers; the only signal is the
-`429` response and its `Retry-After` header. Responses to an allowed origin
+`429` response and its `Retry-After` header (a `sync-many` item refused inside
+a batch instead gets item `status: 429` with `retry_after_seconds`). Responses to an allowed origin
 carry `Access-Control-Expose-Headers: retry-after`, so browser clients can
 read the delay.
 
@@ -538,9 +539,9 @@ A token bucket per `(actor pubky, endpoint class)`, stored in
   continuously (`rate / 60` tokens per second).
 - Burst capacity: rate times `AUTOMATION_RATE_LIMIT_BURST_MULTIPLIER` (default
   2, maximum 10), capped at 20000. A bucket starts full.
-- Each request costs one token. A `sync-many` batch costs one token per item
-  it runs: the request's token pays for the first, and each later item spends
-  one more before it runs (see [Batch sync](#batch-sync-sync-many)).
+- Each request costs one token. A `sync-many` request spends its one token
+  even if no item runs; that token pays for the first item, and each later
+  item spends one more before it runs (see [Batch sync](#batch-sync-sync-many)).
 - Classes are derived from the request path:
 
   | Class | Matches |
@@ -1235,14 +1236,14 @@ Semantics:
   "retry_after_seconds": <integer>}}`, the delay a refused request would get
   in `Retry-After`. With the default bucket (240 tokens, 120 a minute) a full
   100-item batch always fits a full bucket.
-- A batch has 30 seconds. No item starts after that; the item already running
-  finishes under its own homeserver timeouts. Every item not started is
-  answered without running, and without spending a token, as `status: 503`
+- A batch has 30 seconds. No item is admitted after that; the item already
+  running finishes under its own homeserver timeouts. Every item not admitted
+  is answered without running, and spends no token of its own, as `status: 503`
   with `{"ok": false, "error": {"code": "BATCH_DEADLINE_EXCEEDED", "message":
   "..."}}`. Retry those items in a later batch.
-- Items read the homeserver a bounded number at a time: at most 2 items of
-  one caller across all of its concurrent batches, and at most 16 across all
-  callers. Time spent waiting for a turn counts against the batch's 30
+- Per service process, items read the homeserver a bounded number at a time:
+  at most 2 items of one caller across all of its concurrent batches, and at
+  most 16 across all callers. Time spent waiting for a turn counts against the batch's 30
   seconds. Commands outside `sync-many` do not wait for these turns.
 
 ## Inventory
