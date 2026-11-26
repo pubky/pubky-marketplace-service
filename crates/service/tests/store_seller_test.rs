@@ -37,7 +37,7 @@ use common::{
     new_actor, offer_action, order_command, payment_command, place_bid_command,
     prepare_locks_command, register_command, register_locks_command, release_drop_command,
     reserve_command, send, sync_command, sync_drop_command, test_app, TestActor, TestApp,
-    OFFER_COMMAND_ID,
+    OFFER_COMMAND_ID, TEST_BUNDLE_ID,
 };
 
 /// `(METHOD, path)` for every `.route(..)` in `build_router`.
@@ -342,7 +342,7 @@ fn refusal_cases(other: &OtherSeller) -> BTreeMap<String, Value> {
     add(fresh(register_locks_command(
         &other.payment_id,
         2,
-        "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        TEST_BUNDLE_ID,
         "",
         1,
     )));
