@@ -59,6 +59,19 @@ const MAX_RECORD_BYTES: usize = 1024 * 1024;
 /// over `MAX_AWARD_LISTING_BYTES` still reads here and is refused where a
 /// snapshot of its exact bytes is needed, as it was before the bound existed.
 const MAX_JSON_RECORD_BYTES: usize = 4 * 1024 * 1024;
+/// Most JSON values a fetched record may hold, object keys included. A body
+/// of many tiny values (`[0,0,0,…]`, `{"a":0,"b":0,…}`) builds a `Value` tree
+/// tens of times its byte size; this bounds that tree to a few MiB on top of
+/// the body. Decoded strings are never longer than their encoded bytes, so
+/// string payloads stay within [`MAX_JSON_RECORD_BYTES`] without a limit of
+/// their own. A listing at every product limit holds far fewer values.
+const MAX_JSON_RECORD_VALUES: usize = 100_000;
+/// Deepest nesting a fetched record may use, well above what the record
+/// formats need.
+const MAX_JSON_RECORD_DEPTH: usize = 32;
+/// Records parsed at once by one client, on the blocking pool. Parsing never
+/// waits on the network, so a slow homeserver cannot hold a permit.
+const MAX_CONCURRENT_RECORD_PARSES: usize = 8;
 
 /// One listing-record fetch result. Transport failures, non-2xx responses
 /// other than a definitive 404, and non-JSON bodies are `Unavailable`
@@ -77,6 +90,135 @@ pub enum HomeserverRawFetchOutcome {
     NotFound,
     TooLarge,
     Unavailable,
+}
+
+/// Why [`parse_json_record`] refused a body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JsonRecordRefusal {
+    /// Not one well-formed JSON document.
+    Malformed,
+    /// Nested deeper than [`MAX_JSON_RECORD_DEPTH`].
+    TooDeep,
+    /// More than [`MAX_JSON_RECORD_VALUES`] values.
+    TooManyValues,
+}
+
+/// Counts every value and object key of a document without building it, and
+/// stops at the first one over a limit.
+struct RecordShape<'a> {
+    values: &'a std::cell::Cell<usize>,
+    refusal: &'a std::cell::Cell<Option<JsonRecordRefusal>>,
+    depth: usize,
+}
+
+impl RecordShape<'_> {
+    fn count<E: serde::de::Error>(&self) -> Result<(), E> {
+        let values = self.values.get() + 1;
+        self.values.set(values);
+        if values > MAX_JSON_RECORD_VALUES {
+            self.refusal.set(Some(JsonRecordRefusal::TooManyValues));
+            return Err(E::custom("record holds too many values"));
+        }
+        Ok(())
+    }
+
+    fn enter<E: serde::de::Error>(&self) -> Result<Self, E> {
+        self.count()?;
+        if self.depth >= MAX_JSON_RECORD_DEPTH {
+            self.refusal.set(Some(JsonRecordRefusal::TooDeep));
+            return Err(E::custom("record nests too deeply"));
+        }
+        Ok(RecordShape {
+            values: self.values,
+            refusal: self.refusal,
+            depth: self.depth + 1,
+        })
+    }
+
+    fn child(&self) -> Self {
+        RecordShape {
+            values: self.values,
+            refusal: self.refusal,
+            depth: self.depth,
+        }
+    }
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for RecordShape<'_> {
+    type Value = ();
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for RecordShape<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<(), E> {
+        self.count()
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<(), E> {
+        self.count()
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<(), E> {
+        self.count()
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<(), E> {
+        self.count()
+    }
+
+    fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<(), E> {
+        self.count()
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<(), E> {
+        self.count()
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+        let inner = self.enter()?;
+        while seq.next_element_seed(inner.child())?.is_some() {}
+        Ok(())
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        let inner = self.enter()?;
+        while map.next_key_seed(inner.child())?.is_some() {
+            map.next_value_seed(inner.child())?;
+        }
+        Ok(())
+    }
+}
+
+/// Parses a fetched listing, drop, shop or content-lock record into a
+/// `Value`, after a pass that builds nothing has checked that the document
+/// stays within [`MAX_JSON_RECORD_DEPTH`] and [`MAX_JSON_RECORD_VALUES`].
+pub fn parse_json_record(bytes: &[u8]) -> Result<Value, JsonRecordRefusal> {
+    use serde::de::DeserializeSeed;
+    let values = std::cell::Cell::new(0);
+    let refusal = std::cell::Cell::new(None);
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let shape = RecordShape {
+        values: &values,
+        refusal: &refusal,
+        depth: 0,
+    };
+    if shape
+        .deserialize(&mut deserializer)
+        .and_then(|()| deserializer.end())
+        .is_err()
+    {
+        return Err(refusal.get().unwrap_or(JsonRecordRefusal::Malformed));
+    }
+    serde_json::from_slice(bytes).map_err(|_| JsonRecordRefusal::Malformed)
 }
 
 /// Where Shop writes a seller's shop record (singleton).
@@ -780,6 +922,7 @@ impl Default for PkarrResolutionCache {
 /// record read from the seller's own homeserver.
 pub struct HttpHomeserverClient {
     transport: Transport,
+    record_parses: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 enum Transport {
@@ -898,9 +1041,16 @@ impl HttpHomeserverClient {
         }
         tracing::info!(base_url = %base_url, "homeserver client configured");
         let http = reqwest::Client::builder().timeout(FETCH_TIMEOUT).build()?;
-        Ok(Self {
-            transport: Transport::Fixed { base_url, http },
-        })
+        Ok(Self::with_transport(Transport::Fixed { base_url, http }))
+    }
+
+    fn with_transport(transport: Transport) -> Self {
+        Self {
+            transport,
+            record_parses: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_RECORD_PARSES,
+            )),
+        }
     }
 
     /// A client that reads each pubky from the homeserver its Pkarr record
@@ -937,9 +1087,25 @@ impl HttpHomeserverClient {
             cache_ttl_seconds = cache.ttl.as_secs(),
             "homeserver client configured to resolve each pubky through Pkarr"
         );
-        Ok(Self {
-            transport: Transport::Pkarr(transport),
+        Ok(Self::with_transport(Transport::Pkarr(transport)))
+    }
+
+    /// [`parse_json_record`] on the blocking pool, at most
+    /// [`MAX_CONCURRENT_RECORD_PARSES`] at once. Waiting for a turn is bounded
+    /// like the read itself; `Err(None)` when no turn came.
+    async fn parse_record(&self, body: Vec<u8>) -> Result<Value, Option<JsonRecordRefusal>> {
+        let Ok(Ok(permit)) =
+            tokio::time::timeout(FETCH_TIMEOUT, self.record_parses.clone().acquire_owned()).await
+        else {
+            return Err(None);
+        };
+        tokio::task::spawn_blocking(move || {
+            let parsed = parse_json_record(&body);
+            drop(permit);
+            parsed.map_err(Some)
         })
+        .await
+        .unwrap_or(Err(None))
     }
 
     /// One `GET` of `target` on `pubky`'s homeserver, bounded by `timeout`
@@ -1068,7 +1234,25 @@ impl HttpHomeserverClient {
             return (HomeserverFetchOutcome::Unavailable, homeserver);
         }
         let record = match response.body_capped(MAX_JSON_RECORD_BYTES).await {
-            BodyRead::Complete(body) => serde_json::from_slice::<Value>(&body).ok(),
+            BodyRead::Complete(body) => match self.parse_record(body).await {
+                Ok(record) => Some(record),
+                Err(Some(JsonRecordRefusal::Malformed)) => None,
+                Err(Some(refusal)) => {
+                    tracing::warn!(
+                        pubky_host_prefix = %prefix,
+                        refusal = ?refusal,
+                        "homeserver record fetch refused a body over the JSON shape limits"
+                    );
+                    return (HomeserverFetchOutcome::Unavailable, homeserver);
+                }
+                Err(None) => {
+                    tracing::warn!(
+                        pubky_host_prefix = %prefix,
+                        "homeserver record fetch found no record parse turn in time"
+                    );
+                    return (HomeserverFetchOutcome::Unavailable, homeserver);
+                }
+            },
             BodyRead::TooLarge => {
                 tracing::warn!(
                     pubky_host_prefix = %prefix,
@@ -1128,7 +1312,9 @@ impl HttpHomeserverClient {
             return HomeserverFetchOutcome::Unavailable;
         }
         match response.body_capped(MAX_RECORD_BYTES).await {
-            BodyRead::Complete(body) => serde_json::from_slice(&body)
+            BodyRead::Complete(body) => self
+                .parse_record(body)
+                .await
                 .map(HomeserverFetchOutcome::Found)
                 .unwrap_or(HomeserverFetchOutcome::Unavailable),
             BodyRead::TooLarge | BodyRead::Failed => HomeserverFetchOutcome::Unavailable,
@@ -1759,7 +1945,8 @@ pub struct MalformedDigitalLock;
 /// (auction), and — for auctions — the terms from the sale object.
 ///
 /// Returns `Ok(None)` when the record cannot be interpreted as a listing
-/// record at all; field-level invariants are left to
+/// record at all, including variant quantities whose sum overflows an `i64`;
+/// field-level invariants are left to
 /// `validate_register_listing_payload`, which the sync handler runs on the
 /// result. A present-but-invalid `digitalLock` is `Err(MalformedDigitalLock)`.
 pub fn registration_payload_from_record(
@@ -1851,6 +2038,14 @@ pub fn registration_payload_from_record(
     if fulfillment_methods.is_empty() {
         fulfillment_methods = marketplace_domain::commands::default_fulfillment_methods();
     }
+    // Seller-supplied quantities, summed before any domain validation.
+    let Some(quantity) = record
+        .variants
+        .iter()
+        .try_fold(0_i64, |total, variant| total.checked_add(variant.quantity))
+    else {
+        return Ok(None);
+    };
     let digital_lock = match record.digital_lock {
         None => None,
         Some(lock) => {
@@ -1883,7 +2078,7 @@ pub fn registration_payload_from_record(
             .first()
             .and_then(|media| media.content_hash.clone())
             .unwrap_or_default(),
-        quantity: record.variants.iter().map(|variant| variant.quantity).sum(),
+        quantity,
         unit_price,
         shipping_minor,
         sale_format,
@@ -2738,6 +2933,208 @@ mod tests {
             parse_event_stream(&crlf).map(|events| events.len()),
             Some(10)
         );
+    }
+
+    #[test]
+    fn variant_quantities_whose_sum_overflows_are_an_invalid_record() {
+        let seller = "y".repeat(52);
+        for variants in [
+            json!([
+                { "id": "a", "enabled": true, "quantity": i64::MAX },
+                { "id": "b", "enabled": true, "quantity": i64::MAX },
+                { "id": "c", "enabled": true, "quantity": 1 },
+            ]),
+            json!([
+                { "id": "a", "enabled": false, "quantity": i64::MAX },
+                { "id": "b", "enabled": false, "quantity": 1 },
+            ]),
+            json!([
+                { "id": "a", "enabled": true, "quantity": i64::MIN },
+                { "id": "b", "enabled": true, "quantity": -1 },
+            ]),
+        ] {
+            let mut record = record_json();
+            record["variants"] = variants.clone();
+            assert!(
+                matches!(
+                    registration_payload_from_record(&seller, "l", &record),
+                    Ok(None)
+                ),
+                "{variants}"
+            );
+        }
+
+        let mut at_the_bound = record_json();
+        at_the_bound["variants"] = json!([
+            { "id": "a", "enabled": true, "quantity": i64::MAX - 1 },
+            { "id": "b", "enabled": true, "quantity": 1 },
+        ]);
+        let payload = registration_payload_from_record(&seller, "l", &at_the_bound)
+            .expect("record parses")
+            .expect("a sum that fits is a listing record");
+        assert_eq!(payload.quantity, i64::MAX);
+    }
+
+    /// `n` zeros in one array: a body of about `2n` bytes and `n + 1` values.
+    fn zeros(n: usize) -> Vec<u8> {
+        let mut body = Vec::with_capacity(2 * n + 1);
+        body.push(b'[');
+        for index in 0..n {
+            if index > 0 {
+                body.push(b',');
+            }
+            body.push(b'0');
+        }
+        body.push(b']');
+        body
+    }
+
+    #[test]
+    fn record_parsing_refuses_value_amplification_within_the_byte_cap() {
+        // Two million zeros: under the 4 MiB body cap, a `Value` tree of
+        // about 64 MiB if built.
+        let amplified = zeros(MAX_JSON_RECORD_BYTES / 2 - 1);
+        assert!(amplified.len() <= MAX_JSON_RECORD_BYTES);
+        assert_eq!(
+            parse_json_record(&amplified),
+            Err(JsonRecordRefusal::TooManyValues)
+        );
+
+        let mut keys = String::from("{");
+        for index in 0..MAX_JSON_RECORD_VALUES / 2 + 1 {
+            if index > 0 {
+                keys.push(',');
+            }
+            keys.push_str(&format!("\"{index:x}\":0"));
+        }
+        keys.push('}');
+        assert!(keys.len() <= MAX_JSON_RECORD_BYTES);
+        assert_eq!(
+            parse_json_record(keys.as_bytes()),
+            Err(JsonRecordRefusal::TooManyValues),
+            "object keys count as values"
+        );
+
+        assert_eq!(
+            parse_json_record(&zeros(MAX_JSON_RECORD_VALUES - 1))
+                .map(|value| value.as_array().map(Vec::len)),
+            Ok(Some(MAX_JSON_RECORD_VALUES - 1)),
+            "the array and its elements fill the limit exactly"
+        );
+        assert_eq!(
+            parse_json_record(&zeros(MAX_JSON_RECORD_VALUES)),
+            Err(JsonRecordRefusal::TooManyValues)
+        );
+    }
+
+    #[test]
+    fn record_parsing_bounds_depth_and_keeps_large_strings() {
+        let nested = |depth: usize| format!("{}{}", "[".repeat(depth), "]".repeat(depth));
+        assert!(parse_json_record(nested(MAX_JSON_RECORD_DEPTH).as_bytes()).is_ok());
+        assert_eq!(
+            parse_json_record(nested(MAX_JSON_RECORD_DEPTH + 1).as_bytes()),
+            Err(JsonRecordRefusal::TooDeep)
+        );
+        let objects = |depth: usize| format!("{}0{}", "{\"a\":".repeat(depth), "}".repeat(depth));
+        assert!(parse_json_record(objects(MAX_JSON_RECORD_DEPTH).as_bytes()).is_ok());
+        assert_eq!(
+            parse_json_record(objects(MAX_JSON_RECORD_DEPTH + 1).as_bytes()),
+            Err(JsonRecordRefusal::TooDeep)
+        );
+
+        let pad = "x".repeat(MAX_JSON_RECORD_BYTES - 16);
+        let record = parse_json_record(format!(r#"{{"pad":"{pad}"}}"#).as_bytes())
+            .expect("one large string is a small tree");
+        assert_eq!(record["pad"].as_str().map(str::len), Some(pad.len()));
+    }
+
+    #[test]
+    fn record_parsing_matches_serde_json_on_ordinary_and_malformed_records() {
+        let record = serde_json::to_vec(&record_json()).expect("record serializes");
+        assert_eq!(parse_json_record(&record), Ok(record_json()));
+        let escaped = br#"{"a":"\u00e9\n","b":[1.5,-2,18446744073709551615,null,true]}"#;
+        assert_eq!(
+            parse_json_record(escaped),
+            Ok(serde_json::from_slice::<Value>(escaped).expect("valid JSON"))
+        );
+        for malformed in [
+            &b""[..],
+            b"{",
+            b"[1,]",
+            b"{\"a\":1}{}",
+            b"{\"a\":1} x",
+            b"nul",
+        ] {
+            assert_eq!(
+                parse_json_record(malformed),
+                Err(JsonRecordRefusal::Malformed),
+                "{}",
+                String::from_utf8_lossy(malformed)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn record_reads_refuse_an_amplifying_body_and_keep_reading_records() {
+        let amplified = zeros(MAX_JSON_RECORD_VALUES + 1);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock homeserver binds");
+        let address = listener.local_addr().expect("mock homeserver address");
+        let record = serde_json::to_vec(&record_json()).expect("record serializes");
+        let server = tokio::spawn(async move {
+            let routes = Router::new().fallback(move |headers: axum::http::HeaderMap| {
+                let amplifying = headers
+                    .get("pubky-host")
+                    .is_some_and(|host| host.as_bytes().starts_with(b"amp"));
+                let body = if amplifying {
+                    amplified.clone()
+                } else {
+                    record.clone()
+                };
+                async move { body }
+            });
+            axum::serve(listener, routes)
+                .await
+                .expect("mock homeserver serves");
+        });
+        let client =
+            HttpHomeserverClient::new(&format!("http://{address}")).expect("client builds");
+        let amplifying = format!("amp{}", "s".repeat(49));
+        let ordinary = "s".repeat(52);
+
+        for pubky in [&amplifying, &ordinary] {
+            let expected = if pubky == &amplifying {
+                HomeserverFetchOutcome::Unavailable
+            } else {
+                HomeserverFetchOutcome::Found(record_json())
+            };
+            for (read, outcome) in [
+                ("listing", client.fetch_listing(pubky, "l").await),
+                (
+                    "listing_from",
+                    client.fetch_listing_from(pubky, "l").await.0,
+                ),
+                (
+                    "listing_bytes",
+                    client.fetch_listing_bytes(pubky, "l").await,
+                ),
+                ("drop", client.fetch_drop(pubky, "d").await),
+                ("shop", client.fetch_shop(pubky).await),
+                (
+                    "content_lock",
+                    client.fetch_content_lock(pubky, "/pub/locks.app/c").await,
+                ),
+            ] {
+                assert_eq!(outcome, expected, "{read} for {pubky}");
+            }
+        }
+        assert_eq!(
+            client.record_parses.available_permits(),
+            MAX_CONCURRENT_RECORD_PARSES,
+            "every parse turn is returned"
+        );
+        server.abort();
     }
 
     #[test]
