@@ -1,7 +1,9 @@
 //! Phase 6 automation APIs: seller exports, cursor events, bulk listing
 //! synchronization, and durable signed webhooks.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use axum::extract::{Path, Query, Request, State};
@@ -18,6 +20,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{FromRow, Row};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
 use crate::auth::Actor;
@@ -32,6 +35,19 @@ use crate::AppState;
 pub const DEFAULT_PAGE_SIZE: i64 = 50;
 pub const MAX_PAGE_SIZE: i64 = 200;
 pub const MAX_SYNC_MANY: usize = 100;
+/// The production bounds of one `sync-many` request.
+pub const SYNC_MANY_LIMITS: SyncManyLimits = SyncManyLimits {
+    deadline: Duration::from_secs(30),
+    in_flight: 16,
+    in_flight_per_seller: 2,
+};
+// A caller with no slot of its own could never be admitted, and one allowed
+// every shared slot could starve the others.
+const _: () = assert!(
+    SYNC_MANY_LIMITS.in_flight_per_seller >= 1
+        && SYNC_MANY_LIMITS.in_flight_per_seller < SYNC_MANY_LIMITS.in_flight
+);
+const SYNC_MANY_CLASS: &str = "listing.sync_many";
 pub const WEBHOOK_BODY_LIMIT: usize = 64 * 1024;
 const DELIVERY_BATCH_SIZE: i64 = 50;
 const WEBHOOK_VERSION_HEADER: &str = "Pubky-Webhook-Version";
@@ -44,7 +60,7 @@ fn endpoint_class(path: &str) -> &'static str {
     if path.starts_with("/v1/auth/sessions") {
         "session.admin"
     } else if path == "/v1/listings/sync-many" {
-        "listing.sync_many"
+        SYNC_MANY_CLASS
     } else if path.starts_with("/v1/webhooks") {
         "webhook.admin"
     } else if path.ends_with("/orders") {
@@ -406,7 +422,7 @@ async fn exported_listing(state: &AppState, row: &ListingRow) -> Result<Value, &
         | HomeserverRawFetchOutcome::TooLarge
         | HomeserverRawFetchOutcome::Unavailable => return Err("record unavailable"),
     };
-    let record: Value = serde_json::from_slice(&raw).map_err(|_| "record malformed")?;
+    let record = crate::homeserver::parse_json_record(&raw).map_err(|_| "record malformed")?;
     let projection = row
         .public_projection()
         .map_err(|_| "projection inconsistent")?;
@@ -697,86 +713,292 @@ struct SyncManyItem {
     listing_id: String,
 }
 
+/// How long one `sync-many` request may run and how many of its items may
+/// read homeservers at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyncManyLimits {
+    /// Wall-clock budget of one request. No item starts after it; the item
+    /// already running finishes under its own read timeouts.
+    pub deadline: Duration,
+    /// Items in flight at once across every request.
+    pub in_flight: usize,
+    /// Items in flight at once for one caller.
+    pub in_flight_per_seller: usize,
+}
+
+/// Admits `sync-many` items. A caller waits on its own slots before it
+/// queues for a shared one, so the shared queue holds at most
+/// `in_flight_per_seller` items of any one caller, and commands outside
+/// `sync-many` never wait here.
+pub struct SyncManyGate {
+    limits: SyncManyLimits,
+    in_flight: Arc<Semaphore>,
+    sellers: Mutex<HashMap<String, Arc<Semaphore>>>,
+}
+
+impl SyncManyGate {
+    pub fn new(limits: SyncManyLimits) -> Self {
+        Self {
+            limits,
+            in_flight: Arc::new(Semaphore::new(limits.in_flight)),
+            sellers: Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn admit(&self, seller: &str) -> SyncManyPermit<'_> {
+        let slots = self
+            .sellers
+            .lock()
+            .expect("sync-many seller slots lock")
+            .entry(seller.to_string())
+            .or_insert_with(|| Arc::new(Semaphore::new(self.limits.in_flight_per_seller)))
+            .clone();
+        let mut permit = SyncManyPermit {
+            gate: self,
+            seller: seller.to_string(),
+            slots,
+            held: None,
+        };
+        // Neither semaphore is ever closed.
+        let own = permit
+            .slots
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("sync-many seller slots stay open");
+        let shared = self
+            .in_flight
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("sync-many slots stay open");
+        permit.held = Some((own, shared));
+        permit
+    }
+
+    /// Callers with an entry in the per-seller table.
+    #[cfg(any(test, feature = "test-faults"))]
+    pub fn tracked_sellers(&self) -> usize {
+        self.sellers
+            .lock()
+            .expect("sync-many seller slots lock")
+            .len()
+    }
+}
+
+/// One admitted item. Dropping it, admitted or still waiting, frees its slots
+/// and forgets a caller with nothing else in flight or waiting.
+struct SyncManyPermit<'a> {
+    gate: &'a SyncManyGate,
+    seller: String,
+    slots: Arc<Semaphore>,
+    held: Option<(OwnedSemaphorePermit, OwnedSemaphorePermit)>,
+}
+
+impl Drop for SyncManyPermit<'_> {
+    fn drop(&mut self) {
+        self.held = None;
+        let mut sellers = self
+            .gate
+            .sellers
+            .lock()
+            .expect("sync-many seller slots lock");
+        // The table and this permit are the only holders once nobody else
+        // has this caller's slots or waits on them.
+        if Arc::strong_count(&self.slots) == 2
+            && sellers
+                .get(&self.seller)
+                .is_some_and(|slots| Arc::ptr_eq(slots, &self.slots))
+        {
+            sellers.remove(&self.seller);
+        }
+    }
+}
+
+static SYNC_MANY_GATE: LazyLock<SyncManyGate> =
+    LazyLock::new(|| SyncManyGate::new(SYNC_MANY_LIMITS));
+
+/// Why an item of a batch was answered without running.
+#[derive(Clone, Copy)]
+enum Unrun {
+    Deadline,
+    RateLimited { retry_after: i64 },
+    Internal,
+}
+
+impl Unrun {
+    fn entry(self, item: &SyncManyItem) -> Value {
+        let (status, error) = match self {
+            Self::Deadline => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({
+                    "code": "BATCH_DEADLINE_EXCEEDED",
+                    "message": "The batch ran out of time before this listing was synchronized; retry it."
+                }),
+            ),
+            Self::RateLimited { retry_after } => (
+                StatusCode::TOO_MANY_REQUESTS,
+                json!({
+                    "code": "RATE_LIMITED",
+                    "message": "The request rate limit was exceeded.",
+                    "retry_after_seconds": retry_after
+                }),
+            ),
+            Self::Internal => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"code": "internal", "message": "The listing could not be synchronized."}),
+            ),
+        };
+        json!({
+            "seller_pubky": item.seller_pubky,
+            "listing_id": item.listing_id,
+            "status": status.as_u16(),
+            "result": {"ok": false, "error": error}
+        })
+    }
+}
+
 pub async fn sync_many(
     State(state): State<AppState>,
     Extension(actor): Extension<Actor>,
     Json(request): Json<SyncManyRequest>,
 ) -> Response {
-    if request.listings.is_empty() || request.listings.len() > MAX_SYNC_MANY {
-        return error(
+    let (status, body) = run_sync_many(&state, &actor.0, request, &SYNC_MANY_GATE).await;
+    response(status, body)
+}
+
+/// [`sync_many`] for an actor whose session was checked and whose first
+/// rate token was spent, through `gate` instead of the process-wide one.
+#[cfg(any(test, feature = "test-faults"))]
+pub async fn sync_many_through(
+    state: &AppState,
+    actor: &str,
+    request: Value,
+    gate: &SyncManyGate,
+) -> (StatusCode, Value) {
+    match serde_json::from_value(request) {
+        Ok(request) => run_sync_many(state, actor, request, gate).await,
+        Err(_) => (
             StatusCode::UNPROCESSABLE_ENTITY,
-            "invalid_batch",
-            "The batch must contain between 1 and 100 listings.",
+            json!({"ok": false, "error": {"code": "invalid_batch"}}),
+        ),
+    }
+}
+
+async fn run_sync_many(
+    state: &AppState,
+    actor: &str,
+    request: SyncManyRequest,
+    gate: &SyncManyGate,
+) -> (StatusCode, Value) {
+    if request.listings.is_empty() || request.listings.len() > MAX_SYNC_MANY {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            json!({"ok": false, "error": {
+                "code": "invalid_batch",
+                "message": "The batch must contain between 1 and 100 listings."
+            }}),
         );
     }
+    let deadline = tokio::time::Instant::now() + gate.limits.deadline;
     let mut results = Vec::with_capacity(request.listings.len());
-    for item in request.listings {
-        let aggregate_id =
-            marketplace_domain::ids::listing_aggregate_id(&item.seller_pubky, &item.listing_id);
-        let raw = json!({
-            "version": 1,
-            "command_id": Uuid::new_v4(),
-            "aggregate_id": aggregate_id,
-            "expected_revision": 0,
-            "issued_at": format_timestamp(state.clock.now()),
-            "kind": "listing.sync",
-            "payload": {
-                "seller_pubky": item.seller_pubky,
-                "listing_id": item.listing_id
-            }
-        });
-        match crate::executor::execute(&state, &actor.0, &raw).await {
-            Ok((status, body)) => {
-                let (status, body) =
-                    match crate::reserve_secrecy::guard_command_result(&actor.0, body) {
-                        Ok(body) => (status, body),
-                        Err(body) => (StatusCode::INTERNAL_SERVER_ERROR, body),
-                    };
-                let mut entry = json!({
-                    "seller_pubky": item.seller_pubky,
-                    "listing_id": item.listing_id,
-                    "status": status.as_u16(),
-                    "result": body
-                });
-                // A listing whose record lists several variants but that cannot
-                // convert to per-variant stock yet says why.
-                match sqlx::query_as::<_, (String, i32)>(
-                    "SELECT reason, attempts FROM listing_variant_conversion_blocks \
-                     WHERE listing_aggregate_id = $1",
-                )
-                .bind(&aggregate_id)
-                .fetch_optional(&state.pool)
-                .await
-                {
-                    Ok(Some((reason, attempts))) => {
-                        entry["variant_conversion"] = json!({
-                            "state": crate::variant_stock::conversion_state(&reason),
-                            "reason": reason,
-                            "attempts": attempts
-                        });
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        tracing::error!(error = %error, "listing.sync_many conversion marker read failed");
-                    }
+    let mut unrun = None;
+    for (index, item) in request.listings.into_iter().enumerate() {
+        if let Some(unrun) = unrun {
+            results.push(Unrun::entry(unrun, &item));
+            continue;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            unrun = Some(Unrun::Deadline);
+            results.push(Unrun::Deadline.entry(&item));
+            continue;
+        }
+        let Ok(permit) = tokio::time::timeout_at(deadline, gate.admit(actor)).await else {
+            unrun = Some(Unrun::Deadline);
+            results.push(Unrun::Deadline.entry(&item));
+            continue;
+        };
+        // The request's own admission token paid for the first item.
+        if index > 0 {
+            let refused = match consume_automation_rate(state, actor, SYNC_MANY_CLASS).await {
+                Ok(None) => None,
+                Ok(Some(retry_after)) => Some(Unrun::RateLimited { retry_after }),
+                Err(error) => {
+                    tracing::error!(error = %error, "listing.sync_many item rate limit failed");
+                    Some(Unrun::Internal)
                 }
-                results.push(entry);
-            }
-            Err(error) => {
-                tracing::error!(error = %error, "listing.sync_many item failed");
-                results.push(json!({
-                    "seller_pubky": item.seller_pubky,
-                    "listing_id": item.listing_id,
-                    "status": 500,
-                    "result": {"ok": false, "error": {"code": "internal", "message": "The listing could not be synchronized."}}
-                }));
+            };
+            if let Some(refused) = refused {
+                unrun = Some(refused);
+                results.push(refused.entry(&item));
+                continue;
             }
         }
+        results.push(sync_many_item(state, actor, item).await);
+        drop(permit);
     }
-    response(
+    (
         StatusCode::MULTI_STATUS,
         json!({"schema_version": 1, "kind": "listing.sync_many", "results": results}),
     )
+}
+
+async fn sync_many_item(state: &AppState, actor: &str, item: SyncManyItem) -> Value {
+    let aggregate_id =
+        marketplace_domain::ids::listing_aggregate_id(&item.seller_pubky, &item.listing_id);
+    let raw = json!({
+        "version": 1,
+        "command_id": Uuid::new_v4(),
+        "aggregate_id": aggregate_id,
+        "expected_revision": 0,
+        "issued_at": format_timestamp(state.clock.now()),
+        "kind": "listing.sync",
+        "payload": {
+            "seller_pubky": item.seller_pubky,
+            "listing_id": item.listing_id
+        }
+    });
+    match crate::executor::execute(state, actor, &raw).await {
+        Ok((status, body)) => {
+            let (status, body) = match crate::reserve_secrecy::guard_command_result(actor, body) {
+                Ok(body) => (status, body),
+                Err(body) => (StatusCode::INTERNAL_SERVER_ERROR, body),
+            };
+            let mut entry = json!({
+                "seller_pubky": item.seller_pubky,
+                "listing_id": item.listing_id,
+                "status": status.as_u16(),
+                "result": body
+            });
+            // A listing whose record lists several variants but that cannot
+            // convert to per-variant stock yet says why.
+            match sqlx::query_as::<_, (String, i32)>(
+                "SELECT reason, attempts FROM listing_variant_conversion_blocks \
+                 WHERE listing_aggregate_id = $1",
+            )
+            .bind(&aggregate_id)
+            .fetch_optional(&state.pool)
+            .await
+            {
+                Ok(Some((reason, attempts))) => {
+                    entry["variant_conversion"] = json!({
+                        "state": crate::variant_stock::conversion_state(&reason),
+                        "reason": reason,
+                        "attempts": attempts
+                    });
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::error!(error = %error, "listing.sync_many conversion marker read failed");
+                }
+            }
+            entry
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "listing.sync_many item failed");
+            Unrun::Internal.entry(&item)
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1546,6 +1768,69 @@ pub fn spawn_webhook_worker(state: AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn gate(in_flight: usize, in_flight_per_seller: usize) -> SyncManyGate {
+        SyncManyGate::new(SyncManyLimits {
+            deadline: Duration::from_secs(30),
+            in_flight,
+            in_flight_per_seller,
+        })
+    }
+
+    /// The admission if it is granted without waiting.
+    async fn admitted<F: std::future::Future>(admission: F) -> Option<F::Output> {
+        tokio::select! {
+            biased;
+            output = admission => Some(output),
+            () = std::future::ready(()) => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_gate_bounds_one_seller_without_blocking_another() {
+        let gate = gate(3, 2);
+        let first = admitted(gate.admit("alice")).await.expect("first slot");
+        let second = admitted(gate.admit("alice")).await.expect("second slot");
+        assert!(
+            admitted(gate.admit("alice")).await.is_none(),
+            "a third alice item waits for one of her own slots"
+        );
+        let bob = admitted(gate.admit("bob"))
+            .await
+            .expect("bob is not behind alice");
+        assert!(
+            admitted(gate.admit("carol")).await.is_none(),
+            "the shared bound holds across sellers"
+        );
+        drop(first);
+        let third = admitted(gate.admit("alice"))
+            .await
+            .expect("a freed slot admits alice again");
+        drop((second, third, bob));
+        assert_eq!(gate.in_flight.available_permits(), 3);
+        assert_eq!(gate.tracked_sellers(), 0, "idle sellers are forgotten");
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_wait_frees_its_slots_and_its_seller_entry() {
+        let gate = gate(1, 1);
+        let held = admitted(gate.admit("alice")).await.expect("first slot");
+        for seller in ["alice", "bob"] {
+            let waited = tokio::time::timeout(Duration::from_millis(20), gate.admit(seller)).await;
+            assert!(
+                waited.is_err(),
+                "{seller} waits while the only slot is held"
+            );
+        }
+        assert_eq!(gate.tracked_sellers(), 1, "only the holder stays tracked");
+        drop(held);
+        assert_eq!(gate.tracked_sellers(), 0);
+        let again = admitted(gate.admit("bob"))
+            .await
+            .expect("the slot is free again");
+        drop(again);
+        assert_eq!(gate.in_flight.available_permits(), 1);
+    }
 
     #[test]
     fn cursors_are_opaque_and_round_trip() {

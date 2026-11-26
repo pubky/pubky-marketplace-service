@@ -358,6 +358,8 @@ request failed, so clients should branch on HTTP status first, and parse
    | `SHIPPING_UNAVAILABLE_TO_COUNTRY`, `SHIPPING_UNAVAILABLE`, `SHIPPING_CHANGED` | 409 |
    | `SELLER_UNAVAILABLE_IN_REGION`, `SELLER_ANNUAL_LIMIT_REACHED`, `DIGITAL_UNAVAILABLE_IN_REGION`, `COMMERCE_UNAVAILABLE_IN_REGION` | 409 |
    | `UPSTREAM_UNAVAILABLE` | 503 (retriable) |
+   | `RATE_LIMITED` (`sync-many` items only) | 429 (retriable after `retry_after_seconds`) |
+   | `BATCH_DEADLINE_EXCEEDED` (`sync-many` items only) | 503 (retriable) |
 
    A command error may also carry `issues` and `reason` fields.
 
@@ -536,7 +538,9 @@ A token bucket per `(actor pubky, endpoint class)`, stored in
   continuously (`rate / 60` tokens per second).
 - Burst capacity: rate times `AUTOMATION_RATE_LIMIT_BURST_MULTIPLIER` (default
   2, maximum 10), capped at 20000. A bucket starts full.
-- Each request costs one token. A whole `sync-many` batch costs one token.
+- Each request costs one token. A `sync-many` batch costs one token per item
+  it runs: the request's token pays for the first, and each later item spends
+  one more before it runs (see [Batch sync](#batch-sync-sync-many)).
 - Classes are derived from the request path:
 
   | Class | Matches |
@@ -1193,7 +1197,8 @@ Semantics:
   Inspect every `results[].status`.
 - `status` is the HTTP status the same command would have returned on
   `POST /v1/commands`; `result` is the [command envelope](#error-envelopes)
-  (shape 4) for failures.
+  (shape 4) for failures. Items the batch answered without running
+  (`RATE_LIMITED`, `BATCH_DEADLINE_EXCEEDED`, below) use the same envelope.
 - `listing.sync` is convergent. Any authenticated actor may sync any listing,
   and an existing aggregate is not a conflict. A record that is unchanged or
   older than the projection is a no-op that returns the current revision. A
@@ -1214,12 +1219,31 @@ Semantics:
 - Failure modes per item: `NOT_FOUND` (record missing, or listing tombstoned
   once the seller's event stream confirms deletion); `UPSTREAM_UNAVAILABLE`
   (503; homeserver unreachable, retry later); `INVALID_STATE` (record cannot be
-  interpreted, has an invalid digital lock, or fails registration invariants,
+  interpreted, including variant quantities whose sum overflows a 64-bit
+  integer, has an invalid digital lock, or fails registration invariants,
   including a digital lock whose methods are not exactly `[digital]`);
   `SELLER_REGISTRATION_REQUIRED` (auction listings need registration);
   `INVALID_COMMAND` (homeserver sync is disabled on this deployment).
-- The whole batch costs one token of the `listing.sync_many` bucket, not one
-  per item.
+  `UPSTREAM_UNAVAILABLE` also covers a record whose JSON nests deeper than 32
+  levels or holds more than 100,000 values (object keys included), which is
+  refused before it is parsed into a value tree.
+- Each item run costs one token of the `listing.sync_many` bucket. The token
+  that admitted the request pays for the first item; every later item spends
+  one before it runs. When the bucket runs dry, that item and every item after
+  it are answered without running, as `status: 429` with
+  `{"ok": false, "error": {"code": "RATE_LIMITED", "message": "...",
+  "retry_after_seconds": <integer>}}`, the delay a refused request would get
+  in `Retry-After`. With the default bucket (240 tokens, 120 a minute) a full
+  100-item batch always fits a full bucket.
+- A batch has 30 seconds. No item starts after that; the item already running
+  finishes under its own homeserver timeouts. Every item not started is
+  answered without running, and without spending a token, as `status: 503`
+  with `{"ok": false, "error": {"code": "BATCH_DEADLINE_EXCEEDED", "message":
+  "..."}}`. Retry those items in a later batch.
+- Items read the homeserver a bounded number at a time: at most 2 items of
+  one caller across all of its concurrent batches, and at most 16 across all
+  callers. Time spent waiting for a turn counts against the batch's 30
+  seconds. Commands outside `sync-many` do not wait for these turns.
 
 ## Inventory
 
