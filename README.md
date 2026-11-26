@@ -72,7 +72,9 @@ also has
   `HOMESERVER_RESOLUTION=pkarr` resolves each pubky's own homeserver instead
   (see [Homeserver reads](#homeserver-reads));
 - `NEXUS_URL` — the marketplace index the moderation gate reads (an http(s)
-  URL; see [Listing moderation](#listing-moderation));
+  URL; see [Listing moderation](#listing-moderation)), unless a
+  single-seller deployment sets `LISTING_MODERATION=off` (see
+  [Single-seller mode](#single-seller-mode));
 - `REFUSAL_AUDIT_DATABASE_URL` and `REFUSAL_AUDIT_RETENTION_DATABASE_URL` —
   two separate Postgres URLs that log in as
   `marketplace_refusal_audit_writer_login` and
@@ -157,7 +159,9 @@ Configuration is environment-based. Window keys and their defaults also live in
 | `DATABASE_URL` | required | Postgres connection string |
 | `HOMESERVER_RESOLUTION` | `fixed` | where homeserver reads go: `fixed` sends every read to `HOMESERVER_URL`; `pkarr` reads each pubky from the homeserver its Pkarr record names. Any other value refuses to boot. See [Homeserver reads](#homeserver-reads) |
 | `HOMESERVER_URL` | required with `fixed` | homeserver base URL (http(s)) the `listing.sync` command and every other homeserver read fetch seller-signed records from; the service refuses to boot without it under `fixed`, and refuses to boot with it set under `pkarr` |
-| `NEXUS_URL` | required | base URL (http(s)) of the marketplace index (Nexus) the service asks whether a listing is moderated before it accepts a checkout, a bid or an offer on it; the service refuses to boot without it. See [Listing moderation](#listing-moderation) |
+| `NEXUS_URL` | required unless `LISTING_MODERATION=off` | base URL (http(s)) of the marketplace index (Nexus) the service asks whether a listing is moderated before it accepts a checkout, a bid or an offer on it; the service refuses to boot without it while moderation is on, and with it set while moderation is off. See [Listing moderation](#listing-moderation) |
+| `STORE_SELLER_PUBKY` | unset | binds the service to one seller (single-seller mode): every command and signed-in route that names another seller's listing, drop, settings, offer, order, payment or receipt is refused with `SELLER_NOT_SERVED`. Unset or empty serves every seller (marketplace mode). Any other value, whitespace alone included, must be a 52-character z-base-32 pubky without a `pubky` prefix or surrounding whitespace, or the service refuses to boot. See [Single-seller mode](#single-seller-mode) |
+| `LISTING_MODERATION` | `on` | `on` asks the index (`NEXUS_URL`) before selling a listing; `off` builds no moderation gate and does not read `NEXUS_URL`. `off` is allowed only with `STORE_SELLER_PUBKY` set; any other value, or `off` in marketplace mode, refuses to boot. See [Single-seller mode](#single-seller-mode) |
 | `REFUSAL_AUDIT_*` | required | refusal-audit logins, HMAC key pair and attestations; see [Run](#run) |
 | `BIND_ADDR` | `127.0.0.1:8080` | HTTP listen address |
 | `ALLOWED_ORIGINS` | empty | comma-separated exact CORS origins |
@@ -391,6 +395,92 @@ answers are cached (5 minutes, per listing); a "clear" answer is never cached,
 so a moderation placed meanwhile is seen on the next command and lifting one
 takes effect once the cached answer expires. Orders created before a listing
 was moderated are not cancelled by this check.
+
+A single-seller deployment may switch the gate off with
+`LISTING_MODERATION=off` (see [Single-seller mode](#single-seller-mode)).
+
+### Single-seller mode
+
+`STORE_SELLER_PUBKY` binds the service to one seller's shop. Unset, the
+service is a marketplace and serves every seller exactly as before.
+
+When it is set, one check (`store_seller` in the service crate) decides
+whether a request concerns the store seller, and refuses anything else:
+
+- **Commands.** Every `POST /v1/commands` kind, and every item of
+  `POST /v1/listings/sync-many`, is checked by the sellers it names: the
+  aggregate's seller (`listing:`, `drop:`, `seller_settings:`), the seller in
+  the payload, every checkout line's listing, the listing of an offer
+  checkout, and the seller of the offer, order or payment it acts on. That
+  covers the seller's own commands (listing registration and sync, drops,
+  pickup details, digital deliverables, band consent, fulfilment, returns,
+  refunds) and every buyer command against a listing (checkout, offers,
+  bids, Locks prepare and register). A refused command answers
+  `SELLER_NOT_SERVED` (HTTP 409) before its transaction and writes nothing; a
+  command id that already has a stored result is answered from it.
+- **Signed-in routes.** Each route of the router has a scope in
+  `store_seller::ROUTES`. Routes that act for the caller as a seller
+  (inventory, inventory automations, webhooks, every `/v1/connectors` route
+  and `/v0/sellers/me/payment-config`) are served only to the store seller.
+  Routes that name a listing, drop, seller, order, payment or receipt in
+  their path are served only when that record belongs to the store seller.
+  The caller's own sessions, offers, orders, notifications and private-key
+  envelopes stay open. A refusal answers `SELLER_NOT_SERVED` (HTTP 409).
+- **Unlisted routes.** One last layer over the whole router refuses any
+  route missing from `store_seller::ROUTES`, however it was mounted (routed
+  in place, merged or nested, guarded router or not), before the session
+  check. The table is keyed by method and path, so a method a path does not
+  serve is refused the same way rather than answered with 405; a path no
+  route matches is still a 404.
+
+Every refusal writes a refusal-audit row (`seller_not_served`): a command on
+the `v1_command` surface under its own command kind, a route on the
+`seller_route` surface under the `seller_route` command kind. The row tags
+an authenticated actor, so an unlisted route refused without an active
+session writes none. Sessions are
+still issued to any identity, so buyers sign in as before. Public reads
+(`/v0` projections, `/health`) are not filtered; they only show what the
+guarded writes let in. The mode is meant for a database that has only ever
+served the store seller. After migrations, the service and the
+`connector-worker` both refuse to start in it while the database holds any
+of these for another seller, in any state
+(soft-deleted, disconnected or disabled rows included):
+
+- a listing (`listings`), an order (`orders`) or a stock hold on their
+  listing (`reservations`);
+- a store connection (`connector_connections`), pending ones included;
+- a payment configuration (`seller_payment_configs`) or accepted payment
+  option (`seller_accepted_payment_options`);
+- an automation webhook endpoint (`webhook_endpoints`);
+- seller settings, the band consent of a `seller_settings:` aggregate
+  (`attestation_band_consents`).
+
+Drops, offers, bids and pickup or digital details hang off a listing, so
+the listing count covers them. Sessions, `/priv` data-key envelopes and
+notifications belong to identities, which may be buyers, and are not
+counted. The message counts each kind and names up to three of those
+sellers by the first eight characters of their pubky. Nothing is removed:
+start the store on its own database, or unset `STORE_SELLER_PUBKY`.
+
+Set `STORE_SELLER_PUBKY` on every replica of the service and the
+`connector-worker` at once, on a database no other seller uses. A replica
+started without it serves every seller, and a row it writes for another
+seller refuses the next start of every replica that has it.
+
+A refusal does not hide whether another seller's record exists: an
+existing order, payment, receipt or offer of another seller answers 409
+`SELLER_NOT_SERVED`, while an unknown id reaches the handler and answers
+its 404. The boot check keeps such records out of a single-seller
+database, so there is nothing to find.
+
+`LISTING_MODERATION=off` is allowed only in this mode. The moderation gate is
+then not built, `NEXUS_URL` is not read and must be unset, and the boot log
+says so. In marketplace mode `off` refuses to boot.
+
+`GET /health` reports the deployment: `store` (`mode` and `seller`),
+`homeserver_resolution` (`fixed` or `pkarr`), `listing_moderation` (`on` or
+`off`) and `fx_source` (the FX provider and whether its URL is the pinned
+one). See [`docs/api.md`](docs/api.md#health).
 
 ### Region modes
 

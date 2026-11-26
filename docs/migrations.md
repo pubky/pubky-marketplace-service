@@ -907,6 +907,34 @@ Then forget the version:
 DELETE FROM _sqlx_migrations WHERE version = 100;
 ```
 
+## Single-seller refusals (0101)
+
+0101 appends one row to each append-only refusal-audit catalog for
+[single-seller mode](../README.md#single-seller-mode): refusal kind
+`seller_not_served` (id 41), surface `seller_route` (id 3) and command kind
+`seller_route` (id 44). Like 0082 it inserts with `ON CONFLICT (id) DO
+NOTHING` and fails loudly if any of those ids holds anything else, so it is
+directly rerunnable. No table, column or index changes.
+
+**Deploy mode: rolling.** An image from before 0101 never writes the new ids
+and does not read `STORE_SELLER_PUBKY`; the rows are harmless to it. Set
+`STORE_SELLER_PUBKY` only once every serving binary is from 0101 or later:
+an older one would serve every seller. Then set it on every replica of the
+service and the `connector-worker` at once, on a database no other seller
+uses, never replica by replica: a replica still without it serves every
+seller, and a row it writes for another seller refuses the next start of
+every replica that has it.
+
+### Backing out 0101
+
+An image from before it runs on the migrated database. The catalog rows stay
+(the tables are append-only) and are harmless; any refusal-audit buckets that
+reference them age out with the ordinary retention. Forget the version:
+
+```sql
+DELETE FROM _sqlx_migrations WHERE version = 101;
+```
+
 ## Numbers claimed by open pull requests
 
 `main` has 0001 to 0079 (0068 and 0069 were never used). A new migration must
@@ -931,6 +959,7 @@ assume it is free:
 | 0098 | `0098_seller_wallet_receipt_confirmation.sql` | seller confirmations may rest on the seller's wallet Receipt: the `seller_wallet_receipt` basis and `wallet_receipt` |
 | 0099 | `0099_inventory_actor_rate_limits.sql` | per-seller inventory rate buckets and the `session.create` automation class |
 | 0100 | `0100_homeserver_scoped_deletion_cursors.sql` | homeserver-scoped listing deletion cursors and revival markers (`HOMESERVER_RESOLUTION=pkarr`) |
+| 0101 | `0101_single_seller_refusals.sql` | the `seller_not_served` refusal kind and the `seller_route` surface and command kind (single-seller mode), stacked on 0100 |
 
 This table describes unmerged work and goes stale as pull requests land; trust
 `crates/service/migrations/` on `main` over it. sqlx does not reject two files

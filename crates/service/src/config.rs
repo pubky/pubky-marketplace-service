@@ -7,6 +7,7 @@ use crate::payment_attempt::{MarketplaceAssets, MarketplaceContract};
 use crate::payments::{PaykitApi, ENV_PAYKIT_SERVER_API};
 use crate::refusal_audit::AuditKeys;
 use crate::region_policy::{RegionModes, RegionPolicy};
+use crate::store_seller::StoreMode;
 
 /// Default PayPal Website Payments Standard checkout (`_xclick`).
 pub const DEFAULT_PAYPAL_CHECKOUT_URL: &str = "https://www.paypal.com/cgi-bin/webscr";
@@ -273,6 +274,9 @@ pub struct Config {
     /// (`DIGITAL_RELEASE`, default `seller`). Frozen on each such order when
     /// it is paid (`orders.digital_release`).
     pub digital_release: DigitalRelease,
+    /// The one seller the deployment serves (`STORE_SELLER_PUBKY`), or any
+    /// seller when unset ([`crate::store_seller`]).
+    pub store_mode: StoreMode,
 }
 
 /// Who releases a paid order's instant digital lines (`DIGITAL_RELEASE`).
@@ -550,6 +554,8 @@ impl Config {
             PaymentConfirmation::parse(std::env::var("PAYMENT_CONFIRMATION").ok().as_deref())?;
         let digital_release =
             DigitalRelease::parse(std::env::var("DIGITAL_RELEASE").ok().as_deref())?;
+        let store_mode =
+            crate::store_seller::store_mode_from_lookup(&|name| std::env::var(name).ok())?;
         Ok(Self {
             bind_addr,
             database_url,
@@ -611,6 +617,7 @@ impl Config {
             paykit_marketplace_contract,
             payment_confirmation,
             digital_release,
+            store_mode,
         })
     }
 
@@ -686,6 +693,7 @@ impl Config {
             // it; the seller-confirmed suites set `Seller` explicitly.
             payment_confirmation: PaymentConfirmation::Automatic,
             digital_release: DigitalRelease::Payment,
+            store_mode: StoreMode::Marketplace,
         }
     }
 }
@@ -960,6 +968,7 @@ mod tests {
         DEFAULT_PAYPAL_CHECKOUT_URL,
     };
     use crate::payment_attempt::{MarketplaceAssets, MarketplaceContract};
+    use crate::store_seller::StoreMode;
 
     /// Serializes the environment-mutating test (env is process-global).
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1505,10 +1514,31 @@ mod tests {
             ("PAYKIT_SERVER_API", None),
             ("PAYMENT_CONFIRMATION", None),
             ("DIGITAL_RELEASE", None),
+            ("STORE_SELLER_PUBKY", None),
         ];
         vars.extend_from_slice(extra);
         let _guard = EnvGuard::set(&vars);
         Config::from_env()
+    }
+
+    #[test]
+    fn the_store_seller_selects_single_seller_mode_and_must_be_a_pubky() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let config = from_env_with(&[]).expect("defaults parse");
+        assert_eq!(config.store_mode, StoreMode::Marketplace);
+        assert_eq!(Config::for_tests().store_mode, StoreMode::Marketplace);
+        let seller = marketplace_domain::pubky::encode_pubky(&[3; 32]);
+        let config = from_env_with(&[("STORE_SELLER_PUBKY", Some(seller.as_str()))])
+            .expect("a pubky parses");
+        assert_eq!(config.store_mode, StoreMode::SingleSeller(seller));
+        for value in ["seller", "   "] {
+            let error =
+                from_env_with(&[("STORE_SELLER_PUBKY", Some(value))]).expect_err("not a pubky");
+            assert!(
+                error.to_string().starts_with("STORE_SELLER_PUBKY must be"),
+                "{value:?}: {error}"
+            );
+        }
     }
 
     #[test]

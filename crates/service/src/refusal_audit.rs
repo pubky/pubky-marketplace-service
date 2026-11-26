@@ -244,6 +244,9 @@ impl RefusalAuditMetrics {
 pub enum SurfaceKind {
     V1Command = 1,
     BitcoinManualResolve = 2,
+    /// A route refused because it acts for a seller the deployment does not
+    /// serve (`STORE_SELLER_PUBKY`).
+    SellerRoute = 3,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,10 +296,12 @@ pub enum CommandKind {
     CancelReturn = 41,
     WithdrawReview = 42,
     ReleaseDigital = 43,
+    /// Any HTTP route outside `/v1/commands`; the surface names it.
+    SellerRoute = 44,
 }
 
 impl CommandKind {
-    pub const ALL: [Self; 44] = [
+    pub const ALL: [Self; 45] = [
         Self::InvalidEnvelope,
         Self::RegisterListing,
         Self::SyncListing,
@@ -341,6 +346,7 @@ impl CommandKind {
         Self::CancelReturn,
         Self::WithdrawReview,
         Self::ReleaseDigital,
+        Self::SellerRoute,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -389,6 +395,7 @@ impl CommandKind {
             Self::CancelReturn => "cancel_return",
             Self::WithdrawReview => "withdraw_review",
             Self::ReleaseDigital => "release_digital",
+            Self::SellerRoute => "seller_route",
         }
     }
 }
@@ -433,6 +440,7 @@ pub enum RefusalKind {
     BidListingNotFound = 38,
     LocksIdentityMismatch = 39,
     LocksUpstreamUnavailable = 40,
+    SellerNotServed = 41,
 }
 
 #[derive(Debug, Clone)]
@@ -1194,7 +1202,7 @@ async fn flush_loss_gap(pool: &PgPool, metrics: &RefusalAuditMetrics) {
 }
 
 impl RefusalKind {
-    pub const ALL: [Self; 37] = [
+    pub const ALL: [Self; 38] = [
         Self::InvalidEnvelope,
         Self::InvalidCommand,
         Self::Unauthorized,
@@ -1232,6 +1240,7 @@ impl RefusalKind {
         Self::BidListingNotFound,
         Self::LocksIdentityMismatch,
         Self::LocksUpstreamUnavailable,
+        Self::SellerNotServed,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -1273,6 +1282,7 @@ impl RefusalKind {
             Self::BidListingNotFound => "bid_listing_not_found",
             Self::LocksIdentityMismatch => "locks_identity_mismatch",
             Self::LocksUpstreamUnavailable => "locks_upstream_unavailable",
+            Self::SellerNotServed => "seller_not_served",
         }
     }
 }

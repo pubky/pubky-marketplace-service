@@ -99,6 +99,7 @@ pub(crate) fn error_code_name(code: Option<ErrorCode>) -> &'static str {
         Some(ErrorCode::ShippingUnavailableToCountry) => "SHIPPING_UNAVAILABLE_TO_COUNTRY",
         Some(ErrorCode::ShippingUnavailable) => "SHIPPING_UNAVAILABLE",
         Some(ErrorCode::ShippingChanged) => "SHIPPING_CHANGED",
+        Some(ErrorCode::SellerNotServed) => "SELLER_NOT_SERVED",
         None => "",
     }
 }
