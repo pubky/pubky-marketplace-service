@@ -176,7 +176,7 @@ pub async fn claim_next_push(
     lease: std::time::Duration,
     providers: &[String],
 ) -> Result<Option<ClaimedPush>, sqlx::Error> {
-    let lease_until = now + chrono::Duration::from_std(lease).unwrap_or(chrono::Duration::hours(1));
+    let lease_until = super::config::after(now, lease);
     let claimed: Option<(PushRow, String)> = sqlx::query(&format!(
         "WITH due AS ( \
              SELECT id, state AS prior_state FROM connector_order_push \
@@ -729,7 +729,7 @@ pub async fn claim_next_action(
     lease: std::time::Duration,
     providers: &[String],
 ) -> Result<Option<(ActionRow, PushRow)>, sqlx::Error> {
-    let lease_until = now + chrono::Duration::from_std(lease).unwrap_or(chrono::Duration::hours(1));
+    let lease_until = super::config::after(now, lease);
     let mut busy: Vec<Uuid> = Vec::new();
     loop {
         let mut tx = pool.begin().await?;

@@ -15,6 +15,7 @@ use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, RETRY_AFTER};
 use reqwest::Method;
 use serde_json::Value;
 
+use crate::connectors::config::MAX_RETRY_DELAY;
 use crate::connectors::provider::ProviderError;
 
 use super::creds::ApiKeys;
@@ -135,7 +136,7 @@ impl Reply {
                 retry_after: self
                     .header(RETRY_AFTER.as_str())
                     .and_then(|value| value.trim().parse::<u64>().ok())
-                    .map(Duration::from_secs),
+                    .map(|seconds| Duration::from_secs(seconds).min(MAX_RETRY_DELAY)),
             }),
             500..=599 => Err(ProviderError::Unknown(format!(
                 "the store answered {}",
@@ -327,4 +328,40 @@ fn transport_error(error: reqwest::Error) -> ProviderError {
         return ProviderError::Unknown("the store did not answer in time".into());
     }
     ProviderError::Unknown("the store could not be reached".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn throttled(retry_after: &str) -> Option<Duration> {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            RETRY_AFTER,
+            HeaderValue::from_str(retry_after).expect("header"),
+        );
+        let reply = Reply {
+            status: 429,
+            headers,
+            body: Vec::new(),
+        };
+        match reply.checked() {
+            Err(ProviderError::RateLimited { retry_after }) => retry_after,
+            other => panic!("{:?}", other.err()),
+        }
+    }
+
+    #[test]
+    fn a_retry_after_is_read_in_seconds_and_cut_to_a_day() {
+        assert_eq!(throttled("120"), Some(Duration::from_secs(120)));
+        assert_eq!(throttled(" 7 "), Some(Duration::from_secs(7)));
+        assert_eq!(throttled("0"), Some(Duration::ZERO));
+        assert_eq!(throttled("86400"), Some(Duration::from_secs(86_400)));
+        for long in ["9000000000000", "18446744073709551615", "86401"] {
+            assert_eq!(throttled(long), Some(Duration::from_secs(86_400)), "{long}");
+        }
+        for unreadable in ["soon", "-5", "1.5", "18446744073709551616"] {
+            assert_eq!(throttled(unreadable), None, "{unreadable}");
+        }
+    }
 }

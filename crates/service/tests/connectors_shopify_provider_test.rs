@@ -672,6 +672,89 @@ async fn a_throttled_call_waits_and_retries_before_it_gives_up() {
 }
 
 #[tokio::test]
+async fn a_retry_after_too_long_for_a_duration_waits_a_bounded_time() {
+    let (fake, provider, connection) = setup().await;
+    fake.fault("ProductsPage", vec![Fault::TooManyRequestsAfter("1e30")]);
+    provider
+        .list_catalog(&connection, None)
+        .await
+        .expect("retried after a bounded wait");
+    assert_eq!(fake.calls("ProductsPage").len(), 2);
+    fake.assert_clean();
+}
+
+#[tokio::test]
+async fn a_retry_after_that_is_not_a_wait_is_no_hint() {
+    let (fake, provider, connection) = setup().await;
+    fake.fault(
+        "ShopCurrency",
+        vec![
+            Fault::TooManyRequestsAfter("NaN"),
+            Fault::TooManyRequestsAfter("inf"),
+            Fault::TooManyRequestsAfter("-1"),
+        ],
+    );
+    let error = provider
+        .push_order(&connection, &push(0))
+        .await
+        .expect_err("429");
+    assert!(
+        matches!(error, ProviderError::RateLimited { retry_after: None }),
+        "{error:?}"
+    );
+
+    fake.fault("ShopCurrency", vec![Fault::TooManyRequestsAfter("0"); 3]);
+    let error = provider
+        .push_order(&connection, &push(0))
+        .await
+        .expect_err("429");
+    assert!(
+        matches!(error, ProviderError::RateLimited { retry_after: Some(wait) } if wait.is_zero()),
+        "{error:?}"
+    );
+    assert!(fake.orders().is_empty());
+    fake.assert_clean();
+}
+
+#[tokio::test]
+async fn a_throttle_with_a_vanishing_restore_rate_waits_a_bounded_time() {
+    let (fake, provider, connection) = setup().await;
+    fake.fault(
+        "ProductsPage",
+        vec![Fault::ThrottledWith {
+            requested: 600.0,
+            available: 599.0,
+            restore_rate: 1e-300,
+        }],
+    );
+    provider
+        .list_catalog(&connection, None)
+        .await
+        .expect("retried after a bounded wait");
+    assert_eq!(fake.calls("ProductsPage").len(), 2);
+    fake.assert_clean();
+}
+
+#[tokio::test]
+async fn a_bucket_that_never_refills_paces_a_bounded_wait() {
+    let (fake, provider, connection) = setup().await;
+    fake.fault(
+        "ProductsPage",
+        vec![Fault::ThrottledWith {
+            requested: 600.0,
+            available: -1e300,
+            restore_rate: 0.0,
+        }],
+    );
+    provider
+        .list_catalog(&connection, None)
+        .await
+        .expect("paced, then retried");
+    assert_eq!(fake.calls("ProductsPage").len(), 2);
+    fake.assert_clean();
+}
+
+#[tokio::test]
 async fn store_failures_map_to_the_contracts_outcomes() {
     let (fake, provider, connection) = setup().await;
     fake.fault("OrderCreate", vec![Fault::Status(503)]);

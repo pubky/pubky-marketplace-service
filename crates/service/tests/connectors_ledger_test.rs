@@ -371,6 +371,83 @@ async fn a_throttled_push_waits_and_then_goes_without_a_lookup(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_retry_after_beyond_any_date_waits_at_most_a_day(pool: PgPool) {
+    let s = scenario(pool).await;
+    let hints = [
+        Duration::from_secs(9_000_000_000_000),
+        Duration::from_secs(u64::MAX),
+        Duration::MAX,
+    ];
+    for (n, hint) in hints.into_iter().enumerate() {
+        s.store.script(PushScript::RateLimited(Some(hint)));
+        s.pass().await;
+        let (state, _, _, attempts) = s.push().await;
+        assert_eq!((state.as_str(), attempts), ("pending", n as i32 + 1));
+        let next: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+            "SELECT next_attempt_at FROM connector_order_push WHERE pubky_order_id = $1::uuid",
+        )
+        .bind(&s.order.order_id)
+        .fetch_one(&s.app.pool)
+        .await
+        .expect("push row");
+        assert_eq!(
+            next - s.app.clock.now(),
+            chrono::Duration::days(1),
+            "{hint:?}"
+        );
+        s.after(86_400);
+    }
+    s.pass().await;
+    assert_eq!(s.push().await.0, "created");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_rate_limited_cancel_beyond_any_date_waits_at_most_a_day(pool: PgPool) {
+    let s = scenario(pool).await;
+    s.pass().await;
+    assert_eq!(s.push().await.0, "created");
+    let order_id = s.order.order_id.as_str();
+    execute(
+        &s.app,
+        &s.buyer.token,
+        &order_command(
+            "order.cancel_request",
+            order_id,
+            2,
+            json!({ "reason": "changed my mind" }),
+            1_401,
+        ),
+    )
+    .await;
+    let (status, body) = execute(
+        &s.app,
+        &s.seller.token,
+        &order_command("order.cancel_approve", order_id, 3, json!({}), 1_402),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    *s.store
+        .cancel_rate_limited_once
+        .lock()
+        .expect("cancel rate limit lock") = Some(Duration::from_secs(9_000_000_000_000));
+    s.pass().await;
+    assert_eq!(s.store.cancel_calls.load(Ordering::SeqCst), 1);
+    let next: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+        "SELECT next_attempt_at FROM connector_order_actions WHERE kind = 'cancel'",
+    )
+    .fetch_one(&s.app.pool)
+    .await
+    .expect("cancel action");
+    assert_eq!(next - s.app.clock.now(), chrono::Duration::days(1));
+
+    s.after(86_400);
+    s.pass().await;
+    assert_eq!(s.store.cancel_calls.load(Ordering::SeqCst), 2);
+    assert!(s.store.remote_orders()[0].cancelled);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn a_refused_push_is_quarantined_alerted_and_retried_after_a_lookup(pool: PgPool) {
     let s = scenario(pool).await;
     s.store.script(PushScript::Rejected("validation"));

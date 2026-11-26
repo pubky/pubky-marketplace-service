@@ -123,8 +123,7 @@ pub async fn process_due(
     let mut finished = 0;
     for _ in 0..limit {
         let now = state.clock.now();
-        let lease_until =
-            now + chrono::Duration::from_std(runtime.settings.lease).unwrap_or_default();
+        let lease_until = super::config::after(now, runtime.settings.lease);
         let due: Option<DueEvent> = sqlx::query_as(
             "UPDATE connector_inbound_events SET attempts = attempts + 1, lease_until = $2 \
              WHERE id = ( \
@@ -172,9 +171,7 @@ pub async fn process_due(
                 finished += 1;
             }
             Handled::Retry(outcome) => {
-                let retry_at = now
-                    + chrono::Duration::from_std(runtime.settings.backoff(due.attempts))
-                        .unwrap_or_default();
+                let retry_at = super::config::after(now, runtime.settings.backoff(due.attempts));
                 sqlx::query(
                     "UPDATE connector_inbound_events SET lease_until = NULL, \
                      next_attempt_at = $2, outcome = $3 WHERE id = $1",

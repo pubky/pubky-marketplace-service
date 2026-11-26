@@ -24,8 +24,10 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use reqwest::header::{HeaderMap, RETRY_AFTER};
 use serde_json::{json, Value};
 
+use crate::connectors::config::MAX_RETRY_DELAY;
 use crate::connectors::provider::ProviderError;
 
 /// The Admin API version every document is written and validated against.
@@ -70,6 +72,18 @@ impl Bucket {
     fn estimate(&self, now: Instant) -> f64 {
         let elapsed = now.saturating_duration_since(self.at).as_secs_f64();
         (self.available + self.restore_rate * elapsed).min(self.maximum)
+    }
+
+    /// How long the next call waits for the bucket to refill to the pace
+    /// floor, at most [`MAX_INLINE_WAIT`].
+    fn pace_wait(&self, now: Instant) -> Option<Duration> {
+        let estimate = self.estimate(now);
+        let floor = PACE_FLOOR.min(self.maximum);
+        if estimate >= floor {
+            return None;
+        }
+        bounded_wait((floor - estimate) / self.restore_rate.max(1.0))
+            .map(|wait| wait.min(MAX_INLINE_WAIT))
     }
 }
 
@@ -138,14 +152,9 @@ impl Client {
     async fn pace(&self, shop: &str) {
         let wait = {
             let buckets = self.buckets.lock().expect("throttle state is not poisoned");
-            buckets.get(shop).and_then(|bucket| {
-                let estimate = bucket.estimate(Instant::now());
-                let floor = PACE_FLOOR.min(bucket.maximum);
-                (estimate < floor).then(|| {
-                    Duration::from_secs_f64((floor - estimate) / bucket.restore_rate.max(1.0))
-                        .min(MAX_INLINE_WAIT)
-                })
-            })
+            buckets
+                .get(shop)
+                .and_then(|bucket| bucket.pace_wait(Instant::now()))
         };
         if let Some(wait) = wait {
             tokio::time::sleep(wait).await;
@@ -188,13 +197,7 @@ impl Client {
             .await
             .map_err(|error| ProviderError::Unknown(describe(error)))?;
         let status = response.status();
-        let retry_after = response
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.trim().parse::<f64>().ok())
-            .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
-            .map(Duration::from_secs_f64);
+        let retry_after = retry_after(response.headers());
         match status.as_u16() {
             429 => return Err(ProviderError::RateLimited { retry_after }),
             401 | 402 | 403 | 404 | 423 => return Err(ProviderError::Unauthorized),
@@ -275,6 +278,24 @@ fn graphql_error(errors: &Value, body: &Value) -> ProviderError {
     }
 }
 
+/// A wait the store asked for, in seconds, cut to [`MAX_RETRY_DELAY`]. Not a
+/// number, infinite or negative is no hint at all.
+fn bounded_wait(seconds: f64) -> Option<Duration> {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return None;
+    }
+    Duration::try_from_secs_f64(seconds.min(MAX_RETRY_DELAY.as_secs_f64())).ok()
+}
+
+/// A 429's `Retry-After`, in seconds (Shopify may send a fraction).
+fn retry_after(headers: &HeaderMap) -> Option<Duration> {
+    headers
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .and_then(bounded_wait)
+}
+
 /// How long until the bucket holds what the throttled query asked for.
 fn throttle_wait(body: &Value) -> Option<Duration> {
     let cost = body.pointer("/extensions/cost")?;
@@ -283,7 +304,8 @@ fn throttle_wait(body: &Value) -> Option<Duration> {
     let available = status.get("currentlyAvailable")?.as_f64()?;
     let rate = status.get("restoreRate")?.as_f64()?;
     (rate > 0.0 && requested > available)
-        .then(|| Duration::from_secs_f64((requested - available) / rate))
+        .then(|| (requested - available) / rate)
+        .and_then(bounded_wait)
 }
 
 #[cfg(test)]
@@ -305,6 +327,71 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    fn throttled(requested: f64, available: f64, restore_rate: f64) -> Value {
+        json!({"extensions": {"cost": {
+            "requestedQueryCost": requested,
+            "throttleStatus": {"maximumAvailable": 2000.0, "currentlyAvailable": available, "restoreRate": restore_rate}
+        }}})
+    }
+
+    #[test]
+    fn a_throttle_wait_is_cut_to_a_day_or_dropped() {
+        let day = Some(Duration::from_secs(86_400));
+        assert_eq!(throttle_wait(&throttled(600.0, 599.0, 1e-300)), day);
+        assert_eq!(throttle_wait(&throttled(1e8, 0.0, 1e-300)), day);
+        assert_eq!(throttle_wait(&throttled(1e6, 0.0, 1.0)), day);
+        assert_eq!(throttle_wait(&throttled(1e300, 0.0, 1e-300)), None);
+        assert_eq!(throttle_wait(&throttled(1.7e308, -1.7e308, 1.0)), None);
+        assert_eq!(throttle_wait(&throttled(600.0, 100.0, 0.0)), None);
+        assert_eq!(throttle_wait(&throttled(600.0, 100.0, -50.0)), None);
+        assert_eq!(throttle_wait(&throttled(100.0, 600.0, 50.0)), None);
+        assert_eq!(throttle_wait(&throttled(600.0, 600.0, 50.0)), None);
+        assert_eq!(
+            throttle_wait(&throttled(600.0, 100.0, 1000.0)),
+            Some(Duration::from_millis(500))
+        );
+    }
+
+    #[test]
+    fn a_retry_after_is_cut_to_a_day_or_dropped() {
+        let read = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(RETRY_AFTER, value.parse().expect("header"));
+            retry_after(&headers)
+        };
+        assert_eq!(read("1e30"), Some(Duration::from_secs(86_400)));
+        assert_eq!(read("86401"), Some(Duration::from_secs(86_400)));
+        assert_eq!(read("2.5"), Some(Duration::from_millis(2500)));
+        assert_eq!(read("0"), Some(Duration::ZERO));
+        for value in ["NaN", "inf", "-inf", "-1", "-1e30", "soon"] {
+            assert_eq!(read(value), None, "{value}");
+        }
+        assert_eq!(retry_after(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn a_bucket_that_cannot_refill_paces_at_most_the_inline_wait() {
+        let now = Instant::now();
+        let bucket = |available: f64, restore_rate: f64| Bucket {
+            available,
+            maximum: 1000.0,
+            restore_rate,
+            at: now,
+        };
+        assert_eq!(bucket(-1e300, 0.0).pace_wait(now), Some(MAX_INLINE_WAIT));
+        assert_eq!(bucket(-1e300, -50.0).pace_wait(now), Some(MAX_INLINE_WAIT));
+        assert_eq!(
+            bucket(-1.7e308, 1e-300).pace_wait(now),
+            Some(MAX_INLINE_WAIT)
+        );
+        assert_eq!(
+            bucket(100.0, 50.0).pace_wait(now),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(bucket(150.0, 50.0).pace_wait(now), None);
+        assert_eq!(bucket(900.0, 50.0).pace_wait(now), None);
     }
 
     #[test]

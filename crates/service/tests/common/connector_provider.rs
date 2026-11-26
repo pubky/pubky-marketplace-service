@@ -102,6 +102,8 @@ pub struct TestStore {
     pub catalog: Mutex<Vec<CatalogProduct>>,
     pub reject_credentials: AtomicBool,
     pub cancel_unknown_once: AtomicBool,
+    /// The next cancel is rate limited with this `retry_after`.
+    pub cancel_rate_limited_once: Mutex<Option<Duration>>,
     pub last_order_push: Mutex<Option<OrderPush>>,
     pub last_refund: Mutex<Option<RefundRecord>>,
     /// The amount of every refund the store was asked to record, in order.
@@ -479,6 +481,17 @@ impl ConnectorProvider for TestProvider {
         blob(connection)?;
         if self.store.cancel_unknown_once.swap(false, Ordering::SeqCst) {
             return Err(ProviderError::Unknown("timeout".into()));
+        }
+        let rate_limited = self
+            .store
+            .cancel_rate_limited_once
+            .lock()
+            .expect("cancel rate limit lock")
+            .take();
+        if let Some(retry_after) = rate_limited {
+            return Err(ProviderError::RateLimited {
+                retry_after: Some(retry_after),
+            });
         }
         let mut orders = self.store.orders.lock().expect("orders lock");
         if let Some(remote) = orders.iter_mut().find(|remote| remote.id == order.id) {

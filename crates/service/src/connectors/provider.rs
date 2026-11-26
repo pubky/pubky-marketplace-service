@@ -625,7 +625,9 @@ pub enum ProviderError {
     /// `validation`, ...).
     #[error("provider rejected the request: {code}")]
     Rejected { code: String, message: String },
-    /// The store is throttling; nothing was applied.
+    /// The store is throttling; nothing was applied. `retry_after` is the
+    /// store's own wait; the worker waits at least its backoff and at most
+    /// [`super::config::MAX_RETRY_DELAY`].
     #[error("provider is rate limiting")]
     RateLimited { retry_after: Option<Duration> },
     /// The store no longer accepts the credential (revoked, expired,
