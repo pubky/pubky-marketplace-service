@@ -7296,3 +7296,80 @@ async fn a_short_poll_does_not_displace_a_lookup_within_the_http_timeout(pool: P
         "confirmed"
     );
 }
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn waiting_for_the_task_lease_does_not_age_the_first_lookup(pool: PgPool) {
+    verify_after_lock_wait(pool, true).await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn waiting_for_a_table_lock_does_not_age_the_first_lookup(pool: PgPool) {
+    verify_after_lock_wait(pool, false).await;
+}
+
+async fn verify_after_lock_wait(pool: PgPool, block_lease: bool) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
+    register_locks(&app, &buyer.token, &order, &seller.pubky).await;
+
+    let started = app.clock.now();
+    assert!(try_acquire_lease(
+        &app.pool,
+        workers::TASK_LOCKS_VERIFICATION,
+        Uuid::new_v4(),
+        started,
+        0
+    )
+    .await
+    .unwrap());
+    let mut tx = app.pool.begin().await.unwrap();
+    let blocking_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    if block_lease {
+        sqlx::query("SELECT holder FROM worker_leases WHERE task = $1 FOR UPDATE")
+            .bind(workers::TASK_LOCKS_VERIFICATION)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+    } else {
+        // Ordinary CREATE INDEX uses SHARE; readers may proceed but claims must wait.
+        sqlx::query("LOCK TABLE payment_locks_correlations IN SHARE MODE")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+    }
+
+    let release = fake.park_next_lookup();
+    let state = app.state.clone();
+    let first =
+        tokio::spawn(async move { run_once(&state, Uuid::new_v4(), started).await.unwrap() });
+    wait_for_lock_waiters(&app.pool, blocking_pid, 1, "Locks verification pass").await;
+    app.clock.advance_seconds(32);
+    tx.commit().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while fake.lookup_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first worker starts the lookup after acquiring the lease");
+
+    let second = run_once(&app.state, Uuid::new_v4(), app.clock.now())
+        .await
+        .unwrap();
+    fake.complete_matching(&app.pool, TEST_BUNDLE_ID, &order.payment_id)
+        .await;
+    release.notify_one();
+    let first = first.await.unwrap();
+    assert_eq!(
+        fake.lookup_count(),
+        1,
+        "a fresh lookup keeps its full poll interval"
+    );
+    assert_eq!(first.locks_completions_applied, 1);
+    assert_eq!(second.locks_completions_applied, 0);
+}

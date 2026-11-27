@@ -114,9 +114,11 @@ Each lifecycle claim takes the next `claim_generation` of the row, and every
 one of the writes above requires the row to still carry the generation its
 claim took; the completion paths check it under the correlation lock before
 any payment or order effect. Workers take one oldest due correlation just before its
-lookup. They can reclaim it after the poll interval or the ten-second HTTP
-timeout, whichever is longer. A later claim fences any remaining work from
-the old claim.
+lookup. A claim starts its clock after waiting for the task lease and the
+table lock needed by its update. Other workers can still claim different
+rows while a lookup is in flight. They can reclaim the same row after the
+poll interval or the ten-second HTTP timeout, whichever is longer. A
+later claim fences any remaining work from the old claim.
 
 These paths judge time only once the locks their time checks depend on are
 held. Registration, the buyer's cancel and a first preparation read the

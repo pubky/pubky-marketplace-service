@@ -2335,10 +2335,15 @@ pub async fn verify_due_locks_lifecycles(
     let due_before = now - chrono::Duration::seconds(poll_seconds);
     let mut applied = 0u64;
     for _ in 0..LOCKS_VERIFY_BATCH_SIZE {
-        let mut connection = state.pool.acquire().await?;
+        let mut tx = state.pool.begin().await?;
+        // Take the table lock the UPDATE already needs before sampling the claim clock.
+        // SKIP LOCKED skips competing rows, but a schema change can still delay any writer.
+        sqlx::query("LOCK TABLE payment_locks_correlations IN ROW EXCLUSIVE MODE")
+            .execute(&mut *tx)
+            .await?;
         let claimed_at = now + (state.clock.now() - started);
-        let row = claim_next_due_correlation(&mut connection, claimed_at, due_before).await?;
-        drop(connection);
+        let row = claim_next_due_correlation(&mut tx, claimed_at, due_before).await?;
+        tx.commit().await?;
         let Some(row) = row else { break };
         match apply_locks_lookup_outcome(state, locks, &row, claimed_at).await {
             Ok(true) => applied += 1,
@@ -6115,17 +6120,19 @@ pub async fn run_once(
     // closed); the window sweep is a marketplace-time transition and always
     // runs, so correlations registered before a config change still expire.
     if let Some(locks) = &state.locks {
-        let verification_now = now + (state.clock.now() - started);
+        let pass_now = || now + (state.clock.now() - started);
         if try_acquire_lease(
             &state.pool,
             TASK_LOCKS_VERIFICATION,
             holder,
-            verification_now,
+            pass_now(),
             lease_seconds,
         )
         .await?
         {
-            let result = verify_due_locks_lifecycles(state, locks, verification_now).await;
+            // Acquiring the lease can wait for a locked row or a pool connection.
+            // Start the lookup's poll interval after that wait.
+            let result = verify_due_locks_lifecycles(state, locks, pass_now()).await;
             // The checkout-snapshot retention purge runs UNDER the same
             // lease — never after it is released — so concurrent
             // instances cannot purge simultaneously. Bounded at 500 rows
@@ -6133,17 +6140,11 @@ pub async fn run_once(
             // without delaying lifecycle work.
             let purge = crate::locks::purge_terminal_locks_checkout_snapshots(
                 &state.pool,
-                now,
+                pass_now(),
                 state.config.locks_snapshot_retention_days,
             )
             .await;
-            release_lease(
-                &state.pool,
-                TASK_LOCKS_VERIFICATION,
-                holder,
-                verification_now,
-            )
-            .await?;
+            release_lease(&state.pool, TASK_LOCKS_VERIFICATION, holder, pass_now()).await?;
             summary.locks_completions_applied = result?;
             summary.locks_snapshots_purged = purge?;
         }
