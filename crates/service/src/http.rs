@@ -310,8 +310,17 @@ pub fn routes(state: &AppState) -> Router<AppState> {
             auth::require_session,
         ));
 
+    let store_claim = Router::new()
+        .route("/v1/store/claim", post(crate::store_claim::claim_store))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_session,
+        ))
+        .layer(DefaultBodyLimit::max(crate::store_claim::CLAIM_BODY_LIMIT));
+
     Router::new()
         .route("/health", get(health))
+        .route("/v1/store", get(crate::store_claim::get_store))
         .route("/ready", get(ready))
         .route(
             "/v1/auth/sessions",
@@ -392,6 +401,7 @@ pub fn routes(state: &AppState) -> Router<AppState> {
         // the seller's configured email and the exact order total.
         .route("/v0/paypal/ipn", post(crate::payment_methods::paypal_ipn))
         .merge(protected)
+        .merge(store_claim)
         .merge(inventory)
         .merge(automation)
         .merge(connectors)
@@ -459,6 +469,26 @@ async fn log_request(request: axum::extract::Request, next: middleware::Next) ->
 /// configured AND sandbox payments are disabled, §A7); clients hide the
 /// pickup option everywhere when it is off.
 async fn health(State(state): State<AppState>) -> Json<Value> {
+    let active = match state.store.refresh(&state.pool, false).await {
+        Ok(active) => active,
+        Err(error) => {
+            tracing::error!(error = %error, "store health refresh failed");
+            state.store.active()
+        }
+    };
+    let store = match &active {
+        crate::store_seller::Active::Off => json!({ "mode": "marketplace", "seller": null }),
+        crate::store_seller::Active::Unclaimed => {
+            json!({ "mode": "single_seller", "state": "unclaimed", "seller": null })
+        }
+        crate::store_seller::Active::Claimed(seller) => {
+            if state.config.store_mode.is_claim_mode() {
+                json!({ "mode": "single_seller", "state": "claimed", "seller": seller })
+            } else {
+                json!({ "mode": "single_seller", "seller": seller })
+            }
+        }
+    };
     let (bitcoin_offer_available, age_seconds) = state
         .payment_availability
         .rail_snapshot(state.clock.now())
@@ -478,10 +508,7 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
             "bitcoin_offer_available": bitcoin_offer_available,
             "age_seconds": age_seconds,
         },
-        "store": {
-            "mode": state.config.store_mode.as_str(),
-            "seller": state.config.store_mode.store_seller(),
-        },
+        "store": store,
         "homeserver_resolution": state.homeserver.as_ref().and_then(|homeserver| homeserver.resolution()),
         "listing_moderation": if state.listing_moderation.is_some() { "on" } else { "off" },
         "fx_source": {
@@ -515,7 +542,7 @@ const COMMIT_SHORT_LEN: usize = 12;
 /// Short git SHA of the running build, from the `GIT_COMMIT` env the image
 /// build bakes in. Anything that is not a hex SHA reports `unknown`, so the
 /// public `/health` body can never echo an arbitrary env value.
-fn build_commit() -> &'static str {
+pub(crate) fn build_commit() -> &'static str {
     static COMMIT: OnceLock<String> = OnceLock::new();
     COMMIT.get_or_init(|| short_commit(std::env::var("GIT_COMMIT").ok().as_deref()))
 }

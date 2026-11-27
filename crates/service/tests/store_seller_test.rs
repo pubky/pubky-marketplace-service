@@ -163,8 +163,14 @@ async fn writer(pool: &PgPool) -> Writer {
 /// `app` on the same pool and clock, serving only `store`.
 fn single_seller(app: &TestApp, store: &str, audit: Option<&Writer>) -> TestApp {
     let mut config = (*app.state.config).clone();
-    config.store_mode = StoreMode::SingleSeller(store.to_string());
+    config.store_mode = StoreMode::SingleSeller {
+        pinned: Some(store.to_string()),
+    };
     let mut state: AppState = app.state.clone();
+    state.store = Arc::new(marketplace_service::store_seller::StoreBinding::from_mode(
+        &config.store_mode,
+        None,
+    ));
     state.config = Arc::new(config);
     if let Some(audit) = audit {
         state = state.with_refusal_audit(audit.runtime.clone());
@@ -1035,7 +1041,9 @@ async fn single_seller_mode_refuses_to_start_on_another_sellers_rows(pool: PgPoo
     let app = test_app(pool.clone()).await;
     let store = new_actor(&app).await;
     let buyer = new_actor(&app).await;
-    let single = StoreMode::SingleSeller(store.pubky.clone());
+    let single = StoreMode::SingleSeller {
+        pinned: Some(store.pubky.clone()),
+    };
 
     // The store seller's own listing, hold and order: it starts.
     let (status, body) = execute(&app, &store.token, &register_command(&store.pubky, 3)).await;
@@ -1265,7 +1273,9 @@ async fn single_seller_mode_refuses_to_start_on_another_sellers_settings_and_int
 ) {
     let store = marketplace_domain::pubky::encode_pubky(&[11; 32]);
     let carol = marketplace_domain::pubky::encode_pubky(&[12; 32]);
-    let single = StoreMode::SingleSeller(store.clone());
+    let single = StoreMode::SingleSeller {
+        pinned: Some(store.clone()),
+    };
     let at = chrono::Utc::now();
     let seed = |category: &Category, seller: &str| {
         sqlx::query(category.insert)

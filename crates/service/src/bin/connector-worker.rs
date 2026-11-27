@@ -33,6 +33,19 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::from_env()?;
+    let grant_session = marketplace_service::grant_session::GrantSessionConfig::from_env(
+        config.public_service_origin.as_deref(),
+    )?;
+    if config.store_mode.is_claim_mode()
+        && grant_session
+            .as_ref()
+            .is_none_or(|grant| grant.client_ids.is_empty())
+    {
+        anyhow::bail!(
+            "single-seller claim mode requires MARKETPLACE_GRANT_SESSION_ENABLED=true \
+             and at least one MARKETPLACE_GRANT_SESSION_CLIENT_IDS entry"
+        );
+    }
     marketplace_service::inventory::validate_rate_config_from_env()?;
     let locks = marketplace_service::locks::runtime_from_env()?;
     let pickup = marketplace_service::pickup::pickup_keys_from_env(locks.as_deref())?;
@@ -63,13 +76,30 @@ async fn main() -> anyhow::Result<()> {
         .connect(&config.database_url)
         .await?;
     marketplace_service::migrations::run(&pool).await?;
-    marketplace_service::store_seller::refuse_other_sellers(&pool, &config.store_mode).await?;
+    let store = loop {
+        let store = marketplace_service::store_seller::resolve_store_without_code(
+            &pool,
+            &config.store_mode,
+            config.store_claim_code.clone(),
+        )
+        .await?;
+        if !matches!(
+            store.active(),
+            marketplace_service::store_seller::Active::Unclaimed
+        ) {
+            break store;
+        }
+        tracing::info!("connector worker waiting for the store claim");
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    };
     connectors::assert_credentials_coherent(&pool, Some(runtime.keys.as_ref())).await?;
     tracing::info!(
         providers = ?runtime.providers.kinds(),
         "connector worker starting"
     );
 
-    let state = AppState::new(pool, Arc::new(SystemClock), config).with_connectors(Some(runtime));
+    let state = AppState::new(pool, Arc::new(SystemClock), config)
+        .with_store(store)
+        .with_connectors(Some(runtime));
     connectors::worker::run_forever(state).await
 }

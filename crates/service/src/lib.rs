@@ -68,6 +68,8 @@ pub mod rotating_keys;
 pub mod seal;
 pub mod seller_terms;
 pub mod shipping;
+pub mod store_binding_admin;
+pub mod store_claim;
 pub mod store_seller;
 pub mod variant_stock;
 pub mod workers;
@@ -109,6 +111,9 @@ pub struct AppState {
     pub pool: PgPool,
     pub clock: Arc<dyn Clock>,
     pub config: Arc<Config>,
+    /// Exhaustive runtime store state. No Option means serve everyone.
+    pub store: Arc<store_seller::StoreBinding>,
+    pub store_limiters: Arc<store_claim::StoreLimiters>,
     /// Locks verification keys and lifecycle client. `None` on sandbox-only
     /// deployments: `payment.register_locks` is refused and the lifecycle
     /// poller is not scheduled (fail closed; see [`locks::runtime_from_env`]).
@@ -223,10 +228,16 @@ impl AppState {
 
 impl AppState {
     pub fn new(pool: PgPool, clock: Arc<dyn Clock>, config: Config) -> Self {
+        let store = Arc::new(store_seller::StoreBinding::from_mode(
+            &config.store_mode,
+            config.store_claim_code.clone(),
+        ));
         Self {
             pool,
             clock,
             config: Arc::new(config),
+            store,
+            store_limiters: Arc::new(store_claim::StoreLimiters::default()),
             locks: None,
             attestor: None,
             attestor_publisher: None,
@@ -249,6 +260,16 @@ impl AppState {
             listing_availability: Arc::new(listing_availability::AvailabilityLimiter::default()),
             connectors: None,
         }
+    }
+
+    pub fn with_store(mut self, store: Arc<store_seller::StoreBinding>) -> Self {
+        self.store = store;
+        self
+    }
+
+    pub fn with_store_limiters(mut self, limiters: Arc<store_claim::StoreLimiters>) -> Self {
+        self.store_limiters = limiters;
+        self
     }
 
     pub fn with_locks(mut self, locks: Option<Arc<LocksRuntime>>) -> Self {

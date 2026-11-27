@@ -51,6 +51,16 @@ async fn main() -> anyhow::Result<()> {
     let grant_session = marketplace_service::grant_session::GrantSessionConfig::from_env(
         config.public_service_origin.as_deref(),
     )?;
+    if config.store_mode.is_claim_mode()
+        && grant_session
+            .as_ref()
+            .is_none_or(|grant| grant.client_ids.is_empty())
+    {
+        anyhow::bail!(
+            "single-seller claim mode requires MARKETPLACE_GRANT_SESSION_ENABLED=true \
+             and at least one MARKETPLACE_GRANT_SESSION_CLIENT_IDS entry"
+        );
+    }
     tracing::info!(
         grant_sessions = if grant_session.is_some() {
             "enabled"
@@ -171,17 +181,6 @@ async fn main() -> anyhow::Result<()> {
             std::env::var(marketplace_service::homeserver::ENV_HOMESERVER_URL).unwrap_or_default(),
         );
     }
-    match config.store_mode.store_seller() {
-        Some(seller) => tracing::info!(
-            store_mode = config.store_mode.as_str(),
-            store_seller = seller,
-            "single-seller mode: commands and routes for any other seller are refused"
-        ),
-        None => tracing::info!(
-            store_mode = config.store_mode.as_str(),
-            "marketplace mode: any seller is served"
-        ),
-    }
     // NEXUS_URL is required while moderation is on: checkout, bids and offers
     // on a moderated listing are refused from the index's moderation state,
     // and running without it would sell moderated listings by omission. Only
@@ -216,7 +215,29 @@ async fn main() -> anyhow::Result<()> {
     wait_for_database(&pool, BOOT_DATABASE_WAIT).await?;
     marketplace_service::migrations::run(&pool).await?;
     tracing::info!("database migrations applied");
-    marketplace_service::store_seller::refuse_other_sellers(&pool, &config.store_mode).await?;
+    let store = marketplace_service::store_seller::resolve_store(
+        &pool,
+        &config.store_mode,
+        config.store_claim_code.clone(),
+    )
+    .await?;
+    match store.active() {
+        marketplace_service::store_seller::Active::Off => {
+            tracing::info!(
+                store_mode = "marketplace",
+                "marketplace mode: any seller is served"
+            )
+        }
+        marketplace_service::store_seller::Active::Unclaimed => tracing::info!(
+            store_mode = "single_seller",
+            "single-seller store is unclaimed; commerce is refused until the claim"
+        ),
+        marketplace_service::store_seller::Active::Claimed(seller) => tracing::info!(
+            store_mode = "single_seller",
+            store_seller = seller,
+            "single-seller mode: commands and routes for any other seller are refused"
+        ),
+    }
     let audit_writer_options: PgConnectOptions = config.refusal_audit_database_url.parse()?;
     let audit_writer_pool = PgPoolOptions::new()
         .max_connections(marketplace_service::refusal_audit::WRITER_POOL_MAX_CONNECTIONS)
@@ -272,6 +293,7 @@ async fn main() -> anyhow::Result<()> {
 
     let listing_availability =
         Arc::new(marketplace_service::listing_availability::AvailabilityLimiter::from_env()?);
+    let store_limiters = Arc::new(marketplace_service::store_claim::StoreLimiters::from_env()?);
 
     let refund_chain = marketplace_service::refund_chain::client_from_env()?
         .map(|client| Arc::new(client) as Arc<dyn marketplace_service::refund_chain::RefundChain>);
@@ -286,6 +308,8 @@ async fn main() -> anyhow::Result<()> {
 
     let bind_addr = config.bind_addr;
     let state = AppState::new(pool, Arc::new(SystemClock), config)
+        .with_store(store)
+        .with_store_limiters(store_limiters)
         .with_locks(locks)
         .with_attestor(attestor)
         .with_attestor_publisher(attestor_publisher)

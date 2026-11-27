@@ -87,15 +87,17 @@ pub async fn execute_with_edge(
                 command.expected_revision,
                 started.elapsed().as_millis() as u64,
             );
-            enqueue_refusal(
-                state,
-                actor,
-                state.clock.now(),
-                SurfaceKind::V1Command,
-                command_kind(&command.payload),
-                failure.refusal_kind(),
-                Some(command.command_id),
-            );
+            if failure.is_audited() {
+                enqueue_refusal(
+                    state,
+                    actor,
+                    state.clock.now(),
+                    SurfaceKind::V1Command,
+                    command_kind(&command.payload),
+                    failure.refusal_kind(),
+                    Some(command.command_id),
+                );
+            }
             return Ok(failure_response(&failure));
         }
     }

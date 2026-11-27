@@ -18,6 +18,9 @@
 //! With `STORE_SELLER_PUBKY` unset the service is a marketplace and nothing
 //! here runs.
 
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
+
 use axum::extract::{FromRequestParts, MatchedPath, RawPathParams, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
@@ -26,16 +29,21 @@ use axum::Json;
 use marketplace_domain::commands::{Command, CommandPayload};
 use marketplace_domain::ErrorCode;
 use serde_json::json;
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 use crate::auth::Actor;
 use crate::result::CommandFailure;
+use crate::store_claim::ClaimCode;
 use crate::AppState;
 
-/// The one seller this deployment serves. Unset (or empty), the service is a
-/// marketplace for any seller.
+/// The optional pre-pinned seller.
 pub const ENV_STORE_SELLER_PUBKY: &str = "STORE_SELLER_PUBKY";
+pub const ENV_STORE_MODE: &str = "STORE_MODE";
+/// Shared by every boot binding read, the env insert, claims and release.
+pub const STORE_BINDING_LOCK_KEY: i64 = 4_713_371_337_102;
+pub const STORE_UNCLAIMED_MESSAGE: &str = "This store has not been claimed by its seller yet.";
+pub const STORE_ALREADY_CLAIMED_MESSAGE: &str = "This store has already been claimed.";
 
 /// `off` turns the index moderation gate off. Allowed only with
 /// [`ENV_STORE_SELLER_PUBKY`]; unset (or `on`) keeps it on.
@@ -43,29 +51,274 @@ pub const ENV_LISTING_MODERATION: &str = "LISTING_MODERATION";
 
 pub const SELLER_NOT_SERVED_MESSAGE: &str = "This service sells only its store seller's listings.";
 
-/// Which sellers the deployment serves.
+/// Boot-time store configuration. A missing pin is claim mode, not an open
+/// marketplace; runtime decisions use [`Active`] instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreMode {
-    /// Any seller (the default).
     Marketplace,
-    /// Only this seller.
-    SingleSeller(String),
+    SingleSeller { pinned: Option<String> },
 }
 
 impl StoreMode {
-    pub fn store_seller(&self) -> Option<&str> {
-        match self {
-            Self::Marketplace => None,
-            Self::SingleSeller(seller) => Some(seller),
-        }
-    }
-
     pub const fn as_str(&self) -> &'static str {
         match self {
             Self::Marketplace => "marketplace",
-            Self::SingleSeller(_) => "single_seller",
+            Self::SingleSeller { .. } => "single_seller",
         }
     }
+
+    pub fn pinned(&self) -> Option<&str> {
+        match self {
+            Self::Marketplace => None,
+            Self::SingleSeller { pinned } => pinned.as_deref(),
+        }
+    }
+
+    pub const fn is_claim_mode(&self) -> bool {
+        matches!(self, Self::SingleSeller { pinned: None })
+    }
+}
+
+/// The exhaustive runtime answer. Off and Claimed are terminal for a process;
+/// only Unclaimed consults the binding row again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Active {
+    Off,
+    Unclaimed,
+    Claimed(String),
+}
+
+#[derive(Debug)]
+pub struct StoreBinding {
+    active: RwLock<Active>,
+    code: RwLock<Option<ClaimCode>>,
+    last_read: Mutex<Option<Instant>>,
+    refresh: tokio::sync::Mutex<()>,
+}
+
+impl StoreBinding {
+    pub fn new(active: Active, code: Option<ClaimCode>) -> Self {
+        Self {
+            active: RwLock::new(active),
+            code: RwLock::new(code),
+            last_read: Mutex::new(None),
+            refresh: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    pub fn from_mode(mode: &StoreMode, code: Option<ClaimCode>) -> Self {
+        let active = match mode {
+            StoreMode::Marketplace => Active::Off,
+            StoreMode::SingleSeller {
+                pinned: Some(seller),
+            } => Active::Claimed(seller.clone()),
+            StoreMode::SingleSeller { pinned: None } => Active::Unclaimed,
+        };
+        Self::new(active, code)
+    }
+
+    pub fn active(&self) -> Active {
+        self.active.read().expect("store binding read").clone()
+    }
+
+    /// Re-reads an unclaimed binding at most once a second, single flight.
+    pub async fn refresh(&self, pool: &PgPool, force: bool) -> Result<Active, sqlx::Error> {
+        let current = self.active();
+        if !matches!(current, Active::Unclaimed) {
+            return Ok(current);
+        }
+        if !force
+            && self
+                .last_read
+                .lock()
+                .expect("store binding clock")
+                .is_some_and(|read| read.elapsed() < Duration::from_secs(1))
+        {
+            return Ok(current);
+        }
+        let _flight = self.refresh.lock().await;
+        let current = self.active();
+        if !matches!(current, Active::Unclaimed) {
+            return Ok(current);
+        }
+        if !force
+            && self
+                .last_read
+                .lock()
+                .expect("store binding clock")
+                .is_some_and(|read| read.elapsed() < Duration::from_secs(1))
+        {
+            return Ok(current);
+        }
+        let binding = read_binding(pool).await?;
+        *self.last_read.lock().expect("store binding clock") = Some(Instant::now());
+        if let Some(binding) = binding {
+            *self.active.write().expect("store binding write") =
+                Active::Claimed(binding.seller_pubky.clone());
+            *self.code.write().expect("claim code write") = None;
+            return Ok(Active::Claimed(binding.seller_pubky));
+        }
+        Ok(Active::Unclaimed)
+    }
+
+    pub fn claim_code_matches(&self, supplied: &str) -> bool {
+        self.code
+            .read()
+            .expect("claim code read")
+            .as_ref()
+            .is_some_and(|expected| expected.matches(supplied))
+    }
+
+    pub fn mark_claimed(&self, seller: String) {
+        *self.active.write().expect("store binding write") = Active::Claimed(seller);
+        *self.code.write().expect("claim code write") = None;
+    }
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct BindingRow {
+    pub seller_pubky: String,
+    pub bound_by: String,
+    pub claimed_at: chrono::DateTime<chrono::Utc>,
+    pub claim_session_id: Option<Uuid>,
+    pub service_commit: Option<String>,
+}
+
+pub async fn read_binding(pool: &PgPool) -> Result<Option<BindingRow>, sqlx::Error> {
+    sqlx::query_as::<_, BindingRow>(
+        "SELECT seller_pubky, bound_by, claimed_at, claim_session_id, service_commit \
+         FROM store_seller_binding WHERE singleton = TRUE",
+    )
+    .fetch_optional(pool)
+    .await
+}
+
+async fn read_binding_on(connection: &mut PgConnection) -> Result<Option<BindingRow>, sqlx::Error> {
+    sqlx::query_as::<_, BindingRow>(
+        "SELECT seller_pubky, bound_by, claimed_at, claim_session_id, service_commit \
+         FROM store_seller_binding WHERE singleton = TRUE",
+    )
+    .fetch_optional(connection)
+    .await
+}
+
+pub async fn take_binding_lock(connection: &mut PgConnection) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(STORE_BINDING_LOCK_KEY)
+        .execute(connection)
+        .await
+        .map(|_| ())
+}
+
+/// Resolves the boot state in one transaction. Every mode reads the binding
+/// while holding the shared lock, so release and boot are ordered.
+pub async fn resolve_store(
+    pool: &PgPool,
+    mode: &StoreMode,
+    code: Option<ClaimCode>,
+) -> anyhow::Result<Arc<StoreBinding>> {
+    resolve_store_inner(pool, mode, code, true).await
+}
+
+pub async fn resolve_store_without_code(
+    pool: &PgPool,
+    mode: &StoreMode,
+    code: Option<ClaimCode>,
+) -> anyhow::Result<Arc<StoreBinding>> {
+    resolve_store_inner(pool, mode, code, false).await
+}
+
+async fn resolve_store_inner(
+    pool: &PgPool,
+    mode: &StoreMode,
+    code: Option<ClaimCode>,
+    generate_ephemeral: bool,
+) -> anyhow::Result<Arc<StoreBinding>> {
+    let mut tx = pool.begin().await?;
+    take_binding_lock(&mut tx).await?;
+    let existing = read_binding_on(&mut tx).await?;
+    let active = match mode {
+        StoreMode::Marketplace => {
+            if let Some(binding) = existing {
+                anyhow::bail!(
+                    "this database is bound to a single-seller store (seller `{}...`); \
+                     set `STORE_MODE=single_seller`",
+                    crate::logging::actor_prefix(&binding.seller_pubky)
+                );
+            }
+            Active::Off
+        }
+        StoreMode::SingleSeller {
+            pinned: Some(seller),
+        } => {
+            if let Some(binding) = &existing {
+                if &binding.seller_pubky != seller {
+                    anyhow::bail!(
+                        "STORE_SELLER_PUBKY `{}...` does not match the database binding `{}...`",
+                        crate::logging::actor_prefix(seller),
+                        crate::logging::actor_prefix(&binding.seller_pubky)
+                    );
+                }
+            }
+            let rows = other_seller_rows_on(&mut tx, seller).await?;
+            refuse_rows_for_pin(seller, &rows)?;
+            sqlx::query(
+                "INSERT INTO store_seller_binding \
+                 (singleton, seller_pubky, bound_by, service_commit) \
+                 VALUES (TRUE, $1, 'env', $2) ON CONFLICT (singleton) DO NOTHING",
+            )
+            .bind(seller)
+            .bind(crate::http::build_commit())
+            .execute(&mut *tx)
+            .await?;
+            let stored = read_binding_on(&mut tx)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("store binding insert returned no binding"))?;
+            if &stored.seller_pubky != seller {
+                anyhow::bail!("store binding changed while the env pin was being written");
+            }
+            Active::Claimed(seller.clone())
+        }
+        StoreMode::SingleSeller { pinned: None } => match existing {
+            Some(binding) => {
+                let rows = other_seller_rows_on(&mut tx, &binding.seller_pubky).await?;
+                refuse_rows_for_pin(&binding.seller_pubky, &rows)?;
+                if code.is_some() {
+                    tracing::warn!("store is claimed; remove STORE_CLAIM_TOKEN");
+                }
+                Active::Claimed(binding.seller_pubky)
+            }
+            None => {
+                let rows = other_seller_rows_on(&mut tx, "").await?;
+                if !rows.is_empty() {
+                    anyhow::bail!(
+                        "single-seller mode has no seller but the database holds rows of {} sellers; \
+                         set STORE_SELLER_PUBKY or use an empty database",
+                        rows.sellers.len()
+                    );
+                }
+                Active::Unclaimed
+            }
+        },
+    };
+    tx.commit().await?;
+    let code = if matches!(active, Active::Unclaimed) {
+        match code {
+            Some(code) => Some(code),
+            None if generate_ephemeral => {
+                let (code, rendered_code) = ClaimCode::ephemeral();
+                tracing::info!(
+                    "store unclaimed: setup code {} (valid until this process restarts)",
+                    rendered_code
+                );
+                Some(code)
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+    Ok(Arc::new(StoreBinding::new(active, code)))
 }
 
 /// Whether the index moderation gate is constructed and asked.
@@ -89,15 +342,28 @@ impl ListingModeration {
 /// pubky. Whitespace alone is refused, not read as unset: a template that
 /// renders blanks must not fall back to serving every seller.
 pub fn store_mode_from_lookup(get: &dyn Fn(&str) -> Option<String>) -> anyhow::Result<StoreMode> {
-    match get(ENV_STORE_SELLER_PUBKY).filter(|value| !value.is_empty()) {
-        None => Ok(StoreMode::Marketplace),
-        Some(seller) if marketplace_domain::pubky::is_valid_pubky(&seller) => {
-            Ok(StoreMode::SingleSeller(seller))
-        }
+    let pinned = match get(ENV_STORE_SELLER_PUBKY).filter(|value| !value.is_empty()) {
+        None => None,
+        Some(seller) if marketplace_domain::pubky::is_valid_pubky(&seller) => Some(seller),
         Some(_) => anyhow::bail!(
             "{ENV_STORE_SELLER_PUBKY} must be a 52-character z-base-32 pubky, without a \
              `pubky` prefix or surrounding whitespace"
         ),
+    };
+    let configured = get(ENV_STORE_MODE).filter(|value| !value.is_empty());
+    match configured.as_deref() {
+        None => Ok(match pinned {
+            Some(seller) => StoreMode::SingleSeller {
+                pinned: Some(seller),
+            },
+            None => StoreMode::Marketplace,
+        }),
+        Some("single_seller") => Ok(StoreMode::SingleSeller { pinned }),
+        Some("marketplace") if pinned.is_none() => Ok(StoreMode::Marketplace),
+        Some("marketplace") => anyhow::bail!(
+            "STORE_MODE=marketplace contradicts STORE_SELLER_PUBKY; unset the seller pin"
+        ),
+        Some(_) => anyhow::bail!("STORE_MODE must be marketplace or single_seller"),
     }
 }
 
@@ -177,6 +443,14 @@ impl OtherSellerRows {
 /// listings, orders, holds, store connections, payment configurations,
 /// webhook endpoints and seller settings.
 pub async fn other_seller_rows(pool: &PgPool, store: &str) -> Result<OtherSellerRows, sqlx::Error> {
+    let mut connection = pool.acquire().await?;
+    other_seller_rows_on(&mut connection, store).await
+}
+
+pub async fn other_seller_rows_on(
+    connection: &mut PgConnection,
+    store: &str,
+) -> Result<OtherSellerRows, sqlx::Error> {
     type Counts = (i64, i64, i64, i64, i64, i64, i64);
     let (
         listings,
@@ -203,7 +477,7 @@ pub async fn other_seller_rows(pool: &PgPool, store: &str) -> Result<OtherSeller
              (SELECT COUNT(*) FROM attestation_band_consents WHERE seller_pubky <> $1)",
     )
     .bind(store)
-    .fetch_one(pool)
+    .fetch_one(&mut *connection)
     .await?;
     let sellers: Vec<String> = sqlx::query_scalar(
         "SELECT seller_pubky FROM ( \
@@ -218,7 +492,7 @@ pub async fn other_seller_rows(pool: &PgPool, store: &str) -> Result<OtherSeller
          ) other ORDER BY seller_pubky LIMIT 3",
     )
     .bind(store)
-    .fetch_all(pool)
+    .fetch_all(connection)
     .await?;
     Ok(OtherSellerRows {
         listings,
@@ -240,13 +514,18 @@ pub async fn other_seller_rows(pool: &PgPool, store: &str) -> Result<OtherSeller
 /// and command for them, leaving their buyers' orders and holds unserved,
 /// while their store connections, payment rails and webhooks stayed live.
 pub async fn refuse_other_sellers(pool: &PgPool, mode: &StoreMode) -> anyhow::Result<()> {
-    let Some(store) = mode.store_seller() else {
+    let Some(store) = mode.pinned() else {
         return Ok(());
     };
     let rows = other_seller_rows(pool, store).await?;
+    refuse_rows_for_pin(store, &rows)
+}
+
+pub fn refuse_rows_for_pin(store: &str, rows: &OtherSellerRows) -> anyhow::Result<()> {
     if rows.is_empty() {
         return Ok(());
     }
+    let _ = store;
     anyhow::bail!(
         "{ENV_STORE_SELLER_PUBKY} is set, but the database holds {} listings, {} orders, {} \
          holds, {} store connections, {} payment configurations, {} webhook endpoints and {} \
@@ -319,20 +598,23 @@ async fn seller_of(pool: &PgPool, subject: &Subject) -> Result<Option<String>, s
 /// in marketplace mode.
 pub async fn serves(
     pool: &PgPool,
-    mode: &StoreMode,
+    binding: &StoreBinding,
     subjects: &[Subject],
 ) -> Result<bool, sqlx::Error> {
-    let Some(store) = mode.store_seller() else {
-        return Ok(true);
-    };
-    for subject in subjects {
-        if let Some(seller) = seller_of(pool, subject).await? {
-            if seller != store {
-                return Ok(false);
+    match binding.refresh(pool, false).await? {
+        Active::Off => Ok(true),
+        Active::Unclaimed => Ok(false),
+        Active::Claimed(store) => {
+            for subject in subjects {
+                if let Some(seller) = seller_of(pool, subject).await? {
+                    if seller != store {
+                        return Ok(false);
+                    }
+                }
             }
+            Ok(true)
         }
     }
-    Ok(true)
 }
 
 /// Everything a command acts on: its aggregate and whatever its payload
@@ -429,13 +711,20 @@ pub(crate) async fn command_refusal(
     state: &AppState,
     command: &Command,
 ) -> Result<Option<CommandFailure>, sqlx::Error> {
-    let mode = &state.config.store_mode;
-    if *mode == StoreMode::Marketplace
-        || serves(&state.pool, mode, &command_subjects(command)).await?
-    {
-        return Ok(None);
+    match state.store.refresh(&state.pool, false).await? {
+        Active::Off => Ok(None),
+        Active::Unclaimed => Ok(Some(CommandFailure::unaudited(
+            ErrorCode::StoreUnclaimed,
+            STORE_UNCLAIMED_MESSAGE,
+        ))),
+        Active::Claimed(_) => {
+            if serves(&state.pool, &state.store, &command_subjects(command)).await? {
+                Ok(None)
+            } else {
+                Ok(Some(not_served()))
+            }
+        }
     }
-    Ok(Some(not_served()))
 }
 
 fn not_served() -> CommandFailure {
@@ -503,6 +792,7 @@ const STORED: &str = "answers only from what the guarded writes stored";
 pub const ROUTES: &[RouteRule] = &[
     rule("GET", "/health", Public("deployment health")),
     rule("GET", "/ready", Public("deployment readiness")),
+    rule("GET", "/v1/store", Public("public store claim state")),
     rule("POST", "/v1/auth/sessions", Public(SIGN_IN)),
     rule("GET", "/v1/auth/sessions", Public(SIGN_IN)),
     rule("POST", "/v1/auth/grant-session-challenges", Public(SIGN_IN)),
@@ -639,6 +929,11 @@ pub const ROUTES: &[RouteRule] = &[
         StoreSeller,
     ),
     // Signed in.
+    rule(
+        "POST",
+        "/v1/store/claim",
+        Open("signed in; the actor claims the unclaimed store for itself"),
+    ),
     rule("POST", "/v1/commands", Commands),
     rule(
         "GET",
@@ -755,19 +1050,33 @@ pub async fn require_store_seller(
     request: Request,
     next: Next,
 ) -> Response {
-    if state.config.store_mode.store_seller().is_none() {
-        return next.run(request).await;
-    }
     let (mut parts, body) = request.into_parts();
-    let scope = parts
-        .extensions
-        .get::<MatchedPath>()
+    let matched_path = parts.extensions.get::<MatchedPath>().cloned();
+    let scope = matched_path
+        .as_ref()
         .and_then(|path| route_scope(parts.method.as_str(), path.as_str()));
     let actor = parts
         .extensions
         .get::<Actor>()
         .map(|actor| actor.0.clone())
         .unwrap_or_default();
+    let active = match state.store.refresh(&state.pool, false).await {
+        Ok(active) => active,
+        Err(error) => return store_check_error(error),
+    };
+    match active {
+        Active::Off => return next.run(Request::from_parts(parts, body)).await,
+        Active::Unclaimed => {
+            let own_session_admin = matched_path.as_ref().is_some_and(|path| {
+                path.as_str().starts_with("/v1/auth/sessions/") && matches!(scope, Some(Open(_)))
+            });
+            if own_session_admin {
+                return next.run(Request::from_parts(parts, body)).await;
+            }
+            return unclaimed_response();
+        }
+        Active::Claimed(_) => {}
+    }
     let params = RawPathParams::from_request_parts(&mut parts, &state)
         .await
         .ok();
@@ -781,25 +1090,42 @@ pub async fn require_store_seller(
     };
     let admitted = match route_subjects(scope, &actor, param) {
         None => false,
-        Some(subjects) => match serves(&state.pool, &state.config.store_mode, &subjects).await {
+        Some(subjects) => match serves(&state.pool, &state.store, &subjects).await {
             Ok(admitted) => admitted,
-            Err(error) => {
-                tracing::error!(error = %error, "store seller check failed");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({
-                        "ok": false,
-                        "error": { "code": "INTERNAL", "message": "The request could not be processed." },
-                    })),
-                )
-                    .into_response();
-            }
+            Err(error) => return store_check_error(error),
         },
     };
     if admitted {
         return next.run(Request::from_parts(parts, body)).await;
     }
     route_refusal(&state, &actor)
+}
+
+fn store_check_error(error: sqlx::Error) -> Response {
+    tracing::error!(error = %error, "store seller check failed");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({
+            "ok": false,
+            "error": { "code": "INTERNAL", "message": "The request could not be processed." },
+        })),
+    )
+        .into_response()
+}
+
+pub fn unclaimed_response() -> Response {
+    failure_response(&CommandFailure::unaudited(
+        ErrorCode::StoreUnclaimed,
+        STORE_UNCLAIMED_MESSAGE,
+    ))
+}
+
+pub fn failure_response(failure: &CommandFailure) -> Response {
+    (
+        StatusCode::from_u16(failure.http_status()).expect("error codes map to HTTP statuses"),
+        Json(failure.body()),
+    )
+        .into_response()
 }
 
 /// The whole-router guard, layered once by [`crate::http::serve`] over every
@@ -813,7 +1139,11 @@ pub async fn refuse_unlisted_routes(
     request: Request,
     next: Next,
 ) -> Response {
-    if state.config.store_mode.store_seller().is_none() {
+    let active = match state.store.refresh(&state.pool, false).await {
+        Ok(active) => active,
+        Err(error) => return store_check_error(error),
+    };
+    if matches!(active, Active::Off) {
         return next.run(request).await;
     }
     let listed = request
@@ -823,6 +1153,9 @@ pub async fn refuse_unlisted_routes(
         .is_some();
     if listed {
         return next.run(request).await;
+    }
+    if matches!(active, Active::Unclaimed) {
+        return unclaimed_response();
     }
     let actor = crate::auth::session_actor(&state, request.headers())
         .await
@@ -909,7 +1242,9 @@ mod tests {
         assert_eq!(
             modes(&[NEXUS, ("STORE_SELLER_PUBKY", &store)]).expect("boots"),
             (
-                StoreMode::SingleSeller(store.clone()),
+                StoreMode::SingleSeller {
+                    pinned: Some(store.clone())
+                },
                 ListingModeration::On
             )
         );
@@ -921,7 +1256,9 @@ mod tests {
             ])
             .expect("boots"),
             (
-                StoreMode::SingleSeller(store.clone()),
+                StoreMode::SingleSeller {
+                    pinned: Some(store.clone())
+                },
                 ListingModeration::On
             )
         );
@@ -962,7 +1299,9 @@ mod tests {
             ])
             .expect("boots without NEXUS_URL"),
             (
-                StoreMode::SingleSeller(store.clone()),
+                StoreMode::SingleSeller {
+                    pinned: Some(store.clone())
+                },
                 ListingModeration::Off
             )
         );

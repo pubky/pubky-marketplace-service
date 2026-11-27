@@ -14,6 +14,7 @@ pub struct CommandFailure {
     current_revision: Option<i64>,
     issues: Option<Vec<ValidationIssue>>,
     reason: Option<&'static str>,
+    audited: bool,
 }
 
 impl CommandFailure {
@@ -27,7 +28,20 @@ impl CommandFailure {
             current_revision: None,
             issues: None,
             reason: None,
+            audited: true,
         }
+    }
+
+    /// A plain failure outside the seller-subject refusal audit catalog.
+    pub(crate) fn unaudited(code: ErrorCode, message: &str) -> Self {
+        Self {
+            audited: false,
+            ..Self::refused(RefusalKind::SellerNotServed, code, message)
+        }
+    }
+
+    pub(crate) const fn is_audited(&self) -> bool {
+        self.audited
     }
 
     /// A refusal the client distinguishes by `error.reason`, a stable
