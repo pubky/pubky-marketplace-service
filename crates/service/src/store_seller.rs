@@ -1143,9 +1143,6 @@ pub async fn refuse_unlisted_routes(
         Ok(active) => active,
         Err(error) => return store_check_error(error),
     };
-    if matches!(active, Active::Off) {
-        return next.run(request).await;
-    }
     let listed = request
         .extensions()
         .get::<MatchedPath>()
@@ -1154,13 +1151,16 @@ pub async fn refuse_unlisted_routes(
     if listed {
         return next.run(request).await;
     }
-    if matches!(active, Active::Unclaimed) {
-        return unclaimed_response();
+    match active {
+        Active::Off => next.run(request).await,
+        Active::Unclaimed => unclaimed_response(),
+        Active::Claimed(_) => {
+            let actor = crate::auth::session_actor(&state, request.headers())
+                .await
+                .unwrap_or_default();
+            route_refusal(&state, &actor)
+        }
     }
-    let actor = crate::auth::session_actor(&state, request.headers())
-        .await
-        .unwrap_or_default();
-    route_refusal(&state, &actor)
 }
 
 fn route_refusal(state: &AppState, actor: &str) -> Response {

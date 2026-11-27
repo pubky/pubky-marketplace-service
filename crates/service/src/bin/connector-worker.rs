@@ -83,14 +83,14 @@ async fn main() -> anyhow::Result<()> {
             config.store_claim_code.clone(),
         )
         .await?;
-        if !matches!(
-            store.active(),
-            marketplace_service::store_seller::Active::Unclaimed
-        ) {
-            break store;
+        match store.active() {
+            marketplace_service::store_seller::Active::Off
+            | marketplace_service::store_seller::Active::Claimed(_) => break store,
+            marketplace_service::store_seller::Active::Unclaimed => {
+                tracing::info!("connector worker waiting for the store claim");
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
         }
-        tracing::info!("connector worker waiting for the store claim");
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     };
     connectors::assert_credentials_coherent(&pool, Some(runtime.keys.as_ref())).await?;
     tracing::info!(
