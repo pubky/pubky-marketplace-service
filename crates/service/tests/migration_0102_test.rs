@@ -67,7 +67,7 @@ async fn migration_0102_release_trigger_is_null_safe_and_exact(pool: PgPool) {
             insert(&pool, &seller(3)).await;
             let mut tx = pool.begin().await.expect("transaction");
             if let Some(value) = setting {
-                sqlx::query("SELECT set_config('app.allow_store_binding_release', $1, true)")
+                sqlx::query("SELECT set_config('marketplace.release_store_binding', $1, true)")
                     .bind(value)
                     .execute(&mut *tx)
                     .await
@@ -85,7 +85,7 @@ async fn migration_0102_release_trigger_is_null_safe_and_exact(pool: PgPool) {
             tx.rollback().await.expect("rollback restores the binding");
 
             let mut release = pool.begin().await.expect("release transaction");
-            sqlx::query("SELECT set_config('app.allow_store_binding_release', 'on', true)")
+            sqlx::query("SELECT set_config('marketplace.release_store_binding', 'on', true)")
                 .execute(&mut *release)
                 .await
                 .expect("release authority");
@@ -93,7 +93,7 @@ async fn migration_0102_release_trigger_is_null_safe_and_exact(pool: PgPool) {
                 .execute(&mut *release)
                 .await
                 .expect("release authority allows the operation");
-            sqlx::query("SELECT set_config('app.allow_store_binding_release', 'on', true)")
+            sqlx::query("SELECT set_config('marketplace.release_store_binding', 'on', true)")
                 .execute(&mut *release)
                 .await
                 .expect("release authority remains transaction-local");
@@ -106,7 +106,7 @@ async fn migration_0102_release_trigger_is_null_safe_and_exact(pool: PgPool) {
     }
     insert(&pool, &seller(4)).await;
     let mut tx = pool.begin().await.expect("transaction");
-    sqlx::query("SELECT set_config('app.allow_store_binding_release', 'on', true)")
+    sqlx::query("SELECT set_config('marketplace.release_store_binding', 'on', true)")
         .execute(&mut *tx)
         .await
         .expect("release authority");

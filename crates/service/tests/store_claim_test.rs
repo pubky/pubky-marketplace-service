@@ -1199,6 +1199,132 @@ async fn health_store_body_stays_compatible_outside_claim_mode(pool: PgPool) {
     );
 }
 
+async fn seller_row_refuses_unclaimed_boot_and_release(pool: PgPool, insert: &str) {
+    let other = marketplace_domain::pubky::encode_pubky(&[80; 32]);
+    sqlx::query(insert)
+        .bind(&other)
+        .bind(chrono::Utc::now())
+        .execute(&pool)
+        .await
+        .expect("seller row fixture");
+    assert!(!other_seller_rows(&pool, "")
+        .await
+        .expect("seller rows")
+        .is_empty());
+    let error = resolve_store(&pool, &StoreMode::SingleSeller { pinned: None }, None)
+        .await
+        .expect_err("state 3 refuses a populated unclaimed boot");
+    assert!(
+        error
+            .to_string()
+            .contains("database holds rows of 1 sellers"),
+        "{error}"
+    );
+
+    let bound = marketplace_domain::pubky::encode_pubky(&[81; 32]);
+    insert_binding(&pool, &bound, "claim").await;
+    let options = (*pool.connect_options()).clone();
+    pool.close().await;
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .min_connections(0)
+        .connect_with(options)
+        .await
+        .expect("admin connection");
+    let error = marketplace_service::store_binding_admin::release(&admin, &bound[..8])
+        .await
+        .expect_err("release refuses seller rows");
+    assert!(
+        error.to_string().contains("database holds seller rows"),
+        "{error}"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn shipping_config_row_refuses_unclaimed_boot_and_release(pool: PgPool) {
+    seller_row_refuses_unclaimed_boot_and_release(
+        pool,
+        "INSERT INTO shipping_configs (seller_pubky, created_at, updated_at) \
+         VALUES ($1, $2, $2)",
+    )
+    .await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn drop_row_refuses_unclaimed_boot_and_release(pool: PgPool) {
+    seller_row_refuses_unclaimed_boot_and_release(
+        pool,
+        "INSERT INTO drops \
+             (aggregate_id, seller_pubky, drop_id, record_revision, revision, state, format, \
+              starts_at, total_quantity, per_buyer_limit, remaining_quantity, paid_quantity, \
+              stock_display, listing_ids, created_at, updated_at) \
+         VALUES ('drop:' || $1 || '_setup', $1, 'setup', 1, 1, 'announced', 'fcfs', $2, \
+                 1, 1, 1, 0, 'hidden', '[]'::jsonb, $2, $2)",
+    )
+    .await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn seller_stat_attestation_row_refuses_unclaimed_boot_and_release(pool: PgPool) {
+    seller_row_refuses_unclaimed_boot_and_release(
+        pool,
+        "INSERT INTO seller_stat_attestations \
+             (id, seller_pubky, period_from, period_to, body, jws, created_at) \
+         VALUES (gen_random_uuid(), $1, DATE '2026-01-01', DATE '2026-01-07', \
+                 '{}'::jsonb, 'fixture', $2)",
+    )
+    .await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn store_binding_admin_binary_logs_release_and_exits_nonzero_on_refusal(pool: PgPool) {
+    let seller = marketplace_domain::pubky::encode_pubky(&[82; 32]);
+    insert_binding(&pool, &seller, "claim").await;
+    let mut database = url::Url::parse(&std::env::var("DATABASE_URL").expect("DATABASE_URL"))
+        .expect("database url");
+    database.set_path(&format!(
+        "/{}",
+        pool.connect_options()
+            .get_database()
+            .expect("test database name")
+    ));
+    pool.close().await;
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_store-binding-admin"))
+        .env("DATABASE_URL", database.as_str())
+        .args(["release", "--confirm", &seller[..8]])
+        .output()
+        .expect("release binary runs");
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).expect("stdout is text");
+    let stderr = String::from_utf8(output.stderr).expect("stderr is text");
+    let expected = format!("store.binding.released seller={}", &seller[..8]);
+    assert_eq!(
+        format!("{stdout}{stderr}")
+            .lines()
+            .filter(|line| line.contains("store.binding.released"))
+            .count(),
+        1,
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.lines().any(|line| line == expected),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+
+    let refusal = std::process::Command::new(env!("CARGO_BIN_EXE_store-binding-admin"))
+        .env("DATABASE_URL", database.as_str())
+        .args(["release", "--confirm", &seller[..8]])
+        .output()
+        .expect("refused release binary runs");
+    assert!(!refusal.status.success(), "{refusal:?}");
+    let stderr = String::from_utf8(refusal.stderr).expect("stderr is text");
+    assert!(
+        stderr.contains("the store has no seller binding to release"),
+        "{stderr}"
+    );
+}
+
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
 async fn release_refuses_when_any_seller_row_exists(pool: PgPool) {
     let app = common::test_app(pool.clone()).await;

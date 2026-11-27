@@ -944,7 +944,7 @@ optional claim session id and the service commit provide the audit trail.
 
 Row-level update and delete triggers and a statement-level truncate trigger
 share one function. They refuse unless
-`current_setting('app.allow_store_binding_release', true)` is exactly `on`.
+`current_setting('marketplace.release_store_binding', true)` is exactly `on`.
 Unset, empty and `off` values all refuse. Only the release helper sets that
 value, with transaction-local scope. The function and triggers are replace and
 drop then create shapes, so the file is directly rerunnable.

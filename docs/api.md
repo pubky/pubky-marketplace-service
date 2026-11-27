@@ -203,8 +203,9 @@ belongs to. Reads of sealed material (`pickup-details`, `delivery-email`,
 | DELETE | `/v1/webhooks/{id}` | `webhook.admin` | [Webhooks](#webhooks) |
 
 Middleware order on the automation routes is: bearer check (`401`), inventory
-capability check (`403 capability_required`), automation rate limit (`429`),
-then the handler. Request bodies are limited to 64 KiB (inventory: 4096 bytes).
+capability check (`403 capability_required`), store guard (`503 STORE_UNCLAIMED`
+or `409 SELLER_NOT_SERVED`), automation rate limit (`429`), then the handler.
+Request bodies are limited to 64 KiB (inventory: 4096 bytes).
 
 ## Authentication and sessions
 

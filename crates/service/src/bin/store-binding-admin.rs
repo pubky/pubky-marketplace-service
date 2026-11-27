@@ -20,7 +20,11 @@ async fn main() -> anyhow::Result<()> {
         .min_connections(0)
         .connect(&database_url)
         .await?;
-    marketplace_service::store_binding_admin::release(&pool, &confirm).await?;
+    let seller = marketplace_service::store_binding_admin::release(&pool, &confirm).await?;
     pool.close().await;
+    eprintln!(
+        "store.binding.released seller={}",
+        seller.chars().take(8).collect::<String>()
+    );
     Ok(())
 }

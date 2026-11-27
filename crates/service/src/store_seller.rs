@@ -13,7 +13,8 @@
 //! identity: buyers need them.
 //! At boot, [`refuse_other_sellers`] refuses a database that already holds
 //! another seller's listings, orders, holds, store connections, payment
-//! configurations, webhook endpoints or seller settings.
+//! configurations, webhook endpoints, seller settings, shipping
+//! configurations, drops or seller stat attestations.
 //!
 //! With `STORE_SELLER_PUBKY` unset the service is a marketplace and nothing
 //! here runs.
@@ -207,7 +208,9 @@ pub async fn read_binding(pool: &PgPool) -> Result<Option<BindingRow>, sqlx::Err
     .await
 }
 
-async fn read_binding_on(connection: &mut PgConnection) -> Result<Option<BindingRow>, sqlx::Error> {
+pub(crate) async fn read_binding_on(
+    connection: &mut PgConnection,
+) -> Result<Option<BindingRow>, sqlx::Error> {
     sqlx::query_as::<_, BindingRow>(
         "SELECT seller_pubky, bound_by, claimed_at, claim_session_id, service_commit \
          FROM store_seller_binding WHERE singleton = TRUE",
@@ -458,6 +461,9 @@ pub struct OtherSellerRows {
     /// Seller settings: the band consent (`attestation_band_consents`) a
     /// `seller_settings:` aggregate writes.
     pub seller_settings: i64,
+    pub shipping_configs: i64,
+    pub drops: i64,
+    pub seller_stat_attestations: i64,
     /// Up to three of those sellers, by the first eight characters of their
     /// pubky.
     pub sellers: Vec<String>,
@@ -472,12 +478,16 @@ impl OtherSellerRows {
             && self.payment_configs == 0
             && self.webhook_endpoints == 0
             && self.seller_settings == 0
+            && self.shipping_configs == 0
+            && self.drops == 0
+            && self.seller_stat_attestations == 0
     }
 }
 
 /// Counts what the database holds for a seller other than `store`: their
 /// listings, orders, holds, store connections, payment configurations,
-/// webhook endpoints and seller settings.
+/// webhook endpoints, seller settings, shipping configurations, drops and
+/// seller stat attestations.
 pub async fn other_seller_rows(pool: &PgPool, store: &str) -> Result<OtherSellerRows, sqlx::Error> {
     let mut connection = pool.acquire().await?;
     other_seller_rows_on(&mut connection, store).await
@@ -487,7 +497,7 @@ pub async fn other_seller_rows_on(
     connection: &mut PgConnection,
     store: &str,
 ) -> Result<OtherSellerRows, sqlx::Error> {
-    type Counts = (i64, i64, i64, i64, i64, i64, i64);
+    type Counts = (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64);
     let (
         listings,
         orders,
@@ -496,6 +506,9 @@ pub async fn other_seller_rows_on(
         payment_configs,
         webhook_endpoints,
         seller_settings,
+        shipping_configs,
+        drops,
+        seller_stat_attestations,
     ): Counts = sqlx::query_as(
         "SELECT \
              (SELECT COUNT(*) FROM listings WHERE seller_pubky <> $1), \
@@ -510,7 +523,10 @@ pub async fn other_seller_rows_on(
                         WHERE seller_pubky <> $1 \
               ) configured), \
              (SELECT COUNT(*) FROM webhook_endpoints WHERE seller_pubky <> $1), \
-             (SELECT COUNT(*) FROM attestation_band_consents WHERE seller_pubky <> $1)",
+             (SELECT COUNT(*) FROM attestation_band_consents WHERE seller_pubky <> $1), \
+             (SELECT COUNT(*) FROM shipping_configs WHERE seller_pubky <> $1), \
+             (SELECT COUNT(*) FROM drops WHERE seller_pubky <> $1), \
+             (SELECT COUNT(*) FROM seller_stat_attestations WHERE seller_pubky <> $1)",
     )
     .bind(store)
     .fetch_one(&mut *connection)
@@ -525,6 +541,9 @@ pub async fn other_seller_rows_on(
                    WHERE seller_pubky <> $1 \
              UNION SELECT seller_pubky FROM webhook_endpoints WHERE seller_pubky <> $1 \
              UNION SELECT seller_pubky FROM attestation_band_consents WHERE seller_pubky <> $1 \
+             UNION SELECT seller_pubky FROM shipping_configs WHERE seller_pubky <> $1 \
+             UNION SELECT seller_pubky FROM drops WHERE seller_pubky <> $1 \
+             UNION SELECT seller_pubky FROM seller_stat_attestations WHERE seller_pubky <> $1 \
          ) other ORDER BY seller_pubky LIMIT 3",
     )
     .bind(store)
@@ -538,6 +557,9 @@ pub async fn other_seller_rows_on(
         payment_configs,
         webhook_endpoints,
         seller_settings,
+        shipping_configs,
+        drops,
+        seller_stat_attestations,
         sellers: sellers
             .iter()
             .map(|seller| format!("{}…", crate::logging::actor_prefix(seller)))
@@ -564,9 +586,10 @@ pub fn refuse_rows_for_pin(store: &str, rows: &OtherSellerRows) -> anyhow::Resul
     let _ = store;
     anyhow::bail!(
         "{ENV_STORE_SELLER_PUBKY} is set, but the database holds {} listings, {} orders, {} \
-         holds, {} store connections, {} payment configurations, {} webhook endpoints and {} \
-         seller settings of other sellers ({}); single-seller mode needs a database that only \
-         its store seller has used; refusing to start",
+         holds, {} store connections, {} payment configurations, {} webhook endpoints, {} seller \
+         settings, {} shipping configurations, {} drops and {} seller stat attestations of other \
+         sellers ({}); single-seller mode needs a database that only its store seller has used; \
+         refusing to start",
         rows.listings,
         rows.orders,
         rows.holds,
@@ -574,6 +597,9 @@ pub fn refuse_rows_for_pin(store: &str, rows: &OtherSellerRows) -> anyhow::Resul
         rows.payment_configs,
         rows.webhook_endpoints,
         rows.seller_settings,
+        rows.shipping_configs,
+        rows.drops,
+        rows.seller_stat_attestations,
         rows.sellers.join(", ")
     )
 }

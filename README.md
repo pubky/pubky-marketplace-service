@@ -28,7 +28,8 @@ crates/service     axum HTTP service: Postgres schema (sqlx migrations),
                    (see "Background workers": 24 lease-guarded tasks plus
                    the webhook delivery worker). Besides the server binary
                    (`marketplace-service`) it builds the operator binaries
-                   `refusal-audit-admin` and `paykit-attempts-admin`.
+                   `refusal-audit-admin`, `paykit-attempts-admin` and
+                   `store-binding-admin`.
 contracts/         state-machines.json — the machine-readable state machine
                    contract emitted from crates/domain.
                    postal-region-rules.json — country table for
@@ -459,10 +460,13 @@ of these for another seller, in any state
   option (`seller_accepted_payment_options`);
 - an automation webhook endpoint (`webhook_endpoints`);
 - seller settings, the band consent of a `seller_settings:` aggregate
-  (`attestation_band_consents`).
+  (`attestation_band_consents`);
+- a shipping configuration (`shipping_configs`);
+- a drop (`drops`);
+- a seller stat attestation (`seller_stat_attestations`).
 
-Drops, offers, bids and pickup or digital details hang off a listing, so
-the listing count covers them. Sessions, `/priv` data-key envelopes and
+Offers, bids and pickup or digital details hang off a listing, so the listing
+count covers them. Sessions, `/priv` data-key envelopes and
 notifications belong to identities, which may be buyers, and are not
 counted. The message counts each kind and names up to three of those
 sellers by the first eight characters of their pubky. Nothing is removed:
@@ -513,7 +517,7 @@ store-binding-admin release --confirm <pubky-or-first-8-characters>
 
 The helper refuses if another service connection is open, confirmation does
 not match, or any seller row exists. Its transaction alone enables
-`app.allow_store_binding_release` for the guarded delete. A store with seller
+`marketplace.release_store_binding` for the guarded delete. A store with seller
 rows recovers only on a fresh database.
 
 `GET /health` reports the deployment: `store` (`mode` and `seller`), plus

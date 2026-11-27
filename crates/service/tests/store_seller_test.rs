@@ -1104,9 +1104,10 @@ async fn single_seller_mode_refuses_to_start_on_another_sellers_rows(pool: PgPoo
         error,
         format!(
             "STORE_SELLER_PUBKY is set, but the database holds 1 listings, 1 orders, 1 holds, \
-             0 store connections, 0 payment configurations, 0 webhook endpoints and 0 seller \
-             settings of other sellers ({}…); single-seller mode needs a database that only its \
-             store seller has used; refusing to start",
+             0 store connections, 0 payment configurations, 0 webhook endpoints, 0 seller \
+             settings, 0 shipping configurations, 0 drops and 0 seller stat attestations of \
+             other sellers ({}…); single-seller mode needs a database that only its store seller \
+             has used; refusing to start",
             &bob.pubky[..8]
         )
     );
@@ -1260,6 +1261,30 @@ const CATEGORIES: &[Category] = &[
                  VALUES ($1, FALSE, 1, $2)",
         counted: |rows| &mut rows.seller_settings,
     },
+    Category {
+        table: "shipping_configs",
+        insert: "INSERT INTO shipping_configs (seller_pubky, created_at, updated_at) \
+                 VALUES ($1, $2, $2)",
+        counted: |rows| &mut rows.shipping_configs,
+    },
+    Category {
+        table: "drops",
+        insert: "INSERT INTO drops \
+                     (aggregate_id, seller_pubky, drop_id, record_revision, revision, state, \
+                      format, starts_at, total_quantity, per_buyer_limit, remaining_quantity, \
+                      paid_quantity, stock_display, listing_ids, created_at, updated_at) \
+                 VALUES ('drop:' || $1 || '_setup', $1, 'setup', 1, 1, 'announced', 'fcfs', \
+                         $2, 1, 1, 1, 0, 'hidden', '[]'::jsonb, $2, $2)",
+        counted: |rows| &mut rows.drops,
+    },
+    Category {
+        table: "seller_stat_attestations",
+        insert: "INSERT INTO seller_stat_attestations \
+                     (id, seller_pubky, period_from, period_to, body, jws, created_at) \
+                 VALUES (gen_random_uuid(), $1, DATE '2026-01-01', DATE '2026-01-07', \
+                         '{}'::jsonb, 'fixture', $2)",
+        counted: |rows| &mut rows.seller_stat_attestations,
+    },
 ];
 
 /// A seller with no listing, order or hold still keeps single-seller mode
@@ -1335,9 +1360,10 @@ async fn single_seller_mode_refuses_to_start_on_another_sellers_settings_and_int
         error,
         format!(
             "STORE_SELLER_PUBKY is set, but the database holds 0 listings, 0 orders, 0 holds, \
-             1 store connections, 1 payment configurations, 1 webhook endpoints and 1 seller \
-             settings of other sellers ({}…); single-seller mode needs a database that only its \
-             store seller has used; refusing to start",
+             1 store connections, 1 payment configurations, 1 webhook endpoints, 1 seller \
+             settings, 1 shipping configurations, 1 drops and 1 seller stat attestations of \
+             other sellers ({}…); single-seller mode needs a database that only its store seller \
+             has used; refusing to start",
             &carol[..8]
         ),
         "a configuration and an accepted option of one seller are one payment configuration"
@@ -1406,8 +1432,9 @@ async fn the_connector_worker_refuses_to_start_on_another_sellers_rows(pool: PgP
         Boot::Refused(stderr) => assert!(
             stderr.contains(&format!(
                 "STORE_SELLER_PUBKY is set, but the database holds 0 listings, 0 orders, 0 \
-                 holds, 1 store connections, 0 payment configurations, 0 webhook endpoints and \
-                 0 seller settings of other sellers ({}…)",
+                 holds, 1 store connections, 0 payment configurations, 0 webhook endpoints, 0 \
+                 seller settings, 0 shipping configurations, 0 drops and 0 seller stat \
+                 attestations of other sellers ({}…)",
                 &carol[..8]
             )),
             "{stderr}"

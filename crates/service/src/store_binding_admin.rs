@@ -61,7 +61,7 @@ pub async fn begin_release<'a>(
             "store binding cannot be released while the database holds seller rows; use a fresh database"
         );
     }
-    sqlx::query("SELECT set_config('app.allow_store_binding_release', 'on', true)")
+    sqlx::query("SELECT set_config('marketplace.release_store_binding', 'on', true)")
         .execute(&mut *tx)
         .await?;
     let deleted: Option<String> = sqlx::query_scalar(

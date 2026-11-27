@@ -25,7 +25,7 @@ use crate::clock::format_timestamp;
 use crate::listing_availability::ENV_CLIENT_IP_HEADER_OVERRIDE;
 use crate::result::CommandFailure;
 use crate::store_seller::{
-    failure_response, other_seller_rows_on, take_binding_lock, Active, StoreMode,
+    failure_response, other_seller_rows_on, read_binding_on, take_binding_lock, Active, StoreMode,
     STORE_ALREADY_CLAIMED_MESSAGE,
 };
 use crate::AppState;
@@ -135,6 +135,7 @@ struct ClientLimiter {
     salt: [u8; 16],
     per_second: f64,
     capacity: f64,
+    client_capacity: usize,
     clients: Mutex<HashMap<[u8; 16], Bucket>>,
 }
 
@@ -147,8 +148,15 @@ impl ClientLimiter {
             salt,
             per_second,
             capacity,
+            client_capacity: CLIENT_TABLE_CAPACITY,
             clients: Mutex::new(HashMap::new()),
         }
+    }
+
+    #[cfg(test)]
+    fn with_client_capacity(mut self, client_capacity: usize) -> Self {
+        self.client_capacity = client_capacity;
+        self
     }
 
     fn key(&self, headers: &HeaderMap, peer: Option<IpAddr>) -> [u8; 16] {
@@ -179,7 +187,7 @@ impl ClientLimiter {
     ) -> Result<(), u64> {
         let key = self.key(headers, peer);
         let mut clients = self.clients.lock().expect("client limiter lock");
-        if clients.len() >= CLIENT_TABLE_CAPACITY && !clients.contains_key(&key) {
+        if clients.len() >= self.client_capacity && !clients.contains_key(&key) {
             return Err(60);
         }
         Self::bucket(&mut clients, key, now, self.capacity).take(
@@ -191,6 +199,9 @@ impl ClientLimiter {
 
     fn check_failure_budget(&self, key: [u8; 16], now: DateTime<Utc>) -> Result<(), u64> {
         let mut clients = self.clients.lock().expect("claim limiter lock");
+        if clients.len() >= self.client_capacity && !clients.contains_key(&key) {
+            return Err(60);
+        }
         let bucket = Self::bucket(&mut clients, key, now, self.capacity);
         bucket.refill(now, self.per_second, self.capacity);
         if bucket.tokens() >= 1.0 {
@@ -202,6 +213,9 @@ impl ClientLimiter {
 
     fn record_failure(&self, key: [u8; 16], now: DateTime<Utc>) {
         let mut clients = self.clients.lock().expect("claim limiter lock");
+        if clients.len() >= self.client_capacity && !clients.contains_key(&key) {
+            return;
+        }
         let _ = Self::bucket(&mut clients, key, now, self.capacity).take(
             now,
             self.per_second,
@@ -508,9 +522,9 @@ pub async fn claim_store(State(state): State<AppState>, request: Request) -> Res
         Err(error) => return internal(error),
     };
     let Some((seller, claimed_at)) = inserted else {
-        let binding = match crate::store_seller::read_binding(&state.pool).await {
+        let binding = match read_binding_on(&mut tx).await {
             Ok(Some(binding)) => binding.seller_pubky,
-            Ok(None) => session.actor.0.clone(),
+            Ok(None) => return internal(sqlx::Error::RowNotFound),
             Err(error) => return internal(error),
         };
         return already_claimed(&binding, client);
@@ -561,6 +575,39 @@ mod tests {
             );
         }
         assert_eq!(normalize("oi-l abc"), "011ABC");
+    }
+
+    #[test]
+    fn claim_failure_clients_stay_bounded_across_distinct_addresses() {
+        let limiter = ClientLimiter::new(None, 10.0 / 900.0, 10.0).with_client_capacity(4);
+        let now = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .expect("test time")
+            .with_timezone(&Utc);
+        let key = |last| limiter.key(&HeaderMap::new(), Some(IpAddr::from([127, 0, 0, last])));
+
+        for last in 1..=4 {
+            assert_eq!(limiter.check_failure_budget(key(last), now), Ok(()));
+        }
+        assert_eq!(limiter.clients.lock().expect("clients").len(), 4);
+
+        let existing = key(1);
+        let newcomer = key(5);
+        assert_eq!(limiter.check_failure_budget(newcomer, now), Err(60));
+        limiter.record_failure(newcomer, now);
+        {
+            let clients = limiter.clients.lock().expect("clients");
+            assert_eq!(clients.len(), 4);
+            assert!(!clients.contains_key(&newcomer));
+        }
+
+        assert_eq!(limiter.check_failure_budget(existing, now), Ok(()));
+        limiter.record_failure(existing, now);
+        assert_eq!(limiter.clients.lock().expect("clients").len(), 4);
+        for last in 6..=20 {
+            limiter.record_failure(key(last), now);
+            assert_eq!(limiter.check_failure_budget(key(last), now), Err(60));
+            assert!(limiter.clients.lock().expect("clients").len() <= 4);
+        }
     }
 
     #[test]

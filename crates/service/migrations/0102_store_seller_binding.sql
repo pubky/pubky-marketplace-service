@@ -19,7 +19,7 @@ RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    IF current_setting('app.allow_store_binding_release', true) IS NOT DISTINCT FROM 'on' THEN
+    IF current_setting('marketplace.release_store_binding', true) IS NOT DISTINCT FROM 'on' THEN
         IF TG_OP = 'DELETE' THEN
             RETURN OLD;
         ELSIF TG_OP = 'UPDATE' THEN
