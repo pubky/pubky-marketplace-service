@@ -1687,13 +1687,16 @@ cargo test --workspace
 
 Gates (the same as CI): `cargo fmt --check`,
 `cargo clippy --workspace --all-targets -- -D warnings`, and
-`bash scripts/ci-test.sh`. The script exists because several integration
-binaries mutate cluster-global Postgres roles and must run one test at a time
-after the parallel ones, so a bare `cargo test --workspace` can fail on role
-contention. CI runs the toolchain 1.89.0 against PostgreSQL 16; the
-`docker-compose.yml` database is PostgreSQL 17. The pre-push hook
-(`scripts/prepush.sh`) runs the fast gate for the packages a change touches;
-`PREPUSH_FULL=1` runs everything.
+`bash scripts/ci-test.sh`. The script runs lib/bin tests and integration
+binaries in parallel (4 threads by default, matching `sqlx`'s 20-connection
+master pool / 5-connection per-test pool bound; `TEST_MIGRATOR` serializes the
+`0032..=0037` cluster-role migration window with cluster-wide catalog locks)
+and then runs the binaries that depend on cluster-global Postgres roles or
+cluster-wide snapshot `xmin` one test at a time. CI runs toolchain 1.89.0
+against PostgreSQL 16; the `docker-compose.yml` database is PostgreSQL 17.
+The pre-push hook (`scripts/prepush.sh`) runs `cargo fmt --check` and
+`cargo check` for changed packages by default; `PREPUSH_FULL=1` runs clippy
+and `scripts/ci-test.sh`.
 
 The release fixture auth tests are offline and need only Node 24:
 
