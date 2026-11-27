@@ -23,10 +23,10 @@
 //! the facts and enforces; the fence and the digital hold ask this module
 //! what a country's mode is.
 //!
-//! With `REGION_MODES` unset the policy is derived from the two older flags,
-//! exactly as before: `EU_FENCE_ENABLED` turns on C3 and C4 and
-//! `DIGITAL_REGION_BLOCK_ENABLED` turns on C3b, each for the EU-27 and GB as
-//! nuanced regions, and nothing is ever blocked.
+//! With `REGION_MODES` unset the policy is derived from the two older flags:
+//! `EU_FENCE_ENABLED` turns on C3 and C4 and `DIGITAL_REGION_BLOCK_ENABLED`
+//! turns on C3b, each for the EU-27 and GB as nuanced regions, nothing is
+//! ever blocked, and unknown IP origins default to `open`.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -170,9 +170,9 @@ impl RegionModes {
                     "REGION_MODES entry `{entry}`: the United Kingdom is GB"
                 )))
             }
-            "XX" => {
+            "XX" | "ZZ" => {
                 return Err(invalid(format!(
-                    "REGION_MODES entry `{entry}`: XX is the edge's unknown marker; use UNKNOWN"
+                    "REGION_MODES entry `{entry}`: {selector} is the edge's unknown marker; use UNKNOWN"
                 )))
             }
             code if code.len() == 2 && code.bytes().all(|byte| byte.is_ascii_uppercase()) => {
@@ -272,9 +272,9 @@ impl RegionModes {
     }
 
     /// Whether a buyer is blocked: the declared country is blocked, else the
-    /// IP country is blocked, or unknown while unknown origins are blocked.
-    /// A buyer cannot dodge a block by declaring another country or by
-    /// sending no country at all.
+    /// IP country is blocked, or unknown while `UNKNOWN=blocked` is
+    /// configured. From a known blocked IP, a buyer cannot dodge a block by
+    /// declaring an open country or by omitting `buyer_country`.
     pub fn buyer_block(&self, declared: Option<&str>, ip_country: Option<&str>) -> Option<Block> {
         if declared.is_some_and(|country| self.mode_of(country) == Mode::Blocked) {
             return Some(Block::Declared);
@@ -482,6 +482,7 @@ mod tests {
             ("D-=blocked", "selector `D-`"),
             ("UK=blocked", "the United Kingdom is GB"),
             ("XX=blocked", "use UNKNOWN"),
+            ("ZZ=blocked", "use UNKNOWN"),
             ("none,EU=blocked", "must be the whole value"),
             ("EU=blocked,none", "must be the whole value"),
             ("EU=blocked=open", "mode `blocked=open`"),

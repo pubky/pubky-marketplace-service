@@ -28,18 +28,21 @@
 //! checked too. A digital line is refused when EITHER the declared country OR
 //! the IP country is in the EU-27 or is GB. An unusable or missing IP country
 //! (header absent, malformed, or the unknown/Tor markers `XX`, `ZZ` and `T1`)
-//! defaults to `open` and passes unless `UNKNOWN` is explicitly set to
-//! `nuanced` or `blocked`, in which case digital lines fail closed with
-//! `reason: buyer_region_unknown` and an ALERT is logged; physical lines never
-//! need the header. The edge must set the header itself and overwrite any
-//! value the client sent.
+//! defaults to `open` (including under the legacy `DIGITAL_REGION_BLOCK_ENABLED`
+//! flag). When `REGION_MODES` explicitly sets `UNKNOWN=nuanced`, digital lines
+//! fail closed here with `DIGITAL_UNAVAILABLE_IN_REGION`
+//! (`reason: buyer_region_unknown`) and an ALERT is logged; when `REGION_MODES`
+//! sets `UNKNOWN=blocked`, the commerce gate refuses buying commands earlier
+//! with `COMMERCE_UNAVAILABLE_IN_REGION` (`reason: buyer_region_unknown`)
+//! before this gate runs. Physical lines never need the header. The edge must
+//! set the header itself and overwrite any value the client sent.
 //!
 //! The hold is not limited to the EU and UK when `REGION_MODES` names other
 //! nuanced regions: a digital line is held for a buyer whose declared or IP
 //! country is nuanced, and refused with the reason `region_buyer` or
 //! `region_ip` and a message that names no region. An unknown IP country
-//! defaults to `open` and is held only when `UNKNOWN` resolves to anything
-//! other than `open`.
+//! defaults to `open`, is held here when `UNKNOWN=nuanced` is configured, and
+//! is refused earlier by the commerce gate when `UNKNOWN=blocked`.
 //!
 //! The flag is independent of `EU_FENCE_ENABLED`. With it on, a command that
 //! contains a digital line must carry `buyer_country` (the Shop asks for it
