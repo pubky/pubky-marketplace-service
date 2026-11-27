@@ -79,6 +79,20 @@ impl StoreMode {
     }
 }
 
+/// Both service binaries apply the same claim-mode startup prerequisite.
+pub fn require_claim_grant_sessions(
+    mode: &StoreMode,
+    grant: Option<&crate::grant_session::GrantSessionConfig>,
+) -> anyhow::Result<()> {
+    if mode.is_claim_mode() && grant.is_none_or(|grant| grant.client_ids.is_empty()) {
+        anyhow::bail!(
+            "single-seller claim mode requires MARKETPLACE_GRANT_SESSION_ENABLED=true \
+             and at least one MARKETPLACE_GRANT_SESSION_CLIENT_IDS entry"
+        );
+    }
+    Ok(())
+}
+
 /// The exhaustive runtime answer. Off and Claimed are terminal for a process;
 /// only Unclaimed consults the binding row again.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,6 +240,28 @@ pub async fn resolve_store_without_code(
     code: Option<ClaimCode>,
 ) -> anyhow::Result<Arc<StoreBinding>> {
     resolve_store_inner(pool, mode, code, false).await
+}
+
+pub const WORKER_CLAIM_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Connector-worker boot shares the service's marketplace guard and waits,
+/// rather than exiting, until an unclaimed database gains its binding.
+pub async fn resolve_worker_store(
+    pool: &PgPool,
+    mode: &StoreMode,
+    code: Option<ClaimCode>,
+    poll_interval: Duration,
+) -> anyhow::Result<Arc<StoreBinding>> {
+    loop {
+        let store = resolve_store_without_code(pool, mode, code.clone()).await?;
+        match store.active() {
+            Active::Off | Active::Claimed(_) => return Ok(store),
+            Active::Unclaimed => {
+                tracing::info!("connector worker waiting for the store claim");
+                tokio::time::sleep(poll_interval).await;
+            }
+        }
+    }
 }
 
 async fn resolve_store_inner(

@@ -110,6 +110,25 @@ pub fn normalize(raw: &str) -> String {
         .collect()
 }
 
+/// Reads the setup code through the same lookup used by `Config::from_env`.
+/// Keeping this boundary separate lets boot-shape tests exercise the actual
+/// environment parsing without mutating process-global variables.
+pub fn claim_code_from_lookup(
+    mode: &StoreMode,
+    get: &dyn Fn(&str) -> Option<String>,
+) -> anyhow::Result<Option<ClaimCode>> {
+    match get(ENV_CLAIM_TOKEN) {
+        Some(raw) if mode.is_claim_mode() && !raw.is_empty() => ClaimCode::parse(&raw).map(Some),
+        Some(_) if !mode.is_claim_mode() => {
+            tracing::warn!(
+                "STORE_CLAIM_TOKEN is read only in single-seller claim mode; ignoring it"
+            );
+            Ok(None)
+        }
+        _ => Ok(None),
+    }
+}
+
 #[derive(Debug)]
 struct ClientLimiter {
     header: Option<HeaderName>,

@@ -1,12 +1,32 @@
 //! Operator-only release of a wrong-identity binding while the store is empty.
 
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 
 use crate::store_seller::{other_seller_rows_on, take_binding_lock};
 
-/// Release runs in one transaction, with the shared lock taken before the
-/// activity check. Any live service connection therefore refuses the release.
-pub async fn release(pool: &PgPool, confirm: &str) -> anyhow::Result<String> {
+/// A release that passed every check and deleted its binding inside an open
+/// transaction. The shared advisory lock stays held until `commit` or drop.
+pub struct PendingRelease<'a> {
+    tx: Transaction<'a, Postgres>,
+    seller_pubky: String,
+    seller_prefix: String,
+}
+
+impl PendingRelease<'_> {
+    pub async fn commit(self) -> anyhow::Result<String> {
+        self.tx.commit().await?;
+        tracing::info!(seller = self.seller_prefix, "store.binding.released");
+        Ok(self.seller_pubky)
+    }
+}
+
+/// Runs every release check and the delete, leaving the transaction open so
+/// callers can prove boot and release lock ordering. Ordinary callers should
+/// use [`release`], which immediately commits the returned pending release.
+pub async fn begin_release<'a>(
+    pool: &'a PgPool,
+    confirm: &str,
+) -> anyhow::Result<PendingRelease<'a>> {
     if confirm.is_empty() {
         anyhow::bail!("release --confirm requires a pubky or its first 8 characters");
     }
@@ -52,7 +72,15 @@ pub async fn release(pool: &PgPool, confirm: &str) -> anyhow::Result<String> {
     if deleted.as_deref() != Some(binding.seller_pubky.as_str()) {
         anyhow::bail!("store binding changed during release");
     }
-    tx.commit().await?;
-    tracing::info!(seller = prefix, "store.binding.released");
-    Ok(binding.seller_pubky)
+    Ok(PendingRelease {
+        tx,
+        seller_pubky: binding.seller_pubky,
+        seller_prefix: prefix,
+    })
+}
+
+/// Release runs in one transaction, with the shared lock taken before the
+/// activity check. Any live service connection therefore refuses the release.
+pub async fn release(pool: &PgPool, confirm: &str) -> anyhow::Result<String> {
+    begin_release(pool, confirm).await?.commit().await
 }

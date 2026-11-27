@@ -559,18 +559,9 @@ impl Config {
             DigitalRelease::parse(std::env::var("DIGITAL_RELEASE").ok().as_deref())?;
         let store_mode =
             crate::store_seller::store_mode_from_lookup(&|name| std::env::var(name).ok())?;
-        let store_claim_code = match std::env::var(crate::store_claim::ENV_CLAIM_TOKEN) {
-            Ok(raw) if store_mode.is_claim_mode() && !raw.is_empty() => {
-                Some(crate::store_claim::ClaimCode::parse(&raw)?)
-            }
-            Ok(_) if !store_mode.is_claim_mode() => {
-                tracing::warn!(
-                    "STORE_CLAIM_TOKEN is read only in single-seller claim mode; ignoring it"
-                );
-                None
-            }
-            _ => None,
-        };
+        let store_claim_code = crate::store_claim::claim_code_from_lookup(&store_mode, &|name| {
+            std::env::var(name).ok()
+        })?;
         let store_claim_session_max_age_seconds = bounded_i64(
             crate::store_claim::ENV_CLAIM_SESSION_MAX_AGE_SECONDS,
             crate::store_claim::DEFAULT_CLAIM_SESSION_MAX_AGE_SECONDS,

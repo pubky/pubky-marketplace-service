@@ -51,16 +51,10 @@ async fn main() -> anyhow::Result<()> {
     let grant_session = marketplace_service::grant_session::GrantSessionConfig::from_env(
         config.public_service_origin.as_deref(),
     )?;
-    if config.store_mode.is_claim_mode()
-        && grant_session
-            .as_ref()
-            .is_none_or(|grant| grant.client_ids.is_empty())
-    {
-        anyhow::bail!(
-            "single-seller claim mode requires MARKETPLACE_GRANT_SESSION_ENABLED=true \
-             and at least one MARKETPLACE_GRANT_SESSION_CLIENT_IDS entry"
-        );
-    }
+    marketplace_service::store_seller::require_claim_grant_sessions(
+        &config.store_mode,
+        grant_session.as_deref(),
+    )?;
     tracing::info!(
         grant_sessions = if grant_session.is_some() {
             "enabled"
