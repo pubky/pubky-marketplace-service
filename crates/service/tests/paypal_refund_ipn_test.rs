@@ -374,15 +374,15 @@ async fn race_on_order_lock(
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    assert_eq!(
-        blocked, waiting,
-        "contenders did not block on the order lock"
-    );
     locker.rollback().await.expect("lock released");
     let mut statuses = Vec::new();
     for contender in contenders {
         statuses.push(contender.await.expect("contender joins"));
     }
+    assert_eq!(
+        blocked, waiting,
+        "contenders did not block on the order lock"
+    );
     statuses
 }
 

@@ -64,6 +64,8 @@ manifest crates/service marketplace-service marketplace-domain ../domain
 mkdir -p crates/service/tests docs contracts scripts
 printf '// t\n' > crates/service/tests/orders_test.rs
 printf '// t\n' > crates/service/tests/refusal_audit_test.rs
+printf '// t\n' > crates/service/tests/migration_0100_test.rs
+printf '// t\n' > crates/service/tests/connectors_ledger_test.rs
 printf 'doc\n' > docs/readme.md
 printf '{}\n' > contracts/endpoints.json
 cp "$DIR/prepush.sh" "$DIR/prepush-stamp.sh" "$DIR/prepush-packages.sh" \
@@ -246,7 +248,11 @@ cargo_log | grep -q '^test --workspace --lib --bins --no-fail-fast -- --test-thr
   || fail "docs full: lib tests: $(cargo_log)"
 cargo_log | grep -q '^test -p marketplace-service --test orders_test --no-fail-fast -- --test-threads=4$' \
   || fail "docs full: parallel integration binaries: $(cargo_log)"
-cargo_log | grep -q '^test -p marketplace-service --test refusal_audit_test ' \
+# Stage 2 (parallel) must never duplicate any SERIAL binary (role or outbox tests).
+if cargo_log | grep -- '--test-threads=4' | grep -qE 'refusal_audit_test|migration_0100_test|connectors_ledger_test'; then
+  fail "docs full: SERIAL binary duplicated in Stage 2: $(cargo_log)"
+fi
+cargo_log | grep -q '^test -p marketplace-service --test refusal_audit_test .*--test migration_0100_test .*--test connectors_ledger_test .*--test-threads=1$' \
   || fail "docs full: serial binaries: $(cargo_log)"
 [ -e "$WORK/log/docker" ] || fail "docs full did not start Docker when DATABASE_URL unset"
 
