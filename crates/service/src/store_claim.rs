@@ -141,12 +141,12 @@ impl ClientLimiter {
         digest[..16].try_into().expect("a 16-byte client key")
     }
 
-    fn bucket<'a>(
-        clients: &'a mut HashMap<[u8; 16], Bucket>,
+    fn bucket(
+        clients: &mut HashMap<[u8; 16], Bucket>,
         key: [u8; 16],
         now: DateTime<Utc>,
         capacity: f64,
-    ) -> &'a mut Bucket {
+    ) -> &mut Bucket {
         clients
             .entry(key)
             .or_insert_with(|| Bucket::full(capacity, now))
