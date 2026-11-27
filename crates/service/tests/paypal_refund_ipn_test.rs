@@ -344,13 +344,14 @@ async fn put_paypal_email(app: &TestApp, seller: &TestActor, email: Option<&str>
     assert_eq!(status, StatusCode::OK, "config put failed: {body}");
 }
 
-/// Holds the order row lock while `contenders` start, waits until `waiting`
-/// sessions block on it, then releases it so they run against each other.
+/// Holds the order row lock while `spawn` starts the contenders, waits until
+/// `waiting` sessions block on it, then releases it so they run against each
+/// other.
 async fn race_on_order_lock(
     pool: &PgPool,
     order_id: &str,
     waiting: i64,
-    contenders: Vec<tokio::task::JoinHandle<StatusCode>>,
+    spawn: impl FnOnce() -> Vec<tokio::task::JoinHandle<StatusCode>>,
 ) -> Vec<StatusCode> {
     let mut locker = pool.begin().await.expect("lock transaction");
     sqlx::query("SELECT id FROM orders WHERE id = $1::uuid FOR UPDATE")
@@ -358,6 +359,7 @@ async fn race_on_order_lock(
         .execute(&mut *locker)
         .await
         .expect("order lock");
+    let contenders = spawn();
     let mut blocked = 0;
     for _ in 0..500 {
         blocked = sqlx::query_scalar::<_, i64>(
@@ -398,13 +400,13 @@ fn spawn_ipn(app: &TestApp, fields: Fields) -> tokio::task::JoinHandle<StatusCod
     })
 }
 
-async fn spawn_command(
+async fn prepare_command(
     app: &TestApp,
     token: &str,
     kind: &str,
     order_id: &str,
     payload: Value,
-) -> tokio::task::JoinHandle<StatusCode> {
+) -> (axum::Router, String, Value) {
     let revision = read_order(app, token, order_id).await["revision"]
         .as_i64()
         .expect("revision");
@@ -415,8 +417,12 @@ async fn spawn_command(
         payload,
         COMMAND_NUMBER.fetch_add(1, Ordering::Relaxed),
     );
-    let router = app.router.clone();
-    let token = token.to_string();
+    (app.router.clone(), token.to_string(), command)
+}
+
+fn spawn_prepared_command(
+    (router, token, command): (axum::Router, String, Value),
+) -> tokio::task::JoinHandle<StatusCode> {
     tokio::spawn(async move {
         send(router, "POST", "/v1/commands", Some(&token), &command)
             .await
@@ -1727,15 +1733,12 @@ async fn refund_ipn_database_failure_asks_paypal_to_retry(pool: PgPool) {
 async fn two_simultaneous_partial_refunds_both_record(pool: PgPool) {
     let (app, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
     let order = paid_paypal_order(&app, PAYMENT_TXN).await;
-    let statuses = race_on_order_lock(
-        &pool,
-        &order.id,
-        2,
+    let statuses = race_on_order_lock(&pool, &order.id, 2, || {
         vec![
             spawn_ipn(&app, refund("refund-partial-1.ipn", &order.id, PAYMENT_TXN)),
             spawn_ipn(&app, refund("refund-partial-2.ipn", &order.id, PAYMENT_TXN)),
-        ],
-    )
+        ]
+    })
     .await;
     assert_eq!(statuses, vec![StatusCode::OK, StatusCode::OK]);
     let view = read_order(&app, &order.buyer.token, &order.id).await;
@@ -1768,7 +1771,7 @@ async fn a_refund_racing_a_cancel_approval_is_recorded(pool: PgPool) {
         json!({ "reason": "No longer needed" }),
     )
     .await;
-    let approve = spawn_command(
+    let approve = prepare_command(
         &app,
         &order.seller.token,
         "order.cancel_approve",
@@ -1776,15 +1779,12 @@ async fn a_refund_racing_a_cancel_approval_is_recorded(pool: PgPool) {
         json!({}),
     )
     .await;
-    let statuses = race_on_order_lock(
-        &pool,
-        &order.id,
-        2,
+    let statuses = race_on_order_lock(&pool, &order.id, 2, || {
         vec![
             spawn_ipn(&app, refund("refund-partial-1.ipn", &order.id, PAYMENT_TXN)),
-            approve,
-        ],
-    )
+            spawn_prepared_command(approve),
+        ]
+    })
     .await;
     assert_eq!(statuses[0], StatusCode::OK);
     // Whichever took the lock first, the refund is on the order.
@@ -1821,14 +1821,16 @@ async fn a_refund_racing_each_return_step_is_recorded(pool: PgPool) {
             )
             .await;
         }
-        let step = spawn_command(&app, &order.seller.token, kind, &order.id, json!({})).await;
+        let step = prepare_command(&app, &order.seller.token, kind, &order.id, json!({})).await;
         let full = with(
             refund("refund-full.ipn", &order.id, &payment_txn),
             "txn_id",
             &format!("2QQ00000QQ000000{index}"),
         );
-        let statuses =
-            race_on_order_lock(&pool, &order.id, 2, vec![spawn_ipn(&app, full), step]).await;
+        let statuses = race_on_order_lock(&pool, &order.id, 2, || {
+            vec![spawn_ipn(&app, full), spawn_prepared_command(step)]
+        })
+        .await;
         assert_eq!(statuses[0], StatusCode::OK);
         let view = read_order(&app, &order.buyer.token, &order.id).await;
         // The full refund resolves the return from either side of the step.

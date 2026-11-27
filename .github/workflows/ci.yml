@@ -1,7 +1,7 @@
-# Local merge gates (README Test + marketplace-service release skill):
+# Local merge gates (README Test):
 #   cargo fmt --check
 #   cargo clippy --workspace --all-targets -- -D warnings
-#   cargo test --workspace
+#   bash scripts/ci-test.sh
 # plus applying crates/service/migrations twice on a fresh Postgres.
 # Toolchain is Dockerfile `rust:1.89-slim-bookworm` (no rust-toolchain.toml).
 # This workflow is merge gates only.
@@ -56,7 +56,7 @@ jobs:
   test:
     name: test
     runs-on: ubuntu-24.04
-    timeout-minutes: 65
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:16
@@ -82,14 +82,15 @@ jobs:
       - name: Install native build deps
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
       - uses: Swatinem/rust-cache@v2
-      # #[sqlx::test] isolates databases. TEST_MIGRATOR holds a cluster-wide
-      # session lock across each database's migrations so 0032's CONNECTION
-      # LIMIT check cannot race. scripts/ci-test.sh then runs those tests in
-      # parallel and, afterwards, the binaries that mutate cluster-global
-      # roles (fixed CREATE/ALTER ROLE and shared login passwords) with
-      # --test-threads=1. --jobs 1 stays: one binary's pools at a time, under
-      # Postgres max_connections. shm-size is set on the service; GHA cannot
-      # pass `postgres -c max_connections=`.
+      # #[sqlx::test] isolates databases. TEST_MIGRATOR wraps the 0032..=0037
+      # cluster-role window in a transaction locking pg_authid and
+      # pg_auth_members (cluster-wide) so parallel migrations cannot race
+      # 0032's CONNECTION LIMIT check. scripts/ci-test.sh runs lib/bin and
+      # integration tests in parallel (4 threads per binary, matching sqlx's
+      # 20-connection master pool / 5-connection per-test pool bound) and runs
+      # the binaries that depend on cluster-global roles or cluster-wide
+      # snapshot xmin afterwards with --test-threads=1. Cargo executes test
+      # binaries sequentially under Postgres max_connections.
       - run: bash scripts/ci-test.sh
 
   specs-parity:
