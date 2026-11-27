@@ -123,6 +123,7 @@ and write. "Automation" means the inventory capability plus the
 
 | Method | Path |
 | --- | --- |
+| POST | `/v1/store/claim` |
 | POST | `/v1/commands` |
 | GET | `/v1/listings/{aggregate_id}` |
 | GET | `/v1/listings/{aggregate_id}/bids` |

@@ -2013,6 +2013,14 @@ pub fn reconfigured(app: &TestApp, edit: impl FnOnce(&mut Config)) -> TestApp {
     let mut config = (*app.state.config).clone();
     edit(&mut config);
     let mut state = app.state.clone();
+    // Guards read the runtime binding, not the config, so a changed store
+    // mode needs a binding that matches it.
+    if config.store_mode != app.state.config.store_mode {
+        state.store = Arc::new(marketplace_service::store_seller::StoreBinding::from_mode(
+            &config.store_mode,
+            None,
+        ));
+    }
     state.config = Arc::new(config);
     TestApp {
         router: build_router(state.clone()),
