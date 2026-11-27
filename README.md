@@ -197,7 +197,7 @@ Configuration is environment-based. Window keys and their defaults also live in
 | `BITCOIN_PAYMENT_WINDOW_SECONDS` | `1800` | hold window armed by a bitcoin payment-method bind; the same instant is Paykit `expires_at` (fork), or Paykit's activation-time deadline plus 60 s once an upstream request is active — never longer than the invoice the buyer is shown (≥ 60). Honor a deployment value ≥ 60; do not cap below a deployment override |
 | `SANDBOX_PAYMENT_WINDOW_SECONDS` | `900` | hold window armed by the sandbox lock point (`payment.sandbox_advance`'s first transition out of `awaiting_entitlement`) (≥ 60) |
 | `DROP_CLAIM_WINDOW_SECONDS` | `600` | hold window armed at checkout for drop-bound orders (lock-at-claim) (≥ 60) |
-| `LOCKS_POLL_SECONDS` | `30` | minimum interval between lifecycle lookups per pending correlation |
+| `LOCKS_POLL_SECONDS` | `30` | minimum interval between lifecycle lookups per pending correlation, with a floor of the ten-second Locks HTTP timeout |
 | `ATTESTOR_SECRET_KEY` | unset | 32-byte hex Ed25519 secret of the attestor identity (ADR 0024); its z-base-32 public key is the attestor pubky |
 | `ATTESTOR_ORDER_SALT` | unset | 32-byte hex salt for `order_ref` hashing; must stay stable for the attestor identity's lifetime |
 | `ATTESTOR_PUBLISH_ENABLED` | `false` | `true` publishes the attestor's profile and its refund and return annotations to its own homeserver (see [Attestor records](#attestor-records)); needs the two `ATTESTOR_*` secrets above and the five settings below. Off, the service starts, behaves and calls out exactly as before |
@@ -2911,11 +2911,11 @@ advance a payment (ADR-0019 §7).
   and takes the next `claim_generation`; every effect commits in its own
   guarded transaction. A holder that dies between lookup and effect leaves
   the correlation pending, and any instance resumes it after the poll
-  interval: bounded, abortable, resumable, with the same lease discipline
+  interval (at least the ten-second lookup timeout): bounded, abortable, resumable, with the same lease discipline
   as every other worker task.
-- **Stale responses.** A row is claimed again once the poll interval has
-  passed, even while an older pass (whose lease expired, or which another
-  instance took over) is still working through its batch. Every outcome
+- **Stale responses.** Workers claim one oldest due row immediately before its lookup.
+  Other workers can make progress on the remaining rows. A row can be
+  reclaimed once both its poll interval and the lookup timeout have passed. Every outcome
   write, from a status change to a confirmed completion, requires the
   generation its own claim took, so the older pass's late response is
   dropped and the newer claim records the task. A completed, failed or

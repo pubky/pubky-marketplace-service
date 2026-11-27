@@ -49,7 +49,7 @@ pub const ENV_BUNDLE_ENCRYPTION_KEY: &str = "LOCKS_BUNDLE_ENCRYPTION_KEY";
 /// Environment variable holding the 32-byte hex HMAC lookup-token key.
 pub const ENV_LOOKUP_HMAC_KEY: &str = "LOCKS_LOOKUP_HMAC_KEY";
 
-const LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const LOOKUP_TIMEOUT_SECONDS: u32 = 10;
 
 /// The configured Locks secret material. Both keys are required together
 /// and must differ; the service refuses to start otherwise.
@@ -503,7 +503,9 @@ impl HttpLocksClient {
         if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
             anyhow::bail!("{ENV_LOCKS_SERVER_URL} must be an http(s) URL");
         }
-        let http = reqwest::Client::builder().timeout(LOOKUP_TIMEOUT).build()?;
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(u64::from(LOOKUP_TIMEOUT_SECONDS)))
+            .build()?;
         Ok(Self { base_url, http })
     }
 

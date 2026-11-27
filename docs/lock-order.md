@@ -103,7 +103,7 @@ The completion paths (`apply_completed_lifecycle`, `apply_manual_review`,
 `park_unverified_completion`) lock the payment first as well, then the
 correlation; `apply_completed_lifecycle` then locks the order, so every
 path takes the three in the same order. The verifier's status writes
-(`claim_due_correlations`, `record_status_observation`,
+(`claim_next_due_correlation`, `record_status_observation`,
 `record_upstream_terminal`, `record_binding_refusal`,
 `bound_unverified_retry`) lock the correlation row alone and take no other
 row lock while holding it. The sweep therefore waits for the correlation
@@ -113,10 +113,10 @@ holds.
 Each lifecycle claim takes the next `claim_generation` of the row, and every
 one of the writes above requires the row to still carry the generation its
 claim took; the completion paths check it under the correlation lock before
-any payment or order effect. A row is claimed again once the poll interval
-has passed, even while the pass that claimed it before is still working
-through its batch, so without the generation that pass's late response
-could overwrite what the newer claim recorded.
+any payment or order effect. Workers take one oldest due correlation just before its
+lookup. They can reclaim it after the poll interval or the ten-second HTTP
+timeout, whichever is longer. A later claim fences any remaining work from
+the old claim.
 
 These paths judge time only once the locks their time checks depend on are
 held. Registration, the buyer's cancel and a first preparation read the

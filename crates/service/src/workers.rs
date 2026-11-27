@@ -52,7 +52,7 @@
 use chrono::{DateTime, Utc};
 use marketplace_domain::ids;
 use serde_json::Value;
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use uuid::Uuid;
@@ -1637,43 +1637,31 @@ struct ClaimedCorrelation {
     claim_generation: i64,
 }
 
-/// Claims a batch of pending correlations due for a lifecycle lookup by
-/// stamping `last_checked_at` and taking the next `claim_generation`. These
-/// are the only pre-effect writes, so a holder that dies after claiming
-/// loses nothing: the row stays `pending` and is re-verified once the poll
-/// interval elapses. Only `registered` rows with a non-null bundle are
-/// claimable (the same predicates as the
-/// `payment_locks_correlations_pending_idx` partial index): a prepared row
-/// has no bundle to look up and must never enter the batch.
-///
-/// A row is claimed again once the poll interval has passed since the last
-/// claim, even if the pass that made it is still working through its batch
-/// (a worker whose lease expired, or another instance that took the lease
-/// over). The generation orders the two claims: every outcome write
-/// requires the generation its claim took, so the older pass's late
-/// response is dropped instead of overwriting the newer claim's record.
-async fn claim_due_correlations(
-    pool: &PgPool,
-    now: DateTime<Utc>,
-    poll_seconds: i64,
-) -> Result<Vec<ClaimedCorrelation>, sqlx::Error> {
+/// Claims only the oldest due lookup this worker is about to start. A second
+/// worker can take the next row while the first waits for its HTTP response.
+/// The cutoff stays fixed throughout a pass, so slow work never makes the
+/// same correlation eligible twice within that pass.
+async fn claim_next_due_correlation(
+    connection: &mut PgConnection,
+    claimed_at: DateTime<Utc>,
+    due_before: DateTime<Utc>,
+) -> Result<Option<ClaimedCorrelation>, sqlx::Error> {
     sqlx::query_as(
         "UPDATE payment_locks_correlations SET last_checked_at = $1, updated_at = $1, \
          claim_generation = claim_generation + 1 \
-         WHERE id IN (\
+         WHERE id = (\
              SELECT id FROM payment_locks_correlations \
              WHERE verification_state = 'pending' \
              AND preparation_state = 'registered' \
              AND bundle_id_ciphertext IS NOT NULL \
              AND (last_checked_at IS NULL OR last_checked_at <= $2) \
-             ORDER BY last_checked_at ASC NULLS FIRST LIMIT $3 FOR UPDATE SKIP LOCKED\
+             ORDER BY last_checked_at ASC NULLS FIRST LIMIT 1 FOR UPDATE SKIP LOCKED\
          ) RETURNING id, payment_id, creator_pubky, bundle_id_ciphertext, last_observed_status, \
          client_reference_ciphertext, expected_resource_ciphertext, criterion_id, claim_generation",
     )
-    .bind(now)
-    .bind(now - chrono::Duration::seconds(poll_seconds))
-    .bind(LOCKS_VERIFY_BATCH_SIZE)
-    .fetch_all(pool)
+    .bind(claimed_at)
+    .bind(due_before)
+    .fetch_optional(connection)
     .await
 }
 
@@ -2325,8 +2313,8 @@ async fn apply_locks_lookup_outcome(
     }
 }
 
-/// One Locks verification pass: claims due pending correlations, performs
-/// the independent lifecycle lookup for each, and applies the outcome.
+/// One Locks verification pass: claims up to a batch of due correlations,
+/// one immediately before each independent lookup, and applies each outcome.
 /// Returns the number of payments advanced (confirmed or manual review).
 /// A per-item failure (an undecryptable bundle id, an unopenable sealed
 /// pickup row, a database error mid-effect) is logged with the correlation
@@ -2337,10 +2325,22 @@ pub async fn verify_due_locks_lifecycles(
     locks: &LocksRuntime,
     now: DateTime<Utc>,
 ) -> anyhow::Result<u64> {
-    let claimed = claim_due_correlations(&state.pool, now, state.config.locks_poll_seconds).await?;
+    let started = state.clock.now();
+    // A fast poll or task-lease takeover must still give a lookup its full
+    // HTTP timeout. The generation continues to fence genuinely overdue work.
+    let poll_seconds = state
+        .config
+        .locks_poll_seconds
+        .max(i64::from(crate::locks::LOOKUP_TIMEOUT_SECONDS));
+    let due_before = now - chrono::Duration::seconds(poll_seconds);
     let mut applied = 0u64;
-    for row in &claimed {
-        match apply_locks_lookup_outcome(state, locks, row, now).await {
+    for _ in 0..LOCKS_VERIFY_BATCH_SIZE {
+        let mut connection = state.pool.acquire().await?;
+        let claimed_at = now + (state.clock.now() - started);
+        let row = claim_next_due_correlation(&mut connection, claimed_at, due_before).await?;
+        drop(connection);
+        let Some(row) = row else { break };
+        match apply_locks_lookup_outcome(state, locks, &row, claimed_at).await {
             Ok(true) => applied += 1,
             Ok(false) => {}
             Err(error) => {
@@ -6115,16 +6115,17 @@ pub async fn run_once(
     // closed); the window sweep is a marketplace-time transition and always
     // runs, so correlations registered before a config change still expire.
     if let Some(locks) = &state.locks {
+        let verification_now = now + (state.clock.now() - started);
         if try_acquire_lease(
             &state.pool,
             TASK_LOCKS_VERIFICATION,
             holder,
-            now,
+            verification_now,
             lease_seconds,
         )
         .await?
         {
-            let result = verify_due_locks_lifecycles(state, locks, now).await;
+            let result = verify_due_locks_lifecycles(state, locks, verification_now).await;
             // The checkout-snapshot retention purge runs UNDER the same
             // lease — never after it is released — so concurrent
             // instances cannot purge simultaneously. Bounded at 500 rows
@@ -6136,7 +6137,13 @@ pub async fn run_once(
                 state.config.locks_snapshot_retention_days,
             )
             .await;
-            release_lease(&state.pool, TASK_LOCKS_VERIFICATION, holder, now).await?;
+            release_lease(
+                &state.pool,
+                TASK_LOCKS_VERIFICATION,
+                holder,
+                verification_now,
+            )
+            .await?;
             summary.locks_completions_applied = result?;
             summary.locks_snapshots_purged = purge?;
         }

@@ -6722,20 +6722,7 @@ async fn a_pass_overtaken_by_a_newer_claim(
 ) -> (Arc<tokio::sync::Notify>, tokio::task::JoinHandle<u64>, u64) {
     let locks = app.state.locks.clone().expect("locks runtime");
     let before = fake.lookup_count();
-    let release = fake.park_next_lookup();
-    let stale = tokio::spawn({
-        let state = app.state.clone();
-        let locks = locks.clone();
-        let now = app.clock.now();
-        async move {
-            workers::verify_due_locks_lifecycles(&state, &locks, now)
-                .await
-                .expect("stale pass")
-        }
-    });
-    while fake.lookup_count() < before + 1 {
-        tokio::task::yield_now().await;
-    }
+    let (release, stale) = start_parked_locks_pass(app, fake).await;
     app.clock.advance_seconds(61);
     let newer = workers::verify_due_locks_lifecycles(&app.state, &locks, app.clock.now())
         .await
@@ -7198,5 +7185,114 @@ async fn a_not_found_after_the_task_was_reported_keeps_the_unit(pool: PgPool) {
     assert_eq!(
         observation_history(&app.pool, &order.payment_id).await,
         vec![("pending".to_string(), "none".to_string())]
+    );
+}
+
+async fn start_parked_locks_pass(
+    app: &TestApp,
+    fake: &FakeLocksClient,
+) -> (Arc<tokio::sync::Notify>, tokio::task::JoinHandle<u64>) {
+    let before = fake.lookup_count();
+    let release = fake.park_next_lookup();
+    let state = app.state.clone();
+    let now = app.clock.now();
+    let pass = tokio::spawn(async move {
+        workers::verify_due_locks_lifecycles(&state, state.locks.as_ref().unwrap(), now)
+            .await
+            .unwrap()
+    });
+    while fake.lookup_count() == before {
+        tokio::task::yield_now().await;
+    }
+    (release, pass)
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_slow_batch_prefix_does_not_age_the_claim_of_its_next_lookup(pool: PgPool) {
+    let (app, fake) = test_app_with_locks(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let mut payments = HashMap::new();
+    for i in 0..5 {
+        let bundle = bundle_id_with(i);
+        let order = registered_digital_locks_order(
+            &app,
+            &seller,
+            &buyer,
+            &format!("listing_prefix_{i}"),
+            &bundle,
+            25_000 + u64::from(i),
+        )
+        .await;
+        fake.set_outcome(
+            &bundle,
+            LocksLookupOutcome::Status(LocksTaskStatus::Pending),
+        );
+        payments.insert(bundle, order.payment_id);
+    }
+
+    let (mut release_next, pass) = start_parked_locks_pass(&app, &fake).await;
+    // Four eight-second responses exceed the default 30-second lease and poll
+    // interval. The fifth lookup has just started when the other worker claims.
+    for lookup_count in 2..=5 {
+        let release = fake.park_next_lookup();
+        app.clock.advance_seconds(8);
+        release_next.notify_one();
+        while fake.lookup_count() < lookup_count {
+            tokio::task::yield_now().await;
+        }
+        release_next = release;
+    }
+    let bundle = fake.lookups()[4].1.clone();
+    let payment = &payments[&bundle];
+    workers::verify_due_locks_lifecycles(
+        &app.state,
+        app.state.locks.as_ref().unwrap(),
+        app.clock.now(),
+    )
+    .await
+    .unwrap();
+    fake.complete_matching(&app.pool, &bundle, payment).await;
+    release_next.notify_one();
+
+    assert_eq!(
+        pass.await.unwrap(),
+        1,
+        "apply the matching completion from the lookup just started"
+    );
+    assert_eq!(payment_state(&app.pool, payment).await.0, "confirmed");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_short_poll_does_not_displace_a_lookup_within_the_http_timeout(pool: PgPool) {
+    let (mut app, fake) = test_app_with_locks(pool).await;
+    Arc::make_mut(&mut app.state.config).locks_poll_seconds = 4;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = create_pending_locks_order(&app, &seller, &buyer).await;
+    register_locks(&app, &buyer.token, &order, &seller.pubky).await;
+    let (release, pass) = start_parked_locks_pass(&app, &fake).await;
+
+    app.clock.advance_seconds(5);
+    workers::verify_due_locks_lifecycles(
+        &app.state,
+        app.state.locks.as_ref().unwrap(),
+        app.clock.now(),
+    )
+    .await
+    .unwrap();
+    fake.complete_matching(&app.pool, TEST_BUNDLE_ID, &order.payment_id)
+        .await;
+    app.clock.advance_seconds(3);
+    release.notify_one();
+    assert_eq!(
+        pass.await.unwrap(),
+        1,
+        "the eight-second successful lookup still owns its claim"
+    );
+    assert_eq!(fake.lookup_count(), 1);
+    assert_eq!(
+        payment_state(&app.pool, &order.payment_id).await.0,
+        "confirmed"
     );
 }
