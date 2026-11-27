@@ -1616,3 +1616,59 @@ async fn a_duplicate_order_that_could_not_be_cancelled_is_cancelled_by_the_next_
         replay.assert_no_misses();
     }
 }
+
+/// A store that answers every request `429` with this `Retry-After`.
+async fn rate_limiting_store(retry_after: &'static str) -> String {
+    let app = axum::Router::new().fallback(move || async move {
+        (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            [("retry-after", retry_after)],
+            "",
+        )
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("address");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    addr.to_string()
+}
+
+#[tokio::test]
+async fn a_retry_after_beyond_any_date_is_cut_to_a_day() {
+    let provider = WooCommerceProvider::with_options(
+        WooOptions::local_testing(true, Vec::new()),
+        Some(RETURN_URL.to_string()),
+    );
+    for retry_after in ["9000000000000", "18446744073709551615"] {
+        let site = rate_limiting_store(retry_after).await;
+        let connection = ConnectionContext {
+            connection_id: Uuid::new_v4(),
+            seller_pubky: "seller".into(),
+            shop: provider.normalize_shop(&site).expect("shop"),
+            scopes: vec![],
+            credentials: StoredCredentials::new(
+                "ck_test".into(),
+                "cs_test".into(),
+                AuthMode::Basic,
+                "a".repeat(64),
+            )
+            .into_secret(),
+            app: None,
+        };
+        let error = provider
+            .list_catalog(&connection, None)
+            .await
+            .expect_err("rate limited");
+        assert!(
+            matches!(
+                error,
+                ProviderError::RateLimited { retry_after: Some(wait) }
+                    if wait == Duration::from_secs(86_400)
+            ),
+            "Retry-After {retry_after}: {error:?}"
+        );
+    }
+}

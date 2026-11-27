@@ -115,8 +115,17 @@ pub enum Fault {
     Status(u16),
     /// Answer 429 with `Retry-After: 0`.
     TooManyRequests,
+    /// Answer 429 with this `Retry-After` value.
+    TooManyRequestsAfter(&'static str),
     /// GraphQL `THROTTLED`, without running the operation.
     Throttled,
+    /// GraphQL `THROTTLED` with this cost and throttle status, without
+    /// running the operation.
+    ThrottledWith {
+        requested: f64,
+        available: f64,
+        restore_rate: f64,
+    },
     /// GraphQL `ACCESS_DENIED`, without running the operation.
     AccessDenied,
     /// Run the operation, then answer 500: the outcome the caller sees is
@@ -488,6 +497,27 @@ fn process(
                     return Ok(
                         (StatusCode::TOO_MANY_REQUESTS, [("retry-after", "0")], "").into_response()
                     );
+                }
+                Fault::TooManyRequestsAfter(value) => {
+                    return Ok(
+                        (StatusCode::TOO_MANY_REQUESTS, [("retry-after", value)], "")
+                            .into_response(),
+                    );
+                }
+                Fault::ThrottledWith {
+                    requested,
+                    available,
+                    restore_rate,
+                } => {
+                    return Ok(axum::Json(json!({
+                        "errors": [{ "message": "Throttled", "extensions": { "code": "THROTTLED" } }],
+                        "extensions": { "cost": {
+                            "requestedQueryCost": requested,
+                            "actualQueryCost": null,
+                            "throttleStatus": { "maximumAvailable": 2000.0, "currentlyAvailable": available, "restoreRate": restore_rate }
+                        } }
+                    }))
+                    .into_response());
                 }
                 Fault::Throttled => {
                     return Ok(axum::Json(json!({

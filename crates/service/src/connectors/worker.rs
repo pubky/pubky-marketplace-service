@@ -19,6 +19,7 @@ use sqlx::PgPool;
 
 use crate::AppState;
 
+use super::config::after;
 use super::inbound;
 use super::ledger::{self, reason, ClaimedPush};
 use super::order_push::{self, Withheld};
@@ -59,10 +60,6 @@ fn provider_names(runtime: &ConnectorRuntime) -> Vec<String> {
         .into_iter()
         .map(|kind| kind.as_str().to_string())
         .collect()
-}
-
-fn after(now: DateTime<Utc>, delay: Duration) -> DateTime<Utc> {
-    now + chrono::Duration::from_std(delay).unwrap_or(chrono::Duration::hours(1))
 }
 
 /// One full pass in dependency order: events first so a payment confirmed a
@@ -883,5 +880,35 @@ pub async fn run_forever(state: AppState) -> anyhow::Result<()> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_delay_beyond_any_date_is_scheduled_a_day_out() {
+        let now: DateTime<Utc> = "2026-11-26T12:00:00Z".parse().expect("instant");
+        assert_eq!(
+            after(now, Duration::from_secs(30)),
+            now + chrono::Duration::seconds(30)
+        );
+        for delay in [
+            Duration::from_secs(9_000_000_000_000),
+            Duration::from_secs(u64::MAX),
+            Duration::MAX,
+            Duration::from_secs(86_401),
+        ] {
+            assert_eq!(
+                after(now, delay),
+                now + chrono::Duration::days(1),
+                "{delay:?}"
+            );
+        }
+        assert_eq!(
+            after(DateTime::<Utc>::MAX_UTC, Duration::MAX),
+            DateTime::<Utc>::MAX_UTC
+        );
     }
 }

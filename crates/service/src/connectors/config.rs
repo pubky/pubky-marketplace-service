@@ -4,6 +4,7 @@
 
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 pub const ENV_CONNECTORS_ENABLED: &str = "CONNECTORS_ENABLED";
@@ -39,6 +40,22 @@ pub const CALLBACK_BODY_LIMIT: usize = 64 * 1024;
 pub const MAX_CATALOG_PAGES_PER_POLL: usize = 50;
 /// The longest `CONNECTOR_PROVIDER_TIMEOUT_SECONDS` accepted.
 pub const MAX_PROVIDER_TIMEOUT_SECONDS: u64 = 120;
+/// The longest `CONNECTOR_BACKOFF_MAX_SECONDS` accepted: one day.
+pub const MAX_BACKOFF_MAX_SECONDS: u64 = 86_400;
+/// No retry or lease is scheduled further out than this. A store's wait hint
+/// (`Retry-After`, a Shopify throttle status) is cut to it, so nothing a store
+/// sends parks a push longer than an operator could set the backoff, or
+/// overflows a timestamp.
+pub const MAX_RETRY_DELAY: Duration = Duration::from_secs(MAX_BACKOFF_MAX_SECONDS);
+
+/// `now + delay`, with `delay` cut to [`MAX_RETRY_DELAY`]. Never panics: an
+/// instant past chrono's range is its last instant.
+pub fn after(now: DateTime<Utc>, delay: Duration) -> DateTime<Utc> {
+    chrono::Duration::from_std(delay.min(MAX_RETRY_DELAY))
+        .ok()
+        .and_then(|delay| now.checked_add_signed(delay))
+        .unwrap_or(DateTime::<Utc>::MAX_UTC)
+}
 
 #[derive(Debug, Clone)]
 pub struct ConnectorSettings {
@@ -115,7 +132,12 @@ impl ConnectorSettings {
         )?;
         settings.max_attempts = bounded(ENV_CONNECTOR_MAX_ATTEMPTS, 12, 1, 100)? as i32;
         settings.backoff_base = seconds(ENV_CONNECTOR_BACKOFF_BASE_SECONDS, 30, 1, 3600)?;
-        settings.backoff_max = seconds(ENV_CONNECTOR_BACKOFF_MAX_SECONDS, 3600, 1, 86_400)?;
+        settings.backoff_max = seconds(
+            ENV_CONNECTOR_BACKOFF_MAX_SECONDS,
+            3600,
+            1,
+            MAX_BACKOFF_MAX_SECONDS,
+        )?;
         settings.stock_poll_interval = seconds(ENV_CONNECTOR_STOCK_POLL_SECONDS, 900, 60, 86_400)?;
         settings.tick = Duration::from_millis(bounded(
             ENV_CONNECTOR_WORKER_TICK_MILLIS,
