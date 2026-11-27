@@ -46,8 +46,9 @@ pub const STORE_BINDING_LOCK_KEY: i64 = 4_713_371_337_102;
 pub const STORE_UNCLAIMED_MESSAGE: &str = "This store has not been claimed by its seller yet.";
 pub const STORE_ALREADY_CLAIMED_MESSAGE: &str = "This store has already been claimed.";
 
-/// `off` turns the index moderation gate off. Allowed only with
-/// [`ENV_STORE_SELLER_PUBKY`]; unset (or `on`) keeps it on.
+/// `off` turns the index moderation gate off. Allowed only in single-seller
+/// mode (`STORE_MODE=single_seller` or [`ENV_STORE_SELLER_PUBKY`]); unset (or
+/// `on`) keeps it on.
 pub const ENV_LISTING_MODERATION: &str = "LISTING_MODERATION";
 
 pub const SELLER_NOT_SERVED_MESSAGE: &str = "This service sells only its store seller's listings.";
@@ -428,7 +429,7 @@ pub fn moderation_from_lookup(
             if *store == StoreMode::Marketplace {
                 anyhow::bail!(
                     "{ENV_LISTING_MODERATION}=off is allowed only in single-seller mode \
-                     ({ENV_STORE_SELLER_PUBKY} set)"
+                     ({ENV_STORE_MODE}=single_seller or {ENV_STORE_SELLER_PUBKY} set)"
                 );
             }
             if set(nexus).is_some() {
@@ -1367,28 +1368,48 @@ mod tests {
                 ListingModeration::Off
             )
         );
+        assert_eq!(
+            modes(&[
+                ("STORE_MODE", "single_seller"),
+                ("LISTING_MODERATION", "off")
+            ])
+            .expect("claim mode boots without NEXUS_URL"),
+            (
+                StoreMode::SingleSeller { pinned: None },
+                ListingModeration::Off
+            )
+        );
         for vars in [
             vec![("LISTING_MODERATION", "off")],
             vec![NEXUS, ("LISTING_MODERATION", "off")],
         ] {
             let error = modes(&vars).expect_err("off without a store seller");
+            let message = error.to_string();
             assert!(
-                error
-                    .to_string()
-                    .contains("allowed only in single-seller mode"),
-                "{error}"
+                message.contains("allowed only in single-seller mode")
+                    && message.contains("STORE_MODE=single_seller")
+                    && message.contains("STORE_SELLER_PUBKY"),
+                "{message}"
             );
         }
-        let error = modes(&[
-            NEXUS,
-            ("STORE_SELLER_PUBKY", &store),
-            ("LISTING_MODERATION", "off"),
-        ])
-        .expect_err("an index that is not read");
-        assert_eq!(
-            error.to_string(),
-            "NEXUS_URL is not read when LISTING_MODERATION is `off`; unset it"
-        );
+        for vars in [
+            vec![
+                NEXUS,
+                ("STORE_SELLER_PUBKY", &store),
+                ("LISTING_MODERATION", "off"),
+            ],
+            vec![
+                NEXUS,
+                ("STORE_MODE", "single_seller"),
+                ("LISTING_MODERATION", "off"),
+            ],
+        ] {
+            let error = modes(&vars).expect_err("an index that is not read");
+            assert_eq!(
+                error.to_string(),
+                "NEXUS_URL is not read when LISTING_MODERATION is `off`; unset it"
+            );
+        }
     }
 
     #[test]

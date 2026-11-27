@@ -316,6 +316,10 @@ pub fn routes(state: &AppState) -> Router<AppState> {
             state.clone(),
             auth::require_session,
         ))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            crate::store_claim::bound_claim_route_timeout,
+        ))
         .layer(DefaultBodyLimit::max(crate::store_claim::CLAIM_BODY_LIMIT));
 
     Router::new()

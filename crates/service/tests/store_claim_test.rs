@@ -1436,3 +1436,348 @@ async fn release_after_an_earlier_boot_lock_refuses_its_open_connection(pool: Pg
         "{error}"
     );
 }
+
+async fn open_parked_claim(
+    address: std::net::SocketAddr,
+    token: &str,
+    client_ip: &str,
+    body_len: usize,
+) -> tokio::net::TcpStream {
+    use tokio::io::AsyncWriteExt;
+
+    let mut stream = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("connect to test server");
+    let head = format!(
+        "POST /v1/store/claim HTTP/1.1\r\n\
+         Host: localhost\r\n\
+         Authorization: Bearer {token}\r\n\
+         Content-Type: application/json\r\n\
+         X-Test-Client: {client_ip}\r\n\
+         Content-Length: {body_len}\r\n\
+         Connection: close\r\n\
+         \r\n"
+    );
+    stream
+        .write_all(head.as_bytes())
+        .await
+        .expect("write request headers");
+    stream.flush().await.expect("flush request headers");
+    stream
+}
+
+async fn read_http_response(mut stream: tokio::net::TcpStream) -> (u16, String) {
+    use tokio::io::AsyncReadExt;
+
+    let mut raw = Vec::new();
+    stream
+        .read_to_end(&mut raw)
+        .await
+        .expect("read http response");
+    let text = String::from_utf8(raw).expect("http response is utf-8");
+    let status = text
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or_else(|| panic!("malformed HTTP status line: {text}"));
+    (status, text)
+}
+
+async fn send_claim_from(
+    router: axum::Router,
+    token: &str,
+    client_ip: &str,
+    raw_body: &str,
+) -> (StatusCode, HeaderMap, Value) {
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/store/claim")
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .header("x-test-client", client_ip)
+        .body(Body::from(raw_body.to_string()))
+        .expect("claim request builds");
+    let response = router.oneshot(request).await.expect("request executes");
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body collects")
+        .to_bytes();
+    let body = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()));
+    (status, headers, body)
+}
+
+async fn wait_until_in_flight(app: &TestApp, expected: usize) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let current = app.state.store_limiters.claim_in_flight_total();
+        if current == expected {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for in_flight == {expected} (last {current})"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn parked_concurrent_claims_cannot_exceed_ten_failures_and_use_fresh_clock(pool: PgPool) {
+    use tokio::io::AsyncWriteExt;
+
+    let base = unclaimed(pool.clone()).await;
+    let state = base
+        .state
+        .clone()
+        .with_store_limiters(Arc::new(StoreLimiters::new(Some(HeaderName::from_static(
+            "x-test-client",
+        )))));
+    let app = app_with_state(&base, state);
+    let actor = new_actor(&app).await;
+    grant_session(&app, &actor).await;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test listener");
+    let address = listener.local_addr().expect("listener addr");
+    let server = tokio::spawn({
+        let router = app.router.clone();
+        async move {
+            let _ = axum::serve(listener, router).await;
+        }
+    });
+
+    let wrong_body = serde_json::to_string(&json!({ "claim_code": WRONG_CODE })).unwrap();
+    let attacker_ip = "203.0.113.10";
+    let other_ip = "203.0.113.11";
+
+    // Open 10 concurrent requests from one address and park them in `to_bytes`.
+    let mut parked = Vec::new();
+    for _ in 0..10 {
+        parked.push(open_parked_claim(address, &actor.token, attacker_ip, wrong_body.len()).await);
+    }
+    wait_until_in_flight(&app, 10).await;
+
+    // While all 10 bodies remain parked, 5 additional attempts from the same
+    // address are rejected immediately with 429, while a distinct address is
+    // unaffected.
+    for _ in 0..5 {
+        let (status, headers, _) =
+            send_claim_from(app.router.clone(), &actor.token, attacker_ip, &wrong_body).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(headers.contains_key(header::RETRY_AFTER));
+        assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+    }
+    let (other_status, _, other_body) =
+        send_claim_from(app.router.clone(), &actor.token, other_ip, &wrong_body).await;
+    assert_eq!(other_status, StatusCode::FORBIDDEN, "{other_body}");
+    assert_eq!(other_body["error"]["reason"], json!("claim_code_invalid"));
+
+    // Advance the serving clock by 120 s while the 10 bodies are still parked,
+    // then complete all 10 with wrong codes. Failures must be recorded at the
+    // fresh clock (`T0 + 120s`), not at the pre-await timestamp `T0`.
+    app.clock.advance_seconds(120);
+    let mut responses = Vec::new();
+    for mut stream in parked {
+        stream
+            .write_all(wrong_body.as_bytes())
+            .await
+            .expect("write parked body");
+        stream.flush().await.expect("flush parked body");
+        responses.push(tokio::spawn(read_http_response(stream)));
+    }
+    for task in responses {
+        let (status, raw) = task.await.expect("response task");
+        assert_eq!(status, 403, "{raw}");
+        assert!(raw.contains("claim_code_invalid"), "{raw}");
+    }
+
+    // Immediately after those 10 failures at `T0 + 120s`, an 11th attempt must
+    // still be rate-limited (no 120 s refill credited from stale `T0`).
+    let (status, headers, _) =
+        send_claim_from(app.router.clone(), &actor.token, attacker_ip, &wrong_body).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(headers.contains_key(header::RETRY_AFTER));
+
+    server.abort();
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn stalled_and_cancelled_claim_bodies_time_out_and_release_in_flight_slots(pool: PgPool) {
+    let valid_body = serde_json::to_string(&json!({ "claim_code": CODE })).unwrap();
+    let wrong_body = serde_json::to_string(&json!({ "claim_code": WRONG_CODE })).unwrap();
+
+    // 1. Body-read timeout (408) releases every in-flight slot without
+    // spending failure tokens.
+    {
+        let base = unclaimed(pool.clone()).await;
+        let state = base.state.clone().with_store_limiters(Arc::new(
+            StoreLimiters::new(Some(HeaderName::from_static("x-test-client")))
+                .with_claim_timeouts(Duration::from_millis(120), Duration::from_secs(30)),
+        ));
+        let app = app_with_state(&base, state);
+        let actor = new_actor(&app).await;
+        grant_session(&app, &actor).await;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let address = listener.local_addr().expect("listener addr");
+        let server = tokio::spawn({
+            let router = app.router.clone();
+            async move {
+                let _ = axum::serve(listener, router).await;
+            }
+        });
+
+        let ip = "203.0.113.20";
+        let mut tasks = Vec::new();
+        for _ in 0..10 {
+            let stream = open_parked_claim(address, &actor.token, ip, valid_body.len()).await;
+            tasks.push(tokio::spawn(read_http_response(stream)));
+        }
+        for task in tasks {
+            let (status, raw) = tokio::time::timeout(Duration::from_secs(3), task)
+                .await
+                .expect("timed-out request finishes")
+                .expect("response task");
+            assert_eq!(status, 408, "{raw}");
+            assert!(raw.contains("REQUEST_TIMEOUT"), "{raw}");
+            assert!(
+                raw.to_ascii_lowercase().contains("cache-control: no-store"),
+                "{raw}"
+            );
+        }
+
+        // All 10 slots were released without spending failure tokens: one wrong
+        // code returns 403 (not 429), then the valid code claims with 200.
+        let (status, _, body) =
+            send_claim_from(app.router.clone(), &actor.token, ip, &wrong_body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["error"]["reason"], json!("claim_code_invalid"));
+        let (status, _, body) =
+            send_claim_from(app.router.clone(), &actor.token, ip, &valid_body).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        server.abort();
+    }
+
+    // 2. Route-level timeout (408) also drops the in-flight guard cleanly.
+    {
+        let mut tx = pool.begin().await.expect("reset tx");
+        sqlx::query("SET LOCAL marketplace.release_store_binding = 'on'")
+            .execute(&mut *tx)
+            .await
+            .expect("enable release guc");
+        sqlx::query("DELETE FROM store_seller_binding")
+            .execute(&mut *tx)
+            .await
+            .expect("clear binding");
+        tx.commit().await.expect("commit reset");
+
+        let base = unclaimed(pool.clone()).await;
+        let state = base.state.clone().with_store_limiters(Arc::new(
+            StoreLimiters::new(Some(HeaderName::from_static("x-test-client")))
+                .with_claim_timeouts(Duration::from_secs(10), Duration::from_millis(120)),
+        ));
+        let app = app_with_state(&base, state);
+        let actor = new_actor(&app).await;
+        grant_session(&app, &actor).await;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let address = listener.local_addr().expect("listener addr");
+        let server = tokio::spawn({
+            let router = app.router.clone();
+            async move {
+                let _ = axum::serve(listener, router).await;
+            }
+        });
+
+        let ip = "203.0.113.21";
+        let mut tasks = Vec::new();
+        for _ in 0..10 {
+            let stream = open_parked_claim(address, &actor.token, ip, valid_body.len()).await;
+            tasks.push(tokio::spawn(read_http_response(stream)));
+        }
+        for task in tasks {
+            let (status, raw) = tokio::time::timeout(Duration::from_secs(3), task)
+                .await
+                .expect("route-timed-out request finishes")
+                .expect("response task");
+            assert_eq!(status, 408, "{raw}");
+            assert!(raw.contains("REQUEST_TIMEOUT"), "{raw}");
+        }
+
+        // Wait until the route timeout has returned and dropped the inner
+        // handler future, then confirm every slot is free.
+        wait_until_in_flight(&app, 0).await;
+        let (status, _, body) =
+            send_claim_from(app.router.clone(), &actor.token, ip, &valid_body).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        server.abort();
+    }
+
+    // 3. Abrupt client disconnect while parked in `to_bytes` drops the guard
+    // and releases all 10 slots cleanly.
+    {
+        let mut tx = pool.begin().await.expect("reset tx");
+        sqlx::query("SET LOCAL marketplace.release_store_binding = 'on'")
+            .execute(&mut *tx)
+            .await
+            .expect("enable release guc");
+        sqlx::query("DELETE FROM store_seller_binding")
+            .execute(&mut *tx)
+            .await
+            .expect("clear binding");
+        tx.commit().await.expect("commit reset");
+
+        let base = unclaimed(pool.clone()).await;
+        let state = base
+            .state
+            .clone()
+            .with_store_limiters(Arc::new(StoreLimiters::new(Some(HeaderName::from_static(
+                "x-test-client",
+            )))));
+        let app = app_with_state(&base, state);
+        let actor = new_actor(&app).await;
+        grant_session(&app, &actor).await;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let address = listener.local_addr().expect("listener addr");
+        let server = tokio::spawn({
+            let router = app.router.clone();
+            async move {
+                let _ = axum::serve(listener, router).await;
+            }
+        });
+
+        let ip = "203.0.113.22";
+        let mut parked = Vec::new();
+        for _ in 0..10 {
+            parked.push(open_parked_claim(address, &actor.token, ip, valid_body.len()).await);
+        }
+        wait_until_in_flight(&app, 10).await;
+        let (status, _, _) =
+            send_claim_from(app.router.clone(), &actor.token, ip, &valid_body).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+
+        drop(parked);
+        wait_until_in_flight(&app, 0).await;
+        let (status, _, body) =
+            send_claim_from(app.router.clone(), &actor.token, ip, &valid_body).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        server.abort();
+    }
+}

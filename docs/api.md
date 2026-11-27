@@ -533,7 +533,9 @@ request answers `429` with `Retry-After` and `Cache-Control: no-store`.
 
 ### `POST /v1/store/claim`
 
-Requires a bearer and a JSON body no larger than 1 KiB:
+Requires a bearer and a JSON body no larger than 1 KiB (body read is bounded
+to 10 seconds and the route to 30 seconds, returning `408 REQUEST_TIMEOUT` on
+timeout):
 
 ```json
 { "claim_code": "<setup code>" }
@@ -687,9 +689,10 @@ When the bucket is empty: `429` with `Retry-After: <integer seconds>`,
 
 The store routes use independent in-memory, per-replica buckets keyed by a
 salted address hash. `GET /v1/store` refills at 60 per minute with capacity
-30. `POST /v1/store/claim` checks a failure-only bucket before state and code
-checks; only a code mismatch spends one of 10 failures, refilled across 15
-minutes. Both use `LISTING_AVAILABILITY_CLIENT_IP_HEADER`, then
+30. `POST /v1/store/claim` reserves an in-flight failure slot against a
+failure-only bucket before state, session, body and code checks; only a code
+mismatch spends one of 10 failures (refilled across 15 minutes), while every
+other outcome or cancellation releases the reserved slot untouched. Both use `LISTING_AVAILABILITY_CLIENT_IP_HEADER`, then
 `ADDRESS_SEARCH_CLIENT_IP_HEADER`, then the socket peer, exactly as the public
 availability limiter does.
 
