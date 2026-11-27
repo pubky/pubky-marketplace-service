@@ -160,8 +160,11 @@ Configuration is environment-based. Window keys and their defaults also live in
 | `HOMESERVER_RESOLUTION` | `fixed` | where homeserver reads go: `fixed` sends every read to `HOMESERVER_URL`; `pkarr` reads each pubky from the homeserver its Pkarr record names. Any other value refuses to boot. See [Homeserver reads](#homeserver-reads) |
 | `HOMESERVER_URL` | required with `fixed` | homeserver base URL (http(s)) the `listing.sync` command and every other homeserver read fetch seller-signed records from; the service refuses to boot without it under `fixed`, and refuses to boot with it set under `pkarr` |
 | `NEXUS_URL` | required unless `LISTING_MODERATION=off` | base URL (http(s)) of the marketplace index (Nexus) the service asks whether a listing is moderated before it accepts a checkout, a bid or an offer on it; the service refuses to boot without it while moderation is on, and with it set while moderation is off. See [Listing moderation](#listing-moderation) |
-| `STORE_SELLER_PUBKY` | unset | binds the service to one seller (single-seller mode): every command and signed-in route that names another seller's listing, drop, settings, offer, order, payment or receipt is refused with `SELLER_NOT_SERVED`. Unset or empty serves every seller (marketplace mode). Any other value, whitespace alone included, must be a 52-character z-base-32 pubky without a `pubky` prefix or surrounding whitespace, or the service refuses to boot. See [Single-seller mode](#single-seller-mode) |
-| `LISTING_MODERATION` | `on` | `on` asks the index (`NEXUS_URL`) before selling a listing; `off` builds no moderation gate and does not read `NEXUS_URL`. `off` is allowed only with `STORE_SELLER_PUBKY` set; any other value, or `off` in marketplace mode, refuses to boot. See [Single-seller mode](#single-seller-mode) |
+| `STORE_MODE` | derived | `marketplace` or `single_seller`. Empty is unset. Unset derives from `STORE_SELLER_PUBKY`, so existing deployments keep their mode. A seller pin with explicit `marketplace`, or any other value, refuses to boot. |
+| `STORE_SELLER_PUBKY` | unset | optionally pre-pins the one seller in `single_seller` mode. Every command and signed-in route for another seller is refused with `SELLER_NOT_SERVED`. A nonempty value must be a 52-character z-base-32 pubky without a `pubky` prefix or surrounding whitespace. See [Single-seller mode](#single-seller-mode) |
+| `STORE_CLAIM_TOKEN` | unset | optional setup code for claim mode, with no seller pin. After normalization it must be 32 Crockford Base32 characters or 64 hex characters and contain at least 10 distinct characters. Only its SHA-256 digest is retained. If unset while unclaimed, boot generates and logs an ephemeral code. |
+| `STORE_CLAIM_SESSION_MAX_AGE_SECONDS` | `900` | maximum age of the grant-minted session used to claim, from 1 through 3600 seconds. |
+| `LISTING_MODERATION` | `on` | `on` asks the index (`NEXUS_URL`) before selling a listing; `off` builds no moderation gate and does not read `NEXUS_URL`. `off` is allowed only in `single_seller` mode, including claim mode; any other value, or `off` in marketplace mode, refuses to boot. See [Single-seller mode](#single-seller-mode) |
 | `REFUSAL_AUDIT_*` | required | refusal-audit logins, HMAC key pair and attestations; see [Run](#run) |
 | `BIND_ADDR` | `127.0.0.1:8080` | HTTP listen address |
 | `ALLOWED_ORIGINS` | empty | comma-separated exact CORS origins |
@@ -401,10 +404,13 @@ A single-seller deployment may switch the gate off with
 
 ### Single-seller mode
 
-`STORE_SELLER_PUBKY` binds the service to one seller's shop. Unset, the
-service is a marketplace and serves every seller exactly as before.
+`STORE_MODE=single_seller` binds the service to one seller's shop.
+`STORE_SELLER_PUBKY` can pin that seller at deploy time. Without a pin the
+store starts unclaimed. Marketplace mode serves every seller exactly as
+before, except that boot refuses if this database already has a seller
+binding.
 
-When it is set, one check (`store_seller` in the service crate) decides
+When a seller is claimed, one check (`store_seller` in the service crate) decides
 whether a request concerns the store seller, and refuses anything else:
 
 - **Commands.** Every `POST /v1/commands` kind, and every item of
@@ -433,7 +439,7 @@ whether a request concerns the store seller, and refuses anything else:
   serve is refused the same way rather than answered with 405; a path no
   route matches is still a 404.
 
-Every refusal writes a refusal-audit row (`seller_not_served`): a command on
+Every `SELLER_NOT_SERVED` refusal writes a refusal-audit row (`seller_not_served`): a command on
 the `v1_command` surface under its own command kind, a route on the
 `seller_route` surface under the `seller_route` command kind. The row tags
 an authenticated actor, so an unlisted route refused without an active
@@ -460,12 +466,12 @@ the listing count covers them. Sessions, `/priv` data-key envelopes and
 notifications belong to identities, which may be buyers, and are not
 counted. The message counts each kind and names up to three of those
 sellers by the first eight characters of their pubky. Nothing is removed:
-start the store on its own database, or unset `STORE_SELLER_PUBKY`.
+start the store on its own database, or release an empty binding with the
+operator helper below.
 
-Set `STORE_SELLER_PUBKY` on every replica of the service and the
-`connector-worker` at once, on a database no other seller uses. A replica
-started without it serves every seller, and a row it writes for another
-seller refuses the next start of every replica that has it.
+Set `STORE_MODE` and any `STORE_SELLER_PUBKY` consistently on every replica
+of the service and the `connector-worker`. The marketplace guard and the
+other-seller boot check refuse a contradictory restart.
 
 A refusal does not hide whether another seller's record exists: an
 existing order, payment, receipt or offer of another seller answers 409
@@ -477,10 +483,44 @@ database, so there is nothing to find.
 then not built, `NEXUS_URL` is not read and must be unset, and the boot log
 says so. In marketplace mode `off` refuses to boot.
 
-`GET /health` reports the deployment: `store` (`mode` and `seller`),
-`homeserver_resolution` (`fixed` or `pkarr`), `listing_moderation` (`on` or
-`off`) and `fx_source` (the FX provider and whether its URL is the pinned
-one). See [`docs/api.md`](docs/api.md#health).
+#### First-boot claim and release
+
+Claim mode needs `MARKETPLACE_GRANT_SESSION_ENABLED=true` and at least one
+accepted grant client id. While unclaimed, every command, batch sync and
+seller-scoped signed-in route answers `503 STORE_UNCLAIMED` before its
+handler budget. Public reads, sign-in and the caller's own session
+administration remain available. `GET /v1/store` reports `unclaimed` or
+`claimed` and its seller.
+
+`POST /v1/store/claim` accepts `{ "claim_code": "..." }` with a fresh
+grant-minted bearer that covers the inventory service. Legacy AuthToken and
+grant-flow sessions cannot claim. The transaction takes the same advisory
+lock as boot, proves the database has no seller rows and inserts the one
+permanent binding. Exactly one racing claim succeeds. The live state changes
+without a restart, and other replicas notice within one second.
+
+An env-pinned boot also writes the binding. A later mismatch or a marketplace
+boot with a binding refuses to start. Every boot reads the binding in a startup
+transaction under the shared lock, so a failed pin commits nothing and a
+corrected pin can boot.
+
+For a wrong-identity claim before any seller row exists, stop the service and
+connector worker, then run:
+
+```text
+store-binding-admin release --confirm <pubky-or-first-8-characters>
+```
+
+The helper refuses if another service connection is open, confirmation does
+not match, or any seller row exists. Its transaction alone enables
+`app.allow_store_binding_release` for the guarded delete. A store with seller
+rows recovers only on a fresh database.
+
+`GET /health` reports the deployment: `store` (`mode` and `seller`), plus
+`state` only in claim mode, `homeserver_resolution` (`fixed` or `pkarr`),
+`listing_moderation` (`on` or `off`) and `fx_source` (the FX provider and
+whether its URL is the pinned one). Marketplace and env-pinned health bodies
+keep their previous shape. See [`docs/api.md`](docs/api.md#health).
 
 ### Region modes
 

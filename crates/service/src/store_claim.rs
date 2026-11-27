@@ -440,6 +440,14 @@ pub async fn claim_store(State(state): State<AppState>, request: Request) -> Res
         }
     };
     if !state.store.claim_code_matches(&claim.claim_code) {
+        // A parallel winner may have committed and dropped the digest after
+        // this request's first state check. It wins the race response too:
+        // claimed stores never disclose whether an in-flight guess was right.
+        match state.store.refresh(&state.pool, true).await {
+            Ok(Active::Claimed(seller)) => return already_claimed(&seller, client),
+            Ok(_) => {}
+            Err(error) => return internal(error),
+        }
         state
             .store_limiters
             .claim_failures

@@ -95,6 +95,7 @@ and write. "Automation" means the inventory capability plus the
 | --- | --- | --- |
 | GET | `/health` | [Operational endpoints](#operational-endpoints) |
 | GET | `/ready` | [Operational endpoints](#operational-endpoints) |
+| GET | `/v1/store` | Public single-seller claim state. `404` in marketplace mode. See [Store claim](#store-claim). |
 | POST | `/v1/auth/sessions` | Exchange an AuthToken for a bearer; consumes the `session.create` rate limit of the token's pubky. |
 | GET | `/v1/auth/sessions` | Needs a bearer with the inventory capability (checked in the handler); consumes the `session.admin` rate limit. |
 | POST | `/v1/auth/grant-session-challenges` | Issue a short-lived challenge for a grant session. `404 grant_session_unavailable` unless `MARKETPLACE_GRANT_SESSION_ENABLED`. See [Grant sessions](#grant-sessions). |
@@ -354,7 +355,8 @@ request failed, so clients should branch on HTTP status first, and parse
    | `NOT_FOUND` | 404 |
    | `REVISION_CONFLICT`, `IDEMPOTENCY_CONFLICT`, `INSUFFICIENT_INVENTORY`, `INVARIANT_VIOLATION`, `OFFER_EXPIRED`, `INVALID_STATE`, `AUCTION_CLOSED`, `BID_TOO_LOW`, `SELLER_REGISTRATION_REQUIRED` | 409 |
    | `AWARD_EXPIRED`, `AWARD_ALREADY_CONVERTED`, `AWARD_QUANTITY_MISMATCH`, `AWARD_VARIANT_MISMATCH`, `AWARD_LISTING_CHANGED`, `AWARD_HOLD_MISSING` | 409 |
-   | `LISTING_MODERATED`, `LISTING_NOT_ACTIVE`, `SELLER_NOT_SERVED` | 409 |
+   | `LISTING_MODERATED`, `LISTING_NOT_ACTIVE`, `SELLER_NOT_SERVED`, `STORE_ALREADY_CLAIMED` | 409 |
+| `STORE_UNCLAIMED` | 503 |
    | `SHIPPING_UNAVAILABLE_TO_COUNTRY`, `SHIPPING_UNAVAILABLE`, `SHIPPING_CHANGED` | 409 |
    | `SELLER_UNAVAILABLE_IN_REGION`, `SELLER_ANNUAL_LIMIT_REACHED`, `DIGITAL_UNAVAILABLE_IN_REGION`, `COMMERCE_UNAVAILABLE_IN_REGION` | 409 |
    | `UPSTREAM_UNAVAILABLE` | 503 (retriable) |
@@ -511,6 +513,69 @@ request failed, so clients should branch on HTTP status first, and parse
 
 The inventory error codes are listed with the [inventory endpoints](#inventory).
 
+## Store claim
+
+### `GET /v1/store`
+
+No bearer. In `single_seller` mode it answers one of:
+
+```json
+{ "mode": "single_seller", "state": "unclaimed", "seller": null }
+{ "mode": "single_seller", "state": "claimed", "seller": "<z32>" }
+```
+
+Marketplace mode answers `404`. Unclaimed answers carry `Cache-Control:
+no-store`; claimed answers carry `Cache-Control: public, max-age=30`. The
+per-address limiter allows 60 requests per minute with burst 30. A limited
+request answers `429` with `Retry-After` and `Cache-Control: no-store`.
+
+### `POST /v1/store/claim`
+
+Requires a bearer and a JSON body no larger than 1 KiB:
+
+```json
+{ "claim_code": "<setup code>" }
+```
+
+Missing or invalid authentication answers `401` in every mode. An
+authenticated marketplace caller gets `404`; an env-pinned or already claimed
+store gets `409 STORE_ALREADY_CLAIMED`, with the seller in the response. A
+repeat claim gets the same `409`.
+
+The session must have both grant-session source fields, inventory read and
+write capability, and `created_at` no older than
+`STORE_CLAIM_SESSION_MAX_AGE_SECONDS` (default 900, maximum 3600). Legacy
+AuthToken and grant-flow sessions are not eligible. Session and code
+rejections are `403 UNAUTHORIZED` with one of these `error.reason` values:
+`claim_session_source`, `claim_session_capability`, `claim_session_stale` or
+`claim_code_invalid`.
+
+The state check precedes the code check. One transaction takes the shared
+advisory lock, rechecks that the database has no seller rows and inserts the
+session pubky as the seller. A successful request answers `200`:
+
+```json
+{
+  "ok": true,
+  "store": {
+    "mode": "single_seller",
+    "state": "claimed",
+    "seller": "<z32>",
+    "claimed_at": "<timestamp>"
+  }
+}
+```
+
+No restart is needed. Ten failed code attempts per address in 15 minutes
+trigger `429` with `Retry-After`. There is no global lockout. Claim rejections
+are logged with a salted client hash, never the code.
+
+While unclaimed, `POST /v1/commands`, the whole
+`POST /v1/listings/sync-many` request and guarded signed-in routes answer
+`503 STORE_UNCLAIMED`. Batch refusal happens before its automation limiter
+spends a token. Public routes and the caller's own session administration
+remain available.
+
 ## Rate limits
 
 Two independent limiters guard the authenticated surfaces, and the public
@@ -615,6 +680,16 @@ or every client shares the proxy's bucket.
 When the bucket is empty: `429` with `Retry-After: <integer seconds>`,
 `Cache-Control: no-store` and
 `{"ok":false,"error":{"code":"rate_limited","message":"..."}}`.
+
+### Store state and claim limiters
+
+The store routes use independent in-memory, per-replica buckets keyed by a
+salted address hash. `GET /v1/store` refills at 60 per minute with capacity
+30. `POST /v1/store/claim` checks a failure-only bucket before state and code
+checks; only a code mismatch spends one of 10 failures, refilled across 15
+minutes. Both use `LISTING_AVAILABILITY_CLIENT_IP_HEADER`, then
+`ADDRESS_SEARCH_CLIENT_IP_HEADER`, then the socket peer, exactly as the public
+availability limiter does.
 
 ## Public listing availability
 
@@ -2265,8 +2340,10 @@ Liveness plus a capability summary. Always `200` while the process is up:
 ```
 
 `store.mode` is `marketplace` or `single_seller`; in single-seller mode
-`store.seller` is the `STORE_SELLER_PUBKY` the deployment serves, otherwise
-`null` (see [Single-seller mode](../README.md#single-seller-mode)).
+`store.seller` is the bound seller, otherwise `null`. Claim mode also carries
+`store.state`, either `unclaimed` or `claimed`. Marketplace and env-pinned
+bodies do not carry `state`, so their shape is unchanged (see
+[Single-seller mode](../README.md#single-seller-mode)).
 `homeserver_resolution` is the `HOMESERVER_RESOLUTION` in force (`fixed` or
 `pkarr`; see [Homeserver reads](../README.md#homeserver-reads)).
 `listing_moderation` is `on` when the moderation gate asks the index before a

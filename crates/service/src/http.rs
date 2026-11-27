@@ -75,11 +75,11 @@ pub fn routes(state: &AppState) -> Router<AppState> {
         )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
-            crate::store_seller::require_store_seller,
+            crate::automation::require_automation_rate,
         ))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
-            crate::automation::require_automation_rate,
+            crate::store_seller::require_store_seller,
         ))
         .route_layer(middleware::from_fn(auth::require_inventory_capability))
         .route_layer(middleware::from_fn_with_state(
