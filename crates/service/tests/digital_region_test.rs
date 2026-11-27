@@ -474,7 +474,7 @@ async fn a_digital_line_is_refused_when_either_the_declared_or_the_ip_country_is
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn with_the_flag_on_a_missing_or_unusable_ip_country_fails_closed_for_digital_only(
+async fn with_the_flag_on_a_missing_or_unusable_ip_country_is_open_by_default_and_held_when_unknown_is_nuanced(
     pool: PgPool,
 ) {
     common::install_log_capture();
@@ -483,7 +483,14 @@ async fn with_the_flag_on_a_missing_or_unusable_ip_country_fails_closed_for_digi
     let physical = physical_seller(&app).await;
     let buyer = new_actor(&app).await;
     let mut number = 0;
-    for ip in [None, Some(""), Some("XX"), Some("T1"), Some("DEU")] {
+    for ip in [
+        None,
+        Some(""),
+        Some("XX"),
+        Some("ZZ"),
+        Some("T1"),
+        Some("DEU"),
+    ] {
         number += 1;
         let result = execute_from(
             &app,
@@ -492,9 +499,45 @@ async fn with_the_flag_on_a_missing_or_unusable_ip_country_fails_closed_for_digi
             ip,
         )
         .await;
+        assert_eq!(result.0, StatusCode::OK, "{ip:?}: {}", result.1);
+    }
+    assert_eq!(orders(&app).await, 6);
+
+    // An explicit UNKNOWN=nuanced policy still fails closed with an alert.
+    let mut unknown_held_config = (*app.state.config).clone();
+    unknown_held_config.region_modes = Some(
+        marketplace_service::region_policy::RegionModes::parse(
+            "EU=nuanced,GB=nuanced,UNKNOWN=nuanced",
+        )
+        .expect("parse modes"),
+    );
+    let mut state = app.state.clone();
+    state.config = std::sync::Arc::new(unknown_held_config);
+    let unknown_held = TestApp {
+        router: marketplace_service::http::build_router(state.clone()),
+        state,
+        pool: app.pool.clone(),
+        clock: app.clock.clone(),
+    };
+    for ip in [
+        None,
+        Some(""),
+        Some("XX"),
+        Some("ZZ"),
+        Some("T1"),
+        Some("DEU"),
+    ] {
+        number += 1;
+        let result = execute_from(
+            &unknown_held,
+            &buyer.token,
+            &digital_checkout(&seller, number, Some("CH")),
+            ip,
+        )
+        .await;
         assert_blocked(&result, "buyer_region_unknown");
     }
-    assert_eq!(orders(&app).await, 0);
+    assert_eq!(orders(&app).await, 6);
     assert!(common::captured_logs().contains("ALERT digital_region_client_country_missing"));
 
     // A physical order never needs the header.
@@ -538,10 +581,10 @@ async fn the_edge_header_name_is_configurable_and_other_headers_are_ignored(pool
         &app,
         &buyer.token,
         &digital_checkout(&seller, 3, Some("CH")),
-        Some(("x-client-region", "CH")),
+        Some(("x-client-region", "DE")),
     )
     .await;
-    assert_blocked(&other, "buyer_region_unknown");
+    assert_eq!(other.0, StatusCode::OK, "{}", other.1);
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]

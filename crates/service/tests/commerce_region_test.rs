@@ -224,23 +224,57 @@ async fn a_declared_blocked_country_is_reported_before_the_ip(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn checkout_from_an_unknown_origin_is_refused_while_unknown_is_blocked(pool: PgPool) {
+async fn checkout_from_an_unknown_origin_is_allowed_by_default_and_refused_when_unknown_is_blocked(
+    pool: PgPool,
+) {
     let (setup, homeserver) = test_app_with_shop_homeserver(pool).await;
     let seller = seller_in(&setup, &homeserver, "CH", Some("private")).await;
-    let app = launch(&setup);
-    let buyer = new_actor(&app).await;
-    for ip in [
+    let launch_app = launch(&setup);
+    let unknown_blocked = with_modes(&setup, &format!("{LAUNCH},UNKNOWN=blocked"));
+    let buyer = new_actor(&launch_app).await;
+    let unknown_ips = [
         None,
         Some("XX"),
+        Some("ZZ"),
         Some("T1"),
         Some(""),
         Some("usa"),
         Some("1A"),
-    ] {
-        let result = execute_from(&app, &buyer.token, &checkout(&seller, 1, Some("CH")), ip).await;
+    ];
+
+    for ip in unknown_ips {
+        let result = execute_from(
+            &unknown_blocked,
+            &buyer.token,
+            &checkout(&seller, 1, Some("CH")),
+            ip,
+        )
+        .await;
         assert_commerce_refused(&result, "buyer_region_unknown");
     }
-    assert_eq!(orders(&app).await, 0);
+    assert_eq!(orders(&launch_app).await, 0);
+
+    for (number, ip) in unknown_ips.into_iter().enumerate() {
+        let result = buy(
+            &launch_app,
+            &buyer,
+            &seller,
+            number as u64 + 1,
+            Some("CH"),
+            ip,
+        )
+        .await;
+        assert_accepted(&result);
+    }
+    assert_eq!(orders(&launch_app).await, unknown_ips.len() as i64);
+
+    // Known blocked countries remain refused under the launch config.
+    for ip in ["DE", "GB", "US"] {
+        assert_commerce_refused(
+            &buy(&launch_app, &buyer, &seller, 100, Some("CH"), Some(ip)).await,
+            "buyer_ip_blocked",
+        );
+    }
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
@@ -300,20 +334,27 @@ async fn the_declared_country_is_optional_while_the_ip_decides_in_a_blocked_regi
     let (setup, homeserver) = test_app_with_shop_homeserver(pool).await;
     let seller = seller_in(&setup, &homeserver, "CH", None).await;
     let app = launch(&setup);
+    let unknown_blocked = with_modes(&setup, &format!("{LAUNCH},UNKNOWN=blocked"));
     let buyer = new_actor(&app).await;
     assert_commerce_refused(
         &execute_from(&app, &buyer.token, &checkout(&seller, 1, None), Some("US")).await,
         "buyer_ip_blocked",
     );
     assert_commerce_refused(
-        &execute_from(&app, &buyer.token, &checkout(&seller, 1, None), None).await,
+        &execute_from(
+            &unknown_blocked,
+            &buyer.token,
+            &checkout(&seller, 1, None),
+            None,
+        )
+        .await,
         "buyer_region_unknown",
     );
     assert_eq!(orders(&app).await, 0);
-    assert_accepted(
-        &execute_from(&app, &buyer.token, &checkout(&seller, 1, None), Some("CH")).await,
-    );
-    assert_eq!(orders(&app).await, 1);
+    assert_accepted(&buy(&app, &buyer, &seller, 1, None, None).await);
+    assert_accepted(&buy(&app, &buyer, &seller, 2, None, Some("T1")).await);
+    assert_accepted(&buy(&app, &buyer, &seller, 3, None, Some("CH")).await);
+    assert_eq!(orders(&app).await, 3);
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
@@ -365,6 +406,8 @@ async fn offer_create_is_refused_in_a_blocked_region_and_passes_in_an_open_one(p
         command
     };
 
+    let unknown_blocked = with_modes(&setup, &format!("{LAUNCH},UNKNOWN=blocked"));
+
     assert_commerce_refused(
         &execute_from(&app, &buyer.token, &offer(Some("DE")), Some("CH")).await,
         "buyer_region_blocked",
@@ -374,7 +417,7 @@ async fn offer_create_is_refused_in_a_blocked_region_and_passes_in_an_open_one(p
         "buyer_ip_blocked",
     );
     assert_commerce_refused(
-        &execute_from(&app, &buyer.token, &offer(Some("CH")), None).await,
+        &execute_from(&unknown_blocked, &buyer.token, &offer(Some("CH")), None).await,
         "buyer_region_unknown",
     );
     assert_commerce_refused(
@@ -383,7 +426,7 @@ async fn offer_create_is_refused_in_a_blocked_region_and_passes_in_an_open_one(p
     );
     assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM offers").await, 0);
 
-    assert_accepted(&execute_from(&app, &buyer.token, &offer(None), Some("CH")).await);
+    assert_accepted(&execute_from(&app, &buyer.token, &offer(None), Some("T1")).await);
     assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM offers").await, 1);
 }
 
@@ -437,6 +480,7 @@ async fn offer_checkout_is_refused_in_a_blocked_region_and_passes_in_an_open_one
     };
 
     let app = launch(&setup);
+    let unknown_blocked = with_modes(&setup, &format!("{LAUNCH},UNKNOWN=blocked"));
     assert_commerce_refused(
         &execute_from(&app, &buyer.token, &offer_checkout("US"), Some("CH")).await,
         "buyer_region_blocked",
@@ -446,12 +490,12 @@ async fn offer_checkout_is_refused_in_a_blocked_region_and_passes_in_an_open_one
         "buyer_ip_blocked",
     );
     assert_commerce_refused(
-        &execute_from(&app, &buyer.token, &offer_checkout("CH"), None).await,
+        &execute_from(&unknown_blocked, &buyer.token, &offer_checkout("CH"), None).await,
         "buyer_region_unknown",
     );
     assert_eq!(orders(&app).await, 0);
 
-    assert_accepted(&execute_from(&app, &buyer.token, &offer_checkout("CH"), Some("CH")).await);
+    assert_accepted(&execute_from(&app, &buyer.token, &offer_checkout("CH"), Some("T1")).await);
     assert_eq!(orders(&app).await, 1);
 }
 
@@ -477,6 +521,8 @@ async fn a_bid_is_refused_in_a_blocked_region_and_passes_in_an_open_one(pool: Pg
         command
     };
 
+    let unknown_blocked = with_modes(&setup, &format!("{LAUNCH},UNKNOWN=blocked"));
+
     assert_commerce_refused(
         &execute_from(&app, &bidder.token, &bid(Some("US")), Some("CH")).await,
         "buyer_region_blocked",
@@ -486,7 +532,7 @@ async fn a_bid_is_refused_in_a_blocked_region_and_passes_in_an_open_one(pool: Pg
         "buyer_ip_blocked",
     );
     assert_commerce_refused(
-        &execute_from(&app, &bidder.token, &bid(Some("CH")), None).await,
+        &execute_from(&unknown_blocked, &bidder.token, &bid(Some("CH")), None).await,
         "buyer_region_unknown",
     );
     assert_commerce_refused(
@@ -495,7 +541,7 @@ async fn a_bid_is_refused_in_a_blocked_region_and_passes_in_an_open_one(pool: Pg
     );
     assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM bids").await, 0);
 
-    assert_accepted(&execute_from(&app, &bidder.token, &bid(None), Some("CH")).await);
+    assert_accepted(&execute_from(&app, &bidder.token, &bid(None), None).await);
     assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM bids").await, 1);
 }
 
@@ -656,33 +702,20 @@ async fn bind(
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn binding_a_payment_method_is_refused_in_a_blocked_region(pool: PgPool) {
+async fn binding_an_admitted_order_does_not_recheck_live_ip(pool: PgPool) {
     let world = paypal_world(pool).await;
-    let (_seller, buyer, order_id) = world.pending("CH", "CH").await;
     let app = launch(&world.setup);
+    let unknown_blocked = with_modes(&world.setup, &format!("{LAUNCH},UNKNOWN=blocked"));
 
-    assert_commerce_refused(
-        &bind(&app, &buyer, &order_id, Some("US")).await,
-        "buyer_ip_blocked",
-    );
-    assert_commerce_refused(
-        &bind(&app, &buyer, &order_id, None).await,
-        "buyer_region_unknown",
-    );
-    assert_commerce_refused(
-        &bind(&app, &buyer, &order_id, Some("XX")).await,
-        "buyer_region_unknown",
-    );
-    let bound: Option<String> =
-        sqlx::query_scalar("SELECT payment_method FROM orders WHERE id = $1::uuid")
-            .bind(&order_id)
-            .fetch_one(&app.pool)
-            .await
-            .expect("order row");
-    assert_eq!(bound, None, "nothing was bound");
+    for ip in [None, Some("XX"), Some("ZZ"), Some("T1"), Some("US")] {
+        let (_seller, buyer, order_id) = world.pending("CH", "CH").await;
+        let ok = bind(&app, &buyer, &order_id, ip).await;
+        assert_eq!(ok.0, StatusCode::OK, "launch ip={ip:?}: {}", ok.1);
+    }
 
-    let ok = bind(&app, &buyer, &order_id, Some("CH")).await;
-    assert_eq!(ok.0, StatusCode::OK, "{}", ok.1);
+    let (_seller, buyer, order_id) = world.pending("CH", "CH").await;
+    let ok = bind(&unknown_blocked, &buyer, &order_id, None).await;
+    assert_eq!(ok.0, StatusCode::OK, "unknown_blocked: {}", ok.1);
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
@@ -741,16 +774,8 @@ async fn preparing_a_locks_payment_is_refused_in_a_blocked_region(pool: PgPool) 
         .await
         .expect("declare the buyer's country");
     let app = launch(&setup);
+    let unknown_blocked = with_modes(&setup, &format!("{LAUNCH},UNKNOWN=blocked"));
     let prepare = |number: u64| prepare_locks_command(&order.payment_id, number);
-
-    assert_commerce_refused(
-        &execute_from(&app, &buyer.token, &prepare(1), Some("US")).await,
-        "buyer_ip_blocked",
-    );
-    assert_commerce_refused(
-        &execute_from(&app, &buyer.token, &prepare(2), None).await,
-        "buyer_region_unknown",
-    );
 
     sqlx::query("UPDATE orders SET buyer_country = 'DE' WHERE id = $1::uuid")
         .bind(&order.order_id)
@@ -758,7 +783,7 @@ async fn preparing_a_locks_payment_is_refused_in_a_blocked_region(pool: PgPool) 
         .await
         .expect("declare a blocked country");
     assert_commerce_refused(
-        &execute_from(&app, &buyer.token, &prepare(3), Some("CH")).await,
+        &execute_from(&app, &buyer.token, &prepare(1), Some("CH")).await,
         "buyer_region_blocked",
     );
     sqlx::query("UPDATE orders SET buyer_country = 'CH' WHERE id = $1::uuid")
@@ -769,7 +794,7 @@ async fn preparing_a_locks_payment_is_refused_in_a_blocked_region(pool: PgPool) 
 
     homeserver.put_shop_record(&seller.pubky, shop_record(&seller, Some("private"), "US"));
     assert_refused(
-        &execute_from(&app, &buyer.token, &prepare(4), Some("CH")).await,
+        &execute_from(&app, &buyer.token, &prepare(2), Some("CH")).await,
         StatusCode::CONFLICT,
         "SELLER_UNAVAILABLE_IN_REGION",
         "seller_region_blocked",
@@ -777,7 +802,9 @@ async fn preparing_a_locks_payment_is_refused_in_a_blocked_region(pool: PgPool) 
     );
     homeserver.put_shop_record(&seller.pubky, shop_record(&seller, Some("private"), "CH"));
 
-    assert_accepted(&execute_from(&app, &buyer.token, &prepare(5), Some("CH")).await);
+    // An already-admitted order does not re-check live IP at payment start,
+    // even for Tor/unknown IPs or when UNKNOWN=blocked is configured.
+    assert_accepted(&execute_from(&unknown_blocked, &buyer.token, &prepare(3), Some("T1")).await);
 }
 
 // --- selling ------------------------------------------------------------------------
@@ -806,6 +833,7 @@ async fn listing_register_is_refused_for_a_blocked_shop_country_or_ip(pool: PgPo
         );
     }
 
+    let unknown_blocked = with_modes(&setup, &format!("{LAUNCH},UNKNOWN=blocked"));
     let swiss = new_actor(&app).await;
     homeserver.put_shop_record(&swiss.pubky, shop_record(&swiss, None, "CH"));
     let listing = register_command(&swiss.pubky, 5);
@@ -817,12 +845,13 @@ async fn listing_register_is_refused_for_a_blocked_shop_country_or_ip(pool: PgPo
         SELLING_MESSAGE,
     );
     assert_commerce_refused(
-        &execute_from(&app, &swiss.token, &listing, None).await,
+        &execute_from(&unknown_blocked, &swiss.token, &listing, None).await,
         "buyer_region_unknown",
     );
     assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM listings").await, 0);
 
-    assert_accepted(&execute_from(&app, &swiss.token, &listing, Some("CH")).await);
+    // Unknown/Tor IP is allowed by default under the launch config.
+    assert_accepted(&execute_from(&app, &swiss.token, &listing, Some("T1")).await);
     assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM listings").await, 1);
 }
 
@@ -926,7 +955,9 @@ async fn listing_sync_is_refused_when_it_would_publish_a_live_listing_for_a_bloc
     );
 
     // A Swiss seller syncing from a US IP is refused on the IP; a visitor
-    // healing the same listing from there is not the seller.
+    // healing the same listing from there is not the seller. An unknown IP is
+    // refused only when UNKNOWN=blocked is configured.
+    let unknown_blocked = with_modes(&setup, &format!("{LAUNCH},UNKNOWN=blocked"));
     assert_refused(
         &execute_from(
             &app,
@@ -942,7 +973,7 @@ async fn listing_sync_is_refused_when_it_would_publish_a_live_listing_for_a_bloc
     );
     assert_commerce_refused(
         &execute_from(
-            &app,
+            &unknown_blocked,
             &swiss_seller.token,
             &sync_command(&swiss_seller.pubky, "boots_01", 4),
             None,
@@ -952,10 +983,19 @@ async fn listing_sync_is_refused_when_it_would_publish_a_live_listing_for_a_bloc
     );
     assert_eq!(count(&app.pool, "SELECT COUNT(*) FROM listings").await, 0);
 
+    assert_accepted(
+        &execute_from(
+            &app,
+            &swiss_seller.token,
+            &sync_command(&swiss_seller.pubky, "boots_01", 5),
+            Some("XX"),
+        )
+        .await,
+    );
     let healed = execute_from(
         &app,
         &visitor.token,
-        &sync_command(&swiss_seller.pubky, "boots_01", 5),
+        &sync_command(&swiss_seller.pubky, "boots_01", 6),
         Some("US"),
     )
     .await;
@@ -1093,6 +1133,7 @@ async fn seller_payment_setup_is_refused_for_a_blocked_shop_country_or_ip(pool: 
         SELLING_MESSAGE,
     );
 
+    let unknown_blocked = with_modes(&world.setup, &format!("{LAUNCH},UNKNOWN=blocked"));
     let swiss = new_actor(&app).await;
     world
         .homeserver
@@ -1105,7 +1146,7 @@ async fn seller_payment_setup_is_refused_for_a_blocked_shop_country_or_ip(pool: 
         SELLING_MESSAGE,
     );
     assert_commerce_refused(
-        &put_config(&app, &swiss.token, None).await,
+        &put_config(&unknown_blocked, &swiss.token, None).await,
         "buyer_region_unknown",
     );
     assert_eq!(
@@ -1113,6 +1154,8 @@ async fn seller_payment_setup_is_refused_for_a_blocked_shop_country_or_ip(pool: 
         0
     );
 
+    let ok_unknown = put_config(&app, &swiss.token, Some("T1")).await;
+    assert_eq!(ok_unknown.0, StatusCode::OK, "{}", ok_unknown.1);
     let ok = put_config(&app, &swiss.token, Some("CH")).await;
     assert_eq!(ok.0, StatusCode::OK, "{}", ok.1);
 }
@@ -1517,18 +1560,24 @@ async fn nuanced_regions_hold_digital_items_without_any_legacy_flag(pool: PgPool
     );
     let held = execute_from(&app, &buyer.token, &digital(2, "CH"), Some("GB")).await;
     assert_eq!(held.1["error"]["reason"], json!("gb_ip"), "{}", held.1);
-    let held = execute_from(&app, &buyer.token, &digital(3, "CH"), None).await;
+    // An unknown or Tor IP defaults to open under nuanced modes.
+    assert_accepted(&execute_from(&app, &buyer.token, &digital(3, "CH"), None).await);
+    assert_accepted(&execute_from(&app, &buyer.token, &digital(4, "CH"), Some("T1")).await);
+    assert_accepted(&execute_from(&app, &buyer.token, &digital(5, "CH"), Some("CH")).await);
+
+    // Explicit UNKNOWN=nuanced holds unknown origins.
+    let unknown_held = with_modes(&setup, "EU=nuanced,GB=nuanced,UNKNOWN=nuanced");
+    let held = execute_from(&unknown_held, &buyer.token, &digital(6, "CH"), None).await;
     assert_eq!(
         held.1["error"]["reason"],
         json!("buyer_region_unknown"),
         "{}",
         held.1
     );
-    assert_accepted(&execute_from(&app, &buyer.token, &digital(4, "CH"), Some("CH")).await);
 
     // Another nuanced region is held too, with a message that names no region.
     let app = with_modes(&setup, "EU=nuanced,GB=nuanced,CA=nuanced");
-    let held = execute_from(&app, &buyer.token, &digital(5, "CA"), Some("CH")).await;
+    let held = execute_from(&app, &buyer.token, &digital(7, "CA"), Some("CH")).await;
     assert_refused(
         &held,
         StatusCode::CONFLICT,
@@ -1537,9 +1586,9 @@ async fn nuanced_regions_hold_digital_items_without_any_legacy_flag(pool: PgPool
         "Digital items aren't available to buyers in your region yet.",
     );
 
-    // An open unknown origin is let through the hold.
+    // An explicit open unknown origin is let through the hold.
     let app = with_modes(&setup, "EU=nuanced,GB=nuanced,UNKNOWN=open");
-    assert_accepted(&execute_from(&app, &buyer.token, &digital(6, "CH"), None).await);
+    assert_accepted(&execute_from(&app, &buyer.token, &digital(8, "CH"), None).await);
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]

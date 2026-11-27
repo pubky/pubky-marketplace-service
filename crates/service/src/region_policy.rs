@@ -15,9 +15,9 @@
 //!   region.
 //!
 //! A country no entry names is `open`. `none` means every country is `open`.
-//! `UNKNOWN` defaults to the strictest mode any country has, so with one
-//! region blocked a request of unknown origin is blocked for commerce, and
-//! with only nuanced regions it is held for digital items only.
+//! `UNKNOWN` defaults to `open` when omitted; an operator who wants unknown
+//! origins held or blocked sets `UNKNOWN=nuanced` or `UNKNOWN=blocked`
+//! explicitly.
 //!
 //! This module is pure: no I/O, no clock. [`crate::commerce_region`] reads
 //! the facts and enforces; the fence and the digital hold ask this module
@@ -194,10 +194,9 @@ impl RegionModes {
     }
 
     /// The mode of a request whose IP country is unknown: the `UNKNOWN`
-    /// entry, else the strictest mode any country has.
+    /// entry, else `open`.
     pub fn unknown_mode(&self) -> Mode {
-        self.unknown
-            .unwrap_or_else(|| self.countries.values().copied().max().unwrap_or(Mode::Open))
+        self.unknown.unwrap_or(Mode::Open)
     }
 
     /// Whether any request can be refused for commerce: a region or the
@@ -360,7 +359,10 @@ mod tests {
         for code in ["CH", "NO", "IS", "LI", "CA", "JP", "BR", "AU"] {
             assert_eq!(launch.mode_of(code), Mode::Open, "{code}");
         }
-        assert_eq!(launch.unknown_mode(), Mode::Blocked);
+        assert_eq!(launch.unknown_mode(), Mode::Open);
+        assert_eq!(launch.ip_block(None), None);
+        assert_eq!(launch.buyer_block(Some("CH"), None), None);
+        assert_eq!(launch.buyer_block(None, None), None);
         assert!(launch.has_blocked());
         assert!(!launch.holds_digital());
     }
@@ -371,7 +373,7 @@ mod tests {
         assert_eq!(nuanced_eu_and_gb.mode_of("DE"), Mode::Nuanced);
         assert_eq!(nuanced_eu_and_gb.mode_of("GB"), Mode::Nuanced);
         assert_eq!(nuanced_eu_and_gb.mode_of("US"), Mode::Blocked);
-        assert_eq!(nuanced_eu_and_gb.unknown_mode(), Mode::Blocked);
+        assert_eq!(nuanced_eu_and_gb.unknown_mode(), Mode::Open);
 
         let us_unlocked = modes("EU=blocked,GB=blocked");
         assert_eq!(us_unlocked.mode_of("US"), Mode::Open);
@@ -379,7 +381,7 @@ mod tests {
 
         let both = modes("EU=nuanced,GB=nuanced");
         assert_eq!(both, RegionModes::legacy_nuanced());
-        assert_eq!(both.unknown_mode(), Mode::Nuanced);
+        assert_eq!(both.unknown_mode(), Mode::Open);
         assert!(!both.has_blocked());
         assert!(both.holds_digital());
     }
@@ -430,11 +432,12 @@ mod tests {
     }
 
     #[test]
-    fn unknown_defaults_to_the_strictest_mode_in_force() {
+    fn unknown_defaults_to_open_when_omitted() {
         assert_eq!(modes("none").unknown_mode(), Mode::Open);
         assert_eq!(modes("US=open").unknown_mode(), Mode::Open);
-        assert_eq!(modes("EU=nuanced").unknown_mode(), Mode::Nuanced);
-        assert_eq!(modes("EU=nuanced,US=blocked").unknown_mode(), Mode::Blocked);
+        assert_eq!(modes("EU=nuanced").unknown_mode(), Mode::Open);
+        assert_eq!(modes("EU=nuanced,US=blocked").unknown_mode(), Mode::Open);
+        assert_eq!(modes(LAUNCH).unknown_mode(), Mode::Open);
         assert_eq!(modes("DE=blocked,DE=open").unknown_mode(), Mode::Open);
     }
 
@@ -444,6 +447,11 @@ mod tests {
         assert_eq!(open.unknown_mode(), Mode::Open);
         assert!(open.has_blocked());
         assert_eq!(open.ip_block(None), None);
+
+        let launch_blocked = modes("EU=blocked,GB=blocked,US=blocked,UNKNOWN=blocked");
+        assert_eq!(launch_blocked.unknown_mode(), Mode::Blocked);
+        assert!(launch_blocked.has_blocked());
+        assert_eq!(launch_blocked.ip_block(None), Some(IpBlock::Unknown));
 
         let nuanced = modes("US=blocked,UNKNOWN=nuanced");
         assert_eq!(nuanced.unknown_mode(), Mode::Nuanced);
@@ -517,10 +525,20 @@ mod tests {
     #[test]
     fn an_unknown_ip_blocks_only_while_unknown_resolves_to_blocked() {
         let launch = modes(LAUNCH);
+        assert_eq!(launch.buyer_block(Some("CH"), None), None);
+        assert_eq!(launch.buyer_block(None, None), None);
+        assert_eq!(launch.buyer_block(Some("US"), None), Some(Block::Declared));
         assert_eq!(
-            launch.buyer_block(Some("CH"), None),
+            launch.buyer_block(Some("CH"), Some("US")),
+            Some(Block::Ip(IpBlock::Country))
+        );
+
+        let unknown_blocked = modes("EU=blocked,GB=blocked,US=blocked,UNKNOWN=blocked");
+        assert_eq!(
+            unknown_blocked.buyer_block(Some("CH"), None),
             Some(Block::Ip(IpBlock::Unknown))
         );
+
         let unknown_open = modes("EU=blocked,GB=blocked,US=blocked,UNKNOWN=open");
         assert_eq!(unknown_open.buyer_block(Some("CH"), None), None);
         assert_eq!(
@@ -617,7 +635,7 @@ mod tests {
                 assert_eq!(policy.modes().mode_of(code), Mode::Nuanced, "{code}");
             }
             assert_eq!(policy.modes().mode_of("US"), Mode::Open);
-            assert_eq!(policy.modes().unknown_mode(), Mode::Nuanced);
+            assert_eq!(policy.modes().unknown_mode(), Mode::Open);
         }
     }
 
