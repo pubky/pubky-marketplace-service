@@ -555,8 +555,12 @@ rejections are `403 UNAUTHORIZED` with one of these `error.reason` values:
 `claim_code_invalid`.
 
 The state check precedes the code check. One transaction takes the shared
-advisory lock, rechecks that the database has no seller rows and inserts the
-session pubky as the seller. A successful request answers `200`:
+advisory lock, rechecks that the database has no seller rows across the same
+seller-keyed tables enforced at single-seller boot (including durable Paykit
+readiness markers in `paykit_known_sellers`, seller-targeted `listing_removed`
+and `shop_suspended` rows in `moderation_decisions`, and rows in
+`gateway_refund_inbox`) and inserts the session pubky as the seller. A
+successful request answers `200`:
 
 ```json
 {
@@ -576,8 +580,10 @@ are logged with a salted client hash, never the code.
 
 While unclaimed, `POST /v1/commands`, the whole
 `POST /v1/listings/sync-many` request and guarded signed-in routes answer
-`503 STORE_UNCLAIMED`. Batch refusal happens before its automation limiter
-spends a token. Public routes and the caller's own session administration
+`503 STORE_UNCLAIMED`, and `POST /v0/paypal/ipn` answers `503` before
+postback verification so unmatched callbacks cannot write to
+`gateway_refund_inbox`. Batch refusal happens before its automation limiter
+spends a token. Public reads and the caller's own session administration
 remain available.
 
 ## Rate limits

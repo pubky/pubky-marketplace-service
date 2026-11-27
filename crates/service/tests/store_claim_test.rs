@@ -204,7 +204,7 @@ async fn unclaimed_routes_fail_closed_and_claim_needs_no_restart(pool: PgPool) {
         }
     }
     assert!(
-        other_seller_rows(&pool, "")
+        other_seller_rows(&pool, None)
             .await
             .expect("seller rows")
             .is_empty(),
@@ -779,7 +779,7 @@ async fn every_command_kind_is_refused_while_unclaimed(pool: PgPool) {
         assert_eq!(body["error"]["code"], json!("STORE_UNCLAIMED"), "{kind}");
     }
     assert!(
-        other_seller_rows(&pool, "")
+        other_seller_rows(&pool, None)
             .await
             .expect("seller rows")
             .is_empty(),
@@ -861,9 +861,9 @@ async fn populated_unclaimed_and_claimed_boots_refuse_other_seller_rows(pool: Pg
     let (status, body) = execute(&app, &actor.token, &register_command(&actor.pubky, 1)).await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
-    let rows = other_seller_rows(&pool, "")
+    let rows = other_seller_rows(&pool, None)
         .await
-        .expect("empty-pubky scan");
+        .expect("all-seller scan");
     assert_eq!(
         rows.listings, 1,
         "the empty pubky sentinel counts every seller"
@@ -1207,7 +1207,7 @@ async fn seller_row_refuses_unclaimed_boot_and_release(pool: PgPool, insert: &st
         .execute(&pool)
         .await
         .expect("seller row fixture");
-    assert!(!other_seller_rows(&pool, "")
+    assert!(!other_seller_rows(&pool, None)
         .await
         .expect("seller rows")
         .is_empty());
@@ -1274,6 +1274,683 @@ async fn seller_stat_attestation_row_refuses_unclaimed_boot_and_release(pool: Pg
                  '{}'::jsonb, 'fixture', $2)",
     )
     .await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn paykit_known_seller_row_refuses_boot_and_release(pool: PgPool) {
+    let seller_a = marketplace_domain::pubky::encode_pubky(&[85; 32]);
+    let seller_b = marketplace_domain::pubky::encode_pubky(&[86; 32]);
+    sqlx::query("INSERT INTO paykit_known_sellers (seller_pubky, first_ready_at) VALUES ($1, $2)")
+        .bind(&seller_a)
+        .bind(chrono::Utc::now())
+        .execute(&pool)
+        .await
+        .expect("paykit_known_sellers fixture");
+
+    let rows = other_seller_rows(&pool, None)
+        .await
+        .expect("all-seller scan");
+    assert_eq!(rows.paykit_known_sellers, 1);
+    assert_eq!(rows.sellers, vec![format!("{}…", &seller_a[..8])]);
+
+    // Unclaimed boot refuses because durable Paykit seller ownership exists.
+    let error = resolve_store(&pool, &StoreMode::SingleSeller { pinned: None }, None)
+        .await
+        .expect_err("unclaimed boot refuses paykit_known_sellers row");
+    assert!(
+        error
+            .to_string()
+            .contains("database holds rows of 1 sellers"),
+        "{error}"
+    );
+
+    // Pinned boot for another seller refuses with count and seller prefix and commits nothing.
+    let error = resolve_store(
+        &pool,
+        &StoreMode::SingleSeller {
+            pinned: Some(seller_b.clone()),
+        },
+        None,
+    )
+    .await
+    .expect_err("pinned boot for seller B refuses seller A paykit_known_sellers row");
+    let message = error.to_string();
+    assert!(message.contains("1 known Paykit sellers"), "{message}");
+    assert!(
+        message.contains(&format!("{}…", &seller_a[..8])),
+        "{message}"
+    );
+    assert!(
+        marketplace_service::store_seller::read_binding(&pool)
+            .await
+            .expect("binding check")
+            .is_none(),
+        "failed pin must not insert a binding"
+    );
+
+    // Pinned boot for Seller A itself succeeds and binds Seller A.
+    resolve_store(
+        &pool,
+        &StoreMode::SingleSeller {
+            pinned: Some(seller_a.clone()),
+        },
+        None,
+    )
+    .await
+    .expect("pinned boot for seller A accepts its own paykit_known_sellers row");
+
+    let mut database = url::Url::parse(&std::env::var("DATABASE_URL").expect("DATABASE_URL"))
+        .expect("database url");
+    database.set_path(&format!(
+        "/{}",
+        pool.connect_options()
+            .get_database()
+            .expect("test database name")
+    ));
+    let options = (*pool.connect_options()).clone();
+    pool.close().await;
+
+    // Library release refuses and preserves Seller A's binding.
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .min_connections(0)
+        .connect_with(options.clone())
+        .await
+        .expect("admin connection");
+    let error = marketplace_service::store_binding_admin::release(&admin, &seller_a[..8])
+        .await
+        .expect_err("release refuses paykit_known_sellers row");
+    let message = error.to_string();
+    assert!(message.contains("database holds seller rows"), "{message}");
+    assert!(message.contains("1 known Paykit sellers"), "{message}");
+    assert!(
+        message.contains(&format!("{}…", &seller_a[..8])),
+        "{message}"
+    );
+    assert_eq!(
+        marketplace_service::store_seller::read_binding(&admin)
+            .await
+            .expect("binding check")
+            .map(|b| b.seller_pubky),
+        Some(seller_a.clone())
+    );
+    admin.close().await;
+
+    // CLI binary `store-binding-admin release` exits non-zero and preserves Seller A's binding.
+    let refusal = std::process::Command::new(env!("CARGO_BIN_EXE_store-binding-admin"))
+        .env("DATABASE_URL", database.as_str())
+        .args(["release", "--confirm", &seller_a[..8]])
+        .output()
+        .expect("release binary runs");
+    assert!(!refusal.status.success(), "{refusal:?}");
+    let stderr = String::from_utf8(refusal.stderr).expect("stderr is text");
+    assert!(stderr.contains("database holds seller rows"), "{stderr}");
+    assert!(stderr.contains("1 known Paykit sellers"), "{stderr}");
+    assert!(stderr.contains(&format!("{}…", &seller_a[..8])), "{stderr}");
+
+    let verify = PgPoolOptions::new()
+        .max_connections(1)
+        .min_connections(0)
+        .connect_with(options)
+        .await
+        .expect("verify connection");
+    assert_eq!(
+        marketplace_service::store_seller::read_binding(&verify)
+            .await
+            .expect("binding remains after CLI refusal")
+            .map(|b| b.seller_pubky),
+        Some(seller_a)
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn paykit_known_seller_row_refuses_claim(pool: PgPool) {
+    let app = unclaimed(pool.clone()).await;
+    let seller_a = new_actor(&app).await;
+    let seller_b = new_actor(&app).await;
+    grant_session(&app, &seller_a).await;
+    grant_session(&app, &seller_b).await;
+
+    sqlx::query("INSERT INTO paykit_known_sellers (seller_pubky, first_ready_at) VALUES ($1, $2)")
+        .bind(&seller_a.pubky)
+        .bind(app.clock.now())
+        .execute(&pool)
+        .await
+        .expect("paykit_known_sellers fixture");
+
+    for claimant in [&seller_b, &seller_a] {
+        let (status, body) = claim(&app, claimant, CODE).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"]["code"], "STORE_ALREADY_CLAIMED", "{body}");
+        assert_eq!(
+            body["error"]["message"], "The database is not empty; the store cannot be claimed.",
+            "{body}"
+        );
+    }
+
+    assert!(
+        marketplace_service::store_seller::read_binding(&pool)
+            .await
+            .expect("binding check")
+            .is_none(),
+        "refused claim must leave store_seller_binding empty"
+    );
+    let (status, _, body) = get_store_from(app.router.clone(), "203.0.113.44").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["state"], "unclaimed", "{body}");
+}
+
+fn moderation_decision_fixture(
+    recipient: &str,
+    restriction: &str,
+    decided_at: chrono::DateTime<chrono::Utc>,
+) -> marketplace_service::moderation_decisions::Decision {
+    let target_uri = match restriction {
+        "listing_removed" => {
+            format!("pubky://{recipient}/pub/pubky.app/marketplace/v1/listings/lst_1")
+        }
+        "shop_suspended" => format!("pubky://{recipient}/pub/pubky.app/profile.json"),
+        _ => format!("pubky://{recipient}/pub/pubky.app/marketplace/v1/reviews/rev_1"),
+    };
+    marketplace_service::moderation_decisions::Decision::validate(
+        marketplace_service::moderation_decisions::DecisionInput {
+            restriction: restriction.into(),
+            target_uri,
+            territorial_scope: "Every region where Pubky Market is offered".into(),
+            ends_at: None,
+            decided_at,
+            basis: "notice".into(),
+            facts: "Fixture moderation statement for single-seller emptiness coverage.".into(),
+            automated_detection: false,
+            automated_decision: false,
+            automated_means: None,
+            ground: "terms".into(),
+            ground_reference: "Pubky Terms of Service".into(),
+            explanation: "Fixture explanation matching the Terms clause.".into(),
+        },
+        decided_at,
+    )
+    .expect("valid moderation decision fixture")
+}
+
+async fn seller_moderation_restriction_refuses_boot_claim_and_release(
+    pool: PgPool,
+    restriction: &str,
+) {
+    let app = unclaimed(pool.clone()).await;
+    let seller_a = new_actor(&app).await;
+    let seller_b = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    grant_session(&app, &seller_a).await;
+    grant_session(&app, &seller_b).await;
+
+    // Buyer review moderation decisions (`review_text_hidden` and `review_excluded`)
+    // are identity/buyer state and must stay allowed.
+    for buyer_restriction in ["review_text_hidden", "review_excluded"] {
+        let decision =
+            moderation_decision_fixture(&buyer.pubky, buyer_restriction, app.clock.now());
+        marketplace_service::moderation_decisions::record(
+            &pool,
+            &decision,
+            "mod-fixture",
+            app.clock.now(),
+        )
+        .await
+        .expect("record buyer review moderation decision");
+    }
+    assert!(
+        other_seller_rows(&pool, None)
+            .await
+            .expect("all-seller scan with buyer review decisions")
+            .is_empty(),
+        "buyer review moderation decisions must not count as seller rows"
+    );
+
+    // Record the standalone seller-targeted moderation decision with zero listings/orders.
+    let seller_decision =
+        moderation_decision_fixture(&seller_a.pubky, restriction, app.clock.now());
+    marketplace_service::moderation_decisions::record(
+        &pool,
+        &seller_decision,
+        "mod-fixture",
+        app.clock.now(),
+    )
+    .await
+    .expect("record seller moderation decision");
+
+    let rows = other_seller_rows(&pool, None)
+        .await
+        .expect("all-seller scan");
+    assert_eq!(rows.seller_moderation_decisions, 1, "{restriction}");
+    assert_eq!(
+        rows.sellers,
+        vec![format!("{}…", &seller_a.pubky[..8])],
+        "{restriction}"
+    );
+
+    // Unclaimed boot refuses.
+    let error = resolve_store(&pool, &StoreMode::SingleSeller { pinned: None }, None)
+        .await
+        .expect_err("unclaimed boot refuses seller moderation decision");
+    assert!(
+        error
+            .to_string()
+            .contains("database holds rows of 1 sellers"),
+        "{restriction}: {error}"
+    );
+
+    // Pinned boot for Seller B refuses with diagnostic count and seller prefix, committing nothing.
+    let error = resolve_store(
+        &pool,
+        &StoreMode::SingleSeller {
+            pinned: Some(seller_b.pubky.clone()),
+        },
+        None,
+    )
+    .await
+    .expect_err("pinned boot for seller B refuses seller A moderation decision");
+    let message = error.to_string();
+    assert!(
+        message.contains("1 seller moderation decisions"),
+        "{restriction}: {message}"
+    );
+    assert!(
+        message.contains(&format!("{}…", &seller_a.pubky[..8])),
+        "{restriction}: {message}"
+    );
+    assert!(
+        marketplace_service::store_seller::read_binding(&pool)
+            .await
+            .expect("binding check")
+            .is_none(),
+        "{restriction}: failed pin must not insert a binding"
+    );
+
+    // Claim refuses for both Seller B and Seller A and leaves store_seller_binding empty.
+    for claimant in [&seller_b, &seller_a] {
+        let (status, body) = claim(&app, claimant, CODE).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{restriction}: {body}");
+        assert_eq!(
+            body["error"]["code"], "STORE_ALREADY_CLAIMED",
+            "{restriction}: {body}"
+        );
+        assert_eq!(
+            body["error"]["message"], "The database is not empty; the store cannot be claimed.",
+            "{restriction}: {body}"
+        );
+    }
+    assert!(
+        marketplace_service::store_seller::read_binding(&pool)
+            .await
+            .expect("binding check")
+            .is_none(),
+        "{restriction}: refused claim must leave store_seller_binding empty"
+    );
+
+    // Pinned boot for Seller A itself succeeds (buyer review decisions are still present).
+    resolve_store(
+        &pool,
+        &StoreMode::SingleSeller {
+            pinned: Some(seller_a.pubky.clone()),
+        },
+        None,
+    )
+    .await
+    .expect("pinned boot for seller A accepts its own moderation decision");
+
+    let mut database = url::Url::parse(&std::env::var("DATABASE_URL").expect("DATABASE_URL"))
+        .expect("database url");
+    database.set_path(&format!(
+        "/{}",
+        pool.connect_options()
+            .get_database()
+            .expect("test database name")
+    ));
+    let options = (*pool.connect_options()).clone();
+    pool.close().await;
+
+    // Library release refuses and preserves Seller A's binding.
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .min_connections(0)
+        .connect_with(options.clone())
+        .await
+        .expect("admin connection");
+    let error = marketplace_service::store_binding_admin::release(&admin, &seller_a.pubky[..8])
+        .await
+        .expect_err("release refuses seller moderation decision");
+    let message = error.to_string();
+    assert!(
+        message.contains("database holds seller rows"),
+        "{restriction}: {message}"
+    );
+    assert!(
+        message.contains("1 seller moderation decisions"),
+        "{restriction}: {message}"
+    );
+    assert!(
+        message.contains(&format!("{}…", &seller_a.pubky[..8])),
+        "{restriction}: {message}"
+    );
+    admin.close().await;
+
+    // CLI binary `store-binding-admin release` exits non-zero and preserves Seller A's binding.
+    let refusal = std::process::Command::new(env!("CARGO_BIN_EXE_store-binding-admin"))
+        .env("DATABASE_URL", database.as_str())
+        .args(["release", "--confirm", &seller_a.pubky[..8]])
+        .output()
+        .expect("release binary runs");
+    assert!(!refusal.status.success(), "{restriction}: {refusal:?}");
+    let stderr = String::from_utf8(refusal.stderr).expect("stderr is text");
+    assert!(
+        stderr.contains("database holds seller rows"),
+        "{restriction}: {stderr}"
+    );
+    assert!(
+        stderr.contains("1 seller moderation decisions"),
+        "{restriction}: {stderr}"
+    );
+
+    let verify = PgPoolOptions::new()
+        .max_connections(1)
+        .min_connections(0)
+        .connect_with(options)
+        .await
+        .expect("verify connection");
+    assert_eq!(
+        marketplace_service::store_seller::read_binding(&verify)
+            .await
+            .expect("binding remains")
+            .map(|b| b.seller_pubky),
+        Some(seller_a.pubky)
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn moderation_shop_suspended_refuses_boot_claim_and_release(pool: PgPool) {
+    seller_moderation_restriction_refuses_boot_claim_and_release(pool, "shop_suspended").await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn moderation_listing_removed_refuses_boot_claim_and_release(pool: PgPool) {
+    seller_moderation_restriction_refuses_boot_claim_and_release(pool, "listing_removed").await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn moderation_buyer_review_decision_allows_boot_claim_and_release(pool: PgPool) {
+    let app = unclaimed(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    grant_session(&app, &seller).await;
+
+    let decision = moderation_decision_fixture(&buyer.pubky, "review_text_hidden", app.clock.now());
+    marketplace_service::moderation_decisions::record(
+        &pool,
+        &decision,
+        "mod-fixture",
+        app.clock.now(),
+    )
+    .await
+    .expect("record buyer review decision");
+
+    // Unclaimed boot, claim, and release all succeed with a buyer review decision present.
+    resolve_store(&pool, &StoreMode::SingleSeller { pinned: None }, None)
+        .await
+        .expect("unclaimed boot allows buyer review moderation decision");
+
+    let (status, body) = claim(&app, &seller, CODE).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let options = (*pool.connect_options()).clone();
+    pool.close().await;
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .min_connections(0)
+        .connect_with(options)
+        .await
+        .expect("admin connection");
+    let released = marketplace_service::store_binding_admin::release(&admin, &seller.pubky[..8])
+        .await
+        .expect("release allows buyer review moderation decision");
+    assert_eq!(released, seller.pubky);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn gateway_refund_inbox_orphan_row_refuses_boot_claim_and_release(pool: PgPool) {
+    let app = unclaimed(pool.clone()).await;
+    let seller_a = new_actor(&app).await;
+    grant_session(&app, &seller_a).await;
+
+    sqlx::query(
+        "INSERT INTO gateway_refund_inbox \
+             (txn_id, parent_txn_id, payment_status, reason, order_id, fields, received_at) \
+         VALUES ($1, $2, 'Refunded', 'unknown_parent', NULL, $3, $4)",
+    )
+    .bind("ORPHAN_REFUND_TXN_1")
+    .bind("UNKNOWN_PARENT_TXN_1")
+    .bind(json!({
+        "receiver_email": "merchant@example.com",
+        "mc_gross": "-10.00",
+        "mc_currency": "USD"
+    }))
+    .bind(app.clock.now())
+    .execute(&pool)
+    .await
+    .expect("orphan gateway_refund_inbox fixture");
+
+    // All-seller and pinned-seller scans both count the unattributed row (fail-closed).
+    let all_rows = other_seller_rows(&pool, None)
+        .await
+        .expect("all-seller scan");
+    assert_eq!(all_rows.gateway_refund_inbox, 1);
+    assert!(all_rows.sellers.is_empty());
+    let pinned_rows = other_seller_rows(&pool, Some(&seller_a.pubky))
+        .await
+        .expect("pinned-seller scan");
+    assert_eq!(pinned_rows.gateway_refund_inbox, 1);
+
+    // Unclaimed boot refuses with unattributed diagnostic (not "0 sellers").
+    let error = resolve_store(&pool, &StoreMode::SingleSeller { pinned: None }, None)
+        .await
+        .expect_err("unclaimed boot refuses orphan gateway_refund_inbox row");
+    let message = error.to_string();
+    assert!(message.contains("unattributed seller rows"), "{message}");
+    assert!(message.contains("1 gateway refund inbox rows"), "{message}");
+
+    // Pinned boot for Seller A refuses fail-closed and commits nothing.
+    let error = resolve_store(
+        &pool,
+        &StoreMode::SingleSeller {
+            pinned: Some(seller_a.pubky.clone()),
+        },
+        None,
+    )
+    .await
+    .expect_err("pinned boot refuses orphan gateway_refund_inbox row");
+    let message = error.to_string();
+    assert!(message.contains("1 gateway refund inbox rows"), "{message}");
+    assert!(message.contains("(unattributed)"), "{message}");
+    assert!(
+        marketplace_service::store_seller::read_binding(&pool)
+            .await
+            .expect("binding check")
+            .is_none(),
+        "failed pin must not insert a binding"
+    );
+
+    // Claim refuses with 409 and leaves store_seller_binding empty.
+    let (status, body) = claim(&app, &seller_a, CODE).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "STORE_ALREADY_CLAIMED", "{body}");
+    assert_eq!(
+        body["error"]["message"], "The database is not empty; the store cannot be claimed.",
+        "{body}"
+    );
+    assert!(marketplace_service::store_seller::read_binding(&pool)
+        .await
+        .expect("binding check")
+        .is_none());
+
+    // With Seller A bound, both library and CLI release refuse and preserve the binding.
+    insert_binding(&pool, &seller_a.pubky, "claim").await;
+    let mut database = url::Url::parse(&std::env::var("DATABASE_URL").expect("DATABASE_URL"))
+        .expect("database url");
+    database.set_path(&format!(
+        "/{}",
+        pool.connect_options()
+            .get_database()
+            .expect("test database name")
+    ));
+    let options = (*pool.connect_options()).clone();
+    pool.close().await;
+
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .min_connections(0)
+        .connect_with(options.clone())
+        .await
+        .expect("admin connection");
+    let error = marketplace_service::store_binding_admin::release(&admin, &seller_a.pubky[..8])
+        .await
+        .expect_err("release refuses orphan gateway_refund_inbox row");
+    let message = error.to_string();
+    assert!(message.contains("database holds seller rows"), "{message}");
+    assert!(message.contains("1 gateway refund inbox rows"), "{message}");
+    assert!(message.contains("unattributed"), "{message}");
+    admin.close().await;
+
+    let refusal = std::process::Command::new(env!("CARGO_BIN_EXE_store-binding-admin"))
+        .env("DATABASE_URL", database.as_str())
+        .args(["release", "--confirm", &seller_a.pubky[..8]])
+        .output()
+        .expect("release binary runs");
+    assert!(!refusal.status.success(), "{refusal:?}");
+    let stderr = String::from_utf8(refusal.stderr).expect("stderr is text");
+    assert!(stderr.contains("database holds seller rows"), "{stderr}");
+    assert!(stderr.contains("1 gateway refund inbox rows"), "{stderr}");
+
+    let verify = PgPoolOptions::new()
+        .max_connections(1)
+        .min_connections(0)
+        .connect_with(options)
+        .await
+        .expect("verify connection");
+    assert_eq!(
+        marketplace_service::store_seller::read_binding(&verify)
+            .await
+            .expect("binding remains")
+            .map(|b| b.seller_pubky),
+        Some(seller_a.pubky)
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn unclaimed_paypal_ipn_is_refused_without_writing_gateway_refund_inbox(pool: PgPool) {
+    let (app, _paykit, _ipn) =
+        common::test_app_with_payments_config(pool.clone(), claim_config(CODE)).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    grant_session(&app, &seller).await;
+
+    // A verified PayPal Refunded IPN against an unclaimed store must be
+    // refused (503) before verification and write zero inbox rows.
+    let ipn_body = "txn_id=UNCLAIMED_REFUND_1&parent_txn_id=UNKNOWN_PARENT_1\
+                    &payment_status=Refunded&mc_gross=-10.00&mc_currency=USD\
+                    &receiver_email=merchant@example.com";
+    let (status, _) = common::send_bytes(
+        app.router.clone(),
+        "POST",
+        "/v0/paypal/ipn",
+        ipn_body.as_bytes().to_vec(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let inbox_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM gateway_refund_inbox")
+        .fetch_one(&pool)
+        .await
+        .expect("inbox count");
+    assert_eq!(
+        inbox_count, 0,
+        "unclaimed IPN must not write orphan gateway_refund_inbox rows"
+    );
+
+    // The store remains clean and claimable, and matched inbox rows for the
+    // store seller are allowed on pinned boot while other sellers are refused.
+    let (status, body) = claim(&app, &seller, CODE).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) = execute(&app, &seller.token, &register_command(&seller.pubky, 1)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let order = common::create_pending_order(&app, &seller, &buyer).await;
+    let order_uuid = Uuid::parse_str(&order.order_id).expect("order uuid");
+    sqlx::query(
+        "INSERT INTO gateway_refund_inbox \
+             (txn_id, parent_txn_id, payment_status, reason, order_id, fields, received_at) \
+         VALUES ($1, $2, 'Refunded', 'receiver_mismatch', $3, $4, $5)",
+    )
+    .bind("MATCHED_REFUND_TXN_1")
+    .bind("MATCHED_PARENT_TXN_1")
+    .bind(order_uuid)
+    .bind(json!({ "mc_gross": "-10.00", "mc_currency": "USD" }))
+    .bind(app.clock.now())
+    .execute(&pool)
+    .await
+    .expect("matched gateway_refund_inbox fixture");
+
+    assert_eq!(
+        other_seller_rows(&pool, Some(&seller.pubky))
+            .await
+            .expect("own seller scan")
+            .gateway_refund_inbox,
+        0,
+        "a matched inbox row for the store seller's own order is allowed"
+    );
+    let other_seller = marketplace_domain::pubky::encode_pubky(&[88; 32]);
+    let other_rows = other_seller_rows(&pool, Some(&other_seller))
+        .await
+        .expect("other seller scan");
+    assert_eq!(other_rows.gateway_refund_inbox, 1);
+    assert_eq!(other_rows.orders, 1);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn empty_seller_pubky_row_refuses_unclaimed_boot_claim_and_release(pool: PgPool) {
+    let app = unclaimed(pool.clone()).await;
+    let actor = new_actor(&app).await;
+    grant_session(&app, &actor).await;
+
+    sqlx::query("INSERT INTO paykit_known_sellers (seller_pubky, first_ready_at) VALUES ('', $1)")
+        .bind(app.clock.now())
+        .execute(&pool)
+        .await
+        .expect("empty seller_pubky fixture");
+
+    let rows = other_seller_rows(&pool, None)
+        .await
+        .expect("all-seller scan");
+    assert_eq!(rows.paykit_known_sellers, 1);
+    assert!(!rows.is_empty());
+
+    resolve_store(&pool, &StoreMode::SingleSeller { pinned: None }, None)
+        .await
+        .expect_err("unclaimed boot refuses empty-string seller_pubky row");
+
+    let (status, body) = claim(&app, &actor, CODE).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "STORE_ALREADY_CLAIMED", "{body}");
+
+    insert_binding(&pool, &actor.pubky, "claim").await;
+    let options = (*pool.connect_options()).clone();
+    pool.close().await;
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .min_connections(0)
+        .connect_with(options)
+        .await
+        .expect("admin connection");
+    marketplace_service::store_binding_admin::release(&admin, &actor.pubky[..8])
+        .await
+        .expect_err("release refuses empty-string seller_pubky row");
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]

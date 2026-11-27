@@ -458,20 +458,32 @@ of these for another seller, in any state
 - a store connection (`connector_connections`), pending ones included;
 - a payment configuration (`seller_payment_configs`) or accepted payment
   option (`seller_accepted_payment_options`);
+- a durable Paykit seller readiness marker (`paykit_known_sellers`);
 - an automation webhook endpoint (`webhook_endpoints`);
 - seller settings, the band consent of a `seller_settings:` aggregate
   (`attestation_band_consents`);
 - a shipping configuration (`shipping_configs`);
 - a drop (`drops`);
-- a seller stat attestation (`seller_stat_attestations`).
+- a seller stat attestation (`seller_stat_attestations`);
+- a seller-targeted moderation decision (`moderation_decisions` with
+  restriction `listing_removed` or `shop_suspended`);
+- a PayPal gateway refund inbox row (`gateway_refund_inbox`), including
+  unmatched rows whose `order_id` is null (unattributed merchant callbacks).
 
-Offers, bids and pickup or digital details hang off a listing, so the listing
-count covers them. Sessions, `/priv` data-key envelopes and
-notifications belong to identities, which may be buyers, and are not
-counted. The message counts each kind and names up to three of those
-sellers by the first eight characters of their pubky. Nothing is removed:
-start the store on its own database, or release an empty binding with the
-operator helper below.
+Offers, bids, deletion cursors, revival checks and pickup or digital details
+hang off a listing, checkout lock snapshots, binding outcomes and attestation
+annotations hang off an order, and dead letters hang off a webhook endpoint,
+so those parent counts cover them. Sessions, `/priv` data-key envelopes,
+notifications, review moderation decisions (`review_text_hidden` and
+`review_excluded` in `moderation_decisions`) and shared actor rate-limit
+buckets belong to identities, which may be buyers, and are not counted. While
+a single-seller store is unclaimed, `POST /v0/paypal/ipn` answers `503` before
+postback verification so unauthenticated callbacks cannot write unmatched
+rows to `gateway_refund_inbox`. The message counts each kind and names up to
+three of those sellers by the first eight characters of their pubky (or
+`unattributed` when only unmatched gateway refund inbox rows exist). Nothing
+is removed: start the store on its own database, or release an empty binding
+with the operator helper below.
 
 Set `STORE_MODE` and any `STORE_SELLER_PUBKY` consistently on every replica
 of the service and the `connector-worker`. The marketplace guard and the

@@ -55,10 +55,13 @@ pub async fn begin_release<'a>(
     if confirm != binding.seller_pubky && confirm != prefix {
         anyhow::bail!("--confirm does not match the current store binding");
     }
-    let rows = other_seller_rows_on(&mut tx, "").await?;
+    let rows = other_seller_rows_on(&mut tx, None).await?;
     if !rows.is_empty() {
         anyhow::bail!(
-            "store binding cannot be released while the database holds seller rows; use a fresh database"
+            "store binding cannot be released while the database holds seller rows ({}: {}); \
+             use a fresh database",
+            rows.summary(),
+            rows.seller_sample()
         );
     }
     sqlx::query("SELECT set_config('marketplace.release_store_binding', 'on', true)")

@@ -13,8 +13,9 @@
 //! identity: buyers need them.
 //! At boot, [`refuse_other_sellers`] refuses a database that already holds
 //! another seller's listings, orders, holds, store connections, payment
-//! configurations, webhook endpoints, seller settings, shipping
-//! configurations, drops or seller stat attestations.
+//! configurations, known Paykit sellers, webhook endpoints, seller settings,
+//! shipping configurations, drops, seller stat attestations, seller moderation
+//! decisions or gateway refund inbox rows.
 //!
 //! With `STORE_SELLER_PUBKY` unset the service is a marketplace and nothing
 //! here runs.
@@ -300,7 +301,7 @@ async fn resolve_store_inner(
                     );
                 }
             }
-            let rows = other_seller_rows_on(&mut tx, seller).await?;
+            let rows = other_seller_rows_on(&mut tx, Some(seller)).await?;
             refuse_rows_for_pin(seller, &rows)?;
             sqlx::query(
                 "INSERT INTO store_seller_binding \
@@ -321,7 +322,7 @@ async fn resolve_store_inner(
         }
         StoreMode::SingleSeller { pinned: None } => match existing {
             Some(binding) => {
-                let rows = other_seller_rows_on(&mut tx, &binding.seller_pubky).await?;
+                let rows = other_seller_rows_on(&mut tx, Some(&binding.seller_pubky)).await?;
                 refuse_rows_for_pin(&binding.seller_pubky, &rows)?;
                 if code.is_some() {
                     tracing::warn!("store is claimed; remove STORE_CLAIM_TOKEN");
@@ -329,8 +330,15 @@ async fn resolve_store_inner(
                 Active::Claimed(binding.seller_pubky)
             }
             None => {
-                let rows = other_seller_rows_on(&mut tx, "").await?;
+                let rows = other_seller_rows_on(&mut tx, None).await?;
                 if !rows.is_empty() {
+                    if rows.sellers.is_empty() {
+                        anyhow::bail!(
+                            "single-seller mode has no seller but the database holds unattributed \
+                             seller rows ({}); use an empty database",
+                            rows.summary()
+                        );
+                    }
                     anyhow::bail!(
                         "single-seller mode has no seller but the database holds rows of {} sellers; \
                          set STORE_SELLER_PUBKY or use an empty database",
@@ -443,6 +451,32 @@ pub fn moderation_from_lookup(
     }
 }
 
+/// Standalone seller-keyed root tables directly scanned in full by
+/// [`other_seller_rows_on`] (alongside `reservations`, joined through
+/// `listings`). Kept public so the schema-exhaustiveness test checks the
+/// live migrated catalog against the same list the SQL queries.
+pub const SCANNED_SELLER_TABLES: &[&str] = &[
+    "listings",
+    "orders",
+    "connector_connections",
+    "seller_payment_configs",
+    "seller_accepted_payment_options",
+    "paykit_known_sellers",
+    "webhook_endpoints",
+    "attestation_band_consents",
+    "shipping_configs",
+    "drops",
+    "seller_stat_attestations",
+];
+
+/// Mixed-ownership tables scanned conditionally by [`other_seller_rows_on`]:
+/// `moderation_decisions` for seller-targeted restrictions (`listing_removed`,
+/// `shop_suspended`) keyed by `recipient_pubky`, and `gateway_refund_inbox`
+/// for unmatched rows (`order_id IS NULL`) or rows joined to another seller's
+/// order.
+pub const CONDITIONALLY_SCANNED_SELLER_TABLES: &[&str] =
+    &["moderation_decisions", "gateway_refund_inbox"];
+
 /// What the database holds for sellers other than the store seller. Rows
 /// are counted whatever their state: soft-deleted listings and webhook
 /// endpoints and disconnected store connections included.
@@ -457,6 +491,8 @@ pub struct OtherSellerRows {
     /// Sellers with a payment configuration (`seller_payment_configs`) or
     /// an accepted payment option (`seller_accepted_payment_options`).
     pub payment_configs: i64,
+    /// Durable Paykit seller readiness markers (`paykit_known_sellers`).
+    pub paykit_known_sellers: i64,
     /// Automation webhook endpoints (`webhook_endpoints`).
     pub webhook_endpoints: i64,
     /// Seller settings: the band consent (`attestation_band_consents`) a
@@ -465,6 +501,12 @@ pub struct OtherSellerRows {
     pub shipping_configs: i64,
     pub drops: i64,
     pub seller_stat_attestations: i64,
+    /// Seller-targeted moderation decisions (`moderation_decisions` where
+    /// `restriction` is `listing_removed` or `shop_suspended`).
+    pub seller_moderation_decisions: i64,
+    /// PayPal gateway refund inbox rows (`gateway_refund_inbox`) without a
+    /// matched order or joined to another seller's order.
+    pub gateway_refund_inbox: i64,
     /// Up to three of those sellers, by the first eight characters of their
     /// pubky.
     pub sellers: Vec<String>,
@@ -477,90 +519,172 @@ impl OtherSellerRows {
             && self.holds == 0
             && self.connector_connections == 0
             && self.payment_configs == 0
+            && self.paykit_known_sellers == 0
             && self.webhook_endpoints == 0
             && self.seller_settings == 0
             && self.shipping_configs == 0
             && self.drops == 0
             && self.seller_stat_attestations == 0
+            && self.seller_moderation_decisions == 0
+            && self.gateway_refund_inbox == 0
+    }
+
+    pub fn summary(&self) -> String {
+        format!(
+            "{} listings, {} orders, {} holds, {} store connections, {} payment configurations, \
+             {} known Paykit sellers, {} webhook endpoints, {} seller settings, {} shipping \
+             configurations, {} drops, {} seller stat attestations, {} seller moderation \
+             decisions and {} gateway refund inbox rows",
+            self.listings,
+            self.orders,
+            self.holds,
+            self.connector_connections,
+            self.payment_configs,
+            self.paykit_known_sellers,
+            self.webhook_endpoints,
+            self.seller_settings,
+            self.shipping_configs,
+            self.drops,
+            self.seller_stat_attestations,
+            self.seller_moderation_decisions,
+            self.gateway_refund_inbox,
+        )
+    }
+
+    pub fn seller_sample(&self) -> String {
+        if self.sellers.is_empty() {
+            "unattributed".to_string()
+        } else {
+            self.sellers.join(", ")
+        }
     }
 }
 
-/// Counts what the database holds for a seller other than `store`: their
-/// listings, orders, holds, store connections, payment configurations,
-/// webhook endpoints, seller settings, shipping configurations, drops and
-/// seller stat attestations.
-pub async fn other_seller_rows(pool: &PgPool, store: &str) -> Result<OtherSellerRows, sqlx::Error> {
+#[derive(Debug, sqlx::FromRow)]
+struct RowCounts {
+    listings: i64,
+    orders: i64,
+    holds: i64,
+    connector_connections: i64,
+    payment_configs: i64,
+    paykit_known_sellers: i64,
+    webhook_endpoints: i64,
+    seller_settings: i64,
+    shipping_configs: i64,
+    drops: i64,
+    seller_stat_attestations: i64,
+    seller_moderation_decisions: i64,
+    gateway_refund_inbox: i64,
+}
+
+/// Counts what the database holds for any seller (`exclude_seller = None`) or
+/// for sellers other than `exclude_seller` (`Some(store)`): their listings,
+/// orders, holds, store connections, payment configurations, known Paykit
+/// sellers, webhook endpoints, seller settings, shipping configurations,
+/// drops, seller stat attestations, seller-targeted moderation decisions and
+/// gateway refund inbox rows.
+pub async fn other_seller_rows(
+    pool: &PgPool,
+    exclude_seller: Option<&str>,
+) -> Result<OtherSellerRows, sqlx::Error> {
     let mut connection = pool.acquire().await?;
-    other_seller_rows_on(&mut connection, store).await
+    other_seller_rows_on(&mut connection, exclude_seller).await
 }
 
 pub async fn other_seller_rows_on(
     connection: &mut PgConnection,
-    store: &str,
+    exclude_seller: Option<&str>,
 ) -> Result<OtherSellerRows, sqlx::Error> {
-    type Counts = (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64);
-    let (
-        listings,
-        orders,
-        holds,
-        connector_connections,
-        payment_configs,
-        webhook_endpoints,
-        seller_settings,
-        shipping_configs,
-        drops,
-        seller_stat_attestations,
-    ): Counts = sqlx::query_as(
+    let counts: RowCounts = sqlx::query_as(
         "SELECT \
-             (SELECT COUNT(*) FROM listings WHERE seller_pubky <> $1), \
-             (SELECT COUNT(*) FROM orders WHERE seller_pubky <> $1), \
+             (SELECT COUNT(*) FROM listings \
+              WHERE ($1::text IS NULL OR seller_pubky <> $1)) AS listings, \
+             (SELECT COUNT(*) FROM orders \
+              WHERE ($1::text IS NULL OR seller_pubky <> $1)) AS orders, \
              (SELECT COUNT(*) FROM reservations r \
                   JOIN listings l ON l.aggregate_id = r.listing_aggregate_id \
-              WHERE l.seller_pubky <> $1), \
-             (SELECT COUNT(*) FROM connector_connections WHERE seller_pubky <> $1), \
+              WHERE ($1::text IS NULL OR l.seller_pubky <> $1)) AS holds, \
+             (SELECT COUNT(*) FROM connector_connections \
+              WHERE ($1::text IS NULL OR seller_pubky <> $1)) AS connector_connections, \
              (SELECT COUNT(*) FROM ( \
-                  SELECT seller_pubky FROM seller_payment_configs WHERE seller_pubky <> $1 \
+                  SELECT seller_pubky FROM seller_payment_configs \
+                   WHERE ($1::text IS NULL OR seller_pubky <> $1) \
                   UNION SELECT seller_pubky FROM seller_accepted_payment_options \
-                        WHERE seller_pubky <> $1 \
-              ) configured), \
-             (SELECT COUNT(*) FROM webhook_endpoints WHERE seller_pubky <> $1), \
-             (SELECT COUNT(*) FROM attestation_band_consents WHERE seller_pubky <> $1), \
-             (SELECT COUNT(*) FROM shipping_configs WHERE seller_pubky <> $1), \
-             (SELECT COUNT(*) FROM drops WHERE seller_pubky <> $1), \
-             (SELECT COUNT(*) FROM seller_stat_attestations WHERE seller_pubky <> $1)",
+                         WHERE ($1::text IS NULL OR seller_pubky <> $1) \
+              ) configured) AS payment_configs, \
+             (SELECT COUNT(*) FROM paykit_known_sellers \
+              WHERE ($1::text IS NULL OR seller_pubky <> $1)) AS paykit_known_sellers, \
+             (SELECT COUNT(*) FROM webhook_endpoints \
+              WHERE ($1::text IS NULL OR seller_pubky <> $1)) AS webhook_endpoints, \
+             (SELECT COUNT(*) FROM attestation_band_consents \
+              WHERE ($1::text IS NULL OR seller_pubky <> $1)) AS seller_settings, \
+             (SELECT COUNT(*) FROM shipping_configs \
+              WHERE ($1::text IS NULL OR seller_pubky <> $1)) AS shipping_configs, \
+             (SELECT COUNT(*) FROM drops \
+              WHERE ($1::text IS NULL OR seller_pubky <> $1)) AS drops, \
+             (SELECT COUNT(*) FROM seller_stat_attestations \
+              WHERE ($1::text IS NULL OR seller_pubky <> $1)) AS seller_stat_attestations, \
+             (SELECT COUNT(*) FROM moderation_decisions \
+              WHERE restriction IN ('listing_removed', 'shop_suspended') \
+                AND ($1::text IS NULL OR recipient_pubky <> $1)) AS seller_moderation_decisions, \
+             (SELECT COUNT(*) FROM gateway_refund_inbox g \
+                  LEFT JOIN orders o ON o.id = g.order_id \
+              WHERE $1::text IS NULL \
+                 OR g.order_id IS NULL \
+                 OR o.seller_pubky <> $1) AS gateway_refund_inbox",
     )
-    .bind(store)
+    .bind(exclude_seller)
     .fetch_one(&mut *connection)
     .await?;
     let sellers: Vec<String> = sqlx::query_scalar(
         "SELECT seller_pubky FROM ( \
-             SELECT seller_pubky FROM listings WHERE seller_pubky <> $1 \
-             UNION SELECT seller_pubky FROM orders WHERE seller_pubky <> $1 \
-             UNION SELECT seller_pubky FROM connector_connections WHERE seller_pubky <> $1 \
-             UNION SELECT seller_pubky FROM seller_payment_configs WHERE seller_pubky <> $1 \
+             SELECT seller_pubky FROM listings \
+              WHERE ($1::text IS NULL OR seller_pubky <> $1) \
+             UNION SELECT seller_pubky FROM orders \
+                    WHERE ($1::text IS NULL OR seller_pubky <> $1) \
+             UNION SELECT seller_pubky FROM connector_connections \
+                    WHERE ($1::text IS NULL OR seller_pubky <> $1) \
+             UNION SELECT seller_pubky FROM seller_payment_configs \
+                    WHERE ($1::text IS NULL OR seller_pubky <> $1) \
              UNION SELECT seller_pubky FROM seller_accepted_payment_options \
-                   WHERE seller_pubky <> $1 \
-             UNION SELECT seller_pubky FROM webhook_endpoints WHERE seller_pubky <> $1 \
-             UNION SELECT seller_pubky FROM attestation_band_consents WHERE seller_pubky <> $1 \
-             UNION SELECT seller_pubky FROM shipping_configs WHERE seller_pubky <> $1 \
-             UNION SELECT seller_pubky FROM drops WHERE seller_pubky <> $1 \
-             UNION SELECT seller_pubky FROM seller_stat_attestations WHERE seller_pubky <> $1 \
+                    WHERE ($1::text IS NULL OR seller_pubky <> $1) \
+             UNION SELECT seller_pubky FROM paykit_known_sellers \
+                    WHERE ($1::text IS NULL OR seller_pubky <> $1) \
+             UNION SELECT seller_pubky FROM webhook_endpoints \
+                    WHERE ($1::text IS NULL OR seller_pubky <> $1) \
+             UNION SELECT seller_pubky FROM attestation_band_consents \
+                    WHERE ($1::text IS NULL OR seller_pubky <> $1) \
+             UNION SELECT seller_pubky FROM shipping_configs \
+                    WHERE ($1::text IS NULL OR seller_pubky <> $1) \
+             UNION SELECT seller_pubky FROM drops \
+                    WHERE ($1::text IS NULL OR seller_pubky <> $1) \
+             UNION SELECT seller_pubky FROM seller_stat_attestations \
+                    WHERE ($1::text IS NULL OR seller_pubky <> $1) \
+             UNION SELECT recipient_pubky AS seller_pubky FROM moderation_decisions \
+                    WHERE restriction IN ('listing_removed', 'shop_suspended') \
+                      AND ($1::text IS NULL OR recipient_pubky <> $1) \
+             UNION SELECT o.seller_pubky FROM gateway_refund_inbox g \
+                     JOIN orders o ON o.id = g.order_id \
+                    WHERE ($1::text IS NULL OR o.seller_pubky <> $1) \
          ) other ORDER BY seller_pubky LIMIT 3",
     )
-    .bind(store)
+    .bind(exclude_seller)
     .fetch_all(connection)
     .await?;
     Ok(OtherSellerRows {
-        listings,
-        orders,
-        holds,
-        connector_connections,
-        payment_configs,
-        webhook_endpoints,
-        seller_settings,
-        shipping_configs,
-        drops,
-        seller_stat_attestations,
+        listings: counts.listings,
+        orders: counts.orders,
+        holds: counts.holds,
+        connector_connections: counts.connector_connections,
+        payment_configs: counts.payment_configs,
+        paykit_known_sellers: counts.paykit_known_sellers,
+        webhook_endpoints: counts.webhook_endpoints,
+        seller_settings: counts.seller_settings,
+        shipping_configs: counts.shipping_configs,
+        drops: counts.drops,
+        seller_stat_attestations: counts.seller_stat_attestations,
+        seller_moderation_decisions: counts.seller_moderation_decisions,
+        gateway_refund_inbox: counts.gateway_refund_inbox,
         sellers: sellers
             .iter()
             .map(|seller| format!("{}…", crate::logging::actor_prefix(seller)))
@@ -576,7 +700,7 @@ pub async fn refuse_other_sellers(pool: &PgPool, mode: &StoreMode) -> anyhow::Re
     let Some(store) = mode.pinned() else {
         return Ok(());
     };
-    let rows = other_seller_rows(pool, store).await?;
+    let rows = other_seller_rows(pool, Some(store)).await?;
     refuse_rows_for_pin(store, &rows)
 }
 
@@ -586,22 +710,11 @@ pub fn refuse_rows_for_pin(store: &str, rows: &OtherSellerRows) -> anyhow::Resul
     }
     let _ = store;
     anyhow::bail!(
-        "{ENV_STORE_SELLER_PUBKY} is set, but the database holds {} listings, {} orders, {} \
-         holds, {} store connections, {} payment configurations, {} webhook endpoints, {} seller \
-         settings, {} shipping configurations, {} drops and {} seller stat attestations of other \
-         sellers ({}); single-seller mode needs a database that only its store seller has used; \
-         refusing to start",
-        rows.listings,
-        rows.orders,
-        rows.holds,
-        rows.connector_connections,
-        rows.payment_configs,
-        rows.webhook_endpoints,
-        rows.seller_settings,
-        rows.shipping_configs,
-        rows.drops,
-        rows.seller_stat_attestations,
-        rows.sellers.join(", ")
+        "{ENV_STORE_SELLER_PUBKY} is set, but the database holds {} of other sellers ({}); \
+         single-seller mode needs a database that only its store seller has used; refusing to \
+         start",
+        rows.summary(),
+        rows.seller_sample()
     )
 }
 
@@ -907,7 +1020,7 @@ pub const ROUTES: &[RouteRule] = &[
     rule(
         "POST",
         "/v0/paypal/ipn",
-        Public("PayPal's notification for an order only a guarded checkout can create"),
+        Public("PayPal's notification for an order only a guarded checkout can create; refused while unclaimed"),
     ),
     rule(
         "POST",

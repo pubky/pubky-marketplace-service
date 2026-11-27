@@ -659,14 +659,15 @@ pub async fn claim_store(State(state): State<AppState>, request: Request) -> Res
     if let Err(error) = take_binding_lock(&mut tx).await {
         return internal(error);
     }
-    match other_seller_rows_on(&mut tx, "").await {
+    match other_seller_rows_on(&mut tx, None).await {
         Ok(rows) if rows.is_empty() => {}
         Ok(_) => {
+            reject_log("database_not_empty", client);
             return (
                 StatusCode::CONFLICT,
                 Json(json!({ "ok": false, "error": { "code": ErrorCode::StoreAlreadyClaimed, "message": "The database is not empty; the store cannot be claimed." } })),
             )
-                .into_response()
+                .into_response();
         }
         Err(error) => return internal(error),
     }

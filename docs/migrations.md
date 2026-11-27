@@ -952,8 +952,16 @@ drop then create shapes, so the file is directly rerunnable.
 Every service and connector-worker boot reads the binding under the shared
 advisory lock. Env-pinned boot writes it, claim writes it once, and the
 `store-binding-admin release` helper can delete it only while no seller rows
-exist and no other service connection is open. This guard does not stop a
-superuser, the table owner or a database restore.
+exist and no other service connection is open. The zero-seller-rows scan
+shared by boot, claim and release checks `listings`, `orders`, `reservations`
+(via `listings`), `connector_connections`, `seller_payment_configs`,
+`seller_accepted_payment_options`, `paykit_known_sellers`, `webhook_endpoints`,
+`attestation_band_consents`, `shipping_configs`, `drops`,
+`seller_stat_attestations`, seller-targeted `moderation_decisions`
+(`listing_removed` and `shop_suspended`, excluding buyer/review restrictions)
+and `gateway_refund_inbox` (including unmatched rows where `order_id` is
+null). This guard does not stop a superuser, the table owner or a database
+restore.
 
 **Deploy mode: rolling only between images that contain 0102.** An older image
 ignores the binding and claim configuration. There is no down migration.

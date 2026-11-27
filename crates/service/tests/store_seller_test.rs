@@ -24,7 +24,7 @@ use marketplace_service::refusal_audit::{
 };
 use marketplace_service::store_seller::{
     other_seller_rows, refuse_other_sellers, route_scope, OtherSellerRows, RouteScope, StoreMode,
-    ROUTES,
+    CONDITIONALLY_SCANNED_SELLER_TABLES, ROUTES, SCANNED_SELLER_TABLES,
 };
 use marketplace_service::AppState;
 use serde_json::{json, Value};
@@ -1087,7 +1087,9 @@ async fn single_seller_mode_refuses_to_start_on_another_sellers_rows(pool: PgPoo
     .await;
     assert_eq!(status, StatusCode::OK, "reserve: {body}");
     assert_eq!(
-        other_seller_rows(&pool, &store.pubky).await.expect("rows"),
+        other_seller_rows(&pool, Some(&store.pubky))
+            .await
+            .expect("rows"),
         OtherSellerRows {
             listings: 1,
             orders: 1,
@@ -1104,8 +1106,9 @@ async fn single_seller_mode_refuses_to_start_on_another_sellers_rows(pool: PgPoo
         error,
         format!(
             "STORE_SELLER_PUBKY is set, but the database holds 1 listings, 1 orders, 1 holds, \
-             0 store connections, 0 payment configurations, 0 webhook endpoints, 0 seller \
-             settings, 0 shipping configurations, 0 drops and 0 seller stat attestations of \
+             0 store connections, 0 payment configurations, 0 known Paykit sellers, 0 webhook \
+             endpoints, 0 seller settings, 0 shipping configurations, 0 drops, 0 seller stat \
+             attestations, 0 seller moderation decisions and 0 gateway refund inbox rows of \
              other sellers ({}…); single-seller mode needs a database that only its store seller \
              has used; refusing to start",
             &bob.pubky[..8]
@@ -1246,6 +1249,12 @@ const CATEGORIES: &[Category] = &[
         counted: |rows| &mut rows.payment_configs,
     },
     Category {
+        table: "paykit_known_sellers",
+        insert: "INSERT INTO paykit_known_sellers (seller_pubky, first_ready_at) \
+                 VALUES ($1, $2)",
+        counted: |rows| &mut rows.paykit_known_sellers,
+    },
+    Category {
         table: "webhook_endpoints",
         insert: "INSERT INTO webhook_endpoints \
                      (id, seller_pubky, endpoint_url, key_id, signing_key, created_at, \
@@ -1309,11 +1318,20 @@ async fn single_seller_mode_refuses_to_start_on_another_sellers_settings_and_int
             .execute(&pool)
     };
 
+    let mut tested_scanned: BTreeSet<&str> = CATEGORIES.iter().map(|c| c.table).collect();
+    tested_scanned.insert("listings");
+    tested_scanned.insert("orders");
+    let declared_scanned: BTreeSet<&str> = SCANNED_SELLER_TABLES.iter().copied().collect();
+    assert_eq!(
+        tested_scanned, declared_scanned,
+        "every table in SCANNED_SELLER_TABLES must have a live row-seeding test"
+    );
+
     for category in CATEGORIES {
         seed(category, &store).await.expect(category.table);
     }
     assert_eq!(
-        other_seller_rows(&pool, &store).await.expect("rows"),
+        other_seller_rows(&pool, Some(&store)).await.expect("rows"),
         OtherSellerRows::default()
     );
     refuse_other_sellers(&pool, &single)
@@ -1328,7 +1346,7 @@ async fn single_seller_mode_refuses_to_start_on_another_sellers_settings_and_int
         };
         *(category.counted)(&mut expected) = 1;
         assert_eq!(
-            other_seller_rows(&pool, &store).await.expect("rows"),
+            other_seller_rows(&pool, Some(&store)).await.expect("rows"),
             expected,
             "{}",
             category.table
@@ -1360,8 +1378,9 @@ async fn single_seller_mode_refuses_to_start_on_another_sellers_settings_and_int
         error,
         format!(
             "STORE_SELLER_PUBKY is set, but the database holds 0 listings, 0 orders, 0 holds, \
-             1 store connections, 1 payment configurations, 1 webhook endpoints, 1 seller \
-             settings, 1 shipping configurations, 1 drops and 1 seller stat attestations of \
+             1 store connections, 1 payment configurations, 1 known Paykit sellers, 1 webhook \
+             endpoints, 1 seller settings, 1 shipping configurations, 1 drops, 1 seller stat \
+             attestations, 0 seller moderation decisions and 0 gateway refund inbox rows of \
              other sellers ({}…); single-seller mode needs a database that only its store seller \
              has used; refusing to start",
             &carol[..8]
@@ -1432,9 +1451,10 @@ async fn the_connector_worker_refuses_to_start_on_another_sellers_rows(pool: PgP
         Boot::Refused(stderr) => assert!(
             stderr.contains(&format!(
                 "STORE_SELLER_PUBKY is set, but the database holds 0 listings, 0 orders, 0 \
-                 holds, 1 store connections, 0 payment configurations, 0 webhook endpoints, 0 \
-                 seller settings, 0 shipping configurations, 0 drops and 0 seller stat \
-                 attestations of other sellers ({}…)",
+                 holds, 1 store connections, 0 payment configurations, 0 known Paykit sellers, 0 \
+                 webhook endpoints, 0 seller settings, 0 shipping configurations, 0 drops, 0 \
+                 seller stat attestations, 0 seller moderation decisions and 0 gateway refund \
+                 inbox rows of other sellers ({}…)",
                 &carol[..8]
             )),
             "{stderr}"
@@ -1508,4 +1528,365 @@ fn encode_store() -> String {
     pubky_common::crypto::Keypair::from_secret(&[5u8; 32])
         .public_key()
         .z32()
+}
+
+/// Strict foreign-key edges in `public` read directly from `pg_catalog`:
+/// grouped by constraint `oid` so every column of a composite foreign key must
+/// be `NOT NULL` (`bool_and(att.attnotnull)`), and `ON DELETE SET NULL` (`n`)
+/// / `ON DELETE SET DEFAULT` (`d`) constraints are excluded.
+async fn strict_fk_edges<'e, E>(executor: E) -> Vec<(String, String)>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    sqlx::query_as(
+        "SELECT DISTINCT child.relname::text, parent.relname::text \
+         FROM pg_catalog.pg_constraint con \
+         JOIN pg_catalog.pg_class child ON child.oid = con.conrelid \
+         JOIN pg_catalog.pg_namespace child_ns ON child_ns.oid = child.relnamespace \
+         JOIN pg_catalog.pg_class parent ON parent.oid = con.confrelid \
+         JOIN pg_catalog.pg_namespace parent_ns ON parent_ns.oid = parent.relnamespace \
+         JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord) ON TRUE \
+         JOIN pg_catalog.pg_attribute att \
+           ON att.attrelid = con.conrelid AND att.attnum = k.attnum \
+         WHERE con.contype = 'f' \
+           AND child_ns.nspname = 'public' \
+           AND parent_ns.nspname = 'public' \
+           AND con.confdeltype NOT IN ('n', 'd') \
+         GROUP BY con.oid, child.relname, parent.relname \
+         HAVING bool_and(att.attnotnull)",
+    )
+    .fetch_all(executor)
+    .await
+    .expect("strict pg_constraint foreign keys")
+}
+
+/// Guards against future migrations adding ANY table that escapes the store
+/// emptiness audit. Every base table in `public` (excluding `_sqlx_migrations`),
+/// with zero column-name regex pre-filtering, must belong to exactly one
+/// audited bucket: directly scanned roots (`SCANNED_SELLER_TABLES`),
+/// conditionally scanned mixed tables (`CONDITIONALLY_SCANNED_SELLER_TABLES`),
+/// strict `NOT NULL` foreign-key descendants of `SCANNED_SELLER_TABLES`
+/// (verified transitively via `pg_catalog.pg_constraint`), application-scoped
+/// children of never-hard-deleted scanned parents, or explicitly audited
+/// non-seller tables.
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn schema_exhaustiveness_partitions_every_public_base_table(pool: PgPool) {
+    // Tables reachable via strict NOT NULL, non-SET-NULL/SET-DEFAULT Postgres
+    // foreign keys (direct or transitive) to `SCANNED_SELLER_TABLES`.
+    const FK_DESCENDANT_TABLES: &[&str] = &[
+        "bids",
+        "connector_alerts",
+        "connector_app_credentials",
+        "connector_credentials",
+        "connector_inbound_events",
+        "connector_order_actions",
+        "connector_order_push",
+        "connector_product_changes",
+        "connector_product_selection",
+        "connector_product_snapshots",
+        "connector_recipient_keys",
+        "connector_sync_overrides",
+        "connector_sync_settings",
+        "connector_variant_map",
+        "drop_listings",
+        "drop_purchases",
+        "inventory_adjustment_conflicts",
+        "inventory_adjustment_results",
+        "inventory_external_refs",
+        "listing_auction_reserves",
+        "listing_variant_conversion_blocks",
+        "listing_variant_inventory",
+        "offers",
+        "order_delivery_emails",
+        "order_digital_access",
+        "order_digital_pins",
+        "order_gateway_refunds",
+        "order_refund_destinations",
+        "paykit_manual_resolutions",
+        "paykit_resolve_outbox",
+        "paykit_seller_confirmations",
+        "paykit_superseded_attempts",
+        "payment_locks_correlations",
+        "payment_locks_observations",
+        "payments",
+        "pickup_handovers",
+        "pickup_line_snapshots",
+        "receipts",
+        "reservations",
+        "review_attestations",
+        "review_notifications",
+        "reviews",
+        "webhook_deliveries",
+    ];
+
+    // Child tables without a DB-level FOREIGN KEY whose service writers
+    // require an existing row in the named parent table (neither `listings`,
+    // `orders` nor `webhook_endpoints` is ever hard-deleted).
+    const APP_SCOPED_CHILD_TABLES: &[(&str, &str)] = &[
+        ("attestation_annotations", "orders"),
+        ("listing_deletion_cursors", "listings"),
+        ("listing_digital_counters", "listings"),
+        ("listing_digital_versions", "listings"),
+        ("listing_pickup_details", "listings"),
+        ("listing_pickup_version_counters", "listings"),
+        ("listing_revival_checks", "listings"),
+        ("payment_locks_binding_outcomes", "orders"),
+        ("payment_locks_checkout_snapshots", "orders"),
+        ("webhook_dead_letters", "webhook_endpoints"),
+    ];
+
+    // Non-seller tables: singleton binding, shared actor/identity/buyer tables,
+    // rate-limit buckets, refusal-audit subsystem and global service state.
+    const NON_SELLER_TABLES: &[&str] = &[
+        "attestor_publish_attempts",
+        "attestor_publications",
+        "auth_sessions",
+        "auth_token_uses",
+        "automation_rate_limits",
+        "command_refusal_audit_access_buckets",
+        "command_refusal_audit_access_limits",
+        "command_refusal_audit_bucket_limits",
+        "command_refusal_audit_buckets",
+        "command_refusal_audit_epoch_inventory",
+        "command_refusal_audit_loss_gap",
+        "command_refusal_command_kinds",
+        "command_refusal_kinds",
+        "command_refusal_surface_kinds",
+        "command_results",
+        "connector_event_cursor",
+        "digital_read_rate_limits",
+        "events",
+        "fx_rate_samples",
+        "grant_flows",
+        "grant_rate_limits",
+        "grant_result_nonces",
+        "grant_service_requests",
+        "grant_session_challenges",
+        "inventory_actor_rate_limits",
+        "inventory_rate_limits",
+        "notifications",
+        "outbox",
+        "store_seller_binding",
+        "user_priv_key_custody_releases",
+        "user_priv_keys",
+        "worker_leases",
+    ];
+
+    let live_tables: BTreeSet<String> = sqlx::query_scalar(
+        "SELECT table_name \
+         FROM information_schema.tables \
+         WHERE table_schema = 'public' \
+           AND table_type = 'BASE TABLE' \
+           AND table_name <> '_sqlx_migrations' \
+         ORDER BY table_name",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("live public base tables")
+    .into_iter()
+    .collect();
+
+    let scanned: BTreeSet<&str> = SCANNED_SELLER_TABLES.iter().copied().collect();
+    let conditional: BTreeSet<&str> = CONDITIONALLY_SCANNED_SELLER_TABLES
+        .iter()
+        .copied()
+        .collect();
+    let fk_descendants: BTreeSet<&str> = FK_DESCENDANT_TABLES.iter().copied().collect();
+    let app_children: BTreeSet<&str> = APP_SCOPED_CHILD_TABLES.iter().map(|(t, _)| *t).collect();
+    let non_seller: BTreeSet<&str> = NON_SELLER_TABLES.iter().copied().collect();
+
+    assert_eq!(
+        scanned.len(),
+        SCANNED_SELLER_TABLES.len(),
+        "duplicate in SCANNED_SELLER_TABLES"
+    );
+    assert_eq!(
+        conditional.len(),
+        CONDITIONALLY_SCANNED_SELLER_TABLES.len(),
+        "duplicate in CONDITIONALLY_SCANNED_SELLER_TABLES"
+    );
+    assert_eq!(
+        fk_descendants.len(),
+        FK_DESCENDANT_TABLES.len(),
+        "duplicate in FK_DESCENDANT_TABLES"
+    );
+    assert_eq!(
+        app_children.len(),
+        APP_SCOPED_CHILD_TABLES.len(),
+        "duplicate in APP_SCOPED_CHILD_TABLES"
+    );
+    assert_eq!(
+        non_seller.len(),
+        NON_SELLER_TABLES.len(),
+        "duplicate in NON_SELLER_TABLES"
+    );
+
+    let buckets: [(&str, &BTreeSet<&str>); 5] = [
+        ("SCANNED_SELLER_TABLES", &scanned),
+        ("CONDITIONALLY_SCANNED_SELLER_TABLES", &conditional),
+        ("FK_DESCENDANT_TABLES", &fk_descendants),
+        ("APP_SCOPED_CHILD_TABLES", &app_children),
+        ("NON_SELLER_TABLES", &non_seller),
+    ];
+    for i in 0..buckets.len() {
+        for j in (i + 1)..buckets.len() {
+            let overlap: Vec<&str> = buckets[i].1.intersection(buckets[j].1).copied().collect();
+            assert!(
+                overlap.is_empty(),
+                "overlap between {} and {}: {overlap:?}",
+                buckets[i].0,
+                buckets[j].0
+            );
+        }
+    }
+
+    let mut classified: BTreeSet<String> = BTreeSet::new();
+    for (_, set) in buckets {
+        for table in set {
+            classified.insert((*table).to_string());
+        }
+    }
+
+    let unclassified: Vec<&String> = live_tables.difference(&classified).collect();
+    assert!(
+        unclassified.is_empty(),
+        "unclassified base tables in migrated public schema (add to other_seller_rows_on and \
+         SCANNED_SELLER_TABLES / CONDITIONALLY_SCANNED_SELLER_TABLES or explicitly classify): \
+         {unclassified:?}"
+    );
+    let stale: Vec<&String> = classified.difference(&live_tables).collect();
+    assert!(
+        stale.is_empty(),
+        "stale table names in schema exhaustiveness classification: {stale:?}"
+    );
+
+    // Every directly scanned root table must actually hold a NOT NULL
+    // `seller_pubky` column in `pg_attribute`.
+    let not_null_seller_cols: BTreeSet<String> = sqlx::query_scalar(
+        "SELECT cls.relname::text \
+         FROM pg_catalog.pg_class cls \
+         JOIN pg_catalog.pg_namespace ns ON ns.oid = cls.relnamespace \
+         JOIN pg_catalog.pg_attribute att ON att.attrelid = cls.oid \
+         WHERE ns.nspname = 'public' \
+           AND cls.relkind = 'r' \
+           AND att.attname = 'seller_pubky' \
+           AND att.attnotnull \
+           AND NOT att.attisdropped",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("NOT NULL seller_pubky columns")
+    .into_iter()
+    .collect();
+    for table in SCANNED_SELLER_TABLES {
+        assert!(
+            not_null_seller_cols.contains(*table),
+            "SCANNED_SELLER_TABLES entry `{table}` must have a NOT NULL `seller_pubky` column"
+        );
+    }
+
+    // Every app-scoped child must point to a directly scanned root table.
+    for (child, parent) in APP_SCOPED_CHILD_TABLES {
+        assert!(
+            scanned.contains(parent),
+            "APP_SCOPED_CHILD_TABLES entry `{child}` references non-scanned parent `{parent}`"
+        );
+    }
+
+    // Compute transitive closure of strict pg_constraint FKs to
+    // SCANNED_SELLER_TABLES and assert every FK_DESCENDANT_TABLES entry is
+    // strictly anchored to a scanned root.
+    let mut fk_parents: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (child, parent) in strict_fk_edges(&pool).await {
+        fk_parents.entry(child).or_default().insert(parent);
+    }
+    let mut anchored: BTreeSet<String> = scanned.iter().map(|t| (*t).to_string()).collect();
+    loop {
+        let mut added = false;
+        for (child, parents) in &fk_parents {
+            if !anchored.contains(child) && parents.iter().any(|p| anchored.contains(p)) {
+                anchored.insert(child.clone());
+                added = true;
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+    for descendant in FK_DESCENDANT_TABLES {
+        assert!(
+            anchored.contains(*descendant),
+            "FK_DESCENDANT_TABLES entry `{descendant}` lacks a strict NOT NULL, non-SET-NULL / \
+             non-SET-DEFAULT foreign-key chain to SCANNED_SELLER_TABLES (parents: {:?})",
+            fk_parents.get(*descendant)
+        );
+    }
+
+    // Synthetic soundness proof for `strict_fk_edges`: a composite MATCH SIMPLE
+    // FK with one nullable column, an ON DELETE SET NULL FK, and an ON DELETE
+    // SET DEFAULT FK must all be rejected, while an all-NOT-NULL composite FK
+    // must be accepted. Rolled back so the scratch schema stays clean.
+    let mut tx = pool.begin().await.expect("synthetic fk tx");
+    sqlx::raw_sql(
+        "CREATE TABLE _fk_audit_parent ( \
+             k1 INT NOT NULL, \
+             k2 INT NOT NULL, \
+             UNIQUE (k1, k2) \
+         ); \
+         CREATE TABLE _fk_audit_comp_nullable ( \
+             k1 INT NOT NULL, \
+             k2 INT NULL, \
+             FOREIGN KEY (k1, k2) REFERENCES _fk_audit_parent (k1, k2) \
+         ); \
+         CREATE TABLE _fk_audit_set_null ( \
+             k1 INT NOT NULL, \
+             k2 INT NOT NULL, \
+             FOREIGN KEY (k1, k2) REFERENCES _fk_audit_parent (k1, k2) ON DELETE SET NULL \
+         ); \
+         CREATE TABLE _fk_audit_set_default ( \
+             k1 INT NOT NULL DEFAULT 0, \
+             k2 INT NOT NULL DEFAULT 0, \
+             FOREIGN KEY (k1, k2) REFERENCES _fk_audit_parent (k1, k2) ON DELETE SET DEFAULT \
+         ); \
+         CREATE TABLE _fk_audit_comp_strict ( \
+             k1 INT NOT NULL, \
+             k2 INT NOT NULL, \
+             FOREIGN KEY (k1, k2) REFERENCES _fk_audit_parent (k1, k2) \
+         );",
+    )
+    .execute(&mut *tx)
+    .await
+    .expect("create synthetic fk fixtures");
+
+    let synthetic_edges: BTreeSet<(String, String)> =
+        strict_fk_edges(&mut *tx).await.into_iter().collect();
+    assert!(
+        !synthetic_edges.contains(&(
+            "_fk_audit_comp_nullable".to_string(),
+            "_fk_audit_parent".to_string()
+        )),
+        "composite FK with a nullable column must be rejected"
+    );
+    assert!(
+        !synthetic_edges.contains(&(
+            "_fk_audit_set_null".to_string(),
+            "_fk_audit_parent".to_string()
+        )),
+        "ON DELETE SET NULL FK must be rejected"
+    );
+    assert!(
+        !synthetic_edges.contains(&(
+            "_fk_audit_set_default".to_string(),
+            "_fk_audit_parent".to_string()
+        )),
+        "ON DELETE SET DEFAULT FK must be rejected"
+    );
+    assert!(
+        synthetic_edges.contains(&(
+            "_fk_audit_comp_strict".to_string(),
+            "_fk_audit_parent".to_string()
+        )),
+        "all-NOT-NULL composite FK must be accepted"
+    );
+    tx.rollback().await.expect("rollback synthetic fk fixtures");
 }
