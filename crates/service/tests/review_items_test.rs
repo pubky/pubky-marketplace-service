@@ -1066,3 +1066,31 @@ async fn the_order_total_band_stays_consent_only_beside_the_price_decades(pool: 
         ]
     );
 }
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn a_legacy_subcent_price_still_allows_a_review_without_a_price_decade(pool: PgPool) {
+    let app = test_app_with_attestor(pool).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order_id = delivered_order(&app, &seller, &buyer, &LISTINGS[..1]).await;
+    // Orders written before the currency registry can contain USD prices with three decimal places.
+    sqlx::query(
+        "UPDATE orders SET lines = jsonb_set(lines, '{0,unit_price}', $2) WHERE id = $1::uuid",
+    )
+    .bind(&order_id)
+    .bind(json!({"currency": "USD", "exponent": 3, "amount_minor": 1}))
+    .execute(&app.pool)
+    .await
+    .unwrap();
+    let command = order_command(
+        "review.create",
+        &order_id,
+        4,
+        json!({"rating": 5, "text": "Item arrived"}),
+        7409,
+    );
+    let (status, reviewed) = execute(&app, &buyer.token, &command).await;
+    assert_eq!(status, StatusCode::OK, "{reviewed}");
+    let claims = claims_of(&reviewed["result"]["attestation"]);
+    assert!(claims.get("price_decade").is_none(), "{claims}");
+}

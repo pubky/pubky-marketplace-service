@@ -1345,7 +1345,7 @@ attestation per reviewed listing inside the review transaction, all sharing
 the order's `order_ref` (re-fetchable via
 `GET /v1/orders/{id}/review-attestations`, and the first line's via
 `GET /v1/orders/{id}/review-attestation`, participant-scoped, idempotent),
-each carrying the `price_decade` of its listing's unit price paid,
+each carrying the `price_decade` when its listing's unit price has a representable decade,
 the D2 amount-band consent gate applies (`attestation.set_band_consent`
 command + `GET /v1/sellers/{pubky}/band-consent` read), external refunds
 append `attestation_annotations` rows keyed by the
@@ -1371,7 +1371,7 @@ announced. The index serves them
   list and successor (`ATTESTOR_KEYS`, `ATTESTOR_SUCCESSOR`) and the issuance
   policy, which the service states from what it does: the edit window, the
   blind window (`REVIEW_BLIND_WINDOW_DAYS`), `amountBand: "both-sides
-  consent"`, `minOrderValue: null` and `priceDecade: "always"`. The attestor
+  consent"`, `minOrderValue: null` and `priceDecade: "when the unit price is representable"`. The attestor
   signs `price_decade` and the profile states it from one switch,
   `ISSUES_PRICE_DECADE` in `attestor.rs`; turning it off drops the claim and
   turns the profile to `never`.

@@ -21,7 +21,7 @@
 //! The optional `amount_band` log-decade band is emitted only under
 //! both-sides consent (ratified D2): the seller's standing preference AND
 //! the buyer's per-review opt-in. `price_decade`, the log decade of the
-//! bound listing's unit price paid, is always emitted (reviews decision
+//! bound listing's unit price paid, is emitted when representable (reviews decision
 //! RV1): the order of magnitude of the listed price, or for an accepted
 //! offer of the agreed price, which the listing does not show.
 //!
@@ -46,11 +46,8 @@ use crate::clock::format_timestamp;
 pub const ENV_ATTESTOR_SECRET_KEY: &str = "ATTESTOR_SECRET_KEY";
 pub const ENV_ATTESTOR_ORDER_SALT: &str = "ATTESTOR_ORDER_SALT";
 
-/// Whether the purchase attestations this service issues carry `price_decade`.
-/// The attestor profile states it as `issuancePolicy.priceDecade` (`always`
-/// when true, `never` otherwise), so the profile is truthful about what a
-/// verifier will find; `purchase_attestation_claims_follow_the_price_decade_policy`
-/// fails when the two disagree.
+/// Enables the price decade on purchase attestations whose unit price has a representable decade.
+/// Both the signer and the published issuance policy read this switch.
 pub const ISSUES_PRICE_DECADE: bool = true;
 
 /// JOSE `typ` of a v1 purchase attestation (spec fork: normative reference

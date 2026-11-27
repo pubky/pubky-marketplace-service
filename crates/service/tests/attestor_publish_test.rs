@@ -362,7 +362,7 @@ async fn the_profile_states_what_the_service_issues(pool: PgPool) {
     assert_eq!(
         profile["issuancePolicy"]["priceDecade"],
         json!(if ISSUES_PRICE_DECADE {
-            "always"
+            "when the unit price is representable"
         } else {
             "never"
         }),
