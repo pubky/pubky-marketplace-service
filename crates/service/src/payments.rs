@@ -1589,6 +1589,12 @@ impl PaykitClient {
                 Err(PaykitRequestError::Unavailable)
             }
             (_, "invalid_request" | "invoice_conflict") | (reqwest::StatusCode::CONFLICT, _) => {
+                tracing::warn!(
+                    %status,
+                    %code,
+                    %order_id,
+                    "upstream paykit refused the prepare request"
+                );
                 Err(PaykitRequestError::Rejected)
             }
             // A timed-out preparation may have committed remotely. Never
@@ -1597,7 +1603,15 @@ impl PaykitClient {
             (_, "dependency_timeout") => Err(PaykitRequestError::Unavailable),
             // `bitcoin_creation_disabled` (503, §C.16) and everything else:
             // refused cleanly as an availability failure, as today.
-            _ => Err(PaykitRequestError::Unavailable),
+            _ => {
+                tracing::warn!(
+                    %status,
+                    %code,
+                    %order_id,
+                    "upstream paykit could not prepare the request"
+                );
+                Err(PaykitRequestError::Unavailable)
+            }
         }
     }
 
@@ -1730,10 +1744,24 @@ impl PaykitClient {
                 Err(PaykitRequestError::Unavailable)
             }
             (_, "invalid_request" | "invoice_conflict") | (reqwest::StatusCode::CONFLICT, _) => {
+                tracing::warn!(
+                    %status,
+                    %code,
+                    %order_id,
+                    "upstream paykit refused the prepare request"
+                );
                 Err(PaykitRequestError::Rejected)
             }
             (_, "dependency_timeout") => Err(PaykitRequestError::Unavailable),
-            _ => Err(PaykitRequestError::Unavailable),
+            _ => {
+                tracing::warn!(
+                    %status,
+                    %code,
+                    %order_id,
+                    "upstream paykit could not prepare the request"
+                );
+                Err(PaykitRequestError::Unavailable)
+            }
         }
     }
 
