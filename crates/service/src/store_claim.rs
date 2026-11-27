@@ -179,6 +179,37 @@ impl ClientLimiter {
             .or_insert_with(|| Bucket::full(capacity, now))
     }
 
+    fn evict_if_at_capacity(&self, clients: &mut HashMap<[u8; 16], Bucket>, now: DateTime<Utc>) {
+        if clients.len() < self.client_capacity {
+            return;
+        }
+        let per_second = self.per_second;
+        let capacity = self.capacity;
+        clients.retain(|_, bucket| {
+            bucket.refill(now, per_second, capacity);
+            bucket.tokens() < capacity
+        });
+        // Never globally lock out newcomers: if every tracked bucket is still
+        // active after pruning idle entries, evict the most-nearly-recovered
+        // bucket so active repeat offenders remain tracked while memory stays
+        // bounded at `client_capacity`.
+        while clients.len() >= self.client_capacity {
+            let Some(evict) = clients
+                .iter()
+                .max_by(|(key_a, bucket_a), (key_b, bucket_b)| {
+                    bucket_a
+                        .tokens()
+                        .total_cmp(&bucket_b.tokens())
+                        .then_with(|| key_a.cmp(key_b))
+                })
+                .map(|(key, _)| *key)
+            else {
+                break;
+            };
+            clients.remove(&evict);
+        }
+    }
+
     fn admit(
         &self,
         headers: &HeaderMap,
@@ -187,8 +218,11 @@ impl ClientLimiter {
     ) -> Result<(), u64> {
         let key = self.key(headers, peer);
         let mut clients = self.clients.lock().expect("client limiter lock");
-        if clients.len() >= self.client_capacity && !clients.contains_key(&key) {
-            return Err(60);
+        if !clients.contains_key(&key) {
+            self.evict_if_at_capacity(&mut clients, now);
+            if clients.len() >= self.client_capacity {
+                return Err(60);
+            }
         }
         Self::bucket(&mut clients, key, now, self.capacity).take(
             now,
@@ -199,22 +233,29 @@ impl ClientLimiter {
 
     fn check_failure_budget(&self, key: [u8; 16], now: DateTime<Utc>) -> Result<(), u64> {
         let mut clients = self.clients.lock().expect("claim limiter lock");
-        if clients.len() >= self.client_capacity && !clients.contains_key(&key) {
-            return Err(60);
-        }
-        let bucket = Self::bucket(&mut clients, key, now, self.capacity);
+        let Some(bucket) = clients.get_mut(&key) else {
+            return Ok(());
+        };
         bucket.refill(now, self.per_second, self.capacity);
-        if bucket.tokens() >= 1.0 {
+        let tokens = bucket.tokens();
+        if tokens >= self.capacity {
+            clients.remove(&key);
+            return Ok(());
+        }
+        if tokens >= 1.0 {
             Ok(())
         } else {
-            Err((((1.0 - bucket.tokens()) / self.per_second).ceil() as u64).max(1))
+            Err((((1.0 - tokens) / self.per_second).ceil() as u64).max(1))
         }
     }
 
     fn record_failure(&self, key: [u8; 16], now: DateTime<Utc>) {
         let mut clients = self.clients.lock().expect("claim limiter lock");
-        if clients.len() >= self.client_capacity && !clients.contains_key(&key) {
-            return;
+        if !clients.contains_key(&key) {
+            self.evict_if_at_capacity(&mut clients, now);
+            if clients.len() >= self.client_capacity {
+                return;
+            }
         }
         let _ = Self::bucket(&mut clients, key, now, self.capacity).take(
             now,
@@ -585,27 +626,143 @@ mod tests {
             .with_timezone(&Utc);
         let key = |last| limiter.key(&HeaderMap::new(), Some(IpAddr::from([127, 0, 0, last])));
 
-        for last in 1..=4 {
+        // Budget checks on unseen addresses are read-only and never allocate
+        // or trigger a capacity lockout.
+        for last in 1..=20 {
             assert_eq!(limiter.check_failure_budget(key(last), now), Ok(()));
         }
+        assert_eq!(limiter.clients.lock().expect("clients").len(), 0);
+
+        // One active brute-force caller exhausts all 10 failure tokens while
+        // three other callers fail once each, filling the 4-slot table.
+        let attacker = key(1);
+        for _ in 0..10 {
+            assert_eq!(limiter.check_failure_budget(attacker, now), Ok(()));
+            limiter.record_failure(attacker, now);
+        }
+        assert_eq!(limiter.check_failure_budget(attacker, now), Err(90));
+        for last in 2..=4 {
+            limiter.record_failure(key(last), now);
+        }
         assert_eq!(limiter.clients.lock().expect("clients").len(), 4);
 
-        let existing = key(1);
-        let newcomer = key(5);
-        assert_eq!(limiter.check_failure_budget(newcomer, now), Err(60));
-        limiter.record_failure(newcomer, now);
+        // Newcomers at capacity are never locked out, and read-only checks do
+        // not grow or mutate the table.
+        let merchant = key(5);
+        assert_eq!(limiter.check_failure_budget(merchant, now), Ok(()));
+        assert_eq!(limiter.clients.lock().expect("clients").len(), 4);
+        assert!(!limiter
+            .clients
+            .lock()
+            .expect("clients")
+            .contains_key(&merchant));
+
+        // Additional failing addresses evict highest-token entries, keeping
+        // table size bounded and the active brute-force caller rate-limited.
+        for last in 6..=20 {
+            assert_eq!(limiter.check_failure_budget(key(last), now), Ok(()));
+            limiter.record_failure(key(last), now);
+            assert!(limiter.clients.lock().expect("clients").len() <= 4);
+            assert_eq!(limiter.check_failure_budget(attacker, now), Err(90));
+        }
+        assert_eq!(limiter.check_failure_budget(merchant, now), Ok(()));
+
+        // Partial recovery: when single-failure buckets refill to capacity
+        // while a recent brute-force caller is still empty, recording a new
+        // failure prunes the refilled buckets and keeps the brute-force caller.
+        let recent_attacker = key(30);
+        let t_recent = now + chrono::Duration::seconds(30);
+        for _ in 0..10 {
+            limiter.record_failure(recent_attacker, t_recent);
+        }
+        let t_partial = now + chrono::Duration::seconds(90);
+        assert!(limiter
+            .check_failure_budget(recent_attacker, t_partial)
+            .is_err());
+        limiter.record_failure(key(31), t_partial);
         {
             let clients = limiter.clients.lock().expect("clients");
-            assert_eq!(clients.len(), 4);
-            assert!(!clients.contains_key(&newcomer));
+            assert!(clients.contains_key(&recent_attacker));
+            assert!(clients.contains_key(&key(31)));
+            assert_eq!(clients.len(), 3);
+        }
+        assert!(limiter
+            .check_failure_budget(recent_attacker, t_partial)
+            .is_err());
+
+        // Advancing past 900 s lets every tracked bucket refill to capacity:
+        // check_failure_budget drops refilled hits, and record_failure prunes
+        // all remaining stale buckets before inserting.
+        let later = t_partial + chrono::Duration::seconds(901);
+        let len_before_drop = limiter.clients.lock().expect("clients").len();
+        assert_eq!(limiter.check_failure_budget(recent_attacker, later), Ok(()));
+        {
+            let clients = limiter.clients.lock().expect("clients");
+            assert!(!clients.contains_key(&recent_attacker));
+            assert_eq!(clients.len(), len_before_drop - 1);
         }
 
-        assert_eq!(limiter.check_failure_budget(existing, now), Ok(()));
-        limiter.record_failure(existing, now);
+        // Refill all 4 slots at `later`, then advance another 901 s and prove
+        // `record_failure` prunes every idle bucket down to only the newcomer.
+        for last in 40..=43 {
+            limiter.record_failure(key(last), later);
+        }
         assert_eq!(limiter.clients.lock().expect("clients").len(), 4);
-        for last in 6..=20 {
-            limiter.record_failure(key(last), now);
-            assert_eq!(limiter.check_failure_budget(key(last), now), Err(60));
+        let much_later = later + chrono::Duration::seconds(901);
+        let fresh = key(44);
+        assert_eq!(limiter.check_failure_budget(fresh, much_later), Ok(()));
+        limiter.record_failure(fresh, much_later);
+        {
+            let clients = limiter.clients.lock().expect("clients");
+            assert_eq!(clients.len(), 1);
+            assert!(clients.contains_key(&fresh));
+        }
+    }
+
+    #[test]
+    fn store_read_clients_prune_idle_buckets_and_never_lock_out_newcomers() {
+        let limiter = ClientLimiter::new(None, 1.0, 30.0).with_client_capacity(4);
+        let now = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .expect("test time")
+            .with_timezone(&Utc);
+        let headers = HeaderMap::new();
+        let peer = |last| Some(IpAddr::from([198, 51, 100, last]));
+
+        // One hammering visitor exhausts the 30-request burst.
+        for _ in 0..30 {
+            assert_eq!(limiter.admit(&headers, peer(1), now), Ok(()));
+        }
+        assert_eq!(limiter.admit(&headers, peer(1), now), Err(1));
+
+        // Three more distinct visitors fill the 4-slot table.
+        for last in 2..=4 {
+            assert_eq!(limiter.admit(&headers, peer(last), now), Ok(()));
+        }
+        assert_eq!(limiter.clients.lock().expect("clients").len(), 4);
+
+        // Burst of distinct visitors at the same timestamp evicts the
+        // highest-token buckets so newcomers are admitted while the hammering
+        // visitor remains rate-limited.
+        for last in 5..=25 {
+            assert_eq!(limiter.admit(&headers, peer(last), now), Ok(()));
+            assert!(limiter.clients.lock().expect("clients").len() <= 4);
+            assert_eq!(limiter.admit(&headers, peer(1), now), Err(1));
+        }
+
+        // Advancing past the full refill window prunes all idle buckets on the
+        // next visitor request, so lifetime distinct visitors never permanently
+        // 429 GET /v1/store.
+        let later = now + chrono::Duration::seconds(31);
+        assert_eq!(limiter.admit(&headers, peer(50), later), Ok(()));
+        assert_eq!(limiter.clients.lock().expect("clients").len(), 1);
+        assert_eq!(limiter.admit(&headers, peer(1), later), Ok(()));
+
+        // Sequential visitors spread over time beyond 900 s stay bounded and
+        // every visitor is admitted.
+        let far_later = later + chrono::Duration::seconds(901);
+        for offset in 0..20u8 {
+            let at = far_later + chrono::Duration::seconds(i64::from(offset) * 10);
+            assert_eq!(limiter.admit(&headers, peer(100 + offset), at), Ok(()));
             assert!(limiter.clients.lock().expect("clients").len() <= 4);
         }
     }
