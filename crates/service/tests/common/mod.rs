@@ -2015,6 +2015,8 @@ pub async fn execute_from(
 pub fn reconfigured(app: &TestApp, edit: impl FnOnce(&mut Config)) -> TestApp {
     let mut config = (*app.state.config).clone();
     edit(&mut config);
+    marketplace_service::fx::sync_config_fx_admission(&mut config)
+        .expect("test FX feed URL must validate");
     let mut state = app.state.clone();
     // Guards read the runtime binding, not the config, so a changed store
     // mode needs a binding that matches it.
@@ -3407,7 +3409,7 @@ async fn serve_paykit_payment_request(
             let amount_sats = parsed["amount_sats"].as_u64().unwrap_or_default();
             let invoice_id = uuid::Uuid::new_v4();
             let nonce_sats = guard.nonce_sats;
-            let total_sats = amount_sats + nonce_sats;
+            let total_sats = amount_sats.wrapping_add(nonce_sats);
             let expires_at = parsed["expires_at"]
                 .as_str()
                 .unwrap_or_default()

@@ -5712,27 +5712,83 @@ pub struct WorkerSummary {
     pub attestor_records_published: u64,
 }
 
-/// Samples the bounded sole source once per server-time bucket, one sample
-/// per fiat currency from a single fetch. The unique `(currency, bucket)`
+/// Samples the configured FX feed once per server-time bucket, one sample per
+/// supported fiat currency from one snapshot (one HTTP request for Blocktank,
+/// Coinbase, Mempool, and Bitstamp; concurrent per-pair requests under the
+/// shared 3-second deadline for Kraken). The unique `(currency, bucket)`
 /// constraint is the concurrency cap; invalid samples never reach the table,
 /// and each currency's sample is checked against that currency's own
-/// persisted median. The endpoint and ticker contract are pinned in `fx.rs`.
-/// Returns the number of samples accepted across all currencies.
+/// persisted median. The endpoints and wire contracts live in `fx.rs`.
+/// Returns the number of samples accepted across all supported currencies.
 pub async fn sample_fx_rate(
     pool: &PgPool,
     feed_url: &str,
     now: DateTime<Utc>,
 ) -> anyhow::Result<u64> {
-    let snapshot = match fx::fetch_snapshot(feed_url, now).await {
+    sample_fx_rate_for(pool, fx::FxFeedProvider::Blocktank, feed_url, now).await
+}
+
+/// Samples FX rates from `provider` at `feed_url` and persists accepted
+/// reference samples tagged with `provider.as_str()`. Guards outbound fetches
+/// to at most one snapshot attempt per `(sample_bucket, provider)` across both
+/// already-sampled buckets and transient upstream failures within the same
+/// 60-second bucket.
+pub async fn sample_fx_rate_for(
+    pool: &PgPool,
+    provider: fx::FxFeedProvider,
+    feed_url: &str,
+    now: DateTime<Utc>,
+) -> anyhow::Result<u64> {
+    let bucket_seconds = now.timestamp() - now.timestamp().rem_euclid(FX_SAMPLE_INTERVAL_SECONDS);
+    let bucket = DateTime::from_timestamp(bucket_seconds, 0)
+        .ok_or_else(|| anyhow::anyhow!("invalid FX sample bucket"))?;
+    let next_bucket = bucket + chrono::Duration::seconds(FX_SAMPLE_INTERVAL_SECONDS);
+
+    let already_sampled: bool = sqlx::query_scalar(
+        "SELECT EXISTS( \
+             SELECT 1 FROM fx_rate_samples \
+             WHERE sample_bucket = $1 AND source = $2 \
+         )",
+    )
+    .bind(bucket)
+    .bind(provider.as_str())
+    .fetch_one(pool)
+    .await?;
+    if already_sampled {
+        return Ok(0);
+    }
+
+    // Atomically claim the 60-second bucket attempt without same-holder bypass
+    // so transient 429/500 or all-stale responses also fire at most once per
+    // 60-second bucket.
+    let bucket_task = format!("fx_sampler_bucket:{}", provider.as_str());
+    let claimed_bucket: Option<i64> = sqlx::query_scalar(
+        "INSERT INTO worker_leases (task, holder, lease_until, fence) \
+         VALUES ($1, $2, $3, 1) \
+         ON CONFLICT (task) DO UPDATE SET \
+             holder = EXCLUDED.holder, \
+             lease_until = EXCLUDED.lease_until, \
+             fence = worker_leases.fence + 1 \
+         WHERE worker_leases.lease_until <= $4 \
+         RETURNING fence",
+    )
+    .bind(&bucket_task)
+    .bind(Uuid::new_v4())
+    .bind(next_bucket)
+    .bind(now)
+    .fetch_optional(pool)
+    .await?;
+    if claimed_bucket.is_none() {
+        return Ok(0);
+    }
+
+    let snapshot = match fx::fetch_snapshot_for(provider, feed_url, now).await {
         Ok(snapshot) => snapshot,
         Err(error) => {
             tracing::warn!(reason = ?error, "FX reference sample rejected");
             return Ok(0);
         }
     };
-    let bucket_seconds = now.timestamp() - now.timestamp().rem_euclid(FX_SAMPLE_INTERVAL_SECONDS);
-    let bucket = DateTime::from_timestamp(bucket_seconds, 0)
-        .ok_or_else(|| anyhow::anyhow!("invalid FX sample bucket"))?;
     let mut accepted = 0;
     for (currency, sample) in snapshot.samples() {
         let sample = match sample {
@@ -5754,12 +5810,19 @@ pub async fn sample_fx_rate(
         .bind(fx::reference_cutoff(now))
         .fetch_all(pool)
         .await?;
-        if let Some(median) = fx::median(
-            reference
-                .into_iter()
-                .filter_map(|(rate,)| fx::Decimal::parse(&rate))
-                .collect(),
-        ) {
+        let Some(parsed_reference) = reference
+            .into_iter()
+            .map(|(rate,)| fx::Decimal::parse(&rate))
+            .collect::<Option<Vec<_>>>()
+        else {
+            tracing::warn!(
+                currency = currency.code(),
+                reason = "malformed_reference",
+                "FX reference sample rejected"
+            );
+            continue;
+        };
+        if let Some(median) = fx::median(parsed_reference) {
             if !fx::within_deviation(&sample.rate, &median) {
                 tracing::warn!(
                     currency = currency.code(),
@@ -5772,7 +5835,7 @@ pub async fn sample_fx_rate(
         accepted += sqlx::query(
             "INSERT INTO fx_rate_samples \
              (currency, rate, fetched_at, accepted_at, sample_bucket, source) \
-             VALUES ($1, $2, $3, $4, $5, 'blocktank') \
+             VALUES ($1, $2, $3, $4, $5, $6) \
              ON CONFLICT (currency, sample_bucket) DO NOTHING",
         )
         .bind(currency.code())
@@ -5783,6 +5846,7 @@ pub async fn sample_fx_rate(
         .bind(sample.fetched_at)
         .bind(now)
         .bind(bucket)
+        .bind(provider.as_str())
         .execute(pool)
         .await?
         .rows_affected();
@@ -5941,7 +6005,13 @@ pub async fn run_once(
         summary.payment_windows_expired = result?;
     }
     if try_acquire_lease(&state.pool, TASK_FX_SAMPLER, holder, now, lease_seconds).await? {
-        let result = sample_fx_rate(&state.pool, &state.config.fx_feed_url, now).await;
+        let result = sample_fx_rate_for(
+            &state.pool,
+            state.config.fx_feed_provider,
+            &state.config.fx_feed_url,
+            now,
+        )
+        .await;
         release_lease(&state.pool, TASK_FX_SAMPLER, holder, now).await?;
         summary.fx_samples_accepted = result?;
     }

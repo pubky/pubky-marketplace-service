@@ -57,11 +57,13 @@ pub fn personal_minimum_next_bid(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn place_bid(
     tx: &mut Transaction<'_, Postgres>,
     actor: &str,
     command: &Command,
     payload: &PlaceBidPayload,
+    fx: crate::fx::FxFeedAdmission,
     shipping: &crate::shipping::ShippingPlan,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
@@ -72,6 +74,13 @@ pub async fn place_bid(
             "The auction listing is not registered.",
         )));
     };
+    if let Some(refusal) = crate::handlers::fx_currency_refusal(
+        fx,
+        &listing.unit_price_currency,
+        "payload.maximum_amount.currency",
+    ) {
+        return Ok(Err(refusal));
+    }
     if listing.seller_pubky == actor {
         return Ok(Err(CommandFailure::refused(
             crate::refusal_audit::RefusalKind::BidSellerForbidden,

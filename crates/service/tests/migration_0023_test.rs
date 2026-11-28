@@ -558,7 +558,7 @@ fn sorted_migration_catalog(mut numbers: Vec<u32>) -> Vec<u32> {
 }
 
 #[test]
-fn migration_catalog_is_gapless_through_0061_then_0070_to_0102() {
+fn migration_catalog_is_gapless_through_0061_then_0070_to_0103() {
     let numbers: Vec<u32> = std::fs::read_dir(MIGRATIONS_DIR)
         .expect("migrations dir")
         .filter_map(|entry| {
@@ -583,17 +583,18 @@ fn migration_catalog_is_gapless_through_0061_then_0070_to_0102() {
     // tables 0096 and their read fences 0097, the seller wallet Receipt
     // confirmation 0098, the per-seller inventory rate buckets 0099, the
     // homeserver-scoped deletion cursors 0100, the single-seller refusal
-    // kinds 0101 and the store seller binding 0102.
+    // kinds 0101, the store seller binding 0102, and removing static FX rate
+    // ceilings/caps 0103.
     let expected = (1..=61)
         .chain([
             62, 63, 64, 65, 66, 67, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85,
-            86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102,
+            86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103,
         ])
         .collect::<Vec<_>>();
     assert_eq!(
         sorted_migration_catalog(numbers),
         expected,
-        "the raw catalog is 0001..=0061, gapless, then 0062..=0067 and 0070..=0102"
+        "the raw catalog is 0001..=0061, gapless, then 0062..=0067 and 0070..=0103"
     );
 }
 

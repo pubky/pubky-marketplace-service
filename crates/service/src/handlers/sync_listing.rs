@@ -119,16 +119,28 @@ pub async fn prefetch(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn handle(
     tx: &mut Transaction<'_, Postgres>,
     actor: &str,
     command: &Command,
     payload: &SyncListingPayload,
     has_homeserver: bool,
+    fx: crate::fx::FxFeedAdmission,
     prefetched: &SyncPrefetch,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
-    let mut outcome = sync(tx, actor, command, payload, has_homeserver, prefetched, now).await?;
+    let mut outcome = sync(
+        tx,
+        actor,
+        command,
+        payload,
+        has_homeserver,
+        fx,
+        prefetched,
+        now,
+    )
+    .await?;
     // A sync that converged the listing to its record but could not convert it
     // to per-variant stock says so: `variant_conversion` names the state
     // (`deferred`, or `blocked` when the record itself has to change) and why.
@@ -151,12 +163,14 @@ pub async fn handle(
     Ok(outcome)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn sync(
     tx: &mut Transaction<'_, Postgres>,
     actor: &str,
     command: &Command,
     payload: &SyncListingPayload,
     has_homeserver: bool,
+    fx: crate::fx::FxFeedAdmission,
     prefetched: &SyncPrefetch,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
@@ -238,6 +252,13 @@ async fn sync(
             )));
         }
     };
+    if let Some(refusal) = crate::handlers::fx_currency_refusal(
+        fx,
+        &registration.unit_price.currency,
+        "payload.unit_price.currency",
+    ) {
+        return Ok(Err(refusal));
+    }
 
     let current = fetch_listing_for_update(tx, &command.aggregate_id).await?;
     if let Some(deleted) = current.as_ref().filter(|listing| listing.is_deleted()) {

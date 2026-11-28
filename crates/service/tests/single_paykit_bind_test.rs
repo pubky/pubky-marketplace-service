@@ -522,38 +522,27 @@ async fn a_seller_without_a_usdt_address_offers_bitcoin_only(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn an_unreadable_fx_feed_narrows_to_usdt_and_fails_a_bitcoin_only_bind(pool: PgPool) {
+async fn an_unreadable_fx_feed_refuses_dual_rail_and_bitcoin_only_binds_without_demoting_to_usdt(
+    pool: PgPool,
+) {
+    // Dual-rail seller (BTC + USDT): FX unavailability refuses cleanly instead
+    // of silently stripping Bitcoin to push buyers onto USDT.
     let f = fixture(pool.clone(), Setup::both()).await;
     f.fx.set_status(500);
     let order = checkout_usd(&f).await;
     let (status, body) = bind(&f, &order.order_id, "paykit").await;
-    assert_eq!(status, StatusCode::OK, "bind failed: {body}");
-    assert_eq!(prepare_body(&f.paykit)["accepted_assets"], json!(["USDT"]));
-    let view = &body["order"];
-    assert_eq!(view["accepted_assets"], json!(["USDT"]));
-    assert_eq!(view["payment_amounts"], json!({ "USDT": TOTAL_USDT_UNITS }));
-    assert!(view["paykit_total_sats"].is_null(), "{view}");
-    let stored = facts(&pool, &order.order_id).await;
-    assert_eq!(
-        stored.bitcoin_quoted_sats, None,
-        "no Bitcoin quote is pinned"
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["reason"], json!("fx_reference_unavailable"));
+    assert!(
+        f.paykit
+            .calls()
+            .iter()
+            .all(|call| !call.path.starts_with("/marketplace/payment-requests")),
+        "no USDT-only Paykit request left the process"
     );
-    let payment = payment_row(&pool, &order.order_id).await;
-    assert_eq!(
-        (payment.1, payment.2.as_str(), payment.3),
-        (TOTAL_USDT_UNITS as i64, "USDT", 6),
-        "a USDT-only request types its payment in USDT0"
-    );
-    drain(&f).await;
-    assert_eq!(
-        facts(&pool, &order.order_id)
-            .await
-            .paykit_request_state
-            .as_deref(),
-        Some("pending"),
-        "a USDT-only request activates by its denomination"
-    );
+    assert_eq!(facts(&pool, &order.order_id).await.payment_method, None);
 
+    // Bitcoin-only seller: same refusal.
     let g = fixture(
         pool.clone(),
         Setup {
@@ -575,6 +564,167 @@ async fn an_unreadable_fx_feed_narrows_to_usdt_and_fails_a_bitcoin_only_bind(poo
         "no request left the process"
     );
     assert_eq!(facts(&pool, &order.order_id).await.payment_method, None);
+
+    // USDT-only seller on a USD order: needs no FX rate at parity, still binds.
+    let h = fixture(pool.clone(), Setup::both()).await;
+    put_config(
+        &h.app,
+        &h.seller.token,
+        json!({ "bitcoin_enabled": false, "usdt_enabled": true }),
+    )
+    .await;
+    h.fx.set_status(500);
+    let order = checkout_usd(&h).await;
+    let (status, body) = bind(&h, &order.order_id, "paykit").await;
+    assert_eq!(status, StatusCode::OK, "bind failed: {body}");
+    assert_eq!(prepare_body(&h.paykit)["accepted_assets"], json!(["USDT"]));
+    let view = &body["order"];
+    assert_eq!(view["accepted_assets"], json!(["USDT"]));
+    assert_eq!(view["payment_amounts"], json!({ "USDT": TOTAL_USDT_UNITS }));
+    assert!(view["paykit_total_sats"].is_null(), "{view}");
+    let stored = facts(&pool, &order.order_id).await;
+    assert_eq!(
+        stored.bitcoin_quoted_sats, None,
+        "no Bitcoin quote is pinned"
+    );
+    let payment = payment_row(&pool, &order.order_id).await;
+    assert_eq!(
+        (payment.1, payment.2.as_str(), payment.3),
+        (TOTAL_USDT_UNITS as i64, "USDT", 6),
+        "a USDT-only request types its payment in USDT0"
+    );
+    drain(&h).await;
+    assert_eq!(
+        facts(&pool, &order.order_id)
+            .await
+            .paykit_request_state
+            .as_deref(),
+        Some("pending"),
+        "a USDT-only request activates by its denomination"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn dual_rail_fiat_orders_below_1000_sats_and_above_one_btc_keep_bitcoin_and_usdt(
+    pool: PgPool,
+) {
+    let f = fixture(pool.clone(), Setup::both()).await;
+    for (unit_cents, expected_sats) in [
+        // $0.10 at $77,197/BTC = 130 sats (below the removed 1,000-sat floor).
+        (
+            10_i64,
+            (10_u128 * 100_000_000).div_ceil(100 * 77_197) as u64,
+        ),
+        // $200,000.00 at $77,197/BTC = 259,077,426 sats (> 2.59 BTC, above the removed 1.0 BTC cap).
+        (
+            20_000_000_i64,
+            (20_000_000_u128 * 100_000_000).div_ceil(100 * 77_197) as u64,
+        ),
+    ] {
+        let seller = new_actor(&f.app).await;
+        put_config(
+            &f.app,
+            &seller.token,
+            json!({ "bitcoin_enabled": true, "usdt_enabled": true }),
+        )
+        .await;
+        f.paykit.set_claimed(&seller.pubky);
+        f.paykit.set_receivable(&seller.pubky, &["BTC", "USDT"]);
+        let mut register = register_command(&seller.pubky, 5);
+        register["command_id"] = json!(Uuid::new_v4().to_string());
+        register["payload"]["unit_price"] =
+            json!({ "amount_minor": unit_cents, "currency": "USD", "exponent": 2 });
+        register["payload"]["shipping_minor"] = json!(0);
+        let (status, body) = execute(&f.app, &seller.token, &register).await;
+        assert_eq!(status, StatusCode::OK, "register: {body}");
+
+        let mut checkout = checkout_command_with_id(&seller.pubky, &Uuid::new_v4().to_string());
+        checkout["payload"]["lines"][0]["expected_revision"] = json!(1);
+        let (status, body) = execute(&f.app, &f.buyer.token, &checkout).await;
+        assert_eq!(status, StatusCode::OK, "checkout: {body}");
+        let order_id = body["result"]["orders"][0]["id"]
+            .as_str()
+            .expect("order id")
+            .to_string();
+
+        let (status, body) = bind(&f, &order_id, "paykit").await;
+        assert_eq!(status, StatusCode::OK, "unit_cents={unit_cents}: {body}");
+        assert_eq!(
+            body["order"]["accepted_assets"],
+            json!(["BTC", "USDT"]),
+            "Bitcoin must stay offered alongside USDT"
+        );
+        assert_eq!(
+            body["order"]["payment_amounts"]["BTC"],
+            json!(expected_sats)
+        );
+        assert_eq!(
+            body["order"]["payment_amounts"]["USDT"],
+            json!(unit_cents as u64 * 10_000)
+        );
+        assert_eq!(
+            facts(&pool, &order_id).await.bitcoin_quoted_sats,
+            Some(expected_sats as i64)
+        );
+    }
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn usdt_only_sat_order_overflowing_i64_usdt_units_rolls_back_and_voids(pool: PgPool) {
+    let f = sat_fixture(pool.clone(), Setup::both()).await;
+    put_config(
+        &f.app,
+        &f.seller.token,
+        json!({ "bitcoin_enabled": false, "usdt_enabled": true }),
+    )
+    .await;
+    let now = f.app.clock.now();
+    // Rate 200 USD/BTC: 4,611,686,018,427,387,904 sats * 200 / 100 = i64::MAX + 1 USDT0 units.
+    sqlx::query("DELETE FROM fx_rate_samples")
+        .execute(&pool)
+        .await
+        .expect("clear samples");
+    for back in 0..3_i64 {
+        let accepted = now - Duration::seconds(60 * back);
+        let bucket_ts = accepted.timestamp() - accepted.timestamp().rem_euclid(60);
+        let bucket = DateTime::from_timestamp(bucket_ts, 0).expect("bucket");
+        sqlx::query(
+            "INSERT INTO fx_rate_samples \
+             (currency, rate, fetched_at, accepted_at, sample_bucket, source) \
+             VALUES ('USD', 200, $1, $1, $2, 'blocktank')",
+        )
+        .bind(accepted)
+        .bind(bucket)
+        .execute(&pool)
+        .await
+        .expect("seed 200 USD/BTC");
+    }
+    f.fx.set_body(fx_body("200", now.timestamp_millis()));
+    f.paykit.set_usd_per_btc(200);
+
+    let order = create_sat_order(&f.app, &f.seller, &f.buyer).await;
+    let overflowing_sats: i64 = (i64::MAX / 2) + 1;
+    sqlx::query(
+        "UPDATE orders SET subtotal_minor = $2, shipping_minor = 0, total_minor = $2 WHERE id = $1",
+    )
+    .bind(uuid(&order.order_id))
+    .bind(overflowing_sats)
+    .execute(&pool)
+    .await
+    .expect("set large sat total");
+
+    let (status, body) = bind(&f, &order.order_id, "paykit").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["reason"], json!("fx_reference_unavailable"));
+    assert_eq!(facts(&pool, &order.order_id).await.payment_method, None);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        f.paykit
+            .calls()
+            .iter()
+            .any(|call| call.path == "/marketplace/payment-requests/void"),
+        "prepared upstream invoice exceeding i64 USDT0 units must be courtesy-voided"
+    );
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
@@ -2340,10 +2490,15 @@ fn test_database_url(pool: &PgPool) -> String {
 async fn a_review_row_without_a_satoshi_total_lists_through_the_query_and_the_admin_binary(
     pool: PgPool,
 ) {
-    // The FX quote is unreadable, so the request offers USDT only and its
-    // released attempt has no satoshi total.
+    // A USDT-only seller creates a request with no satoshi total, so its
+    // released attempt has total_sats = NULL.
     let f = fixture(pool.clone(), Setup::both()).await;
-    f.fx.set_status(500);
+    put_config(
+        &f.app,
+        &f.seller.token,
+        json!({ "bitcoin_enabled": false, "usdt_enabled": true }),
+    )
+    .await;
     let order = checkout_usd(&f).await;
     let order_id = order.order_id.clone();
     let (status, body) = bind(&f, &order_id, "paykit").await;

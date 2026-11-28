@@ -264,6 +264,7 @@ pub async fn create(
     command: &Command,
     payload: &OfferTermsPayload,
     homeserver_configured: bool,
+    fx: crate::fx::FxFeedAdmission,
     prefetched: &RecordPrefetch,
     shipping: &crate::shipping::ShippingPlan,
     now: DateTime<Utc>,
@@ -275,6 +276,13 @@ pub async fn create(
             "The listing is not registered.",
         )));
     };
+    if let Some(refusal) = crate::handlers::fx_currency_refusal(
+        fx,
+        &listing.unit_price_currency,
+        "payload.amount.currency",
+    ) {
+        return Ok(Err(refusal));
+    }
     if let Some(failure) = create_refusal(&listing, actor, command, payload) {
         return Ok(Err(failure));
     }
@@ -447,12 +455,14 @@ pub async fn create(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn counter(
     tx: &mut Transaction<'_, Postgres>,
     actor: &str,
     command: &Command,
     payload: &CounterOfferPayload,
     homeserver_configured: bool,
+    fx: crate::fx::FxFeedAdmission,
     prefetched: &RecordPrefetch,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
@@ -461,6 +471,11 @@ pub async fn counter(
             Ok(offer) => offer,
             Err(failure) => return Ok(Err(failure)),
         };
+    if let Some(refusal) =
+        crate::handlers::fx_currency_refusal(fx, &offer.currency, "payload.amount.currency")
+    {
+        return Ok(Err(refusal));
+    }
     if let Some(failure) = counter_refusal(&offer, actor, command, payload) {
         return Ok(Err(failure));
     }
@@ -667,6 +682,35 @@ pub async fn counter(
     }))
 }
 
+/// Resolves an actionable `offer.accept` command's currency locally before any
+/// moderation, lifecycle, shipping, or homeserver record reads run. Preserves
+/// `NotFound`, aggregate-id, participant and self-accept authorization,
+/// actionability, expiry, and revision precedence; the locked check in
+/// [`accept`] stays authoritative under `FOR UPDATE`.
+pub(crate) async fn accept_currency_refusal(
+    pool: &PgPool,
+    clock: &dyn crate::clock::Clock,
+    fx: crate::fx::FxFeedAdmission,
+    actor: &str,
+    command: &Command,
+    payload: &OfferActionPayload,
+) -> Result<Option<CommandFailure>, sqlx::Error> {
+    let Some(offer) = fetch_offer_row(pool, payload.offer_id).await? else {
+        return Ok(None);
+    };
+    let now = clock.now();
+    if actionable_refusal(&offer, actor, &command.aggregate_id, now).is_some()
+        || accept_refusal(&offer, actor, command).is_some()
+    {
+        return Ok(None);
+    }
+    Ok(crate::handlers::fx_currency_refusal(
+        fx,
+        &offer.currency,
+        "payload.offer_id",
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn accept(
     tx: &mut Transaction<'_, Postgres>,
@@ -674,6 +718,7 @@ pub async fn accept(
     command: &Command,
     payload: &OfferActionPayload,
     homeserver_configured: bool,
+    fx: crate::fx::FxFeedAdmission,
     prefetched: &RecordPrefetch,
     shipping: &crate::shipping::ShippingPlan,
     now: DateTime<Utc>,
@@ -685,6 +730,11 @@ pub async fn accept(
         };
     if let Some(failure) = accept_refusal(&offer, actor, command) {
         return Ok(Err(failure));
+    }
+    if let Some(refusal) =
+        crate::handlers::fx_currency_refusal(fx, &offer.currency, "payload.offer_id")
+    {
+        return Ok(Err(refusal));
     }
     let (snapshot, fetched_identity_present) = if homeserver_configured {
         let Some(current_listing) = fetch_listing(tx, &offer.listing_aggregate_id).await? else {

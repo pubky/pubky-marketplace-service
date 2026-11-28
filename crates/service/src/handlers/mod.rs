@@ -23,15 +23,45 @@ pub mod reviews;
 pub mod sync_listing;
 
 use chrono::{DateTime, Utc};
-use marketplace_domain::{ids, Command, ErrorCode};
+use marketplace_domain::currency::{Currency, REASON_CURRENCY_UNSUPPORTED};
+use marketplace_domain::{ids, Command, ErrorCode, ValidationIssue};
 use serde_json::{json, Value};
 use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::executor::insert_event;
+use crate::fx::{unsupported_currency_message_from_slice, FxFeedAdmission};
 use crate::model::{AuctionReserveRow, ListingRow, OrderRow, ProjectionContext, ReviewRow};
 use crate::queries::ORDER_COLUMNS;
 use crate::result::{CommandFailure, HandlerResult, HandlerSuccess};
+
+/// Refuses a command whose currency is outside what the configured FX feed
+/// provider quotes (`422 INVALID_COMMAND`, `reason: "currency_unsupported"`).
+pub(crate) fn fx_currency_refusal(
+    fx: FxFeedAdmission,
+    currency_code: &str,
+    path: &str,
+) -> Option<CommandFailure> {
+    let currency = Currency::parse(currency_code)?;
+    if fx.supports_currency(currency) {
+        return None;
+    }
+    let message =
+        unsupported_currency_message_from_slice(fx.provider, fx.supported_fiat, currency_code);
+    Some(
+        CommandFailure::refused_with_issues(
+            crate::refusal_audit::RefusalKind::InvalidCommand,
+            ErrorCode::InvalidCommand,
+            &message,
+            vec![ValidationIssue {
+                path: path.to_string(),
+                message: message.clone(),
+                reason: Some(REASON_CURRENCY_UNSUPPORTED.to_string()),
+            }],
+        )
+        .with_reason(REASON_CURRENCY_UNSUPPORTED),
+    )
+}
 
 pub const LISTING_COLUMNS: &str = "aggregate_id, seller_pubky, listing_id, title, \
      listing_revision, content_hash, server_revision, state, total_quantity, \

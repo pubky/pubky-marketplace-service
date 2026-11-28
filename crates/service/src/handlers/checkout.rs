@@ -32,6 +32,93 @@ pub struct CheckoutContext<'a> {
     /// What the sellers' shipping profiles and shop records said, read
     /// before the transaction opened.
     pub shipping: &'a crate::shipping::ShippingPlan,
+    /// Configured FX feed admission, used to reject checkouts in currencies
+    /// the feed URL cannot quote.
+    pub fx: crate::fx::FxFeedAdmission,
+}
+
+#[derive(sqlx::FromRow)]
+struct CheckoutPreflightListing {
+    aggregate_id: String,
+    seller_pubky: String,
+    sale_format: String,
+    state: String,
+    server_revision: i64,
+    unit_price_currency: String,
+    unit_price_exponent: i32,
+}
+
+/// Resolves a `checkout.create` command's listing currency locally before
+/// moderation, lifecycle, region-fence, or shipping homeserver reads run,
+/// preserving aggregate-id, existence, self-purchase authorization,
+/// sale-format, availability, revision, and single-asset precedence. The
+/// locked check in [`handle`] stays authoritative under `FOR UPDATE`.
+pub(crate) async fn checkout_currency_refusal(
+    pool: &sqlx::PgPool,
+    fx: crate::fx::FxFeedAdmission,
+    actor: &str,
+    command: &Command,
+    payload: &CreateCheckoutPayload,
+) -> Result<Option<CommandFailure>, sqlx::Error> {
+    if command.aggregate_id != ids::checkout_aggregate_id(command.command_id)
+        || command.expected_revision != 0
+        || payload.lines.is_empty()
+    {
+        return Ok(None);
+    }
+    let ids: Vec<&str> = payload
+        .lines
+        .iter()
+        .map(|line| line.listing_aggregate_id.as_str())
+        .collect();
+    let rows: Vec<CheckoutPreflightListing> = sqlx::query_as(
+        "SELECT aggregate_id, seller_pubky, sale_format, state, server_revision, \
+                unit_price_currency, unit_price_exponent \
+         FROM listings \
+         WHERE aggregate_id = ANY($1) AND deleted_at IS NULL",
+    )
+    .bind(&ids)
+    .fetch_all(pool)
+    .await?;
+    let mut currency: Option<(&str, i32)> = None;
+    for line in &payload.lines {
+        let Some(listing) = rows
+            .iter()
+            .find(|row| row.aggregate_id == line.listing_aggregate_id)
+        else {
+            return Ok(None);
+        };
+        if listing.seller_pubky == actor
+            || listing.sale_format != "fixed_price"
+            || listing.state != "available"
+            || line.expected_revision != listing.server_revision
+        {
+            return Ok(None);
+        }
+        match currency {
+            None => {
+                currency = Some((
+                    listing.unit_price_currency.as_str(),
+                    listing.unit_price_exponent,
+                ));
+            }
+            Some((first_currency, first_exponent))
+                if first_currency != listing.unit_price_currency
+                    || first_exponent != listing.unit_price_exponent =>
+            {
+                return Ok(None);
+            }
+            Some(_) => {}
+        }
+    }
+    let Some((currency, _)) = currency else {
+        return Ok(None);
+    };
+    Ok(crate::handlers::fx_currency_refusal(
+        fx,
+        currency,
+        "payload.lines",
+    ))
 }
 
 pub async fn handle(
@@ -227,6 +314,11 @@ pub async fn handle(
     }
     let currency = first.unit_price_currency.clone();
     let exponent = first.unit_price_exponent;
+    if let Some(refusal) =
+        crate::handlers::fx_currency_refusal(context.fx, &currency, "payload.lines")
+    {
+        return Ok(Err(refusal));
+    }
     // What one unit of each line costs. The variant the line takes its units
     // from sells at its own price when the registration carried one; the
     // listing row is locked above, so the price read here is the one the

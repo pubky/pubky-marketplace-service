@@ -994,7 +994,11 @@ async fn health_reports_the_mode_resolution_moderation_and_fx_source(pool: PgPoo
     assert_eq!(body["listing_moderation"], json!("off"), "no gate");
     assert_eq!(
         body["fx_source"],
-        json!({ "provider": "blocktank", "pinned": true })
+        json!({
+            "provider": "blocktank",
+            "pinned": true,
+            "currencies": ["USD", "EUR", "CHF", "GBP", "JPY", "CAD", "AUD"]
+        })
     );
 
     let store = encode_store();
@@ -1025,7 +1029,27 @@ async fn health_reports_the_mode_resolution_moderation_and_fx_source(pool: PgPoo
     let unpinned = common::reconfigured(&base, |config| {
         config.fx_feed_url = "http://127.0.0.1:9/fx".to_string();
     });
-    assert_eq!(health(&unpinned).await["fx_source"]["pinned"], json!(false));
+    assert_eq!(
+        health(&unpinned).await["fx_source"],
+        json!({
+            "provider": "blocktank",
+            "pinned": false,
+            "currencies": ["USD", "EUR", "CHF", "GBP", "JPY", "CAD", "AUD"]
+        })
+    );
+
+    let kraken = common::reconfigured(&base, |config| {
+        config.fx_feed_provider = marketplace_service::fx::FxFeedProvider::Kraken;
+        config.fx_feed_url = marketplace_service::fx::KRAKEN_FX_URL.to_string();
+    });
+    assert_eq!(
+        health(&kraken).await["fx_source"],
+        json!({
+            "provider": "kraken",
+            "pinned": false,
+            "currencies": ["USD", "EUR", "CHF", "GBP", "JPY", "CAD", "AUD"]
+        })
+    );
 }
 
 async fn server_revision(pool: &PgPool, seller: &str) -> i64 {

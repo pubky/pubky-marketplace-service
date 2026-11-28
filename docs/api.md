@@ -498,7 +498,8 @@ request failed, so clients should branch on HTTP status first, and parse
    outside the EU-27 and GB.
 
    `GET /v1/sellers/{seller_pubky}/annual-limit` answers `{"enabled": false}`
-   with the fence off. On, it answers `enabled`, `year` and `limit_reached` to
+   when EU annual limits are off (fence off, or no EU-27 country resolves to
+   `nuanced`). On, it answers `enabled`, `year` and `limit_reached` to
    any signed-in actor, and to the seller themself also `resident_in_eu`,
    `sales_limit`, `eur_limit_cents`, `sales`, `eur_cents` (EU-resident sellers),
    and `eu_buyer_sales`, `eu_buyer_eur_cents` and `reconfirmation_required`
@@ -2365,7 +2366,11 @@ Liveness plus a capability summary. Always `200` while the process is up:
   "store": { "mode": "marketplace", "seller": null },
   "homeserver_resolution": "fixed",
   "listing_moderation": "on",
-  "fx_source": { "provider": "blocktank", "pinned": true }
+  "fx_source": {
+    "provider": "blocktank",
+    "pinned": true,
+    "currencies": ["USD", "EUR", "CHF", "GBP", "JPY", "CAD", "AUD"]
+  }
 }
 ```
 
@@ -2378,10 +2383,25 @@ bodies do not carry `state`, so their shape is unchanged (see
 `pkarr`; see [Homeserver reads](../README.md#homeserver-reads)).
 `listing_moderation` is `on` when the moderation gate asks the index before a
 sale and `off` when a single-seller deployment set `LISTING_MODERATION=off`.
-`fx_source.provider` names the FX feed the service prices against (always
-`blocktank` today) and `fx_source.pinned` is `true` when `FX_FEED_URL` is the
-pinned Blocktank URL. These are configuration values only; no URL, key or
-secret is reported.
+`fx_source.provider` names the FX feed provider the service prices against
+(`blocktank` in marketplace mode, or `blocktank`, `kraken`, `coinbase`,
+`mempool`, or `bitstamp` in single-seller mode, including claim mode) and
+`fx_source.pinned` is `true` when `fx_source.provider` is `blocktank` at the
+pinned Blocktank URL. `fx_source.currencies` lists the fiat currencies the
+resolved `(FX_FEED_PROVIDER, FX_FEED_URL)` quotes at admission, sampling, and
+bind time (`BTC` and `SAT` are implicit). A default Kraken or Bitstamp URL
+without a single pair lists every fiat that provider's public API supports; one
+explicit Kraken `?pair=<PAIR>` or Bitstamp `/api/v2/ticker/btc<ccy>/` URL lists
+that fiat only. Official `api.coinbase.com` URLs must include
+`/v2/exchange-rates?currency=BTC` (queryless official URLs default to USD on
+Coinbase and are refused at boot; custom Coinbase-format hosts may omit the
+query when they default to BTC). With `PAYKIT_MARKETPLACE_CONTRACT=multi_asset` (upstream Paykit
+only), USD must appear in that list so non-USD orders can quote the `BTCUSD`
+cross rate; a non-USD single-pair feed is for the legacy contract only. With
+`EU_FENCE_ENABLED=true` or any nuanced EU-27 country in `REGION_MODES`, EUR
+must appear in that list so C4 annual limits and EU re-confirmation can convert
+non-EUR totals (blocked-only and open-only region modes do not require EUR).
+These are configuration values only; no URL, key or secret is reported.
 
 `commit` is the first 12 characters of the git SHA the image was built from
 (the `GIT_COMMIT` Docker build arg, set by the production image workflow), or

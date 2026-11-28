@@ -80,6 +80,10 @@ impl StoreMode {
     pub const fn is_claim_mode(&self) -> bool {
         matches!(self, Self::SingleSeller { pinned: None })
     }
+
+    pub const fn is_single_seller(&self) -> bool {
+        !matches!(self, Self::Marketplace)
+    }
 }
 
 /// Both service binaries apply the same claim-mode startup prerequisite.

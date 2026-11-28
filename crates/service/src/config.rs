@@ -236,14 +236,19 @@ pub struct Config {
     /// is bounded (oldest first, 500 rows per pass) and runs under the
     /// locks-verification lease.
     pub locks_snapshot_retention_days: i64,
-    /// The bounded sole FX source URL. Permanently the pinned Blocktank
-    /// BTCUSD ticker endpoint ([`crate::fx::FX_URL`]): a release binary
-    /// CANNOT be repointed by environment — `from_env` never consults
-    /// `FX_FEED_URL`. Integration tests override the field in-process (the
-    /// test harness constructs `Config` directly and points it at a local
-    /// scripted double before building `AppState`); that seam is not
-    /// reachable from any environment variable.
+    /// FX feed provider (`FX_FEED_PROVIDER`, default `blocktank`). Marketplace
+    /// mode stays pinned to `blocktank` at [`crate::fx::FX_URL`]; single-seller
+    /// mode may select a built-in exchange ticker adapter (`kraken`,
+    /// `coinbase`, `mempool`, `bitstamp`) or a custom Blocktank-format URL.
+    pub fx_feed_provider: crate::fx::FxFeedProvider,
+    /// FX feed endpoint URL (`FX_FEED_URL`, default [`crate::fx::FX_URL`]).
+    /// Marketplace mode refuses custom URLs and stays pinned to Blocktank;
+    /// single-seller mode (`STORE_MODE=single_seller` or `STORE_SELLER_PUBKY`
+    /// set) honors operator-chosen URLs. Integration tests may still override
+    /// this field in-process.
     pub fx_feed_url: String,
+    /// Fiat currencies quoted by the resolved `(fx_feed_provider, fx_feed_url)`.
+    pub fx_supported_fiat: &'static [marketplace_domain::currency::Currency],
     /// PayPal `_xclick` checkout base (`PAYPAL_CHECKOUT_URL`). Default is
     /// live `www.paypal.com`; `www.sandbox.paypal.com` is the only other
     /// allowed host.
@@ -274,8 +279,8 @@ pub struct Config {
     /// (`DIGITAL_RELEASE`, default `seller`). Frozen on each such order when
     /// it is paid (`orders.digital_release`).
     pub digital_release: DigitalRelease,
-    /// The one seller the deployment serves (`STORE_SELLER_PUBKY`), or any
-    /// seller when unset ([`crate::store_seller`]).
+    /// Deployment store mode (`STORE_MODE` / `STORE_SELLER_PUBKY`): marketplace
+    /// or single-seller (pinned or first-boot claim, [`crate::store_seller`]).
     pub store_mode: StoreMode,
     /// SHA-256 of the normalized setup code, never its plaintext.
     pub store_claim_code: Option<crate::store_claim::ClaimCode>,
@@ -351,6 +356,11 @@ impl Config {
             Some(modes) => RegionPolicy::explicit(modes),
             None => RegionPolicy::legacy(self.eu_fence_enabled, self.digital_region_block_enabled),
         }
+    }
+
+    pub fn fx_feed_pinned(&self) -> bool {
+        self.fx_feed_provider == crate::fx::FxFeedProvider::Blocktank
+            && self.fx_feed_url == crate::fx::FX_URL
     }
 
     pub fn from_env() -> anyhow::Result<Self> {
@@ -530,10 +540,13 @@ impl Config {
             DEFAULT_DIGITAL_DELIVERY_MAX_BYTES,
         )?;
         let locks_snapshot_retention_days = env_days("LOCKS_SNAPSHOT_RETENTION_DAYS", 90)?;
-        // The FX feed is the pinned Blocktank endpoint, always: the source
-        // is a permanent bounded single source, so no environment variable
-        // is consulted here (a release binary cannot be repointed).
-        let fx_feed_url = crate::fx::FX_URL.to_string();
+        let store_mode =
+            crate::store_seller::store_mode_from_lookup(&|name| std::env::var(name).ok())?;
+        let fx_feed =
+            crate::fx::fx_feed_from_lookup(&|name| std::env::var(name).ok(), &store_mode)?;
+        let fx_feed_provider = fx_feed.provider;
+        let fx_supported_fiat = fx_feed.supported_currencies();
+        let fx_feed_url = fx_feed.url;
         let public_app_origin = env_app_base("PUBLIC_APP_ORIGIN")?;
         let public_service_origin = env_origin("PUBLIC_SERVICE_ORIGIN")?;
         let paypal_checkout_url =
@@ -557,8 +570,6 @@ impl Config {
             PaymentConfirmation::parse(std::env::var("PAYMENT_CONFIRMATION").ok().as_deref())?;
         let digital_release =
             DigitalRelease::parse(std::env::var("DIGITAL_RELEASE").ok().as_deref())?;
-        let store_mode =
-            crate::store_seller::store_mode_from_lookup(&|name| std::env::var(name).ok())?;
         let store_claim_code = crate::store_claim::claim_code_from_lookup(&store_mode, &|name| {
             std::env::var(name).ok()
         })?;
@@ -568,6 +579,16 @@ impl Config {
             1,
             crate::store_claim::MAX_CLAIM_SESSION_MAX_AGE_SECONDS,
         )?;
+        let fx_admission = crate::fx::FxFeedAdmission {
+            provider: fx_feed_provider,
+            supported_fiat: fx_supported_fiat,
+        };
+        crate::fx::ensure_multi_asset_fx_admission(paykit_marketplace_contract, fx_admission)?;
+        let region_policy = match &region_modes {
+            Some(modes) => RegionPolicy::explicit(modes),
+            None => RegionPolicy::legacy(eu_fence_enabled, digital_region_block_enabled),
+        };
+        crate::fx::ensure_region_policy_fx_admission(region_policy, fx_admission)?;
         Ok(Self {
             bind_addr,
             database_url,
@@ -622,7 +643,9 @@ impl Config {
             buyer_email_retention_days,
             buyer_email_unpaid_retention_days,
             locks_snapshot_retention_days,
+            fx_feed_provider,
             fx_feed_url,
+            fx_supported_fiat,
             paypal_checkout_url,
             usdt_payments_enabled,
             paykit_marketplace_assets,
@@ -698,7 +721,9 @@ impl Config {
             buyer_email_retention_days: 30,
             buyer_email_unpaid_retention_days: 7,
             locks_snapshot_retention_days: 90,
+            fx_feed_provider: crate::fx::FxFeedProvider::Blocktank,
             fx_feed_url: crate::fx::FX_URL.to_string(),
+            fx_supported_fiat: &marketplace_domain::currency::Currency::FIAT,
             paypal_checkout_url: DEFAULT_PAYPAL_CHECKOUT_URL.to_string(),
             usdt_payments_enabled: false,
             paykit_marketplace_assets: MarketplaceAssets::BTC_ONLY,
@@ -1028,83 +1053,217 @@ mod tests {
     }
 
     #[test]
-    fn from_env_never_consults_fx_feed_url() {
+    fn from_env_pins_blocktank_in_marketplace_mode_and_refuses_custom_fx_feed() {
         let _guard = ENV_LOCK.lock().expect("env lock");
-        let previous_database_url = std::env::var("DATABASE_URL").ok();
-        let previous_fx_feed_url = std::env::var("FX_FEED_URL").ok();
-        let previous_writer_url = std::env::var("REFUSAL_AUDIT_DATABASE_URL").ok();
-        let previous_retention_url = std::env::var("REFUSAL_AUDIT_RETENTION_DATABASE_URL").ok();
-        let previous_root = std::env::var("REFUSAL_AUDIT_HMAC_ROOT_B64").ok();
-        let previous_epoch = std::env::var("REFUSAL_AUDIT_HMAC_PREVIOUS_KEY_EPOCH").ok();
-        let previous_backup = std::env::var("REFUSAL_AUDIT_BACKUP_EXPIRY_ATTESTED").ok();
-        let previous_replica = std::env::var("REFUSAL_AUDIT_REPLICA_EXPIRY_ATTESTED").ok();
-        let previous_risk = std::env::var("REFUSAL_AUDIT_RESIDUAL_RISK_ACCEPTED").ok();
-        let previous_checkout_hold = std::env::var("CHECKOUT_HOLD_WINDOW_SECONDS").ok();
-        let previous_fiat_window = std::env::var("FIAT_PAYMENT_WINDOW_SECONDS").ok();
-        let previous_bitcoin_window = std::env::var("BITCOIN_PAYMENT_WINDOW_SECONDS").ok();
-        let previous_prepare_ttl = std::env::var("PAYKIT_MAX_PREPARE_TTL_SECONDS").ok();
-        std::env::set_var("DATABASE_URL", "postgres://example.invalid/test");
-        std::env::set_var(
-            "REFUSAL_AUDIT_DATABASE_URL",
-            "postgres://marketplace_refusal_audit_writer_login@audit.example/refusal",
-        );
-        std::env::set_var(
-            "REFUSAL_AUDIT_RETENTION_DATABASE_URL",
-            "postgres://marketplace_refusal_audit_retention@audit.example/refusal",
-        );
-        std::env::set_var(
-            "REFUSAL_AUDIT_HMAC_ROOT_B64",
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [7u8; 32]),
-        );
-        std::env::set_var("REFUSAL_AUDIT_HMAC_KEY_EPOCH", "1");
-        std::env::set_var("REFUSAL_AUDIT_BACKUP_EXPIRY_ATTESTED", "true");
-        std::env::set_var("REFUSAL_AUDIT_REPLICA_EXPIRY_ATTESTED", "true");
-        std::env::set_var("REFUSAL_AUDIT_RESIDUAL_RISK_ACCEPTED", "true");
-        std::env::set_var("FX_FEED_URL", "https://attacker.example/fx");
-        std::env::remove_var("CHECKOUT_HOLD_WINDOW_SECONDS");
-        std::env::remove_var("FIAT_PAYMENT_WINDOW_SECONDS");
-        std::env::remove_var("BITCOIN_PAYMENT_WINDOW_SECONDS");
-        std::env::remove_var("PAYKIT_MAX_PREPARE_TTL_SECONDS");
-        let result = Config::from_env();
-        match previous_database_url {
-            Some(value) => std::env::set_var("DATABASE_URL", value),
-            None => std::env::remove_var("DATABASE_URL"),
-        }
-        match previous_fx_feed_url {
-            Some(value) => std::env::set_var("FX_FEED_URL", value),
-            None => std::env::remove_var("FX_FEED_URL"),
-        }
-        for (name, previous) in [
-            ("REFUSAL_AUDIT_DATABASE_URL", previous_writer_url),
-            (
-                "REFUSAL_AUDIT_RETENTION_DATABASE_URL",
-                previous_retention_url,
-            ),
-            ("REFUSAL_AUDIT_HMAC_ROOT_B64", previous_root),
-            ("REFUSAL_AUDIT_HMAC_KEY_EPOCH", previous_epoch),
-            ("REFUSAL_AUDIT_BACKUP_EXPIRY_ATTESTED", previous_backup),
-            ("REFUSAL_AUDIT_REPLICA_EXPIRY_ATTESTED", previous_replica),
-            ("REFUSAL_AUDIT_RESIDUAL_RISK_ACCEPTED", previous_risk),
-            ("CHECKOUT_HOLD_WINDOW_SECONDS", previous_checkout_hold),
-            ("FIAT_PAYMENT_WINDOW_SECONDS", previous_fiat_window),
-            ("BITCOIN_PAYMENT_WINDOW_SECONDS", previous_bitcoin_window),
-            ("PAYKIT_MAX_PREPARE_TTL_SECONDS", previous_prepare_ttl),
-        ] {
-            match previous {
-                Some(value) => std::env::set_var(name, value),
-                None => std::env::remove_var(name),
-            }
-        }
-        let config = result.expect("from_env succeeds with DATABASE_URL set");
+        let config = from_env_with(&[
+            ("CHECKOUT_HOLD_WINDOW_SECONDS", None),
+            ("FIAT_PAYMENT_WINDOW_SECONDS", None),
+            ("BITCOIN_PAYMENT_WINDOW_SECONDS", None),
+            ("PAYKIT_MAX_PREPARE_TTL_SECONDS", None),
+        ])
+        .expect("from_env succeeds with defaults in marketplace mode");
         assert_eq!(
-            config.fx_feed_url,
-            crate::fx::FX_URL,
-            "a release binary cannot be repointed by FX_FEED_URL"
+            config.fx_feed_provider,
+            crate::fx::FxFeedProvider::Blocktank
         );
+        assert_eq!(config.fx_feed_url, crate::fx::FX_URL);
+        assert!(config.fx_feed_pinned());
         assert_eq!(config.checkout_hold_window_seconds, 900);
         assert_eq!(config.fiat_payment_window_seconds, 600);
         assert_eq!(config.bitcoin_payment_window_seconds, 1_800);
         assert_eq!(config.paykit_max_prepare_ttl_seconds, 900);
+
+        let pinned = from_env_with(&[
+            ("FX_FEED_PROVIDER", Some("blocktank")),
+            ("FX_FEED_URL", Some(crate::fx::FX_URL)),
+        ])
+        .expect("explicit pinned Blocktank URL is allowed in marketplace mode");
+        assert!(pinned.fx_feed_pinned());
+
+        let custom_url_err = from_env_with(&[("FX_FEED_URL", Some("https://attacker.example/fx"))])
+            .expect_err("marketplace mode refuses custom FX_FEED_URL");
+        assert!(
+            custom_url_err
+                .to_string()
+                .contains("allowed only in single-seller mode"),
+            "{custom_url_err}"
+        );
+
+        let provider_err = from_env_with(&[("FX_FEED_PROVIDER", Some("kraken"))])
+            .expect_err("marketplace mode refuses non-blocktank FX_FEED_PROVIDER");
+        assert!(
+            provider_err
+                .to_string()
+                .contains("allowed only in single-seller mode"),
+            "{provider_err}"
+        );
+
+        let explicit_marketplace_err = from_env_with(&[
+            ("STORE_MODE", Some("marketplace")),
+            ("FX_FEED_PROVIDER", Some("kraken")),
+        ])
+        .expect_err("explicit STORE_MODE=marketplace refuses custom FX provider");
+        assert!(
+            explicit_marketplace_err
+                .to_string()
+                .contains("allowed only in single-seller mode"),
+            "{explicit_marketplace_err}"
+        );
+    }
+
+    #[test]
+    fn from_env_honors_custom_fx_feed_in_single_seller_claim_mode() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let claim_kraken = from_env_with(&[
+            ("STORE_MODE", Some("single_seller")),
+            (
+                "FX_FEED_URL",
+                Some("https://api.kraken.com/0/public/Trades?pair=XXBTZUSD&count=1"),
+            ),
+        ])
+        .expect("STORE_MODE=single_seller claim mode accepts custom FX feed");
+        assert_eq!(
+            claim_kraken.store_mode,
+            StoreMode::SingleSeller { pinned: None }
+        );
+        assert_eq!(
+            claim_kraken.fx_feed_provider,
+            crate::fx::FxFeedProvider::Kraken
+        );
+        assert_eq!(
+            claim_kraken.fx_supported_fiat,
+            &[marketplace_domain::currency::Currency::Usd]
+        );
+        assert!(!claim_kraken.fx_feed_pinned());
+
+        let claim_custom = from_env_with(&[
+            ("STORE_MODE", Some("single_seller")),
+            ("FX_FEED_PROVIDER", Some("bitstamp")),
+        ])
+        .expect("STORE_MODE=single_seller claim mode accepts built-in FX provider");
+        assert_eq!(
+            claim_custom.fx_feed_provider,
+            crate::fx::FxFeedProvider::Bitstamp
+        );
+        assert_eq!(claim_custom.fx_feed_url, crate::fx::BITSTAMP_FX_URL);
+        assert!(!claim_custom.fx_feed_pinned());
+    }
+
+    #[test]
+    fn from_env_honors_custom_fx_feed_and_public_ticker_adapters_in_single_seller_mode() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let seller = marketplace_domain::pubky::encode_pubky(&[5; 32]);
+
+        let custom = from_env_with(&[
+            ("STORE_SELLER_PUBKY", Some(seller.as_str())),
+            ("FX_FEED_URL", Some("https://fx.solo.example/rates")),
+        ])
+        .expect("single-seller honors custom Blocktank-format URL");
+        assert_eq!(
+            custom.fx_feed_provider,
+            crate::fx::FxFeedProvider::Blocktank
+        );
+        assert_eq!(custom.fx_feed_url, "https://fx.solo.example/rates");
+        assert!(!custom.fx_feed_pinned());
+
+        let kraken = from_env_with(&[
+            ("STORE_SELLER_PUBKY", Some(seller.as_str())),
+            ("FX_FEED_PROVIDER", Some("kraken")),
+        ])
+        .expect("single-seller honors built-in Kraken adapter");
+        assert_eq!(kraken.fx_feed_provider, crate::fx::FxFeedProvider::Kraken);
+        assert_eq!(kraken.fx_feed_url, crate::fx::KRAKEN_FX_URL);
+        assert!(!kraken.fx_feed_pinned());
+
+        let mempool = from_env_with(&[
+            ("STORE_SELLER_PUBKY", Some(seller.as_str())),
+            ("FX_FEED_URL", Some(crate::fx::MEMPOOL_FX_URL)),
+        ])
+        .expect("single-seller infers Mempool adapter from official URL");
+        assert_eq!(mempool.fx_feed_provider, crate::fx::FxFeedProvider::Mempool);
+        assert_eq!(mempool.fx_feed_url, crate::fx::MEMPOOL_FX_URL);
+        assert!(!mempool.fx_feed_pinned());
+
+        let self_hosted_coinbase = from_env_with(&[
+            ("STORE_SELLER_PUBKY", Some(seller.as_str())),
+            ("FX_FEED_PROVIDER", Some("coinbase")),
+            ("FX_FEED_URL", Some("http://127.0.0.1:8999/exchange-rates")),
+        ])
+        .expect("single-seller honors explicit provider with custom URL");
+        assert_eq!(
+            self_hosted_coinbase.fx_feed_provider,
+            crate::fx::FxFeedProvider::Coinbase
+        );
+        assert_eq!(
+            self_hosted_coinbase.fx_feed_url,
+            "http://127.0.0.1:8999/exchange-rates"
+        );
+        assert!(!self_hosted_coinbase.fx_feed_pinned());
+
+        let custom_host_coinbase = from_env_with(&[
+            ("STORE_SELLER_PUBKY", Some(seller.as_str())),
+            ("FX_FEED_PROVIDER", Some("coinbase")),
+            (
+                "FX_FEED_URL",
+                Some("https://fx.solo.example/v2/exchange-rates"),
+            ),
+        ])
+        .expect("custom Coinbase-format host may omit query when it defaults to BTC");
+        assert_eq!(
+            custom_host_coinbase.fx_feed_provider,
+            crate::fx::FxFeedProvider::Coinbase
+        );
+
+        let official_coinbase = from_env_with(&[
+            ("STORE_SELLER_PUBKY", Some(seller.as_str())),
+            (
+                "FX_FEED_URL",
+                Some("https://api.coinbase.com/v2/exchange-rates?currency=BTC"),
+            ),
+        ])
+        .expect("official Coinbase URL with currency=BTC boots");
+        assert_eq!(
+            official_coinbase.fx_feed_provider,
+            crate::fx::FxFeedProvider::Coinbase
+        );
+
+        for bad_coinbase in [
+            "https://api.coinbase.com/v2/exchange-rates",
+            "https://api.coinbase.com/v2/exchange-rates/",
+            "https://api.coinbase.com/v2/exchange-rates?",
+            "https://API.COINBASE.COM/v2/exchange-rates",
+            "https://api.coinbase.com./v2/exchange-rates",
+            "https://api.coinbase.com/v2/exchange-rates?currency=btc",
+        ] {
+            for provider in [None, Some("coinbase")] {
+                let err = from_env_with(&[
+                    ("STORE_SELLER_PUBKY", Some(seller.as_str())),
+                    ("FX_FEED_PROVIDER", provider),
+                    ("FX_FEED_URL", Some(bad_coinbase)),
+                ])
+                .expect_err("queryless or non-BTC official Coinbase URL must fail closed at boot");
+                assert!(
+                    err.to_string().contains("currency=BTC"),
+                    "{bad_coinbase} (provider={provider:?}): {err}"
+                );
+            }
+        }
+
+        for bad_url in [
+            "http://fx.solo.example/rates",
+            "https://169.254.169.254/latest/meta-data/",
+            "https://[::ffff:169.254.169.254]/fx",
+            "https://[fe80::1]/fx",
+        ] {
+            assert!(
+                from_env_with(&[
+                    ("STORE_SELLER_PUBKY", Some(seller.as_str())),
+                    ("FX_FEED_URL", Some(bad_url)),
+                ])
+                .is_err(),
+                "{bad_url} must be refused at boot"
+            );
+        }
     }
 
     #[test]
@@ -1531,7 +1690,15 @@ mod tests {
             ("PAYKIT_SERVER_API", None),
             ("PAYMENT_CONFIRMATION", None),
             ("DIGITAL_RELEASE", None),
+            ("STORE_MODE", None),
             ("STORE_SELLER_PUBKY", None),
+            ("STORE_CLAIM_TOKEN", None),
+            ("STORE_CLAIM_SESSION_MAX_AGE_SECONDS", None),
+            ("EU_FENCE_ENABLED", None),
+            ("DIGITAL_REGION_BLOCK_ENABLED", None),
+            ("REGION_MODES", None),
+            ("FX_FEED_PROVIDER", None),
+            ("FX_FEED_URL", None),
         ];
         vars.extend_from_slice(extra);
         let _guard = EnvGuard::set(&vars);
@@ -1714,6 +1881,198 @@ mod tests {
             );
         }
         assert!(from_env_with(&[("PAYKIT_MARKETPLACE_CONTRACT", Some("both"))]).is_err());
+    }
+
+    #[test]
+    fn multi_asset_contract_requires_usd_in_the_fx_feed() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let seller = marketplace_domain::pubky::encode_pubky(&[4; 32]);
+        for (fx_url, message) in [
+            (
+                "https://api.kraken.com/0/public/Trades?pair=XXBTZEUR&count=1",
+                crate::fx::MULTI_ASSET_REQUIRES_USD_FX,
+            ),
+            (
+                "https://www.bitstamp.net/api/v2/ticker/btceur/",
+                crate::fx::MULTI_ASSET_REQUIRES_USD_FX,
+            ),
+        ] {
+            let refused = from_env_with(&[
+                ("STORE_SELLER_PUBKY", Some(seller.as_str())),
+                ("PAYKIT_SERVER_API", Some("upstream")),
+                ("PAYKIT_MARKETPLACE_CONTRACT", Some("multi_asset")),
+                ("FX_FEED_URL", Some(fx_url)),
+            ])
+            .expect_err("non-USD single-pair feeds cannot run multi_asset");
+            assert!(refused.to_string().contains(message), "{fx_url}: {refused}");
+        }
+        let accepted = from_env_with(&[
+            ("STORE_SELLER_PUBKY", Some(seller.as_str())),
+            ("PAYKIT_SERVER_API", Some("upstream")),
+            ("PAYKIT_MARKETPLACE_CONTRACT", Some("multi_asset")),
+            (
+                "FX_FEED_URL",
+                Some("https://api.kraken.com/0/public/Trades?pair=XXBTZUSD&count=1"),
+            ),
+        ])
+        .expect("USD single-pair is valid with multi_asset");
+        assert!(accepted
+            .fx_supported_fiat
+            .contains(&marketplace_domain::currency::Currency::Usd));
+    }
+
+    #[test]
+    fn regional_c4_eu_limits_require_eur_in_the_fx_feed_at_boot() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let seller = marketplace_domain::pubky::encode_pubky(&[6; 32]);
+        let non_eur_urls = [
+            "https://api.kraken.com/0/public/Trades?pair=XXBTZUSD&count=1",
+            "https://www.bitstamp.net/api/v2/ticker/btcusd/",
+            "https://www.bitstamp.net/api/v2/ticker/btcgbp/",
+        ];
+
+        // Legacy EU_FENCE_ENABLED=true and any REGION_MODES with a nuanced EU-27 country
+        // refuse non-EUR single-pair feeds in both pinned and claim single-seller modes.
+        for store_vars in [
+            vec![("STORE_SELLER_PUBKY", Some(seller.as_str()))],
+            vec![("STORE_MODE", Some("single_seller"))],
+        ] {
+            for (region_vars, label) in [
+                (vec![("EU_FENCE_ENABLED", Some("true"))], "legacy eu_fence"),
+                (
+                    vec![("REGION_MODES", Some("EU=nuanced,GB=nuanced"))],
+                    "eu+gb nuanced",
+                ),
+                (
+                    vec![("REGION_MODES", Some("EU=nuanced,GB=nuanced,US=blocked"))],
+                    "eu+gb nuanced us blocked",
+                ),
+                (
+                    vec![("REGION_MODES", Some("EU=blocked,DE=nuanced"))],
+                    "single eu country nuanced",
+                ),
+                (vec![("REGION_MODES", Some("FR=nuanced"))], "fr nuanced"),
+            ] {
+                for fx_url in non_eur_urls {
+                    let mut vars = store_vars.clone();
+                    vars.extend_from_slice(&region_vars);
+                    vars.push(("FX_FEED_URL", Some(fx_url)));
+                    let err = from_env_with(&vars).expect_err("must reject non-EUR feed");
+                    assert!(
+                        err.to_string()
+                            .contains(crate::fx::EU_LIMITS_REQUIRE_EUR_FX),
+                        "{label} / {fx_url}: {err}"
+                    );
+                }
+            }
+        }
+
+        // Open-only, blocked-only, digital-only, GB-only-nuanced, and REGION_MODES
+        // overrides of EU_FENCE_ENABLED=true all admit USD-only feeds (including multi_asset).
+        for (region_vars, label) in [
+            (vec![], "all off"),
+            (
+                vec![("DIGITAL_REGION_BLOCK_ENABLED", Some("true"))],
+                "digital only",
+            ),
+            (vec![("REGION_MODES", Some("none"))], "region_modes none"),
+            (
+                vec![
+                    ("EU_FENCE_ENABLED", Some("true")),
+                    ("REGION_MODES", Some("none")),
+                ],
+                "none overrides legacy eu_fence",
+            ),
+            (
+                vec![
+                    ("EU_FENCE_ENABLED", Some("true")),
+                    ("REGION_MODES", Some("EU=blocked,GB=blocked,US=blocked")),
+                ],
+                "blocked launch overrides legacy eu_fence",
+            ),
+            (
+                vec![("REGION_MODES", Some("EU=blocked,GB=nuanced,US=blocked"))],
+                "gb nuanced only",
+            ),
+            (
+                vec![("REGION_MODES", Some("US=blocked"))],
+                "us blocked only",
+            ),
+            (
+                vec![("REGION_MODES", Some("EU=nuanced,EU=blocked"))],
+                "eu overridden to blocked",
+            ),
+            (
+                vec![("REGION_MODES", Some("DE=nuanced,DE=open"))],
+                "de overridden to open",
+            ),
+        ] {
+            for fx_url in [
+                "https://api.kraken.com/0/public/Trades?pair=XXBTZUSD&count=1",
+                "https://www.bitstamp.net/api/v2/ticker/btcusd/",
+            ] {
+                let mut vars = vec![
+                    ("STORE_MODE", Some("single_seller")),
+                    ("PAYKIT_SERVER_API", Some("upstream")),
+                    ("PAYKIT_MARKETPLACE_CONTRACT", Some("multi_asset")),
+                    ("FX_FEED_URL", Some(fx_url)),
+                ];
+                vars.extend_from_slice(&region_vars);
+                let cfg = from_env_with(&vars)
+                    .unwrap_or_else(|err| panic!("{label} / {fx_url} must boot: {err}"));
+                assert_eq!(
+                    cfg.fx_supported_fiat,
+                    &[marketplace_domain::currency::Currency::Usd]
+                );
+            }
+        }
+
+        // EUR-only feeds remain valid with nuanced EU under legacy contract,
+        // and multi-currency feeds (including Bitstamp all-pairs) stay valid
+        // with nuanced EU + multi_asset.
+        let eur_legacy = from_env_with(&[
+            ("STORE_MODE", Some("single_seller")),
+            ("REGION_MODES", Some("EU=nuanced,GB=nuanced")),
+            (
+                "FX_FEED_URL",
+                Some("https://api.kraken.com/0/public/Trades?pair=XXBTZEUR&count=1"),
+            ),
+        ])
+        .expect("EUR-only legacy boots with EU=nuanced");
+        assert_eq!(
+            eur_legacy.fx_supported_fiat,
+            &[marketplace_domain::currency::Currency::Eur]
+        );
+
+        let eur_multi_err = from_env_with(&[
+            ("STORE_MODE", Some("single_seller")),
+            ("REGION_MODES", Some("EU=nuanced,GB=nuanced")),
+            ("PAYKIT_SERVER_API", Some("upstream")),
+            ("PAYKIT_MARKETPLACE_CONTRACT", Some("multi_asset")),
+            (
+                "FX_FEED_URL",
+                Some("https://www.bitstamp.net/api/v2/ticker/btceur/"),
+            ),
+        ])
+        .expect_err("EUR-only cannot run multi_asset");
+        assert!(eur_multi_err
+            .to_string()
+            .contains(crate::fx::MULTI_ASSET_REQUIRES_USD_FX));
+
+        let bitstamp_all = from_env_with(&[
+            ("STORE_MODE", Some("single_seller")),
+            ("REGION_MODES", Some("EU=nuanced,GB=nuanced,US=blocked")),
+            ("PAYKIT_SERVER_API", Some("upstream")),
+            ("PAYKIT_MARKETPLACE_CONTRACT", Some("multi_asset")),
+            ("FX_FEED_PROVIDER", Some("bitstamp")),
+        ])
+        .expect("Bitstamp all-pairs (USD/EUR/GBP) boots with EU=nuanced + multi_asset");
+        assert!(bitstamp_all
+            .fx_supported_fiat
+            .contains(&marketplace_domain::currency::Currency::Usd));
+        assert!(bitstamp_all
+            .fx_supported_fiat
+            .contains(&marketplace_domain::currency::Currency::Eur));
     }
 
     #[test]
