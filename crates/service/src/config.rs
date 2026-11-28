@@ -28,6 +28,27 @@ pub const MAX_REVIEW_BLIND_WINDOW_DAYS: i64 = 90;
 pub const AUTOMATION_RATE_LIMIT_MAX_TOKENS: i64 = 20_000;
 /// Hard deployment-policy ceiling for accepted upstream preparation TTLs.
 pub const MAX_PAYKIT_PREPARE_TTL_SECONDS: i64 = 86_400;
+/// Default `LOCKS_LIVE_TASK_HOLD_SECONDS`: paykit-server's default
+/// `payment_window` (24 h), plus the 10 minutes the Lock Server allows
+/// between proof submission and invoice creation, plus a 2-hour
+/// confirmation allowance for a payment seen before the Paykit deadline.
+/// The registration grace ([`crate::locks::REGISTRATION_GRACE_SECONDS`])
+/// takes 600 s of that allowance.
+pub const DEFAULT_LOCKS_LIVE_TASK_HOLD_SECONDS: i64 = 86_400 + 600 + 7_200;
+/// Smallest `LOCKS_LIVE_TASK_HOLD_SECONDS`: the Lock Server's invoice
+/// admission alone.
+pub const MIN_LOCKS_LIVE_TASK_HOLD_SECONDS: i64 = 600;
+/// paykit-server's default `payment_window` (24 h) plus the Lock Server's
+/// 600 s invoice admission plus the 600 s registration grace: the latest
+/// default Paykit deadline after the hold window, for a bundle submitted
+/// and registered at the end of the grace. A smaller
+/// `LOCKS_LIVE_TASK_HOLD_SECONDS` is accepted with a startup warning,
+/// because it is safe only with a Lock Server whose Paykit `payment_window`
+/// is that much shorter, which the service cannot see.
+pub const PAYKIT_DEFAULT_LOCKS_DEADLINE_SECONDS: i64 =
+    86_400 + 600 + crate::locks::REGISTRATION_GRACE_SECONDS;
+/// Largest `LOCKS_LIVE_TASK_HOLD_SECONDS` (30 days).
+pub const MAX_LOCKS_LIVE_TASK_HOLD_SECONDS: i64 = 2_592_000;
 
 /// The default edge header carrying the client's country.
 pub const DEFAULT_CLIENT_COUNTRY_HEADER: &str = "x-client-region";
@@ -87,14 +108,30 @@ pub struct Config {
     /// run in sequence, so it caps how long a slow homeserver can delay the
     /// rest of the pass; it must leave the task lease half its length.
     pub listing_deletion_pass_budget_ms: u64,
-    /// Marketplace payment window armed by `payment.register_locks`: the
+    /// Marketplace payment window armed by `payment.prepare_locks`: the
     /// lock point acquires the order's inventory hold and this window bounds
     /// it — the correlation window IS the hold window. A payment still
     /// awaiting entitlement when it elapses moves to `expired`, the order is
-    /// cancelled, and the hold restocks. Deliberately separate from upstream
-    /// failure — Locks v1 leaves transport/status failures pending
-    /// (ADR-0019 §7).
+    /// cancelled, and the hold restocks, unless its registered task is live
+    /// or not yet looked up (`locks_live_task_hold_seconds`), or the payment
+    /// is prepared but not registered
+    /// ([`crate::locks::REGISTRATION_GRACE_SECONDS`]).
+    /// Deliberately separate from upstream failure; Locks v1 leaves
+    /// transport/status failures pending (ADR-0019 §7).
     pub locks_payment_window_seconds: i64,
+    /// How long past `locks_payment_window_seconds` a Locks order stays held
+    /// while its registered task is live or not yet looked up
+    /// (`LOCKS_LIVE_TASK_HOLD_SECONDS`, default
+    /// [`DEFAULT_LOCKS_LIVE_TASK_HOLD_SECONDS`], range 600..=2592000). The
+    /// operator must keep it above the Lock Server's Paykit `payment_window`
+    /// plus 600 s of invoice admission plus the 600 s registration grace, or
+    /// a payment confirming before the Paykit deadline can find its unit
+    /// released. Only the range is
+    /// enforced, with a startup warning below
+    /// [`PAYKIT_DEFAULT_LOCKS_DEADLINE_SECONDS`]: neither the lock nor the
+    /// Lock Server's task lookup carries that window, and the service does
+    /// not query Paykit for Locks orders.
+    pub locks_live_task_hold_seconds: i64,
     /// Unbound leftover cancel (`CHECKOUT_HOLD_WINDOW_SECONDS`, default
     /// 900, minimum 60). Ordinary `checkout.create` does not hold stock;
     /// this window cancels `pending_payment` rows with `stock_held=false`
@@ -452,6 +489,22 @@ impl Config {
         if locks_payment_window_seconds < 60 {
             anyhow::bail!("LOCKS_PAYMENT_WINDOW_SECONDS must be at least 60");
         }
+        let locks_live_task_hold_seconds = bounded_i64(
+            "LOCKS_LIVE_TASK_HOLD_SECONDS",
+            DEFAULT_LOCKS_LIVE_TASK_HOLD_SECONDS,
+            MIN_LOCKS_LIVE_TASK_HOLD_SECONDS,
+            MAX_LOCKS_LIVE_TASK_HOLD_SECONDS,
+        )?;
+        if locks_live_task_hold_seconds < PAYKIT_DEFAULT_LOCKS_DEADLINE_SECONDS {
+            tracing::warn!(
+                locks_live_task_hold_seconds,
+                "LOCKS_LIVE_TASK_HOLD_SECONDS is below paykit-server's default payment_window \
+                 plus invoice admission plus the registration grace \
+                 ({PAYKIT_DEFAULT_LOCKS_DEADLINE_SECONDS} s): a Locks \
+                 order can be released while its task can still complete, unless the Lock \
+                 Server's Paykit payment_window is that much shorter"
+            );
+        }
         let checkout_hold_window_seconds = env_i64("CHECKOUT_HOLD_WINDOW_SECONDS", 900)?;
         if checkout_hold_window_seconds < 60 {
             anyhow::bail!("CHECKOUT_HOLD_WINDOW_SECONDS must be at least 60");
@@ -617,6 +670,7 @@ impl Config {
             worker_lease_seconds,
             listing_deletion_pass_budget_ms,
             locks_payment_window_seconds,
+            locks_live_task_hold_seconds,
             checkout_hold_window_seconds,
             fiat_payment_window_seconds,
             bitcoin_payment_window_seconds,
@@ -692,6 +746,7 @@ impl Config {
             worker_lease_seconds: 30,
             listing_deletion_pass_budget_ms: 10_000,
             locks_payment_window_seconds: 3_600,
+            locks_live_task_hold_seconds: DEFAULT_LOCKS_LIVE_TASK_HOLD_SECONDS,
             checkout_hold_window_seconds: 900,
             // Integration clocks keep the prior 1 h / 2 h rails so bind and
             // late-money tests stay independent of production 600 / 1800
@@ -1007,7 +1062,7 @@ mod tests {
         parse_review_blind_window_days, refusal_audit_keys_from_env, reject_audit_url_reuse,
         required_postgres_url, validate_postgres_url, Config, DigitalRelease, PaymentConfirmation,
         AUTOMATION_RATE_LIMIT_MAX_TOKENS, DEFAULT_AUTO_COMPLETE_DAYS, DEFAULT_DELIVERY_ASSUME_DAYS,
-        DEFAULT_PAYPAL_CHECKOUT_URL,
+        DEFAULT_LOCKS_LIVE_TASK_HOLD_SECONDS, DEFAULT_PAYPAL_CHECKOUT_URL,
     };
     use crate::payment_attempt::{MarketplaceAssets, MarketplaceContract};
     use crate::store_seller::StoreMode;
@@ -1060,6 +1115,7 @@ mod tests {
             ("FIAT_PAYMENT_WINDOW_SECONDS", None),
             ("BITCOIN_PAYMENT_WINDOW_SECONDS", None),
             ("PAYKIT_MAX_PREPARE_TTL_SECONDS", None),
+            ("LOCKS_LIVE_TASK_HOLD_SECONDS", None),
         ])
         .expect("from_env succeeds with defaults in marketplace mode");
         assert_eq!(
@@ -1072,6 +1128,26 @@ mod tests {
         assert_eq!(config.fiat_payment_window_seconds, 600);
         assert_eq!(config.bitcoin_payment_window_seconds, 1_800);
         assert_eq!(config.paykit_max_prepare_ttl_seconds, 900);
+        assert_eq!(config.locks_live_task_hold_seconds, 94_200);
+        let live_task_hold_refusals: Vec<(&str, bool)> = ["599", "600", "2592000", "2592001"]
+            .into_iter()
+            .map(|value| {
+                (
+                    value,
+                    from_env_with(&[("LOCKS_LIVE_TASK_HOLD_SECONDS", Some(value))]).is_err(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            live_task_hold_refusals,
+            [
+                ("599", true),
+                ("600", false),
+                ("2592000", false),
+                ("2592001", true)
+            ],
+            "LOCKS_LIVE_TASK_HOLD_SECONDS is validated at startup"
+        );
 
         let pinned = from_env_with(&[
             ("FX_FEED_PROVIDER", Some("blocktank")),
@@ -1467,6 +1543,35 @@ mod tests {
 
         let (_, logs) = from_env_with_region_env(Some("none"), None, None);
         assert!(logs.is_empty(), "no legacy flag, no warning: {logs}");
+    }
+
+    #[test]
+    fn a_locks_live_task_hold_below_paykits_default_deadline_is_accepted_with_a_warning() {
+        for (value, expected, warns) in [
+            (None, DEFAULT_LOCKS_LIVE_TASK_HOLD_SECONDS, false),
+            (Some("600"), 600, true),
+            (Some("87599"), 87_599, true),
+            (Some("87600"), 87_600, false),
+            (Some("2592000"), 2_592_000, false),
+        ] {
+            let _guard = ENV_LOCK.lock().expect("env lock");
+            let logs = LogBuffer::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .finish();
+            let config = tracing::subscriber::with_default(subscriber, || {
+                from_env_with(&[("LOCKS_LIVE_TASK_HOLD_SECONDS", value)])
+            })
+            .expect("from_env accepts the hold");
+            let logs = String::from_utf8(logs.0.lock().expect("log buffer").clone()).expect("utf8");
+            assert_eq!(config.locks_live_task_hold_seconds, expected, "{value:?}");
+            assert_eq!(
+                logs.contains("WARN") && logs.contains("LOCKS_LIVE_TASK_HOLD_SECONDS is below"),
+                warns,
+                "{value:?}: {logs}"
+            );
+        }
     }
 
     #[test]

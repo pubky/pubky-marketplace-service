@@ -83,6 +83,59 @@ path holds while it waits for that path's variant row. Every path above
 expiry, reservation expiry, the Bitcoin re-hold, `inventory.adjust`,
 registration and sync) takes the listing row first.
 
+## A payment, then its Locks correlation, then its order
+
+A path that locks a Locks payment's `payment_locks_correlations` row together
+with the payment locks the payment row first. `payment.prepare_locks` and
+`payment.register_locks` then lock the correlation and the order. The
+held-window sweep (`workers::expire_due_payment_windows`) does the same: its
+discovery statement locks the payment, then `lock_held_due_order` locks the
+correlation and the order and checks the whole sweep predicate again,
+including whether the payment is prepared or its task is live. The
+correlation stays locked until the sweep commits, so a status the verifier
+records after discovery is either visible to that check or written after the
+sweep commits, and a registration waits for the payment the sweep holds. The
+buyer's `order.cancel_request` on a Locks payment takes the same three locks
+in the same order before it checks the same predicate, and appends its
+`buyer_cancelled` observation under the correlation lock it holds.
+
+The completion paths (`apply_completed_lifecycle`, `apply_manual_review`,
+`park_unverified_completion`) lock the payment first as well, then the
+correlation; `apply_completed_lifecycle` then locks the order, so every
+path takes the three in the same order. The verifier's status writes
+(`claim_next_due_correlation`, `record_status_observation`,
+`record_upstream_terminal`, `record_binding_refusal`,
+`bound_unverified_retry`) lock the correlation row alone and take no other
+row lock while holding it. The sweep therefore waits for the correlation
+instead of skipping it: nothing that holds it waits for a lock the sweep
+holds.
+
+Each lifecycle claim takes the next `claim_generation` of the row, and every
+one of the writes above requires the row to still carry the generation its
+claim took; the completion paths check it under the correlation lock before
+any payment or order effect. Workers take one oldest due correlation just before its
+lookup. A claim starts its clock after waiting for the task lease and the
+table lock needed by its update. Other workers can still claim different
+rows while a lookup is in flight. They can reclaim the same row after the
+poll interval or the ten-second HTTP timeout, whichever is longer. A
+later claim fences any remaining work from the old claim.
+
+These paths judge time only once the locks their time checks depend on are
+held. Registration, the buyer's cancel and a first preparation read the
+injected clock once the payment, correlation and order are locked; a
+preparation replay, which reads no order fields, reads it once the payment
+and correlation are locked. The sweep advances its tick instant by the
+clock's movement up to the moment the correlation lock is granted. The
+registration grace, the live-task bound, the armed hold and every timestamp
+these paths take from the clock therefore use an instant read after those
+waits, so a transaction that enters before a bound and waits across it is
+judged past the bound. Work after the read does not move it: a first
+preparation still reads the seller's homeserver records and waits for the
+seller's region lock and its listing and variant rows, and a cancel or a
+sweep waits for the stock rows it releases, so a first preparation's window
+can start up to that long before it commits. No time check depends on those
+rows.
+
 ## Where a retry is enough
 
 `workers::expire_due_payment_windows` and `expiry::expire_due_reservations`

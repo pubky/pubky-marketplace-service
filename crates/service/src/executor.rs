@@ -1139,7 +1139,7 @@ async fn dispatch(
                 command,
                 payload,
                 state.locks.as_deref(),
-                now,
+                state.clock.as_ref(),
             )
             .await
         }
@@ -1154,12 +1154,20 @@ async fn dispatch(
                 &reads.locks,
                 state.config.locks_payment_window_seconds,
                 state.config.region_policy().fence_modes(),
-                now,
+                state.clock.as_ref(),
             )
             .await
         }
         CommandPayload::RequestCancellation(payload) => {
-            crate::handlers::cancellation::request(tx, actor, command, payload, now).await
+            crate::handlers::cancellation::request(
+                tx,
+                actor,
+                command,
+                payload,
+                state.config.locks_live_task_hold_seconds,
+                state.clock.as_ref(),
+            )
+            .await
         }
         CommandPayload::ApproveCancellation(payload) => {
             crate::handlers::cancellation::approve(tx, actor, command, payload, now).await
