@@ -179,11 +179,13 @@ pub async fn execute_with_edge(
         }
     }
 
-    // Commerce in a blocked region (`REGION_MODES`): buying, starting a
-    // payment and selling are refused for a blocked declared country, a
-    // blocked or unknown IP country and a blocked seller shop country. Only
-    // the commands that start new commerce are checked; a replay is answered
-    // from its stored result.
+    // Commerce in a blocked region (`REGION_MODES`): buying and selling are
+    // refused for a blocked declared/shop country, a blocked IP country, or
+    // an unknown IP country when `UNKNOWN=blocked` is explicitly set;
+    // starting a payment on an already-admitted order checks its stored
+    // declared buyer, destination and seller shop country without
+    // re-checking the live request IP. Only commands that start new commerce
+    // are checked; a replay is answered from its stored result.
     if state.config.region_policy().commerce_active()
         && crate::commerce_region::is_gated(&command.payload)
         && stored_command_result(&state.pool, actor, command.command_id)

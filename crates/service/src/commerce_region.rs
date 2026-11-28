@@ -12,11 +12,11 @@
 //!   blocked (`buyer_region_blocked`), when the request's own country from
 //!   the trusted edge header is blocked (`buyer_ip_blocked`), or when the
 //!   edge sent none and unknown origins are blocked (`buyer_region_unknown`).
-//!   A buyer cannot dodge a block by declaring Switzerland from a US IP or by
-//!   sending no header.
+//!   A buyer cannot dodge a block by declaring Switzerland from a US IP.
 //! - **Starting a payment:** `payment.prepare_locks` and the HTTP payment
-//!   method bind check the buyer's request against the country the buyer
-//!   declared at checkout, and the seller's shop country.
+//!   method bind check the country the buyer declared at checkout, the
+//!   destination country and the seller's shop country, without re-checking
+//!   the live request IP on an already-admitted order.
 //! - **Selling:** `listing.register`, `listing.sync`, `drop.sync` and the
 //!   seller's payment setup are refused with `SELLER_UNAVAILABLE_IN_REGION`
 //!   when the seller's shop country is blocked (`seller_region_blocked`) or,
@@ -34,9 +34,10 @@
 //! fulfillment, delivery, reviews, reads and takedowns are never gated, so
 //! nobody is trapped with money in flight.
 //!
-//! Unknown origins fail closed for commerce commands only; every other
-//! request never reads the region. With no blocked region configured nothing
-//! here reads the database or refuses.
+//! Unknown origins default to open and are refused for commerce commands
+//! only when `UNKNOWN=blocked` is explicitly configured; every other request
+//! never reads the region. With no blocked region configured nothing here
+//! reads the database or refuses.
 
 use marketplace_domain::commands::{Command, CommandPayload};
 use marketplace_domain::ErrorCode;
@@ -49,7 +50,7 @@ use crate::refusal_audit::RefusalKind;
 use crate::region_fence::{
     read_sellers, region_refusal, unavailable, REASON_SELLER_REGION_BLOCKED, SELLER_BLOCKED_MESSAGE,
 };
-use crate::region_policy::{Block, IpBlock};
+use crate::region_policy::{Block, IpBlock, Mode};
 use crate::result::CommandFailure;
 use crate::AppState;
 
@@ -149,7 +150,7 @@ pub async fn gate(
                 unavailable()
             })?;
             match order {
-                Some(order) => start_payment_check(state, order, edge).await,
+                Some(order) => start_payment_check(state, order).await,
                 None => Ok(()),
             }
         }
@@ -180,7 +181,7 @@ pub async fn gate_bind(
     state: &AppState,
     actor: &str,
     order_id: uuid::Uuid,
-    edge: &EdgeContext,
+    _edge: &EdgeContext,
 ) -> Result<(), CommandFailure> {
     if !state.config.region_policy().commerce_active() {
         return Ok(());
@@ -198,7 +199,7 @@ pub async fn gate_bind(
         unavailable()
     })?;
     match order {
-        Some(order) => start_payment_check(state, order, edge).await,
+        Some(order) => start_payment_check(state, order).await,
         None => Ok(()),
     }
 }
@@ -275,27 +276,26 @@ struct OrderFacts {
     destination_country: Option<String>,
 }
 
-/// A payment starts from the country the buyer declared at checkout and the
-/// request's own country now. The seller's shop country is the frozen one,
-/// else the shop record is read now (fail closed), so a seller who moved to a
-/// blocked region after checkout takes no payment.
-async fn start_payment_check(
-    state: &AppState,
-    order: OrderFacts,
-    edge: &EdgeContext,
-) -> Result<(), CommandFailure> {
-    buyer_check(state, order.buyer_country.as_deref(), edge)?;
+/// A payment starts from the country the buyer declared at checkout, the
+/// destination country and the seller's shop country (the frozen one, else
+/// the shop record is read now, fail closed, so a seller who moved to a
+/// blocked region after checkout takes no payment). An already-admitted order
+/// does not re-check the live request IP at payment start.
+async fn start_payment_check(state: &AppState, order: OrderFacts) -> Result<(), CommandFailure> {
+    let modes = state.config.region_policy().modes();
+    if order
+        .buyer_country
+        .as_deref()
+        .is_some_and(|country| modes.mode_of(country) == Mode::Blocked)
+    {
+        return Err(buyer_refusal(Block::Declared));
+    }
     destination_check(state, order.destination_country.as_deref())?;
     let seller_country = match order.seller_country {
         Some(country) => Some(country),
         None => shop_country(state, &order.seller_pubky).await?,
     };
-    if state
-        .config
-        .region_policy()
-        .modes()
-        .shop_country_blocked(seller_country.as_deref())
-    {
+    if modes.shop_country_blocked(seller_country.as_deref()) {
         return Err(region_refusal(
             REASON_SELLER_REGION_BLOCKED,
             SELLER_BLOCKED_MESSAGE,

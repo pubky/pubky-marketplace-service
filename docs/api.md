@@ -442,32 +442,41 @@ request failed, so clients should branch on HTTP status first, and parse
    record the service cannot read is refused with `UPSTREAM_UNAVAILABLE`.
 
    `DIGITAL_UNAVAILABLE_IN_REGION` exists only while
-   `DIGITAL_REGION_BLOCK_ENABLED` is on (see
+   `DIGITAL_REGION_BLOCK_ENABLED` is on or `REGION_MODES` sets a nuanced region
+   or `UNKNOWN=nuanced` (see
    [Digital sales to EU and UK buyers](../README.md#digital-sales-to-eu-and-uk-buyers)):
    `checkout.create` and `offer.checkout` with a digital line, from a buyer whose
    `payload.buyer_country` is in the EU-27 (`reason: "eu_buyer"`) or is `GB`
    (`reason: "gb_buyer"`), or whose request country (the header named by
    `CLIENT_COUNTRY_HEADER`, set by the trusted edge from the client's IP) is in
-   the EU-27 (`reason: "eu_ip"`) or is `GB` (`reason: "gb_ip"`); with no usable
-   request country the digital line is refused with `reason:
-   "buyer_region_unknown"`. Such a command must carry `buyer_country` (422
-   `INVALID_COMMAND` without it).
+   the EU-27 (`reason: "eu_ip"`) or is `GB` (`reason: "gb_ip"`). An absent or
+   unusable request country (`XX`, `ZZ`, `T1`) defaults to `open` (including
+   under `DIGITAL_REGION_BLOCK_ENABLED`); it is refused here with `reason:
+   "buyer_region_unknown"` only when `REGION_MODES` explicitly sets
+   `UNKNOWN=nuanced` (with `UNKNOWN=blocked`, the commerce gate refuses earlier
+   with `COMMERCE_UNAVAILABLE_IN_REGION`). Such a command must carry
+   `buyer_country` (422 `INVALID_COMMAND` without it).
 
    `COMMERCE_UNAVAILABLE_IN_REGION` exists only while `REGION_MODES` blocks a
-   region (see [Region modes](../README.md#region-modes)). It refuses
-   `checkout.create`, `offer.create`, `offer.checkout` and `auction.place_bid`
-   (`payload.buyer_country` is optional here: the request country decides, and
-   a declared country is checked when present), `payment.prepare_locks` and the first `POST /v0/orders/{id}/payment-method`
-   of an order. `reason` is `buyer_region_blocked` (the declared country is
-   blocked), `buyer_ip_blocked` (the request country from the header named by
-   `CLIENT_COUNTRY_HEADER` is blocked, whatever the buyer declared) or
-   `buyer_region_unknown` (no usable request country while unknown origins are
-   blocked; also the answer to a seller's own request in that case) or
-   `destination_region_blocked` (the `destination_country` the buyer sent on
-   the command, or the order's when payment starts, is blocked; message
-   "Shipping to that country isn't available yet."). The message is "Buying and selling aren't available in your region yet." or, for
-   an unknown origin, "We can't tell where you are, so buying and selling are
-   paused." In the same mode `SELLER_UNAVAILABLE_IN_REGION` also has `reason`
+   region or sets `UNKNOWN=blocked` (see [Region modes](../README.md#region-modes)).
+   On `checkout.create`, `offer.create`, `offer.checkout` and `auction.place_bid`
+   (`payload.buyer_country` is optional here: the request country decides when
+   known, and a declared country is checked when present), `reason` is
+   `buyer_region_blocked` (the declared country is blocked), `buyer_ip_blocked`
+   (the request country from the header named by `CLIENT_COUNTRY_HEADER` is
+   blocked, whatever the buyer declared), `buyer_region_unknown` (no usable
+   request country while `UNKNOWN=blocked` is explicitly configured; also the
+   answer to a seller's own interactive request in that case), or
+   `destination_region_blocked` (the `destination_country` is blocked; message
+   "Shipping to that country isn't available yet."). On `payment.prepare_locks`
+   and the first `POST /v0/orders/{id}/payment-method` of an already-admitted
+   order, the service checks the order's stored declared `buyer_country`
+   (`buyer_region_blocked`), `destination_country`
+   (`destination_region_blocked`), and seller shop country
+   (`SELLER_UNAVAILABLE_IN_REGION` / `seller_region_blocked`) without
+   re-checking the live request IP. The message is "Buying and selling aren't
+   available in your region yet." or, for an unknown origin, "We can't tell
+   where you are, so buying and selling are paused." In the same mode `SELLER_UNAVAILABLE_IN_REGION` also has `reason`
    `seller_region_blocked` (the seller's shop country is blocked: refused on
    every buyer command on their listings, on `payment.prepare_locks`, the bind,
    and on the seller's own `listing.register`, `listing.sync`, `drop.sync` and
