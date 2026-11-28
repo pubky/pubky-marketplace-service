@@ -2,18 +2,17 @@
 # Proves the fast and full modes of scripts/prepush.sh run the right steps,
 # and that scripts/prepush-packages.sh maps a change to its packages.
 # Runs the real scripts in a throwaway workspace. cargo and docker are
-# stand-ins on PATH that log their arguments; metadata and clean go to the
-# real cargo, and nothing is built or started.
+# stand-ins on PATH that log their arguments; metadata goes to the real cargo,
+# and nothing is built or started.
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/prepush-mode-test.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
-# A caller's CARGO_TARGET_DIR would make the gate seed its private target by
-# copying that directory; a caller's override would replace every case's target.
 unset CARGO_TARGET_DIR
 unset PREPUSH_CARGO_TARGET
 unset PREPUSH_FULL
+unset DATABASE_URL
 
 fail() {
   echo "FAIL: $*" >&2
@@ -22,30 +21,12 @@ fail() {
 
 REAL_CARGO="$(command -v cargo)"
 mkdir -p "$WORK/bin"
-# metadata and clean go to the real cargo, so package widening reads a real
-# graph and member cleaning really removes copied workspace artifacts.
 cat > "$WORK/bin/cargo" <<'EOF'
 #!/usr/bin/env bash
 if [ "${1:-}" = metadata ]; then
-  if [ "${FAKE_METADATA_NO_DEPS_FAIL:-0}" = 1 ]; then
-    for arg in "$@"; do
-      [ "$arg" != --no-deps ] || exit 101
-    done
-  fi
   exec "$REAL_CARGO" "$@"
 fi
 printf '%s\n' "$*" >> "$FAKE_LOG/cargo"
-if [ "${1:-}" = clean ]; then
-  if [ "${FAKE_CLEAN_REQUIRE_NO_MARKER:-0}" = 1 ] && [ -e "${CARGO_TARGET_DIR:?}/.prepush-members-clean" ]; then
-    echo 'fake cargo: clean found a copied marker' >&2
-    exit 102
-  fi
-  if [ "${FAKE_CLEAN_FAIL:-0}" = 1 ]; then
-    echo 'fake cargo: clean failed' >&2
-    exit 101
-  fi
-  exec "$REAL_CARGO" "$@"
-fi
 EOF
 cat > "$WORK/bin/docker" <<'EOF'
 #!/usr/bin/env bash
@@ -83,6 +64,8 @@ manifest crates/service marketplace-service marketplace-domain ../domain
 mkdir -p crates/service/tests docs contracts scripts
 printf '// t\n' > crates/service/tests/orders_test.rs
 printf '// t\n' > crates/service/tests/refusal_audit_test.rs
+printf '// t\n' > crates/service/tests/migration_0100_test.rs
+printf '// t\n' > crates/service/tests/connectors_ledger_test.rs
 printf 'doc\n' > docs/readme.md
 printf '{}\n' > contracts/endpoints.json
 cp "$DIR/prepush.sh" "$DIR/prepush-stamp.sh" "$DIR/prepush-packages.sh" \
@@ -194,15 +177,13 @@ echo "test: packages: this repository's graph widens marketplace-domain to marke
 got="$(cd "$DIR/.." && prepush_with_dependents marketplace-domain | tr '\n' ' ' | sed 's/ $//')"
 [ "$got" = "$both" ] || fail "repository graph: $got"
 
-# The real gate. Each case commits one change on top of the base, so the
-# selection is that change alone and no stamp is reused.
 gate() {
   rm -rf "$WORK/log"
   mkdir -p "$WORK/log"
   local st=0
   FAKE_LOG="$WORK/log" PATH="$WORK/bin:$PATH" PREPUSH_BASE="$BASE" \
-    PREPUSH_CARGO_TARGET="${PREPUSH_CARGO_TARGET:-$WORK/target}" HEAVY_LOCK_DIR="$WORK/locks" \
-    HEAVY_DISK_VOLUMES="" bash scripts/prepush.sh </dev/null >"$WORK/out" 2>&1 || st=$?
+    HEAVY_LOCK_DIR="$WORK/locks" \
+    bash scripts/prepush.sh </dev/null >"$WORK/out" 2>&1 || st=$?
   printf '%s\n' "$st"
 }
 cargo_log() { cat "$WORK/log/cargo" 2>/dev/null || true; }
@@ -216,213 +197,72 @@ commit_change() {
   printf '// %s %s\n' "$RANDOM" "$(date +%s)" >> "$1"
   git commit -qam "change $1"
 }
-expected_clean='clean -p marketplace-domain -p marketplace-service'
-actual_members="$("$REAL_CARGO" metadata --no-deps --format-version 1 --locked | jq -r '.packages[].name')"
-[ "$actual_members" = $'marketplace-domain\nmarketplace-service' ] \
-  || fail "workspace members changed; update the literal clean expectation: $actual_members"
 
-echo "test: gate: a seeded target cleans every workspace member before the gate"
-commit_change crates/domain/src/lib.rs
-mkdir -p "$WORK/shared-target/debug/.fingerprint/marketplace-domain-deadbeef" \
-  "$WORK/shared-target/debug/deps"
-printf 'registry artifact\n' > "$WORK/shared-target/artifact"
-printf 'fingerprint\n' > "$WORK/shared-target/debug/.fingerprint/marketplace-domain-deadbeef/lib-marketplace-domain.json"
-printf 'member\n' > "$WORK/shared-target/debug/deps/libmarketplace_domain-deadbeef.rlib"
-printf 'member\n' > "$WORK/shared-target/debug/deps/marketplace_service-deadbeef.d"
-printf 'registry\n' > "$WORK/shared-target/debug/deps/libserde-deadbeef.rlib"
-st="$(CARGO_TARGET_DIR="$WORK/shared-target" PREPUSH_CARGO_TARGET="$WORK/seeded-target" gate)"
-expect_ok "$st" "seeded target" fast
-[ -f "$WORK/seeded-target/artifact" ] || fail "seeded target: shared artifact was not copied"
-[ ! -e "$WORK/seeded-target/debug/.fingerprint/marketplace-domain-deadbeef" ] \
-  || fail "seeded target: domain fingerprint was not cleaned"
-[ ! -e "$WORK/seeded-target/debug/deps/libmarketplace_domain-deadbeef.rlib" ] \
-  || fail "seeded target: domain rlib was not cleaned"
-[ ! -e "$WORK/seeded-target/debug/deps/marketplace_service-deadbeef.d" ] \
-  || fail "seeded target: service dep-info was not cleaned"
-[ -f "$WORK/seeded-target/debug/deps/libserde-deadbeef.rlib" ] \
-  || fail "seeded target: registry artifact was cleaned"
-cargo_log | grep -Fqx "$expected_clean" || fail "seeded target: expected $expected_clean: $(cargo_log)"
-[ "$(cargo_log | sed -n '1p')" = "$expected_clean" ] \
-  || fail "seeded target: member clean did not precede fmt/clippy/test: $(cargo_log)"
-[ -f "$WORK/seeded-target/.prepush-members-clean" ] || fail "seeded target: no clean marker"
-[ "$(cat "$WORK/seeded-target/.prepush-members-clean")" = "$PWD" ] \
-  || fail "seeded target: marker has the wrong root"
-
-echo "test: gate: seeding follows a shared-target symlink without marking its target"
-ln -s "$WORK/shared-target" "$WORK/shared-target-link"
-commit_change crates/service/src/lib.rs
-st="$(CARGO_TARGET_DIR="$WORK/shared-target-link" PREPUSH_CARGO_TARGET="$WORK/symlink-seeded-target" gate)"
-expect_ok "$st" "symlinked shared target" fast
-[ ! -L "$WORK/symlink-seeded-target" ] || fail "symlinked shared target: private target is a symlink"
-[ -f "$WORK/symlink-seeded-target/artifact" ] || fail "symlinked shared target: artifact was not copied"
-[ ! -e "$WORK/shared-target/.prepush-members-clean" ] \
-  || fail "symlinked shared target: clean marker landed in the shared directory"
-cargo_log | grep -Fqx "$expected_clean" || fail "symlinked shared target: expected $expected_clean: $(cargo_log)"
-
-echo "test: gate: an existing unmarked target survives a failed clean"
-mkdir -p "$WORK/uncleanable-target"
-printf 'keep\n' > "$WORK/uncleanable-target/sentinel"
-commit_change crates/domain/src/lib.rs
-st="$(PREPUSH_CARGO_TARGET="$WORK/uncleanable-target" FAKE_CLEAN_FAIL=1 gate)"
-[ "$st" -ne 0 ] || fail "failed existing-target clean returned zero: $(cat "$WORK/out")"
-[ -d "$WORK/uncleanable-target" ] || fail "failed existing-target clean deleted the directory"
-[ -f "$WORK/uncleanable-target/sentinel" ] || fail "failed existing-target clean deleted the sentinel"
-grep -Fqx "prepush: cannot clean workspace members in $WORK/uncleanable-target; delete it or set PREPUSH_CARGO_TARGET to a new path" "$WORK/out" \
-  || fail "failed existing-target clean: wrong error: $(cat "$WORK/out")"
-grep -q '^fake cargo: clean failed$' "$WORK/out" \
-  || fail "failed existing-target clean hid cargo stderr: $(cat "$WORK/out")"
-
-echo "test: gate: a copied marker is removed before the seeded clean"
-mkdir -p "$WORK/marked-shared-target"
-printf '%s\n' "$PWD" > "$WORK/marked-shared-target/.prepush-members-clean"
-commit_change crates/service/src/lib.rs
-st="$(CARGO_TARGET_DIR="$WORK/marked-shared-target" PREPUSH_CARGO_TARGET="$WORK/copied-marker-target" \
-  FAKE_CLEAN_REQUIRE_NO_MARKER=1 gate)"
-expect_ok "$st" "copied marker" fast
-if grep -q '^fake cargo: clean found a copied marker$' "$WORK/out"; then
-  fail "copied marker survived until the seeded clean"
-fi
-[ "$(cargo_log | grep -Fxc "$expected_clean" || true)" = 1 ] \
-  || fail "copied marker skipped the seeded clean: $(cargo_log)"
-[ "$(cat "$WORK/copied-marker-target/.prepush-members-clean")" = "$PWD" ] \
-  || fail "copied marker: marker has the wrong root"
-
-echo "test: gate: a brand-new target is marked without a clean"
-commit_change crates/service/src/lib.rs
-st="$(gate)"
-expect_ok "$st" "brand-new target" fast
-if cargo_log | grep -q '^clean '; then
-  fail "brand-new target was cleaned: $(cargo_log)"
-fi
-[ "$(cat "$WORK/target/.prepush-members-clean")" = "$PWD" ] \
-  || fail "brand-new target: marker has the wrong root"
-
-echo "test: gate: a marker from another root causes one clean and is updated"
-mkdir -p "$WORK/other-root-target"
-printf '/another/worktree\n' > "$WORK/other-root-target/.prepush-members-clean"
-commit_change crates/domain/src/lib.rs
-st="$(PREPUSH_CARGO_TARGET="$WORK/other-root-target" gate)"
-expect_ok "$st" "other-root marker" fast
-[ "$(cargo_log | grep -Fxc "$expected_clean" || true)" = 1 ] \
-  || fail "other-root marker: expected one clean: $(cargo_log)"
-[ "$(cat "$WORK/other-root-target/.prepush-members-clean")" = "$PWD" ] \
-  || fail "other-root marker was not updated"
-
-echo "test: gate: an unmarked target is cleaned once"
-mkdir -p "$WORK/legacy-target"
-commit_change crates/domain/src/lib.rs
-st="$(PREPUSH_CARGO_TARGET="$WORK/legacy-target" gate)"
-expect_ok "$st" "unmarked target" fast
-[ "$(cargo_log | grep -Fxc "$expected_clean" || true)" = 1 ] \
-  || fail "unmarked target: expected one member clean: $(cargo_log)"
-[ "$(cat "$WORK/legacy-target/.prepush-members-clean")" = "$PWD" ] \
-  || fail "unmarked target: marker has the wrong root"
-commit_change crates/service/src/lib.rs
-st="$(PREPUSH_CARGO_TARGET="$WORK/legacy-target" gate)"
-expect_ok "$st" "marked target" fast
-if cargo_log | grep -q '^clean '; then
-  fail "marked target cleaned again: $(cargo_log)"
-fi
-
-echo "test: gate: a seeded target with a failed clean falls back to an empty target"
-mkdir -p "$WORK/failing-shared-target"
-printf 'discard\n' > "$WORK/failing-shared-target/artifact"
-commit_change crates/domain/src/lib.rs
-st="$(CARGO_TARGET_DIR="$WORK/failing-shared-target" PREPUSH_CARGO_TARGET="$WORK/failing-seeded-target" \
-  FAKE_CLEAN_FAIL=1 gate)"
-expect_ok "$st" "seeded clean failure" fast
-[ -d "$WORK/failing-seeded-target" ] || fail "seeded clean failure: no fallback directory"
-[ ! -e "$WORK/failing-seeded-target/artifact" ] || fail "seeded clean failure retained the seeded artifact"
-[ "$(cat "$WORK/failing-seeded-target/.prepush-members-clean")" = "$PWD" ] \
-  || fail "seeded clean failure: fallback marker has the wrong root"
-grep -q '^prepush: could not clean workspace members; using an empty target$' "$WORK/out" \
-  || fail "seeded clean failure: no fallback explanation: $(cat "$WORK/out")"
-grep -q '^fake cargo: clean failed$' "$WORK/out" \
-  || fail "seeded clean failure hid cargo stderr: $(cat "$WORK/out")"
-
-echo "test: gate: a member metadata failure falls back to an empty target"
-commit_change crates/domain/src/lib.rs
-st="$(CARGO_TARGET_DIR="$WORK/shared-target" PREPUSH_CARGO_TARGET="$WORK/failed-target" \
-  FAKE_METADATA_NO_DEPS_FAIL=1 gate)"
-expect_ok "$st" "metadata failure" fast
-[ ! -e "$WORK/failed-target/artifact" ] || fail "metadata failure retained the seeded artifact"
-[ "$(cat "$WORK/failed-target/.prepush-members-clean")" = "$PWD" ] \
-  || fail "metadata failure: fallback marker has the wrong root"
-grep -q '^prepush: could not clean workspace members; using an empty target$' "$WORK/out" \
-  || fail "metadata failure: no fallback explanation: $(cat "$WORK/out")"
-
-echo "test: gate: fast widens a domain change to the service and its integration binaries"
+echo "test: gate: fast runs fmt and cargo check for widened packages without Docker"
 commit_change crates/domain/src/lib.rs
 st="$(gate)"
 expect_ok "$st" "domain fast" fast
 cargo_log | grep -qx 'fmt --check' || fail "domain fast: no fmt: $(cargo_log)"
-cargo_log | grep -qx 'clippy -p marketplace-domain -p marketplace-service --all-targets -- -D warnings' \
-  || fail "domain fast: clippy: $(cargo_log)"
-cargo_log | grep -q '^test -p marketplace-domain -p marketplace-service --jobs 1 --lib --bins ' \
-  || fail "domain fast: lib tests: $(cargo_log)"
-cargo_log | grep -q '^test -p marketplace-service --jobs 1 --test orders_test ' \
-  || fail "domain fast: integration binaries: $(cargo_log)"
-if cargo_log | grep -q -- '--workspace'; then
-  fail "domain fast used --workspace: $(cargo_log)"
+cargo_log | grep -qx 'check -p marketplace-domain -p marketplace-service --all-targets' \
+  || fail "domain fast: check: $(cargo_log)"
+if cargo_log | grep -qE '^(clippy|test) '; then
+  fail "domain fast ran clippy or tests: $(cargo_log)"
 fi
+[ ! -e "$WORK/log/docker" ] || fail "domain fast started Docker: $(cat "$WORK/log/docker")"
 
-echo "test: gate: fast runs the integration binaries for a service change"
+echo "test: gate: fast runs cargo check only for marketplace-service on service change"
 commit_change crates/service/src/lib.rs
 st="$(gate)"
 expect_ok "$st" "service fast" fast
-cargo_log | grep -qx 'clippy -p marketplace-service --all-targets -- -D warnings' \
-  || fail "service fast: clippy: $(cargo_log)"
-cargo_log | grep -q '^test -p marketplace-service --jobs 1 --lib --bins ' \
-  || fail "service fast: lib tests: $(cargo_log)"
-cargo_log | grep -q '^test -p marketplace-service --jobs 1 --test orders_test ' \
-  || fail "service fast: parallel binaries: $(cargo_log)"
-cargo_log | grep -q '^test -p marketplace-service --jobs 1 --test refusal_audit_test --test ' \
-  || fail "service fast: serial binaries: $(cargo_log)"
-if cargo_log | grep -q -- '--workspace'; then
-  fail "service fast used --workspace: $(cargo_log)"
-fi
+cargo_log | grep -qx 'fmt --check' || fail "service fast: no fmt: $(cargo_log)"
+cargo_log | grep -qx 'check -p marketplace-service --all-targets' \
+  || fail "service fast: check: $(cargo_log)"
+[ ! -e "$WORK/log/docker" ] || fail "service fast started Docker: $(cat "$WORK/log/docker")"
 
 echo "test: gate: fast runs fmt only when no package changed"
 commit_change docs/readme.md
 st="$(gate)"
 expect_ok "$st" "docs fast" fast
 [ "$(cargo_log)" = 'fmt --check' ] || fail "docs fast: cargo calls: $(cargo_log)"
-[ ! -e "$WORK/log/docker" ] || fail "docs fast started Postgres: $(cat "$WORK/log/docker")"
+[ ! -e "$WORK/log/docker" ] || fail "docs fast started Docker: $(cat "$WORK/log/docker")"
 
-echo "test: gate: fmt-only exits before creating or cleaning a fresh target"
-commit_change docs/readme.md
-st="$(PREPUSH_CARGO_TARGET="$WORK/fmt-only-target" FAKE_CLEAN_FAIL=1 gate)"
-expect_ok "$st" "fmt-only fresh target" fast
-[ "$(cargo_log)" = 'fmt --check' ] || fail "fmt-only fresh target: cargo calls: $(cargo_log)"
-[ ! -e "$WORK/fmt-only-target" ] || fail "fmt-only fresh target: target path was created"
-
-echo "test: gate: fast runs the workspace for a Cargo.lock change"
+echo "test: gate: fast checks the workspace for a Cargo.lock change"
 commit_change Cargo.lock
 st="$(gate)"
 expect_ok "$st" "lock fast" fast
-cargo_log | grep -qx 'clippy --workspace --all-targets -- -D warnings' \
-  || fail "lock fast: clippy: $(cargo_log)"
-cargo_log | grep -q '^test --workspace --jobs 1 --lib --bins ' \
-  || fail "lock fast: tests: $(cargo_log)"
+cargo_log | grep -qx 'fmt --check' || fail "lock fast: no fmt: $(cargo_log)"
+cargo_log | grep -qx 'check --workspace --all-targets' \
+  || fail "lock fast: check: $(cargo_log)"
 
-echo "test: gate: PREPUSH_FULL=1 runs the whole workspace for a docs-only change"
+echo "test: gate: PREPUSH_FULL=1 runs fmt, clippy, and parallel ci-test.sh via Docker when DATABASE_URL is unset"
 commit_change docs/readme.md
 st="$(gate)"
 expect_ok "$st" "docs fast before full" fast
 st="$(PREPUSH_FULL=1 gate)"
 expect_ok "$st" "docs full" full
 grep -q 'reused' "$WORK/out" && fail "full reused the fast stamp: $(cat "$WORK/out")"
+cargo_log | grep -qx 'fmt --check' || fail "docs full: no fmt: $(cargo_log)"
 cargo_log | grep -qx 'clippy --workspace --all-targets -- -D warnings' \
   || fail "docs full: clippy: $(cargo_log)"
-cargo_log | grep -q '^test --workspace --jobs 1 --lib --bins ' \
+cargo_log | grep -q '^test --workspace --lib --bins --no-fail-fast -- --test-threads=4$' \
   || fail "docs full: lib tests: $(cargo_log)"
-cargo_log | grep -q '^test -p marketplace-service --jobs 1 --test orders_test ' \
-  || fail "docs full: integration binaries: $(cargo_log)"
+cargo_log | grep -q '^test -p marketplace-service --test orders_test --no-fail-fast -- --test-threads=4$' \
+  || fail "docs full: parallel integration binaries: $(cargo_log)"
+# Stage 2 (parallel) must never duplicate any SERIAL binary (role or outbox tests).
+if cargo_log | grep -- '--test-threads=4' | grep -qE 'refusal_audit_test|migration_0100_test|connectors_ledger_test'; then
+  fail "docs full: SERIAL binary duplicated in Stage 2: $(cargo_log)"
+fi
+cargo_log | grep -q '^test -p marketplace-service --test refusal_audit_test .*--test migration_0100_test .*--test connectors_ledger_test .*--test-threads=1$' \
+  || fail "docs full: serial binaries: $(cargo_log)"
+[ -e "$WORK/log/docker" ] || fail "docs full did not start Docker when DATABASE_URL unset"
+
+echo "test: gate: PREPUSH_FULL=1 reuses DATABASE_URL without invoking Docker"
+commit_change docs/readme.md
+st="$(PREPUSH_FULL=1 DATABASE_URL='postgres://postgres:postgres@127.0.0.1:5432/postgres' gate)"
+expect_ok "$st" "full with DATABASE_URL" full
+[ ! -e "$WORK/log/docker" ] || fail "full with DATABASE_URL called Docker: $(cat "$WORK/log/docker")"
 
 echo "test: gate: a fast run after a full pass reuses it"
-commit_change docs/readme.md
-st="$(PREPUSH_FULL=1 gate)"
-expect_ok "$st" "full before fast" full
 st="$(gate)"
 expect_ok "$st" "fast after full" "fast reused:full .*"
 [ -z "$(cargo_log)" ] || fail "fast after full ran cargo: $(cargo_log)"
