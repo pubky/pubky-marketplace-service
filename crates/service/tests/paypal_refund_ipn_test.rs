@@ -2026,14 +2026,19 @@ async fn a_canceled_reversal_before_its_reversal_leaves_nothing_outstanding(pool
     assert_eq!(ledger_rows(&pool, &order.id).await.len(), 2);
 }
 
-/// Payer values the real IPN fixtures carry; none may be stored or logged.
+/// Distinctive postal code substituted for the fixture's 5-digit `95131` so
+/// random UUIDs, hashes, or pubkys from this test or parallel siblings cannot
+/// cause a false substring collision in logs or database scans.
+const PAYER_ZIP: &str = "95131-PAYERZIP";
+
+/// Payer values carried by the IPN requests below; none may be stored or logged.
 const PAYER_VALUES: [&str; 8] = [
     "buyer@example.com",
     "LPLWNMTBWMFAY",
     "Test Buyer",
     "1 Main St",
     "San Jose",
-    "95131",
+    PAYER_ZIP,
     "AtkOfCXbDm2hu0ZELryHFjY",
     "5f3e8a1c9b2d4",
 ];
@@ -2042,25 +2047,40 @@ const PAYER_VALUES: [&str; 8] = [
 async fn paypal_ipn_stores_nothing_about_the_payer(pool: PgPool) {
     install_log_capture();
     let (app, _paykit, _ipn) = test_app_with_payments_and_ipn(pool.clone()).await;
-    let order = paid_paypal_order(&app, PAYMENT_TXN).await;
+    let order = pending_paypal_order(&app).await;
+    let completed = with(
+        with(fixture("completed.ipn", &order.id), "txn_id", PAYMENT_TXN),
+        "address_zip",
+        PAYER_ZIP,
+    );
+    assert_eq!(post_ipn(&app, &completed).await, StatusCode::OK);
+    let view = read_order(&app, &order.buyer.token, &order.id).await;
+    assert_eq!(view["state"], json!("paid"), "{view}");
 
     // A refund applied to the order, and one held in the inbox.
-    assert_eq!(
-        post_ipn(
-            &app,
-            &refund("refund-partial-1.ipn", &order.id, PAYMENT_TXN)
-        )
-        .await,
-        StatusCode::OK
+    let partial = with(
+        refund("refund-partial-1.ipn", &order.id, PAYMENT_TXN),
+        "address_zip",
+        PAYER_ZIP,
     );
-    let unknown = refund("refund-full.ipn", &order.id, "9ZZ99999ZZ9999999");
+    assert_eq!(post_ipn(&app, &partial).await, StatusCode::OK);
+    let unknown = with(
+        refund("refund-full.ipn", &order.id, "9ZZ99999ZZ9999999"),
+        "address_zip",
+        PAYER_ZIP,
+    );
     assert_eq!(post_ipn(&app, &unknown).await, StatusCode::OK);
     assert_eq!(inbox_rows(&pool).await.len(), 1);
 
+    let logs = captured_logs();
     for value in PAYER_VALUES {
         let hits = db_columns_containing(&pool, value).await;
         assert!(hits.is_empty(), "{value} stored at {hits:?}");
-        assert!(!captured_logs().contains(value), "{value} reached the logs");
+        let matching: Vec<&str> = logs.lines().filter(|line| line.contains(value)).collect();
+        assert!(
+            matching.is_empty(),
+            "{value} reached the logs: {matching:?}"
+        );
     }
 
     // What is kept is the payment id and the seller's account.
