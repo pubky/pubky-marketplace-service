@@ -93,7 +93,7 @@ use crate::refusal_audit::RefusalAuditRuntime;
 
 /// The sealing keys a payment confirmation pins order terms under: the
 /// pickup snapshot and the digital delivery pin.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Clone, Copy, Default)]
 pub struct ConfirmKeys<'a> {
     pub pickup: Option<&'a PickupKeys>,
     pub digital: Option<&'a DigitalKeys>,
@@ -104,6 +104,21 @@ pub struct ConfirmKeys<'a> {
     /// Who releases instant digital lines on the orders this confirmation
     /// pays (`DIGITAL_RELEASE`).
     pub digital_release: config::DigitalRelease,
+    /// Authoritative clock sampled after blocking locks in confirmation and
+    /// payment-start fences.
+    pub clock: Option<&'a dyn Clock>,
+}
+
+impl std::fmt::Debug for ConfirmKeys<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConfirmKeys")
+            .field("pickup", &self.pickup.is_some())
+            .field("digital", &self.digital.is_some())
+            .field("fence", &self.fence)
+            .field("digital_release", &self.digital_release)
+            .field("clock", &self.clock.is_some())
+            .finish()
+    }
 }
 
 #[derive(Clone)]
@@ -227,6 +242,7 @@ impl AppState {
             digital: self.digital.as_deref(),
             fence: self.config.region_policy().fence_modes(),
             digital_release: self.config.digital_release,
+            clock: Some(self.clock.as_ref()),
         }
     }
 }

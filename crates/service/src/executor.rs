@@ -1155,6 +1155,7 @@ async fn dispatch(
                 &reads.locks,
                 state.config.locks_payment_window_seconds,
                 state.config.region_policy().fence_modes(),
+                state.clock.as_ref(),
                 now,
             )
             .await

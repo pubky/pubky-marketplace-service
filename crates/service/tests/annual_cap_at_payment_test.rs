@@ -660,3 +660,104 @@ async fn concurrent_polls_of_two_settled_payments_take_one_reconfirmation_slot(p
         ]
     );
 }
+
+async fn wait_for_advisory_lock_waiter(pool: &PgPool) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_stat_activity \
+             WHERE datname = current_database() \
+               AND pid <> pg_backend_pid() \
+               AND state = 'active' \
+               AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("query pg_stat_activity for advisory lock waiter");
+        if waiting > 0 {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for transaction to block on seller advisory lock"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn bind_waiting_on_seller_advisory_lock_across_year_boundary_uses_post_lock_year_start(
+    pool: PgPool,
+) {
+    let fx = fixture(pool.clone(), "DE", "DE").await;
+    // Fill all 29 paid sales in calendar year 2026 (hitting both the annual
+    // limit and EU private-seller reconfirmation threshold) while leaving a
+    // 30th order open for payment.
+    paid_sales(&fx, 28).await;
+    let twenty_ninth = placed(&fx, 101).await;
+    let thirtieth = placed(&fx, 102).await;
+    let reference = bind_ok(&fx, &twenty_ninth).await;
+    fx.paykit
+        .set_status(&reference, status_confirmed("exclusive", true, 2));
+    assert!(poll_now(&fx.app, fx.app.clock.now()).await >= 1);
+    assert_eq!(paid_events(&fx).await, 29);
+
+    // Keep the buyer's session valid across the Dec 31 to Jan 1 year boundary.
+    let dec_31: DateTime<Utc> = "2026-12-31T23:59:30Z".parse().expect("valid dec 31");
+    let jan_1: DateTime<Utc> = "2027-01-01T01:30:00Z".parse().expect("valid jan 1");
+    let session_valid_until: DateTime<Utc> = "2027-01-02T00:00:00Z"
+        .parse()
+        .expect("valid session expiry");
+    sqlx::query("UPDATE auth_sessions SET expires_at = $1 WHERE pubky = $2")
+        .bind(session_valid_until)
+        .bind(&thirtieth.buyer.pubky)
+        .execute(&pool)
+        .await
+        .expect("extend test session across year boundary");
+
+    fx.app.clock.set(dec_31);
+    seed_eur(&fx.app.pool, dec_31).await;
+
+    // Hold the seller's region-fence advisory lock (seed 6381) while the 30th
+    // order starts binding on Dec 31, 2026. Without post-lock clock sampling
+    // inside `recheck_at_payment`, the waiter would evaluate `year_start` and
+    // usage cutoffs against stale Dec 31 time and refuse with
+    // `SELLER_ANNUAL_LIMIT_REACHED`.
+    let mut blocker_tx = pool.begin().await.expect("seller advisory lock tx");
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 6381))")
+        .bind(&fx.seller.pubky)
+        .execute(&mut *blocker_tx)
+        .await
+        .expect("acquire seller advisory lock");
+
+    let router = fx.app.router.clone();
+    let token = thirtieth.buyer.token.clone();
+    let order_id = thirtieth.order_id.clone();
+    let bind_task = tokio::spawn(async move {
+        send(
+            router,
+            "POST",
+            &format!("/v0/orders/{order_id}/payment-method"),
+            Some(&token),
+            &json!({ "method": "bitcoin" }),
+        )
+        .await
+    });
+
+    wait_for_advisory_lock_waiter(&pool).await;
+
+    // Cross into calendar year 2027 (more than 1 hour past the 2026 FX samples
+    // so only 2027 FX reference samples are valid at post-lock time) before
+    // releasing the advisory lock.
+    fx.app.clock.set(jan_1);
+    seed_eur(&fx.app.pool, jan_1).await;
+    blocker_tx.rollback().await.expect("release seller lock");
+
+    let (status, body) = bind_task.await.expect("bind task");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "post-advisory-lock evaluation in 2027 must use Jan 1 year_start and succeed: {body}"
+    );
+    assert_eq!(body["order"]["payment_method"], json!("bitcoin"));
+}

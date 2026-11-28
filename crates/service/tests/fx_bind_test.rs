@@ -4620,3 +4620,95 @@ async fn bind_fails_closed_when_fx_ages_past_300s_while_blocked_on_listing_lock(
     assert!(!stock_held, "order hold must roll back on fx_rate_stale");
     assert_eq!(reserved_qty, 0, "listing reservation must roll back");
 }
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn acquire_payment_hold_blocked_on_inventory_lock_derives_fresh_post_lock_hold_window(
+    pool: PgPool,
+) {
+    let (app, _paykit, _fx) = test_app_with_payments_and_fx(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (status, body) = send(
+        app.router.clone(),
+        "PUT",
+        "/v0/sellers/me/payment-config",
+        Some(&seller.token),
+        &json!({ "bitcoin_enabled": false, "paypal_merchant_email": "merchant@example.com" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "config: {body}");
+    let (status, body) = execute(&app, &seller.token, &register_command(&seller.pubky, 5)).await;
+    assert_eq!(status, StatusCode::OK, "register: {body}");
+    let order = checkout_usd(&app, &seller, &buyer).await;
+
+    let bind_window = app.state.config.fiat_payment_window_seconds;
+
+    // Lock the listing's variant inventory row FOR UPDATE in a separate
+    // transaction so `acquire_payment_hold` blocks on inventory locking.
+    let mut blocker_tx = pool.begin().await.expect("inventory lock tx");
+    let locked_listing: String = sqlx::query_scalar(
+        "SELECT listing_aggregate_id FROM listing_variant_inventory \
+         WHERE listing_aggregate_id = $1 FOR UPDATE",
+    )
+    .bind(listing_aggregate(&seller.pubky))
+    .fetch_one(&mut *blocker_tx)
+    .await
+    .expect("lock variant inventory row");
+    assert_eq!(locked_listing, listing_aggregate(&seller.pubky));
+
+    let router = app.router.clone();
+    let token = buyer.token.clone();
+    let order_id = order.order_id.clone();
+    let bind_task = tokio::spawn(async move {
+        send(
+            router,
+            "POST",
+            &format!("/v0/orders/{order_id}/payment-method"),
+            Some(&token),
+            &json!({ "method": "paypal" }),
+        )
+        .await
+    });
+
+    wait_for_db_lock_waiter(&pool).await;
+
+    // Advance the clock past an entire hold window while blocked on the
+    // inventory lock; under stale pre-lock timestamps the newly acquired hold
+    // would already be expired.
+    app.clock.advance_seconds(bind_window + 120);
+    let post_lock_now = app.clock.now();
+    blocker_tx.rollback().await.expect("release inventory lock");
+
+    let (status, body) = bind_task.await.expect("bind task");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "bind after lock wait failed: {body}"
+    );
+    let expected_expiry = post_lock_now + Duration::seconds(bind_window);
+    let facts = order_facts(&pool, &order.order_id).await;
+    assert_eq!(
+        facts.hold_expires_at,
+        Some(expected_expiry),
+        "new hold must receive a full post-lock [post_lock_now, post_lock_now + window] deadline"
+    );
+    assert_eq!(facts.hold_source.as_deref(), Some("bind"));
+
+    // Intentional non-renewal: an idempotent re-bind of the same method later
+    // must keep the original hold deadline rather than extending it.
+    app.clock.advance_seconds(300);
+    let (status, body) = send(
+        app.router.clone(),
+        "POST",
+        &format!("/v0/orders/{}/payment-method", order.order_id),
+        Some(&buyer.token),
+        &json!({ "method": "paypal" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "idempotent re-bind: {body}");
+    assert_eq!(
+        order_facts(&pool, &order.order_id).await.hold_expires_at,
+        Some(expected_expiry),
+        "idempotent re-bind must not renew hold_expires_at"
+    );
+}

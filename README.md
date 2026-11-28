@@ -77,7 +77,9 @@ also has
   single-seller deployment sets `LISTING_MODERATION=off` (see
   [Single-seller mode](#single-seller-mode)).
 
-Refusal audit is optional. To enable it, configure all of:
+Refusal audit is optional: leave all six variables below unset to disable it.
+Setting any one of them (including an empty or whitespace-only value) enables
+all-or-nothing validation. To enable refusal audit, configure all of:
 
 - `REFUSAL_AUDIT_DATABASE_URL` and `REFUSAL_AUDIT_RETENTION_DATABASE_URL`:
   two separate Postgres URLs that log in as
@@ -94,9 +96,9 @@ Refusal audit is optional. To enable it, configure all of:
 
 The compliance-attestation booleans (`REFUSAL_AUDIT_BACKUP_EXPIRY_ATTESTED`,
 `REFUSAL_AUDIT_REPLICA_EXPIRY_ATTESTED`, and
-`REFUSAL_AUDIT_RESIDUAL_RISK_ACCEPTED`) are optional; omitting them or setting
-them to `false` does not block startup, while malformed non-boolean or
-non-UTF-8 values fail configuration validation.
+`REFUSAL_AUDIT_RESIDUAL_RISK_ACCEPTED`) are optional; leaving them unset or
+setting them to `false` does not block startup, while empty, whitespace-only,
+malformed non-boolean, or non-UTF-8 values fail configuration validation.
 
 The refusal-audit operator binary (`refusal-audit-admin`) additionally uses
 `REFUSAL_AUDIT_ADMIN_DATABASE_URL`; see

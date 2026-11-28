@@ -477,6 +477,7 @@ pub async fn prepare(
     prefetched: &LocksPrefetch,
     payment_window_seconds: i64,
     fence: Option<&crate::region_policy::RegionModes>,
+    clock: &dyn crate::clock::Clock,
     now: DateTime<Utc>,
 ) -> Result<HandlerResult, sqlx::Error> {
     let (Some(locks), true) = (locks, homeserver_configured) else {
@@ -747,30 +748,38 @@ pub async fn prepare(
         )));
     }
     // The EU seller's annual limit (legal launch plan C4) at payment start,
-    // before any listing lock.
+    // before any listing lock; the clock is sampled after the advisory lock.
     if let Some(modes) = fence {
         if let Err(failure) =
-            crate::region_fence::recheck_at_payment(tx, modes, order.id, now).await
+            crate::region_fence::recheck_at_payment(tx, modes, order.id, || clock.now()).await
         {
             return Ok(Err(failure));
         }
     }
-    if let Err(failure) = holds::acquire_payment_hold(
+    let held_order = match holds::acquire_payment_hold(
         tx,
         order,
         payment_window_seconds,
         holds::HOLD_SOURCE_LOCKS,
-        now,
+        || clock.now(),
     )
     .await?
     {
-        return Ok(Err(failure));
-    }
+        Ok(order) => order,
+        Err(failure) => return Ok(Err(failure)),
+    };
     let client_reference = LocksKeys::mint_client_reference();
     let correlation_id = Uuid::new_v4();
-    let window_expires_at = now + chrono::Duration::seconds(payment_window_seconds);
+    let post_hold_now = clock.now();
+    let window_expires_at = if held_order.auction_aggregate_id.is_none() {
+        held_order
+            .hold_expires_at
+            .unwrap_or_else(|| post_hold_now + chrono::Duration::seconds(payment_window_seconds))
+    } else {
+        post_hold_now + chrono::Duration::seconds(payment_window_seconds)
+    };
     // The authority row is populated from the VERIFIED SNAPSHOT values
-    // only — order, parties, economics, and the resource hash — never
+    // only (order, parties, economics, and the resource hash), never
     // from the mutable current payment (each was compared equal above;
     // the snapshot is the sole source).
     sqlx::query(
@@ -786,25 +795,25 @@ pub async fn prepare(
     .bind(locks.keys.encrypt_prepared_value(payment.id, b"locks-resource:", &resource))
     .bind(&snapshot.criterion_id)
     .bind(locks.keys.encrypt_prepared_value(payment.id, b"locks-client-reference:", &client_reference))
-    .bind(now).execute(&mut **tx).await?;
+    .bind(post_hold_now).execute(&mut **tx).await?;
     record_binding_outcome(
         &mut **tx,
         command.command_id,
         payment.id,
         OUTCOME_PREPARED,
-        now,
+        post_hold_now,
     )
     .await?;
     // The hold, the prepared row, and the adapter switch commit atomically
     // (DESIGN §3.2): from here only server-side verification can advance
-    // this payment — the sandbox path is already closed, not only once a
+    // this payment; the sandbox path is already closed, not only once a
     // bundle attaches.
     let updated_payment: PaymentRow = sqlx::query_as(&format!(
         "UPDATE payments SET revision = revision + 1, adapter = 'locks', updated_at = $2 \
          WHERE id = $1 RETURNING {PAYMENT_COLUMNS}"
     ))
     .bind(payment.id)
-    .bind(now)
+    .bind(post_hold_now)
     .fetch_one(&mut **tx)
     .await?;
     Ok(Ok(HandlerSuccess {

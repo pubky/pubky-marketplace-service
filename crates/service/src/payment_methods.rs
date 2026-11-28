@@ -1580,7 +1580,7 @@ async fn prefetch_bind_fx_snapshot(
         .bind(actor)
         .fetch_optional(&state.pool)
         .await?;
-        if active_end.is_none_or(|end| end <= now) {
+        if active_end.is_none_or(|end| end <= state.clock.now()) {
             return Ok(None);
         }
     }
@@ -1877,7 +1877,7 @@ pub async fn bind_payment_method(
         None
     };
     let mut fx_retried = false;
-    let (mut tx, payment, order, config, bitcoin_enabled, usdt_wanted) = loop {
+    let (mut tx, payment, order, config, bitcoin_enabled, usdt_wanted, auction_hold_expires_at) = loop {
         let mut tx = match state.pool.begin().await {
             Ok(tx) => tx,
             Err(error) => return internal("payment method transaction", &error),
@@ -1950,8 +1950,8 @@ pub async fn bind_payment_method(
         // the order's deadline: the bind neither opens a new window nor reads
         // the payment window as one. Upstream Paykit narrows it to the
         // activation cutoff inside the reservation. A bind after the
-        // reservation ended is refused.
-        let lock_now = state.clock.now();
+        // reservation ended is refused; sample the clock AFTER acquiring the
+        // reservation FOR UPDATE lock so a lock wait crossing expiry fails closed.
         let auction_hold_expires_at = match &order.auction_aggregate_id {
             Some(auction_aggregate_id) => {
                 let reservation_end: Option<DateTime<Utc>> = match sqlx::query_scalar(
@@ -1967,7 +1967,8 @@ pub async fn bind_payment_method(
                     Ok(end) => end,
                     Err(error) => return internal("auction reservation lookup", &error),
                 };
-                match reservation_end.filter(|end| *end > lock_now) {
+                let post_lock_now = state.clock.now();
+                match reservation_end.filter(|end| *end > post_lock_now) {
                     Some(end) => Some(end),
                     None => {
                         return method_error(
@@ -2102,7 +2103,15 @@ pub async fn bind_payment_method(
                 return internal("auction winner delivery update", &error);
             }
         }
-        break (tx, payment, order, config, bitcoin_enabled, usdt_wanted);
+        break (
+            tx,
+            payment,
+            order,
+            config,
+            bitcoin_enabled,
+            usdt_wanted,
+            auction_hold_expires_at,
+        );
     };
 
     // Validate static currency / satoshi shape upfront before taking listing
@@ -2154,7 +2163,6 @@ pub async fn bind_payment_method(
     // The bind lock point: first ordinary acquire (or a re-arm when a drop
     // claim / prior lock point already holds). Fiat uses the 10-minute
     // listing hold; bitcoin uses the invoice window the buyer is shown.
-    let hold_now = state.clock.now();
     let bind_window = if on_paykit {
         state.config.bitcoin_payment_window_seconds
     } else {
@@ -2167,7 +2175,7 @@ pub async fn bind_payment_method(
         &terms,
         order.id,
         &order.seller_pubky,
-        hold_now,
+        state.clock.now(),
     )
     .await
     {
@@ -2196,10 +2204,12 @@ pub async fn bind_payment_method(
     }
     // The EU seller's annual limit (legal launch plan C4) at payment start:
     // the buyer is not asked to pay a seller who has reached it. Before any
-    // listing lock, so the per-seller counter lock stays first.
+    // listing lock, so the per-seller counter lock stays first; the clock is
+    // sampled inside `recheck_at_payment` after acquiring the advisory lock.
     if let Some(modes) = state.config.region_policy().fence_modes() {
         if let Err(failure) =
-            crate::region_fence::recheck_at_payment(&mut tx, modes, order.id, hold_now).await
+            crate::region_fence::recheck_at_payment(&mut tx, modes, order.id, || state.clock.now())
+                .await
         {
             return method_error(
                 failure.code(),
@@ -2213,7 +2223,7 @@ pub async fn bind_payment_method(
         order,
         bind_window,
         crate::handlers::holds::HOLD_SOURCE_BIND,
-        hold_now,
+        || state.clock.now(),
     )
     .await
     {
@@ -2322,6 +2332,13 @@ pub async fn bind_payment_method(
     // past `MAX_RATE_AGE_SECS` fails closed with `FxError::Stale` and rolls
     // back cleanly without refetching HTTP inside `tx`.
     let quote_now = state.clock.now();
+    if auction_hold_expires_at.is_some_and(|end| end <= quote_now) {
+        return method_error(
+            ErrorCode::InvalidState,
+            "auction_window_ended",
+            "Your window to pay for this auction has ended.",
+        );
+    }
     let now = quote_now;
     let mut plan = RequestPlan::LegacySats;
     let mut usd_conversion: Option<UsdConversionRecord> = None;

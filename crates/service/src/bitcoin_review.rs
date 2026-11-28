@@ -1431,7 +1431,11 @@ async fn apply_outcome_effects(
             // funds go back. Checked first so the per-seller counter lock
             // stays ahead of the listing locks the paid effects take.
             if let Some(modes) = state.config.region_policy().fence_modes() {
-                match crate::region_fence::recheck_at_payment(tx, modes, order.id, now).await {
+                match crate::region_fence::recheck_at_payment(tx, modes, order.id, || {
+                    state.clock.now()
+                })
+                .await
+                {
                     Ok(()) => {}
                     Err(failure) if crate::region_fence::is_limit_at_payment(&failure) => {
                         return Err(ResolutionFailure::RefundRequired);
@@ -1819,7 +1823,11 @@ pub(crate) async fn apply_late_money(
     // shape, like money whose unit is gone. Checked before the reacquire so
     // the per-seller counter lock stays ahead of the listing locks.
     if let Some(modes) = keys.fence {
-        match crate::region_fence::recheck_at_payment(tx, modes, order.id, now).await {
+        match crate::region_fence::recheck_at_payment(tx, modes, order.id, || {
+            keys.clock.map_or(now, crate::clock::Clock::now)
+        })
+        .await
+        {
             Ok(()) => {}
             Err(failure) if crate::region_fence::is_limit_at_payment(&failure) => {
                 refund_required(

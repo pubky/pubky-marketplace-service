@@ -618,7 +618,7 @@ pub async fn recheck_at_payment(
     tx: &mut Transaction<'_, Postgres>,
     modes: &RegionModes,
     order_id: Uuid,
-    now: DateTime<Utc>,
+    sample_now: impl FnOnce() -> DateTime<Utc>,
 ) -> Result<(), CommandFailure> {
     if !modes.has_nuanced_eu_country() {
         return Ok(());
@@ -656,6 +656,7 @@ pub async fn recheck_at_payment(
             tracing::error!(%error, "eu fence could not lock the seller's counters");
             unavailable()
         })?;
+    let now = sample_now();
     let new_cents = eur_cents(tx, &order.currency, order.exponent, order.total_minor, now).await?;
     let refusal = if annual_limit {
         let annual = usage(
