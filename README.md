@@ -72,11 +72,14 @@ also has
   other homeserver read go to (an http(s) URL), unless
   `HOMESERVER_RESOLUTION=pkarr` resolves each pubky's own homeserver instead
   (see [Homeserver reads](#homeserver-reads));
-- `NEXUS_URL` — the marketplace index the moderation gate reads (an http(s)
+- `NEXUS_URL`: the marketplace index the moderation gate reads (an http(s)
   URL; see [Listing moderation](#listing-moderation)), unless a
   single-seller deployment sets `LISTING_MODERATION=off` (see
-  [Single-seller mode](#single-seller-mode));
-- `REFUSAL_AUDIT_DATABASE_URL` and `REFUSAL_AUDIT_RETENTION_DATABASE_URL` —
+  [Single-seller mode](#single-seller-mode)).
+
+Refusal audit is optional. To enable it, configure all of:
+
+- `REFUSAL_AUDIT_DATABASE_URL` and `REFUSAL_AUDIT_RETENTION_DATABASE_URL`:
   two separate Postgres URLs that log in as
   `marketplace_refusal_audit_writer_login` and
   `marketplace_refusal_audit_retention` respectively (each with a password,
@@ -87,10 +90,13 @@ also has
 - `REFUSAL_AUDIT_HMAC_ROOT_B64` (32 bytes, canonical base64) and
   `REFUSAL_AUDIT_HMAC_KEY_EPOCH` (positive integer), plus the optional pair
   `REFUSAL_AUDIT_HMAC_PREVIOUS_ROOT_B64` /
-  `REFUSAL_AUDIT_HMAC_PREVIOUS_KEY_EPOCH` during a rotation (both or neither);
-- `REFUSAL_AUDIT_BACKUP_EXPIRY_ATTESTED`,
-  `REFUSAL_AUDIT_REPLICA_EXPIRY_ATTESTED` and
-  `REFUSAL_AUDIT_RESIDUAL_RISK_ACCEPTED`, each `true`.
+  `REFUSAL_AUDIT_HMAC_PREVIOUS_KEY_EPOCH` during a rotation (both or neither).
+
+The compliance-attestation booleans (`REFUSAL_AUDIT_BACKUP_EXPIRY_ATTESTED`,
+`REFUSAL_AUDIT_REPLICA_EXPIRY_ATTESTED`, and
+`REFUSAL_AUDIT_RESIDUAL_RISK_ACCEPTED`) are optional; omitting them or setting
+them to `false` does not block startup, while malformed non-boolean or
+non-UTF-8 values fail configuration validation.
 
 The refusal-audit operator binary (`refusal-audit-admin`) additionally uses
 `REFUSAL_AUDIT_ADMIN_DATABASE_URL`; see
@@ -166,7 +172,7 @@ Configuration is environment-based. Window keys and their defaults also live in
 | `STORE_CLAIM_TOKEN` | unset | optional setup code for claim mode, with no seller pin. After normalization it must be 32 Crockford Base32 characters or 64 hex characters and contain at least 10 distinct characters. Only its SHA-256 digest is retained. If unset while unclaimed, boot generates and logs an ephemeral code. |
 | `STORE_CLAIM_SESSION_MAX_AGE_SECONDS` | `900` | maximum age of the grant-minted session used to claim, from 1 through 3600 seconds. |
 | `LISTING_MODERATION` | `on` | `on` asks the index (`NEXUS_URL`) before selling a listing; `off` builds no moderation gate and does not read `NEXUS_URL`. `off` is allowed only in `single_seller` mode, including claim mode; any other value, or `off` in marketplace mode, refuses to boot. See [Single-seller mode](#single-seller-mode) |
-| `REFUSAL_AUDIT_*` | required | refusal-audit logins, HMAC key pair and attestations; see [Run](#run) |
+| `REFUSAL_AUDIT_*` | optional | optional refusal-audit logins and HMAC key pair; see [Run](#run) |
 | `BIND_ADDR` | `127.0.0.1:8080` | HTTP listen address |
 | `ALLOWED_ORIGINS` | empty | comma-separated exact CORS origins |
 | `AUTH_TOKEN_WINDOW_SECONDS` | `120` | acceptance window around server time for an AuthToken's signing timestamp |
@@ -351,8 +357,11 @@ Resolved records are cached in memory per process: at most 10,000 records
 publisher set, then resolved again. Whether a homeserver serves
 path-addressed storage (`/storage/{pubky}/pub/…`, read from its `/info`)
 is cached for 60 s for at most 256 homeservers; one that does not is read
-in the legacy form with a `pubky-host` header. No other per-homeserver
-state is kept, so publishing many homeservers does not grow memory. A
+in the legacy form with a `pubky-host` header. Direct homeserver transport
+also keeps a bounded LRU pool of at most 256 per-homeserver keep-alive HTTP
+clients (`60 s` idle timeout, up to 4 idle connections per host, replaced in
+place when the homeserver's resolved endpoints change), so publishing many
+homeservers does not grow memory without bound. A
 pubky that moves to another
 homeserver is read from the new one within 5 minutes of republishing its
 record; until then reads still go to the old homeserver. A deletion proof
@@ -395,10 +404,13 @@ without a moderation check`. The index is not the transaction authority
 (ADR 0019), so an outage there does not stop sales; the exception is a
 listing the gate has seen moderated: it stays refused until the index answers
 that it is clear (`ALERT the index could not confirm a moderated listing is
-still moderated; refusing it on the last moderated answer`). Only "moderated"
-answers are cached (5 minutes, per listing); a "clear" answer is never cached,
-so a moderation placed meanwhile is seen on the next command and lifting one
-takes effect once the cached answer expires. Orders created before a listing
+still moderated; refusing it on the last moderated answer`). "Moderated"
+answers are cached per listing for 5 minutes (bounded LRU) and "clear"
+answers are cached per listing for 15 seconds (bounded LRU, sequence-fenced
+and invalidated on any "moderated" or unavailable response; unavailable
+answers are never cached), so a newly placed moderation takes effect within
+at most 15 seconds and lifting one takes effect once the moderated entry
+expires. Orders created before a listing
 was moderated are not cancelled by this check.
 
 A single-seller deployment may switch the gate off with
@@ -441,8 +453,9 @@ whether a request concerns the store seller, and refuses anything else:
   serve is refused the same way rather than answered with 405; a path no
   route matches is still a 404.
 
-Every `SELLER_NOT_SERVED` refusal writes a refusal-audit row (`seller_not_served`): a command on
-the `v1_command` surface under its own command kind, a route on the
+When optional refusal audit is configured, every `SELLER_NOT_SERVED` refusal
+writes a refusal-audit row (`seller_not_served`): a command on the
+`v1_command` surface under its own command kind, a route on the
 `seller_route` surface under the `seller_route` command kind. The row tags
 an authenticated actor, so an unlisted route refused without an active
 session writes none. Sessions are
@@ -2438,8 +2451,9 @@ a PayPal reversal outstanding on the order holds the assumption; instant-only
 orders are delivered by their release (at payment under `DIGITAL_RELEASE=payment`)
 and never wait for it. A background
 worker deletes the sealed address after its retention (see
-`BUYER_EMAIL_RETENTION_DAYS`), and `/ready` reports `unavailable` if the purge
-falls behind.
+`BUYER_EMAIL_RETENTION_DAYS`), and `/ready` surfaces a
+`delivery_email_purge_overdue` warning while staying 200 OK if the purge falls
+behind.
 
 The entitlement ends, and reads are refused, when the order is `cancelled`,
 `refunded_external` or `closed` (`delivery_ended`). PayPal can also take the
@@ -2488,8 +2502,8 @@ the code and pinned by tests.
   unpaid checkout that was cancelled or expired
   (`BUYER_EMAIL_UNPAID_RETENTION_DAYS`). `ended_at` is stamped when the order
   enters one of those states and later writes do not move it.
-  `/ready` answers `delivery_email_purge_overdue` while an address is more
-  than a day past its retention.
+  `/ready` includes a `delivery_email_purge_overdue` warning (staying 200 OK)
+  while an address is more than a day past its retention.
 - The clock starts when the order ends. A paid order whose seller never marks
   the email delivered and never ends is a live order and keeps its sealed
   address until it does.
@@ -3079,10 +3093,10 @@ commands, exactly as in the engine.
 - Structured logs via `tracing`; log fields are command kind, command id,
   aggregate id, revision, and outcome code — no payload contents, no
   addresses, no message bodies.
-- `/health` is liveness plus a capability summary; `/ready` answers 503
-  when the refusal-audit pipeline is not ready, the database probe fails, or
-  buyer delivery emails are past their retention (the purge worker is not
-  running). The service publishes no version endpoint. `/health` carries
+- `/health` is liveness plus a capability summary; `/ready` answers 503 only
+  when the core database probe fails, while reporting an unready refusal-audit
+  writer or overdue buyer delivery email retention as structured warnings on
+  the 200 OK response. The service publishes no version endpoint. `/health` carries
   `commit`, the 12-character source SHA from the `GIT_COMMIT` image build arg
   (`unknown` when unset); the image digest and its
   `org.opencontainers.image.revision` label remain the authoritative record.

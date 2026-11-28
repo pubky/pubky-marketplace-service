@@ -140,6 +140,10 @@ pub struct AppState {
     /// Single flight for commands that read the homeserver before their
     /// executor transaction (`listing.register` with a public record).
     pub command_flights: command_flight::CommandFlights,
+    /// Single flight per order for payment-method binds so external FX HTTP
+    /// fetches stay outside PostgreSQL transactions while concurrent binds
+    /// for the same order serialize cleanly.
+    pub bind_flights: command_flight::CommandFlights,
     /// Seller payment-method rails: seller-secret sealing, PayPal IPN
     /// verification and the signed Paykit client. `None` when
     /// `STRIPE_KEY_ENCRYPTION_KEY` (the seller-secret key) is unset: the
@@ -170,8 +174,9 @@ pub struct AppState {
     /// Per-endpoint cache of pinned-stack readiness identities for the
     /// resolve delivery arm (§B.8.8: 15 s TTL, per endpoint).
     pub resolve_pin_cache: resolve_delivery::ResolvePinCache,
-    /// Optional only in in-process legacy tests. Production always installs
-    /// this after constructing its separate lazy writer pool.
+    /// Optional refusal-audit writer runtime. Installed when the deployment
+    /// configures the refusal-audit database logins and HMAC keys; `None`
+    /// otherwise.
     pub refusal_audit: Option<Arc<RefusalAuditRuntime>>,
     /// The retention connection is distinct from both domain and writer
     /// pools; its login is limited to the purge function.
@@ -244,6 +249,7 @@ impl AppState {
             refund_chain: None,
             homeserver: None,
             command_flights: command_flight::CommandFlights::default(),
+            bind_flights: command_flight::CommandFlights::default(),
             payments: None,
             payment_availability: PaymentAvailabilityCache::default(),
             bitcoin_setup_ready: BitcoinSetupReadyCache::default(),

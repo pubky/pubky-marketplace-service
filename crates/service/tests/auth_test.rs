@@ -275,4 +275,101 @@ async fn health_and_readiness_endpoints_respond(pool: PgPool) {
     let (status, body) = send(app.router.clone(), "GET", "/ready", None, &Value::Null).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], json!("ready"));
+    assert!(body.get("warnings").is_none(), "{body}");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn ready_returns_503_when_postgres_fails(pool: PgPool) {
+    let app = test_app(pool.clone()).await;
+    pool.close().await;
+
+    let (status, body) = send(app.router.clone(), "GET", "/ready", None, &Value::Null).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body, json!({ "status": "unavailable" }));
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn ready_returns_200_with_warnings_when_secondary_diagnostics_or_feeds_degrade(pool: PgPool) {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+
+    use marketplace_service::config::Config;
+    use marketplace_service::http::build_router;
+    use marketplace_service::listing_moderation::{
+        ListingModerationClient, ListingModerationGate, ModerationLookup,
+    };
+    use marketplace_service::refusal_audit::{AuditKeys, RefusalAuditRuntime};
+
+    struct UnavailableModeration;
+    impl ListingModerationClient for UnavailableModeration {
+        fn lookup<'a>(
+            &'a self,
+            _seller_pubky: &'a str,
+            _listing_id: &'a str,
+        ) -> Pin<Box<dyn Future<Output = ModerationLookup> + Send + 'a>> {
+            Box::pin(async { ModerationLookup::Unavailable })
+        }
+    }
+
+    let mut config = Config::for_tests();
+    config.usdt_payments_enabled = true;
+    config.fx_feed_url = "http://127.0.0.1:1/unreachable-fx".to_string();
+    let app = common::test_app_with_config(pool.clone(), config).await;
+
+    // Install an unverified refusal-audit writer (domain pool fails authority
+    // probe so is_ready() is false) plus an unavailable moderation gate.
+    let root = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [9u8; 32]);
+    let keys = AuditKeys::parse(&root, "1", None, None).expect("keys");
+    let audit = Arc::new(RefusalAuditRuntime::spawn(pool.clone(), keys));
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert!(!audit.is_ready());
+
+    // Seed an ended order with an overdue unpurged buyer delivery email.
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let order = common::create_pending_order(&app, &seller, &buyer).await;
+    let order_id = uuid::Uuid::parse_str(&order.order_id).expect("order uuid");
+    let now = app.clock.now();
+    sqlx::query("UPDATE orders SET state = 'cancelled' WHERE id = $1")
+        .bind(order_id)
+        .execute(&pool)
+        .await
+        .expect("cancel order");
+    sqlx::query("UPDATE orders SET ended_at = $2 WHERE id = $1")
+        .bind(order_id)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("stamp ended_at at app clock");
+    sqlx::query(
+        "INSERT INTO order_delivery_emails \
+         (order_id, buyer_pubky, email_ciphertext, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $4)",
+    )
+    .bind(order_id)
+    .bind(&buyer.pubky)
+    .bind(&[0_u8; 32][..])
+    .bind(now)
+    .execute(&pool)
+    .await
+    .expect("seed overdue email");
+    app.clock.set(now + chrono::Duration::days(40));
+
+    let state = app
+        .state
+        .clone()
+        .with_refusal_audit(audit)
+        .with_listing_moderation(Some(Arc::new(ListingModerationGate::new(Arc::new(
+            UnavailableModeration,
+        )))));
+    let router = build_router(state);
+
+    let (status, body) = send(router, "GET", "/ready", None, &Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], json!("ready"));
+    assert_eq!(
+        body["warnings"],
+        json!(["refusal_audit_not_ready", "delivery_email_purge_overdue"])
+    );
 }

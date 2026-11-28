@@ -859,3 +859,51 @@ async fn an_index_without_the_moderation_route_is_unavailable_not_clear() {
         ModerationLookup::Unavailable
     );
 }
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn clear_moderation_cache_dedupes_burst_and_enforces_moderation_after_ttl(pool: PgPool) {
+    let mut app = test_app(pool).await;
+    let index = Arc::new(FakeIndex::default());
+    let gate = ListingModerationGate::with_ttls(
+        index.clone(),
+        Duration::from_secs(60),
+        Duration::from_millis(120),
+    );
+    app.state = app
+        .state
+        .clone()
+        .with_listing_moderation(Some(Arc::new(gate)));
+    app.router = build_router(app.state.clone());
+
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (status, body) = execute(&app, &seller.token, &register_command(&seller.pubky, 5)).await;
+    assert_eq!(status, StatusCode::OK, "register: {body}");
+
+    // Three sequential checkouts on the same clear listing within the short
+    // Clear TTL hit Nexus only once instead of hammering it on every order.
+    for number in 0..3 {
+        let mut command = checkout_command_with_id(
+            &seller.pubky,
+            &format!("00000000-0000-4000-8000-00000000900{number}"),
+        );
+        command["payload"]["lines"][0]["expected_revision"] = json!(1);
+        let (status, body) = execute(&app, &buyer.token, &command).await;
+        assert_eq!(status, StatusCode::OK, "checkout {number}: {body}");
+    }
+    assert_eq!(
+        index.lookups(),
+        1,
+        "burst checkouts reuse the short-TTL Clear cache"
+    );
+
+    // Once moderated and the short Clear TTL elapses, the block is enforced.
+    index.moderate(&seller.pubky, "boots_01");
+    tokio::time::sleep(Duration::from_millis(160)).await;
+    let mut blocked =
+        checkout_command_with_id(&seller.pubky, "00000000-0000-4000-8000-000000009099");
+    blocked["payload"]["lines"][0]["expected_revision"] = json!(1);
+    let (status, body) = execute(&app, &buyer.token, &blocked).await;
+    assert_moderated_refusal(status, &body);
+    assert_eq!(index.lookups(), 2);
+}

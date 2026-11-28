@@ -68,64 +68,40 @@ pub async fn execute_with_edge(
     };
     let request_hash = command.request_hash();
 
-    // In single-seller mode a command for any other seller is refused before
-    // any other gate. A command id that already has a stored result is a
-    // replay and is answered from it.
-    if let Some(failure) = crate::store_seller::command_refusal(state, &command).await? {
-        if stored_command_result(&state.pool, actor, command.command_id)
-            .await?
-            .is_none()
-        {
-            log_command(
-                actor,
-                command.kind(),
-                &command.command_id.to_string(),
-                &command.aggregate_id,
-                "refused",
-                Some(failure.code()),
-                Some(failure.message()),
-                command.expected_revision,
-                started.elapsed().as_millis() as u64,
-            );
-            if failure.is_audited() {
-                enqueue_refusal(
-                    state,
-                    actor,
-                    state.clock.now(),
-                    SurfaceKind::V1Command,
-                    command_kind(&command.payload),
-                    failure.refusal_kind(),
-                    Some(command.command_id),
-                );
-            }
-            return Ok(failure_response(&failure));
-        }
+    // Check stored command result once before any pre-transaction gate or
+    // external read. `command_results` rows are append-only (never updated or
+    // deleted), so an existing replay answers immediately without running
+    // redundant DB or network checks. Concurrent duplicates are still
+    // serialized by `command_flights` and the transactional advisory lock.
+    if let Some((stored_hash, stored_result)) =
+        stored_command_result(&state.pool, actor, command.command_id).await?
+    {
+        return Ok(stored_result_response(
+            state,
+            actor,
+            &command,
+            &request_hash,
+            &stored_hash,
+            stored_result,
+            started,
+        ));
     }
 
-    // Reject commands whose currency is outside what the configured FX feed
-    // quotes (for example CHF/JPY/CAD/AUD when configured with Bitstamp, or
-    // non-USD currencies on a USD-only single-pair URL) upfront with 422
-    // INVALID_COMMAND before any upstream IO or writes. Commands whose payload
-    // omits the currency (`offer.accept`, `offer.checkout`, `checkout.create`)
-    // resolve it locally from PostgreSQL while preserving auth, state, and
-    // revision precedence. A command id with a stored result is still answered
-    // as a replay.
-    if let Some(failure) = resolve_provider_currency_refusal(state, actor, &command).await? {
-        if stored_command_result(&state.pool, actor, command.command_id)
-            .await?
-            .is_none()
-        {
-            log_command(
-                actor,
-                command.kind(),
-                &command.command_id.to_string(),
-                &command.aggregate_id,
-                "refused",
-                Some(failure.code()),
-                Some(failure.message()),
-                command.expected_revision,
-                started.elapsed().as_millis() as u64,
-            );
+    // In single-seller mode a command for any other seller is refused before
+    // any other gate.
+    if let Some(failure) = crate::store_seller::command_refusal(state, &command).await? {
+        log_command(
+            actor,
+            command.kind(),
+            &command.command_id.to_string(),
+            &command.aggregate_id,
+            "refused",
+            Some(failure.code()),
+            Some(failure.message()),
+            command.expected_revision,
+            started.elapsed().as_millis() as u64,
+        );
+        if failure.is_audited() {
             enqueue_refusal(
                 state,
                 actor,
@@ -135,8 +111,40 @@ pub async fn execute_with_edge(
                 failure.refusal_kind(),
                 Some(command.command_id),
             );
-            return Ok(failure_response(&failure));
         }
+        return Ok(failure_response(&failure));
+    }
+
+    // Reject commands whose currency is outside what the configured FX feed
+    // quotes (for example CHF/JPY/CAD/AUD when configured with Bitstamp, or
+    // non-USD currencies on a USD-only single-pair URL) upfront with 422
+    // INVALID_COMMAND before any upstream IO or writes. Commands whose payload
+    // omits the currency (`offer.accept`, `offer.checkout`, `checkout.create`)
+    // resolve it locally from PostgreSQL while preserving auth, state, and
+    // revision precedence. A command id with a stored result was already
+    // answered above as a replay.
+    if let Some(failure) = resolve_provider_currency_refusal(state, actor, &command).await? {
+        log_command(
+            actor,
+            command.kind(),
+            &command.command_id.to_string(),
+            &command.aggregate_id,
+            "refused",
+            Some(failure.code()),
+            Some(failure.message()),
+            command.expected_revision,
+            started.elapsed().as_millis() as u64,
+        );
+        enqueue_refusal(
+            state,
+            actor,
+            state.clock.now(),
+            SurfaceKind::V1Command,
+            command_kind(&command.payload),
+            failure.refusal_kind(),
+            Some(command.command_id),
+        );
+        return Ok(failure_response(&failure));
     }
 
     // A command that sells a listing is refused when the index says the
@@ -144,12 +152,13 @@ pub async fn execute_with_edge(
     // record says it is not for sale (any non-active state for a new
     // commitment, a removal for a continuation). Both are read before the
     // transaction, so a slow index or homeserver never holds a domain
-    // connection. A command id that already has a stored result is a replay
-    // and is answered from it.
-    let moderation = state.listing_moderation.as_deref();
+    // connection. The sold listings lookup is cached for the rest of this
+    // pre-transaction pass and reused by the region fence and shipping plan.
+    let moderation = state.listing_moderation.as_ref();
     let lifecycle = state.homeserver.clone().and_then(|homeserver| {
         crate::listing_lifecycle::gate_for(&command.payload).map(|gate| (homeserver, gate))
     });
+    let mut sold_listings: Option<Vec<crate::listing_moderation::SoldListing>> = None;
     if moderation.is_some() || lifecycle.is_some() {
         let listings =
             crate::listing_moderation::listings_a_command_sells(&state.pool, actor, &command)
@@ -166,26 +175,17 @@ pub async fn execute_with_edge(
                 .map(|listing| (listing.seller_pubky.clone(), listing.listing_id.clone()))
                 .collect(),
         };
-        if (!listings.is_empty() || !lifecycle_listings.is_empty())
-            && stored_command_result(&state.pool, actor, command.command_id)
-                .await?
-                .is_none()
-        {
+        if !listings.is_empty() || !lifecycle_listings.is_empty() {
             let (moderated, not_on_sale) = tokio::join!(
                 async {
                     let gate = moderation?;
-                    for listing in &listings {
-                        if gate.check(&listing.seller_pubky, &listing.listing_id).await
-                            == crate::listing_moderation::ModerationVerdict::Moderated
-                        {
-                            return Some(CommandFailure::refused(
-                                crate::refusal_audit::RefusalKind::InvalidState,
-                                ErrorCode::ListingModerated,
-                                crate::listing_moderation::LISTING_MODERATED_MESSAGE,
-                            ));
-                        }
-                    }
-                    None
+                    gate.any_moderated(&listings).await.then(|| {
+                        CommandFailure::refused(
+                            crate::refusal_audit::RefusalKind::InvalidState,
+                            ErrorCode::ListingModerated,
+                            crate::listing_moderation::LISTING_MODERATED_MESSAGE,
+                        )
+                    })
                 },
                 async {
                     let (homeserver, gate) = lifecycle?;
@@ -216,6 +216,7 @@ pub async fn execute_with_edge(
                 return Ok(failure_response(&failure));
             }
         }
+        sold_listings = Some(listings);
     }
 
     // Commerce in a blocked region (`REGION_MODES`): buying and selling are
@@ -227,9 +228,6 @@ pub async fn execute_with_edge(
     // are checked; a replay is answered from its stored result.
     if state.config.region_policy().commerce_active()
         && crate::commerce_region::is_gated(&command.payload)
-        && stored_command_result(&state.pool, actor, command.command_id)
-            .await?
-            .is_none()
     {
         if let Err(failure) = crate::commerce_region::gate(state, actor, &command, edge).await {
             log_command(
@@ -261,18 +259,24 @@ pub async fn execute_with_edge(
     // the buyer's country, a buyer in a nuanced region buys only from a
     // declared private seller, and a seller in a blocked region sells to
     // nobody. The sellers' shop records are read here for the same reason as
-    // above. A replay is answered from its stored result.
+    // above.
     let mut fence = crate::region_fence::FencePlan::off();
     if state.config.region_policy().fence_active()
         && crate::region_fence::buyer_country_of(&command.payload).is_some()
-        && stored_command_result(&state.pool, actor, command.command_id)
-            .await?
-            .is_none()
     {
-        let listings =
-            crate::listing_moderation::listings_a_command_sells(&state.pool, actor, &command)
+        let listings = match &sold_listings {
+            Some(listings) => listings.as_slice(),
+            None => {
+                let fetched = crate::listing_moderation::listings_a_command_sells(
+                    &state.pool,
+                    actor,
+                    &command,
+                )
                 .await?;
-        match crate::region_fence::gate(state, &command, &listings).await {
+                sold_listings.insert(fetched).as_slice()
+            }
+        };
+        match crate::region_fence::gate(state, &command, listings).await {
             Ok(plan) => fence = plan,
             Err(failure) => {
                 log_command(
@@ -302,12 +306,8 @@ pub async fn execute_with_edge(
 
     // No digital sales to EU or UK buyers (legal launch plan C3b), when
     // `DIGITAL_REGION_BLOCK_ENABLED` is on or `REGION_MODES` has a nuanced
-    // region. A replay is answered from its stored result.
-    if state.config.region_policy().digital_active()
-        && stored_command_result(&state.pool, actor, command.command_id)
-            .await?
-            .is_none()
-    {
+    // region.
+    if state.config.region_policy().digital_active() {
         if let Err(failure) = crate::digital_region::gate(state, &command, edge).await {
             log_command(
                 actor,
@@ -335,8 +335,7 @@ pub async fn execute_with_edge(
 
     // Zone-priced shipping reads the sellers' shipping profiles and shop
     // records here, before the transaction, for the same reason: a slow
-    // homeserver never holds a listing row lock. A replay is answered from
-    // its stored result.
+    // homeserver never holds a listing row lock.
     let mut shipping = crate::shipping::ShippingPlan::off();
     if matches!(
         command.payload,
@@ -344,11 +343,13 @@ pub async fn execute_with_edge(
             | CommandPayload::CreateOffer(_)
             | CommandPayload::AcceptOffer(_)
             | CommandPayload::PlaceBid(_)
-    ) && stored_command_result(&state.pool, actor, command.command_id)
-        .await?
-        .is_none()
-    {
-        shipping = crate::shipping::ShippingPlan::read(state, &command).await?;
+    ) {
+        shipping = crate::shipping::ShippingPlan::read_with_listings(
+            state,
+            &command,
+            sold_listings.as_deref(),
+        )
+        .await?;
     }
 
     // A `listing.register` that needs the seller's public record, every

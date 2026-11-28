@@ -1626,8 +1626,14 @@ async fn refusal_audit_writer_identity_mismatch_blocks_readiness_and_drops_deliv
     let app = common::test_app(pool).await;
     let router =
         marketplace_service::http::build_router(app.state.clone().with_refusal_audit(runtime));
-    let (status, _) = common::send(router, "GET", "/ready", None, &serde_json::Value::Null).await;
-    assert_eq!(status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    let (status, body) =
+        common::send(router, "GET", "/ready", None, &serde_json::Value::Null).await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+    assert_eq!(body["status"], serde_json::json!("ready"));
+    assert_eq!(
+        body["warnings"],
+        serde_json::json!(["refusal_audit_not_ready"])
+    );
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
@@ -3001,5 +3007,42 @@ async fn refusal_audit_retention_outage_does_not_abort_domain_worker_pass(pool: 
     )
     .await
     .expect("audit retention outage must not abort the domain pass");
+    assert_eq!(summary.refusal_audit_rows_purged, 0);
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn optional_refusal_audit_disabled_skips_writes_and_retention_purge_cleanly(pool: PgPool) {
+    let app = common::test_app(pool.clone()).await;
+    assert!(app.state.refusal_audit.is_none());
+    assert!(app.state.refusal_audit_retention_pool.is_none());
+
+    let actor = common::new_actor(&app).await;
+    let (status, body) = common::send(
+        app.router.clone(),
+        "POST",
+        "/v1/commands",
+        Some(&actor.token),
+        &serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(body["error"]["code"], "INVALID_COMMAND");
+
+    let buckets: i64 = sqlx::query_scalar("SELECT count(*) FROM command_refusal_audit_buckets")
+        .fetch_one(&pool)
+        .await
+        .expect("bucket count");
+    assert_eq!(
+        buckets, 0,
+        "no audit row is written against the domain pool when refusal audit is disabled"
+    );
+
+    let summary = marketplace_service::workers::run_once(
+        &app.state,
+        Uuid::new_v4(),
+        common::NOW.parse().expect("fixed worker time"),
+    )
+    .await
+    .expect("worker pass succeeds with refusal audit disabled");
     assert_eq!(summary.refusal_audit_rows_purged, 0);
 }

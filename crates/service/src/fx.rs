@@ -31,6 +31,7 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
@@ -943,6 +944,11 @@ impl FxSnapshot {
             return Err(FxError::UnsupportedCurrency);
         }
         Err(FxError::Malformed)
+    }
+
+    /// Whether the configured feed URL quotes `currency`.
+    pub fn supports_fiat(&self, currency: Currency) -> bool {
+        currency.is_fiat() && self.supported_fiat.contains(&currency)
     }
 
     /// Every supported fiat currency with its validation outcome.
@@ -2041,6 +2047,29 @@ where
     median(parsed).ok_or(FxError::MissingReference)
 }
 
+/// Validates the USD ticker from a pre-fetched `snapshot` against point-of-use
+/// freshness (`now`) and the persisted reference median, without performing
+/// HTTP I/O on `executor`.
+pub async fn reference_rate_from_snapshot<'e, E>(
+    executor: E,
+    snapshot: &FxSnapshot,
+    now: DateTime<Utc>,
+) -> Result<(Decimal, RateSample), FxError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    if !snapshot.supports_fiat(Currency::Usd) {
+        return Err(FxError::UnsupportedCurrency);
+    }
+    let median_rate = reference_median(executor, Currency::Usd, now).await?;
+    let current = snapshot.sample(Currency::Usd)?;
+    check_freshness(current.fetched_at, now)?;
+    if !within_deviation(&current.rate, &median_rate) {
+        return Err(FxError::DeviationExceeded);
+    }
+    Ok((current.rate.clone(), current))
+}
+
 /// The reference BTCUSD rate from `provider`: the current feed rate, accepted
 /// only while it sits within [`MAX_DEVIATION_BPS`] of the median of the
 /// persisted samples.
@@ -2075,6 +2104,35 @@ where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
 {
     reference_rate_for(executor, FxFeedProvider::Blocktank, feed_url, now).await
+}
+
+/// Quotes a fiat price in satoshis from a pre-fetched `snapshot` against
+/// point-of-use freshness (`now`) and the persisted median on `executor`,
+/// with zero HTTP I/O while holding a transaction.
+pub async fn quote_fiat_from_snapshot<'e, E>(
+    executor: E,
+    snapshot: &FxSnapshot,
+    currency: Currency,
+    total_minor: i64,
+    now: DateTime<Utc>,
+) -> Result<(Decimal, RateSample, u64), FxError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    if !currency.is_fiat() {
+        return Err(FxError::Malformed);
+    }
+    if !snapshot.supports_fiat(currency) {
+        return Err(FxError::UnsupportedCurrency);
+    }
+    let median_rate = reference_median(executor, currency, now).await?;
+    let current = snapshot.sample(currency)?;
+    check_freshness(current.fetched_at, now)?;
+    if !within_deviation(&current.rate, &median_rate) {
+        return Err(FxError::DeviationExceeded);
+    }
+    let sats = quote_sats(total_minor, currency.exponent(), &current.rate)?;
+    Ok((current.rate.clone(), current, sats))
 }
 
 /// Quotes a fiat price in satoshis from `provider` with the currency's own
@@ -2246,6 +2304,91 @@ pub struct OrderQuote {
     pub usd: UsdSettlement,
 }
 
+/// Quotes one fiat order total from a pre-fetched `snapshot` against
+/// point-of-use freshness (`now`) and the persisted references on `conn`,
+/// with zero HTTP I/O inside an open database transaction.
+pub async fn quote_order_from_snapshot(
+    conn: &mut sqlx::PgConnection,
+    snapshot: &FxSnapshot,
+    currency: Currency,
+    total_minor: i64,
+    now: DateTime<Utc>,
+) -> Result<OrderQuote, FxError> {
+    if !currency.is_fiat() {
+        return Err(FxError::Malformed);
+    }
+    if !snapshot.supports_fiat(currency) {
+        return Err(FxError::UnsupportedCurrency);
+    }
+    if currency != Currency::Usd && !snapshot.supports_fiat(Currency::Usd) {
+        return Err(FxError::UnsupportedCurrency);
+    }
+    let direct_reference = reference_median(&mut *conn, currency, now).await?;
+    let usd_reference = if currency == Currency::Usd {
+        None
+    } else {
+        Some(reference_median(&mut *conn, Currency::Usd, now).await?)
+    };
+    build_order_quote(
+        currency,
+        total_minor,
+        &direct_reference,
+        usd_reference.as_ref(),
+        snapshot,
+        now,
+    )
+}
+
+fn build_order_quote(
+    currency: Currency,
+    total_minor: i64,
+    direct_reference: &Decimal,
+    usd_reference: Option<&Decimal>,
+    snapshot: &FxSnapshot,
+    now: DateTime<Utc>,
+) -> Result<OrderQuote, FxError> {
+    let direct = snapshot.sample(currency)?;
+    check_freshness(direct.fetched_at, now)?;
+    if !within_deviation(&direct.rate, direct_reference) {
+        return Err(FxError::DeviationExceeded);
+    }
+    let sats = quote_sats(total_minor, currency.exponent(), &direct.rate);
+    let usd = match usd_reference {
+        None => UsdSettlement {
+            cents: u64::try_from(total_minor).map_err(|_| FxError::Overflow)?,
+            cross: None,
+        },
+        Some(usd_reference) => {
+            let usd_sample = snapshot.sample(Currency::Usd)?;
+            check_freshness(usd_sample.fetched_at, now)?;
+            if !within_deviation(&usd_sample.rate, usd_reference) {
+                return Err(FxError::DeviationExceeded);
+            }
+            let cents = usd_cents_for(
+                total_minor,
+                currency.exponent(),
+                &usd_sample.rate,
+                &direct.rate,
+            )?;
+            UsdSettlement {
+                cents,
+                cross: Some(CrossRate {
+                    pair: format!("{}USD", currency.code()),
+                    usd_rate: usd_sample.rate,
+                    currency_rate: direct.rate.clone(),
+                    fetched_at: usd_sample.fetched_at.min(direct.fetched_at),
+                }),
+            }
+        }
+    };
+    Ok(OrderQuote {
+        currency,
+        direct,
+        sats,
+        usd,
+    })
+}
+
 /// Quotes one fiat order total from a single snapshot of `provider` for the
 /// multi-asset contract: the guarded direct `BTC<CCY>` quote and the
 /// USD-cents settlement. A non-USD currency also needs a guarded `BTCUSD`
@@ -2288,44 +2431,14 @@ pub async fn quote_order_for(
         now,
     )
     .await?;
-    let direct = snapshot.sample(currency)?;
-    if !within_deviation(&direct.rate, &direct_reference) {
-        return Err(FxError::DeviationExceeded);
-    }
-    let sats = quote_sats(total_minor, currency.exponent(), &direct.rate);
-    let usd = match usd_reference {
-        None => UsdSettlement {
-            cents: u64::try_from(total_minor).map_err(|_| FxError::Overflow)?,
-            cross: None,
-        },
-        Some(usd_reference) => {
-            let usd_sample = snapshot.sample(Currency::Usd)?;
-            if !within_deviation(&usd_sample.rate, &usd_reference) {
-                return Err(FxError::DeviationExceeded);
-            }
-            let cents = usd_cents_for(
-                total_minor,
-                currency.exponent(),
-                &usd_sample.rate,
-                &direct.rate,
-            )?;
-            UsdSettlement {
-                cents,
-                cross: Some(CrossRate {
-                    pair: format!("{}USD", currency.code()),
-                    usd_rate: usd_sample.rate,
-                    currency_rate: direct.rate.clone(),
-                    fetched_at: usd_sample.fetched_at.min(direct.fetched_at),
-                }),
-            }
-        }
-    };
-    Ok(OrderQuote {
+    build_order_quote(
         currency,
-        direct,
-        sats,
-        usd,
-    })
+        total_minor,
+        &direct_reference,
+        usd_reference.as_ref(),
+        &snapshot,
+        now,
+    )
 }
 
 /// [`quote_order_for`] against the Blocktank wire format.
@@ -2386,37 +2499,70 @@ fn validate_http_age(headers: &reqwest::header::HeaderMap) -> Result<(), FxError
     Ok(())
 }
 
-async fn build_fx_http_client(
-    feed_url: &str,
-    deadline: tokio::time::Instant,
-) -> Result<(Url, reqwest::Client), FxError> {
-    let parsed = validate_fx_feed_url(feed_url).map_err(|_| FxError::Malformed)?;
-    let loopback = is_loopback_host(&parsed);
-    let port = parsed.port_or_known_default().ok_or(FxError::Malformed)?;
+/// Validates every resolved IP address against [`is_allowed_fx_ip`] inside
+/// reqwest's DNS hook before TCP connect, allowing pooled keep-alive reuse
+/// while preventing DNS rebinding to link-local, metadata, or private ranges.
+struct FxDnsResolver {
+    allow_loopback: bool,
+}
 
-    let mut builder = reqwest::Client::builder()
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .https_only(!loopback)
-        .user_agent("pubky-marketplace-service");
-
-    match parsed.host() {
-        Some(Host::Domain(domain)) => {
-            let addresses: Vec<SocketAddr> =
-                tokio::time::timeout_at(deadline, tokio::net::lookup_host((domain, port)))
-                    .await
-                    .map_err(|_| FxError::Malformed)?
-                    .map_err(|_| FxError::Malformed)?
-                    .collect();
+impl reqwest::dns::Resolve for FxDnsResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let allow_loopback = self.allow_loopback;
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            let addresses: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
+                .await
+                .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)?
+                .collect();
             if addresses.is_empty()
                 || !addresses
                     .iter()
-                    .all(|address| is_allowed_fx_ip(address.ip(), loopback))
+                    .all(|address| is_allowed_fx_ip(address.ip(), allow_loopback))
             {
-                return Err(FxError::Malformed);
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "FX feed resolved to a disallowed IP address",
+                ))
+                    as Box<dyn std::error::Error + Send + Sync>);
             }
-            builder = builder.resolve_to_addrs(domain, &addresses);
-        }
+            let iter: reqwest::dns::Addrs = Box::new(addresses.into_iter());
+            Ok(iter)
+        })
+    }
+}
+
+fn build_fx_http_client(allow_loopback: bool) -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(FX_CONNECT_TIMEOUT)
+        .timeout(FX_REQUEST_TIMEOUT)
+        .pool_idle_timeout(StdDuration::from_secs(60))
+        .pool_max_idle_per_host(4)
+        .https_only(!allow_loopback)
+        .dns_resolver(Arc::new(FxDnsResolver { allow_loopback }))
+        .user_agent("pubky-marketplace-service")
+        .build()
+        .expect("FX reqwest client builds")
+}
+
+fn fx_http_client(loopback: bool) -> &'static reqwest::Client {
+    if loopback {
+        static LOOPBACK_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+        LOOPBACK_CLIENT.get_or_init(|| build_fx_http_client(true))
+    } else {
+        static PUBLIC_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+        PUBLIC_CLIENT.get_or_init(|| build_fx_http_client(false))
+    }
+}
+
+fn prepare_fx_request(feed_url: &str) -> Result<(Url, &'static reqwest::Client), FxError> {
+    let parsed = validate_fx_feed_url(feed_url).map_err(|_| FxError::Malformed)?;
+    let loopback = is_loopback_host(&parsed);
+
+    match parsed.host() {
+        Some(Host::Domain(_)) => {}
         Some(Host::Ipv4(ip)) => {
             if !is_allowed_fx_ip(IpAddr::V4(ip), loopback) {
                 return Err(FxError::Malformed);
@@ -2430,17 +2576,7 @@ async fn build_fx_http_client(
         None => return Err(FxError::Malformed),
     }
 
-    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-    if remaining.is_zero() {
-        return Err(FxError::Malformed);
-    }
-
-    let client = builder
-        .connect_timeout(FX_CONNECT_TIMEOUT.min(remaining))
-        .timeout(remaining)
-        .build()
-        .map_err(|_| FxError::Malformed)?;
-    Ok((parsed, client))
+    Ok((parsed, fx_http_client(loopback)))
 }
 
 async fn fetch_body_with_client(
@@ -2448,16 +2584,16 @@ async fn fetch_body_with_client(
     url: Url,
     deadline: tokio::time::Instant,
 ) -> Result<FetchedFeed, FxError> {
-    if deadline
-        .saturating_duration_since(tokio::time::Instant::now())
-        .is_zero()
-    {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
         return Err(FxError::Malformed);
     }
+
     let mut response = tokio::time::timeout_at(
         deadline,
         client
             .get(url)
+            .timeout(remaining)
             .header(reqwest::header::CACHE_CONTROL, "no-cache")
             .send(),
     )
@@ -2506,8 +2642,8 @@ async fn fetch_body_with_timeout(
         return Err(FxError::Malformed);
     }
     let deadline = tokio::time::Instant::now() + budget;
-    let (parsed, client) = build_fx_http_client(feed_url, deadline).await?;
-    fetch_body_with_client(&client, parsed, deadline).await
+    let (parsed, client) = prepare_fx_request(feed_url)?;
+    fetch_body_with_client(client, parsed, deadline).await
 }
 
 async fn fetch_kraken_snapshot_currencies(
@@ -2521,7 +2657,7 @@ async fn fetch_kraken_snapshot_currencies(
         return Err(FxError::Malformed);
     }
     let deadline = tokio::time::Instant::now() + budget;
-    let (parsed, client) = build_fx_http_client(feed_url, deadline).await?;
+    let (parsed, client) = prepare_fx_request(feed_url)?;
 
     // If the configured URL already specifies a `pair` query parameter,
     // canonicalize it (`pair=<pair>&count=1`, stripping `since` and any
@@ -2539,7 +2675,7 @@ async fn fetch_kraken_snapshot_currencies(
             return Err(FxError::Malformed);
         }
         let canonical = kraken_canonical_pair_url(&parsed, explicit_pairs[0].trim());
-        let fetched = fetch_body_with_client(&client, canonical, deadline).await?;
+        let fetched = fetch_body_with_client(client, canonical, deadline).await?;
         return parse_kraken_snapshot(&fetched.body, observed_at, supported_fiat);
     }
 
@@ -2556,9 +2692,8 @@ async fn fetch_kraken_snapshot_currencies(
     let mut join_set = tokio::task::JoinSet::new();
     for currency in target_currencies.iter().copied() {
         let pair_url = kraken_pair_url(&parsed, currency)?;
-        let client = client.clone();
         join_set.spawn(async move {
-            let outcome = match fetch_body_with_client(&client, pair_url, deadline).await {
+            let outcome = match fetch_body_with_client(client, pair_url, deadline).await {
                 Ok(fetched) => match parse_kraken_envelope(&fetched.body) {
                     Ok(result) => Ok(parse_kraken_pair_trades(&result, currency, observed_at)),
                     Err(error) => Err(error),
@@ -2628,6 +2763,34 @@ async fn fetch_snapshot_currencies_for(
     }
     let fetched = fetch_body(feed_url).await?;
     parse_snapshot_for_url(provider, feed_url, &fetched.body, now, fetched.header_date)
+}
+
+/// One fetch of `provider` at `feed_url`, requesting only `currencies` on
+/// per-pair providers such as Kraken while validating every returned ticker.
+pub async fn fetch_snapshot_for_currencies(
+    provider: FxFeedProvider,
+    feed_url: &str,
+    currencies: &[Currency],
+    now: DateTime<Utc>,
+) -> Result<FxSnapshot, FxError> {
+    if currencies.is_empty() {
+        return Err(FxError::Malformed);
+    }
+    let feed = FxFeedConfig::resolve(provider, feed_url).map_err(|_| FxError::Malformed)?;
+    if !currencies
+        .iter()
+        .all(|currency| feed.supports_fiat(*currency))
+    {
+        return Err(FxError::UnsupportedCurrency);
+    }
+    fetch_snapshot_currencies_for(
+        feed.provider,
+        feed_url,
+        feed.supported_currencies(),
+        currencies,
+        now,
+    )
+    .await
 }
 
 /// One fetch of `provider` at `feed_url`, every URL-supported fiat ticker
@@ -4992,5 +5155,60 @@ mod tests {
             "USD-base Coinbase response must fail closed"
         );
         assert_eq!(usd_hits.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn fetch_body_reuses_pooled_keep_alive_connection() {
+        let now: DateTime<Utc> = FIXTURE_NOW.parse().unwrap();
+        let body = format!(
+            r#"{{"time":{},"USD":77197,"EUR":66481,"GBP":57037,"CAD":106992,"CHF":62992,"AUD":107607,"JPY":11745955}}"#,
+            now.timestamp()
+        );
+        let raw = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
+            body.len()
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind keep-alive server");
+        let addr = listener.local_addr().unwrap();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let conns_bg = connections.clone();
+        let raw_bytes = raw.into_bytes();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                conns_bg.fetch_add(1, AtomicOrdering::SeqCst);
+                let resp = raw_bytes.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {
+                                if socket.write_all(&resp).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        let url = format!("http://{addr}/api/v1/prices");
+        for _ in 0..4 {
+            let snap = fetch_snapshot_for(FxFeedProvider::Mempool, &url, now)
+                .await
+                .expect("pooled mempool fetch");
+            assert_eq!(
+                snap.sample(Currency::Usd).unwrap().rate.to_string_value(),
+                "77197"
+            );
+        }
+        assert_eq!(
+            connections.load(AtomicOrdering::SeqCst),
+            1,
+            "sequential FX fetches reuse one pooled keep-alive TCP connection"
+        );
     }
 }

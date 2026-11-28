@@ -1195,23 +1195,34 @@ fn a_homeserver_that_republishes_its_direct_port_is_reached_at_the_new_one() {
             HomeserverFetchOutcome::Found(record) => record["title"].as_str().map(str::to_owned),
             _ => None,
         };
-        for _ in 0..2 {
+        for _ in 0..4 {
             assert_eq!(
                 title(client.fetch_listing(&pubky, LISTING_ID).await).as_deref(),
                 Some("at the old port")
             );
         }
+        assert_eq!(
+            old_connections.load(Ordering::SeqCst),
+            1,
+            "sequential direct reads to an unchanged endpoint reuse one keep-alive connection"
+        );
         assert_eq!(new_connections.load(Ordering::SeqCst), 0);
 
         publish_endpoints(&testnet, &homeserver, direct(new_port)).await;
         tokio::time::sleep_until((resolved_at + ttl + Duration::from_secs(1)).into()).await;
+        for _ in 0..3 {
+            assert_eq!(
+                title(client.fetch_listing(&pubky, LISTING_ID).await).as_deref(),
+                Some("at the new port"),
+                "a connection made before the republish is not reused for the new record's endpoint"
+            );
+        }
+        assert_eq!(old_connections.load(Ordering::SeqCst), 1);
         assert_eq!(
-            title(client.fetch_listing(&pubky, LISTING_ID).await).as_deref(),
-            Some("at the new port"),
-            "a connection made before the republish is not reused for the new record's endpoint"
+            new_connections.load(Ordering::SeqCst),
+            1,
+            "subsequent reads to the republished endpoint reuse its pooled connection"
         );
-        assert!(old_connections.load(Ordering::SeqCst) >= 1);
-        assert!(new_connections.load(Ordering::SeqCst) >= 1);
     });
 }
 
