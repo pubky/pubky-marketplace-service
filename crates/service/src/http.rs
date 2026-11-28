@@ -568,17 +568,25 @@ fn short_commit(raw: Option<&str>) -> String {
 }
 
 async fn ready(State(state): State<AppState>) -> Response {
+    if let Err(error) = sqlx::query("SELECT 1").execute(&state.pool).await {
+        tracing::error!(error = %error, "readiness probe failed");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "status": "unavailable" })),
+        )
+            .into_response();
+    }
+    let mut warnings: Vec<&'static str> = Vec::new();
     if let Some(audit) = &state.refusal_audit {
         if !audit.is_ready() {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({ "status": "unavailable" })),
-            )
-                .into_response();
+            tracing::warn!(
+                metric = "refusal_audit_ready",
+                value = 0_u64,
+                "refusal audit writer is not ready; readiness remains ok"
+            );
+            warnings.push("refusal_audit_not_ready");
         }
     }
-    // A purge that stopped running leaves buyer addresses past their
-    // retention; readiness reports it rather than keeping them silently.
     match crate::handlers::digital_manual::overdue_delivery_emails(
         &state.pool,
         state.clock.now(),
@@ -588,36 +596,28 @@ async fn ready(State(state): State<AppState>) -> Response {
     .await
     {
         Ok(0) => {}
-        Ok(_) => {
-            tracing::error!(
-                "buyer delivery emails are past their retention; the purge is not running"
+        Ok(overdue) => {
+            tracing::warn!(
+                metric = "delivery_email_purge_overdue_total",
+                value = overdue,
+                "buyer delivery emails are past their retention; readiness remains ok"
             );
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({ "status": "unavailable", "reason": "delivery_email_purge_overdue" })),
-            )
-                .into_response();
+            warnings.push("delivery_email_purge_overdue");
         }
         Err(error) => {
-            tracing::error!(error = %error, "readiness probe failed");
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({ "status": "unavailable" })),
-            )
-                .into_response();
+            tracing::warn!(
+                error = %error,
+                "delivery email retention check failed; readiness remains ok"
+            );
+            warnings.push("delivery_email_purge_check_failed");
         }
     }
-    match sqlx::query("SELECT 1").execute(&state.pool).await {
-        Ok(_) => (StatusCode::OK, Json(json!({ "status": "ready" }))).into_response(),
-        Err(error) => {
-            tracing::error!(error = %error, "readiness probe failed");
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({ "status": "unavailable" })),
-            )
-                .into_response()
-        }
-    }
+    let body = if warnings.is_empty() {
+        json!({ "status": "ready" })
+    } else {
+        json!({ "status": "ready", "warnings": warnings })
+    };
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 async fn execute_command(

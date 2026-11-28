@@ -176,7 +176,10 @@ pub async fn advance(
         // per-seller counter lock stays first (`docs/lock-order.md`).
         if let (Some(modes), SandboxPaymentTarget::Confirmed) = (keys.fence, payload.target) {
             if let Err(failure) =
-                crate::region_fence::recheck_at_payment(tx, modes, order.id, now).await
+                crate::region_fence::recheck_at_payment(tx, modes, order.id, || {
+                    keys.clock.map_or(now, crate::clock::Clock::now)
+                })
+                .await
             {
                 return Ok(Err(failure));
             }
@@ -186,7 +189,7 @@ pub async fn advance(
             order,
             sandbox_payment_window_seconds,
             crate::handlers::holds::HOLD_SOURCE_SANDBOX,
-            now,
+            || keys.clock.map_or(now, crate::clock::Clock::now),
         )
         .await?
         {
@@ -338,8 +341,10 @@ pub(crate) async fn confirm_order(
     // the per-seller counter lock comes before the drop and listing rows
     // (`docs/lock-order.md`).
     if let Some(modes) = keys.fence {
-        if let Err(failure) =
-            crate::region_fence::recheck_at_payment(tx, modes, order.id, now).await
+        if let Err(failure) = crate::region_fence::recheck_at_payment(tx, modes, order.id, || {
+            keys.clock.map_or(now, crate::clock::Clock::now)
+        })
+        .await
         {
             return Ok(Err(failure));
         }

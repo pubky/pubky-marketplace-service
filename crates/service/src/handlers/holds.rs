@@ -137,20 +137,22 @@ pub(crate) async fn release_lines(
 /// transaction. Returns the order with its hold columns current.
 ///
 /// - An auction order is untouched: its hold is the winning reservation.
-/// - An order that is no longer `pending_payment` refuses the lock point —
+/// - An order that is no longer `pending_payment` refuses the lock point:
 ///   a cancelled or already-paid order must never grab stock.
 /// - An order that already holds stock never double-decrements; it re-arms
 ///   `hold_expires_at` and `hold_source` to this lock point's window.
-/// - Otherwise each line atomically moves `available → reserved` under the
-///   listing row lock (`INSUFFICIENT_INVENTORY` with
-///   [`SOLD_OUT_BEFORE_PAYMENT`] when the stock is gone) and the hold
-///   window arms at `now + window_seconds`.
+/// - Otherwise each listing and variant row is locked in ascending
+///   `aggregate_id` order first, `sample_now` is evaluated after every
+///   inventory lock is acquired, each line atomically moves available stock
+///   to reserved (`INSUFFICIENT_INVENTORY` with [`SOLD_OUT_BEFORE_PAYMENT`]
+///   when the stock is gone), and the hold window arms at
+///   `post_lock_now + window_seconds`.
 pub async fn acquire_payment_hold(
     tx: &mut Transaction<'_, Postgres>,
     order: OrderRow,
     window_seconds: i64,
     hold_source: &str,
-    now: DateTime<Utc>,
+    sample_now: impl FnOnce() -> DateTime<Utc>,
 ) -> Result<Result<OrderRow, CommandFailure>, sqlx::Error> {
     if order.auction_aggregate_id.is_some() {
         return Ok(Ok(order));
@@ -162,8 +164,9 @@ pub async fn acquire_payment_hold(
             "Only an order pending payment can start a payment.",
         )));
     }
-    let hold_expires_at = now + chrono::Duration::seconds(window_seconds);
     if order.stock_held {
+        let now = sample_now();
+        let hold_expires_at = now + chrono::Duration::seconds(window_seconds);
         let rearmed: OrderRow = sqlx::query_as(&format!(
             "UPDATE orders SET hold_expires_at = $2, hold_source = $3, updated_at = $4 \
              WHERE id = $1 RETURNING {ORDER_COLUMNS}"
@@ -177,7 +180,16 @@ pub async fn acquire_payment_hold(
         return Ok(Ok(rearmed));
     }
 
-    lock_listings_in_order(tx, order_line_listings(&order)).await?;
+    let mut listing_ids: Vec<&str> = order_line_listings(&order).collect();
+    listing_ids.sort_unstable();
+    listing_ids.dedup();
+    lock_listings_in_order(tx, listing_ids.iter().copied()).await?;
+    for aggregate_id in &listing_ids {
+        variant_stock::lock_rows(tx, aggregate_id).await?;
+    }
+    let now = sample_now();
+    let hold_expires_at = now + chrono::Duration::seconds(window_seconds);
+
     let lines = order.lines.as_array().expect("order lines are an array");
     for line in lines {
         let aggregate_id = line["listing_aggregate_id"]

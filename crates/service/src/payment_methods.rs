@@ -1524,6 +1524,126 @@ impl RequestPlan {
     }
 }
 
+#[derive(sqlx::FromRow)]
+struct PreTxFxOrder {
+    seller_pubky: String,
+    currency: String,
+    exponent: i32,
+    auction_aggregate_id: Option<String>,
+    fulfillment: String,
+    has_delivery: bool,
+}
+
+/// Fetches the FX snapshot BEFORE `bind_payment_method` opens its Postgres
+/// transaction, so slow upstream FX responses never hold a database connection
+/// or row lock. Returns `Ok(None)` when the order does not need an FX read
+/// (already bound, wrong state/role, unsupported currency, BTC-only, or
+/// USD-priced USDT-only). Returns `Ok(Some(Err(MissingReference)))` without
+/// dialing HTTP when persisted reference samples are missing.
+#[allow(clippy::too_many_arguments)]
+async fn prefetch_bind_fx_snapshot(
+    state: &AppState,
+    order_id: Uuid,
+    actor: &str,
+    bind: BindMethod,
+    multi_contract: bool,
+    usdt_deployed: bool,
+    has_winner_delivery: bool,
+    now: DateTime<Utc>,
+) -> Result<Option<Result<crate::fx::FxSnapshot, crate::fx::FxError>>, sqlx::Error> {
+    let row: Option<PreTxFxOrder> = sqlx::query_as(
+        "SELECT o.seller_pubky, o.currency, o.exponent, o.auction_aggregate_id, \
+                o.fulfillment, \
+                (o.delivery_address IS NOT NULL OR o.delivery_address_envelope IS NOT NULL) AS has_delivery \
+         FROM orders o \
+         JOIN payments p ON p.order_id = o.id \
+         WHERE o.id = $1 AND o.buyer_pubky = $2 \
+           AND o.payment_method IS NULL \
+           AND o.state = 'pending_payment' \
+           AND p.state = 'awaiting_entitlement' \
+           AND p.adapter <> 'locks'",
+    )
+    .bind(order_id)
+    .bind(actor)
+    .fetch_optional(&state.pool)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    if let Some(auction_aggregate_id) = &row.auction_aggregate_id {
+        let active_end: Option<DateTime<Utc>> = sqlx::query_scalar(
+            "SELECT expires_at FROM reservations \
+             WHERE listing_aggregate_id = $1 AND buyer_pubky = $2 AND status = 'active' \
+             ORDER BY expires_at DESC LIMIT 1",
+        )
+        .bind(auction_aggregate_id)
+        .bind(actor)
+        .fetch_optional(&state.pool)
+        .await?;
+        if active_end.is_none_or(|end| end <= state.clock.now()) {
+            return Ok(None);
+        }
+    }
+    let takes_delivery_address =
+        row.auction_aggregate_id.is_some() && row.fulfillment == "shipping";
+    if (has_winner_delivery && !takes_delivery_address)
+        || (!has_winner_delivery && takes_delivery_address && !row.has_delivery)
+    {
+        return Ok(None);
+    }
+    let config = load_config(&state.pool, &row.seller_pubky).await?;
+    let bitcoin_enabled = config.as_ref().is_some_and(|config| config.bitcoin_enabled);
+    let usdt_wanted = usdt_deployed
+        && bind == BindMethod::Paykit
+        && state.config.usdt_payments_enabled
+        && usdt_option_enabled(&state.pool, &row.seller_pubky).await?;
+    if !bitcoin_enabled && !usdt_wanted {
+        return Ok(None);
+    }
+    let Some(currency) = Currency::for_money(&row.currency, row.exponent) else {
+        return Ok(None);
+    };
+    let required_references: Vec<Currency> = if currency.is_bitcoin() {
+        if multi_contract && usdt_wanted {
+            vec![Currency::Usd]
+        } else {
+            return Ok(None);
+        }
+    } else if multi_contract && bind == BindMethod::Paykit {
+        if !bitcoin_enabled && currency == Currency::Usd {
+            return Ok(None);
+        }
+        if currency == Currency::Usd {
+            vec![Currency::Usd]
+        } else {
+            vec![currency, Currency::Usd]
+        }
+    } else {
+        vec![currency]
+    };
+    let fx = crate::fx::FxFeedAdmission::from_config(&state.config);
+    for &reference_currency in &required_references {
+        if !fx.supports_fiat(reference_currency) {
+            return Ok(Some(Err(crate::fx::FxError::UnsupportedCurrency)));
+        }
+    }
+    for &reference_currency in &required_references {
+        if let Err(error) = crate::fx::reference_median(&state.pool, reference_currency, now).await
+        {
+            return Ok(Some(Err(error)));
+        }
+    }
+    // No Postgres transaction or connection is held across this HTTP fetch.
+    let snapshot = crate::fx::fetch_snapshot_for_currencies(
+        state.config.fx_feed_provider,
+        &state.config.fx_feed_url,
+        &required_references,
+        now,
+    )
+    .await;
+    Ok(Some(snapshot))
+}
+
 /// `POST /v0/orders/{id}/payment-method` (buyer session): binds exactly one
 /// available method to a pending order. Bitcoin binding creates the Paykit
 /// payment request inside the same transaction: if paykit-server refuses,
@@ -1578,6 +1698,7 @@ pub async fn bind_payment_method(
         Ok(delivery) => delivery,
         Err(refusal) => return method_error(refusal.code, refusal.reason, refusal.message),
     };
+    let _bind_flight = state.bind_flights.enter("payment_bind", order_id).await;
     let bind_listings = if state.listing_moderation.is_some() || state.homeserver.is_some() {
         match crate::listing_moderation::listings_a_bind_sells(&state.pool, order_id, &actor.0)
             .await
@@ -1591,17 +1712,13 @@ pub async fn bind_payment_method(
     // An order created before its listing was moderated is not payable: the
     // index is read before any attempt is spent or transaction opened, with
     // the same fail-open-with-ALERT semantics as the commands that sell.
-    if let Some(gate) = state.listing_moderation.as_deref() {
-        for listing in &bind_listings {
-            if gate.check(&listing.seller_pubky, &listing.listing_id).await
-                == crate::listing_moderation::ModerationVerdict::Moderated
-            {
-                return method_error(
-                    ErrorCode::ListingModerated,
-                    "listing_moderated",
-                    crate::listing_moderation::LISTING_MODERATED_MESSAGE,
-                );
-            }
+    if let Some(gate) = state.listing_moderation.as_ref() {
+        if gate.any_moderated(&bind_listings).await {
+            return method_error(
+                ErrorCode::ListingModerated,
+                "listing_moderated",
+                crate::listing_moderation::LISTING_MODERATED_MESSAGE,
+            );
         }
     }
     // A seller who removed the listing cannot fulfil the order, so no
@@ -1703,6 +1820,41 @@ pub async fn bind_payment_method(
         Err(error) => return internal("bind eligibility lookup", &error),
     };
     let now = state.clock.now();
+    // How the upstream request is priced. The legacy `amount_sats` request
+    // (the fork, and every deployment whose paykit-server has not moved to
+    // the multi-asset contract, `PAYKIT_MARKETPLACE_CONTRACT`) carries the
+    // satoshi amount the service quoted. The multi-asset request carries the
+    // denomination and amount and lets paykit-server derive and price every
+    // asset the seller can receive; the service quote then only guards
+    // paykit-server's fixed amounts. USDT rides only the multi-asset request,
+    // and only where the deployment lists it.
+    let multi_contract = payments
+        .paykit
+        .as_ref()
+        .is_some_and(|paykit| paykit.api() == PaykitApi::Upstream)
+        && state.config.paykit_marketplace_contract.is_multi_asset();
+    let usdt_deployed = multi_contract && state.config.paykit_marketplace_assets.includes_usdt();
+    // Fetch any required FX snapshot BEFORE opening the Postgres transaction
+    // so a slow upstream FX feed never holds a database connection or row lock.
+    let mut prefetched_fx = if on_paykit && payments.paykit.is_some() {
+        match prefetch_bind_fx_snapshot(
+            &state,
+            order_id,
+            &actor.0,
+            bind,
+            multi_contract,
+            usdt_deployed,
+            winner_delivery.is_some(),
+            now,
+        )
+        .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => return internal("pre-tx fx check", &error),
+        }
+    } else {
+        None
+    };
     // A bitcoin bind spends its attempt number in a committed statement of
     // its own, before the bind transaction: a bind that rolls back after
     // paykit prepared (and courtesy-voided) its invoice has still used that
@@ -1724,273 +1876,273 @@ pub async fn bind_payment_method(
     } else {
         None
     };
-    let mut tx = match state.pool.begin().await {
-        Ok(tx) => tx,
-        Err(error) => return internal("payment method transaction", &error),
-    };
-    let payment = match fetch_payment_for_order_update(&mut tx, order_id).await {
-        Ok(Some(payment)) => payment,
-        Ok(None) => {
+    let mut fx_retried = false;
+    let (mut tx, payment, order, config, bitcoin_enabled, usdt_wanted, auction_hold_expires_at) = loop {
+        let mut tx = match state.pool.begin().await {
+            Ok(tx) => tx,
+            Err(error) => return internal("payment method transaction", &error),
+        };
+        let payment = match fetch_payment_for_order_update(&mut tx, order_id).await {
+            Ok(Some(payment)) => payment,
+            Ok(None) => {
+                return method_error(
+                    ErrorCode::NotFound,
+                    "order_not_found",
+                    "The order was not found.",
+                )
+            }
+            Err(error) => return internal("payment lookup", &error),
+        };
+        let order = match fetch_order_for_update(&mut tx, order_id).await {
+            Ok(Some(order)) => order,
+            Ok(None) => {
+                return method_error(
+                    ErrorCode::NotFound,
+                    "order_not_found",
+                    "The order was not found.",
+                )
+            }
+            Err(error) => return internal("order lookup", &error),
+        };
+        if order.buyer_pubky != actor.0 {
             return method_error(
-                ErrorCode::NotFound,
-                "order_not_found",
-                "The order was not found.",
-            )
+                ErrorCode::Unauthorized,
+                "not_buyer",
+                "Only the buyer may bind the payment method.",
+            );
         }
-        Err(error) => return internal("payment lookup", &error),
-    };
-    let order = match fetch_order_for_update(&mut tx, order_id).await {
-        Ok(Some(order)) => order,
-        Ok(None) => {
+        if let Some(bound) = &order.payment_method {
+            if bound == method {
+                // Idempotent re-bind of the same method.
+                return match order_response(&mut tx, &order, &actor.0, json!({})).await {
+                    Ok(response) => response,
+                    Err(error) => internal("order projection", &error),
+                };
+            }
             return method_error(
-                ErrorCode::NotFound,
-                "order_not_found",
-                "The order was not found.",
-            )
+                ErrorCode::InvalidState,
+                "payment_method_already_bound",
+                "A payment method is already bound to this order.",
+            );
         }
-        Err(error) => return internal("order lookup", &error),
-    };
-    if order.buyer_pubky != actor.0 {
-        return method_error(
-            ErrorCode::Unauthorized,
-            "not_buyer",
-            "Only the buyer may bind the payment method.",
-        );
-    }
-    if let Some(bound) = &order.payment_method {
-        if bound == method {
-            // Idempotent re-bind of the same method.
-            return match order_response(&mut tx, &order, &actor.0, json!({})).await {
-                Ok(response) => response,
-                Err(error) => internal("order projection", &error),
-            };
+        if order.state != "pending_payment" {
+            return method_error(
+                ErrorCode::InvalidState,
+                "order_not_pending",
+                "Only an order pending payment can bind a payment method.",
+            );
         }
-        return method_error(
-            ErrorCode::InvalidState,
-            "payment_method_already_bound",
-            "A payment method is already bound to this order.",
-        );
-    }
-    if order.state != "pending_payment" {
-        return method_error(
-            ErrorCode::InvalidState,
-            "order_not_pending",
-            "Only an order pending payment can bind a payment method.",
-        );
-    }
-    if payment.state != "awaiting_entitlement" {
-        return method_error(
-            ErrorCode::InvalidState,
-            "payment_not_awaiting",
-            "The payment is no longer awaiting a method.",
-        );
-    }
-    if payment.adapter == "locks" {
-        return method_error(
-            ErrorCode::InvalidState,
-            "locks_managed",
-            "A Locks-correlated payment advances only by server-side verification.",
-        );
-    }
-    // An auction winner's hold is the winning reservation, and its end is the
-    // order's deadline: the bind neither opens a new window nor reads the
-    // payment window as one. Upstream Paykit narrows it to the activation
-    // cutoff inside the reservation. A bind after the reservation ended is
-    // refused.
-    let auction_hold_expires_at = match &order.auction_aggregate_id {
-        Some(auction_aggregate_id) => {
-            let reservation_end: Option<DateTime<Utc>> = match sqlx::query_scalar(
-                "SELECT expires_at FROM reservations \
-                 WHERE listing_aggregate_id = $1 AND buyer_pubky = $2 AND status = 'active' \
-                 ORDER BY expires_at DESC LIMIT 1 FOR UPDATE",
-            )
-            .bind(auction_aggregate_id)
-            .bind(&order.buyer_pubky)
-            .fetch_optional(&mut *tx)
-            .await
-            {
-                Ok(end) => end,
-                Err(error) => return internal("auction reservation lookup", &error),
-            };
-            match reservation_end.filter(|end| *end > now) {
-                Some(end) => Some(end),
-                None => {
-                    return method_error(
-                        ErrorCode::InvalidState,
-                        "auction_window_ended",
-                        "Your window to pay for this auction has ended.",
-                    )
+        if payment.state != "awaiting_entitlement" {
+            return method_error(
+                ErrorCode::InvalidState,
+                "payment_not_awaiting",
+                "The payment is no longer awaiting a method.",
+            );
+        }
+        if payment.adapter == "locks" {
+            return method_error(
+                ErrorCode::InvalidState,
+                "locks_managed",
+                "A Locks-correlated payment advances only by server-side verification.",
+            );
+        }
+        // An auction winner's hold is the winning reservation, and its end is
+        // the order's deadline: the bind neither opens a new window nor reads
+        // the payment window as one. Upstream Paykit narrows it to the
+        // activation cutoff inside the reservation. A bind after the
+        // reservation ended is refused; sample the clock AFTER acquiring the
+        // reservation FOR UPDATE lock so a lock wait crossing expiry fails closed.
+        let auction_hold_expires_at = match &order.auction_aggregate_id {
+            Some(auction_aggregate_id) => {
+                let reservation_end: Option<DateTime<Utc>> = match sqlx::query_scalar(
+                    "SELECT expires_at FROM reservations \
+                     WHERE listing_aggregate_id = $1 AND buyer_pubky = $2 AND status = 'active' \
+                     ORDER BY expires_at DESC LIMIT 1 FOR UPDATE",
+                )
+                .bind(auction_aggregate_id)
+                .bind(&order.buyer_pubky)
+                .fetch_optional(&mut *tx)
+                .await
+                {
+                    Ok(end) => end,
+                    Err(error) => return internal("auction reservation lookup", &error),
+                };
+                let post_lock_now = state.clock.now();
+                match reservation_end.filter(|end| *end > post_lock_now) {
+                    Some(end) => Some(end),
+                    None => {
+                        return method_error(
+                            ErrorCode::InvalidState,
+                            "auction_window_ended",
+                            "Your window to pay for this auction has ended.",
+                        )
+                    }
                 }
             }
-        }
-        None => None,
-    };
-    let takes_delivery_address = order.auction_aggregate_id.is_some()
-        && order.fulfillment == "shipping"
-        && order.state == "pending_payment";
-    match (&winner_delivery, takes_delivery_address) {
-        (Some(_), false) => {
-            let refusal = crate::handlers::delivery_envelope::WinnerDeliveryRefusal::NOT_ACCEPTED;
-            return method_error(refusal.code, refusal.reason, refusal.message);
-        }
-        (None, true) if !order.has_delivery_address() => {
-            let refusal = crate::handlers::delivery_envelope::WinnerDeliveryRefusal::REQUIRED;
-            return method_error(refusal.code, refusal.reason, refusal.message);
-        }
-        _ => {}
-    }
-    if let Some(auction_hold_expires_at) = auction_hold_expires_at {
-        let stored = match &winner_delivery {
-            Some(delivery) => {
-                sqlx::query(
-                    "UPDATE orders SET hold_expires_at = $2, delivery_address = $3, \
-                     delivery_address_envelope = $4, delivery_key_id = $5, \
-                     checkout_command_id = $6 WHERE id = $1",
-                )
-                .bind(order.id)
-                .bind(auction_hold_expires_at)
-                .bind(&delivery.address)
-                .bind(
-                    delivery
-                        .envelope
-                        .as_ref()
-                        .map(|stored| stored.bytes.as_slice()),
-                )
-                .bind(
-                    delivery
-                        .envelope
-                        .as_ref()
-                        .map(|stored| stored.key_id.as_str()),
-                )
-                .bind(delivery.envelope.as_ref().map(|_| order.id))
-                .execute(&mut *tx)
-                .await
-            }
-            None => {
-                sqlx::query("UPDATE orders SET hold_expires_at = $2 WHERE id = $1")
-                    .bind(order.id)
-                    .bind(auction_hold_expires_at)
-                    .execute(&mut *tx)
-                    .await
-            }
+            None => None,
         };
-        if let Err(error) = stored {
-            return internal("auction winner delivery update", &error);
+        let takes_delivery_address = order.auction_aggregate_id.is_some()
+            && order.fulfillment == "shipping"
+            && order.state == "pending_payment";
+        match (&winner_delivery, takes_delivery_address) {
+            (Some(_), false) => {
+                let refusal =
+                    crate::handlers::delivery_envelope::WinnerDeliveryRefusal::NOT_ACCEPTED;
+                return method_error(refusal.code, refusal.reason, refusal.message);
+            }
+            (None, true) if !order.has_delivery_address() => {
+                let refusal = crate::handlers::delivery_envelope::WinnerDeliveryRefusal::REQUIRED;
+                return method_error(refusal.code, refusal.reason, refusal.message);
+            }
+            _ => {}
         }
-    }
-    // Stay on this transaction. A second pool checkout while other binds
-    // already hold connections can exhaust the pool (PoolTimedOut → INTERNAL
-    // 500) instead of the 409 HOLDING_COPY losers must see.
-    let config = match load_config(&mut *tx, &order.seller_pubky).await {
-        Ok(config) => config,
-        Err(error) => return internal("payment config read", &error),
-    };
-
-    // How the upstream request is priced. The legacy `amount_sats` request
-    // (the fork, and every deployment whose paykit-server has not moved to
-    // the multi-asset contract, `PAYKIT_MARKETPLACE_CONTRACT`) carries the
-    // satoshi amount the service quoted. The multi-asset request carries the
-    // denomination and amount and lets paykit-server derive and price every
-    // asset the seller can receive; the service quote then only guards
-    // paykit-server's fixed amounts. USDT rides only the multi-asset request,
-    // and only where the deployment lists it.
-    let multi_contract = payments
-        .paykit
-        .as_ref()
-        .is_some_and(|paykit| paykit.api() == PaykitApi::Upstream)
-        && state.config.paykit_marketplace_contract.is_multi_asset();
-    let usdt_deployed = multi_contract && state.config.paykit_marketplace_assets.includes_usdt();
-    let mut plan = RequestPlan::LegacySats;
-    let mut usd_conversion: Option<UsdConversionRecord> = None;
-    let bitcoin_quote = if on_paykit {
+        // Stay on this transaction. A second pool checkout while other binds
+        // already hold connections can exhaust the pool instead of letting
+        // losers observe 409 HOLDING_COPY.
+        let config = match load_config(&mut *tx, &order.seller_pubky).await {
+            Ok(config) => config,
+            Err(error) => return internal("payment config read", &error),
+        };
         let bitcoin_enabled = config.as_ref().is_some_and(|config| config.bitcoin_enabled);
-        // USDT rides the `paykit` method of a deployment that lists it, on
-        // every order the service can convert (USD/2, SAT/0, BTC/8), for a
-        // seller who consented. It does not need the seller's Bitcoin rail
-        // switch: a seller who takes only USDT is offered a USDT-only
-        // request.
-        let usdt_wanted = usdt_deployed
+        let usdt_wanted = on_paykit
+            && usdt_deployed
             && bind == BindMethod::Paykit
             && state.config.usdt_payments_enabled
             && match usdt_option_enabled(&mut *tx, &order.seller_pubky).await {
                 Ok(enabled) => enabled,
                 Err(error) => return internal("usdt consent read", &error),
             };
-        if !bitcoin_enabled && !usdt_wanted {
+        if on_paykit {
+            if !bitcoin_enabled && !usdt_wanted {
+                return method_error(
+                    ErrorCode::InvalidState,
+                    "method_unavailable",
+                    if bind == BindMethod::Paykit {
+                        "The seller does not accept Paykit payments."
+                    } else {
+                        "The seller does not accept Bitcoin."
+                    },
+                );
+            }
+            if payments.paykit.is_none() {
+                return method_error(
+                    ErrorCode::UpstreamUnavailable,
+                    "bitcoin_unavailable",
+                    "Bitcoin payments are not enabled on this deployment.",
+                );
+            }
+            let fx_needed = match Currency::for_money(&order.currency, order.exponent) {
+                Some(currency) if currency.is_bitcoin() => multi_contract && usdt_wanted,
+                Some(currency) if multi_contract && bind == BindMethod::Paykit => {
+                    bitcoin_enabled || currency != Currency::Usd
+                }
+                Some(_) => true,
+                None => false,
+            };
+            // If the seller enabled a rail between pre-tx prefetch and row
+            // locking, roll back first and run one bounded FX prefetch outside
+            // any database transaction before retrying.
+            if fx_needed && prefetched_fx.is_none() && !fx_retried {
+                fx_retried = true;
+                let _ = tx.rollback().await;
+                let retry_now = state.clock.now();
+                prefetched_fx = match prefetch_bind_fx_snapshot(
+                    &state,
+                    order_id,
+                    &actor.0,
+                    bind,
+                    multi_contract,
+                    usdt_deployed,
+                    winner_delivery.is_some(),
+                    retry_now,
+                )
+                .await
+                {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => return internal("pre-tx fx retry", &error),
+                };
+                continue;
+            }
+        }
+        if let Some(auction_hold_expires_at) = auction_hold_expires_at {
+            let stored = match &winner_delivery {
+                Some(delivery) => {
+                    sqlx::query(
+                        "UPDATE orders SET hold_expires_at = $2, delivery_address = $3, \
+                         delivery_address_envelope = $4, delivery_key_id = $5, \
+                         checkout_command_id = $6 WHERE id = $1",
+                    )
+                    .bind(order.id)
+                    .bind(auction_hold_expires_at)
+                    .bind(&delivery.address)
+                    .bind(
+                        delivery
+                            .envelope
+                            .as_ref()
+                            .map(|stored| stored.bytes.as_slice()),
+                    )
+                    .bind(
+                        delivery
+                            .envelope
+                            .as_ref()
+                            .map(|stored| stored.key_id.as_str()),
+                    )
+                    .bind(delivery.envelope.as_ref().map(|_| order.id))
+                    .execute(&mut *tx)
+                    .await
+                }
+                None => {
+                    sqlx::query("UPDATE orders SET hold_expires_at = $2 WHERE id = $1")
+                        .bind(order.id)
+                        .bind(auction_hold_expires_at)
+                        .execute(&mut *tx)
+                        .await
+                }
+            };
+            if let Err(error) = stored {
+                return internal("auction winner delivery update", &error);
+            }
+        }
+        break (
+            tx,
+            payment,
+            order,
+            config,
+            bitcoin_enabled,
+            usdt_wanted,
+            auction_hold_expires_at,
+        );
+    };
+
+    // Validate static currency / satoshi shape upfront before taking listing
+    // holds; actual FX quote evaluation and point-of-use freshness checks run
+    // below after EVERY blocking lock in this transaction has been acquired.
+    let bind_currency = if on_paykit {
+        let Some(currency) = Currency::for_money(&order.currency, order.exponent) else {
             return method_error(
                 ErrorCode::InvalidState,
-                "method_unavailable",
-                if bind == BindMethod::Paykit {
-                    "The seller does not accept Paykit payments."
-                } else {
-                    "The seller does not accept Bitcoin."
-                },
+                "currency_unsupported",
+                "Bitcoin binding supports only USD, EUR, CHF, GBP, JPY, CAD, AUD, BTC/8 \
+                 and SAT/0 orders.",
             );
-        }
-        if payments.paykit.is_none() {
-            return method_error(
-                ErrorCode::UpstreamUnavailable,
-                "bitcoin_unavailable",
-                "Bitcoin payments are not enabled on this deployment.",
-            );
-        }
-        match Currency::for_money(&order.currency, order.exponent) {
-            Some(currency) if currency.is_bitcoin() => {
-                let sats = match bitcoin_amount_sats(&order) {
-                    Some(sats) => sats,
-                    None => {
-                        return method_error(
-                            ErrorCode::InvalidState,
-                            "invalid_sats",
-                            "The Bitcoin amount must be a positive satoshi amount.",
-                        )
-                    }
-                };
-                if multi_contract {
-                    // The Bitcoin amount is the price itself. A USDT amount is
-                    // paykit-server's rate, which the service checks against its
-                    // own; without a readable rate USDT cannot be checked, so the
-                    // request narrows to Bitcoin (or, for a seller who takes only
-                    // USDT, the bind is refused like any unreadable feed).
-                    let (only, usdt_check) = if usdt_wanted {
-                        match crate::fx::reference_rate_for(
-                            &mut *tx,
-                            state.config.fx_feed_provider,
-                            &state.config.fx_feed_url,
-                            now,
-                        )
-                        .await
-                        {
-                            Ok((rate, _sample)) => (
-                                if bitcoin_enabled {
-                                    None
-                                } else {
-                                    Some(vec![AcceptedAsset::Usdt])
-                                },
-                                Some(UsdtCheck::Rate { sats, rate }),
-                            ),
-                            Err(error) if bitcoin_enabled => {
-                                tracing::warn!(
-                                    order_id = %order.id,
-                                    ?error,
-                                    "FX rate unavailable; offering Bitcoin only"
-                                );
-                                (Some(vec![AcceptedAsset::Btc]), None)
-                            }
-                            Err(error) => return fx_error_response(error),
-                        }
-                    } else {
-                        (Some(vec![AcceptedAsset::Btc]), None)
-                    };
-                    plan = RequestPlan::assets(PaymentAsset::Btc, sats, only, None, usdt_check);
-                }
-                bitcoin_enabled.then_some((None, sats))
+        };
+        if currency.is_bitcoin() {
+            if bitcoin_amount_sats(&order).is_none() {
+                return method_error(
+                    ErrorCode::InvalidState,
+                    "invalid_sats",
+                    "The Bitcoin amount must be a positive satoshi amount.",
+                );
             }
-            Some(currency)
-                if !crate::fx::FxFeedAdmission::from_config(&state.config)
-                    .supports_currency(currency) =>
-            {
-                let fx = crate::fx::FxFeedAdmission::from_config(&state.config);
+        } else {
+            let fx = crate::fx::FxFeedAdmission::from_config(&state.config);
+            let admitted =
+                if multi_contract && bind == BindMethod::Paykit && currency != Currency::Usd {
+                    fx.supports_currency(currency) && fx.supports_fiat(Currency::Usd)
+                } else {
+                    fx.supports_currency(currency)
+                };
+            if !admitted {
                 let message = crate::fx::unsupported_currency_message_from_slice(
                     fx.provider,
                     fx.supported_fiat,
@@ -2002,110 +2154,8 @@ pub async fn bind_payment_method(
                     &message,
                 );
             }
-            Some(currency) if multi_contract && bind == BindMethod::Paykit => {
-                // Every fiat price is requested in USD cents: USD as it is,
-                // any other currency converted at the cross rate of one
-                // snapshot (rounded up), so USDT stays at parity with the
-                // request and paykit-server fixes the Bitcoin rate itself.
-                // When the seller accepts Bitcoin (alone or alongside USDT)
-                // and FX lookup fails, refuse cleanly instead of silently
-                // stripping Bitcoin to offer USDT only.
-                let needs_quote = bitcoin_enabled || currency != Currency::Usd;
-                let quote = if needs_quote {
-                    match crate::fx::quote_order_for(
-                        &mut tx,
-                        state.config.fx_feed_provider,
-                        &state.config.fx_feed_url,
-                        currency,
-                        order.total_minor,
-                        now,
-                    )
-                    .await
-                    {
-                        Ok(quote) => Some(quote),
-                        Err(error) => return fx_error_response(error),
-                    }
-                } else {
-                    None
-                };
-                let cents = match &quote {
-                    Some(quote) => quote.usd.cents,
-                    None => u64::try_from(order.total_minor).unwrap_or_default(),
-                };
-                let guard_sats = if bitcoin_enabled {
-                    match quote.as_ref().map(|quote| quote.sats) {
-                        Some(Ok(sats)) => Some(sats),
-                        Some(Err(error)) => return fx_error_response(error),
-                        None => return fx_error_response(crate::fx::FxError::MissingReference),
-                    }
-                } else {
-                    None
-                };
-                let only = match (bitcoin_enabled, usdt_wanted) {
-                    (true, true) => None,
-                    (true, false) => Some(vec![AcceptedAsset::Btc]),
-                    (false, true) => Some(vec![AcceptedAsset::Usdt]),
-                    (false, false) => {
-                        return method_error(
-                            ErrorCode::InvalidState,
-                            "method_unavailable",
-                            "The seller does not accept Paykit payments.",
-                        )
-                    }
-                };
-                plan = RequestPlan::assets(
-                    PaymentAsset::Usd,
-                    cents,
-                    only,
-                    guard_sats,
-                    usdt_wanted.then_some(UsdtCheck::Parity {
-                        cents: i64::try_from(cents).unwrap_or_default(),
-                    }),
-                );
-                if let Some(cross) = quote.as_ref().and_then(|quote| quote.usd.cross.clone()) {
-                    usd_conversion = Some(UsdConversionRecord { cross, cents });
-                }
-                match (quote, guard_sats) {
-                    (Some(quote), Some(sats)) => {
-                        Some((Some((quote.direct.rate.clone(), quote.direct)), sats))
-                    }
-                    _ => None,
-                }
-            }
-            Some(currency) => {
-                let (rate, sample, sats) = match crate::fx::quote_fiat_for(
-                    &mut *tx,
-                    state.config.fx_feed_provider,
-                    &state.config.fx_feed_url,
-                    currency,
-                    order.total_minor,
-                    now,
-                )
-                .await
-                {
-                    Ok(quote) => quote,
-                    Err(error) => return fx_error_response(error),
-                };
-                if multi_contract {
-                    plan = RequestPlan::assets(
-                        PaymentAsset::Btc,
-                        sats,
-                        Some(vec![AcceptedAsset::Btc]),
-                        None,
-                        None,
-                    );
-                }
-                Some((Some((rate, sample)), sats))
-            }
-            None => {
-                return method_error(
-                    ErrorCode::InvalidState,
-                    "currency_unsupported",
-                    "Bitcoin binding supports only USD, EUR, CHF, GBP, JPY, CAD, AUD, BTC/8 \
-                     and SAT/0 orders.",
-                )
-            }
         }
+        Some(currency)
     } else {
         None
     };
@@ -2125,7 +2175,7 @@ pub async fn bind_payment_method(
         &terms,
         order.id,
         &order.seller_pubky,
-        now,
+        state.clock.now(),
     )
     .await
     {
@@ -2154,10 +2204,12 @@ pub async fn bind_payment_method(
     }
     // The EU seller's annual limit (legal launch plan C4) at payment start:
     // the buyer is not asked to pay a seller who has reached it. Before any
-    // listing lock, so the per-seller counter lock stays first.
+    // listing lock, so the per-seller counter lock stays first; the clock is
+    // sampled inside `recheck_at_payment` after acquiring the advisory lock.
     if let Some(modes) = state.config.region_policy().fence_modes() {
         if let Err(failure) =
-            crate::region_fence::recheck_at_payment(&mut tx, modes, order.id, now).await
+            crate::region_fence::recheck_at_payment(&mut tx, modes, order.id, || state.clock.now())
+                .await
         {
             return method_error(
                 failure.code(),
@@ -2171,7 +2223,7 @@ pub async fn bind_payment_method(
         order,
         bind_window,
         crate::handlers::holds::HOLD_SOURCE_BIND,
-        now,
+        || state.clock.now(),
     )
     .await
     {
@@ -2241,6 +2293,205 @@ pub async fn bind_payment_method(
             }
             BindMethod::Usdt => unreachable!("a usdt bind is refused above"),
         };
+
+    // Acquire the final blocking lock (upstream auction reservation FOR SHARE)
+    // BEFORE sampling `quote_now` and evaluating FX freshness so no subsequent
+    // lock wait can age a prefetched ticker past `MAX_RATE_AGE_SECS`.
+    let upstream_auction_reservation_expires_at: Option<DateTime<Utc>> = if paykit_reference
+        .is_some()
+        && payments
+            .paykit
+            .as_ref()
+            .is_some_and(|paykit| paykit.api() == PaykitApi::Upstream)
+    {
+        if let Some(auction_aggregate_id) = &order.auction_aggregate_id {
+            match sqlx::query_scalar(
+                "SELECT expires_at FROM reservations \
+                 WHERE listing_aggregate_id = $1 AND buyer_pubky = $2 \
+                 AND status = 'active' FOR SHARE",
+            )
+            .bind(auction_aggregate_id)
+            .bind(&order.buyer_pubky)
+            .fetch_optional(&mut *tx)
+            .await
+            {
+                Ok(expires_at) => expires_at,
+                Err(error) => return internal("auction reservation", &error),
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Sample a fresh point-of-use clock AFTER every blocking lock in this
+    // transaction (`payments`/`orders` FOR UPDATE, `recheck_at_payment`
+    // advisory lock, `acquire_payment_hold` listing/variant FOR UPDATE locks,
+    // and upstream auction FOR SHARE) so any pre-fetched FX ticker that aged
+    // past `MAX_RATE_AGE_SECS` fails closed with `FxError::Stale` and rolls
+    // back cleanly without refetching HTTP inside `tx`.
+    let quote_now = state.clock.now();
+    if auction_hold_expires_at.is_some_and(|end| end <= quote_now) {
+        return method_error(
+            ErrorCode::InvalidState,
+            "auction_window_ended",
+            "Your window to pay for this auction has ended.",
+        );
+    }
+    let now = quote_now;
+    let mut plan = RequestPlan::LegacySats;
+    let mut usd_conversion: Option<UsdConversionRecord> = None;
+    let bitcoin_quote = if let Some(currency) = bind_currency {
+        if currency.is_bitcoin() {
+            let sats = bitcoin_amount_sats(&order).expect("validated positive satoshi amount");
+            if multi_contract {
+                // The Bitcoin amount is the price itself. A USDT amount is
+                // paykit-server's rate, which the service checks against its
+                // own; without a readable rate USDT cannot be checked, so the
+                // request narrows to Bitcoin (or, for a seller who takes only
+                // USDT, the bind is refused like any unreadable feed).
+                let (only, usdt_check) = if usdt_wanted {
+                    let rate_result = match prefetched_fx.as_ref() {
+                        Some(Ok(snapshot)) => {
+                            crate::fx::reference_rate_from_snapshot(&mut *tx, snapshot, quote_now)
+                                .await
+                        }
+                        Some(Err(error)) => Err(*error),
+                        None => Err(crate::fx::FxError::MissingReference),
+                    };
+                    match rate_result {
+                        Ok((rate, _sample)) => (
+                            if bitcoin_enabled {
+                                None
+                            } else {
+                                Some(vec![AcceptedAsset::Usdt])
+                            },
+                            Some(UsdtCheck::Rate { sats, rate }),
+                        ),
+                        Err(error) if bitcoin_enabled => {
+                            tracing::warn!(
+                                order_id = %order.id,
+                                ?error,
+                                "FX rate unavailable; offering Bitcoin only"
+                            );
+                            (Some(vec![AcceptedAsset::Btc]), None)
+                        }
+                        Err(error) => return fx_error_response(error),
+                    }
+                } else {
+                    (Some(vec![AcceptedAsset::Btc]), None)
+                };
+                plan = RequestPlan::assets(PaymentAsset::Btc, sats, only, None, usdt_check);
+            }
+            bitcoin_enabled.then_some((None, sats))
+        } else if multi_contract && bind == BindMethod::Paykit {
+            // Every fiat price is requested in USD cents: USD as it is,
+            // any other currency converted at the cross rate of one
+            // snapshot (rounded up), so USDT stays at parity with the
+            // request and paykit-server fixes the Bitcoin rate itself.
+            // When the seller accepts Bitcoin (alone or alongside USDT)
+            // and FX lookup fails, refuse cleanly instead of silently
+            // stripping Bitcoin to offer USDT only.
+            let needs_quote = bitcoin_enabled || currency != Currency::Usd;
+            let quote = if needs_quote {
+                let quote_result = match prefetched_fx.as_ref() {
+                    Some(Ok(snapshot)) => {
+                        crate::fx::quote_order_from_snapshot(
+                            &mut tx,
+                            snapshot,
+                            currency,
+                            order.total_minor,
+                            quote_now,
+                        )
+                        .await
+                    }
+                    Some(Err(error)) => Err(*error),
+                    None => Err(crate::fx::FxError::MissingReference),
+                };
+                match quote_result {
+                    Ok(quote) => Some(quote),
+                    Err(error) => return fx_error_response(error),
+                }
+            } else {
+                None
+            };
+            let cents = match &quote {
+                Some(quote) => quote.usd.cents,
+                None => u64::try_from(order.total_minor).unwrap_or_default(),
+            };
+            let guard_sats = if bitcoin_enabled {
+                match quote.as_ref().map(|quote| quote.sats) {
+                    Some(Ok(sats)) => Some(sats),
+                    Some(Err(error)) => return fx_error_response(error),
+                    None => return fx_error_response(crate::fx::FxError::MissingReference),
+                }
+            } else {
+                None
+            };
+            let only = match (bitcoin_enabled, usdt_wanted) {
+                (true, true) => None,
+                (true, false) => Some(vec![AcceptedAsset::Btc]),
+                (false, true) => Some(vec![AcceptedAsset::Usdt]),
+                (false, false) => {
+                    return method_error(
+                        ErrorCode::InvalidState,
+                        "method_unavailable",
+                        "The seller does not accept Paykit payments.",
+                    )
+                }
+            };
+            plan = RequestPlan::assets(
+                PaymentAsset::Usd,
+                cents,
+                only,
+                guard_sats,
+                usdt_wanted.then_some(UsdtCheck::Parity {
+                    cents: i64::try_from(cents).unwrap_or_default(),
+                }),
+            );
+            if let Some(cross) = quote.as_ref().and_then(|quote| quote.usd.cross.clone()) {
+                usd_conversion = Some(UsdConversionRecord { cross, cents });
+            }
+            match (quote, guard_sats) {
+                (Some(quote), Some(sats)) => {
+                    Some((Some((quote.direct.rate.clone(), quote.direct)), sats))
+                }
+                _ => None,
+            }
+        } else {
+            let fiat_result = match prefetched_fx.as_ref() {
+                Some(Ok(snapshot)) => {
+                    crate::fx::quote_fiat_from_snapshot(
+                        &mut *tx,
+                        snapshot,
+                        currency,
+                        order.total_minor,
+                        quote_now,
+                    )
+                    .await
+                }
+                Some(Err(error)) => Err(*error),
+                None => Err(crate::fx::FxError::MissingReference),
+            };
+            let (rate, sample, sats) = match fiat_result {
+                Ok(quote) => quote,
+                Err(error) => return fx_error_response(error),
+            };
+            if multi_contract {
+                plan = RequestPlan::assets(
+                    PaymentAsset::Btc,
+                    sats,
+                    Some(vec![AcceptedAsset::Btc]),
+                    None,
+                    None,
+                );
+            }
+            Some((Some((rate, sample)), sats))
+        }
+    } else {
+        None
+    };
 
     // Pins still on an unbound order belong to a released attempt; they are
     // recorded (idempotently) before this bind overwrites them, so that
@@ -2343,37 +2594,22 @@ pub async fn bind_payment_method(
         // activation to land; the activation guard enforces the same bound.
         let mut payment_window_seconds = state.config.bitcoin_payment_window_seconds;
         let mut auction_hold_cap: Option<DateTime<Utc>> = None;
-        if paykit.api() == PaykitApi::Upstream {
-            if let Some(auction_aggregate_id) = &order.auction_aggregate_id {
-                let reservation_expires_at: Option<DateTime<Utc>> = match sqlx::query_scalar(
-                    "SELECT expires_at FROM reservations \
-                     WHERE listing_aggregate_id = $1 AND buyer_pubky = $2 \
-                     AND status = 'active' FOR SHARE",
-                )
-                .bind(auction_aggregate_id)
-                .bind(&order.buyer_pubky)
-                .fetch_optional(&mut *tx)
-                .await
-                {
-                    Ok(expires_at) => expires_at,
-                    Err(error) => return internal("auction reservation", &error),
-                };
-                match reservation_expires_at
-                    .and_then(|deadline| upstream_auction_window(deadline, now))
-                {
-                    Some(window) => {
-                        payment_window_seconds =
-                            payment_window_seconds.min(window.max_payment_window_seconds);
-                        auction_hold_cap = Some(window.hold_deadline);
-                    }
-                    None => {
-                        let _ = tx.rollback().await;
-                        return method_error(
-                            ErrorCode::InvalidState,
-                            "auction_payment_window_too_short",
-                            "Too little time is left on this auction win to pay with Bitcoin.",
-                        );
-                    }
+        if paykit.api() == PaykitApi::Upstream && order.auction_aggregate_id.is_some() {
+            match upstream_auction_reservation_expires_at
+                .and_then(|deadline| upstream_auction_window(deadline, now))
+            {
+                Some(window) => {
+                    payment_window_seconds =
+                        payment_window_seconds.min(window.max_payment_window_seconds);
+                    auction_hold_cap = Some(window.hold_deadline);
+                }
+                None => {
+                    let _ = tx.rollback().await;
+                    return method_error(
+                        ErrorCode::InvalidState,
+                        "auction_payment_window_too_short",
+                        "Too little time is left on this auction win to pay with Bitcoin.",
+                    );
                 }
             }
         }

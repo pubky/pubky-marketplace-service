@@ -61,6 +61,13 @@ const ADDRESSING_TTL: Duration = Duration::from_secs(60);
 /// Homeservers whose storage addressing is kept; the least recently used is
 /// evicted first.
 const ADDRESSING_CACHE_CAPACITY: usize = 256;
+/// Homeservers whose direct keep-alive client pool is kept; the least recently
+/// used is evicted first.
+const DIRECT_POOL_CAPACITY: usize = 256;
+/// Idle keep-alive timeout for pooled homeserver connections.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Maximum idle keep-alive connections kept per homeserver endpoint.
+const POOL_MAX_IDLE_PER_HOST: usize = 4;
 
 /// Which addresses a read may connect to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -288,28 +295,27 @@ fn more_recent(
     cache.keep(chosen)
 }
 
-/// Resolves a homeserver key to the addresses its own record lists for
-/// itself, keeping those the policy allows.
-struct DirectResolver {
-    records: Records,
+/// Resolves one homeserver key to a fixed set of resolved direct socket
+/// addresses, re-checking each address against `policy`. Because the pool is
+/// keyed on `(homeserver, addrs)`, a client reuses keep-alive connections
+/// while the record's endpoints stay unchanged and is replaced immediately
+/// when a homeserver republishes a new IP or port.
+struct PinnedDirectResolver {
+    expected_host: String,
+    addrs: Vec<SocketAddr>,
     policy: EndpointPolicy,
 }
 
-impl Resolve for DirectResolver {
+impl Resolve for PinnedDirectResolver {
     fn resolve(&self, name: Name) -> Resolving {
-        let records = self.records.clone();
+        let matched = name.as_str() == self.expected_host;
+        let addrs = if matched {
+            self.addrs.clone()
+        } else {
+            Vec::new()
+        };
         let policy = self.policy;
-        let name = name.as_str().to_owned();
-        Box::pin(async move {
-            let addrs = match pkarr::PublicKey::try_from(name.as_str()) {
-                Ok(key) if key.to_z32() == name => match records.current(&key).await {
-                    Ok(packet) => direct_addrs(&packet),
-                    Err(_) => Vec::new(),
-                },
-                _ => Vec::new(),
-            };
-            allowed_addrs(addrs, policy).await
-        })
+        Box::pin(async move { allowed_addrs(addrs, policy).await })
     }
 }
 
@@ -415,9 +421,9 @@ fn hardened(builder: pubky_reqwest::ClientBuilder) -> pubky_reqwest::ClientBuild
 /// Where a homeserver can be reached, from its Pkarr record.
 #[derive(Debug, PartialEq, Eq)]
 struct Route {
-    /// The record lists a direct address the policy allows; the homeserver
-    /// is reached at its key, over TLS pinned to that key.
-    direct: bool,
+    /// Allowed direct socket addresses in the record's priority order; the
+    /// homeserver is reached at its key over TLS pinned to that key.
+    direct: Vec<SocketAddr>,
     /// ICANN endpoints, in the record's priority order: a host and its port
     /// (443 when unset). A host is a domain exactly as the record wrote it
     /// (lowercase, no trailing dot), or an IP address the policy allows.
@@ -427,8 +433,9 @@ struct Route {
 impl Route {
     fn of(packet: &SignedPacket, policy: EndpointPolicy) -> Self {
         let direct = direct_addrs(packet)
-            .iter()
-            .any(|addr| policy.allows(addr.ip()));
+            .into_iter()
+            .filter(|addr| policy.allows(addr.ip()))
+            .collect();
         let mut icann = Vec::new();
         for svcb in https_records(packet) {
             if targets_itself(svcb) {
@@ -531,9 +538,18 @@ impl Exchange<'_> {
     }
 }
 
+struct DirectPoolEntry {
+    addrs: Vec<SocketAddr>,
+    client: pubky_reqwest::Client,
+}
+
 pub(super) struct PkarrTransport {
     records: Records,
-    direct: pubky_reqwest::Client,
+    direct_tls: Box<rustls::ClientConfig>,
+    /// Per homeserver key: pooled keep-alive client pinned to the exact
+    /// resolved direct `(ip, port)` list. Replaced immediately when the
+    /// homeserver republishes a new address or port.
+    direct_pools: Mutex<lru::LruCache<String, DirectPoolEntry>>,
     icann: pubky_reqwest::Client,
     /// Per homeserver key: when its `/info` was read, and whether it
     /// advertises path-addressed storage.
@@ -568,19 +584,13 @@ impl PkarrTransport {
             cache: records,
             ttl_seconds: record_ttl_seconds,
         };
-        // Every direct request connects anew. A pooled connection is not
-        // resolved again, so one made before the homeserver republished its
-        // address or port would keep serving at the old endpoint under the
-        // same URL.
-        let direct = hardened(pubky_reqwest::Client::builder())
-            .pool_max_idle_per_host(0)
-            .dns_resolver(Arc::new(DirectResolver {
-                records: records.clone(),
-                policy,
-            }))
-            .use_preconfigured_tls(direct_tls())
-            .build()?;
+        let direct_tls = Box::new(direct_tls());
+        let direct_pools = Mutex::new(lru::LruCache::new(
+            NonZeroUsize::new(DIRECT_POOL_CAPACITY).expect("non-zero capacity"),
+        ));
         let icann = hardened(pubky_reqwest::Client::builder())
+            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+            .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
             .dns_resolver(Arc::new(IcannResolver { policy }))
             .use_preconfigured_tls(icann_tls()?)
             .build()?;
@@ -589,11 +599,60 @@ impl PkarrTransport {
         ));
         Ok(Self {
             records,
-            direct,
+            direct_tls,
+            direct_pools,
             icann,
             addressing,
             policy,
         })
+    }
+
+    /// Returns a pooled direct keep-alive client for `homeserver` pinned to
+    /// `addrs`, replacing any cached client whose resolved endpoints changed.
+    fn direct_client(
+        &self,
+        homeserver: &str,
+        addrs: &[SocketAddr],
+    ) -> Option<pubky_reqwest::Client> {
+        {
+            let mut pools = self
+                .direct_pools
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(entry) = pools.get(homeserver) {
+                if entry.addrs.as_slice() == addrs {
+                    return Some(entry.client.clone());
+                }
+            }
+        }
+        let built = hardened(pubky_reqwest::Client::builder())
+            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+            .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
+            .dns_resolver(Arc::new(PinnedDirectResolver {
+                expected_host: homeserver.to_owned(),
+                addrs: addrs.to_vec(),
+                policy: self.policy,
+            }))
+            .use_preconfigured_tls((*self.direct_tls).clone())
+            .build()
+            .ok()?;
+        let mut pools = self
+            .direct_pools
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(entry) = pools.get(homeserver) {
+            if entry.addrs.as_slice() == addrs {
+                return Some(entry.client.clone());
+            }
+        }
+        pools.put(
+            homeserver.to_owned(),
+            DirectPoolEntry {
+                addrs: addrs.to_vec(),
+                client: built.clone(),
+            },
+        );
+        Some(built)
     }
 
     /// One `GET` of `target` on `pubky`'s homeserver, bounded by `budget`
@@ -629,7 +688,7 @@ impl PkarrTransport {
             }
         };
         let route = match tokio::time::timeout_at(deadline, self.route(&homeserver)).await {
-            Ok(Ok(route)) if route.direct || !route.icann.is_empty() => Ok(route),
+            Ok(Ok(route)) if !route.direct.is_empty() || !route.icann.is_empty() => Ok(route),
             Ok(Ok(_)) => Err("no endpoint at an allowed address"),
             Ok(Err(failure)) => Err(failure),
             Err(_) => Err("endpoint lookup timed out"),
@@ -733,19 +792,22 @@ impl PkarrTransport {
         exchange: &Exchange<'_>,
         deadline: Instant,
     ) -> Result<pubky_reqwest::Response, Unreached> {
-        let direct = route.direct.then(|| {
-            (
-                &self.direct,
-                Host::Domain(homeserver.to_owned()),
-                format!("https://{homeserver}"),
-            )
-        });
+        let direct = (!route.direct.is_empty())
+            .then(|| self.direct_client(homeserver, &route.direct))
+            .flatten()
+            .map(|client| {
+                (
+                    client,
+                    Host::Domain(homeserver.to_owned()),
+                    format!("https://{homeserver}"),
+                )
+            });
         let icann = route.icann.iter().map(|(host, port)| {
             let base = match port {
                 Some(port) => format!("https://{host}:{port}"),
                 None => format!("https://{host}"),
             };
-            (&self.icann, host.clone(), base)
+            (self.icann.clone(), host.clone(), base)
         });
         for (client, host, base) in direct.into_iter().chain(icann) {
             let Some((url, pubky_host)) = exchange.url(&base) else {
@@ -1058,7 +1120,7 @@ mod tests {
         assert_eq!(
             Route::of(&record, EndpointPolicy::PublicOnly),
             Route {
-                direct: false,
+                direct: Vec::new(),
                 icann: vec![
                     (Host::Ipv4(Ipv4Addr::new(8, 8, 4, 4)), Some(6286)),
                     (Host::Ipv4(Ipv4Addr::new(8, 8, 8, 8)), Some(6286)),
@@ -1082,8 +1144,13 @@ mod tests {
     #[test]
     fn direct_endpoints_use_the_records_own_addresses() {
         let internal = endpoint_record(&["."], &["10.0.0.1", "127.0.0.1"]);
-        assert!(!Route::of(&internal, EndpointPolicy::PublicOnly).direct);
-        assert!(Route::of(&internal, EndpointPolicy::PublicOrLoopback).direct);
+        assert!(Route::of(&internal, EndpointPolicy::PublicOnly)
+            .direct
+            .is_empty());
+        assert_eq!(
+            Route::of(&internal, EndpointPolicy::PublicOrLoopback).direct,
+            vec!["127.0.0.1:6286".parse::<SocketAddr>().unwrap()]
+        );
 
         let mixed = endpoint_record(&[".", "pubky.example"], &["10.0.0.1", "8.8.8.8"]);
         assert_eq!(
@@ -1096,7 +1163,7 @@ mod tests {
         assert_eq!(
             Route::of(&mixed, EndpointPolicy::PublicOnly),
             Route {
-                direct: true,
+                direct: vec!["8.8.8.8:6286".parse::<SocketAddr>().unwrap()],
                 icann: vec![(Host::Domain("pubky.example".to_owned()), Some(6286))],
             }
         );
@@ -1276,5 +1343,27 @@ mod tests {
         let held = cache.get(&key).expect("cached");
         assert_eq!(held.timestamp(), newest.timestamp());
         assert!(!held.is_expired(60, 60));
+    }
+
+    #[test]
+    fn direct_client_replaces_stale_endpoint_entry_for_same_homeserver_key() {
+        let transport = PkarrTransport::new(
+            pubky::PubkyHttpClient::builder(),
+            PkarrResolutionCache::default(),
+            EndpointPolicy::PublicOrLoopback,
+        )
+        .expect("transport builds");
+        let homeserver = pkarr::Keypair::random().public_key().to_z32();
+        for port in [6286_u16, 6287, 6288, 6289, 6290] {
+            let addrs = vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)];
+            assert!(transport.direct_client(&homeserver, &addrs).is_some());
+            let pools = transport.direct_pools.lock().expect("direct pools lock");
+            assert_eq!(
+                pools.len(),
+                1,
+                "republishing port {port} replaces the single entry for this homeserver key"
+            );
+            assert_eq!(pools.peek(&homeserver).expect("cached entry").addrs, addrs);
+        }
     }
 }

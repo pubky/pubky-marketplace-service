@@ -4083,3 +4083,632 @@ async fn offer_accept_and_offer_checkout_preflight_sample_clock_after_db_wait_fo
     );
     assert_eq!(body["error"]["code"], json!("AWARD_EXPIRED"));
 }
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn fx_http_fetch_does_not_hold_a_database_connection_or_transaction(pool: PgPool) {
+    // Build a 1-connection pool targeting this exact test database. If the
+    // bind held an open Postgres transaction across the stalled FX HTTP fetch,
+    // no other query could acquire a connection from the pool while the fetch
+    // is in flight.
+    let db_name: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&pool)
+        .await
+        .expect("current database");
+    let mut url =
+        url::Url::parse(&std::env::var("DATABASE_URL").expect("DATABASE_URL set for sqlx::test"))
+            .expect("valid DATABASE_URL");
+    url.set_path(&format!("/{db_name}"));
+    let single_conn_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_millis(300))
+        .connect(url.as_str())
+        .await
+        .expect("1-connection pool connects");
+
+    let fixture = fx_fixture(single_conn_pool.clone()).await;
+    let now = fixture.app.clock.now();
+    seed_fx_samples(&single_conn_pool, RATE, now, 3).await;
+    let order = checkout_usd(&fixture.app, &fixture.seller, &fixture.buyer).await;
+
+    let held = fixture.fx.hold_next_fetch();
+    let router = fixture.app.router.clone();
+    let token = fixture.buyer.token.clone();
+    let order_id = order.order_id.clone();
+    let bind_task = tokio::spawn(async move {
+        send(
+            router,
+            "POST",
+            &format!("/v0/orders/{order_id}/payment-method"),
+            Some(&token),
+            &json!({ "method": "bitcoin" }),
+        )
+        .await
+    });
+    held.request_arrived().await;
+
+    // While the upstream FX HTTP request is stalled, the sole pool connection
+    // is free and immediately serves a query (zero open DB transaction!).
+    let ping: i32 = sqlx::query_scalar("SELECT 1")
+        .fetch_one(&single_conn_pool)
+        .await
+        .expect("FX HTTP fetch must not hold the sole Postgres pool connection");
+    assert_eq!(ping, 1);
+
+    held.release();
+    let (status, body) = bind_task.await.expect("bind task completes");
+    assert_eq!(status, StatusCode::OK, "bind failed: {body}");
+    assert_eq!(
+        order_facts(&single_conn_pool, &order.order_id)
+            .await
+            .bitcoin_quoted_sats,
+        Some(quoted_sats() as i64)
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn non_usd_eur_fx_http_fetch_does_not_hold_a_database_connection_or_transaction(
+    pool: PgPool,
+) {
+    use common::fx_feed::fx_body_multi;
+    use marketplace_service::config::Config;
+    use marketplace_service::payment_attempt::{MarketplaceAssets, MarketplaceContract};
+    use marketplace_service::payments::PaykitApi;
+
+    let db_name: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&pool)
+        .await
+        .expect("current database");
+    let mut url =
+        url::Url::parse(&std::env::var("DATABASE_URL").expect("DATABASE_URL set for sqlx::test"))
+            .expect("valid DATABASE_URL");
+    url.set_path(&format!("/{db_name}"));
+    let single_conn_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_millis(300))
+        .connect(url.as_str())
+        .await
+        .expect("1-connection pool connects");
+
+    let mut config = Config::for_tests();
+    config.usdt_payments_enabled = true;
+    config.paykit_marketplace_contract = MarketplaceContract::MultiAsset;
+    config.paykit_marketplace_assets =
+        MarketplaceAssets::parse(Some("BTC,USDT"), PaykitApi::Upstream).expect("assets");
+    let (app, paykit, fx) =
+        test_app_with_paykit_fx_config(single_conn_pool.clone(), config, PaykitApi::Upstream).await;
+    paykit.use_multi_asset_contract();
+    paykit.set_usd_per_btc(77_197);
+
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (status, body) = send(
+        app.router.clone(),
+        "PUT",
+        "/v0/sellers/me/payment-config",
+        Some(&seller.token),
+        &json!({ "bitcoin_enabled": true, "usdt_enabled": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "config: {body}");
+    paykit.set_claimed(&seller.pubky);
+    paykit.set_receivable(&seller.pubky, &["BTC", "USDT"]);
+
+    let now = app.clock.now();
+    let prices = [("USD", "77197"), ("GBP", "57037"), ("JPY", "11745955")];
+    for (currency, rate) in prices {
+        for back in 0..3_i64 {
+            let accepted = now - Duration::seconds(60 * back);
+            let bucket_ts = accepted.timestamp() - accepted.timestamp().rem_euclid(60);
+            let bucket = DateTime::from_timestamp(bucket_ts, 0).expect("bucket");
+            sqlx::query(
+                "INSERT INTO fx_rate_samples \
+                 (currency, rate, fetched_at, accepted_at, sample_bucket, source) \
+                 VALUES ($1, $2::numeric, $3, $3, $4, 'blocktank') ON CONFLICT DO NOTHING",
+            )
+            .bind(currency)
+            .bind(rate)
+            .bind(accepted)
+            .bind(bucket)
+            .execute(&single_conn_pool)
+            .await
+            .expect("seed non-usd sample");
+        }
+    }
+    fx.set_body(fx_body_multi(&prices, now.timestamp_millis()));
+
+    for (listing_id, currency, exponent, method, expected_sats) in [
+        ("gbp_item", "GBP", 2_i32, "paykit", 240_195_i64),
+        ("jpy_item", "JPY", 0_i32, "bitcoin", 116_636_i64),
+    ] {
+        let mut register = register_command(&seller.pubky, 5);
+        register["command_id"] = json!(Uuid::new_v4().to_string());
+        register["aggregate_id"] = json!(format!("listing:{}_{listing_id}", seller.pubky));
+        register["payload"]["listing_id"] = json!(listing_id);
+        register["payload"]["unit_price"] =
+            json!({ "amount_minor": 12_500, "currency": currency, "exponent": exponent });
+        let (status, body) = execute(&app, &seller.token, &register).await;
+        assert_eq!(status, StatusCode::OK, "{currency} register: {body}");
+
+        let mut checkout = checkout_command_with_id(&seller.pubky, &Uuid::new_v4().to_string());
+        checkout["payload"]["lines"][0]["listing_aggregate_id"] =
+            json!(format!("listing:{}_{listing_id}", seller.pubky));
+        checkout["payload"]["lines"][0]["expected_revision"] = json!(1);
+        let (status, body) = execute(&app, &buyer.token, &checkout).await;
+        assert_eq!(status, StatusCode::OK, "{currency} checkout: {body}");
+        let order_id = body["result"]["orders"][0]["id"]
+            .as_str()
+            .expect("order id")
+            .to_string();
+
+        let held = fx.hold_next_fetch();
+        let router = app.router.clone();
+        let token = buyer.token.clone();
+        let bind_order_id = order_id.clone();
+        let bind_method = method.to_string();
+        let bind_task = tokio::spawn(async move {
+            send(
+                router,
+                "POST",
+                &format!("/v0/orders/{bind_order_id}/payment-method"),
+                Some(&token),
+                &json!({ "method": bind_method }),
+            )
+            .await
+        });
+        held.request_arrived().await;
+
+        let ping: i32 = sqlx::query_scalar("SELECT 1")
+            .fetch_one(&single_conn_pool)
+            .await
+            .unwrap_or_else(|e| panic!("{currency} FX fetch held sole DB connection: {e}"));
+        assert_eq!(ping, 1);
+
+        held.release();
+        let (status, body) = bind_task.await.expect("bind task");
+        assert_eq!(status, StatusCode::OK, "{currency} bind: {body}");
+        assert_eq!(
+            order_facts(&single_conn_pool, &order_id)
+                .await
+                .bitcoin_quoted_sats,
+            Some(expected_sats),
+            "{currency} quoted sats"
+        );
+    }
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn prefetched_fx_snapshot_aged_past_300s_before_lock_acquisition_returns_stale_without_refetch(
+    pool: PgPool,
+) {
+    // 1. Legacy USD bind: ticker is fresh at prefetch time, then clock advances
+    //    301s while waiting before FOR UPDATE lock evaluation. Must fail closed
+    //    with fx_rate_stale and zero refetch inside tx.
+    let fixture = fx_fixture(pool.clone()).await;
+    let start = fixture.app.clock.now();
+    seed_fx_samples(&pool, RATE, start, 3).await;
+    let order = checkout_usd(&fixture.app, &fixture.seller, &fixture.buyer).await;
+
+    let held = fixture.fx.hold_next_fetch();
+    let router = fixture.app.router.clone();
+    let token = fixture.buyer.token.clone();
+    let order_id = order.order_id.clone();
+    let bind_task = tokio::spawn(async move {
+        send(
+            router,
+            "POST",
+            &format!("/v0/orders/{order_id}/payment-method"),
+            Some(&token),
+            &json!({ "method": "bitcoin" }),
+        )
+        .await
+    });
+    held.request_arrived().await;
+
+    // Advance past MAX_RATE_AGE_SECS (300s) before the transaction runs.
+    fixture.app.clock.advance_seconds(301);
+    held.release();
+
+    let (status, body) = bind_task.await.expect("bind task");
+    assert_eq!(status, StatusCode::CONFLICT, "stale after wait: {body}");
+    assert_eq!(body["error"]["reason"], json!("fx_rate_stale"));
+    assert_eq!(
+        fixture.fx.fetch_count(),
+        1,
+        "must fail closed without refetching HTTP inside tx"
+    );
+    assert_no_side_effects(
+        &order_facts(&pool, &order.order_id).await,
+        &fixture.paykit,
+        "stale after wait",
+    );
+
+    // 2. Multi-asset EUR bind: BTCEUR stays within 300s after a 250s wait,
+    //    while BTCUSD was 60s older at prefetch and crosses 300s (310s old)
+    //    before lock evaluation. Both legs must be rechecked against quote_now.
+    let mut cfg = marketplace_service::config::Config::for_tests();
+    cfg.usdt_payments_enabled = true;
+    cfg.paykit_marketplace_contract =
+        marketplace_service::payment_attempt::MarketplaceContract::MultiAsset;
+    cfg.paykit_marketplace_assets = marketplace_service::payment_attempt::MarketplaceAssets::parse(
+        Some("BTC,USDT"),
+        marketplace_service::payments::PaykitApi::Upstream,
+    )
+    .expect("assets");
+    let (eur_app, eur_paykit, eur_fx) = test_app_with_paykit_fx_config(
+        pool.clone(),
+        cfg,
+        marketplace_service::payments::PaykitApi::Upstream,
+    )
+    .await;
+    eur_paykit.use_multi_asset_contract();
+    eur_paykit.set_usd_per_btc(77_197);
+    let eur_seller = new_actor(&eur_app).await;
+    let eur_buyer = new_actor(&eur_app).await;
+    let (status, body) = send(
+        eur_app.router.clone(),
+        "PUT",
+        "/v0/sellers/me/payment-config",
+        Some(&eur_seller.token),
+        &json!({ "bitcoin_enabled": true, "usdt_enabled": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "config: {body}");
+    eur_paykit.set_claimed(&eur_seller.pubky);
+    eur_paykit.set_receivable(&eur_seller.pubky, &["BTC", "USDT"]);
+    let mut reg = register_command(&eur_seller.pubky, 5);
+    reg["command_id"] = json!(Uuid::new_v4().to_string());
+    reg["payload"]["unit_price"] =
+        json!({ "amount_minor": 12_500, "currency": "EUR", "exponent": 2 });
+    let (status, body) = execute(&eur_app, &eur_seller.token, &reg).await;
+    assert_eq!(status, StatusCode::OK, "eur register: {body}");
+    let eur_now = eur_app.clock.now();
+    for (currency, rate) in [("USD", "77197"), ("EUR", "66481")] {
+        for back in 0..3_i64 {
+            let accepted = eur_now - Duration::seconds(60 * back);
+            let bucket_ts = accepted.timestamp() - accepted.timestamp().rem_euclid(60);
+            let bucket = DateTime::from_timestamp(bucket_ts, 0).expect("bucket");
+            sqlx::query(
+                "INSERT INTO fx_rate_samples \
+                 (currency, rate, fetched_at, accepted_at, sample_bucket, source) \
+                 VALUES ($1, $2::numeric, $3, $3, $4, 'blocktank') ON CONFLICT DO NOTHING",
+            )
+            .bind(currency)
+            .bind(rate)
+            .bind(accepted)
+            .bind(bucket)
+            .execute(&pool)
+            .await
+            .expect("seed eur/usd sample");
+        }
+    }
+    let eur_ms = eur_now.timestamp_millis();
+    let usd_ms = (eur_now - Duration::seconds(60)).timestamp_millis();
+    eur_fx.set_body(format!(
+        r#"{{"tickers":[
+            {{"symbol":"BTCUSD","lastPrice":"77197","base":"BTC","quote":"USD","lastUpdatedAt":{usd_ms}}},
+            {{"symbol":"BTCEUR","lastPrice":"66481","base":"BTC","quote":"EUR","lastUpdatedAt":{eur_ms}}}
+        ]}}"#
+    ));
+    let eur_order = checkout_usd(&eur_app, &eur_seller, &eur_buyer).await;
+    let eur_held = eur_fx.hold_next_fetch();
+    let eur_router = eur_app.router.clone();
+    let eur_token = eur_buyer.token.clone();
+    let eur_order_id = eur_order.order_id.clone();
+    let eur_bind_task = tokio::spawn(async move {
+        send(
+            eur_router,
+            "POST",
+            &format!("/v0/orders/{eur_order_id}/payment-method"),
+            Some(&eur_token),
+            &json!({ "method": "paykit" }),
+        )
+        .await
+    });
+    eur_held.request_arrived().await;
+    // After 250s: BTCEUR is 250s old (fresh), BTCUSD is 310s old (stale!).
+    eur_app.clock.advance_seconds(250);
+    eur_held.release();
+
+    let (status, body) = eur_bind_task.await.expect("eur bind task");
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "stale USD leg after wait: {body}"
+    );
+    assert_eq!(body["error"]["reason"], json!("fx_rate_stale"));
+    assert_eq!(eur_fx.fetch_count(), 1);
+    assert_no_side_effects(
+        &order_facts(&pool, &eur_order.order_id).await,
+        &eur_paykit,
+        "stale USD leg after wait",
+    );
+}
+
+/// Polls `pg_stat_activity` until another backend in this test database is
+/// actively blocked on a PostgreSQL row/table lock (`wait_event_type = 'Lock'`).
+async fn wait_for_db_lock_waiter(pool: &PgPool) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_stat_activity \
+             WHERE datname = current_database() \
+               AND pid <> pg_backend_pid() \
+               AND state = 'active' \
+               AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("query pg_stat_activity for lock waiter");
+        if waiting > 0 {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for transaction to block on PostgreSQL lock"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn seller_enabling_bitcoin_between_prefetch_and_tx_retries_fx_prefetch_outside_tx(
+    pool: PgPool,
+) {
+    let (app, paykit, fx) = test_app_with_payments_and_fx(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    paykit.set_claimed(&seller.pubky);
+    // Start with bitcoin disabled so pre-tx prefetch sees no active rail.
+    let (status, body) = send(
+        app.router.clone(),
+        "PUT",
+        "/v0/sellers/me/payment-config",
+        Some(&seller.token),
+        &json!({ "bitcoin_enabled": false, "paypal_merchant_email": "merchant@example.com" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "config: {body}");
+    let (status, body) = execute(&app, &seller.token, &register_command(&seller.pubky, 5)).await;
+    assert_eq!(status, StatusCode::OK, "register: {body}");
+
+    let now = app.clock.now();
+    fx.set_body(fx_body(RATE, now.timestamp_millis()));
+    seed_fx_samples(&pool, RATE, now, 3).await;
+    let order = checkout_usd(&app, &seller, &buyer).await;
+
+    // Lock the payments row from a separate transaction so bind_bitcoin runs
+    // its initial pre-tx prefetch (seeing bitcoin_enabled == false, returning
+    // None) and then blocks on fetch_payment_for_order_update.
+    let mut blocker_tx = pool.begin().await.expect("blocker tx");
+    let locked_payment: Uuid =
+        sqlx::query_scalar("SELECT id FROM payments WHERE order_id = $1 FOR UPDATE")
+            .bind(Uuid::parse_str(&order.order_id).unwrap())
+            .fetch_one(&mut *blocker_tx)
+            .await
+            .expect("lock payment row");
+    assert_eq!(locked_payment.to_string(), order.payment_id);
+
+    let router = app.router.clone();
+    let token = buyer.token.clone();
+    let order_id = order.order_id.clone();
+    let bind_task = tokio::spawn(async move {
+        send(
+            router,
+            "POST",
+            &format!("/v0/orders/{order_id}/payment-method"),
+            Some(&token),
+            &json!({ "method": "bitcoin" }),
+        )
+        .await
+    });
+
+    // Wait deterministically until bind_bitcoin is blocked on the payments row lock.
+    wait_for_db_lock_waiter(&pool).await;
+    assert_eq!(
+        fx.fetch_count(),
+        0,
+        "initial prefetch skipped FX while bitcoin was disabled"
+    );
+
+    // Seller enables bitcoin before blocker_tx releases the payment lock.
+    let (status, body) = send(
+        app.router.clone(),
+        "PUT",
+        "/v0/sellers/me/payment-config",
+        Some(&seller.token),
+        &json!({ "bitcoin_enabled": true, "paypal_merchant_email": "merchant@example.com" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "enable bitcoin: {body}");
+    blocker_tx.rollback().await.expect("release payment lock");
+
+    let (status, body) = bind_task.await.expect("bind task");
+    assert_eq!(status, StatusCode::OK, "retry prefetch succeeded: {body}");
+    assert_eq!(
+        fx.fetch_count(),
+        1,
+        "exactly one FX fetch on retry outside tx"
+    );
+    assert_eq!(
+        order_facts(&pool, &order.order_id)
+            .await
+            .bitcoin_quoted_sats,
+        Some(quoted_sats() as i64)
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn bind_fails_closed_when_fx_ages_past_300s_while_blocked_on_listing_lock(pool: PgPool) {
+    let (app, paykit, fx) = test_app_with_payments_and_fx(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    enable_bitcoin(&app, &paykit, &seller).await;
+    let (status, body) = execute(&app, &seller.token, &register_command(&seller.pubky, 5)).await;
+    assert_eq!(status, StatusCode::OK, "register: {body}");
+
+    let now = app.clock.now();
+    fx.set_body(fx_body(RATE, now.timestamp_millis()));
+    seed_fx_samples(&pool, RATE, now, 3).await;
+    let order = checkout_usd(&app, &seller, &buyer).await;
+
+    // Hold a FOR UPDATE lock on the seller's listing row from a separate
+    // transaction so the bind prefetches a fresh FX snapshot, passes the
+    // payments/orders locks, and blocks inside acquire_payment_hold.
+    let mut blocker_tx = pool.begin().await.expect("blocker tx");
+    let locked_listing: String =
+        sqlx::query_scalar("SELECT aggregate_id FROM listings WHERE seller_pubky = $1 FOR UPDATE")
+            .bind(&seller.pubky)
+            .fetch_one(&mut *blocker_tx)
+            .await
+            .expect("lock listing row");
+    assert!(!locked_listing.is_empty());
+
+    let router = app.router.clone();
+    let token = buyer.token.clone();
+    let order_id = order.order_id.clone();
+    let bind_task = tokio::spawn(async move {
+        send(
+            router,
+            "POST",
+            &format!("/v0/orders/{order_id}/payment-method"),
+            Some(&token),
+            &json!({ "method": "bitcoin" }),
+        )
+        .await
+    });
+
+    // Wait deterministically until bind_payment_method blocks on the listing lock.
+    wait_for_db_lock_waiter(&pool).await;
+    assert_eq!(
+        fx.fetch_count(),
+        1,
+        "fresh FX snapshot was prefetched before entering the transaction"
+    );
+
+    // Advance the clock past MAX_RATE_AGE_SECS (300 s) while blocked on the
+    // listing lock, then release the lock.
+    app.clock.advance_seconds(301);
+    blocker_tx.rollback().await.expect("release listing lock");
+
+    let (status, body) = bind_task.await.expect("bind task");
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "stale FX after listing lock wait must fail closed: {body}"
+    );
+    assert_eq!(body["error"]["reason"], json!("fx_rate_stale"));
+    assert_eq!(
+        fx.fetch_count(),
+        1,
+        "must not refetch HTTP inside the transaction after lock wait"
+    );
+    assert_no_side_effects(
+        &order_facts(&pool, &order.order_id).await,
+        &paykit,
+        "stale FX after listing lock wait",
+    );
+    let (stock_held, reserved_qty): (bool, i64) = sqlx::query_as(
+        "SELECT o.stock_held, l.reserved_quantity \
+         FROM orders o JOIN listings l ON l.aggregate_id = $2 \
+         WHERE o.id = $1",
+    )
+    .bind(Uuid::parse_str(&order.order_id).unwrap())
+    .bind(&locked_listing)
+    .fetch_one(&pool)
+    .await
+    .expect("check rolled-back hold state");
+    assert!(!stock_held, "order hold must roll back on fx_rate_stale");
+    assert_eq!(reserved_qty, 0, "listing reservation must roll back");
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn acquire_payment_hold_blocked_on_inventory_lock_derives_fresh_post_lock_hold_window(
+    pool: PgPool,
+) {
+    let (app, _paykit, _fx) = test_app_with_payments_and_fx(pool.clone()).await;
+    let seller = new_actor(&app).await;
+    let buyer = new_actor(&app).await;
+    let (status, body) = send(
+        app.router.clone(),
+        "PUT",
+        "/v0/sellers/me/payment-config",
+        Some(&seller.token),
+        &json!({ "bitcoin_enabled": false, "paypal_merchant_email": "merchant@example.com" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "config: {body}");
+    let (status, body) = execute(&app, &seller.token, &register_command(&seller.pubky, 5)).await;
+    assert_eq!(status, StatusCode::OK, "register: {body}");
+    let order = checkout_usd(&app, &seller, &buyer).await;
+
+    let bind_window = app.state.config.fiat_payment_window_seconds;
+
+    // Lock the listing's variant inventory row FOR UPDATE in a separate
+    // transaction so `acquire_payment_hold` blocks on inventory locking.
+    let mut blocker_tx = pool.begin().await.expect("inventory lock tx");
+    let locked_listing: String = sqlx::query_scalar(
+        "SELECT listing_aggregate_id FROM listing_variant_inventory \
+         WHERE listing_aggregate_id = $1 FOR UPDATE",
+    )
+    .bind(listing_aggregate(&seller.pubky))
+    .fetch_one(&mut *blocker_tx)
+    .await
+    .expect("lock variant inventory row");
+    assert_eq!(locked_listing, listing_aggregate(&seller.pubky));
+
+    let router = app.router.clone();
+    let token = buyer.token.clone();
+    let order_id = order.order_id.clone();
+    let bind_task = tokio::spawn(async move {
+        send(
+            router,
+            "POST",
+            &format!("/v0/orders/{order_id}/payment-method"),
+            Some(&token),
+            &json!({ "method": "paypal" }),
+        )
+        .await
+    });
+
+    wait_for_db_lock_waiter(&pool).await;
+
+    // Advance the clock past an entire hold window while blocked on the
+    // inventory lock; under stale pre-lock timestamps the newly acquired hold
+    // would already be expired.
+    app.clock.advance_seconds(bind_window + 120);
+    let post_lock_now = app.clock.now();
+    blocker_tx.rollback().await.expect("release inventory lock");
+
+    let (status, body) = bind_task.await.expect("bind task");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "bind after lock wait failed: {body}"
+    );
+    let expected_expiry = post_lock_now + Duration::seconds(bind_window);
+    let facts = order_facts(&pool, &order.order_id).await;
+    assert_eq!(
+        facts.hold_expires_at,
+        Some(expected_expiry),
+        "new hold must receive a full post-lock [post_lock_now, post_lock_now + window] deadline"
+    );
+    assert_eq!(facts.hold_source.as_deref(), Some("bind"));
+
+    // Intentional non-renewal: an idempotent re-bind of the same method later
+    // must keep the original hold deadline rather than extending it.
+    app.clock.advance_seconds(300);
+    let (status, body) = send(
+        app.router.clone(),
+        "POST",
+        &format!("/v0/orders/{}/payment-method", order.order_id),
+        Some(&buyer.token),
+        &json!({ "method": "paypal" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "idempotent re-bind: {body}");
+    assert_eq!(
+        order_facts(&pool, &order.order_id).await.hold_expires_at,
+        Some(expected_expiry),
+        "idempotent re-bind must not renew hold_expires_at"
+    );
+}

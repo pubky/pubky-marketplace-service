@@ -919,19 +919,22 @@ async fn delivery_email_retention_sweep(pool: PgPool) {
             .expect("purge"),
         1
     );
-    // Past retention plus grace with the purge not run: readiness fails.
+    // Past retention plus grace with the purge not run: readiness stays 200 OK
+    // so load balancers never drop checkout, while surfacing a warning.
     app.clock.set(start + chrono::Duration::days(40));
     let (status, body) = ready(&app).await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    assert_eq!(body["reason"], json!("delivery_email_purge_overdue"));
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], json!("ready"));
+    assert_eq!(body["warnings"], json!(["delivery_email_purge_overdue"]));
     assert_eq!(
         purge_delivery_emails(&app.pool, start + chrono::Duration::days(40), 30, 7)
             .await
             .expect("purge"),
         1
     );
-    let (status, _) = ready(&app).await;
-    assert_eq!(status, StatusCode::OK);
+    let (status, body) = ready(&app).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.get("warnings").is_none(), "{body}");
 
     let kept: Vec<(String, bool, bool, bool)> = sqlx::query_as(
         "SELECT order_id::text, email_ciphertext IS NOT NULL, emailed_at IS NOT NULL, \

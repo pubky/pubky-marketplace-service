@@ -6,6 +6,7 @@ use tracing_subscriber::EnvFilter;
 
 use marketplace_service::clock::SystemClock;
 use marketplace_service::config::Config;
+use marketplace_service::homeserver::HomeserverListingClient;
 use marketplace_service::store_seller::ListingModeration;
 use marketplace_service::{http, workers, AppState};
 
@@ -14,6 +15,22 @@ use marketplace_service::{http, workers, AppState};
 fn resolves_through_pkarr() -> bool {
     std::env::var(marketplace_service::homeserver::ENV_HOMESERVER_RESOLUTION)
         .is_ok_and(|value| value.trim() == "pkarr")
+}
+
+/// Returns the `HOMESERVER_URL` to verify against `HOMESERVER_PUBKY` at boot.
+/// Under `HOMESERVER_RESOLUTION=pkarr`, `HOMESERVER_URL` is intentionally
+/// unset so the check is skipped instead of logging a boot error.
+fn homeserver_url_for_grant_check(
+    resolution: Option<&str>,
+    homeserver_url: Option<&str>,
+) -> Option<String> {
+    if resolution == Some("pkarr") {
+        return None;
+    }
+    homeserver_url
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(str::to_string)
 }
 
 fn env_filter(pkarr: bool) -> EnvFilter {
@@ -171,9 +188,18 @@ async fn main() -> anyhow::Result<()> {
     let homeserver = Arc::new(marketplace_service::homeserver::client_from_env()?);
     tracing::info!("homeserver listing sync enabled");
     if let Some(grant) = &grant {
-        grant.spawn_homeserver_check(
-            std::env::var(marketplace_service::homeserver::ENV_HOMESERVER_URL).unwrap_or_default(),
-        );
+        let configured_url =
+            std::env::var(marketplace_service::homeserver::ENV_HOMESERVER_URL).ok();
+        if let Some(homeserver_url) =
+            homeserver_url_for_grant_check(homeserver.resolution(), configured_url.as_deref())
+        {
+            grant.spawn_homeserver_check(homeserver_url);
+        } else if homeserver.resolution() == Some("pkarr") {
+            tracing::info!(
+                "skipping HOMESERVER_URL check against HOMESERVER_PUBKY under \
+                 HOMESERVER_RESOLUTION=pkarr"
+            );
+        }
     }
     // NEXUS_URL is required while moderation is on: checkout, bids and offers
     // on a moderated listing are refused from the index's moderation state,
@@ -232,27 +258,40 @@ async fn main() -> anyhow::Result<()> {
             "single-seller mode: commands and routes for any other seller are refused"
         ),
     }
-    let audit_writer_options: PgConnectOptions = config.refusal_audit_database_url.parse()?;
-    let audit_writer_pool = PgPoolOptions::new()
-        .max_connections(marketplace_service::refusal_audit::WRITER_POOL_MAX_CONNECTIONS)
-        .min_connections(0)
-        .acquire_timeout(Duration::from_millis(100))
-        .idle_timeout(Some(Duration::from_secs(60)))
-        .connect_lazy_with(audit_writer_options);
-    let audit_retention_options: PgConnectOptions =
-        config.refusal_audit_retention_database_url.parse()?;
-    let audit_retention_pool = PgPoolOptions::new()
-        .max_connections(marketplace_service::refusal_audit::RETENTION_POOL_MAX_CONNECTIONS)
-        .min_connections(0)
-        .acquire_timeout(Duration::from_millis(100))
-        .idle_timeout(Some(Duration::from_secs(60)))
-        .connect_lazy_with(audit_retention_options);
-    let refusal_audit = Arc::new(
-        marketplace_service::refusal_audit::RefusalAuditRuntime::spawn(
-            audit_writer_pool,
-            config.refusal_audit_keys.clone(),
-        ),
-    );
+    let (refusal_audit, audit_retention_pool) = match (
+        config.refusal_audit_database_url.as_deref(),
+        config.refusal_audit_retention_database_url.as_deref(),
+        config.refusal_audit_keys.as_ref(),
+    ) {
+        (Some(writer_url), Some(retention_url), Some(keys)) => {
+            let audit_writer_options: PgConnectOptions = writer_url.parse()?;
+            let audit_writer_pool = PgPoolOptions::new()
+                .max_connections(marketplace_service::refusal_audit::WRITER_POOL_MAX_CONNECTIONS)
+                .min_connections(0)
+                .acquire_timeout(Duration::from_millis(100))
+                .idle_timeout(Some(Duration::from_secs(60)))
+                .connect_lazy_with(audit_writer_options);
+            let audit_retention_options: PgConnectOptions = retention_url.parse()?;
+            let audit_retention_pool = PgPoolOptions::new()
+                .max_connections(marketplace_service::refusal_audit::RETENTION_POOL_MAX_CONNECTIONS)
+                .min_connections(0)
+                .acquire_timeout(Duration::from_millis(100))
+                .idle_timeout(Some(Duration::from_secs(60)))
+                .connect_lazy_with(audit_retention_options);
+            let refusal_audit = Arc::new(
+                marketplace_service::refusal_audit::RefusalAuditRuntime::spawn(
+                    audit_writer_pool,
+                    keys.clone(),
+                ),
+            );
+            tracing::info!("refusal audit enabled");
+            (Some(refusal_audit), Some(audit_retention_pool))
+        }
+        _ => {
+            tracing::info!("refusal audit disabled (no refusal-audit logins configured)");
+            (None, None)
+        }
+    };
 
     // The pickup sealing boot probe runs AFTER migrations (the schema must
     // exist first) and attempts one real open — current key, then previous —
@@ -301,7 +340,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let bind_addr = config.bind_addr;
-    let state = AppState::new(pool, Arc::new(SystemClock), config)
+    let mut state = AppState::new(pool, Arc::new(SystemClock), config)
         .with_store(store)
         .with_store_limiters(store_limiters)
         .with_locks(locks)
@@ -315,12 +354,16 @@ async fn main() -> anyhow::Result<()> {
         .with_digital(digital)
         .with_priv_keys(priv_keys)
         .with_connectors(connectors)
-        .with_refusal_audit(refusal_audit)
-        .with_refusal_audit_retention_pool(audit_retention_pool)
         .with_grant(grant)
         .with_grant_session(grant_session)
         .with_address_search(address_search)
         .with_listing_availability(listing_availability);
+    if let Some(refusal_audit) = refusal_audit {
+        state = state.with_refusal_audit(refusal_audit);
+    }
+    if let Some(audit_retention_pool) = audit_retention_pool {
+        state = state.with_refusal_audit_retention_pool(audit_retention_pool);
+    }
     workers::spawn(state.clone());
     marketplace_service::automation::spawn_webhook_worker(state.clone());
     marketplace_service::grant::spawn(state.clone());
@@ -387,8 +430,31 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::{
-        env_filter, main_pool_options, wait_for_database, BOOT_DATABASE_WAIT, POOL_ACQUIRE_WAIT,
+        env_filter, homeserver_url_for_grant_check, main_pool_options, wait_for_database,
+        BOOT_DATABASE_WAIT, POOL_ACQUIRE_WAIT,
     };
+
+    #[test]
+    fn pkarr_resolution_skips_empty_homeserver_url_grant_check() {
+        assert_eq!(homeserver_url_for_grant_check(Some("pkarr"), None), None);
+        assert_eq!(
+            homeserver_url_for_grant_check(Some("pkarr"), Some("")),
+            None
+        );
+        assert_eq!(
+            homeserver_url_for_grant_check(Some("pkarr"), Some("https://homeserver.example")),
+            None
+        );
+        assert_eq!(
+            homeserver_url_for_grant_check(Some("fixed"), Some("https://homeserver.example")),
+            Some("https://homeserver.example".to_string())
+        );
+        assert_eq!(
+            homeserver_url_for_grant_check(Some("fixed"), Some("  ")),
+            None
+        );
+        assert_eq!(homeserver_url_for_grant_check(Some("fixed"), None), None);
+    }
 
     #[test]
     fn dependency_directives_remain_at_warn() {

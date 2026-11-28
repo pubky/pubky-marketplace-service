@@ -148,43 +148,78 @@ impl ShippingPlan {
     /// sent no destination. Profiles are read only for a command that carries
     /// a destination: without one a zone-priced line is refused before any
     /// profile is consulted.
+    /// Reads the shipping profiles and shop records needed for `command`,
+    /// reusing pre-fetched `sold_listings` when available to avoid a duplicate
+    /// `listings` query.
     pub async fn read(state: &AppState, command: &Command) -> Result<Self, sqlx::Error> {
+        Self::read_with_listings(state, command, None).await
+    }
+
+    pub async fn read_with_listings(
+        state: &AppState,
+        command: &Command,
+        sold_listings: Option<&[crate::listing_moderation::SoldListing]>,
+    ) -> Result<Self, sqlx::Error> {
         let mut wanted = Wanted::default();
         match &command.payload {
             CommandPayload::CreateCheckout(payload) => {
-                let aggregate_ids: Vec<&str> = payload
-                    .lines
-                    .iter()
-                    .map(|line| line.listing_aggregate_id.as_str())
-                    .collect();
-                wanted
-                    .listings(
-                        &state.pool,
-                        &aggregate_ids,
+                if let Some(listings) = sold_listings {
+                    wanted.add_sold_listings(
+                        listings,
                         payload.destination_country.is_some(),
                         false,
-                    )
-                    .await?;
+                    );
+                } else {
+                    let aggregate_ids: Vec<&str> = payload
+                        .lines
+                        .iter()
+                        .map(|line| line.listing_aggregate_id.as_str())
+                        .collect();
+                    wanted
+                        .listings(
+                            &state.pool,
+                            &aggregate_ids,
+                            payload.destination_country.is_some(),
+                            false,
+                        )
+                        .await?;
+                }
             }
             CommandPayload::CreateOffer(payload) => {
-                wanted
-                    .listings(
-                        &state.pool,
-                        &[command.aggregate_id.as_str()],
+                if let Some(listings) = sold_listings {
+                    wanted.add_sold_listings(
+                        listings,
                         payload.destination_country.is_some(),
                         payload.destination_country.is_some(),
-                    )
-                    .await?;
+                    );
+                } else {
+                    wanted
+                        .listings(
+                            &state.pool,
+                            &[command.aggregate_id.as_str()],
+                            payload.destination_country.is_some(),
+                            payload.destination_country.is_some(),
+                        )
+                        .await?;
+                }
             }
             CommandPayload::PlaceBid(payload) => {
-                wanted
-                    .listings(
-                        &state.pool,
-                        &[command.aggregate_id.as_str()],
+                if let Some(listings) = sold_listings {
+                    wanted.add_sold_listings(
+                        listings,
                         payload.destination_country.is_some(),
                         false,
-                    )
-                    .await?;
+                    );
+                } else {
+                    wanted
+                        .listings(
+                            &state.pool,
+                            &[command.aggregate_id.as_str()],
+                            payload.destination_country.is_some(),
+                            false,
+                        )
+                        .await?;
+                }
             }
             CommandPayload::AcceptOffer(_) => {
                 wanted
@@ -303,6 +338,27 @@ struct Wanted {
 }
 
 impl Wanted {
+    fn add_sold_listings(
+        &mut self,
+        listings: &[crate::listing_moderation::SoldListing],
+        with_profiles: bool,
+        with_record: bool,
+    ) {
+        for listing in listings.iter().filter(|listing| listing.live) {
+            if with_profiles {
+                if let Some(profile_id) = &listing.shipping_profile_id {
+                    self.profiles
+                        .insert((listing.seller_pubky.clone(), profile_id.clone()));
+                }
+            }
+            if with_record {
+                self.records
+                    .push((listing.seller_pubky.clone(), listing.listing_id.clone()));
+            }
+            self.shops.insert(listing.seller_pubky.clone());
+        }
+    }
+
     async fn listings(
         &mut self,
         pool: &sqlx::PgPool,

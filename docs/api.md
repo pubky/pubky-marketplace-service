@@ -2431,11 +2431,13 @@ check must not treat these flags as failures.
 
 ### `GET /ready`
 
-Readiness for traffic. `200 {"status":"ready"}` when the service can serve;
-`503 {"status":"unavailable"}` when it cannot. A `503` is returned when the
-refusal-audit pipeline is not ready, the database probe fails, or buyer
-delivery emails are held beyond their retention window (in that case the body
-also carries `"reason":"delivery_email_purge_overdue"`).
+Readiness for traffic. Returns `200 {"status":"ready"}` whenever the core
+database probe succeeds, and `503 {"status":"unavailable"}` when the database
+probe fails. Non-commerce diagnostics (an unready refusal-audit writer or buyer
+delivery emails awaiting retention purge) are reported as structured warning
+logs and an optional `"warnings"` array on the `200` response (for example
+`["refusal_audit_not_ready"]` or `["delivery_email_purge_overdue"]`) instead of
+returning `503`.
 
 The service publishes no version endpoint. `GET /health` reports `commit`; for
 the authoritative record use the digest of the image that is deployed and its

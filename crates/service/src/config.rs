@@ -36,11 +36,13 @@ pub const DEFAULT_CLIENT_COUNTRY_HEADER: &str = "x-client-region";
 pub struct Config {
     pub bind_addr: SocketAddr,
     pub database_url: String,
-    /// Separate least-privilege writer login; this must not be the domain URL.
-    pub refusal_audit_database_url: String,
-    /// Separate retention login; it can execute only the bounded purge function.
-    pub refusal_audit_retention_database_url: String,
-    pub refusal_audit_keys: AuditKeys,
+    /// Optional separate least-privilege writer login; when set, this must not
+    /// be the domain URL.
+    pub refusal_audit_database_url: Option<String>,
+    /// Optional separate retention login; it can execute only the bounded
+    /// purge function.
+    pub refusal_audit_retention_database_url: Option<String>,
+    pub refusal_audit_keys: Option<AuditKeys>,
     /// Exact origins allowed by CORS. Empty means no browser origin is
     /// allowed (non-browser clients are unaffected).
     pub allowed_origins: Vec<HeaderValue>,
@@ -366,28 +368,47 @@ impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
         let database_url = std::env::var("DATABASE_URL")
             .map_err(|_| anyhow::anyhow!("DATABASE_URL must be set"))?;
-        let refusal_audit_database_url = required_postgres_url(
+        let mut has_refusal_audit_setting = false;
+        for name in [
             "REFUSAL_AUDIT_DATABASE_URL",
-            crate::refusal_audit::WRITER_LOGIN,
-        )?;
-        let refusal_audit_retention_database_url = required_postgres_url(
             "REFUSAL_AUDIT_RETENTION_DATABASE_URL",
-            crate::refusal_audit::RETENTION_LOGIN,
-        )?;
-        reject_audit_url_reuse(&database_url, &refusal_audit_database_url)?;
-        reject_audit_url_reuse(&database_url, &refusal_audit_retention_database_url)?;
-        reject_audit_url_reuse(
-            &refusal_audit_database_url,
-            &refusal_audit_retention_database_url,
-        )?;
-        let refusal_audit_keys = refusal_audit_keys_from_env()?;
+            "REFUSAL_AUDIT_HMAC_ROOT_B64",
+            "REFUSAL_AUDIT_HMAC_KEY_EPOCH",
+            "REFUSAL_AUDIT_HMAC_PREVIOUS_ROOT_B64",
+            "REFUSAL_AUDIT_HMAC_PREVIOUS_KEY_EPOCH",
+        ] {
+            if optional_env(name)?.is_some() {
+                has_refusal_audit_setting = true;
+            }
+        }
+        let (refusal_audit_database_url, refusal_audit_retention_database_url, refusal_audit_keys) =
+            if has_refusal_audit_setting {
+                let writer_url = required_postgres_url(
+                    "REFUSAL_AUDIT_DATABASE_URL",
+                    crate::refusal_audit::WRITER_LOGIN,
+                )?;
+                let retention_url = required_postgres_url(
+                    "REFUSAL_AUDIT_RETENTION_DATABASE_URL",
+                    crate::refusal_audit::RETENTION_LOGIN,
+                )?;
+                reject_audit_url_reuse(&database_url, &writer_url)?;
+                reject_audit_url_reuse(&database_url, &retention_url)?;
+                reject_audit_url_reuse(&writer_url, &retention_url)?;
+                let keys = refusal_audit_keys_from_env()?;
+                (Some(writer_url), Some(retention_url), Some(keys))
+            } else {
+                (None, None, None)
+            };
+        // Compliance-attestation flags are optional; validate UTF-8 and
+        // boolean syntax whenever present (including blank or whitespace-only
+        // values) without blocking startup when unset or false.
         for name in [
             "REFUSAL_AUDIT_BACKUP_EXPIRY_ATTESTED",
             "REFUSAL_AUDIT_REPLICA_EXPIRY_ATTESTED",
             "REFUSAL_AUDIT_RESIDUAL_RISK_ACCEPTED",
         ] {
-            if !env_bool(name, false)? {
-                anyhow::bail!("{name} must be true before refusal-audit production readiness");
+            if optional_env(name)?.is_some() {
+                let _ = env_bool(name, false)?;
             }
         }
         let bind_addr = std::env::var("BIND_ADDR")
@@ -665,11 +686,15 @@ impl Config {
         Self {
             bind_addr: "127.0.0.1:0".parse().expect("valid test bind address"),
             database_url: String::new(),
-            refusal_audit_database_url: "postgres://writer@audit.test/refusal_audit".to_string(),
-            refusal_audit_retention_database_url: "postgres://retention@audit.test/refusal_audit"
-                .to_string(),
-            refusal_audit_keys: AuditKeys::parse(&test_root, "1", None, None)
-                .expect("test audit key parses"),
+            refusal_audit_database_url: Some(
+                "postgres://writer@audit.test/refusal_audit".to_string(),
+            ),
+            refusal_audit_retention_database_url: Some(
+                "postgres://retention@audit.test/refusal_audit".to_string(),
+            ),
+            refusal_audit_keys: Some(
+                AuditKeys::parse(&test_root, "1", None, None).expect("test audit key parses"),
+            ),
             allowed_origins: vec![HeaderValue::from_static("http://localhost:3000")],
             auth_token_window_seconds: 120,
             session_ttl_seconds: 86_400,
@@ -753,8 +778,20 @@ impl std::fmt::Debug for Config {
     }
 }
 
+fn optional_env(name: &str) -> anyhow::Result<Option<String>> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => anyhow::bail!("{name} must be valid UTF-8"),
+    }
+}
+
+fn required_env(name: &str) -> anyhow::Result<String> {
+    optional_env(name)?.ok_or_else(|| anyhow::anyhow!("{name} must be set"))
+}
+
 fn required_postgres_url(name: &str, expected_login: &str) -> anyhow::Result<String> {
-    let value = std::env::var(name).map_err(|_| anyhow::anyhow!("{name} must be set"))?;
+    let value = required_env(name)?;
     validate_postgres_url(name, &value, expected_login)?;
     Ok(value)
 }
@@ -800,17 +837,15 @@ fn reject_audit_url_reuse(first: &str, second: &str) -> anyhow::Result<()> {
 }
 
 fn refusal_audit_keys_from_env() -> anyhow::Result<AuditKeys> {
+    let active_root = required_env("REFUSAL_AUDIT_HMAC_ROOT_B64")?;
+    let active_epoch = required_env("REFUSAL_AUDIT_HMAC_KEY_EPOCH")?;
+    let previous_root = optional_env("REFUSAL_AUDIT_HMAC_PREVIOUS_ROOT_B64")?;
+    let previous_epoch = optional_env("REFUSAL_AUDIT_HMAC_PREVIOUS_KEY_EPOCH")?;
     AuditKeys::parse(
-        &std::env::var("REFUSAL_AUDIT_HMAC_ROOT_B64")
-            .map_err(|_| anyhow::anyhow!("REFUSAL_AUDIT_HMAC_ROOT_B64 must be set"))?,
-        &std::env::var("REFUSAL_AUDIT_HMAC_KEY_EPOCH")
-            .map_err(|_| anyhow::anyhow!("REFUSAL_AUDIT_HMAC_KEY_EPOCH must be set"))?,
-        std::env::var("REFUSAL_AUDIT_HMAC_PREVIOUS_ROOT_B64")
-            .ok()
-            .as_deref(),
-        std::env::var("REFUSAL_AUDIT_HMAC_PREVIOUS_KEY_EPOCH")
-            .ok()
-            .as_deref(),
+        &active_root,
+        &active_epoch,
+        previous_root.as_deref(),
+        previous_epoch.as_deref(),
     )
 }
 
@@ -976,7 +1011,8 @@ fn env_bool(name: &str, default: bool) -> anyhow::Result<bool> {
             "false" | "0" => Ok(false),
             _ => Err(anyhow::anyhow!("{name} must be true, false, 1, or 0")),
         },
-        Err(_) => Ok(default),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(std::env::VarError::NotUnicode(_)) => anyhow::bail!("{name} must be valid UTF-8"),
     }
 }
 
@@ -2106,6 +2142,206 @@ mod tests {
             assert!(
                 parse_paypal_checkout_url(Some(value)).is_err(),
                 "{value} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn refusal_audit_logins_and_attestations_are_optional_at_boot() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        // Minimal standard deployment: DATABASE_URL only, zero refusal-audit
+        // logins, zero HMAC keys, zero compliance-attestation env vars.
+        let minimal = from_env_with(&[
+            ("REFUSAL_AUDIT_DATABASE_URL", None),
+            ("REFUSAL_AUDIT_RETENTION_DATABASE_URL", None),
+            ("REFUSAL_AUDIT_HMAC_ROOT_B64", None),
+            ("REFUSAL_AUDIT_HMAC_KEY_EPOCH", None),
+            ("REFUSAL_AUDIT_BACKUP_EXPIRY_ATTESTED", None),
+            ("REFUSAL_AUDIT_REPLICA_EXPIRY_ATTESTED", None),
+            ("REFUSAL_AUDIT_RESIDUAL_RISK_ACCEPTED", None),
+        ])
+        .expect("from_env succeeds without refusal-audit env vars");
+        assert!(minimal.refusal_audit_database_url.is_none());
+        assert!(minimal.refusal_audit_retention_database_url.is_none());
+        assert!(minimal.refusal_audit_keys.is_none());
+
+        // Configured refusal-audit works without compliance-attestation flags.
+        let without_attestations = from_env_with(&[
+            ("REFUSAL_AUDIT_BACKUP_EXPIRY_ATTESTED", None),
+            ("REFUSAL_AUDIT_REPLICA_EXPIRY_ATTESTED", None),
+            ("REFUSAL_AUDIT_RESIDUAL_RISK_ACCEPTED", None),
+        ])
+        .expect("refusal-audit config does not require attestation booleans");
+        assert!(without_attestations.refusal_audit_database_url.is_some());
+        assert!(without_attestations
+            .refusal_audit_retention_database_url
+            .is_some());
+        assert!(without_attestations.refusal_audit_keys.is_some());
+
+        // False compliance-attestation flags do not block startup either.
+        let false_attestations = from_env_with(&[
+            ("REFUSAL_AUDIT_BACKUP_EXPIRY_ATTESTED", Some("false")),
+            ("REFUSAL_AUDIT_REPLICA_EXPIRY_ATTESTED", Some("false")),
+            ("REFUSAL_AUDIT_RESIDUAL_RISK_ACCEPTED", Some("false")),
+        ])
+        .expect("false attestation booleans do not refuse boot");
+        assert!(false_attestations.refusal_audit_keys.is_some());
+
+        // Partial refusal-audit credentials still fail closed.
+        assert!(
+            from_env_with(&[("REFUSAL_AUDIT_RETENTION_DATABASE_URL", None)]).is_err(),
+            "writer URL without retention URL fails closed"
+        );
+        assert!(
+            from_env_with(&[("REFUSAL_AUDIT_HMAC_ROOT_B64", None)]).is_err(),
+            "audit URLs without HMAC root fail closed"
+        );
+        assert!(
+            from_env_with(&[("REFUSAL_AUDIT_BACKUP_EXPIRY_ATTESTED", Some("notabool"))]).is_err(),
+            "malformed optional attestation boolean fails closed"
+        );
+    }
+
+    #[test]
+    fn blank_or_whitespace_refusal_audit_and_attestation_env_vars_fail_closed() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        const REFUSAL_AUDIT_VARS: [&str; 6] = [
+            "REFUSAL_AUDIT_DATABASE_URL",
+            "REFUSAL_AUDIT_RETENTION_DATABASE_URL",
+            "REFUSAL_AUDIT_HMAC_ROOT_B64",
+            "REFUSAL_AUDIT_HMAC_KEY_EPOCH",
+            "REFUSAL_AUDIT_HMAC_PREVIOUS_ROOT_B64",
+            "REFUSAL_AUDIT_HMAC_PREVIOUS_KEY_EPOCH",
+        ];
+        const ATTESTATION_VARS: [&str; 3] = [
+            "REFUSAL_AUDIT_BACKUP_EXPIRY_ATTESTED",
+            "REFUSAL_AUDIT_REPLICA_EXPIRY_ATTESTED",
+            "REFUSAL_AUDIT_RESIDUAL_RISK_ACCEPTED",
+        ];
+        let all_unset = [
+            ("REFUSAL_AUDIT_DATABASE_URL", None),
+            ("REFUSAL_AUDIT_RETENTION_DATABASE_URL", None),
+            ("REFUSAL_AUDIT_HMAC_ROOT_B64", None),
+            ("REFUSAL_AUDIT_HMAC_KEY_EPOCH", None),
+            ("REFUSAL_AUDIT_HMAC_PREVIOUS_ROOT_B64", None),
+            ("REFUSAL_AUDIT_HMAC_PREVIOUS_KEY_EPOCH", None),
+            ("REFUSAL_AUDIT_BACKUP_EXPIRY_ATTESTED", None),
+            ("REFUSAL_AUDIT_REPLICA_EXPIRY_ATTESTED", None),
+            ("REFUSAL_AUDIT_RESIDUAL_RISK_ACCEPTED", None),
+        ];
+
+        // Baseline: all nine vars truly unset succeeds with auditing disabled.
+        let unset = from_env_with(&all_unset).expect("truly unset optional vars succeed");
+        assert!(unset.refusal_audit_database_url.is_none());
+        assert!(unset.refusal_audit_retention_database_url.is_none());
+        assert!(unset.refusal_audit_keys.is_none());
+
+        // Any lone blank or whitespace-only refusal-audit setting must fail
+        // closed under all-or-nothing validation instead of silently disabling
+        // auditing.
+        for name in REFUSAL_AUDIT_VARS {
+            for blank in ["", "   ", "\t"] {
+                let mut overrides = all_unset.to_vec();
+                overrides.push((name, Some(blank)));
+                assert!(
+                    from_env_with(&overrides).is_err(),
+                    "lone {name}={blank:?} must fail closed"
+                );
+            }
+        }
+
+        // With valid active refusal-audit credentials, blank or whitespace-only
+        // rotation vars (alone or paired) must fail closed rather than being
+        // treated as unset.
+        for blank in ["", "   "] {
+            assert!(
+                from_env_with(&[("REFUSAL_AUDIT_HMAC_PREVIOUS_ROOT_B64", Some(blank))]).is_err(),
+                "blank REFUSAL_AUDIT_HMAC_PREVIOUS_ROOT_B64={blank:?} must fail closed"
+            );
+            assert!(
+                from_env_with(&[("REFUSAL_AUDIT_HMAC_PREVIOUS_KEY_EPOCH", Some(blank))]).is_err(),
+                "blank REFUSAL_AUDIT_HMAC_PREVIOUS_KEY_EPOCH={blank:?} must fail closed"
+            );
+            assert!(
+                from_env_with(&[
+                    ("REFUSAL_AUDIT_HMAC_PREVIOUS_ROOT_B64", Some(blank)),
+                    ("REFUSAL_AUDIT_HMAC_PREVIOUS_KEY_EPOCH", Some(blank)),
+                ])
+                .is_err(),
+                "paired blank REFUSAL_AUDIT_HMAC_PREVIOUS_*={blank:?} must fail closed"
+            );
+        }
+
+        // Any present blank or whitespace-only compliance-attestation boolean
+        // must fail closed whether refusal auditing is disabled or enabled.
+        for name in ATTESTATION_VARS {
+            for blank in ["", "   ", "\t"] {
+                let mut disabled_overrides = all_unset.to_vec();
+                disabled_overrides.push((name, Some(blank)));
+                let err_disabled = from_env_with(&disabled_overrides)
+                    .expect_err("blank attestation with auditing disabled must fail closed");
+                assert!(
+                    err_disabled
+                        .to_string()
+                        .contains("must be true, false, 1, or 0"),
+                    "{name}={blank:?}: {err_disabled}"
+                );
+
+                let err_enabled = from_env_with(&[(name, Some(blank))])
+                    .expect_err("blank attestation with auditing enabled must fail closed");
+                assert!(
+                    err_enabled
+                        .to_string()
+                        .contains("must be true, false, 1, or 0"),
+                    "{name}={blank:?}: {err_enabled}"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_refusal_audit_env_fails_closed() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let bad = OsStr::from_bytes(b"\xff\xfe");
+        for name in [
+            "REFUSAL_AUDIT_DATABASE_URL",
+            "REFUSAL_AUDIT_HMAC_PREVIOUS_ROOT_B64",
+            "REFUSAL_AUDIT_BACKUP_EXPIRY_ATTESTED",
+        ] {
+            let previous = std::env::var_os(name);
+            let _env = EnvGuard::set(&[
+                ("DATABASE_URL", Some("postgres://example.invalid/test")),
+                ("REFUSAL_AUDIT_DATABASE_URL", None),
+                ("REFUSAL_AUDIT_RETENTION_DATABASE_URL", None),
+                ("REFUSAL_AUDIT_HMAC_ROOT_B64", None),
+                ("REFUSAL_AUDIT_HMAC_KEY_EPOCH", None),
+                ("REFUSAL_AUDIT_HMAC_PREVIOUS_ROOT_B64", None),
+                ("REFUSAL_AUDIT_HMAC_PREVIOUS_KEY_EPOCH", None),
+                ("REFUSAL_AUDIT_BACKUP_EXPIRY_ATTESTED", None),
+                ("REFUSAL_AUDIT_REPLICA_EXPIRY_ATTESTED", None),
+                ("REFUSAL_AUDIT_RESIDUAL_RISK_ACCEPTED", None),
+                ("FX_FEED_PROVIDER", None),
+                ("FX_FEED_URL", None),
+                ("STORE_MODE", None),
+                ("STORE_SELLER_PUBKY", None),
+                ("STORE_CLAIM_TOKEN", None),
+                ("EU_FENCE_ENABLED", None),
+                ("REGION_MODES", None),
+            ]);
+            std::env::set_var(name, bad);
+            let result = Config::from_env();
+            match previous {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+            let error = result.expect_err("non-UTF-8 refusal-audit env must fail closed");
+            assert!(
+                error.to_string().contains("must be valid UTF-8"),
+                "{name}: {error}"
             );
         }
     }

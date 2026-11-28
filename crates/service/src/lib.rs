@@ -93,7 +93,7 @@ use crate::refusal_audit::RefusalAuditRuntime;
 
 /// The sealing keys a payment confirmation pins order terms under: the
 /// pickup snapshot and the digital delivery pin.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Clone, Copy, Default)]
 pub struct ConfirmKeys<'a> {
     pub pickup: Option<&'a PickupKeys>,
     pub digital: Option<&'a DigitalKeys>,
@@ -104,6 +104,21 @@ pub struct ConfirmKeys<'a> {
     /// Who releases instant digital lines on the orders this confirmation
     /// pays (`DIGITAL_RELEASE`).
     pub digital_release: config::DigitalRelease,
+    /// Authoritative clock sampled after blocking locks in confirmation and
+    /// payment-start fences.
+    pub clock: Option<&'a dyn Clock>,
+}
+
+impl std::fmt::Debug for ConfirmKeys<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConfirmKeys")
+            .field("pickup", &self.pickup.is_some())
+            .field("digital", &self.digital.is_some())
+            .field("fence", &self.fence)
+            .field("digital_release", &self.digital_release)
+            .field("clock", &self.clock.is_some())
+            .finish()
+    }
 }
 
 #[derive(Clone)]
@@ -140,6 +155,10 @@ pub struct AppState {
     /// Single flight for commands that read the homeserver before their
     /// executor transaction (`listing.register` with a public record).
     pub command_flights: command_flight::CommandFlights,
+    /// Single flight per order for payment-method binds so external FX HTTP
+    /// fetches stay outside PostgreSQL transactions while concurrent binds
+    /// for the same order serialize cleanly.
+    pub bind_flights: command_flight::CommandFlights,
     /// Seller payment-method rails: seller-secret sealing, PayPal IPN
     /// verification and the signed Paykit client. `None` when
     /// `STRIPE_KEY_ENCRYPTION_KEY` (the seller-secret key) is unset: the
@@ -170,8 +189,9 @@ pub struct AppState {
     /// Per-endpoint cache of pinned-stack readiness identities for the
     /// resolve delivery arm (§B.8.8: 15 s TTL, per endpoint).
     pub resolve_pin_cache: resolve_delivery::ResolvePinCache,
-    /// Optional only in in-process legacy tests. Production always installs
-    /// this after constructing its separate lazy writer pool.
+    /// Optional refusal-audit writer runtime. Installed when the deployment
+    /// configures the refusal-audit database logins and HMAC keys; `None`
+    /// otherwise.
     pub refusal_audit: Option<Arc<RefusalAuditRuntime>>,
     /// The retention connection is distinct from both domain and writer
     /// pools; its login is limited to the purge function.
@@ -222,6 +242,7 @@ impl AppState {
             digital: self.digital.as_deref(),
             fence: self.config.region_policy().fence_modes(),
             digital_release: self.config.digital_release,
+            clock: Some(self.clock.as_ref()),
         }
     }
 }
@@ -244,6 +265,7 @@ impl AppState {
             refund_chain: None,
             homeserver: None,
             command_flights: command_flight::CommandFlights::default(),
+            bind_flights: command_flight::CommandFlights::default(),
             payments: None,
             payment_availability: PaymentAvailabilityCache::default(),
             bitcoin_setup_ready: BitcoinSetupReadyCache::default(),
