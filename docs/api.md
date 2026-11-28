@@ -554,12 +554,22 @@ rejections are `403 UNAUTHORIZED` with one of these `error.reason` values:
 `claim_session_source`, `claim_session_capability`, `claim_session_stale` or
 `claim_code_invalid`.
 
-The state check precedes the code check. One transaction takes the shared
-advisory lock, rechecks that the database has no seller rows across the same
+The state check precedes the code check. Session activity and claim eligibility
+are rechecked after reading the request body before verifying the claim code so
+a revoked, expired, or stale parked request cannot probe the code. One
+transaction then takes the shared advisory lock, confirms the store is still
+unclaimed, rechecks that the database has no seller rows across the same
 seller-keyed tables enforced at single-seller boot (including durable Paykit
 readiness markers in `paykit_known_sellers`, seller-targeted `listing_removed`
 and `shop_suspended` rows in `moderation_decisions`, and rows in
-`gateway_refund_inbox`) and inserts the session pubky as the seller. A
+`gateway_refund_inbox`), locks the caller's `auth_sessions` row (`FOR UPDATE`)
+through commit while revalidating session activity (`revoked_at IS NULL`,
+`expires_at > now`), grant source, inventory capability, and claim maximum age
+against a fresh clock sample, and then inserts the session pubky as the seller.
+Holding the `auth_sessions` row lock through commit serializes concurrent
+revocation with the claim; any session revocation or expiry observed at either
+recheck rolls back and answers `401` (and any claim-eligibility rejection
+answers `403 UNAUTHORIZED`) without spending a wrong-code failure slot. A
 successful request answers `200`:
 
 ```json

@@ -481,9 +481,105 @@ struct ClaimRequest {
 #[derive(Debug, sqlx::FromRow)]
 struct ClaimSessionFacts {
     session_id: Uuid,
+    pubky: String,
+    capabilities: String,
     created_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+    revoked_at: Option<DateTime<Utc>>,
     source_grant_id: Option<String>,
     source_client_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimSessionRejection {
+    InvalidSession(&'static str),
+    Ineligible(&'static str),
+}
+
+async fn fetch_claim_session_facts<'e, E>(
+    executor: E,
+    token_hash: &[u8],
+    for_update: bool,
+) -> Result<Option<ClaimSessionFacts>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    let query = if for_update {
+        "SELECT session_id, pubky, capabilities, created_at, expires_at, revoked_at, \
+                source_grant_id, source_client_id \
+         FROM auth_sessions WHERE token_hash = $1 FOR UPDATE"
+    } else {
+        "SELECT session_id, pubky, capabilities, created_at, expires_at, revoked_at, \
+                source_grant_id, source_client_id \
+         FROM auth_sessions WHERE token_hash = $1"
+    };
+    sqlx::query_as::<_, ClaimSessionFacts>(query)
+        .bind(token_hash)
+        .fetch_optional(executor)
+        .await
+}
+
+fn validate_claim_session(
+    facts: Option<ClaimSessionFacts>,
+    expected_pubky: &str,
+    now: DateTime<Utc>,
+    max_age_seconds: i64,
+    grant_session: Option<&crate::grant_session::GrantSessionConfig>,
+) -> Result<ClaimSessionFacts, ClaimSessionRejection> {
+    let Some(facts) = facts else {
+        return Err(ClaimSessionRejection::InvalidSession(
+            "claim_session_invalid",
+        ));
+    };
+    if facts.pubky != expected_pubky {
+        return Err(ClaimSessionRejection::InvalidSession(
+            "claim_session_invalid",
+        ));
+    }
+    if facts.revoked_at.is_some() {
+        return Err(ClaimSessionRejection::InvalidSession(
+            "claim_session_revoked",
+        ));
+    }
+    if facts.expires_at <= now {
+        return Err(ClaimSessionRejection::InvalidSession(
+            "claim_session_expired",
+        ));
+    }
+    let (Some(grant_id), Some(client_id)) = (
+        facts.source_grant_id.as_deref(),
+        facts.source_client_id.as_deref(),
+    ) else {
+        return Err(ClaimSessionRejection::Ineligible("claim_session_source"));
+    };
+    if grant_id.trim().is_empty() || client_id.trim().is_empty() {
+        return Err(ClaimSessionRejection::Ineligible("claim_session_source"));
+    }
+    if let Some(grant) = grant_session {
+        if !grant.client_ids.iter().any(|allowed| allowed == client_id) {
+            return Err(ClaimSessionRejection::Ineligible("claim_session_source"));
+        }
+    }
+    if !capability_covers_inventory_service(&facts.capabilities) {
+        return Err(ClaimSessionRejection::Ineligible(
+            "claim_session_capability",
+        ));
+    }
+    let age = now.signed_duration_since(facts.created_at);
+    if age < chrono::Duration::zero() || age > chrono::Duration::seconds(max_age_seconds) {
+        return Err(ClaimSessionRejection::Ineligible("claim_session_stale"));
+    }
+    Ok(facts)
+}
+
+fn reject_claim_session(rejection: ClaimSessionRejection, client: [u8; 16]) -> Response {
+    match rejection {
+        ClaimSessionRejection::InvalidSession(reason) => {
+            reject_log(reason, client);
+            crate::auth::invalid_session_response()
+        }
+        ClaimSessionRejection::Ineligible(reason) => session_rejection(reason, client),
+    }
 }
 
 fn internal(error: sqlx::Error) -> Response {
@@ -590,27 +686,18 @@ pub async fn claim_store(State(state): State<AppState>, request: Request) -> Res
         return already_claimed(&seller, client);
     }
 
-    let facts = match sqlx::query_as::<_, ClaimSessionFacts>(
-        "SELECT session_id, created_at, source_grant_id, source_client_id \
-         FROM auth_sessions WHERE token_hash = $1",
-    )
-    .bind(&session.token_hash)
-    .fetch_optional(&state.pool)
-    .await
-    {
-        Ok(Some(facts)) => facts,
-        Ok(None) => return session_rejection("claim_session_source", client),
+    let pre_facts = match fetch_claim_session_facts(&state.pool, &session.token_hash, false).await {
+        Ok(facts) => facts,
         Err(error) => return internal(error),
     };
-    if facts.source_grant_id.is_none() || facts.source_client_id.is_none() {
-        return session_rejection("claim_session_source", client);
-    }
-    if !capability_covers_inventory_service(&session.capabilities) {
-        return session_rejection("claim_session_capability", client);
-    }
-    let age = (state.clock.now() - facts.created_at).num_seconds();
-    if age < 0 || age > state.config.store_claim_session_max_age_seconds {
-        return session_rejection("claim_session_stale", client);
+    if let Err(rejection) = validate_claim_session(
+        pre_facts,
+        &session.actor.0,
+        state.clock.now(),
+        state.config.store_claim_session_max_age_seconds,
+        state.grant_session.as_deref(),
+    ) {
+        return reject_claim_session(rejection, client);
     }
 
     let body = match tokio::time::timeout(
@@ -629,6 +716,20 @@ pub async fn claim_store(State(state): State<AppState>, request: Request) -> Res
         }
         Err(_) => return timeout_response("Timed out reading the claim request body."),
     };
+    let post_body_facts =
+        match fetch_claim_session_facts(&state.pool, &session.token_hash, false).await {
+            Ok(facts) => facts,
+            Err(error) => return internal(error),
+        };
+    if let Err(rejection) = validate_claim_session(
+        post_body_facts,
+        &session.actor.0,
+        state.clock.now(),
+        state.config.store_claim_session_max_age_seconds,
+        state.grant_session.as_deref(),
+    ) {
+        return reject_claim_session(rejection, client);
+    }
     let claim: ClaimRequest = match serde_json::from_slice(&body) {
         Ok(claim) => claim,
         Err(_) => {
@@ -657,11 +758,25 @@ pub async fn claim_store(State(state): State<AppState>, request: Request) -> Res
         Err(error) => return internal(error),
     };
     if let Err(error) = take_binding_lock(&mut tx).await {
+        let _ = tx.rollback().await;
         return internal(error);
+    }
+    match read_binding_on(&mut tx).await {
+        Ok(Some(binding)) => {
+            let _ = tx.rollback().await;
+            state.store.mark_claimed(binding.seller_pubky.clone());
+            return already_claimed(&binding.seller_pubky, client);
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let _ = tx.rollback().await;
+            return internal(error);
+        }
     }
     match other_seller_rows_on(&mut tx, None).await {
         Ok(rows) if rows.is_empty() => {}
         Ok(_) => {
+            let _ = tx.rollback().await;
             reject_log("database_not_empty", client);
             return (
                 StatusCode::CONFLICT,
@@ -669,29 +784,66 @@ pub async fn claim_store(State(state): State<AppState>, request: Request) -> Res
             )
                 .into_response();
         }
-        Err(error) => return internal(error),
+        Err(error) => {
+            let _ = tx.rollback().await;
+            return internal(error);
+        }
     }
+    // Lock ordering: STORE_BINDING_LOCK_KEY is always acquired before any
+    // auth_sessions row lock. Holding FOR UPDATE on this exact session row
+    // through commit linearizes concurrent revocation against the binding.
+    let locked_facts = match fetch_claim_session_facts(&mut *tx, &session.token_hash, true).await {
+        Ok(facts) => facts,
+        Err(error) => {
+            let _ = tx.rollback().await;
+            return internal(error);
+        }
+    };
+    let locked_facts = match validate_claim_session(
+        locked_facts,
+        &session.actor.0,
+        state.clock.now(),
+        state.config.store_claim_session_max_age_seconds,
+        state.grant_session.as_deref(),
+    ) {
+        Ok(facts) => facts,
+        Err(rejection) => {
+            let _ = tx.rollback().await;
+            return reject_claim_session(rejection, client);
+        }
+    };
     let inserted: Option<(String, DateTime<Utc>)> = match sqlx::query_as(
         "INSERT INTO store_seller_binding \
          (singleton, seller_pubky, bound_by, claimed_at, claim_session_id, service_commit) \
          VALUES (TRUE, $1, 'claim', now(), $2, $3) \
          ON CONFLICT (singleton) DO NOTHING RETURNING seller_pubky, claimed_at",
     )
-    .bind(&session.actor.0)
-    .bind(facts.session_id)
+    .bind(&locked_facts.pubky)
+    .bind(locked_facts.session_id)
     .bind(crate::http::build_commit())
     .fetch_optional(&mut *tx)
     .await
     {
         Ok(inserted) => inserted,
-        Err(error) => return internal(error),
+        Err(error) => {
+            let _ = tx.rollback().await;
+            return internal(error);
+        }
     };
     let Some((seller, claimed_at)) = inserted else {
         let binding = match read_binding_on(&mut tx).await {
             Ok(Some(binding)) => binding.seller_pubky,
-            Ok(None) => return internal(sqlx::Error::RowNotFound),
-            Err(error) => return internal(error),
+            Ok(None) => {
+                let _ = tx.rollback().await;
+                return internal(sqlx::Error::RowNotFound);
+            }
+            Err(error) => {
+                let _ = tx.rollback().await;
+                return internal(error);
+            }
         };
+        let _ = tx.rollback().await;
+        state.store.mark_claimed(binding.clone());
         return already_claimed(&binding, client);
     };
     if let Err(error) = tx.commit().await {
@@ -1140,5 +1292,115 @@ mod tests {
         let (code, display) = ClaimCode::ephemeral();
         assert_eq!(display.len(), 39);
         assert!(code.matches(&display));
+    }
+
+    #[test]
+    fn validate_claim_session_enforces_exact_boundaries() {
+        let t0 = DateTime::parse_from_rfc3339("2026-01-01T12:00:00Z")
+            .expect("test time")
+            .with_timezone(&Utc);
+        let pubky = marketplace_domain::pubky::encode_pubky(&[7; 32]);
+        let other_pubky = marketplace_domain::pubky::encode_pubky(&[8; 32]);
+        let grant_config = crate::grant_session::GrantSessionConfig::new(
+            "https://svc.test",
+            "shop.pubky.app",
+            120,
+        )
+        .expect("grant config");
+        let base_facts = || ClaimSessionFacts {
+            session_id: Uuid::new_v4(),
+            pubky: pubky.clone(),
+            capabilities: "/pub/pubky.app/marketplace-service/v1/:rw".to_string(),
+            created_at: t0,
+            expires_at: t0 + chrono::Duration::seconds(60),
+            revoked_at: None,
+            source_grant_id: Some("grant-1".to_string()),
+            source_client_id: Some("shop.pubky.app".to_string()),
+        };
+
+        // Missing row, wrong actor, revoked, and exact/past expiry map to 401.
+        assert_eq!(
+            validate_claim_session(None, &pubky, t0, 1, Some(&grant_config)).unwrap_err(),
+            ClaimSessionRejection::InvalidSession("claim_session_invalid")
+        );
+        let mut wrong_actor = base_facts();
+        wrong_actor.pubky = other_pubky;
+        assert_eq!(
+            validate_claim_session(Some(wrong_actor), &pubky, t0, 1, Some(&grant_config))
+                .unwrap_err(),
+            ClaimSessionRejection::InvalidSession("claim_session_invalid")
+        );
+        let mut revoked = base_facts();
+        revoked.revoked_at = Some(t0);
+        assert_eq!(
+            validate_claim_session(Some(revoked), &pubky, t0, 1, Some(&grant_config)).unwrap_err(),
+            ClaimSessionRejection::InvalidSession("claim_session_revoked")
+        );
+        assert_eq!(
+            validate_claim_session(
+                Some(base_facts()),
+                &pubky,
+                t0 + chrono::Duration::seconds(60),
+                900,
+                Some(&grant_config),
+            )
+            .unwrap_err(),
+            ClaimSessionRejection::InvalidSession("claim_session_expired")
+        );
+
+        // Grant source (missing, empty, unlisted client) and capability checks.
+        let mut empty_grant = base_facts();
+        empty_grant.source_grant_id = Some(String::new());
+        assert_eq!(
+            validate_claim_session(Some(empty_grant), &pubky, t0, 1, Some(&grant_config))
+                .unwrap_err(),
+            ClaimSessionRejection::Ineligible("claim_session_source")
+        );
+        let mut unlisted_client = base_facts();
+        unlisted_client.source_client_id = Some("other.pubky.app".to_string());
+        assert_eq!(
+            validate_claim_session(Some(unlisted_client), &pubky, t0, 1, Some(&grant_config))
+                .unwrap_err(),
+            ClaimSessionRejection::Ineligible("claim_session_source")
+        );
+        let mut read_only = base_facts();
+        read_only.capabilities = "/pub/pubky.app/marketplace-service/v1/:r".to_string();
+        assert_eq!(
+            validate_claim_session(Some(read_only), &pubky, t0, 1, Some(&grant_config))
+                .unwrap_err(),
+            ClaimSessionRejection::Ineligible("claim_session_capability")
+        );
+
+        // Sub-second-safe freshness boundaries for max_age = 1 second.
+        assert!(validate_claim_session(
+            Some(base_facts()),
+            &pubky,
+            t0 + chrono::Duration::seconds(1),
+            1,
+            Some(&grant_config),
+        )
+        .is_ok());
+        assert_eq!(
+            validate_claim_session(
+                Some(base_facts()),
+                &pubky,
+                t0 + chrono::Duration::milliseconds(1_001),
+                1,
+                Some(&grant_config),
+            )
+            .unwrap_err(),
+            ClaimSessionRejection::Ineligible("claim_session_stale")
+        );
+        assert_eq!(
+            validate_claim_session(
+                Some(base_facts()),
+                &pubky,
+                t0 - chrono::Duration::nanoseconds(1),
+                1,
+                Some(&grant_config),
+            )
+            .unwrap_err(),
+            ClaimSessionRejection::Ineligible("claim_session_stale")
+        );
     }
 }

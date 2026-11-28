@@ -26,7 +26,7 @@ use marketplace_service::store_claim::{ClaimCode, StoreLimiters, CLAIM_CODE_SHAP
 use marketplace_service::store_seller::{
     other_seller_rows, require_claim_grant_sessions, resolve_store, resolve_worker_store,
     route_scope, store_mode_from_lookup, take_binding_lock, Active, RouteScope, StoreBinding,
-    StoreMode, ROUTES,
+    StoreMode, ROUTES, STORE_BINDING_LOCK_KEY,
 };
 use marketplace_service::AppState;
 use serde_json::{json, Value};
@@ -2457,4 +2457,853 @@ async fn stalled_and_cancelled_claim_bodies_time_out_and_release_in_flight_slots
 
         server.abort();
     }
+}
+
+fn token_hash_for_bearer(bearer: &str) -> Vec<u8> {
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(bearer)
+        .expect("valid base64url bearer");
+    marketplace_service::auth::hash_token(&raw)
+}
+
+async fn mark_session_as_grant(
+    pool: &PgPool,
+    bearer: &str,
+    created_at: chrono::DateTime<chrono::Utc>,
+    expires_at: chrono::DateTime<chrono::Utc>,
+    client_id: &str,
+) -> Uuid {
+    sqlx::query_scalar(
+        "UPDATE auth_sessions \
+         SET source_grant_id = 'grant-fixture', \
+             source_client_id = $2, \
+             created_at = $3, \
+             expires_at = $4 \
+         WHERE token_hash = $1 \
+         RETURNING session_id",
+    )
+    .bind(token_hash_for_bearer(bearer))
+    .bind(client_id)
+    .bind(created_at)
+    .bind(expires_at)
+    .fetch_one(pool)
+    .await
+    .expect("grant-session fixture row")
+}
+
+async fn wait_for_advisory_lock_waiter(pool: &PgPool, key: i64) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "timed out waiting for advisory lock waiter on key {key}"
+        );
+        let waiting: bool = tokio::time::timeout(
+            remaining,
+            sqlx::query_scalar(
+                "SELECT EXISTS ( \
+                     SELECT 1 FROM pg_locks \
+                     WHERE database = (SELECT oid FROM pg_database WHERE datname = current_database()) \
+                       AND locktype = 'advisory' \
+                       AND objsubid = 1 \
+                       AND classid = (($1::bigint >> 32) & x'ffffffff'::bigint)::oid \
+                       AND objid = ($1::bigint & x'ffffffff'::bigint)::oid \
+                       AND NOT granted \
+                 )",
+            )
+            .bind(key)
+            .fetch_one(pool),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for advisory lock waiter on key {key}"))
+        .expect("pg_locks query");
+        if waiting {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_for_revoke_lock_waiter(pool: &PgPool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "timed out waiting for revoke_session to block on auth_sessions row lock"
+        );
+        let waiting: bool = tokio::time::timeout(
+            remaining,
+            sqlx::query_scalar(
+                "SELECT EXISTS ( \
+                     SELECT 1 FROM pg_stat_activity \
+                     WHERE datname = current_database() \
+                       AND wait_event_type = 'Lock' \
+                       AND query LIKE 'UPDATE auth_sessions SET revoked_at%' \
+                 )",
+            )
+            .fetch_one(pool),
+        )
+        .await
+        .expect("timed out waiting for revoke_session to block on auth_sessions row lock")
+        .expect("pg_stat_activity query");
+        if waiting {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn spawn_claim_from(
+    router: axum::Router,
+    token: &str,
+    client_ip: &'static str,
+    raw_body: &str,
+) -> tokio::task::JoinHandle<(StatusCode, HeaderMap, Value)> {
+    let token = token.to_string();
+    let raw_body = raw_body.to_string();
+    tokio::spawn(async move { send_claim_from(router, &token, client_ip, &raw_body).await })
+}
+
+async fn assert_full_ten_failure_budget_intact(
+    app: &TestApp,
+    actor: &TestActor,
+    client_ip: &str,
+    client_id: &str,
+) {
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    let fresh_token = common::authenticate(app, &actor.keypair).await;
+    let now = app.clock.now();
+    mark_session_as_grant(
+        &app.pool,
+        &fresh_token,
+        now,
+        now + chrono::Duration::seconds(3_600),
+        client_id,
+    )
+    .await;
+    let wrong_body = serde_json::to_string(&json!({ "claim_code": WRONG_CODE })).unwrap();
+    for attempt in 0..10 {
+        let (status, _, body) =
+            send_claim_from(app.router.clone(), &fresh_token, client_ip, &wrong_body).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "attempt {attempt} should still have failure budget: {body}"
+        );
+        assert_eq!(body["error"]["reason"], json!("claim_code_invalid"));
+    }
+    let (status, headers, _) =
+        send_claim_from(app.router.clone(), &fresh_token, client_ip, &wrong_body).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(headers.contains_key(header::RETRY_AFTER));
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn parked_claim_crossing_max_age_on_binding_lock_rejects_without_consuming_failure_slot(
+    pool: PgPool,
+) {
+    let mut config = claim_config(CODE);
+    config.store_claim_session_max_age_seconds = 1;
+    let base = test_app_with_config(pool.clone(), config).await;
+    let state = base
+        .state
+        .clone()
+        .with_store_limiters(Arc::new(StoreLimiters::new(Some(HeaderName::from_static(
+            "x-test-client",
+        )))));
+    let app = app_with_state(&base, state);
+    let actor = new_actor(&app).await;
+    let t0 = app.clock.now();
+    mark_session_as_grant(
+        &pool,
+        &actor.token,
+        t0,
+        t0 + chrono::Duration::seconds(3_600),
+        "client-fixture",
+    )
+    .await;
+
+    let valid_body = serde_json::to_string(&json!({ "claim_code": CODE })).unwrap();
+    let client_ip = "203.0.113.51";
+
+    let mut lock_tx = pool.begin().await.expect("lock tx");
+    take_binding_lock(&mut lock_tx)
+        .await
+        .expect("hold binding lock");
+
+    let claim_task = spawn_claim_from(app.router.clone(), &actor.token, client_ip, &valid_body);
+    wait_for_advisory_lock_waiter(&pool, STORE_BINDING_LOCK_KEY).await;
+
+    // Cross STORE_CLAIM_SESSION_MAX_AGE_SECONDS=1 by 500 ms (proving both
+    // post-lock revalidation and sub-second precision, not integer truncation).
+    app.clock.set(t0 + chrono::Duration::milliseconds(1_500));
+    lock_tx.commit().await.expect("release binding lock");
+
+    let (status, _, body) = tokio::time::timeout(Duration::from_secs(5), claim_task)
+        .await
+        .expect("claim finishes")
+        .expect("claim task");
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["code"], json!("UNAUTHORIZED"));
+    assert_eq!(body["error"]["reason"], json!("claim_session_stale"));
+
+    assert!(marketplace_service::store_seller::read_binding(&pool)
+        .await
+        .expect("binding check")
+        .is_none());
+    let (store_status, _, store_body) = get_store_from(app.router.clone(), client_ip).await;
+    assert_eq!(store_status, StatusCode::OK, "{store_body}");
+    assert_eq!(store_body["state"], json!("unclaimed"));
+    assert_eq!(app.state.store_limiters.claim_in_flight_total(), 0);
+
+    // Pre-body check also uses sub-second precision (1.5 s > 1 s).
+    let (status, _, body) =
+        send_claim_from(app.router.clone(), &actor.token, client_ip, &valid_body).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["reason"], json!("claim_session_stale"));
+
+    assert_full_ten_failure_budget_intact(&app, &actor, client_ip, "client-fixture").await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn parked_claim_crossing_session_expiry_on_binding_lock_rejects_with_401(pool: PgPool) {
+    let base = unclaimed(pool.clone()).await;
+    let state = base
+        .state
+        .clone()
+        .with_store_limiters(Arc::new(StoreLimiters::new(Some(HeaderName::from_static(
+            "x-test-client",
+        )))));
+    let app = app_with_state(&base, state);
+    let actor = new_actor(&app).await;
+    let t0 = app.clock.now();
+    // Expires in 10 s while STORE_CLAIM_SESSION_MAX_AGE_SECONDS is 900 s, so
+    // advancing to t0 + 10 s crosses only auth_sessions.expires_at.
+    mark_session_as_grant(
+        &pool,
+        &actor.token,
+        t0,
+        t0 + chrono::Duration::seconds(10),
+        "client-fixture",
+    )
+    .await;
+
+    let valid_body = serde_json::to_string(&json!({ "claim_code": CODE })).unwrap();
+    let client_ip = "203.0.113.52";
+
+    let mut lock_tx = pool.begin().await.expect("lock tx");
+    take_binding_lock(&mut lock_tx)
+        .await
+        .expect("hold binding lock");
+
+    let claim_task = spawn_claim_from(app.router.clone(), &actor.token, client_ip, &valid_body);
+    wait_for_advisory_lock_waiter(&pool, STORE_BINDING_LOCK_KEY).await;
+
+    app.clock.set(t0 + chrono::Duration::seconds(10));
+    lock_tx.commit().await.expect("release binding lock");
+
+    let (status, _, body) = tokio::time::timeout(Duration::from_secs(5), claim_task)
+        .await
+        .expect("claim finishes")
+        .expect("claim task");
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(
+        body["error"]["message"],
+        json!("The session is invalid or expired.")
+    );
+
+    assert!(marketplace_service::store_seller::read_binding(&pool)
+        .await
+        .expect("binding check")
+        .is_none());
+    let (store_status, _, store_body) = get_store_from(app.router.clone(), client_ip).await;
+    assert_eq!(store_status, StatusCode::OK, "{store_body}");
+    assert_eq!(store_body["state"], json!("unclaimed"));
+    assert_eq!(app.state.store_limiters.claim_in_flight_total(), 0);
+
+    assert_full_ten_failure_budget_intact(&app, &actor, client_ip, "client-fixture").await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn concurrent_session_revocation_while_claim_waits_rejects_with_401(pool: PgPool) {
+    let base = unclaimed(pool.clone()).await;
+    let state = base
+        .state
+        .clone()
+        .with_store_limiters(Arc::new(StoreLimiters::new(Some(HeaderName::from_static(
+            "x-test-client",
+        )))));
+    let app = app_with_state(&base, state);
+    let actor = new_actor(&app).await;
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    let admin_token = common::authenticate(&app, &actor.keypair).await;
+
+    let t0 = app.clock.now();
+    let claimant_session_id = mark_session_as_grant(
+        &pool,
+        &actor.token,
+        t0,
+        t0 + chrono::Duration::seconds(3_600),
+        "client-fixture",
+    )
+    .await;
+    sqlx::query("UPDATE auth_sessions SET created_at = $2, expires_at = $3 WHERE token_hash = $1")
+        .bind(token_hash_for_bearer(&admin_token))
+        .bind(t0)
+        .bind(t0 + chrono::Duration::seconds(3_600))
+        .execute(&pool)
+        .await
+        .expect("align admin session window");
+
+    let valid_body = serde_json::to_string(&json!({ "claim_code": CODE })).unwrap();
+    let client_ip = "203.0.113.53";
+
+    let mut lock_tx = pool.begin().await.expect("lock tx");
+    take_binding_lock(&mut lock_tx)
+        .await
+        .expect("hold binding lock");
+
+    let claim_task = spawn_claim_from(app.router.clone(), &actor.token, client_ip, &valid_body);
+    wait_for_advisory_lock_waiter(&pool, STORE_BINDING_LOCK_KEY).await;
+
+    // Another session for the same actor revokes the claimant session and
+    // receives 204 while the valid-code claim waits on the binding lock.
+    let (revoke_status, revoke_body) = tokio::time::timeout(
+        Duration::from_secs(5),
+        send(
+            app.router.clone(),
+            "DELETE",
+            &format!("/v1/auth/sessions/{claimant_session_id}"),
+            Some(&admin_token),
+            &Value::Null,
+        ),
+    )
+    .await
+    .expect("revoke finishes without blocking on binding lock");
+    assert_eq!(revoke_status, StatusCode::NO_CONTENT, "{revoke_body}");
+
+    lock_tx.commit().await.expect("release binding lock");
+
+    let (status, _, body) = tokio::time::timeout(Duration::from_secs(5), claim_task)
+        .await
+        .expect("claim finishes")
+        .expect("claim task");
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+    assert_eq!(
+        body["error"]["message"],
+        json!("The session is invalid or expired.")
+    );
+
+    assert!(marketplace_service::store_seller::read_binding(&pool)
+        .await
+        .expect("binding check")
+        .is_none());
+    let (store_status, _, store_body) = get_store_from(app.router.clone(), client_ip).await;
+    assert_eq!(store_status, StatusCode::OK, "{store_body}");
+    assert_eq!(store_body["state"], json!("unclaimed"));
+    assert_eq!(app.state.store_limiters.claim_in_flight_total(), 0);
+
+    assert_full_ten_failure_budget_intact(&app, &actor, client_ip, "client-fixture").await;
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn claim_row_lock_on_auth_sessions_serializes_concurrent_revocation_through_commit(
+    pool: PgPool,
+) {
+    const TEST_PAUSE_LOCK_KEY: i64 = 4_713_371_337_999;
+
+    let app = unclaimed(pool.clone()).await;
+    let actor = new_actor(&app).await;
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    let admin_token = common::authenticate(&app, &actor.keypair).await;
+
+    let t0 = app.clock.now();
+    let claimant_session_id = mark_session_as_grant(
+        &pool,
+        &actor.token,
+        t0,
+        t0 + chrono::Duration::seconds(3_600),
+        "client-fixture",
+    )
+    .await;
+    sqlx::query("UPDATE auth_sessions SET created_at = $2, expires_at = $3 WHERE token_hash = $1")
+        .bind(token_hash_for_bearer(&admin_token))
+        .bind(t0)
+        .bind(t0 + chrono::Duration::seconds(3_600))
+        .execute(&pool)
+        .await
+        .expect("align admin session window");
+
+    // Pause the claim transaction inside INSERT INTO store_seller_binding
+    // (after auth_sessions FOR UPDATE and before COMMIT) using a test-only
+    // trigger on the isolated test database.
+    sqlx::query(&format!(
+        "CREATE FUNCTION test_pause_store_binding_insert() RETURNS trigger AS $$ \
+         BEGIN \
+             PERFORM pg_advisory_xact_lock({TEST_PAUSE_LOCK_KEY}); \
+             RETURN NEW; \
+         END; \
+         $$ LANGUAGE plpgsql;"
+    ))
+    .execute(&pool)
+    .await
+    .expect("create pause function");
+    sqlx::query(
+        "CREATE TRIGGER test_pause_store_binding_insert_trg \
+         BEFORE INSERT ON store_seller_binding \
+         FOR EACH ROW EXECUTE FUNCTION test_pause_store_binding_insert();",
+    )
+    .execute(&pool)
+    .await
+    .expect("create pause trigger");
+
+    let mut pause_tx = pool.begin().await.expect("pause tx");
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(TEST_PAUSE_LOCK_KEY)
+        .execute(&mut *pause_tx)
+        .await
+        .expect("hold pause lock");
+
+    let claim_task = tokio::spawn({
+        let router = app.router.clone();
+        let token = actor.token.clone();
+        async move {
+            send(
+                router,
+                "POST",
+                "/v1/store/claim",
+                Some(&token),
+                &json!({ "claim_code": CODE }),
+            )
+            .await
+        }
+    });
+    wait_for_advisory_lock_waiter(&pool, TEST_PAUSE_LOCK_KEY).await;
+
+    // While claim_store holds auth_sessions FOR UPDATE before committing the
+    // binding, concurrent revocation must block rather than returning 204
+    // ahead of the claim commit.
+    let mut revoke_task = tokio::spawn({
+        let router = app.router.clone();
+        let token = admin_token.clone();
+        let uri = format!("/v1/auth/sessions/{claimant_session_id}");
+        async move { send(router, "DELETE", &uri, Some(&token), &Value::Null).await }
+    });
+    wait_for_revoke_lock_waiter(&pool).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(120), &mut revoke_task)
+            .await
+            .is_err(),
+        "DELETE /v1/auth/sessions/{{id}} must block until claim_store releases auth_sessions FOR UPDATE on commit"
+    );
+
+    pause_tx.commit().await.expect("release pause lock");
+
+    let (claim_status, claim_body) = tokio::time::timeout(Duration::from_secs(5), claim_task)
+        .await
+        .expect("claim finishes")
+        .expect("claim task");
+    assert_eq!(claim_status, StatusCode::OK, "{claim_body}");
+    assert_eq!(claim_body["store"]["seller"], json!(actor.pubky));
+
+    let (revoke_status, revoke_body) = tokio::time::timeout(Duration::from_secs(5), revoke_task)
+        .await
+        .expect("revoke finishes after claim commit")
+        .expect("revoke task");
+    assert_eq!(revoke_status, StatusCode::NO_CONTENT, "{revoke_body}");
+
+    let binding = marketplace_service::store_seller::read_binding(&pool)
+        .await
+        .expect("binding check")
+        .expect("store is claimed");
+    assert_eq!(binding.seller_pubky, actor.pubky);
+    assert_eq!(binding.claim_session_id, Some(claimant_session_id));
+
+    let revoked_at: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT revoked_at FROM auth_sessions WHERE session_id = $1")
+            .bind(claimant_session_id)
+            .fetch_one(&pool)
+            .await
+            .expect("revoked_at check");
+    assert!(
+        revoked_at.is_some(),
+        "session is revoked after claim commit"
+    );
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn parked_claim_revalidates_grant_source_and_capability_after_binding_lock(pool: PgPool) {
+    let base = unclaimed(pool.clone()).await;
+    let grant_config = Arc::new(
+        GrantSessionConfig::new("https://svc.test", "shop.pubky.app", 120)
+            .expect("grant session config"),
+    );
+    let state = base
+        .state
+        .clone()
+        .with_grant_session(Some(grant_config))
+        .with_store_limiters(Arc::new(StoreLimiters::new(Some(HeaderName::from_static(
+            "x-test-client",
+        )))));
+    let app = app_with_state(&base, state);
+    let valid_body = serde_json::to_string(&json!({ "claim_code": CODE })).unwrap();
+
+    // 1. Capability narrowed while parked on the binding lock answers 403 claim_session_capability.
+    {
+        let actor = new_actor(&app).await;
+        let t0 = app.clock.now();
+        mark_session_as_grant(
+            &pool,
+            &actor.token,
+            t0,
+            t0 + chrono::Duration::seconds(3_600),
+            "shop.pubky.app",
+        )
+        .await;
+        let client_ip = "203.0.113.54";
+        let mut lock_tx = pool.begin().await.expect("lock tx");
+        take_binding_lock(&mut lock_tx)
+            .await
+            .expect("hold binding lock");
+        let claim_task = spawn_claim_from(app.router.clone(), &actor.token, client_ip, &valid_body);
+        wait_for_advisory_lock_waiter(&pool, STORE_BINDING_LOCK_KEY).await;
+
+        sqlx::query("UPDATE auth_sessions SET capabilities = '' WHERE token_hash = $1")
+            .bind(token_hash_for_bearer(&actor.token))
+            .execute(&pool)
+            .await
+            .expect("narrow capability");
+        lock_tx.commit().await.expect("release binding lock");
+
+        let (status, _, body) = tokio::time::timeout(Duration::from_secs(5), claim_task)
+            .await
+            .expect("claim finishes")
+            .expect("claim task");
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["error"]["reason"], json!("claim_session_capability"));
+        assert!(marketplace_service::store_seller::read_binding(&pool)
+            .await
+            .expect("binding check")
+            .is_none());
+    }
+
+    // 2. Grant source client_id invalidated while parked on the binding lock answers 403 claim_session_source.
+    {
+        let actor = new_actor(&app).await;
+        let t0 = app.clock.now();
+        mark_session_as_grant(
+            &pool,
+            &actor.token,
+            t0,
+            t0 + chrono::Duration::seconds(3_600),
+            "shop.pubky.app",
+        )
+        .await;
+        let client_ip = "203.0.113.55";
+        let mut lock_tx = pool.begin().await.expect("lock tx");
+        take_binding_lock(&mut lock_tx)
+            .await
+            .expect("hold binding lock");
+        let claim_task = spawn_claim_from(app.router.clone(), &actor.token, client_ip, &valid_body);
+        wait_for_advisory_lock_waiter(&pool, STORE_BINDING_LOCK_KEY).await;
+
+        sqlx::query(
+            "UPDATE auth_sessions SET source_client_id = 'other.pubky.app' WHERE token_hash = $1",
+        )
+        .bind(token_hash_for_bearer(&actor.token))
+        .execute(&pool)
+        .await
+        .expect("change source_client_id");
+        lock_tx.commit().await.expect("release binding lock");
+
+        let (status, _, body) = tokio::time::timeout(Duration::from_secs(5), claim_task)
+            .await
+            .expect("claim finishes")
+            .expect("claim task");
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["error"]["reason"], json!("claim_session_source"));
+        assert!(marketplace_service::store_seller::read_binding(&pool)
+            .await
+            .expect("binding check")
+            .is_none());
+        assert_full_ten_failure_budget_intact(&app, &actor, client_ip, "shop.pubky.app").await;
+    }
+}
+
+async fn open_parked_claim_with_prefix(
+    address: std::net::SocketAddr,
+    token: &str,
+    client_ip: &str,
+    total_body_len: usize,
+    prefix: &[u8],
+) -> tokio::net::TcpStream {
+    use tokio::io::AsyncWriteExt;
+
+    let mut stream = open_parked_claim(address, token, client_ip, total_body_len).await;
+    stream
+        .write_all(prefix)
+        .await
+        .expect("write initial body byte");
+    stream.flush().await.expect("flush initial body byte");
+    stream
+}
+
+fn router_notifying_first_body_frame(
+    router: axum::Router,
+    entered: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+) -> axum::Router {
+    router.layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let entered = Arc::clone(&entered);
+            async move {
+                let request = request.map(move |body| {
+                    Body::new(body.map_frame(move |frame| {
+                        if let Some(tx) = entered.lock().expect("body gate lock").take() {
+                            let _ = tx.send(());
+                        }
+                        frame
+                    }))
+                });
+                next.run(request).await
+            }
+        },
+    ))
+}
+
+#[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
+async fn parked_claim_in_body_read_crossing_max_age_or_revocation_rejects(pool: PgPool) {
+    use tokio::io::AsyncWriteExt;
+
+    let mut config = claim_config(CODE);
+    config.store_claim_session_max_age_seconds = 1;
+    let base = test_app_with_config(pool.clone(), config).await;
+    let state = base
+        .state
+        .clone()
+        .with_store_limiters(Arc::new(StoreLimiters::new(Some(HeaderName::from_static(
+            "x-test-client",
+        )))));
+    let app = app_with_state(&base, state);
+
+    let entered_slot: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let observed_router =
+        router_notifying_first_body_frame(app.router.clone(), Arc::clone(&entered_slot));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test listener");
+    let address = listener.local_addr().expect("listener addr");
+    let server = tokio::spawn({
+        let router = observed_router;
+        async move {
+            let _ = axum::serve(listener, router).await;
+        }
+    });
+
+    let valid_body = serde_json::to_string(&json!({ "claim_code": CODE })).unwrap();
+    let wrong_body = serde_json::to_string(&json!({ "claim_code": WRONG_CODE })).unwrap();
+
+    // 1. Session passes pre-body check at t0, parks in to_bytes after the
+    // first body byte is consumed, and crosses STORE_CLAIM_SESSION_MAX_AGE_SECONDS=1
+    // by 500 ms before the rest of the body arrives.
+    {
+        let actor = new_actor(&app).await;
+        let t0 = app.clock.now();
+        mark_session_as_grant(
+            &pool,
+            &actor.token,
+            t0,
+            t0 + chrono::Duration::seconds(3_600),
+            "client-fixture",
+        )
+        .await;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        *entered_slot.lock().expect("body gate lock") = Some(entered_tx);
+        let mut stream = open_parked_claim_with_prefix(
+            address,
+            &actor.token,
+            "203.0.113.56",
+            valid_body.len(),
+            &valid_body.as_bytes()[..1],
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .expect("claim reached body read after pre-body check")
+            .expect("body frame signal");
+        assert_eq!(app.state.store_limiters.claim_in_flight_total(), 1);
+
+        app.clock.set(t0 + chrono::Duration::milliseconds(1_500));
+        stream
+            .write_all(&valid_body.as_bytes()[1..])
+            .await
+            .expect("write remaining valid body");
+        stream.flush().await.expect("flush valid body");
+        let (status, raw) =
+            tokio::time::timeout(Duration::from_secs(5), read_http_response(stream))
+                .await
+                .expect("response arrives");
+        assert_eq!(status, 403, "{raw}");
+        assert!(raw.contains("claim_session_stale"), "{raw}");
+        assert!(marketplace_service::store_seller::read_binding(&pool)
+            .await
+            .expect("binding check")
+            .is_none());
+        wait_until_in_flight(&app, 0).await;
+    }
+
+    // 2. Session passes pre-body check, parks in to_bytes, and another session
+    // for the same actor revokes it (204) before the valid body finishes,
+    // answering 401 without claiming.
+    {
+        let actor = new_actor(&app).await;
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let admin_token = common::authenticate(&app, &actor.keypair).await;
+        let t1 = app.clock.now();
+        let claimant_session_id = mark_session_as_grant(
+            &pool,
+            &actor.token,
+            t1,
+            t1 + chrono::Duration::seconds(3_600),
+            "client-fixture",
+        )
+        .await;
+        sqlx::query(
+            "UPDATE auth_sessions SET created_at = $2, expires_at = $3 WHERE token_hash = $1",
+        )
+        .bind(token_hash_for_bearer(&admin_token))
+        .bind(t1)
+        .bind(t1 + chrono::Duration::seconds(3_600))
+        .execute(&pool)
+        .await
+        .expect("align admin session window");
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        *entered_slot.lock().expect("body gate lock") = Some(entered_tx);
+        let mut stream = open_parked_claim_with_prefix(
+            address,
+            &actor.token,
+            "203.0.113.57",
+            valid_body.len(),
+            &valid_body.as_bytes()[..1],
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .expect("claim reached body read after pre-body check")
+            .expect("body frame signal");
+        assert_eq!(app.state.store_limiters.claim_in_flight_total(), 1);
+
+        let (revoke_status, revoke_body) = tokio::time::timeout(
+            Duration::from_secs(5),
+            send(
+                app.router.clone(),
+                "DELETE",
+                &format!("/v1/auth/sessions/{claimant_session_id}"),
+                Some(&admin_token),
+                &Value::Null,
+            ),
+        )
+        .await
+        .expect("revoke finishes");
+        assert_eq!(revoke_status, StatusCode::NO_CONTENT, "{revoke_body}");
+
+        stream
+            .write_all(&valid_body.as_bytes()[1..])
+            .await
+            .expect("write remaining valid body");
+        stream.flush().await.expect("flush valid body");
+        let (status, raw) =
+            tokio::time::timeout(Duration::from_secs(5), read_http_response(stream))
+                .await
+                .expect("response arrives");
+        assert_eq!(status, 401, "{raw}");
+        assert!(raw.contains("The session is invalid or expired."), "{raw}");
+        assert!(marketplace_service::store_seller::read_binding(&pool)
+            .await
+            .expect("binding check")
+            .is_none());
+        wait_until_in_flight(&app, 0).await;
+    }
+
+    // 3. A revoked parked request sending a wrong claim code also answers 401
+    // before claim-code verification (no post-revocation code oracle and no
+    // wrong-code failure slot consumed).
+    {
+        let actor = new_actor(&app).await;
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let admin_token = common::authenticate(&app, &actor.keypair).await;
+        let t2 = app.clock.now();
+        let claimant_session_id = mark_session_as_grant(
+            &pool,
+            &actor.token,
+            t2,
+            t2 + chrono::Duration::seconds(3_600),
+            "client-fixture",
+        )
+        .await;
+        sqlx::query(
+            "UPDATE auth_sessions SET created_at = $2, expires_at = $3 WHERE token_hash = $1",
+        )
+        .bind(token_hash_for_bearer(&admin_token))
+        .bind(t2)
+        .bind(t2 + chrono::Duration::seconds(3_600))
+        .execute(&pool)
+        .await
+        .expect("align admin session window");
+
+        let client_ip = "203.0.113.58";
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        *entered_slot.lock().expect("body gate lock") = Some(entered_tx);
+        let mut stream = open_parked_claim_with_prefix(
+            address,
+            &actor.token,
+            client_ip,
+            wrong_body.len(),
+            &wrong_body.as_bytes()[..1],
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .expect("claim reached body read after pre-body check")
+            .expect("body frame signal");
+        assert_eq!(app.state.store_limiters.claim_in_flight_total(), 1);
+
+        let (revoke_status, revoke_body) = tokio::time::timeout(
+            Duration::from_secs(5),
+            send(
+                app.router.clone(),
+                "DELETE",
+                &format!("/v1/auth/sessions/{claimant_session_id}"),
+                Some(&admin_token),
+                &Value::Null,
+            ),
+        )
+        .await
+        .expect("revoke finishes");
+        assert_eq!(revoke_status, StatusCode::NO_CONTENT, "{revoke_body}");
+
+        stream
+            .write_all(&wrong_body.as_bytes()[1..])
+            .await
+            .expect("write remaining wrong body");
+        stream.flush().await.expect("flush wrong body");
+        let (status, raw) =
+            tokio::time::timeout(Duration::from_secs(5), read_http_response(stream))
+                .await
+                .expect("response arrives");
+        assert_eq!(status, 401, "{raw}");
+        assert!(raw.contains("The session is invalid or expired."), "{raw}");
+        assert!(marketplace_service::store_seller::read_binding(&pool)
+            .await
+            .expect("binding check")
+            .is_none());
+        wait_until_in_flight(&app, 0).await;
+        assert_full_ten_failure_budget_intact(&app, &actor, client_ip, "client-fixture").await;
+    }
+
+    server.abort();
 }

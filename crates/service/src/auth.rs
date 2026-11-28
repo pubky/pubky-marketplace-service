@@ -250,6 +250,13 @@ fn auth_error(status: StatusCode, message: &str) -> Response {
     (status, Json(json!({ "error": { "message": message } }))).into_response()
 }
 
+pub(crate) fn invalid_session_response() -> Response {
+    auth_error(
+        StatusCode::UNAUTHORIZED,
+        "The session is invalid or expired.",
+    )
+}
+
 fn rate_limited(retry_after: i64) -> Response {
     let mut response = (
         StatusCode::TOO_MANY_REQUESTS,
@@ -441,10 +448,7 @@ pub async fn require_session(
                 reason = "INVALID_OR_EXPIRED_SESSION",
                 "auth.rejected"
             );
-            return auth_error(
-                StatusCode::UNAUTHORIZED,
-                "The session is invalid or expired.",
-            );
+            return invalid_session_response();
         }
         Err(error) => {
             tracing::error!(error = %error, "failed to resolve session");
@@ -495,12 +499,7 @@ async fn resolve_header_session(
             tracing::error!(error = %error, "failed to resolve session");
             auth_error(StatusCode::INTERNAL_SERVER_ERROR, "Session lookup failed.")
         })?
-        .ok_or_else(|| {
-            auth_error(
-                StatusCode::UNAUTHORIZED,
-                "The session is invalid or expired.",
-            )
-        })?;
+        .ok_or_else(invalid_session_response)?;
     record_session_use(&state.pool, &session.token_hash, now).await;
     Ok(session)
 }

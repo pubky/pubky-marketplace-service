@@ -511,9 +511,11 @@ administration remain available. `GET /v1/store` reports `unclaimed` or
 `POST /v1/store/claim` accepts `{ "claim_code": "..." }` with a fresh
 grant-minted bearer that covers the inventory service. Legacy AuthToken and
 grant-flow sessions cannot claim. The transaction takes the same advisory
-lock as boot, proves the database has no seller rows and inserts the one
-permanent binding. Exactly one racing claim succeeds. The live state changes
-without a restart, and other replicas notice within one second.
+lock as boot, proves the database has no seller rows, locks the caller's
+`auth_sessions` row through commit while revalidating session activity, grant
+source, capability and claim maximum age against a fresh clock sample, and
+inserts the one permanent binding. Exactly one racing claim succeeds. The live
+state changes without a restart, and other replicas notice within one second.
 
 An env-pinned boot also writes the binding. A later mismatch or a marketplace
 boot with a binding refuses to start. Every boot reads the binding in a startup
