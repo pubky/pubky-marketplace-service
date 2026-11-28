@@ -4,11 +4,14 @@
 //! The marketplace's own FX wrapper is never mocked; the double speaks the
 //! pinned wire contract from `tests/fixtures/blocktank_fx_rates_btc.json`.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use axum::extract::State;
-use axum::http::StatusCode;
+use axum::extract::{Query, State};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::Router;
+use chrono::{DateTime, Utc};
+use marketplace_service::fx::FxFeedProvider;
 
 #[derive(Clone)]
 struct FakeFxState {
@@ -18,6 +21,8 @@ struct FakeFxState {
 struct FakeFxInner {
     status: u16,
     body: String,
+    pair_bodies: HashMap<String, String>,
+    date_header: Option<DateTime<Utc>>,
     fetches: usize,
     gate: Option<FetchGate>,
 }
@@ -53,7 +58,21 @@ impl HeldFetch {
 /// tests assert against.
 pub struct FakeFxFeed {
     state: FakeFxState,
+    pub origin: String,
     pub base_url: String,
+}
+
+impl FakeFxFeed {
+    /// Loopback URL for `provider` on this fake feed (canonical path only).
+    pub fn url_for(&self, provider: FxFeedProvider) -> String {
+        match provider {
+            FxFeedProvider::Blocktank => format!("{}/api/v2/rates", self.origin),
+            FxFeedProvider::Mempool => format!("{}/api/v1/prices", self.origin),
+            FxFeedProvider::Kraken => format!("{}/0/public/Trades", self.origin),
+            FxFeedProvider::Coinbase => format!("{}/v2/exchange-rates", self.origin),
+            FxFeedProvider::Bitstamp => format!("{}/api/v2/ticker/", self.origin),
+        }
+    }
 }
 
 impl FakeFxFeed {
@@ -62,12 +81,28 @@ impl FakeFxFeed {
         let mut guard = self.state.inner.lock().expect("fake fx lock");
         guard.status = 200;
         guard.body = body;
+        guard.pair_bodies.clear();
+    }
+
+    /// Serves per-pair bodies keyed by the `pair` query parameter (used by
+    /// Kraken `/0/public/Trades?pair=<PAIR>&count=1` tests).
+    #[allow(dead_code)]
+    pub fn set_pair_bodies(&self, pair_bodies: HashMap<String, String>) {
+        let mut guard = self.state.inner.lock().expect("fake fx lock");
+        guard.status = 200;
+        guard.pair_bodies = pair_bodies;
     }
 
     /// Forces a transport-level failure (a 500 the client maps to its
     /// malformed/unavailable class) for every later fetch.
     pub fn set_status(&self, status: u16) {
         self.state.inner.lock().expect("fake fx lock").status = status;
+    }
+
+    /// Sets an explicit HTTP `Date` header on responses (used by timestamp-less
+    /// exchange ticker tests such as Kraken and Coinbase).
+    pub fn set_date_header(&self, date: Option<DateTime<Utc>>) {
+        self.state.inner.lock().expect("fake fx lock").date_header = date;
     }
 
     /// Holds the next fetch only: its body is whatever is set when it
@@ -112,15 +147,22 @@ pub fn fx_body_multi(prices: &[(&str, &str)], last_updated_millis: i64) -> Strin
     format!(r#"{{"tickers":[{tickers}]}}"#)
 }
 
-async fn serve_fx_rates(State(state): State<FakeFxState>) -> (StatusCode, String) {
-    let (response, gate) = {
+async fn serve_fx_rates(
+    State(state): State<FakeFxState>,
+    Query(query): Query<HashMap<String, String>>,
+) -> (StatusCode, HeaderMap, String) {
+    let (status, date_header, body, gate) = {
         let mut guard = state.inner.lock().expect("fake fx lock");
         guard.fetches += 1;
+        let body = query
+            .get("pair")
+            .and_then(|pair| guard.pair_bodies.get(pair))
+            .cloned()
+            .unwrap_or_else(|| guard.body.clone());
         (
-            (
-                StatusCode::from_u16(guard.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-                guard.body.clone(),
-            ),
+            StatusCode::from_u16(guard.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            guard.date_header,
+            body,
             guard.gate.take(),
         )
     };
@@ -128,7 +170,18 @@ async fn serve_fx_rates(State(state): State<FakeFxState>) -> (StatusCode, String
         gate.entered.notify_one();
         gate.release.notified().await;
     }
-    response
+    let mut headers = HeaderMap::new();
+    if let Some(date) = date_header {
+        let formatted = date.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        if let Ok(value) = HeaderValue::from_str(&formatted) {
+            headers.insert(header::DATE, value);
+        }
+    }
+    (status, headers, body)
+}
+
+async fn serve_fx_not_found() -> StatusCode {
+    StatusCode::NOT_FOUND
 }
 
 pub async fn spawn_fake_fx() -> FakeFxFeed {
@@ -136,19 +189,38 @@ pub async fn spawn_fake_fx() -> FakeFxFeed {
         inner: Arc::new(Mutex::new(FakeFxInner {
             status: 200,
             body: String::new(),
+            pair_bodies: HashMap::new(),
+            date_header: None,
             fetches: 0,
             gate: None,
         })),
     };
     let router = Router::new()
-        .route("/api/fx/rates/btc", axum::routing::get(serve_fx_rates))
+        .route("/api/v2/rates", axum::routing::get(serve_fx_rates))
+        .route("/api/v1/prices", axum::routing::get(serve_fx_rates))
+        .route("/api/v2/ticker", axum::routing::get(serve_fx_rates))
+        .route("/api/v2/ticker/", axum::routing::get(serve_fx_rates))
+        .route("/api/v2/ticker/btcusd", axum::routing::get(serve_fx_rates))
+        .route("/api/v2/ticker/btcusd/", axum::routing::get(serve_fx_rates))
+        .route("/api/v2/ticker/btceur", axum::routing::get(serve_fx_rates))
+        .route("/api/v2/ticker/btceur/", axum::routing::get(serve_fx_rates))
+        .route("/api/v2/ticker/btcgbp", axum::routing::get(serve_fx_rates))
+        .route("/api/v2/ticker/btcgbp/", axum::routing::get(serve_fx_rates))
+        .route("/0/public/Trades", axum::routing::get(serve_fx_rates))
+        .route("/v2/exchange-rates", axum::routing::get(serve_fx_rates))
+        .fallback(axum::routing::get(serve_fx_not_found))
         .with_state(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("fake fx binds");
-    let base_url = format!("http://{}/api/fx/rates/btc", listener.local_addr().unwrap());
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let base_url = format!("{origin}/api/v2/rates");
     tokio::spawn(async move {
         axum::serve(listener, router).await.expect("fake fx serves");
     });
-    FakeFxFeed { state, base_url }
+    FakeFxFeed {
+        state,
+        origin,
+        base_url,
+    }
 }

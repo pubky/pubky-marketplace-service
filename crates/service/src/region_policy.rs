@@ -212,6 +212,13 @@ impl RegionModes {
         self.countries.values().any(|mode| *mode == Mode::Nuanced)
     }
 
+    /// Whether any EU-27 member state is nuanced: only then can C4's annual
+    /// limit or private-seller EU re-confirmation run and convert non-EUR
+    /// totals via the persisted EUR FX reference.
+    pub fn has_nuanced_eu_country(&self) -> bool {
+        EU_27.iter().any(|code| self.mode_of(code) == Mode::Nuanced)
+    }
+
     /// Whether digital items are held back for any region.
     pub fn holds_digital(&self) -> bool {
         self.unknown_mode() == Mode::Nuanced
@@ -324,6 +331,20 @@ impl<'a> RegionPolicy<'a> {
     /// The modes C3 and C4 read, when the fence is on.
     pub fn fence_modes(&self) -> Option<&'a RegionModes> {
         self.fence.then_some(self.modes)
+    }
+
+    /// The modes C4's EU annual limit and EU-buyer re-confirmation read:
+    /// `Some` only when the fence is on and at least one EU-27 member state
+    /// resolves to `nuanced`.
+    pub fn eu_limits_modes(&self) -> Option<&'a RegionModes> {
+        self.fence_modes()
+            .filter(|modes| modes.has_nuanced_eu_country())
+    }
+
+    /// Whether C4's EU annual limit or private-seller EU re-confirmation can
+    /// run under this policy (and therefore require EUR FX reference coverage).
+    pub fn eu_limits_active(&self) -> bool {
+        self.eu_limits_modes().is_some()
     }
 
     pub fn fence_active(&self) -> bool {
@@ -666,5 +687,51 @@ mod tests {
         assert!(!none.fence_active());
         assert!(!none.digital_active());
         assert!(none.fence_modes().is_none());
+        assert!(!none.eu_limits_active());
+    }
+
+    #[test]
+    fn eu_limits_active_only_when_an_eu_27_country_is_nuanced() {
+        assert!(!RegionPolicy::legacy(false, false).eu_limits_active());
+        assert!(!RegionPolicy::legacy(false, true).eu_limits_active());
+        assert!(RegionPolicy::legacy(true, false).eu_limits_active());
+        assert!(RegionPolicy::legacy(true, true).eu_limits_active());
+
+        for inactive in [
+            "none",
+            LAUNCH,
+            "EU=blocked,GB=blocked",
+            "EU=blocked,GB=nuanced,US=blocked",
+            "GB=nuanced,US=nuanced,CH=nuanced,UNKNOWN=nuanced",
+            "US=blocked",
+            "UNKNOWN=blocked",
+            "DE=nuanced,DE=open",
+            "EU=nuanced,EU=blocked",
+        ] {
+            let parsed = modes(inactive);
+            let policy = RegionPolicy::explicit(&parsed);
+            assert!(
+                !policy.eu_limits_active(),
+                "{inactive} must not require EU C4 limits"
+            );
+            assert!(policy.eu_limits_modes().is_none(), "{inactive}");
+        }
+
+        for active in [
+            "EU=nuanced",
+            "EU=nuanced,GB=nuanced",
+            "EU=nuanced,GB=nuanced,US=blocked",
+            "EU=blocked,DE=nuanced",
+            "FR=nuanced",
+            "EU=nuanced,DE=open",
+        ] {
+            let parsed = modes(active);
+            let policy = RegionPolicy::explicit(&parsed);
+            assert!(
+                policy.eu_limits_active(),
+                "{active} must mark EU C4 limits active"
+            );
+            assert!(policy.eu_limits_modes().is_some(), "{active}");
+        }
     }
 }

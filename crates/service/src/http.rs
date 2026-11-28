@@ -516,8 +516,15 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
         "homeserver_resolution": state.homeserver.as_ref().and_then(|homeserver| homeserver.resolution()),
         "listing_moderation": if state.listing_moderation.is_some() { "on" } else { "off" },
         "fx_source": {
-            "provider": crate::fx::FX_SOURCE,
-            "pinned": state.config.fx_feed_url == crate::fx::FX_URL,
+            "provider": state.config.fx_feed_provider.as_str(),
+            "pinned": state.config.fx_feed_pinned(),
+            "currencies": state
+                .config
+                .fx_supported_fiat
+                .iter()
+                .copied()
+                .map(marketplace_domain::currency::Currency::code)
+                .collect::<Vec<_>>(),
         },
     });
     // Present only while the USDT flag is on, so the body is byte-identical

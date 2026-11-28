@@ -992,6 +992,7 @@ assume it is free:
 | 0100 | `0100_homeserver_scoped_deletion_cursors.sql` | homeserver-scoped listing deletion cursors and revival markers (`HOMESERVER_RESOLUTION=pkarr`) |
 | 0101 | `0101_single_seller_refusals.sql` | the `seller_not_served` refusal kind and the `seller_route` surface and command kind (single-seller mode), stacked on 0100 |
 | 0102 | `0102_store_seller_binding.sql` | permanent one-row seller binding, release triggers and first-boot claim |
+| 0103 | `0103_fx_remove_static_rate_ceilings.sql` | replace static FX rate bands with finite positive checks, drop the 1.0 BTC fiat-quote cap, and admit built-in single-seller FX feed providers |
 
 This table describes unmerged work and goes stale as pull requests land; trust
 `crates/service/migrations/` on `main` over it. sqlx does not reject two files
@@ -1014,11 +1015,11 @@ table (#92).
 
 `0061_multi_currency_fx.sql` is additive and directly rerunnable. It widens
 `fx_rate_samples` from USD only to the seven fiat currencies (the currency
-check) with one sanity band per currency (`fx_rate_samples_rate_check`,
-repeated from `fx::rate_bounds` and kept equal by a test), and adds the six
-`usd_conversion_*` columns with an all-or-nothing, currency-matching check to
-`orders` and `paykit_superseded_attempts`. Constraints are `NOT VALID` then
-validated. See `docs/multi-currency.md`.
+check) with per-currency rate checks (originally static bands, later replaced
+by finite positive checks and widened FX sources in migration 0103), and adds
+the six `usd_conversion_*` columns with an all-or-nothing, currency-matching
+check to `orders` and `paykit_superseded_attempts`. Constraints are `NOT VALID`
+then validated. See `docs/multi-currency.md`.
 
 It follows 0060 (the single Paykit bind) in number and in the branch it is
 stacked on, and reads or writes nothing 0060 creates. A binary from before
@@ -1102,3 +1103,17 @@ applies it at once.
 scratch database) pins the backfill on a database migrated through 0061 (the last migration
 before 0070 in this tree; 0062 to 0069 are the connectors' and are not here), the
 rerun, each trigger, the old-binary write, and the table's checks.
+
+## Remove static FX rate ceilings and quote caps (0103)
+
+`0103_fx_remove_static_rate_ceilings.sql` is additive and directly rerunnable.
+It replaces the hardcoded per-currency market-price bands on
+`fx_rate_samples_rate_check` (0024 and 0061) with a finite positive rate check
+(`rate > 0 AND rate < 'Infinity'::numeric`), removes the `100000000` satoshi
+ceiling from `orders_fx_quote_check`, and widens the FX source checks on
+`fx_rate_samples`, `orders`, and `paykit_superseded_attempts` to admit the
+built-in single-seller feed providers (`blocktank`, `kraken`, `coinbase`,
+`mempool`, `bitstamp`). The file uses `-- no-transaction` so each short
+`DROP CONSTRAINT` plus `ADD CONSTRAINT ... NOT VALID` commits and releases
+`ACCESS EXCLUSIVE` before `VALIDATE CONSTRAINT` runs in a separate transaction
+under `lock_timeout = '10s'`.

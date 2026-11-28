@@ -23,6 +23,51 @@ struct AwardReservation {
     variant_id: Option<String>,
 }
 
+/// Resolves an accepted `offer.checkout` command's currency locally before any
+/// moderation, lifecycle, or region-fence homeserver reads run, preserving
+/// buyer authorization, aggregate-id, revision, state, and award-window
+/// precedence. The locked check in [`handle`] stays authoritative under
+/// `FOR UPDATE`.
+pub(crate) async fn checkout_currency_refusal(
+    pool: &sqlx::PgPool,
+    clock: &dyn crate::clock::Clock,
+    fx: crate::fx::FxFeedAdmission,
+    actor: &str,
+    command: &Command,
+    payload: &OfferCheckoutPayload,
+) -> Result<Option<CommandFailure>, sqlx::Error> {
+    let offer: Option<OfferRow> =
+        sqlx::query_as(&format!("SELECT {OFFER_COLUMNS} FROM offers WHERE id = $1"))
+            .bind(payload.offer_id)
+            .fetch_optional(pool)
+            .await?;
+    let Some(offer) = offer else {
+        return Ok(None);
+    };
+    let now = clock.now();
+    if command.aggregate_id != ids::offer_aggregate_id(offer.id)
+        || actor != offer.buyer_pubky
+        || offer.state == "converted"
+        || command.expected_revision != offer.revision
+        || offer.expiry_reason.as_deref() == Some("award_window")
+        || offer.state != "accepted"
+        || offer
+            .award_expires_at
+            .is_none_or(|deadline| now >= deadline)
+    {
+        return Ok(None);
+    }
+    let offer_currency = offer
+        .accepted_currency
+        .as_deref()
+        .unwrap_or(&offer.currency);
+    Ok(crate::handlers::fx_currency_refusal(
+        fx,
+        offer_currency,
+        "payload.offer_id",
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn handle(
     tx: &mut Transaction<'_, Postgres>,
@@ -32,6 +77,7 @@ pub async fn handle(
     clock: &dyn Clock,
     hold_window_seconds: i64,
     require_encrypted_delivery: bool,
+    fx: crate::fx::FxFeedAdmission,
     fence: &crate::region_fence::FencePlan,
 ) -> Result<HandlerResult, sqlx::Error> {
     // The EU fence's per-seller counter lock comes before every other lock
@@ -98,6 +144,15 @@ pub async fn handle(
             ErrorCode::InvalidState,
             "Only an accepted offer can enter offer checkout.",
         )));
+    }
+    let offer_currency = offer
+        .accepted_currency
+        .as_deref()
+        .unwrap_or(&offer.currency);
+    if let Some(refusal) =
+        crate::handlers::fx_currency_refusal(fx, offer_currency, "payload.offer_id")
+    {
+        return Ok(Err(refusal));
     }
     if offer.accepted_variant_id.as_deref() != Some(&payload.variant_id) {
         return Ok(Err(CommandFailure::refused(

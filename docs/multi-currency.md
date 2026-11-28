@@ -2,9 +2,9 @@
 
 Listings, offers, bids and orders are priced in USD, EUR, CHF, GBP, JPY, CAD,
 AUD, or in Bitcoin (`BTC` at exponent 8, `SAT` at exponent 0). Every payment
-amount is computed at checkout (bind) from a fresh Blocktank rate. Nothing
-is converted ahead of time, and the price of record (`total_minor`,
-`currency`, `exponent` on the order) never changes.
+amount is computed at checkout (bind) from a fresh rate from the configured FX
+provider. Nothing is converted ahead of time, and the price of record
+(`total_minor`, `currency`, `exponent` on the order) never changes.
 
 ## Currency registry
 
@@ -47,23 +47,51 @@ currency.
 
 ## Rates
 
-One Blocktank response (`https://api1.blocktank.to/api/fx/rates/btc`) carries
-the seven `BTC<CCY>` tickers. Each is guarded independently, so a stale JPY
-ticker never blocks a USD quote:
+In marketplace mode the service reads the pinned Blocktank response
+(`https://api1.blocktank.to/api/fx/rates/btc`), carrying the seven `BTC<CCY>`
+tickers. In single-seller mode (`STORE_MODE=single_seller`, including claim
+mode, or `STORE_SELLER_PUBKY` set), the operator may configure `FX_FEED_URL` (a
+custom Blocktank-format URL or exchange endpoint) and `FX_FEED_PROVIDER`
+(`blocktank`, `kraken`, `coinbase`, `mempool`, or `bitstamp`). With the default
+provider URLs, `blocktank`, `kraken` (`/0/public/Trades` without a `pair`
+filter), `coinbase` (`/v2/exchange-rates?currency=BTC`; `api.coinbase.com`
+refuses an empty query at boot because Coinbase defaults it to USD, while
+custom Coinbase-format hosts may omit the query when they default to BTC), and
+`mempool` quote all seven fiat currencies; `bitstamp`
+(`/api/v2/ticker/`) quotes `USD`, `EUR`, and `GBP` only. A single Kraken
+`?pair=<PAIR>` or Bitstamp `/api/v2/ticker/btc<ccy>/` URL quotes one fiat;
+command admission, background sampling, bind-time quoting, and `GET /health`
+`fx_source.currencies` all use that URL-specific set (not the provider-wide
+default). Commands or Paykit binds outside the resolved set are refused upfront
+with `422 INVALID_COMMAND`, `reason: "currency_unsupported"`, including when
+fresh pre-seeded `fx_rate_samples` rows exist for an unsupported fiat. When
+`EU_FENCE_ENABLED=true` or any EU-27 country resolves to `nuanced` in
+`REGION_MODES`, C4 annual limits and private-seller EU re-confirmation convert
+non-EUR orders and paid history through `eur_cents_reference`, so startup
+requires `EUR` in the feed's supported currencies (blocked-only and open-only
+region modes do not require `EUR`). `BTC` and `SAT` stay supported on every
+provider. Each quoted currency is guarded independently, so a stale JPY trade
+or ticker never blocks a USD quote:
 
-- exactly one ticker per symbol, with `base = BTC` and `quote = <CCY>`;
-- age at most 300 s, at most 60 s in the future;
-- inside the currency's sanity band (`fx::rate_bounds`, units per bitcoin,
-  repeated in the `fx_rate_samples_rate_check` constraint of migration 0061):
-  USD 10,000 to 1,000,000; EUR and CHF 7,000 to 1,000,000; GBP 6,000 to
-  900,000; JPY 1,000,000 to 200,000,000; CAD 10,000 to 1,500,000; AUD 10,000
-  to 1,700,000;
+- unambiguous pair match for `BTC` against `<CCY>`;
+- age at most 300 s, at most 60 s in the future (from the payload timestamp on
+  Blocktank, Mempool and Bitstamp, from the selected trade execution `time` on
+  Kraken `/0/public/Trades`, or from a required single HTTP `Date` header on
+  Coinbase; responses with an `Age` header over 300 s or malformed `Age`/`Date`
+  fail closed);
+- strictly positive, exact decimal precision up to 18 fractional digits
+  (`Decimal::is_valid_rate`, stored without truncation in PostgreSQL `NUMERIC`,
+  with no hardcoded market-price ceilings or floors and fail-closed rejection
+  of excess non-zero digits);
 - within 5% (`MAX_DEVIATION_BPS`, inclusive) of the median of that currency's
   own persisted samples of the last hour, with at least three samples.
 
-The `fx_sampler` task takes one sample per currency per minute from one fetch,
-checks each against its own median, and drops a rejected currency for that
-minute only. A currency with fewer than three samples is refused with
+The `fx_sampler` task takes one snapshot per minute across the fiat currencies
+the resolved feed URL quotes (one HTTP request for Blocktank, Coinbase, Mempool,
+Bitstamp's all-pairs array, or a single-pair Bitstamp ticker; concurrent pair
+requests under the shared 3-second deadline for Kraken when no single `pair` is
+configured), checks each against its own median, and drops a rejected currency
+for that minute only. A currency with fewer than three samples is refused with
 `fx_reference_unavailable` and no feed fetch. After the first deploy of 0061
 the non-USD references fill in about three minutes.
 
@@ -73,10 +101,10 @@ All integer arithmetic. Every conversion rounds up, so the buyer pays the exact
 price or less than one unit of the settlement asset more, never less.
 
 - Fiat to sats (legacy Paykit contract, `amount_sats`):
-  `ceil(total_minor * 10^8 / (10^exponent * BTC<CCY>))`, refused below 1,000
-  sats (`below_minimum_sats`) and above 100,000,000 sats
-  (`fx_rate_out_of_bounds`). `SAT` and `BTC` totals are already sats and never
-  read the feed.
+  `ceil(total_minor * 10^8 / (10^exponent * BTC<CCY>))`, positive satoshis with
+  checked `i64` overflow safety and no artificial minimum-satoshi floor or
+  one-bitcoin cap. `SAT` and `BTC` totals are already sats and never read the
+  feed.
 - Fiat to USD cents (multi-asset Paykit contract, `fx::usd_cents_for`):
   `ceil(total_minor * 100 * BTCUSD / (10^exponent * BTC<CCY>))`. The cross
   rate is the ratio of two tickers of one snapshot, each guarded against its
@@ -90,18 +118,24 @@ price or less than one unit of the settlement asset more, never less.
   price to sats with `BTC<CCY>` and sends `amount_sats`.
 - **Multi-asset (`multi_asset`, the `paykit` bind):** every fiat price is
   requested as `{amount: <USD cents>, asset: "USD"}`. A non-USD price is
-  converted with the cross rate of one snapshot. USDT is then exactly
+  converted with the cross rate of one snapshot. That cross leg needs
+  `BTCUSD` from the same FX snapshot, so `PAYKIT_MARKETPLACE_CONTRACT=multi_asset`
+  requires USD among the feed's supported currencies (a multi-currency feed or
+  a USD single-pair Kraken/Bitstamp URL). A non-USD single-pair feed is valid
+  only with the legacy contract / Paykit fork. USDT is then exactly
   `cents x 10_000` at parity, and paykit-server fixes the Bitcoin rate for
   its own conversion exactly as for a USD listing, so paykit-server needs no
   change. The service keeps its guard: the Bitcoin amount paykit-server fixes
-  must sit within 5% of the service's own direct `BTC<CCY>` quote of the
-  price (and inside the 1,000-sat and 1-bitcoin bounds), else the bind is
-  refused with `fx_deviation_exceeded` and the prepared invoice is voided.
+  must be positive and sit within 5% of the service's own direct `BTC<CCY>`
+  quote of the price, else the bind is refused with `fx_deviation_exceeded` and
+  the prepared invoice is voided. When a seller accepts Bitcoin (alone or
+  alongside USDT) and FX lookup fails, the bind is refused with the typed FX
+  error rather than silently stripping Bitcoin to offer USDT only.
   A seller with only the USDT consent has no Bitcoin leg to guard; a non-USD
   price still needs the feed for its USD amount, so an unreadable feed
   refuses that bind (`fx_reference_unavailable`) instead of narrowing it. A
-  USD price needs no feed for USDT at parity and still binds with the feed
-  down.
+  USD price for a USDT-only seller needs no feed for USDT at parity and still
+  binds with the feed down.
 
 A USDT refund of a non-USD order is recorded in USDT0 millionths and capped at
 the USDT paid (`refund_destination::received_refund_amount_minor` and
@@ -128,7 +162,7 @@ as `order.bitcoin_quote`:
 | --- | --- |
 | `pair` | `BTC<CCY>` (present only once a quote exists) |
 | `rate` | units of the listing currency per bitcoin, exact decimal string |
-| `source` | `blocktank` |
+| `source` | FX provider (`blocktank`, or in single-seller mode `kraken`, `coinbase`, `mempool`, or `bitstamp`) |
 | `fetched_at` | the ticker's own timestamp |
 | `quoted_sats` | the amount asked of Paykit (legacy) or the guard amount (multi-asset) |
 | `currency`, `exponent` | the listing currency (the order's `total` is the listing-currency total) |

@@ -620,6 +620,9 @@ pub async fn recheck_at_payment(
     order_id: Uuid,
     now: DateTime<Utc>,
 ) -> Result<(), CommandFailure> {
+    if !modes.has_nuanced_eu_country() {
+        return Ok(());
+    }
     let row: Option<OrderToPay> = sqlx::query_as(
         "SELECT seller_pubky, seller_country, seller_status, buyer_country, \
                 seller_status_confirmed_at, total_minor, currency, exponent \
@@ -777,7 +780,7 @@ pub async fn get_annual_limit(
             "The seller was not found.",
         ));
     }
-    let Some(modes) = state.config.region_policy().fence_modes() else {
+    let Some(modes) = state.config.region_policy().eu_limits_modes() else {
         return reply(StatusCode::OK, json!({ "enabled": false }));
     };
     let now = state.clock.now();

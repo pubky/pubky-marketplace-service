@@ -519,15 +519,15 @@ async fn each_guard_refuses_only_the_currency_it_failed_for(pool: PgPool) {
             r#"{{"symbol":"BTC{currency}","lastPrice":"{price}","base":"BTC","quote":"{currency}","lastUpdatedAt":{updated}}}"#
         )
     };
-    // USD stays healthy. EUR is stale, JPY from the future, GBP out of its
-    // band, CHF carries no ticker, CAD is zero, AUD deviates 10% from the
-    // persisted reference.
+    // USD stays healthy. EUR is stale, JPY from the future, GBP is zero
+    // (non-positive), CHF carries no ticker, CAD is zero, AUD deviates 10%
+    // from the persisted reference.
     let feed = format!(
         r#"{{"tickers":[{},{},{},{},{},{}]}}"#,
         ticker("USD", price_of("USD"), current),
         ticker("EUR", price_of("EUR"), current - 301_000),
         ticker("JPY", price_of("JPY"), current + 61_000),
-        ticker("GBP", "5999", current),
+        ticker("GBP", "0.00000000", current),
         ticker("CAD", "0", current),
         ticker("AUD", "118368", current),
     );
@@ -646,16 +646,17 @@ async fn a_failed_feed_leaves_every_currency_unbound_with_no_side_effects(pool: 
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn a_quote_below_the_minimum_or_above_the_cap_is_refused_for_every_currency(pool: PgPool) {
+async fn small_and_large_fiat_orders_bind_without_artificial_sats_floor_or_cap(pool: PgPool) {
     let fixture = fixture(pool.clone()).await;
     seed_all_references(&pool, fixture.app.clock.now()).await;
     let buyer = new_actor(&fixture.app).await;
-    // 100 JPY is 852 sats (under 1,000): refused. 100,000,000 JPY is 851
-    // million sats (over 1 BTC): refused. 1,000 JPY (8,514 sats) binds.
-    for (total, reason) in [
-        (100, Some("below_minimum_sats")),
-        (100_000_000, Some("fx_rate_out_of_bounds")),
-        (1_000, None),
+    // 100 JPY is 852 sats (below the removed 1,000-sat floor); 100,000,000 JPY
+    // is 851,356,914 sats (> 8.5 BTC, above the removed 1.0 BTC cap);
+    // 1,000 JPY is 8,514 sats. All three bind cleanly.
+    for (total, expected_sats) in [
+        (100_i64, 852_u64),
+        (100_000_000, 851_356_914),
+        (1_000, 8_514),
     ] {
         let seller = new_actor(&fixture.app).await;
         enable_bitcoin(&fixture.app, &fixture.paykit, &seller).await;
@@ -668,24 +669,22 @@ async fn a_quote_below_the_minimum_or_above_the_cap_is_refused_for_every_currenc
         assert_eq!(status, StatusCode::OK, "{body}");
         let order_id = checkout(&fixture.app, &seller, &buyer).await;
         let (status, body) = bind(&fixture.app, &buyer.token, &order_id, "bitcoin").await;
-        match reason {
-            Some(reason) => {
-                assert_eq!(status, StatusCode::CONFLICT, "{total} JPY: {body}");
-                assert_eq!(body["error"]["reason"], json!(reason), "{total} JPY");
-            }
-            None => {
-                assert_eq!(status, StatusCode::OK, "{total} JPY: {body}");
-                assert_eq!(
-                    fixture
-                        .paykit
-                        .requests()
-                        .last()
-                        .expect("prepared")
-                        .amount_sats,
-                    8_514
-                );
-            }
-        }
+        assert_eq!(status, StatusCode::OK, "{total} JPY: {body}");
+        assert_eq!(
+            fixture
+                .paykit
+                .requests()
+                .last()
+                .expect("prepared")
+                .amount_sats,
+            expected_sats,
+            "{total} JPY"
+        );
+        assert_eq!(
+            facts(&pool, &order_id).await.bitcoin_quoted_sats,
+            Some(expected_sats as i64),
+            "{total} JPY persisted"
+        );
     }
 }
 
@@ -725,6 +724,11 @@ async fn the_sampler_stores_one_sample_per_currency_from_one_fetch(pool: PgPool)
         sample_fx_rate(&pool, url, now).await.unwrap(),
         0,
         "the bucket constraint caps each currency at one sample"
+    );
+    assert_eq!(
+        fixture.fx.fetch_count(),
+        1,
+        "already-sampled bucket performs zero redundant outbound fetches"
     );
     assert_eq!(sample_rows(&pool).await.len(), 7);
 }
@@ -784,11 +788,11 @@ async fn a_usd_only_feed_still_samples_usd(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn rate_bounds_match_the_table_check(pool: PgPool) {
+async fn fx_rate_samples_check_admits_positive_finite_rates_without_static_ceilings(pool: PgPool) {
     for (index, currency) in Currency::FIAT.into_iter().enumerate() {
-        let (low, high) = fx::rate_bounds(currency).expect("fiat bounds");
-        let insert = |rate: u128, bucket: i64| {
+        let insert = |rate: &str, bucket: i64| {
             let pool = pool.clone();
+            let rate = rate.to_string();
             async move {
                 sqlx::query(
                     "INSERT INTO fx_rate_samples \
@@ -796,20 +800,22 @@ async fn rate_bounds_match_the_table_check(pool: PgPool) {
                      VALUES ($1, $2::numeric, now(), now(), to_timestamp($3), 'blocktank')",
                 )
                 .bind(currency.code())
-                .bind(rate.to_string())
+                .bind(rate)
                 .bind(1_800_000_000 + index as i64 * 100 + bucket)
                 .execute(&pool)
                 .await
             }
         };
-        insert(low, 0)
+        insert("1", 0)
             .await
-            .unwrap_or_else(|e| panic!("{currency} low: {e}"));
-        insert(high, 1)
+            .unwrap_or_else(|e| panic!("{currency} small positive: {e}"));
+        insert("500000000", 1)
             .await
-            .unwrap_or_else(|e| panic!("{currency} high: {e}"));
-        assert!(insert(low - 1, 2).await.is_err(), "{currency} below");
-        assert!(insert(high + 1, 3).await.is_err(), "{currency} above");
+            .unwrap_or_else(|e| panic!("{currency} large positive: {e}"));
+        assert!(insert("0", 2).await.is_err(), "{currency} zero");
+        assert!(insert("-1", 3).await.is_err(), "{currency} negative");
+        assert!(insert("NaN", 4).await.is_err(), "{currency} NaN");
+        assert!(insert("Infinity", 5).await.is_err(), "{currency} Infinity");
     }
     let outside = sqlx::query(
         "INSERT INTO fx_rate_samples \
@@ -964,20 +970,20 @@ async fn the_cross_rate_guards_both_legs_against_their_own_references(pool: PgPo
 }
 
 #[sqlx::test(migrator = "marketplace_service::TEST_MIGRATOR")]
-async fn a_usdt_only_request_needs_no_bitcoin_amount_so_a_tiny_price_still_converts(pool: PgPool) {
+async fn tiny_and_large_fiat_prices_produce_both_sats_and_usd_quotes(pool: PgPool) {
     let fixture = fixture(pool.clone()).await;
     seed_all_references(&pool, fixture.app.clock.now()).await;
-    // 1 JPY is 9 sats (under the 1,000-sat minimum) but one USD cent.
+    // 1 JPY quotes to 9 sats and one USD cent.
     let quote = quote_order(&fixture, Currency::Jpy, 1)
         .await
         .expect("quote");
-    assert_eq!(quote.sats, Err(FxError::BelowMinimum));
+    assert_eq!(quote.sats, Ok(9));
     assert_eq!(quote.usd.cents, 1);
-    // 100 billion JPY exceeds the one-bitcoin cap for the Bitcoin leg only.
+    // 100 billion JPY quotes above 1 BTC cleanly for both Bitcoin and USD.
     let quote = quote_order(&fixture, Currency::Jpy, 100_000_000_000)
         .await
         .expect("quote");
-    assert_eq!(quote.sats, Err(FxError::CapExceeded));
+    assert_eq!(quote.sats, Ok(851_356_913_934));
     assert!(quote.usd.cents > 0);
     // Bitcoin spellings are not fiat and have no ticker.
     assert_eq!(

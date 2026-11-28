@@ -175,7 +175,8 @@ Configuration is environment-based. Window keys and their defaults also live in
 | `WORKER_LEASE_SECONDS` | `30` | worker task/outbox lease duration |
 | `LISTING_DELETION_PASS_BUDGET_MS` | `10000` | time budget of one listing-deletion follower pass; must be at most half of `WORKER_LEASE_SECONDS`. See [`docs/listing-deletion-follower.md`](docs/listing-deletion-follower.md) |
 | `LOCKS_SNAPSHOT_RETENTION_DAYS` | `90` | days Locks lifecycle snapshots are kept before the purge (≥ 1) |
-| `FX_FEED_URL` | fixed production URL | FX rate feed for the sampler. A release binary ignores this variable and always uses the fixed URL; only in-process test configuration repoints it |
+| `FX_FEED_PROVIDER` | `blocktank` | FX feed wire format: `blocktank`, `kraken`, `coinbase`, `mempool`, or `bitstamp`. Marketplace mode stays pinned to `blocktank` and refuses any other value; `single_seller` mode (`STORE_MODE=single_seller`, including claim mode, or `STORE_SELLER_PUBKY` set) honors operator-chosen providers. Default provider URLs support every fiat that provider's public API quotes (`blocktank`, `kraken`, `coinbase`, and `mempool`: all seven; `bitstamp`: `USD`, `EUR`, `GBP` only). A single Kraken `?pair=<PAIR>` or Bitstamp `/api/v2/ticker/btc<ccy>/` URL supports one fiat only; commands, sampling, bind, and `GET /health` `fx_source.currencies` follow that URL-specific set. `PAYKIT_MARKETPLACE_CONTRACT=multi_asset` requires `USD` in that set, and `EU_FENCE_ENABLED=true` or any nuanced EU-27 country in `REGION_MODES` requires `EUR` in that set (blocked-only and open-only region modes do not require `EUR`). `BTC` and `SAT` stay supported on all providers |
+| `FX_FEED_URL` | provider default (`https://api1.blocktank.to/api/fx/rates/btc` for `blocktank`, `https://api.kraken.com/0/public/Trades` for `kraken`) | FX rate feed URL for the sampler and bind-time quotes. Marketplace mode stays pinned to the Blocktank URL and refuses custom URLs; `single_seller` mode (`STORE_MODE=single_seller`, including claim mode, or `STORE_SELLER_PUBKY` set) honors custom Blocktank-format URLs or public exchange URLs (inferring `kraken`, `coinbase`, `mempool`, or `bitstamp` from their official hosts when `FX_FEED_PROVIDER` is unset). Kraken uses the price-timestamped `/0/public/Trades` endpoint (omit `pair` for all supported pairs, or set exactly one `?pair=<PAIR>&count=1`; `/0/public/Ticker` and multiple `pair` values are refused). Bitstamp may use the all-pairs array (`/api/v2/ticker/`) or one ticker path (`btcusd`, `btceur`, `btcgbp`). Coinbase on `api.coinbase.com` requires `/v2/exchange-rates?currency=BTC` (an empty query defaults to USD on Coinbase and is refused at boot; custom Coinbase-format hosts may omit the query when they default to BTC). Blocktank and Mempool refuse query parameters, and Coinbase refuses unexpected query parameters. Remote URLs must use `https`, resolve to public IPs, ignore system proxies (`no_proxy`), disable redirects, and stay under 1 MiB (`http` is allowed only for loopback `127.0.0.1`, `localhost`, or `[::1]`) |
 | `AUTOMATION_RATE_LIMIT_PER_MINUTE` | `120` | seller automation rate limit per `(actor, endpoint class)`; see [`docs/api.md`](docs/api.md#rate-limits) |
 | `AUTOMATION_RATE_LIMIT_BURST_MULTIPLIER` | `2` | burst capacity multiplier (max 10); rate × multiplier must be at most 20000 |
 | `INVENTORY_AUTHENTICATED_RATE_LIMIT_PER_MINUTE` | `120` | inventory API rate per seller, shared by all of the seller's sessions (1–10000) |
@@ -499,6 +500,36 @@ database, so there is nothing to find.
 then not built, `NEXUS_URL` is not read and must be unset, and the boot log
 says so. In marketplace mode `off` refuses to boot.
 
+`FX_FEED_PROVIDER` and custom `FX_FEED_URL` values are also allowed only in
+`single_seller` mode (both `STORE_MODE=single_seller` claim mode and
+`STORE_SELLER_PUBKY` pinned mode): an operator may pick a built-in public
+exchange feed adapter (`blocktank`, `kraken`, `coinbase`, `mempool`, `bitstamp`)
+or supply a custom URL while keeping staleness, finite-positive, and 5%
+deviation guards. Marketplace mode stays pinned to Blocktank and refuses custom
+FX settings at boot.
+
+Provider endpoint and currency support matrix:
+
+| Provider | Default endpoint | Freshness timestamp | Supported fiat currencies | Bitcoin units |
+| --- | --- | --- | --- | --- |
+| `blocktank` | `https://api1.blocktank.to/api/fx/rates/btc` | ticker `lastUpdatedAt` | `USD, EUR, CHF, GBP, JPY, CAD, AUD` | `BTC, SAT` |
+| `kraken` | `https://api.kraken.com/0/public/Trades` (all pairs, or one `?pair=<PAIR>&count=1`) | trade execution `time` | default URL: all seven fiats; one `pair`: that fiat only | `BTC, SAT` |
+| `coinbase` | `https://api.coinbase.com/v2/exchange-rates?currency=BTC` | required single HTTP `Date` + `Age <= 300` | `USD, EUR, CHF, GBP, JPY, CAD, AUD` | `BTC, SAT` |
+| `mempool` | `https://mempool.space/api/v1/prices` | payload `time` | `USD, EUR, CHF, GBP, JPY, CAD, AUD` | `BTC, SAT` |
+| `bitstamp` | `https://www.bitstamp.net/api/v2/ticker/` or `.../ticker/btc<ccy>/` | market `timestamp` | array: `USD, EUR, GBP`; single path: that fiat only | `BTC, SAT` |
+
+When the configured FX feed URL quotes a subset of fiats (for example
+`FX_FEED_PROVIDER=bitstamp` or a single-pair Kraken/Bitstamp URL), listings,
+syncs, checkouts, offers, bids, and Paykit/Bitcoin binds outside that resolved
+set are refused upfront with `422 INVALID_COMMAND`
+(`reason: "currency_unsupported"`). `PAYKIT_MARKETPLACE_CONTRACT=multi_asset`
+requires `USD` in the resolved set, and `EU_FENCE_ENABLED=true` or any nuanced
+EU-27 country in `REGION_MODES` requires `EUR` in the resolved set so C4 annual
+limits and EU re-confirmation can convert non-EUR totals (blocked-only and
+open-only region modes do not require `EUR`). All FX fetches disable system
+proxies (`no_proxy`), disable redirects, enforce public-IP DNS pinning, and cap
+responses at 1 MiB within the 3-second deadline.
+
 #### First-boot claim and release
 
 Claim mode needs `MARKETPLACE_GRANT_SESSION_ENABLED=true` and at least one
@@ -536,9 +567,10 @@ rows recovers only on a fresh database.
 
 `GET /health` reports the deployment: `store` (`mode` and `seller`), plus
 `state` only in claim mode, `homeserver_resolution` (`fixed` or `pkarr`),
-`listing_moderation` (`on` or `off`) and `fx_source` (the FX provider and
-whether its URL is the pinned one). Marketplace and env-pinned health bodies
-keep their previous shape. See [`docs/api.md`](docs/api.md#health).
+`listing_moderation` (`on` or `off`) and `fx_source` (the FX provider, whether
+its URL is the pinned Blocktank feed, and the fiat currencies that URL quotes).
+Marketplace and env-pinned health bodies keep their previous `store` shape. See
+[`docs/api.md`](docs/api.md#health).
 
 ### Region modes
 
@@ -1215,19 +1247,21 @@ working unchanged (Bitcoin only, its projection unchanged).
   sends `accepted_assets` only to narrow: `["BTC"]` when USDT is not wanted
   (the seller's consent or `USDT_PAYMENTS_ENABLED` is off, or
   `PAYKIT_MARKETPLACE_ASSETS` does not list `USDT`: the new body with USDT
-  off); `["USDT"]` when the seller's Bitcoin switch is off (a seller who takes
-  only USDT) or the FX quote or rate cannot be read but USDT is available (a
-  `["BTC"]` request is the fallback when only the USDT amount cannot be
-  checked, see below). Activation names the same denomination and amount
+  off) or when a Bitcoin-priced order cannot verify a USDT rate; `["USDT"]`
+  only when the seller's Bitcoin switch is off (a seller who takes only USDT).
+  When a seller accepts Bitcoin (alone or alongside USDT) on a fiat-priced
+  order and FX lookup fails, the bind is refused with the typed FX error
+  instead of silently stripping Bitcoin to offer USDT only. Activation names
+  the same denomination and amount
   (`{amount, asset, creator, invoice_id}`), and the response must echo the
   persisted terms. Against the fork, or with `legacy`, `paykit` is the legacy
   Bitcoin request exactly as the `bitcoin` bind sends it (`amount_sats`, the
   service FX quote for USD orders).
 - **Guards.** Whatever paykit-server offers is checked before the bind
   records anything: a USD order's USDT amount is exactly the order total at
-  parity (`cents x 10_000` millionths) and its Bitcoin amount must sit within
-  the FX deviation bound (`MAX_DEVIATION_BPS`) of the service's own quote and
-  inside the 1,000-sat minimum and the cap; a satoshi-priced order's Bitcoin
+  parity (`cents x 10_000` millionths) and its Bitcoin amount must be positive
+  and sit within the FX deviation bound (`MAX_DEVIATION_BPS`) of the service's
+  own quote; a satoshi-priced order's Bitcoin
   amount is exactly the price and its USDT amount must sit within the same
   bound of what the price is worth at the service's own rate. A mismatch
   refuses the bind and voids the prepared invoice. Every order currency the

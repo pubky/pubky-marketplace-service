@@ -65,7 +65,7 @@ async fn the_usd_conversion_is_all_or_nothing_and_matches_the_order_currency(poo
     for (what, set) in [
         ("another pair", "usd_conversion_pair = 'CHFUSD'"),
         ("USDUSD", "usd_conversion_pair = 'USDUSD'"),
-        ("another source", "usd_conversion_source = 'kraken'"),
+        ("another source", "usd_conversion_source = 'other'"),
         ("a zero USD rate", "usd_conversion_usd_rate = 0"),
         ("a negative rate", "usd_conversion_currency_rate = -1"),
         ("zero cents", "usd_conversion_cents = 0"),

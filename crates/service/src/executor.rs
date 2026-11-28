@@ -102,6 +102,43 @@ pub async fn execute_with_edge(
         }
     }
 
+    // Reject commands whose currency is outside what the configured FX feed
+    // quotes (for example CHF/JPY/CAD/AUD when configured with Bitstamp, or
+    // non-USD currencies on a USD-only single-pair URL) upfront with 422
+    // INVALID_COMMAND before any upstream IO or writes. Commands whose payload
+    // omits the currency (`offer.accept`, `offer.checkout`, `checkout.create`)
+    // resolve it locally from PostgreSQL while preserving auth, state, and
+    // revision precedence. A command id with a stored result is still answered
+    // as a replay.
+    if let Some(failure) = resolve_provider_currency_refusal(state, actor, &command).await? {
+        if stored_command_result(&state.pool, actor, command.command_id)
+            .await?
+            .is_none()
+        {
+            log_command(
+                actor,
+                command.kind(),
+                &command.command_id.to_string(),
+                &command.aggregate_id,
+                "refused",
+                Some(failure.code()),
+                Some(failure.message()),
+                command.expected_revision,
+                started.elapsed().as_millis() as u64,
+            );
+            enqueue_refusal(
+                state,
+                actor,
+                state.clock.now(),
+                SurfaceKind::V1Command,
+                command_kind(&command.payload),
+                failure.refusal_kind(),
+                Some(command.command_id),
+            );
+            return Ok(failure_response(&failure));
+        }
+    }
+
     // A command that sells a listing is refused when the index says the
     // listing, or its seller, is moderated, and when the seller's current
     // record says it is not for sale (any non-active state for a new
@@ -853,6 +890,72 @@ impl RecordReads {
     }
 }
 
+async fn resolve_provider_currency_refusal(
+    state: &AppState,
+    actor: &str,
+    command: &Command,
+) -> Result<Option<CommandFailure>, sqlx::Error> {
+    let fx = crate::fx::FxFeedAdmission::from_config(&state.config);
+    if fx.supports_all_fiat() {
+        return Ok(None);
+    }
+    match &command.payload {
+        CommandPayload::RegisterListing(payload) => Ok(crate::handlers::fx_currency_refusal(
+            fx,
+            payload.unit_price.currency.as_str(),
+            "payload.unit_price.currency",
+        )),
+        CommandPayload::CreateOffer(payload) => Ok(crate::handlers::fx_currency_refusal(
+            fx,
+            payload.amount.currency.as_str(),
+            "payload.amount.currency",
+        )),
+        CommandPayload::CounterOffer(payload) => Ok(crate::handlers::fx_currency_refusal(
+            fx,
+            payload.amount.currency.as_str(),
+            "payload.amount.currency",
+        )),
+        CommandPayload::PlaceBid(payload) => Ok(crate::handlers::fx_currency_refusal(
+            fx,
+            payload.maximum_amount.currency.as_str(),
+            "payload.maximum_amount.currency",
+        )),
+        CommandPayload::AcceptOffer(payload) => {
+            crate::handlers::offers::accept_currency_refusal(
+                &state.pool,
+                state.clock.as_ref(),
+                fx,
+                actor,
+                command,
+                payload,
+            )
+            .await
+        }
+        CommandPayload::OfferCheckout(payload) => {
+            crate::handlers::offer_checkout::checkout_currency_refusal(
+                &state.pool,
+                state.clock.as_ref(),
+                fx,
+                actor,
+                command,
+                payload,
+            )
+            .await
+        }
+        CommandPayload::CreateCheckout(payload) => {
+            crate::handlers::checkout::checkout_currency_refusal(
+                &state.pool,
+                fx,
+                actor,
+                command,
+                payload,
+            )
+            .await
+        }
+        _ => Ok(None),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn dispatch(
     state: &AppState,
@@ -879,6 +982,7 @@ async fn dispatch(
                 command,
                 payload,
                 state.homeserver.is_some(),
+                crate::fx::FxFeedAdmission::from_config(&state.config),
                 synced,
                 now,
             )
@@ -918,6 +1022,7 @@ async fn dispatch(
                     require_encrypted_delivery: state.config.require_encrypted_delivery_address,
                     fence,
                     shipping,
+                    fx: crate::fx::FxFeedAdmission::from_config(&state.config),
                 },
                 now,
             )
@@ -930,6 +1035,7 @@ async fn dispatch(
                 command,
                 payload,
                 state.homeserver.is_some(),
+                crate::fx::FxFeedAdmission::from_config(&state.config),
                 &reads.offer_record,
                 shipping,
                 now,
@@ -943,6 +1049,7 @@ async fn dispatch(
                 command,
                 payload,
                 state.homeserver.is_some(),
+                crate::fx::FxFeedAdmission::from_config(&state.config),
                 &reads.offer_record,
                 now,
             )
@@ -955,6 +1062,7 @@ async fn dispatch(
                 command,
                 payload,
                 state.homeserver.is_some(),
+                crate::fx::FxFeedAdmission::from_config(&state.config),
                 &reads.offer_record,
                 shipping,
                 now,
@@ -975,6 +1083,7 @@ async fn dispatch(
                 state.clock.as_ref(),
                 hold_window_seconds,
                 state.config.require_encrypted_delivery_address,
+                crate::fx::FxFeedAdmission::from_config(&state.config),
                 fence,
             )
             .await
@@ -986,7 +1095,16 @@ async fn dispatch(
             crate::handlers::offers::withdraw(tx, actor, command, payload, now).await
         }
         CommandPayload::PlaceBid(payload) => {
-            crate::handlers::auction::place_bid(tx, actor, command, payload, shipping, now).await
+            crate::handlers::auction::place_bid(
+                tx,
+                actor,
+                command,
+                payload,
+                crate::fx::FxFeedAdmission::from_config(&state.config),
+                shipping,
+                now,
+            )
+            .await
         }
         CommandPayload::CloseAuction(payload) => {
             crate::handlers::auction::close(tx, actor, command, payload, now).await

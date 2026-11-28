@@ -1300,7 +1300,10 @@ impl OrderRow {
     /// its earlier projection byte for byte.
     fn bitcoin_quote_view(&self) -> Value {
         let mut quote = json!({
-            "rate": self.bitcoin_quote_rate.as_ref().map(ToString::to_string),
+            "rate": self
+                .bitcoin_quote_rate
+                .as_ref()
+                .map(|rate| rate.normalized().to_plain_string()),
             "source": self.bitcoin_quote_source,
             "fetched_at": self.bitcoin_quote_fetched_at.map(format_timestamp),
             "quoted_sats": self.bitcoin_quoted_sats,
@@ -1448,17 +1451,19 @@ impl OrderRow {
             return None;
         };
         let (fetched_at, cents) = (self.usd_conversion_fetched_at?, self.usd_conversion_cents?);
+        let usd_rate_str = usd_rate.normalized().to_plain_string();
+        let currency_rate_str = currency_rate.normalized().to_plain_string();
         let cross = crate::fx::CrossRate {
             pair: pair.clone(),
-            usd_rate: crate::fx::Decimal::parse(&usd_rate.to_string())?,
-            currency_rate: crate::fx::Decimal::parse(&currency_rate.to_string())?,
+            usd_rate: crate::fx::Decimal::parse(&usd_rate_str)?,
+            currency_rate: crate::fx::Decimal::parse(&currency_rate_str)?,
             fetched_at,
         };
         Some(json!({
             "pair": pair,
             "rate": cross.rate_string(),
-            "usd_rate": usd_rate.to_string(),
-            "currency_rate": currency_rate.to_string(),
+            "usd_rate": usd_rate_str,
+            "currency_rate": currency_rate_str,
             "source": source,
             "fetched_at": format_timestamp(fetched_at),
             "from": money_json(self.total_minor, &self.currency, self.exponent),
