@@ -935,6 +935,37 @@ reference them age out with the ordinary retention. Forget the version:
 DELETE FROM _sqlx_migrations WHERE version = 101;
 ```
 
+## Store seller binding (0102)
+
+0102 creates the one-row `store_seller_binding` table. Its constant true
+primary key prevents a second seller, and its checks require a nonempty
+52-character z-base-32 pubky and a `claim` or `env` source. `claimed_at`, the
+optional claim session id and the service commit provide the audit trail.
+
+Row-level update and delete triggers and a statement-level truncate trigger
+share one function. They refuse unless
+`current_setting('marketplace.release_store_binding', true)` is exactly `on`.
+Unset, empty and `off` values all refuse. Only the release helper sets that
+value, with transaction-local scope. The function and triggers are replace and
+drop then create shapes, so the file is directly rerunnable.
+
+Every service and connector-worker boot reads the binding under the shared
+advisory lock. Env-pinned boot writes it, claim writes it once, and the
+`store-binding-admin release` helper can delete it only while no seller rows
+exist and no other service connection is open. The zero-seller-rows scan
+shared by boot, claim and release checks `listings`, `orders`, `reservations`
+(via `listings`), `connector_connections`, `seller_payment_configs`,
+`seller_accepted_payment_options`, `paykit_known_sellers`, `webhook_endpoints`,
+`attestation_band_consents`, `shipping_configs`, `drops`,
+`seller_stat_attestations`, seller-targeted `moderation_decisions`
+(`listing_removed` and `shop_suspended`, excluding buyer/review restrictions)
+and `gateway_refund_inbox` (including unmatched rows where `order_id` is
+null). This guard does not stop a superuser, the table owner or a database
+restore.
+
+**Deploy mode: rolling only between images that contain 0102.** An older image
+ignores the binding and claim configuration. There is no down migration.
+
 ## Numbers claimed by open pull requests
 
 `main` has 0001 to 0079 (0068 and 0069 were never used). A new migration must
@@ -960,6 +991,7 @@ assume it is free:
 | 0099 | `0099_inventory_actor_rate_limits.sql` | per-seller inventory rate buckets and the `session.create` automation class |
 | 0100 | `0100_homeserver_scoped_deletion_cursors.sql` | homeserver-scoped listing deletion cursors and revival markers (`HOMESERVER_RESOLUTION=pkarr`) |
 | 0101 | `0101_single_seller_refusals.sql` | the `seller_not_served` refusal kind and the `seller_route` surface and command kind (single-seller mode), stacked on 0100 |
+| 0102 | `0102_store_seller_binding.sql` | permanent one-row seller binding, release triggers and first-boot claim |
 
 This table describes unmerged work and goes stale as pull requests land; trust
 `crates/service/migrations/` on `main` over it. sqlx does not reject two files

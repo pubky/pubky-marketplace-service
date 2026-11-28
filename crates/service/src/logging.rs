@@ -100,6 +100,8 @@ pub(crate) fn error_code_name(code: Option<ErrorCode>) -> &'static str {
         Some(ErrorCode::ShippingUnavailable) => "SHIPPING_UNAVAILABLE",
         Some(ErrorCode::ShippingChanged) => "SHIPPING_CHANGED",
         Some(ErrorCode::SellerNotServed) => "SELLER_NOT_SERVED",
+        Some(ErrorCode::StoreUnclaimed) => "STORE_UNCLAIMED",
+        Some(ErrorCode::StoreAlreadyClaimed) => "STORE_ALREADY_CLAIMED",
         None => "",
     }
 }

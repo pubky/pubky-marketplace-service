@@ -495,10 +495,35 @@ impl Bucket {
         self.tokens
     }
 
+    pub(crate) fn updated(&self) -> DateTime<Utc> {
+        self.updated
+    }
+
+    /// Monotonic token refill: an older or equal timestamp earns no refill and
+    /// never moves `updated` backward, so out-of-order completions or clock
+    /// rollbacks cannot credit the same interval twice.
     pub(crate) fn refill(&mut self, now: DateTime<Utc>, per_second: f64, capacity: f64) {
-        let elapsed = (now - self.updated).num_milliseconds().max(0) as f64 / 1_000.0;
-        self.tokens = (self.tokens + elapsed * per_second).min(capacity);
-        self.updated = now;
+        let elapsed_ms = (now - self.updated).num_milliseconds();
+        if elapsed_ms <= 0 {
+            return;
+        }
+        self.tokens =
+            crate::clock::refilled_tokens(self.tokens, elapsed_ms, per_second * 60.0, capacity);
+        self.updated += chrono::TimeDelta::milliseconds(elapsed_ms);
+    }
+
+    /// Whole seconds until this bucket holds at least one token relative to
+    /// `now`, including any positive `(self.updated - now)` offset so an
+    /// out-of-order or rolled-back clock never under-reports `Retry-After`.
+    pub(crate) fn retry_after(&self, now: DateTime<Utc>, per_second: f64, capacity: f64) -> u64 {
+        crate::clock::retry_after_seconds(
+            self.tokens,
+            per_second * 60.0,
+            capacity,
+            self.updated,
+            now,
+        )
+        .max(1) as u64
     }
 
     /// Takes one token, or returns the whole seconds until one is available.
@@ -510,10 +535,13 @@ impl Bucket {
     ) -> Result<(), u64> {
         self.refill(now, per_second, capacity);
         if self.tokens >= 1.0 {
+            if self.tokens >= capacity {
+                self.updated = self.updated.max(now);
+            }
             self.tokens -= 1.0;
             Ok(())
         } else {
-            Err((((1.0 - self.tokens) / per_second).ceil() as u64).max(1))
+            Err(self.retry_after(now, per_second, capacity))
         }
     }
 }
@@ -1237,5 +1265,55 @@ mod tests {
         );
         drop(inner);
         silent.abort();
+    }
+
+    #[test]
+    fn bucket_refill_is_monotonic_and_retry_after_includes_future_offset() {
+        use super::Bucket;
+        use chrono::{DateTime, Duration, Utc};
+
+        let t0 = DateTime::parse_from_rfc3339("2026-01-01T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let t1 = t0 + Duration::seconds(100);
+        let rate = 10.0 / 900.0;
+        let capacity = 10.0;
+
+        let mut bucket = Bucket::full(capacity, t1);
+        for _ in 0..10 {
+            assert_eq!(bucket.take(t1, rate, capacity), Ok(()));
+        }
+        assert_eq!(bucket.updated(), t1);
+
+        // An older timestamp must not rewind `updated` or credit refill, and
+        // `Retry-After` must include the positive `(updated - now)` offset.
+        bucket.refill(t0, rate, capacity);
+        assert_eq!(bucket.tokens(), 0.0);
+        assert_eq!(bucket.updated(), t1);
+        assert_eq!(bucket.take(t0, rate, capacity), Err(190));
+        assert_eq!(bucket.updated(), t1);
+
+        // Returning to `t1` must still see an empty bucket (no double credit).
+        assert_eq!(bucket.take(t1, rate, capacity), Err(90));
+        assert_eq!(
+            bucket.take(t1 + Duration::seconds(89), rate, capacity),
+            Err(1)
+        );
+        assert_eq!(
+            bucket.take(t1 + Duration::seconds(90), rate, capacity),
+            Ok(())
+        );
+
+        // Sub-millisecond polling while empty must not advance `updated` and
+        // starve refill.
+        let t2 = t1 + Duration::seconds(90);
+        for step in 1..=10 {
+            let probe = t2 + Duration::microseconds(step * 500);
+            assert!(bucket.take(probe, rate, capacity).is_err());
+        }
+        assert_eq!(
+            bucket.take(t2 + Duration::seconds(90), rate, capacity),
+            Ok(())
+        );
     }
 }

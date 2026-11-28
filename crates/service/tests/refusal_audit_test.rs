@@ -2783,8 +2783,9 @@ async fn refusal_audit_real_fixture_is_invariant_across_writer_states(pool: PgPo
     ));
 
     let single_seller = common::reconfigured(&base, |config| {
-        config.store_mode =
-            marketplace_service::store_seller::StoreMode::SingleSeller(other.pubky.clone());
+        config.store_mode = marketplace_service::store_seller::StoreMode::SingleSeller {
+            pinned: Some(other.pubky.clone()),
+        };
     });
     cases.push(command_case(
         RefusalKind::SellerNotServed,

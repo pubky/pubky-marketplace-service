@@ -3737,6 +3737,16 @@ fn parse_gateway_amount_minor(value: &str, exponent: i32) -> Option<i64> {
 /// `Reversed`, and `Canceled_Reversal` notifications are never dropped
 /// (`paypal_refund`, docs/paypal-refund-ipn.md).
 pub async fn paypal_ipn(State(state): State<AppState>, body: String) -> Response {
+    // An unclaimed single-seller store has no orders and must not verify or
+    // persist unmatched refund IPNs (`gateway_refund_inbox`) before claim.
+    match state.store.refresh(&state.pool, false).await {
+        Ok(crate::store_seller::Active::Unclaimed) => {
+            tracing::warn!("paypal ipn refused: store is unclaimed");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        Ok(_) => {}
+        Err(error) => return internal("ipn store state read", &error),
+    }
     let Ok(payments) = payments_runtime(&state) else {
         tracing::warn!("paypal ipn received while payment methods are disabled");
         return StatusCode::OK.into_response();

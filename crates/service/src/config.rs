@@ -277,6 +277,9 @@ pub struct Config {
     /// The one seller the deployment serves (`STORE_SELLER_PUBKY`), or any
     /// seller when unset ([`crate::store_seller`]).
     pub store_mode: StoreMode,
+    /// SHA-256 of the normalized setup code, never its plaintext.
+    pub store_claim_code: Option<crate::store_claim::ClaimCode>,
+    pub store_claim_session_max_age_seconds: i64,
 }
 
 /// Who releases a paid order's instant digital lines (`DIGITAL_RELEASE`).
@@ -556,6 +559,15 @@ impl Config {
             DigitalRelease::parse(std::env::var("DIGITAL_RELEASE").ok().as_deref())?;
         let store_mode =
             crate::store_seller::store_mode_from_lookup(&|name| std::env::var(name).ok())?;
+        let store_claim_code = crate::store_claim::claim_code_from_lookup(&store_mode, &|name| {
+            std::env::var(name).ok()
+        })?;
+        let store_claim_session_max_age_seconds = bounded_i64(
+            crate::store_claim::ENV_CLAIM_SESSION_MAX_AGE_SECONDS,
+            crate::store_claim::DEFAULT_CLAIM_SESSION_MAX_AGE_SECONDS,
+            1,
+            crate::store_claim::MAX_CLAIM_SESSION_MAX_AGE_SECONDS,
+        )?;
         Ok(Self {
             bind_addr,
             database_url,
@@ -618,6 +630,8 @@ impl Config {
             payment_confirmation,
             digital_release,
             store_mode,
+            store_claim_code,
+            store_claim_session_max_age_seconds,
         })
     }
 
@@ -694,6 +708,9 @@ impl Config {
             payment_confirmation: PaymentConfirmation::Automatic,
             digital_release: DigitalRelease::Payment,
             store_mode: StoreMode::Marketplace,
+            store_claim_code: None,
+            store_claim_session_max_age_seconds:
+                crate::store_claim::DEFAULT_CLAIM_SESSION_MAX_AGE_SECONDS,
         }
     }
 }
@@ -1530,7 +1547,12 @@ mod tests {
         let seller = marketplace_domain::pubky::encode_pubky(&[3; 32]);
         let config = from_env_with(&[("STORE_SELLER_PUBKY", Some(seller.as_str()))])
             .expect("a pubky parses");
-        assert_eq!(config.store_mode, StoreMode::SingleSeller(seller));
+        assert_eq!(
+            config.store_mode,
+            StoreMode::SingleSeller {
+                pinned: Some(seller)
+            }
+        );
         for value in ["seller", "   "] {
             let error =
                 from_env_with(&[("STORE_SELLER_PUBKY", Some(value))]).expect_err("not a pubky");

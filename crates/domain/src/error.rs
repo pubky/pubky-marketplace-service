@@ -69,6 +69,10 @@ pub enum ErrorCode {
     /// order, payment or settings. A 409, not a 403, for the reason given at
     /// `ListingModerated`.
     SellerNotServed,
+    /// The deployment is a single-seller store whose owner has not claimed it.
+    StoreUnclaimed,
+    /// The store already has its permanent seller binding.
+    StoreAlreadyClaimed,
 }
 
 impl ErrorCode {
@@ -103,8 +107,9 @@ impl ErrorCode {
             | ErrorCode::ShippingUnavailableToCountry
             | ErrorCode::ShippingUnavailable
             | ErrorCode::ShippingChanged
-            | ErrorCode::SellerNotServed => 409,
-            ErrorCode::UpstreamUnavailable => 503,
+            | ErrorCode::SellerNotServed
+            | ErrorCode::StoreAlreadyClaimed => 409,
+            ErrorCode::UpstreamUnavailable | ErrorCode::StoreUnclaimed => 503,
         }
     }
 }

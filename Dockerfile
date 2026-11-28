@@ -12,6 +12,9 @@ COPY --from=builder /build/target/release/marketplace-service /usr/local/bin/mar
 # The store connector worker runs from the same image with its own command:
 # `connector-worker` (needs CONNECTORS_ENABLED=true).
 COPY --from=builder /build/target/release/connector-worker /usr/local/bin/connector-worker
+# Operator release of a wrong-identity store claim, run with the service and
+# worker stopped: `store-binding-admin release --confirm <pubky-or-first-8>`.
+COPY --from=builder /build/target/release/store-binding-admin /usr/local/bin/store-binding-admin
 # The commit is a runtime env, set after the compile stage so a new SHA does
 # not invalidate the cargo build cache. `/health` reports it as `commit`.
 ARG GIT_COMMIT=unknown

@@ -33,6 +33,13 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::from_env()?;
+    let grant_session = marketplace_service::grant_session::GrantSessionConfig::from_env(
+        config.public_service_origin.as_deref(),
+    )?;
+    marketplace_service::store_seller::require_claim_grant_sessions(
+        &config.store_mode,
+        grant_session.as_deref(),
+    )?;
     marketplace_service::inventory::validate_rate_config_from_env()?;
     let locks = marketplace_service::locks::runtime_from_env()?;
     let pickup = marketplace_service::pickup::pickup_keys_from_env(locks.as_deref())?;
@@ -63,13 +70,21 @@ async fn main() -> anyhow::Result<()> {
         .connect(&config.database_url)
         .await?;
     marketplace_service::migrations::run(&pool).await?;
-    marketplace_service::store_seller::refuse_other_sellers(&pool, &config.store_mode).await?;
+    let store = marketplace_service::store_seller::resolve_worker_store(
+        &pool,
+        &config.store_mode,
+        config.store_claim_code.clone(),
+        marketplace_service::store_seller::WORKER_CLAIM_POLL_INTERVAL,
+    )
+    .await?;
     connectors::assert_credentials_coherent(&pool, Some(runtime.keys.as_ref())).await?;
     tracing::info!(
         providers = ?runtime.providers.kinds(),
         "connector worker starting"
     );
 
-    let state = AppState::new(pool, Arc::new(SystemClock), config).with_connectors(Some(runtime));
+    let state = AppState::new(pool, Arc::new(SystemClock), config)
+        .with_store(store)
+        .with_connectors(Some(runtime));
     connectors::worker::run_forever(state).await
 }
