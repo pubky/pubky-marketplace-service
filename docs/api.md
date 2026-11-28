@@ -1089,8 +1089,18 @@ ratings for the order.
 
 `review.create` writes one review per listing and issues one purchase
 attestation per listing; the attestations share the order's `order_ref` and
-each binds its listing. Within 24 hours of their first review of the order, a
-buyer may create again to add listings not yet reviewed, and either reviewer
+each binds its listing. Buyer and seller attestations include `price_decade` when the
+unit price is representable. Its value is the log decade of the bound listing's unit price paid,
+`{CURRENCY}:{k}` in the listing's own currency code, decaded in the
+`pubky-market-specs` price weight table's minor unit (sats for `BTC` and
+`SAT`, cents for `USD`, `EUR`, `GBP`, `CHF`, `CAD` and `AUD`, yen for `JPY`).
+The price paid is the order line's: for an accepted offer it is the agreed
+price, so the public claim shows that price's decade, not the listing's.
+Current listings, variants, offers and bids use positive amounts at the currency's own exponent.
+A historical price below one table minor unit (for example, USD 0.001) has no representable decade.
+The attestation then omits the claim and the review has the minimum price weight. The
+order-total `amount_band` stays consent-only. Within 24 hours of their
+first review of the order, a buyer may create again to add listings not yet reviewed, and either reviewer
 may `review.update` the listings they reviewed (v1 terms edit the first line).
 Reviewing a listing twice is refused with `INVALID_STATE`; past the window,
 adding and editing are refused with `INVALID_STATE`. A buyer's first review

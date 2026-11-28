@@ -62,7 +62,7 @@ use crate::attestor::{Attestor, ISSUES_PRICE_DECADE};
 use crate::attestor_records::{
     annotation_path, Annotation, IssuancePolicy, Operator, Outcome, OutcomeKind, Profile,
     ProfileKey, AMOUNT_BAND_POLICY_BOTH_SIDES_CONSENT, MAX_ANNOTATION_OUTCOMES,
-    PRICE_DECADE_POLICY_ALWAYS, PRICE_DECADE_POLICY_NEVER, PROFILE_PATH,
+    PRICE_DECADE_POLICY_NEVER, PRICE_DECADE_POLICY_WHEN_REPRESENTABLE, PROFILE_PATH,
 };
 use crate::handlers::reviews::REVIEW_EDIT_WINDOW_SECONDS;
 use crate::workers::{release_fenced_lease, try_acquire_fenced_lease};
@@ -264,7 +264,7 @@ pub fn build_profile(settings: &ProfileSettings, blind_window_days: i64) -> Prof
             blind_window_days,
             amount_band: AMOUNT_BAND_POLICY_BOTH_SIDES_CONSENT.to_string(),
             price_decade: if ISSUES_PRICE_DECADE {
-                PRICE_DECADE_POLICY_ALWAYS
+                PRICE_DECADE_POLICY_WHEN_REPRESENTABLE
             } else {
                 PRICE_DECADE_POLICY_NEVER
             }

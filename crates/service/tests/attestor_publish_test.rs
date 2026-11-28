@@ -224,6 +224,7 @@ async fn attested_order(pool: &PgPool, attestor: &Attestor) -> (Uuid, String) {
         &listing,
         "2026-08-19",
         None,
+        None,
         "2026-08-19T22:00:00Z".parse().unwrap(),
     );
     sqlx::query(
@@ -361,7 +362,7 @@ async fn the_profile_states_what_the_service_issues(pool: PgPool) {
     assert_eq!(
         profile["issuancePolicy"]["priceDecade"],
         json!(if ISSUES_PRICE_DECADE {
-            "always"
+            "when the unit price is representable"
         } else {
             "never"
         }),

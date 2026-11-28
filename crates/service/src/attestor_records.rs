@@ -42,6 +42,8 @@ pub const AMOUNT_BAND_POLICY_BOTH_SIDES_CONSENT: &str = "both-sides consent";
 /// `issuancePolicy.priceDecade` of an attestor that signs every per-item
 /// attestation's `price_decade`.
 pub const PRICE_DECADE_POLICY_ALWAYS: &str = "always";
+/// The unit price must have a log decade in the specification's currency units.
+pub const PRICE_DECADE_POLICY_WHEN_REPRESENTABLE: &str = "when the unit price is representable";
 /// `issuancePolicy.priceDecade` of an attestor that signs none.
 pub const PRICE_DECADE_POLICY_NEVER: &str = "never";
 
