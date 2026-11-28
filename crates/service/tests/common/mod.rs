@@ -337,12 +337,15 @@ fn log_buffer() -> Arc<Mutex<Vec<u8>>> {
 }
 
 /// Installs the process-global tracing subscriber writing into a shared
-/// buffer (first call wins; later calls are no-ops). Tests assert on
-/// distinctive markers (order/invoice ids), never on global ordering.
+/// buffer (first call wins; later calls are no-ops). Wall-clock timestamps
+/// are omitted so microsecond digits cannot produce false substring hits in
+/// negative log assertions. Tests assert on distinctive markers
+/// (order/invoice ids), never on global ordering.
 pub fn install_log_capture() {
     let _ = tracing_subscriber::fmt()
         .with_writer(|| LogWriter(log_buffer()))
         .with_ansi(false)
+        .without_time()
         .try_init();
 }
 
